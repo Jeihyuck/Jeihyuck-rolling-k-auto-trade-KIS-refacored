@@ -1,0 +1,10 @@
+# requirements.txt
+python-dotenv
+fastapi
+uvicorn
+pandas
+numpy
+git+https://github.com/FinanceData/FinanceDataReader.git
+python-dateutil
+requests
+streamlit
