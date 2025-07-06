@@ -4,4 +4,4 @@ python-dotenv
 pandas>=2.2
 numpy>=1.26
 pykrx
-finance-datareader @ git+https://github.com/FinanceData/finance-datareader>=0.9
+finance-datareader>=0.9
