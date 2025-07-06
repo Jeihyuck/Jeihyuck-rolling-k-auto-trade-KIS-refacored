@@ -1,6 +1,6 @@
 def simulate_with_k_and_get_metrics(stock_code, k, price_data):
     returns = []
-    peak = -float('inf')
+    peak = -float("inf")
     max_drawdown = 0
     wins = 0
     trades = 0
@@ -31,5 +31,5 @@ def simulate_with_k_and_get_metrics(stock_code, k, price_data):
         "k": k,
         "avg_return_pct": avg_return_pct,
         "win_rate_pct": win_rate_pct,
-        "mdd_pct": mdd_pct
+        "mdd_pct": mdd_pct,
     }

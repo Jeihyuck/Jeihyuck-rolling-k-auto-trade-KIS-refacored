@@ -2,12 +2,14 @@
 from pydantic import BaseModel
 from typing import Optional
 
+
 class BuyOrderRequest(BaseModel):
     code: str
     name: str
     buy_price: float
     quantity: int
     signal_date: str
+
 
 class SellOrderRequest(BaseModel):
     code: str

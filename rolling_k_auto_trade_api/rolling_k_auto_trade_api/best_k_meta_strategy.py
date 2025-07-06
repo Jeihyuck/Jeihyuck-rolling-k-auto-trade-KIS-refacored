@@ -17,7 +17,11 @@ def get_kosdaq_top_50(date_str: str | None = None):
     """
     try:
         # ── 0. 날짜 보정 ──────────────────────────────────────────────
-        target = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
+        target = (
+            datetime.today()
+            if date_str is None
+            else datetime.strptime(date_str, "%Y-%m-%d")
+        )
         from_date = get_nearest_business_day_in_a_week(target.strftime("%Y%m%d"))
         logger.info(f"📅 pykrx 시총 조회일 → {from_date}")
 
@@ -33,7 +37,7 @@ def get_kosdaq_top_50(date_str: str | None = None):
         # 시가총액·티커 컬럼명 탐색 (공백·괄호 대비)
         cols = mktcap_df.columns.tolist()
         capcol = next((c for c in cols if "시가총액" in c.replace(" ", "")), None)
-        ticcol = next((c for c in cols if "티커"   in c.replace(" ", "")), None)
+        ticcol = next((c for c in cols if "티커" in c.replace(" ", "")), None)
         if capcol is None or ticcol is None:
             logger.error(f"❌  필수컬럼 누락 cap={capcol}, tic={ticcol}")
             return pd.DataFrame()
@@ -42,19 +46,18 @@ def get_kosdaq_top_50(date_str: str | None = None):
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
 
-        logger.info(f"[DEBUG] pykrx after rename → {mktcap_df[['Code', 'Marcap']].head()}")
+        logger.info(
+            f"[DEBUG] pykrx after rename → {mktcap_df[['Code', 'Marcap']].head()}"
+        )
 
         # ── 2. FDR 종목 기본정보 ────────────────────────────────────
-        fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
+        fdr_df = fdr.StockListing("KOSDAQ").rename(
+            columns={"Symbol": "Code", "Name": "Name"}
+        )
         fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
 
         # ── 3. 병합 ────────────────────────────────────────────────
-        merged = pd.merge(
-            fdr_df,
-            mktcap_df[["Code", "Marcap"]],
-            on="Code",
-            how="inner"
-        )
+        merged = pd.merge(fdr_df, mktcap_df[["Code", "Marcap"]], on="Code", how="inner")
         logger.info(f"[DEBUG] merged.columns → {merged.columns.tolist()}")
         logger.info(f"[DEBUG] merged.shape   → {merged.shape}")
 
@@ -71,7 +74,7 @@ def get_kosdaq_top_50(date_str: str | None = None):
 
         # ── 4. NaN 제거·상위 50 추출 ───────────────────────────────
         merged = merged.dropna(subset=["Marcap"])
-        top50  = merged.sort_values("Marcap", ascending=False).head(50)
+        top50 = merged.sort_values("Marcap", ascending=False).head(50)
 
         if top50.empty:
             logger.warning("⚠️  Top50 결과가 비어 있음 → 종료")
@@ -87,17 +90,14 @@ def get_kosdaq_top_50(date_str: str | None = None):
         return pd.DataFrame()
 
 
-
-
-
-
-
 def simulate_k_range_for(stock_code, price_data, k_range=np.arange(0.1, 1.0, 0.1)):
     results = []
     for k in k_range:
         metrics = simulate_with_k_and_get_metrics(stock_code, k, price_data)
         metrics["k"] = k
-        metrics["sharpe"] = round((metrics["avg_return_pct"] / 100) / (0.01 + metrics["mdd_pct"] / 100), 2)
+        metrics["sharpe"] = round(
+            (metrics["avg_return_pct"] / 100) / (0.01 + metrics["mdd_pct"] / 100), 2
+        )
         results.append(metrics)
     return results
 
@@ -105,22 +105,38 @@ def simulate_k_range_for(stock_code, price_data, k_range=np.arange(0.1, 1.0, 0.1
 def get_price_data_segments(code, base_date):
     price_data = {}
     try:
-        logger.info(f"[DEBUG] 📦 Requesting DataReader for {code} from {base_date - timedelta(days=400)} to {base_date + timedelta(days=1)}")
-        df = fdr.DataReader(code, start=base_date - timedelta(days=400), end=base_date + timedelta(days=1))
+        logger.info(
+            f"[DEBUG] 📦 Requesting DataReader for {code} from {base_date - timedelta(days=400)} to {base_date + timedelta(days=1)}"
+        )
+        df = fdr.DataReader(
+            code,
+            start=base_date - timedelta(days=400),
+            end=base_date + timedelta(days=1),
+        )
         logger.info(f"[DEBUG] 📊 DataReader response: {df.shape}")
         df = df.dropna()
-        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"})
+        df = df.rename(
+            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
+        )
         df = df.reset_index()
         df["date"] = df["Date"].dt.date
         df = df[["date", "open", "high", "low", "close"]]
         df = df.sort_values("date")
 
         base = base_date
-        price_data["year"] = df[df["date"] >= base - timedelta(days=365)].to_dict(orient="records")
-        price_data["quarter"] = df[df["date"] >= base - timedelta(days=90)].to_dict(orient="records")
-        price_data["month"] = df[df["date"] >= base - timedelta(days=30)].to_dict(orient="records")
+        price_data["year"] = df[df["date"] >= base - timedelta(days=365)].to_dict(
+            orient="records"
+        )
+        price_data["quarter"] = df[df["date"] >= base - timedelta(days=90)].to_dict(
+            orient="records"
+        )
+        price_data["month"] = df[df["date"] >= base - timedelta(days=30)].to_dict(
+            orient="records"
+        )
 
-        logger.info(f"[DEBUG] ✅ Segments for {code} — year: {len(price_data['year'])}, quarter: {len(price_data['quarter'])}, month: {len(price_data['month'])}")
+        logger.info(
+            f"[DEBUG] ✅ Segments for {code} — year: {len(price_data['year'])}, quarter: {len(price_data['quarter'])}, month: {len(price_data['month'])}"
+        )
 
     except Exception as e:
         logger.error(f"[ERROR] ❌ Failed to fetch data for {code}: {e}")
@@ -153,7 +169,7 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> list[dict]:
                  }
     """
     rebalance_date = datetime.strptime(rebalance_date_str, "%Y-%m-%d").date()
-    today          = datetime.today().date()
+    today = datetime.today().date()
 
     # 1) 시가총액 Top50 확보
     top50_df = get_kosdaq_top_50(rebalance_date_str)
@@ -189,30 +205,32 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> list[dict]:
                     code, best_k, price_segments["month"]
                 )
                 avg_return = month_perf["avg_return_pct"]
-                win_rate   = month_perf["win_rate_pct"]
-                mdd        = month_perf["mdd_pct"]
-                trades     = month_perf.get("trades", 0)
-                cum_ret    = month_perf.get("cumulative_return_pct", avg_return)
-                hold_days  = month_perf.get("avg_holding_days", 1)
+                win_rate = month_perf["win_rate_pct"]
+                mdd = month_perf["mdd_pct"]
+                trades = month_perf.get("trades", 0)
+                cum_ret = month_perf.get("cumulative_return_pct", avg_return)
+                hold_days = month_perf.get("avg_holding_days", 1)
 
-            logger.info(f"[SIM] {name}({code}) R={avg_return:.1f}%  "
-                        f"W={win_rate:.1f}%  MDD={mdd:.1f}%  K={best_k}")
+            logger.info(
+                f"[SIM] {name}({code}) R={avg_return:.1f}%  "
+                f"W={win_rate:.1f}%  MDD={mdd:.1f}%  K={best_k}"
+            )
 
             # 3) 필터링
             if avg_return > 5 and win_rate > 60 and mdd < 10:
                 result_map[code] = {
-                    "code"                  : code,
-                    "name"                  : name,
-                    "best_k"                : best_k,
-                    "avg_return_pct"        : round(avg_return, 2),
-                    "win_rate_pct"          : round(win_rate, 1),
-                    "mdd_pct"               : round(mdd, 1),
-                    "trades"                : trades,
-                    "cumulative_return_pct" : round(cum_ret, 2),
-                    "avg_holding_days"      : round(hold_days, 1),
-                    "sharpe_y"              : max((m["sharpe"] for m in y_metrics), default=0),
-                    "sharpe_q"              : max((m["sharpe"] for m in q_metrics), default=0),
-                    "sharpe_m"              : max((m["sharpe"] for m in m_metrics), default=0)
+                    "code": code,
+                    "name": name,
+                    "best_k": best_k,
+                    "avg_return_pct": round(avg_return, 2),
+                    "win_rate_pct": round(win_rate, 1),
+                    "mdd_pct": round(mdd, 1),
+                    "trades": trades,
+                    "cumulative_return_pct": round(cum_ret, 2),
+                    "avg_holding_days": round(hold_days, 1),
+                    "sharpe_y": max((m["sharpe"] for m in y_metrics), default=0),
+                    "sharpe_q": max((m["sharpe"] for m in q_metrics), default=0),
+                    "sharpe_m": max((m["sharpe"] for m in m_metrics), default=0),
                 }
 
         except Exception as e:
@@ -247,5 +265,3 @@ def get_best_k_meta(year_metrics, quarter_metrics, month_metrics):
 
     best_k = max(scores.items(), key=lambda x: x[1])[0]
     return round(best_k, 2)
-
-

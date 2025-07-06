@@ -6,18 +6,22 @@ import os
 
 PORTFOLIO_STATE_FILE = "rolling_k_auto_trade_api/portfolio_state.json"
 
+
 def load_portfolio_state():
     if os.path.exists(PORTFOLIO_STATE_FILE):
         with open(PORTFOLIO_STATE_FILE, "r") as f:
             return json.load(f)
     return {}
 
+
 def save_portfolio_state(state):
     with open(PORTFOLIO_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
+
 def calculate_target_price(prev_high, prev_low, today_open, k):
     return today_open + (prev_high - prev_low) * k
+
 
 def monitor_and_trade_all(stocks):
     """
@@ -47,7 +51,7 @@ def monitor_and_trade_all(stocks):
                 state[code] = {
                     "buy_price": current_price,
                     "buy_time": datetime.now().isoformat(),
-                    "target_price": target_price
+                    "target_price": target_price,
                 }
 
             # 보유 중인 경우 → 종가 근접 시 자동 매도 (단순 종료 조건 예시)

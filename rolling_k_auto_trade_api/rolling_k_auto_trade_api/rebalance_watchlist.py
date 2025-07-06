@@ -15,6 +15,7 @@ WATCHLIST_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
+
 @router.get("/watchlist/{date_str}")
 async def run_rebalance_watchlist(date_str: str):
     """
@@ -28,9 +29,9 @@ async def run_rebalance_watchlist(date_str: str):
     raw = get_best_k_for_kosdaq_50(date_str)
     logger.info(f"[DEBUG] get_best_k_for_kosdaq_50 raw result len = {len(raw)}")
 
-
     filtered = [
-        r for r in raw
+        r
+        for r in raw
         if r.get("avg_return_pct", 0) > 5
         and r.get("win_rate", 0) > 60
         and r.get("mdd_pct", 99) < 10
@@ -60,14 +61,16 @@ async def run_rebalance_watchlist(date_str: str):
         target = open_price + (prev_ohlc["high"] - prev_ohlc["low"]) * k_val
         qty = math.floor(each_cap / open_price)
 
-        watchlist.append({
-            "code": code,
-            "best_k": k_val,
-            "target_price": round(target, 2),
-            "open_price": open_price,
-            "qty": qty,
-            "bought": False,
-        })
+        watchlist.append(
+            {
+                "code": code,
+                "best_k": k_val,
+                "target_price": round(target, 2),
+                "open_price": open_price,
+                "qty": qty,
+                "bought": False,
+            }
+        )
 
     fp = WATCHLIST_DIR / f"{date_str}.json"
     with open(fp, "w", encoding="utf-8") as f:

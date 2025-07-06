@@ -5,6 +5,7 @@ import pandas as pd
 
 LOG_DIR = "./rolling_k_auto_trade_api/logs"
 
+
 def dashboard_summary():
     try:
         buy_path = os.path.join(LOG_DIR, "buy_orders.log")
@@ -20,7 +21,7 @@ def dashboard_summary():
         summary = {
             "매수건수": len(buy_df),
             "매도건수": len(sell_df),
-            "보유종목수": len(set(buy_df['code']) - set(sell_df['code']))
+            "보유종목수": len(set(buy_df["code"]) - set(sell_df["code"])),
         }
         return summary
     except Exception as e:
