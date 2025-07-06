@@ -1,9 +1,13 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.openapi.utils import get_openapi
+
 from .rebalance_api import rebalance_router, latest_rebalance_result
 from .report_api import report_router
 from .kis_token import get_kis_access_token, update_env_token
 from .realtime_executor import monitor_and_trade_all
+from .rebalance_watchlist import router as watchlist_router  # ✅ 추가
+from rolling_k_auto_trade_api.errors import DomainError, http_exception_handler
+
 
 app = FastAPI(
     title="Rolling K Auto Trade API",
@@ -19,9 +23,13 @@ def refresh_token_on_startup():
     except Exception as e:
         print("❌ KIS Access Token 갱신 실패:", e)
 
-# API 등록
+# 예외 핸들러 등록
+app.add_exception_handler(DomainError, http_exception_handler)
+
+# 라우터 등록
 app.include_router(rebalance_router)
 app.include_router(report_router)
+app.include_router(watchlist_router)  # ✅ 추가
 
 @app.get("/monitor/start", tags=["Monitoring"])
 def start_realtime_monitoring(background_tasks: BackgroundTasks):
@@ -44,11 +52,3 @@ def custom_openapi():
         description=app.description
     )
 
-from fastapi import FastAPI
-from rolling_k_auto_trade_api.rebalance_api import rebalance_router
-from rolling_k_auto_trade_api.rebalance_debug_api import rebalance_debug_router  # ✅ 추가
-
-app = FastAPI()
-
-app.include_router(rebalance_router)
-app.include_router(rebalance_debug_router)  # ✅ 추가
