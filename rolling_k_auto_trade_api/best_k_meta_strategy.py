@@ -102,47 +102,60 @@ def simulate_k_range_for(stock_code, price_data, k_range=np.arange(0.1, 1.0, 0.1
     return results
 
 
-def get_price_data_segments(code, base_date):
-    price_data = {}
+import logging
+from datetime import timedelta
+import FinanceDataReader as fdr
+
+logger = logging.getLogger(__name__)
+
+def get_price_data_segments(code: str, base_date: datetime.date) -> dict[str, list[dict]]:
+    """
+    종목 코드(code)와 기준일(base_date)에 대해
+    과거 1년, 90일, 30일 가격 데이터를 조회하여
+    'year', 'quarter', 'month'로 구분해 반환합니다.
+    """
     try:
-        logger.info(
-            f"[DEBUG] 📦 Requesting DataReader for {code} from {base_date - timedelta(days=400)} to {base_date + timedelta(days=1)}"
-        )
-        df = fdr.DataReader(
-            code,
-            start=base_date - timedelta(days=400),
-            end=base_date + timedelta(days=1),
-        )
-        logger.info(f"[DEBUG] 📊 DataReader response: {df.shape}")
-        df = df.dropna()
-        df = df.rename(
-            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
-        )
+        # 조회 기간 설정: 과거 400일치부터 리밸런스 전날까지
+        start_date = base_date - timedelta(days=400)
+        end_date = base_date - timedelta(days=1)
+        logger.info(f"[DEBUG] 📦 Fetching {code} from {start_date} to {end_date}")
+
+        df = fdr.DataReader(code, start=start_date, end=end_date)
+        logger.info(f"[DEBUG] 📊 DataReader returned {df.shape} rows for {code}")
+
+        # 필수 컬럼만 남기고 결측치 제거
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = df.rename(columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close"
+        })
+
+        # 날짜 컬럼 생성 및 정리
         df = df.reset_index()
         df["date"] = df["Date"].dt.date
         df = df[["date", "open", "high", "low", "close"]]
         df = df.sort_values("date")
 
-        base = base_date
-        price_data["year"] = df[df["date"] >= base - timedelta(days=365)].to_dict(
-            orient="records"
-        )
-        price_data["quarter"] = df[df["date"] >= base - timedelta(days=90)].to_dict(
-            orient="records"
-        )
-        price_data["month"] = df[df["date"] >= base - timedelta(days=30)].to_dict(
-            orient="records"
-        )
-
+        # 구간별로 분리
+        price_data = {
+            "year": df[df["date"] >= base_date - timedelta(days=365)].to_dict(orient="records"),
+            "quarter": df[df["date"] >= base_date - timedelta(days=90)].to_dict(orient="records"),
+            "month": df[df["date"] >= base_date - timedelta(days=30)].to_dict(orient="records"),
+        }
         logger.info(
-            f"[DEBUG] ✅ Segments for {code} — year: {len(price_data['year'])}, quarter: {len(price_data['quarter'])}, month: {len(price_data['month'])}"
+            f"[DEBUG] ✅ Segments for {code}: "
+            f"year={len(price_data['year'])}, "
+            f"quarter={len(price_data['quarter'])}, "
+            f"month={len(price_data['month'])}"
         )
-
     except Exception as e:
-        logger.error(f"[ERROR] ❌ Failed to fetch data for {code}: {e}")
+        logger.exception(f"[ERROR] ❌ Failed to fetch data for {code}: {e}")
         price_data = {"year": [], "quarter": [], "month": []}
 
     return price_data
+
 
 
 # --------------------------------------------------------------------
@@ -217,7 +230,8 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> list[dict]:
             )
 
             # 3) 필터링
-            if avg_return > 5 and win_rate > 60 and mdd < 10:
+            #if avg_return > 5 and win_rate > 60 and mdd < 10:
+            if avg_return > 1 and win_rate > 20 and mdd < 30:
                 result_map[code] = {
                     "code": code,
                     "name": name,

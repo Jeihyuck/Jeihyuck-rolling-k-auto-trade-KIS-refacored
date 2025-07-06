@@ -1,15 +1,32 @@
-from fastapi import FastAPI
-
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from logging_config import setup_logging
+from rolling_k_auto_trade_api.rebalance_api import rebalance_router
 
-# 로깅은 앱 생성 전에 초기화!
-setup_logging("rolling_k")
+# 1) 로거 설정
+setup_logging()
+logger = logging.getLogger(__name__)
 
-from .rebalance_watchlist import router as rebalance_router  # noqa: E402
-from .errors import DomainError, domain_error_handler  # noqa: E402
+# 2) FastAPI 앱 생성
+app = FastAPI()
 
-app = FastAPI(title="Rolling K Auto Trade API")
+# 3) 예외 처리 미들웨어
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        logger.exception(f"Unhandled error: {request.method} {request.url.path}")
+        try:
+            body = await request.body()
+            logger.debug(f"Request body: {body.decode('utf-8', 'ignore')}")
+        except:
+            pass
+        return JSONResponse(
+            status_code=500,
+            content={"error": "서버 내부 오류 발생"}
+        )
 
-# 라우터 & 예외 핸들러 등록
+# 4) 라우터 등록
 app.include_router(rebalance_router)
-app.add_exception_handler(DomainError, domain_error_handler)
