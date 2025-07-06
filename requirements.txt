@@ -3,5 +3,5 @@ uvicorn[standard]>=0.29,<1.0
 python-dotenv
 pandas>=2.2
 numpy>=1.26
-FinanceDataReader @ git+https://github.com/FinanceData/FinanceDataReader.git
 pykrx
+finance-datareader @ git+https://github.com/FinanceData/finance-datareader>=0.9
