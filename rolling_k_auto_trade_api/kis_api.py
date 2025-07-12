@@ -1,5 +1,3 @@
-# File: rolling_k_auto_trade_api/kis_api.py
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -9,68 +7,42 @@ import json
 import logging
 import requests
 
-import logging
-import os
+REST_DOMAIN = os.getenv("KIS_REST_URL", "https://openapi.koreainvestment.com:9443")
+APP_KEY     = os.getenv("KIS_APP_KEY")
+APP_SECRET  = os.getenv("KIS_APP_SECRET")
+ACCOUNT     = os.getenv("KIS_ACCOUNT")        # 계좌번호 (8자리 이상)
+ACCESS_TOKEN= os.getenv("KIS_ACCESS_TOKEN")   # 초기 액세스 토큰
 
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "kis_api.log")
-os.makedirs(LOG_DIR, exist_ok=True)
+KIS_ENV = os.getenv("KIS_ENV", "practice").lower()
+if KIS_ENV == "practice":
+    DOMAIN = os.getenv("KIS_REST_URL", "https://openapivts.koreainvestment.com:29443")
+    ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
+else:
+    DOMAIN = os.getenv("KIS_REST_URL", "https://openapi.koreainvestment.com:9443")
+    ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 
+ORDER_URL   = os.getenv("KIS_ORDER_URL",   f"{DOMAIN}{ORDER_PATH}")
+BALANCE_URL = os.getenv("KIS_BALANCE_URL", f"{DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance")
+FILL_URL    = os.getenv("KIS_FILL_URL",    f"{DOMAIN}/uapi/domestic-stock/v1/trading/inquire-psbl-order")
+TOKEN_URL   = os.getenv("KIS_TOKEN_URL",   f"{DOMAIN}/oauth2/tokenP")
+
+# 로거 설정 (콘솔+파일)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-# 콘솔 핸들러
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# 파일 핸들러
-file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-file_handler.setLevel(logging.DEBUG)
-
-# 포맷 정의
-formatter = logging.Formatter("[%(asctime)s][%(levelname)s][%(name)s] %(message)s")
-console_handler.setFormatter(formatter)
+formatter = logging.Formatter('[%(asctime)s][%(levelname)s][%(name)s] %(message)s')
+file_handler = logging.FileHandler('kis_api.log', encoding='utf-8')
 file_handler.setFormatter(formatter)
-
-# 핸들러 등록 (중복 방지)
-if not logger.hasHandlers():
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-
-# ─────────────────────────────
-# 환경 변수 및 기본 설정
-# ─────────────────────────────
-REST_DOMAIN  = os.getenv("KIS_REST_URL", "https://openapi.koreainvestment.com:9443")
-APP_KEY      = os.getenv("KIS_APP_KEY")
-APP_SECRET   = os.getenv("KIS_APP_SECRET")
-ACCOUNT      = os.getenv("KIS_ACCOUNT")
-ACCESS_TOKEN = os.getenv("KIS_ACCESS_TOKEN")
-KIS_ENV      = os.getenv("KIS_ENV", "practice").lower()
-
-# ─────────────────────────────
-# KIS 주문 URL 설정 (모의 vs 실전)
-# ─────────────────────────────
-if KIS_ENV == "practice":
-    DOMAIN = "https://openapivts.koreainvestment.com:29443"
-else:
-    DOMAIN = "https://openapi.koreainvestment.com:9443"
-
-ORDER_PATH   = "/uapi/domestic-stock/v1/trading/order-cash"
-ORDER_URL    = f"{DOMAIN}{ORDER_PATH}"
-BALANCE_URL  = f"{DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance"
-FILL_URL     = f"{DOMAIN}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-TOKEN_URL    = f"{DOMAIN}/oauth2/tokenP"
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
 _token_expires_at = 0
-logger = logging.getLogger(__name__)
 
-# ─────────────────────────────
-# 토큰 재발급
-# ─────────────────────────────
 def refresh_token():
+    """만료된 토큰을 재발급하고 ACCESS_TOKEN / 만료시각 갱신"""
     global ACCESS_TOKEN, _token_expires_at
-
-    url = TOKEN_URL
+    url = f"{REST_DOMAIN}/oauth2/tokenP"
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-cache",
@@ -81,14 +53,11 @@ def refresh_token():
         "appsecret":  APP_SECRET,
     }
     logger.info("[TOKEN] 재발급 요청")
-
-    resp = requests.post(url, headers=headers, json=payload, timeout=5)
+    resp = requests.post(url, headers=headers, json=payload, timeout=7)
     logger.debug("[TOKEN_RESP] %s %s", resp.status_code, resp.text)
-
     if resp.status_code >= 400:
         logger.error("[TOKEN_FAIL] status=%s body=%s", resp.status_code, resp.text)
         resp.raise_for_status()
-
     j = resp.json()
     ACCESS_TOKEN = j["access_token"]
     _token_expires_at = time.time() + int(j.get("expires_in", 3600)) - 30
@@ -100,51 +69,47 @@ def get_valid_token():
         return refresh_token()
     return ACCESS_TOKEN
 
-# ─────────────────────────────
-# 해시키 생성
-# ─────────────────────────────
 def _create_hashkey(payload: dict) -> str:
     url = f"{REST_DOMAIN}/uapi/hashkey"
     headers = {
         "Content-Type": "application/json; charset=utf-8",
-        "appkey":     APP_KEY,
-        "appsecret":  APP_SECRET,
+        "appkey":  APP_KEY,
+        "appsecret": APP_SECRET,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=5)
+    resp = requests.post(url, headers=headers, json=payload, timeout=7)
+    logger.debug("[HASHKEY_RESP] %s %s", resp.status_code, resp.text)
     resp.raise_for_status()
     return resp.json()["HASH"]
 
-# ─────────────────────────────
-# 주문 요청
-# ─────────────────────────────
-def send_order(code: str, qty: int, side: str = "buy") -> dict:
-    """현금 주문 (시장가)"""
-    token = get_valid_token()
+def send_order(code: str, qty: int, price: int) -> dict:
+    """
+    KIS 엑셀 명세 100% 일치 지정가 매수 주문 함수
+    :param code: 종목코드 (ex. '005930')
+    :param qty: 수량
+    :param price: 지정가
+    """
+    cano = str(ACCOUNT)[:8]
+    acnt_prdt_cd = "01"
 
-    # ✅ 환경에 따라 주문 구분코드와 TR_ID 결정
-    KIS_ENV = os.getenv("KIS_ENV", "production").lower()
+    # TR_ID 및 기타 헤더 설정
     if KIS_ENV == "practice":
-        tr_id = "VTTC0807U" if side == "buy" else "VTTC0801U"
+        tr_id = "VTTC0011U"
         custtype = "P"
-        ord_dvsn_cd = "00"  # ✅ 모의투자 시장가 주문
-        ord_unpr = "10000"
     else:
-        tr_id = "TTTC0802U" if side == "buy" else "TTTC0801U"
+        tr_id = "TTTC0011U"
         custtype = "E"
-        ord_dvsn_cd = "01"  # 실전 시장가 주문
-        ord_unpr = "0"
 
+    # 엑셀 명세에 맞는 필드명/값/타입/순서
     body = {
-        "CANO": ACCOUNT[:8],
-        "ACNT_PRDT_CD": "01",
-        "PDNO": code,
-        "ORD_DVSN_CD": ord_dvsn_cd,
-        "ORD_QTY": str(qty),
-        "ORD_UNPR": ord_unpr
+        "CANO": cano,                      # 종합계좌번호
+        "ACNT_PRDT_CD": acnt_prdt_cd,      # 계좌상품코드
+        "PDNO": code,                      # 종목코드
+        "ORD_DVSN": "00",                 # 지정가 (엑셀 명세)
+        "ORD_QTY": str(qty),               # 주문수량
+        "ORD_UNPR": str(price),             # 주문단가
     }
 
     hashkey = _create_hashkey(body)
-
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "appkey": APP_KEY,
@@ -152,60 +117,40 @@ def send_order(code: str, qty: int, side: str = "buy") -> dict:
         "tr_id": tr_id,
         "custtype": custtype,
         "hashkey": hashkey,
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {get_valid_token()}",
     }
 
-    logger.info(f"[KIS_ORDER_ENV] KIS_ENV={KIS_ENV}, TR_ID={tr_id}, ORD_DVSN_CD={ord_dvsn_cd}, UNPR={ord_unpr}")
-    logger.info(f"[KIS_ORDER_ENV] KIS_ENV={KIS_ENV}, ORDER_URL={ORDER_URL}")
-    logger.info(f"[ORDER_PARAM] TR_ID={tr_id}, ORD_DVSN_CD={ord_dvsn_cd}, ORD_UNPR={ord_unpr}")
-    logger.debug("[KIS_ORDER] Headers=%s", headers)
-    logger.debug("[KIS_ORDER] Body=%s", json.dumps(body, ensure_ascii=False))
-
-    try:
-        resp = requests.post(ORDER_URL, headers=headers, json=body, timeout=5)
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError as ce:
-        logger.warning(f"[RETRY_ORDER] ConnectionError: {ce}, retrying in 2 sec...")
-        time.sleep(2)
-    # 한 번 재시도
-        resp = requests.post(ORDER_URL, headers=headers, json=body, timeout=5)
-
+    logger.info(f"[KIS_ORDER_BODY] {body}")
+    resp = requests.post(ORDER_URL, headers=headers, json=body, timeout=7)
     logger.debug("[KIS_ORDER_RESP] %s %s", resp.status_code, resp.text)
-
     if resp.status_code >= 400:
-        raise requests.HTTPError(
-            f"{resp.status_code} {resp.reason} | Body: {resp.text}",
-            response=resp
-        )
-
+        logger.error("[KIS_ORDER_FAIL] code=%s, error=%s | Body=%s", code, resp.status_code, resp.text)
+        resp.raise_for_status()
     return resp.json()
 
-
-
-# ─────────────────────────────
-# 잔고 조회
-# ─────────────────────────────
 def inquire_balance(code: str) -> dict:
     token = get_valid_token()
+    if not BALANCE_URL:
+        raise ValueError("KIS_BALANCE_URL 환경변수가 설정되지 않았습니다.")
+
     params = {"CANO": ACCOUNT[:8], "ACNT_PRDT_CD": "01", "PDNO": code}
     headers = {"Authorization": f"Bearer {token}"}
     logger.debug(f"[KIS_BALANCE] URL={BALANCE_URL}, Params={params}")
-    resp = requests.get(BALANCE_URL, params=params, headers=headers, timeout=5)
+    resp = requests.get(BALANCE_URL, params=params, headers=headers, timeout=7)
     logger.debug(f"[KIS_BALANCE_RESP] Status={resp.status_code}, Body={resp.text}")
     resp.raise_for_status()
     return resp.json()
 
-# ─────────────────────────────
-# 체결 조회
-# ─────────────────────────────
 def inquire_filled_order(ord_no: str) -> dict:
     token = get_valid_token()
+    if not FILL_URL:
+        raise ValueError("KIS_FILL_URL 환경변수가 설정되지 않았습니다.")
+
     params = {"CANO": ACCOUNT[:8], "ACNT_PRDT_CD": "01", "ORD_UNQ_NO": ord_no}
     headers = {"Authorization": f"Bearer {token}"}
     logger.debug(f"[KIS_FILL] URL={FILL_URL}, Params={params}")
-    resp = requests.get(FILL_URL, params=params, headers=headers, timeout=5)
+    resp = requests.get(FILL_URL, params=params, headers=headers, timeout=7)
     logger.debug(f"[KIS_FILL_RESP] Status={resp.status_code}, Body={resp.text}")
     resp.raise_for_status()
     return resp.json()
-
 

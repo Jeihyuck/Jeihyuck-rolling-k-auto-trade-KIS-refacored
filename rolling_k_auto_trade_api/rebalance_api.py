@@ -1,5 +1,3 @@
-# File: rolling_k_auto_trade_api/rebalance_api.py
-
 import os
 import json
 import uuid
@@ -63,14 +61,14 @@ async def run_rebalance(date: str):
         quantity = max(each_invest // price, 1)
 
         try:
-            # 주문 요청 및 로깅 강화 (kis_api.send_order 안에서 상세 로깅)
-            resp = send_order(code, qty=quantity, side="buy")
+            # [수정] 지정가 매수 - 리밸런싱 전략 가격(price)으로만 주문
+            resp = send_order(code, qty=quantity, price=price)
             time.sleep(3.0)  # ✅ 초당 1건 제한 회피용 (모의투자 필수)
 
             ord_no = resp.get("output1", {}).get("OrdNo") or resp.get("ordNo")
             stock["order_response"] = resp
             stock["order_status"] = f"접수번호={ord_no}, qty={quantity}"
-            logger.info(f"[ORDER] code={code}, qty={quantity}, ord_no={ord_no}")
+            logger.info(f"[ORDER] code={code}, qty={quantity}, price={price}, ord_no={ord_no}")
 
             # 잔고 조회
             try:

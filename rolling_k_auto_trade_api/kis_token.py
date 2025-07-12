@@ -8,14 +8,15 @@ load_dotenv(ENV_PATH)
 APP_KEY = os.getenv("KIS_APP_KEY")
 APP_SECRET = os.getenv("KIS_APP_SECRET")
 
-
 def get_kis_access_token():
     url = "https://openapivts.koreainvestment.com:29443/oauth2/tokenP"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "content-type": "application/json"
+    }
     payload = {
         "grant_type": "client_credentials",
         "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
+        "appsecret": APP_SECRET
     }
     response = requests.post(url, headers=headers, json=payload)
     res_json = response.json()
@@ -24,7 +25,6 @@ def get_kis_access_token():
         raise Exception(f"❌ Token 발급 실패: {res_json}")
 
     return res_json["access_token"]
-
 
 def update_env_token(token: str):
     lines = []
@@ -40,4 +40,4 @@ def update_env_token(token: str):
         lines.append(f"KIS_ACCESS_TOKEN={token}\n")
     with open(ENV_PATH, "w") as f:
         f.writelines(lines)
-    print("✅ KIS_ACCESS_TOKEN 자동 갱신 완료")
+

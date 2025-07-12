@@ -1,64 +1,71 @@
-# rolling_k_auto_trade_api/orders.py
 from fastapi import APIRouter
 from rolling_k_auto_trade_api.models import BuyOrderRequest, SellOrderRequest
+from datetime import datetime
 import json
 import os
-from datetime import datetime
+import requests
+from dotenv import load_dotenv
 
 router = APIRouter()
-TRADE_STATE = {}
+load_dotenv()
 
 LOG_DIR = "./rolling_k_auto_trade_api/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
+KIS_APP_KEY = os.getenv("KIS_APP_KEY")
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
+KIS_ACCESS_TOKEN = os.getenv("KIS_ACCESS_TOKEN")
+KIS_REST_URL = os.getenv("KIS_REST_URL", "https://openapivts.koreainvestment.com:29443")
 
 def log_order(data: dict, order_type: str):
     log_file = os.path.join(LOG_DIR, f"{order_type}_orders.log")
     with open(log_file, "a") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
-
 @router.post("/order/buy")
 def buy_stock(order: BuyOrderRequest):
-    order_data = order.dict()
-    order_data["timestamp"] = datetime.now().isoformat()
-    log_order(order_data, "buy")
-    TRADE_STATE[order.code] = order_data
-    return {"message": "Buy order logged", "data": order_data}
-
+    url = f"{KIS_REST_URL}/uapi/domestic-stock/v1/trading/order-cash"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {KIS_ACCESS_TOKEN}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "VTTC0012U",
+        "custtype": "P"
+    }
+    payload = {
+        "CANO": order.account_no,
+        "ACNT_PRDT_CD": order.product_code,
+        "PDNO": order.code,
+        "ORD_DVSN": order.order_type,
+        "ORD_QTY": order.quantity,
+        "ORD_UNPR": order.price
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    res_data = response.json()
+    log_order(res_data, "buy")
+    return res_data
 
 @router.post("/order/sell")
 def sell_stock(order: SellOrderRequest):
-    order_data = order.dict()
-    order_data["timestamp"] = datetime.now().isoformat()
-    log_order(order_data, "sell")
-    if order.code in TRADE_STATE:
-        del TRADE_STATE[order.code]
-    return {"message": "Sell order logged", "data": order_data}
-
-
-def get_order_status():
-    return {"open_positions": TRADE_STATE, "count": len(TRADE_STATE)}
-
-
-from rolling_k_auto_trade_api.models import BuyOrderRequest, SellOrderRequest
-import logging
-
-
-def execute_buy_order(request: BuyOrderRequest):
-    # 여기선 예시로, 실제 API 연동 대신 로그만 남깁니다
-    logging.info(f"[BUY] {request.ticker} - {request.amount}주 매수 요청됨")
-    return {
-        "result": "buy order received",
-        "ticker": request.ticker,
-        "amount": request.amount,
+    url = f"{KIS_REST_URL}/uapi/domestic-stock/v1/trading/order-cash"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {KIS_ACCESS_TOKEN}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "VTTC0011U",
+        "custtype": "P"
     }
-
-
-def execute_sell_order(request: SellOrderRequest):
-    logging.info(f"[SELL] {request.ticker} - {request.amount}주 매도 요청됨")
-    return {
-        "result": "sell order received",
-        "ticker": request.ticker,
-        "amount": request.amount,
+    payload = {
+        "CANO": order.account_no,
+        "ACNT_PRDT_CD": order.product_code,
+        "PDNO": order.code,
+        "ORD_DVSN": order.order_type,
+        "ORD_QTY": order.quantity,
+        "ORD_UNPR": order.price
     }
+    response = requests.post(url, headers=headers, json=payload)
+    res_data = response.json()
+    log_order(res_data, "sell")
+    return res_data

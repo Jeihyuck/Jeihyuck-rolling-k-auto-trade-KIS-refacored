@@ -1,19 +1,17 @@
-# rolling_k_auto_trade_api/models.py
 from pydantic import BaseModel
-from typing import Optional
 
 
-class BuyOrderRequest(BaseModel):
-    code: str
-    name: str
-    buy_price: float
-    quantity: int
-    signal_date: str
+class OrderBase(BaseModel):
+    account_no: str         # 종합계좌번호 (8자리)
+    product_code: str       # 계좌상품코드 (2자리, 일반적으로 '01')
+    code: str               # 종목코드
+    order_type: str         # 주문구분 (00: 지정가, 01: 시장가 등)
+    quantity: int           # 수량
+    price: str              # 단가 (시장가인 경우 '0')
 
+class BuyOrderRequest(OrderBase):
+    pass
 
-class SellOrderRequest(BaseModel):
-    code: str
-    name: str
-    sell_price: float
-    sell_date: str
-    reason: Optional[str] = None
+class SellOrderRequest(OrderBase):
+    pass
+
