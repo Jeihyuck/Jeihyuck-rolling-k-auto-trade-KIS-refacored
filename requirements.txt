@@ -3,6 +3,8 @@ uvicorn[standard]>=0.29,<1.0
 python-dotenv
 pandas>=2.2
 numpy>=1.26
-pykrx
+pykrx>=1.0.51
+
+
 finance-datareader>=0.9
 python-dotenv>=0.21.0

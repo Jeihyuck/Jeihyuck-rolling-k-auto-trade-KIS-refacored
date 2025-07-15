@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import logging
+import time as time_module 
 from datetime import datetime
 
 from fastapi import APIRouter, Query, Request, HTTPException
@@ -12,8 +13,10 @@ from FinanceDataReader import StockListing, DataReader
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50
 from rolling_k_auto_trade_api.kis_api import send_order, inquire_balance, inquire_filled_order
+from rolling_k_auto_trade_api.logging_config import configure_logging
 
-# 로거 설정
+# 로깅 설정
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # 라우터 및 전역 변수
@@ -21,13 +24,27 @@ rebalance_router = APIRouter()
 latest_rebalance_result = {"date": None, "selected_stocks": []}
 TOTAL_CAPITAL = 10_000_000
 
+# rebalance_api.py
+from datetime import datetime, time, timezone, timedelta
+import pytz   # settings.py 등에서 KST 타임존을 이미 쓰고 있다면 생략
+
+KST = pytz.timezone("Asia/Seoul")
+
+def is_market_open(ts: datetime | None = None) -> bool:
+    """모의·실전 공통: 평일 08:30~16:00(KST)"""
+    ts = ts or datetime.now(tz=KST)
+    if ts.weekday() >= 5:                 # 5=토, 6=일
+        return False
+    open_t  = ts.replace(hour=8,  minute=30, second=0, microsecond=0)
+    close_t = ts.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= ts <= close_t
+
+
 @rebalance_router.post("/rebalance/run/{date}", tags=["Rebalance"])
 async def run_rebalance(date: str):
     """
     date: YYYY-MM-DD 포맷의 리밸런싱 실행 날짜
     """
-    import time
-
     logger.info(f"[RUN] run_rebalance 호출됨: date={date}")
 
     # 1) Best-K 계산
@@ -50,24 +67,54 @@ async def run_rebalance(date: str):
             s["stock_code"] = code_key
             results_map[code_key] = s
 
+    # 필터 통과 종목 수 로깅
+    logger.info(f"[FILTER] Best-K 후보 count = {len(results_map)}개")
+
     results_list = []
     count = len(results_map)
     each_invest = TOTAL_CAPITAL // count if count > 0 else 0
 
     # 3) 종목별 주문 및 로그
+    now = datetime.now(tz=KST)
+    if not is_market_open(now):
+        logger.info("[SKIP] 장 종료 – 주문·잔고 로직 생략")
+        return {"message": "장 종료 — 리밸런싱 스킵"}
+    
     for code, stock in results_map.items():
         stock["stock_code"] = code
-        price = stock.get("close", 10000)
-        quantity = max(each_invest // price, 1)
+        # 목표가 우선 매수 로그
+        logger.info(
+            f"[DEBUG][목표가 LOG] code={code}, "
+            f"목표가={stock.get('목표가')}, "
+            f"target_price={stock.get('target_price')}, "
+            f"best_k_price={stock.get('best_k_price')}, "
+            f"buy_price={stock.get('buy_price')}, "
+            f"close={stock.get('close')}"
+        )
+
+        price = (
+            stock.get("목표가") or
+            stock.get("target_price") or
+            stock.get("best_k_price") or
+            stock.get("buy_price") or
+            stock.get("close")  # 없을 때만 fallback
+        )
+        if not price or price <= 0:
+            logger.warning(f"[SKIP] 목표가 미정의 or 0원: code={code}")
+            continue
+
+        price = int(round(price))           # ← ① 소숫점 제거(정수 지정가)
+        quantity = int(max(each_invest // price, 1))   # ← ② 반드시 정수 수량
+
+        stock["매수단가"] = price
+        stock["매수수량"] = quantity
 
         try:
-            # [수정] 지정가 매수 - 리밸런싱 전략 가격(price)으로만 주문
             resp = send_order(code, qty=quantity, price=price)
-            time.sleep(3.0)  # ✅ 초당 1건 제한 회피용 (모의투자 필수)
-
+            time_module.sleep(3.0)  # 초당 1건 제한
             ord_no = resp.get("output1", {}).get("OrdNo") or resp.get("ordNo")
             stock["order_response"] = resp
-            stock["order_status"] = f"접수번호={ord_no}, qty={quantity}"
+            stock["order_status"] = f"접수번호={ord_no}, qty={quantity}, price={price}"
             logger.info(f"[ORDER] code={code}, qty={quantity}, price={price}, ord_no={ord_no}")
 
             # 잔고 조회
@@ -93,6 +140,9 @@ async def run_rebalance(date: str):
 
         results_list.append(stock)
 
+    # 주문 시도 건수 로깅
+    logger.info(f"[ORDER_COUNT] 주문 시도 종목 수 = {len(results_list)}개")
+
     # 4) 메모리 캐시 업데이트
     latest_rebalance_result["date"] = date
     latest_rebalance_result["selected_stocks"] = results_list
@@ -116,13 +166,10 @@ async def run_rebalance(date: str):
         "selected_stocks": results_list,
     }
 
-
-
 @rebalance_router.get("/rebalance/latest", tags=["Rebalance"])
 def get_latest_rebalance():
     """가장 최근 실행한 리밸런싱 결과를 반환"""
     return latest_rebalance_result
-
 
 @rebalance_router.get(
     "/rebalance/backtest-monthly",
@@ -135,12 +182,7 @@ def rebalance_backtest_monthly(
     end_date:   str = Query("2024-04-01", description="종료일 (YYYY-MM-DD)"),
     request:    Request = None,
 ):
-    """
-    월별 백테스트를 수행하고,
-    curl 요청엔 전체 데이터, 브라우저 요청엔 요약만 반환합니다.
-    """
     logger.info(f"[BACKTEST] 호출: {start_date}~{end_date}")
-
     ua = (request.headers.get("user-agent") or "").lower()
     referer = (request.headers.get("referer") or "").lower()
     is_curl = ("curl" in ua) or ("/docs" in referer)
@@ -177,7 +219,6 @@ def rebalance_backtest_monthly(
                     if df.empty:
                         continue
                     df.index = pd.to_datetime(df.index)
-
                     train = df.loc[start_train:end_train].copy()
                     test  = df.loc[start_test:end_test].copy()
                     if len(train) < 15 or len(test) < 5:
@@ -218,3 +259,4 @@ def rebalance_backtest_monthly(
     except Exception as e:
         logger.exception(f"[ERROR] rebalance-backtest 예외: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
