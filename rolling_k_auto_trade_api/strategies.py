@@ -5,42 +5,40 @@ import numpy as np
 from datetime import datetime
 from rolling_k_auto_trade_api.orders import log_order, TRADE_STATE
 
+import logging
+
+logging.basicConfig(
+    filename='rebalance_debug.log',   # 파일 저장, 필요시 삭제하거나 로그 파일명 변경
+    level=logging.DEBUG,
+    format='[%(asctime)s][%(levelname)s] %(message)s',
+    encoding='utf-8'
+)
+logger = logging.getLogger(__name__)
+
+
 fee = 0.0015
 k_values = np.arange(0.1, 1.01, 0.05)
 
 
 def run_rebalance_for_date(date_input):
-    if date_input == "latest":
-        raise ValueError(
-            "Invalid string literal 'latest' passed. Use actual date string like '2024-04-01'."
-        )
-
-    # rebalance_date = pd.to_datetime(date_input)
-    # start_train = (rebalance_date - pd.DateOffset(months=1)).strftime('%Y-%m-%d')
-    # end_train = (rebalance_date - pd.DateOffset(days=1)).strftime('%Y-%m-%d')
-    # start_test = rebalance_date.strftime('%Y-%m-%d')
-    # end_test = (rebalance_date + pd.DateOffset(months=1) - pd.DateOffset(days=1)).strftime('%Y-%m-%d')
-
     from calendar import monthrange
     from datetime import datetime
 
     rebalance_date = pd.to_datetime(date_input)
-
     start_train = (rebalance_date - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
     end_train = (rebalance_date - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
     start_test = rebalance_date.strftime("%Y-%m-%d")
-
-    # ✅ 수정: 해당 월의 마지막 날짜를 정확하게 계산
-    year = rebalance_date.year
-    month = rebalance_date.month
-    last_day = monthrange(year, month)[1]  # 월말 계산 (예: 2024-04 → 30)
-    end_test = datetime(year, month, last_day).strftime("%Y-%m-%d")
+    end_test = datetime(rebalance_date.year, rebalance_date.month, monthrange(rebalance_date.year, rebalance_date.month)[1]).strftime("%Y-%m-%d")
 
     kosdaq = fdr.StockListing("KOSDAQ")
     top50 = kosdaq.sort_values(by="Marcap", ascending=False).head(50)
     tickers = list(zip(top50["Code"], top50["Name"]))
 
-    pool = []
+    k_values = [round(x, 1) for x in np.arange(0.1, 1.1, 0.1)]
+    fee = 0.0015  # 수수료 가정
+
+    selected = []
+    candidates = []
 
     for code, name in tickers:
         try:
@@ -59,14 +57,8 @@ def run_rebalance_for_date(date_input):
                 temp["buy_signal"] = temp["High"] > temp["target"]
                 temp["buy_price"] = np.where(temp["buy_signal"], temp["target"], np.nan)
                 temp["sell_price"] = temp["Close"]
-                temp["strategy_return"] = np.where(
-                    temp["buy_signal"],
-                    (temp["sell_price"] - temp["buy_price"]) / temp["buy_price"] - fee,
-                    0,
-                )
-                temp["cumulative_return"] = (
-                    1 + temp["strategy_return"].fillna(0)
-                ).cumprod() - 1
+                temp["strategy_return"] = np.where(temp["buy_signal"], (temp["sell_price"] - temp["buy_price"]) / temp["buy_price"] - fee, 0)
+                temp["cumulative_return"] = (1 + temp["strategy_return"].fillna(0)).cumprod() - 1
                 final_ret = temp["cumulative_return"].iloc[-1]
                 if final_ret > best_ret:
                     best_ret = final_ret
@@ -77,58 +69,74 @@ def run_rebalance_for_date(date_input):
             test["buy_signal"] = test["High"] > test["target"]
             test["buy_price"] = np.where(test["buy_signal"], test["target"], np.nan)
             test["sell_price"] = test["Close"]
-            test["strategy_return"] = np.where(
-                test["buy_signal"],
-                (test["sell_price"] - test["buy_price"]) / test["buy_price"] - fee,
-                0,
-            )
+            test["strategy_return"] = np.where(test["buy_signal"], (test["sell_price"] - test["buy_price"]) / test["buy_price"] - fee, 0)
             test["cumulative"] = (1 + test["strategy_return"].fillna(0)).cumprod()
 
-            if len(test["cumulative"]) == 0:
-                continue
-
-            mdd = (
-                (test["cumulative"] - test["cumulative"].cummax())
-                / test["cumulative"].cummax()
-            ).min() * 100
+            mdd = ((test["cumulative"] - test["cumulative"].cummax()) / test["cumulative"].cummax()).min() * 100
             wins = (test["strategy_return"] > 0).sum()
             total = test["strategy_return"].notnull().sum()
             win_rate = wins / total if total > 0 else 0
             final_ret = (test["cumulative"].iloc[-1] - 1) * 100
 
-            if (final_ret > 0) and (win_rate > 0.2) and (mdd > -30):
-                pool.append(
-                    {
-                        "리밸런싱시점": start_test,
-                        "티커": code,
-                        "종목명": name,
-                        "최적k": best_k,
-                        "수익률(%)": round(final_ret, 2),
-                        "MDD(%)": round(mdd, 2),
-                        "승률(%)": round(win_rate * 100, 2),
-                    }
-                )
-        except:
+            info = {
+                "rebalance_date": start_test,
+                "code": code,
+                "name": name,
+                "best_k": best_k,
+                "cumulative_return_pct": round(final_ret, 2),
+                "win_rate_pct": round(win_rate * 100, 2),
+                "mdd_pct": round(mdd, 2),
+                "목표가": round(test["target"].iloc[-1], 2),
+                "close": round(test["Close"].iloc[-1], 2),
+            }
+            candidates.append(info)
+
+            if (
+    info["cumulative_return_pct"] > 1.0 and
+    info["win_rate_pct"] > 50.0 and
+    info["mdd_pct"] <= 15.0
+):
+                selected.append(info)
+
+        except Exception as e:
+            print(f"[ERROR] {code} - {name} 분석 실패: {str(e)}")
             continue
 
-    pool_df = pd.DataFrame(pool)
-
-    if pool_df.empty:
+    if not selected:
         return {
-            "message": f"{rebalance_date.strftime('%Y-%m-%d')}에 해당하는 리밸런싱 종목이 없습니다."
+            "status": "skipped",
+            "reason": "no_qualified_candidates",
+            "candidates": candidates,
+            "selected": []
         }
 
-    pool_df = pool_df.sort_values("수익률(%)", ascending=False).head(20)
-    pool_df["포트비중(%)"] = round(100 / len(pool_df), 2)
+    selected_df = pd.DataFrame(selected)
+    selected_df = selected_df.sort_values("cumulative_return_pct", ascending=False).head(20)
+    selected_df["포트비중(%)"] = round(100 / len(selected_df), 2)
 
-    return pool_df.to_dict(orient="records")
-
+    return {
+        "status": "ready",
+        "rebalance_date": date_input,
+        "selected": selected_df.to_dict(orient="records"),
+        "candidates": candidates
+    }
 
 def auto_trade_on_rebalance(date: str):
     result = run_rebalance_for_date(date)
-    for row in result:
-        log_order("buy", row["티커"], row["포트비중(%)"])
-    return {"status": "매수 주문 완료", "종목 수": len(result)}
+    if result["status"] != "ready":
+        print(f"[INFO] 리밸런싱 매매 생략: 사유 = {result.get('reason')}")
+        return {"status": "skipped", "reason": result.get("reason")}
+
+    selected = result["selected"]
+    for row in selected:
+        try:
+            # 여기에 실제 주문 함수 호출 로직 삽입 가능
+            print(f"[ORDER] 매수 - 종목: {row['name']}({row['code']}), 목표가: {row['목표가']}, 비중: {row['포트비중(%)']}%")
+        except Exception as e:
+            print(f"[ERROR] 주문 실패 - 종목: {row['name']}({row['code']}) - {str(e)}")
+
+    return {"status": "매수 주문 완료", "종목 수": len(selected)}
+
 
 
 def check_sell_conditions():

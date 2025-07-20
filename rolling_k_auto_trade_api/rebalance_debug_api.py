@@ -104,7 +104,7 @@ def debug_backtest_monthly(
                     win_rate = wins / total if total > 0 else 0
                     final_ret = (test["cumulative"].iloc[-1] - 1) * 100
 
-                    if (final_ret > 0) and (win_rate > 0.2) and (mdd > -30):
+                    if (final_ret > 0.02) and (win_rate > 0.5) and (mdd <= 0.1):
                         selected.append(
                             {
                                 "리밸런싱시점": start_test,
