@@ -88,7 +88,7 @@ async def run_rebalance(
 
     # 조건: 수익률 2% 초과, 승률 50% 초과, MDD 10% 이하만 selected에
     for code, stock in results_map.items():
-        info = dict(stock)  # 복사 안전
+        info = dict(stock)
         candidates.append(info)
         try:
             cumret = info.get("cumulative_return_pct") or info.get("수익률(%)")
@@ -173,14 +173,20 @@ async def run_rebalance(
                 logger.error(f"[ORDER_FAIL] code={code}, resp is None/비 dict")
                 continue
 
+            # ODNO 필드로 주문번호 파싱
             ord_no = None
-            if resp.get("output1") and resp["output1"].get("OrdNo"):
-                ord_no = resp["output1"]["OrdNo"]
+            if resp.get("output") and resp["output"].get("ODNO"):
+                ord_no = resp["output"]["ODNO"]
             elif resp.get("ordNo"):
                 ord_no = resp["ordNo"]
 
             info["order_response"] = resp
-            info["order_status"] = f"접수번호={ord_no}, qty={quantity}, price={price}" if ord_no else f"실패: 응답에서 OrdNo 없음"
+            if ord_no:
+                info["order_status"] = f"접수번호={ord_no}, qty={quantity}, price={price}"
+            else:
+                logger.error(f"[PARSE_FAIL] code={code}, resp missing ODNO: {resp}")
+                info["order_status"] = "실패: 응답에서 주문번호(ODNO) 없음"
+
             logger.info(f"[ORDER] code={code}, qty={quantity}, price={price}, ord_no={ord_no}")
 
             # 잔고 조회
@@ -253,16 +259,11 @@ def rebalance_backtest_monthly(
     end_date:   str = Query("2024-04-01", description="종료일 (YYYY-MM-DD)"),
     request:    Request = None,
 ):
-    """
-    월별 리밸런스 백테스트
-    반환은 요약(HTML/docs) 또는 전체 JSON(curl) 두 형태 지원
-    """
     logger.info(f"[BACKTEST] 호출: {start_date}~{end_date}")
     ua = (request.headers.get("user-agent") or "").lower() if request else ""
     referer = (request.headers.get("referer") or "").lower() if request else ""
     is_curl = ("curl" in ua) or ("/docs" in referer)
 
-    # 날짜 형식 검사
     try:
         datetime.strptime(start_date, "%Y-%m-%d")
         datetime.strptime(end_date,   "%Y-%m-%d")
@@ -299,11 +300,7 @@ def rebalance_backtest_monthly(
                     if len(train) < 15 or len(test) < 5:
                         continue
 
-                    # ▼▼▼ 전략에 따라 최적 K 계산 및 월간 성과 측정(여기를 반드시 구현) ▼▼▼
-                    # 아래 예시는 수익률(%)을 계산해서 dict에 담는 구조 샘플입니다.
-                    # 실제 전략 로직에 맞게 대체/확장하십시오!
                     try:
-                        # 예시: (종가/시가 - 1) * 100, 실제로는 변동성돌파 결과 등 넣으세요
                         start_price = test["Open"].iloc[0]
                         end_price = test["Close"].iloc[-1]
                         rtn_pct = (end_price / start_price - 1) * 100
@@ -311,7 +308,6 @@ def rebalance_backtest_monthly(
                         logger.warning(f"[WARN] {name}({code}) 수익률 계산 실패: {e}")
                         continue
 
-                    # 반드시 "수익률(%)" 키로 넣기!
                     selected.append({
                         "code": code,
                         "name": name,
@@ -319,7 +315,6 @@ def rebalance_backtest_monthly(
                         "시작일": start_test,
                         "종료일": end_test,
                         "종가": int(end_price),
-                        # 필요한 성과 지표 추가 가능 (ex. K, MDD, 승률 등)
                     })
                 except Exception as e:
                     logger.exception(f"[ERROR] {name}({code}) 백테스트 중 예외: {e}")
