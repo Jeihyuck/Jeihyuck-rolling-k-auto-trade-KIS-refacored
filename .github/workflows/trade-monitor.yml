@@ -1,8 +1,10 @@
 name: Trade Monitor (5‑min)
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: '*/5 * * * *'  # 최소 실행 주기: 5분
+    - cron: '*/5 * * * *'
+
 
 jobs:
   monitor-trade:
