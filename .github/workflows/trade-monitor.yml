@@ -9,6 +9,7 @@ on:
 jobs:
   monitor-trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 30   # 기본 6시간에서 더 줄일 수도 있음
     env:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
