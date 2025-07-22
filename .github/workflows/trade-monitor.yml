@@ -1,0 +1,29 @@
+name: Trade Monitor (5‑min)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 최소 실행 주기: 5분
+
+jobs:
+  monitor-trade:
+    runs-on: ubuntu-latest
+    env:
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python trader/trader.py
+
+
+
+
+
+          
