@@ -17,11 +17,14 @@ class KisAPI:
             data = resp.json()
             print(f"🔐 Auth response (attempt {attempt}):", data)
             if "access_token" in data:
-                self.token = data["access_token"]; return
+                self.token = data["access_token"]
+                return
             if "accessToken" in data:
-                self.token = data["accessToken"]; return
-            print(f"⚠️ 인증 실패 (code {data.get('error_code') or data.get('error')}) 재시도 중...")
-            if attempt < max_retries: time.sleep(2 ** attempt)
+                self.token = data["accessToken"]
+                return
+            print(f"⚠️ 인증 실패 (code {data.get('error_code') or data.get('error')}) - 재시도 {attempt}/{max_retries}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
         raise RuntimeError(f"🚫 인증 3회 실패 — 최종 응답: {data}")
 
     def _headers(self):
@@ -35,13 +38,21 @@ class KisAPI:
             headers=self._headers(),
             params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code}
         )
-        return float(resp.json()["output"]["stck_prpr"])
+        data = resp.json()
+        print(f"📈 get_current_price response for {code}:", data)
+        if resp.status_code != 200 or "output" not in data:
+            raise RuntimeError(f"가격 조회 실패 — 응답: {data}")
+        try:
+            return float(data["output"]["stck_prpr"])
+        except (KeyError, ValueError) as e:
+            raise RuntimeError(f"응답에서 가격 파싱 실패 — {e}, 응답: {data}")
 
     def order_cash(self, code, qty, order_type="00", side="1"):
         payload = {"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "PDNO": code, "ORD_QTY": str(qty), "ORD_UNPR": "0"}
         resp = requests.post(
             "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/order-cash",
-            headers=self._headers(), json=payload
+            headers=self._headers(),
+            json=payload
         )
         return resp.json()
 
@@ -68,3 +79,4 @@ class KisAPI:
             params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD}
         )
         return resp.json().get("output", [])
+
