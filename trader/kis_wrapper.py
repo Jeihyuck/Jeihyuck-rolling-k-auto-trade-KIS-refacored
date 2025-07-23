@@ -1,35 +1,35 @@
 import requests
-import time
+from datetime import datetime, timedelta
 from settings import APP_KEY, APP_SECRET, CANO, ACNT_PRDT_CD
 
 class KisAPI:
     def __init__(self):
         self.token = None
+        self.token_expiry = datetime.min
 
     def authenticate(self):
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            resp = requests.post(
-                "https://openapi.koreainvestment.com:9443/oauth2/tokenP",
-                json={"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET},
-                timeout=10
-            )
-            data = resp.json()
-            print(f"🔐 Auth response (attempt {attempt}):", data)
-            if "access_token" in data:
-                self.token = data["access_token"]
-                return
-            if "accessToken" in data:
-                self.token = data["accessToken"]
-                return
-            print(f"⚠️ 인증 실패 (code {data.get('error_code') or data.get('error')}) - 재시도 {attempt}/{max_retries}")
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"🚫 인증 3회 실패 — 최종 응답: {data}")
+        # 토큰 유효하면 재발급 없이 그대로 사용
+        if self.token and datetime.now() < self.token_expiry:
+            return
+
+        resp = requests.post(
+            "https://openapi.koreainvestment.com:9443/oauth2/tokenP",
+            json={"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET},
+            timeout=10
+        )
+        data = resp.json()
+        print("🔐 Auth response:", data)
+
+        if "access_token" not in data:
+            raise RuntimeError(f"🚫 인증 실패 — 응답: {data}")
+
+        self.token = data["access_token"]
+        # 만료시간을 조금 여유 있게 설정 (60초 전)
+        self.token_expiry = datetime.now() + timedelta(seconds=int(data.get("expires_in", 86400)) - 60)
+        print(f"✅ New token, expires at {self.token_expiry}")
 
     def _headers(self):
-        if not self.token:
-            raise RuntimeError("⚠️ 인증 필요: authenticate() 먼저 호출하세요.")
+        self.authenticate()
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
     def get_current_price(self, code):
@@ -42,19 +42,17 @@ class KisAPI:
         print(f"📈 get_current_price response for {code}:", data)
         if resp.status_code != 200 or "output" not in data:
             raise RuntimeError(f"가격 조회 실패 — 응답: {data}")
-        try:
-            return float(data["output"]["stck_prpr"])
-        except (KeyError, ValueError) as e:
-            raise RuntimeError(f"응답에서 가격 파싱 실패 — {e}, 응답: {data}")
+        return float(data["output"]["stck_prpr"])
 
-    def order_cash(self, code, qty, order_type="00", side="1"):
+    def order_cash(self, code, qty):
         payload = {"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "PDNO": code, "ORD_QTY": str(qty), "ORD_UNPR": "0"}
         resp = requests.post(
             "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/order-cash",
-            headers=self._headers(),
-            json=payload
+            headers=self._headers(), json=payload
         )
-        return resp.json()
+        data = resp.json()
+        print(f"💸 order_cash response for {code}:", data)
+        return data
 
     def get_open_orders(self):
         resp = requests.get(
@@ -62,7 +60,9 @@ class KisAPI:
             headers=self._headers(),
             params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD}
         )
-        return resp.json().get("output", [])
+        data = resp.json()
+        print("📂 get_open_orders response:", data)
+        return data.get("output", [])
 
     def inquire_order(self, order_no):
         resp = requests.get(
@@ -70,7 +70,9 @@ class KisAPI:
             headers=self._headers(),
             params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "ORD_NO": order_no}
         )
-        return resp.json()
+        data = resp.json()
+        print(f"🧾 inquire_order response for {order_no}:", data)
+        return data
 
     def get_balance(self):
         resp = requests.get(
@@ -78,5 +80,8 @@ class KisAPI:
             headers=self._headers(),
             params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD}
         )
-        return resp.json().get("output", [])
+        data = resp.json()
+        print("💰 get_balance response:", data)
+        return data.get("output", [])
+
 
