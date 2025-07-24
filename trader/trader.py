@@ -9,23 +9,22 @@ logger = logging.getLogger(__name__)
 def get_month_first_date():
     today = datetime.today()
     month_first = today.replace(day=1)
-    return month_first.strftime("%Y-%m-%d")   # 하이픈 포함!
-
+    return month_first.strftime("%Y-%m-%d")
 
 def fetch_rebalancing_targets(date):
-    """rolling_k_auto_trade_api 서버에서 리밸런싱 종목 리스트 받아오기 (POST 방식)"""
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}"
     response = requests.post(REBALANCE_API_URL)
+    logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")  # 여기 추가!
     if response.status_code == 200:
         data = response.json()
-        logger.info(f"[🎯 리밸런싱 종목]: {data['selected']}")
-        return data["selected"]
+        logger.info(f"[🎯 리밸런싱 종목]: {data.get('selected')}")
+        return data.get("selected", [])
     else:
         raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
 def main():
     kis = KisAPI()
-    rebalance_date = get_month_first_date()  # 예: 20250701
+    rebalance_date = get_month_first_date()
     logger.info(f"[ℹ️ 리밸런싱 기준일]: {rebalance_date}")
     targets = fetch_rebalancing_targets(rebalance_date)
     for target in targets:
