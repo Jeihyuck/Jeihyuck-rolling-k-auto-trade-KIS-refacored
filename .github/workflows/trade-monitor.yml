@@ -1,29 +1,40 @@
-name: Trade Monitor (5‑min)
+name: Trade Monitor
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: '*/5 * * * *'
-
+    - cron: "*/5 0-7 * * 1-5"  # 장중 5분마다 실행 예시
+  workflow_dispatch:
 
 jobs:
   monitor-trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # 기본 6시간에서 더 줄일 수도 있음
+
     env:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python trader/trader.py
+          python-version: "3.11"
+
+      - name: Dependencies 설치
+        run: |
+          pip install -r requirements.txt
+
+      - name: 리밸런싱 API 서버 실행 (FastAPI)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 &
+          sleep 10  # 서버 구동 시간 여유 확보
+
+      - name: trader 자동매매 로직 실행
+        run: |
+          python trader/trader.py
+
 
 
 
