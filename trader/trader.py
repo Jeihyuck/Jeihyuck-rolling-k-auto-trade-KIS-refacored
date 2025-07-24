@@ -1,28 +1,39 @@
-import time
-from settings import TARGETS, POLL_INTERVAL
+import logging, requests
 from kis_wrapper import KisAPI
-from utils import log, send_slack
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 전략 API에서 타겟 종목 받아오기
+def fetch_rebalancing_targets(date):
+    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}"
+    response = requests.get(REBALANCE_API_URL)
+    if response.status_code == 200:
+        data = response.json()
+        logger.info(f"[🎯 리밸런싱 종목]: {data['selected']}")
+        return data["selected"]
+    else:
+        raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
 def main():
     kis = KisAPI()
-    kis.authenticate()
-    for code, target in TARGETS.items():
-        price = kis.get_current_price(code)
-        log(f"{code} 현재가 {price}, 목표가 {target}")
-        if price >= target:
-            resp = kis.order_cash(code, qty=1, side="1")
-            log(f"BUY {code}@{price}: {resp}")
-            send_slack(f"📈 매수: {code} @ {price}")
+    today = datetime.today().strftime("%Y%m%d")
 
-    for o in kis.get_open_orders():
-        log(f"Order {o['ord_no']} 상태 조회: {kis.inquire_order(o['ord_no'])}")
+    targets = fetch_rebalancing_targets(today)
 
-    for bal in kis.get_balance():
-        qty = int(bal.get("hldg_qty", 0))
-        if qty > 0:
-            resp = kis.order_cash(bal["pdno"], qty=qty, side="2")
-            log(f"SELL {bal['pdno']} qty={qty}: {resp}")
-            send_slack(f"📉 매도: {bal['pdno']} qty={qty}")
+    for target in targets:
+        code = target["종목코드"]
+        qty = target["매수수량"]  # 리밸런싱 결과 기반 수량
+        try:
+            current_price = kis.get_current_price(code)
+            logger.info(f"[📈 현재가 조회] {code}: {current_price}원")
+
+            result = kis.buy_stock(code, qty)
+            logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
+
+        except Exception as e:
+            logger.error(f"[❌ 주문 실패] 종목: {code}, 오류: {e}")
 
 if __name__ == "__main__":
     main()
