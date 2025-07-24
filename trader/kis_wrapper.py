@@ -1,98 +1,51 @@
-import requests
-from datetime import datetime, timedelta
-from settings import APP_KEY, APP_SECRET, CANO, ACNT_PRDT_CD, API_BASE_URL
+import requests, logging
+from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+
+logger = logging.getLogger(__name__)
 
 class KisAPI:
     def __init__(self):
-        self.token = None
-        self.token_expiry = datetime.min
+        self.token = self._issue_token()
 
-    def authenticate(self):
-        if self.token and datetime.now() < self.token_expiry:
-            return
-        resp = requests.post(
-            f"{API_BASE_URL}/oauth2/tokenP",
-            json={"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET},
-            timeout=10
-        )
-        data = resp.json()
-        print("🔐 Auth response:", data)
-        if "access_token" not in data:
-            raise RuntimeError(f"🚫 인증 실패 — 응답: {data}")
-        self.token = data["access_token"]
-        self.token_expiry = datetime.now() + timedelta(seconds=int(data.get("expires_in", 86400)) - 60)
-        print(f"✅ New token, expires at {self.token_expiry}")
+    def _issue_token(self):
+        url = f"{API_BASE_URL}/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
+        resp = requests.post(url, json=data, headers=headers).json()
+        logger.info(f"[🔑 토큰발급] 응답: {resp}")
+        return resp["access_token"]
 
-    def _headers(self):
-        self.authenticate()
-        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+    def _headers(self, tr_id):
+        return {
+            "authorization": f"Bearer {self.token}",
+            "appkey": APP_KEY,
+            "appsecret": APP_SECRET,
+            "tr_id": tr_id,
+            "custtype": "P",
+            "content-type": "application/json"
+        }
 
     def get_current_price(self, code):
-        tried = []
-        for market_div in ["U", "J"]:
-            # "005930"와 "A005930" 모두 시도
-            for code_fmt in [code, "A" + code if not code.startswith("A") else code[1:]]:
-                params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-                resp = requests.get(url, headers=self._headers(), params=params)
-                data = resp.json()
-                tried.append({
-                    "market_div": market_div,
-                    "code_fmt": code_fmt,
-                    "status_code": resp.status_code,
-                    "response": data
-                })
-                print(f"📈 get_current_price try: {params} status={resp.status_code} resp={data}")
-                if resp.status_code == 200 and data.get("rt_cd") == "0" and "output" in data and "stck_prpr" in data["output"]:
-                    return float(data["output"]["stck_prpr"])
-        raise RuntimeError(f"❌ 가격 조회 모두 실패 — tried: {tried}")
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._headers("VTTC3001R" if KIS_ENV == "practice" else "FHKST01010100")
+        params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code}
+        resp = requests.get(url, headers=headers, params=params).json()
+        if resp["rt_cd"] == "0":
+            return float(resp["output"]["stck_prpr"])
+        raise Exception(f"현재가 조회 실패({code}): {resp['msg1']}")
 
-    def order_cash(self, code, qty, price=0):
-        payload = {
+    def buy_stock(self, code, qty):
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        headers = self._headers("VTTC0802U" if KIS_ENV == "practice" else "TTTC0802U")
+        data = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
             "PDNO": code,
+            "ORD_DVSN": "01",  # 시장가
             "ORD_QTY": str(qty),
-            "ORD_UNPR": str(price),
-            "ORD_DVSN": "01",
-            "CVI": ""
+            "ORD_UNPR": "0"
         }
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        resp = requests.post(url, headers=self._headers(), json=payload)
-        data = resp.json()
-        print(f"💸 order_cash response for {code}:", data)
-        return data
-
-    def get_open_orders(self):
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-orders"
-        resp = requests.get(
-            url,
-            headers=self._headers(),
-            params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD}
-        )
-        data = resp.json()
-        print("📂 get_open_orders response:", data)
-        return data.get("output", [])
-
-    def inquire_order(self, order_no):
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-order-detail"
-        resp = requests.get(
-            url,
-            headers=self._headers(),
-            params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "ORD_NO": order_no}
-        )
-        data = resp.json()
-        print(f"🧾 inquire_order response for {order_no}:", data)
-        return data
-
-    def get_balance(self):
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-        resp = requests.get(
-            url,
-            headers=self._headers(),
-            params={"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD}
-        )
-        data = resp.json()
-        print("💰 get_balance response:", data)
-        return data.get("output", [])
-
+        resp = requests.post(url, headers=headers, json=data).json()
+        if resp["rt_cd"] == "0":
+            return resp["output"]
+        raise Exception(f"매수주문 실패({code}): {resp['msg1']}")
