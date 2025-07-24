@@ -7,7 +7,8 @@ logger = logging.getLogger(__name__)
 
 def fetch_rebalancing_targets(date):
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}"
-    response = requests.get(REBALANCE_API_URL)
+    # ⚠️ [GET → POST로 변경] ⚠️
+    response = requests.post(REBALANCE_API_URL)
     if response.status_code == 200:
         data = response.json()
         logger.info(f"[🎯 리밸런싱 종목]: {data['selected']}")
