@@ -5,7 +5,6 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 전략 API에서 타겟 종목 받아오기
 def fetch_rebalancing_targets(date):
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}"
     response = requests.get(REBALANCE_API_URL)
@@ -19,12 +18,11 @@ def fetch_rebalancing_targets(date):
 def main():
     kis = KisAPI()
     today = datetime.today().strftime("%Y%m%d")
-
     targets = fetch_rebalancing_targets(today)
 
     for target in targets:
         code = target["종목코드"]
-        qty = target["매수수량"]  # 리밸런싱 결과 기반 수량
+        qty = target["매수수량"]
         try:
             current_price = kis.get_current_price(code)
             logger.info(f"[📈 현재가 조회] {code}: {current_price}원")

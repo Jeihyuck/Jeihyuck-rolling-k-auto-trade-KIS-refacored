@@ -1,19 +1,43 @@
-import requests, logging
+import requests, os, json, time, logging
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 
 logger = logging.getLogger(__name__)
 
 class KisAPI:
     def __init__(self):
-        self.token = self._issue_token()
+        self.token = self._get_token_with_file_cache()
 
-    def _issue_token(self):
+    def _get_token_with_file_cache(self):
+        cache_path = "kis_token_cache.json"
+        # 캐시 파일이 있으면 불러오기
+        if os.path.exists(cache_path):
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            # 토큰 만료 5분 전까진 재사용
+            if time.time() < cache["expires_at"] - 300:
+                logger.info(f"[토큰캐시] 캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
+                return cache["access_token"]
+        # 새로 발급
+        token, expires_in = self._issue_token_and_expire()
+        with open(cache_path, "w") as f:
+            json.dump({
+                "access_token": token,
+                "expires_at": time.time() + int(expires_in)
+            }, f)
+        logger.info(f"[토큰캐시] 새 토큰 발급 및 캐시")
+        return token
+
+    def _issue_token_and_expire(self):
         url = f"{API_BASE_URL}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
         resp = requests.post(url, json=data, headers=headers).json()
-        logger.info(f"[🔑 토큰발급] 응답: {resp}")
-        return resp["access_token"]
+        if "access_token" in resp:
+            logger.info(f"[🔑 토큰발급] 성공: {resp}")
+            return resp["access_token"], resp["expires_in"]
+        else:
+            logger.error(f"[🔑 토큰발급 실패]: {resp.get('error_description')}")
+            raise Exception(f"토큰 발급 실패: {resp.get('error_description')}")
 
     def _headers(self, tr_id):
         return {
@@ -32,7 +56,7 @@ class KisAPI:
         resp = requests.get(url, headers=headers, params=params).json()
         if resp["rt_cd"] == "0":
             return float(resp["output"]["stck_prpr"])
-        raise Exception(f"현재가 조회 실패({code}): {resp['msg1']}")
+        raise Exception(f"현재가 조회 실패({code}): {resp.get('msg1', resp)}")
 
     def buy_stock(self, code, qty):
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
@@ -48,4 +72,4 @@ class KisAPI:
         resp = requests.post(url, headers=headers, json=data).json()
         if resp["rt_cd"] == "0":
             return resp["output"]
-        raise Exception(f"매수주문 실패({code}): {resp['msg1']}")
+        raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
