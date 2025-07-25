@@ -2,7 +2,8 @@ name: Trade Monitor
 
 on:
   schedule:
-    - cron: "*/5 0-7 * * 1-5"  # 장중 5분마다 실행 예시
+    # 월~금 0:00~6:30(UTC) == 한국시간 09:00~15:30 (장운영시간)에만 5분마다 실행
+    - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -26,27 +27,26 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: 리밸런싱 API 서버 실행 (FastAPI, 로그 저장)
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
-          #nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000
-          #sleep 10  # 서버 구동 시간 여유 확보
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 10  # 서버 구동 시간 여유 확보
 
-      #- name: trader 자동매매 로직 실행
-      #  run: |
-      #    python trader/trader.py
+      - name: trader 자동매매 로직 실행
+        run: |
+          python trader/trader.py
 
-      #- name: FastAPI 로그 출력 (cat)
-      #  run: |
-      #    echo "::group::FastAPI Server Log"
-      #    cat fastapi.log
-      #    echo "::endgroup::"
+      - name: FastAPI 로그 출력 (cat)
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log
+          echo "::endgroup::"
 
-      #- name: FastAPI 로그 업로드 (artifact)
-      #  uses: actions/upload-artifact@v4
-      #  with:
-      #    name: fastapi-log
-      #    path: fastapi.log
+      - name: FastAPI 로그 업로드 (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
 
 
 
