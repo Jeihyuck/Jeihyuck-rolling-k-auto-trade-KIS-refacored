@@ -81,14 +81,21 @@ class KisAPI:
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "01",  # 시장가
+            "ORD_DVSN": "00",  # 시장가
             "ORD_QTY": str(qty).strip(),
             "ORD_UNPR": "0"
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
+        # Graceful handling for 장종료, 초과 등
         if resp["rt_cd"] == "0":
             return resp["output"]
-        raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
-
-
+        elif resp.get("msg1") == "모의투자 장종료 입니다.":
+            logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
+            return None
+        elif "초과" in resp.get("msg1", ""):
+            logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+            return None
+        else:
+            logger.error(f"[ORDER_FAIL] {resp}")
+            raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
