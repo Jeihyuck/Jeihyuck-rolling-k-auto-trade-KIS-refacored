@@ -27,8 +27,14 @@ def main():
     rebalance_date = get_month_first_date()
     logger.info(f"[ℹ️ 리밸런싱 기준일]: {rebalance_date}")
     targets = fetch_rebalancing_targets(rebalance_date)
+
+    is_open = kis.is_market_open()
+    if is_open:
+        logger.info("[⏰ 장 OPEN] 실매수 주문 실행")
+    else:
+        logger.info("[⏰ 장 종료] 실매수 주문 생략, 현재가만 조회")
+
     for target in targets:
-        # 실제 데이터 구조에 맞게 key를 순차로 가져옵니다.
         code = target.get("stock_code") or target.get("code")
         qty = target.get("매수수량") or target.get("qty")
         if not code or not qty:
@@ -37,10 +43,13 @@ def main():
         try:
             current_price = kis.get_current_price(code)
             logger.info(f"[📈 현재가 조회] {code}: {current_price}원")
-            result = kis.buy_stock(code, qty)
-            logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
+            if is_open:
+                result = kis.buy_stock(code, qty)
+                logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
+            else:
+                logger.info(f"[🔔 장종료, 주문 SKIP] 종목: {code}, 목표가(매수수량): {target.get('목표가')}({qty})")
         except Exception as e:
-            logger.error(f"[❌ 주문 실패] 종목: {code}, 오류: {e}")
+            logger.error(f"[❌ 주문/조회 실패] 종목: {code}, 오류: {e}")
 
 if __name__ == "__main__":
     main()

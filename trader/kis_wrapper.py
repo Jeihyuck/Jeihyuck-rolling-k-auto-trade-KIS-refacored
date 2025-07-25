@@ -1,18 +1,16 @@
 import requests, os, json, time, logging
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# --- 환경 변수, 파라미터 방어적 정제 함수 ---
 def safe_strip(val):
-    """환경 변수 등 어떤 값이 와도 안전하게 str 변환 후 개행/공백 제거."""
     if val is None:
         return ''
     if isinstance(val, str):
         return val.replace('\n', '').replace('\r', '').strip()
     return str(val).strip()
 
-# --- 실제 환경변수 값 로그로 찍기 ---
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
 logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
@@ -87,7 +85,6 @@ class KisAPI:
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
-        # Graceful handling for 장종료, 초과 등
         if resp["rt_cd"] == "0":
             return resp["output"]
         elif resp.get("msg1") == "모의투자 장종료 입니다.":
@@ -99,3 +96,12 @@ class KisAPI:
         else:
             logger.error(f"[ORDER_FAIL] {resp}")
             raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
+
+    def is_market_open(self):
+        now = datetime.now()
+        # 평일(월~금) 09:00 ~ 15:30 (점심시간 구분 안함)
+        if now.weekday() >= 5:
+            return False
+        open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return open_time <= now <= close_time
