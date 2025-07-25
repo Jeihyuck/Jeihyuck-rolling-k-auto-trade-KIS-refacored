@@ -12,7 +12,7 @@ def get_month_first_date():
     return month_first.strftime("%Y-%m-%d")
 
 def fetch_rebalancing_targets(date):
-    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
+    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=false"
     response = requests.post(REBALANCE_API_URL)
     logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")
     if response.status_code == 200:
