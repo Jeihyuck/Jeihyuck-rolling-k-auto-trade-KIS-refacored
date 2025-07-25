@@ -30,7 +30,7 @@ jobs:
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 10  # 서버 구동 시간 여유 확보
+          sleep 30  # 서버 구동 시간 여유 확보
 
       - name: trader 자동매매 로직 실행
         run: |
