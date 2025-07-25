@@ -3,21 +3,25 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 
 logger = logging.getLogger(__name__)
 
+def strip_env(val):
+    # 환경 변수 및 파라미터 방어적 정제 (None도 방지)
+    return str(val or '').replace('\n', '').replace('\r', '').strip()
+
 class KisAPI:
     def __init__(self):
+        # 항상 strip된 버전으로 멤버에 저장
+        self.CANO = strip_env(CANO)
+        self.ACNT_PRDT_CD = strip_env(ACNT_PRDT_CD)
         self.token = self._get_token_with_file_cache()
 
     def _get_token_with_file_cache(self):
         cache_path = "kis_token_cache.json"
-        # 캐시 파일이 있으면 불러오기
         if os.path.exists(cache_path):
             with open(cache_path, "r") as f:
                 cache = json.load(f)
-            # 토큰 만료 5분 전까진 재사용
             if time.time() < cache["expires_at"] - 300:
                 logger.info(f"[토큰캐시] 캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                 return cache["access_token"]
-        # 새로 발급
         token, expires_in = self._issue_token_and_expire()
         with open(cache_path, "w") as f:
             json.dump({
@@ -62,14 +66,17 @@ class KisAPI:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         headers = self._headers("VTTC0802U" if KIS_ENV == "practice" else "TTTC0802U")
         data = {
-            "CANO": CANO,
-            "ACNT_PRDT_CD": ACNT_PRDT_CD,
-            "PDNO": code,
+            "CANO": strip_env(self.CANO),
+            "ACNT_PRDT_CD": strip_env(self.ACNT_PRDT_CD),
+            "PDNO": str(code).strip(),
             "ORD_DVSN": "01",  # 시장가
-            "ORD_QTY": str(qty),
+            "ORD_QTY": str(qty).strip(),
             "ORD_UNPR": "0"
         }
+        # 로그로 한 번 더 실제 값 점검
+        logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
         if resp["rt_cd"] == "0":
             return resp["output"]
         raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
+
