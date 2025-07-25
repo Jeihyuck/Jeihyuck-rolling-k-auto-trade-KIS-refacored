@@ -2,7 +2,7 @@ name: Trade Monitor
 
 on:
   schedule:
-    # 월~금 0:00~6:30(UTC) == 한국시간 09:00~15:30 (장운영시간)에만 5분마다 실행
+    # 한국시간 09:00~15:30(UTC 0~6시) 평일 5분마다 실행
     - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
 
@@ -37,21 +37,15 @@ jobs:
           python trader/trader.py
 
       - name: FastAPI 로그 출력 (cat)
+        if: always()
         run: |
           echo "::group::FastAPI Server Log"
           cat fastapi.log
           echo "::endgroup::"
 
       - name: FastAPI 로그 업로드 (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fastapi-log
           path: fastapi.log
-
-
-
-
-
-
-
-          
