@@ -36,6 +36,16 @@ jobs:
         run: |
           python trader/trader.py
 
+      - name: CEO 리포트 자동 생성
+        run: |
+          python report_ceo.py
+
+      - name: CEO 리포트 artifact 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: reports/
+
       - name: FastAPI 로그 출력 (cat)
         if: always()
         run: |
