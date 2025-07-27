@@ -18,25 +18,49 @@ logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 
 class KisAPI:
+    _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
+    _cache_path = "kis_token_cache.json"
+
     def __init__(self):
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
-        self.token = self._get_token_with_file_cache()
+        self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}")
 
-    def _get_token_with_file_cache(self):
-        cache_path = "kis_token_cache.json"
-        if os.path.exists(cache_path):
-            with open(cache_path, "r") as f:
+    def get_valid_token(self):
+        now = time.time()
+        # 메모리 캐시 우선
+        if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
+            return self._token_cache["token"]
+        # 파일 캐시 (워크플로우 여러 인스턴스 동시 동작 대비)
+        if os.path.exists(self._cache_path):
+            with open(self._cache_path, "r") as f:
                 cache = json.load(f)
-            if time.time() < cache["expires_at"] - 300:
-                logger.info(f"[토큰캐시] 캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
+            if "access_token" in cache and now < cache["expires_at"] - 300:
+                # 메모리에도 반영
+                self._token_cache["token"] = cache["access_token"]
+                self._token_cache["expires_at"] = cache["expires_at"]
+                self._token_cache["last_issued"] = cache.get("last_issued", 0)
+                logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                 return cache["access_token"]
+        # 1분 제한
+        if now - self._token_cache["last_issued"] < 61:
+            logger.warning(f"[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
+            if self._token_cache["token"]:
+                return self._token_cache["token"]
+            else:
+                raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
+        # 새로 발급
         token, expires_in = self._issue_token_and_expire()
-        with open(cache_path, "w") as f:
+        expires_at = now + int(expires_in)
+        self._token_cache["token"] = token
+        self._token_cache["expires_at"] = expires_at
+        self._token_cache["last_issued"] = now
+        with open(self._cache_path, "w") as f:
             json.dump({
                 "access_token": token,
-                "expires_at": time.time() + int(expires_in)
+                "expires_at": expires_at,
+                "last_issued": now
             }, f)
         logger.info(f"[토큰캐시] 새 토큰 발급 및 캐시")
         return token
@@ -55,7 +79,7 @@ class KisAPI:
 
     def _headers(self, tr_id):
         return {
-            "authorization": f"Bearer {self.token}",
+            "authorization": f"Bearer {self.get_valid_token()}",
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
             "tr_id": tr_id,

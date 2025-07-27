@@ -19,6 +19,14 @@ def load_trades(date):
                     continue
     return trades
 
+def is_market_open(date):
+    # 장이 열렸는지 날짜 기준 체크 (한국 기준 평일 09:00~15:30)
+    if date.weekday() >= 5:
+        return False
+    open_time = date.replace(hour=9, minute=0, second=0, microsecond=0)
+    close_time = date.replace(hour=15, minute=30, second=0, microsecond=0)
+    return open_time <= date <= close_time
+
 def ceo_report(date=None, period="daily"):
     # period: daily, weekly, monthly 지원
     if not date:
@@ -41,8 +49,31 @@ def ceo_report(date=None, period="daily"):
     for d in trade_days:
         trades.extend(load_trades(d))
 
+    report_msg = ""
+    market_status = is_market_open(date)
     if not trades:
-        return {"title": title, "msg": "해당 기간 거래 내역 없음"}
+        if not market_status:
+            report_msg = "거래 내역 없음 (시장 미개장 또는 휴일/주말)"
+        else:
+            report_msg = "거래 내역 없음 (장 열림/평일)"
+        리포트 = {
+            "title": title,
+            "msg": report_msg,
+            "전략설정": {
+                "운영K": "종목별 전월 rolling K, 백테스트 기반 자동적용",
+                "리밸런싱방식": "월초 리밸런싱 + 실시간 매수, 당일 장마감 익일 매도",
+                "매수기준": "목표가 돌파시 실시간 시장가/지정가 매수",
+                "매도기준": "당일 장마감 전 전량 매도",
+            },
+            "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "market_open": market_status,
+            "거래세부내역": []
+        }
+        # 반드시 파일로 저장!
+        filename = f"ceo_report_{period}_{date.strftime('%Y-%m-%d')}.json"
+        with open(REPORT_DIR / filename, "w", encoding="utf-8") as f:
+            json.dump(리포트, f, indent=2, ensure_ascii=False)
+        return 리포트
 
     df = pd.DataFrame(trades)
     df["수익"] = 0
