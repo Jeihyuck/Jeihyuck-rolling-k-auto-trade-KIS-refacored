@@ -29,28 +29,23 @@ class KisAPI:
 
     def get_valid_token(self):
         now = time.time()
-        # 메모리 캐시 우선
         if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
             return self._token_cache["token"]
-        # 파일 캐시 (워크플로우 여러 인스턴스 동시 동작 대비)
         if os.path.exists(self._cache_path):
             with open(self._cache_path, "r") as f:
                 cache = json.load(f)
             if "access_token" in cache and now < cache["expires_at"] - 300:
-                # 메모리에도 반영
                 self._token_cache["token"] = cache["access_token"]
                 self._token_cache["expires_at"] = cache["expires_at"]
                 self._token_cache["last_issued"] = cache.get("last_issued", 0)
                 logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                 return cache["access_token"]
-        # 1분 제한
         if now - self._token_cache["last_issued"] < 61:
             logger.warning(f"[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
             if self._token_cache["token"]:
                 return self._token_cache["token"]
             else:
                 raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
-        # 새로 발급
         token, expires_in = self._issue_token_and_expire()
         expires_at = now + int(expires_in)
         self._token_cache["token"] = token
@@ -103,7 +98,7 @@ class KisAPI:
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",  # 시장가
+            "ORD_DVSN": "00",
             "ORD_QTY": str(qty).strip(),
             "ORD_UNPR": "0"
         }
@@ -121,9 +116,40 @@ class KisAPI:
             logger.error(f"[ORDER_FAIL] {resp}")
             raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
 
+    def get_cash_balance(self):
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._headers("VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R")
+        params = {
+            "CANO": safe_strip(self.CANO),
+            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
+            "AFHR_FLPR_YN": "N",
+            "UNPR_YN": "N",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "OFL_YN": "N",
+            "INQR_DVSN": "02",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
+        }
+        logger.info(f"[잔고조회 요청파라미터] {params}")
+        resp = requests.get(url, headers=headers, params=params).json()
+        logger.info(f"[잔고조회 응답] {resp}")
+        if resp.get("rt_cd") == "0" and "output2" in resp and resp["output2"]:
+            try:
+                cash = int(resp["output2"][0]["dnca_tot_amt"])
+                logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
+                return cash
+            except Exception as e:
+                logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
+                return 0
+        else:
+            logger.error(f"[CASH_BALANCE_PARSE_FAIL] {resp}")
+            return 0
+
     def is_market_open(self):
         now = datetime.now()
-        # 평일(월~금) 09:00 ~ 15:30 (점심시간 구분 안함)
         if now.weekday() >= 5:
             return False
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
