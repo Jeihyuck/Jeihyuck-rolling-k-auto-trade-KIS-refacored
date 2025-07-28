@@ -1,5 +1,7 @@
 import requests, os, json, time, logging
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+
+import pytz
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -149,7 +151,8 @@ class KisAPI:
             return 0
 
     def is_market_open(self):
-        now = datetime.now()
+        KST = pytz.timezone('Asia/Seoul')
+        now = datetime.now(KST)  # 반드시 한국시간!
         if now.weekday() >= 5:
             return False
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
