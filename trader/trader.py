@@ -71,17 +71,30 @@ def main():
             }
 
             if is_open:
-                result = kis.buy_stock(code, qty)
-                logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
-                # 매수 로그 기록
-                trade = {
-                    **trade_common,
-                    "side": "BUY",
-                    "price": current_price,
-                    "amount": int(current_price) * int(qty),
-                    "result": result
-                }
-                log_trade(trade)
+                # 🔥 목표가 도달 조건 추가!
+                if current_price >= float(target_price):
+                    result = kis.buy_stock(code, qty)
+                    logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
+                    # 매수 로그 기록
+                    trade = {
+                        **trade_common,
+                        "side": "BUY",
+                        "price": current_price,
+                        "amount": int(current_price) * int(qty),
+                        "result": result
+                    }
+                    log_trade(trade)
+                else:
+                    logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({target_price}), 매수 미실행")
+                    # 기록도 남길 수 있음 (원하면 아래 코드 주석 해제)
+                    trade = {
+                        **trade_common,
+                        "side": "SKIP",
+                        "price": current_price,
+                        "amount": int(current_price) * int(qty),
+                        "reason": f"현재가 < 목표가, 매수 미실행"
+                    }
+                    log_trade(trade)
             else:
                 logger.info(f"[🔔 장종료, 주문 SKIP] 종목: {code}, 목표가(매수수량): {target_price}({qty})")
                 # 장종료에도 조회/기록 가능
