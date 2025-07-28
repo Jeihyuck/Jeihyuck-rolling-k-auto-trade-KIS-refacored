@@ -4,6 +4,7 @@ from kis_wrapper import KisAPI
 from datetime import datetime
 import json
 from pathlib import Path
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +29,6 @@ def fetch_rebalancing_targets(date):
         raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
 def log_trade(trade: dict):
-    # 일자별 jsonl(한줄에 한 dict)로 기록
     today = datetime.now().strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
@@ -56,6 +56,10 @@ def main():
         if not code or not qty:
             logger.error(f"[❌ 필수 값 없음] target={target}")
             continue
+
+        # 🛑 시세조회 API 초당 제한
+        time.sleep(0.3)
+
         try:
             current_price = kis.get_current_price(code)
             logger.info(f"[📈 현재가 조회] {code}: {current_price}원")
@@ -71,11 +75,9 @@ def main():
             }
 
             if is_open:
-                # 🔥 목표가 도달 조건 추가!
                 if current_price >= float(target_price):
                     result = kis.buy_stock(code, qty)
                     logger.info(f"[✅ 매수주문 성공] 종목: {code}, 수량: {qty}, 응답: {result}")
-                    # 매수 로그 기록
                     trade = {
                         **trade_common,
                         "side": "BUY",
@@ -84,20 +86,20 @@ def main():
                         "result": result
                     }
                     log_trade(trade)
+                    # 🟢 매수주문 API 초당 제한
+                    time.sleep(0.3)
                 else:
                     logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({target_price}), 매수 미실행")
-                    # 기록도 남길 수 있음 (원하면 아래 코드 주석 해제)
                     trade = {
                         **trade_common,
                         "side": "SKIP",
                         "price": current_price,
                         "amount": int(current_price) * int(qty),
-                        "reason": f"현재가 < 목표가, 매수 미실행"
+                        "reason": "현재가 < 목표가, 매수 미실행"
                     }
                     log_trade(trade)
             else:
                 logger.info(f"[🔔 장종료, 주문 SKIP] 종목: {code}, 목표가(매수수량): {target_price}({qty})")
-                # 장종료에도 조회/기록 가능
                 trade = {
                     **trade_common,
                     "side": "INFO",
@@ -110,3 +112,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
