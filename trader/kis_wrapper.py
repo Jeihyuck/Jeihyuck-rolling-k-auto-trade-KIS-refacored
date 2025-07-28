@@ -1,6 +1,7 @@
 import requests, os, json, time, logging
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from datetime import datetime
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +84,16 @@ class KisAPI:
         }
 
     def get_current_price(self, code):
-        # 마켓 구분/코드포맷 자동 시도(코스피/코스닥 + prefix)
         tried = []
-        for market_div in ["J", "U"]:  # J=코스피, U=코스닥
+        # [수정] TR_ID 반드시 FHKST01010100 (KIS 공식문서/엑셀 기준, 모의/실전 공통)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._headers("FHKST01010100")
+        for market_div in ["J", "U"]:
             for code_fmt in [code, f"A{code}", code[1:] if code.startswith("A") else code]:
                 params = {
                     "fid_cond_mrkt_div_code": market_div,
                     "fid_input_iscd": code_fmt
                 }
-                url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-                headers = self._headers("VTTC3001R" if KIS_ENV == "practice" else "FHKST01010100")
                 resp = requests.get(url, headers=headers, params=params).json()
                 tried.append((market_div, code_fmt, resp.get("rt_cd"), resp.get("msg1")))
                 if resp.get("rt_cd") == "0" and "output" in resp:
@@ -100,8 +101,10 @@ class KisAPI:
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
     def buy_stock(self, code, qty):
+        # [수정] TR_ID: 모의투자 VTTC0012U, 실전 TTTC0012U
+        tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        headers = self._headers("VTTC0802U" if KIS_ENV == "practice" else "TTTC0802U")
+        headers = self._headers(tr_id)
         data = {
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
@@ -112,7 +115,7 @@ class KisAPI:
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
-        if resp["rt_cd"] == "0":
+        if resp.get("rt_cd") == "0":
             return resp["output"]
         elif resp.get("msg1") == "모의투자 장종료 입니다.":
             logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
@@ -157,8 +160,6 @@ class KisAPI:
             return 0
 
     def is_market_open(self):
-        # 반드시 KST로 바꿔야 정상동작!
-        import pytz
         KST = pytz.timezone('Asia/Seoul')
         now = datetime.now(KST)
         if now.weekday() >= 5:
