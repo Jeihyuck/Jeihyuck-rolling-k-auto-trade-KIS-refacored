@@ -2,6 +2,7 @@ import requests, os, json, time, logging
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from datetime import datetime
 import pytz
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -9,7 +10,7 @@ def safe_strip(val):
     if val is None:
         return ''
     if isinstance(val, str):
-        return val.replace('\n', '').replace('\r', '').strip()
+            return val.replace('\n', '').replace('\r', '').strip()
     return str(val).strip()
 
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
@@ -21,6 +22,7 @@ logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 class KisAPI:
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
     _cache_path = "kis_token_cache.json"
+    _token_lock = threading.Lock()  # 락 추가
 
     def __init__(self):
         self.CANO = safe_strip(CANO)
@@ -29,37 +31,39 @@ class KisAPI:
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}")
 
     def get_valid_token(self):
-        now = time.time()
-        if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
-            return self._token_cache["token"]
-        if os.path.exists(self._cache_path):
-            with open(self._cache_path, "r") as f:
-                cache = json.load(f)
-            if "access_token" in cache and now < cache["expires_at"] - 300:
-                self._token_cache["token"] = cache["access_token"]
-                self._token_cache["expires_at"] = cache["expires_at"]
-                self._token_cache["last_issued"] = cache.get("last_issued", 0)
-                logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
-                return cache["access_token"]
-        if now - self._token_cache["last_issued"] < 61:
-            logger.warning(f"[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
-            if self._token_cache["token"]:
+        with KisAPI._token_lock:  # 락으로 동시발급 방지
+            now = time.time()
+            if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
                 return self._token_cache["token"]
-            else:
-                raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
-        token, expires_in = self._issue_token_and_expire()
-        expires_at = now + int(expires_in)
-        self._token_cache["token"] = token
-        self._token_cache["expires_at"] = expires_at
-        self._token_cache["last_issued"] = now
-        with open(self._cache_path, "w") as f:
-            json.dump({
-                "access_token": token,
-                "expires_at": expires_at,
-                "last_issued": now
-            }, f)
-        logger.info(f"[토큰캐시] 새 토큰 발급 및 캐시")
-        return token
+            if os.path.exists(self._cache_path):
+                with open(self._cache_path, "r") as f:
+                    cache = json.load(f)
+                if "access_token" in cache and now < cache["expires_at"] - 300:
+                    self._token_cache["token"] = cache["access_token"]
+                    self._token_cache["expires_at"] = cache["expires_at"]
+                    self._token_cache["last_issued"] = cache.get("last_issued", 0)
+                    logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
+                    return cache["access_token"]
+            # 1분 이내 중복발급 방지
+            if now - self._token_cache["last_issued"] < 61:
+                logger.warning(f"[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
+                if self._token_cache["token"]:
+                    return self._token_cache["token"]
+                else:
+                    raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
+            token, expires_in = self._issue_token_and_expire()
+            expires_at = now + int(expires_in)
+            self._token_cache["token"] = token
+            self._token_cache["expires_at"] = expires_at
+            self._token_cache["last_issued"] = now
+            with open(self._cache_path, "w") as f:
+                json.dump({
+                    "access_token": token,
+                    "expires_at": expires_at,
+                    "last_issued": now
+                }, f)
+            logger.info(f"[토큰캐시] 새 토큰 발급 및 캐시")
+            return token
 
     def _issue_token_and_expire(self):
         url = f"{API_BASE_URL}/oauth2/tokenP"
@@ -83,9 +87,10 @@ class KisAPI:
             "content-type": "application/json"
         }
 
+    # 이하 기존 시세, 주문, 잔고, 마켓오픈 판정 등 모든 함수 동일 (TR_ID도 정상 적용)
+
     def get_current_price(self, code):
         tried = []
-        # [수정] TR_ID 반드시 FHKST01010100 (KIS 공식문서/엑셀 기준, 모의/실전 공통)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = self._headers("FHKST01010100")
         for market_div in ["J", "U"]:
@@ -101,7 +106,6 @@ class KisAPI:
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
     def buy_stock(self, code, qty):
-        # [수정] TR_ID: 모의투자 VTTC0012U, 실전 TTTC0012U
         tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         headers = self._headers(tr_id)
