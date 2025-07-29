@@ -10,7 +10,7 @@ def safe_strip(val):
     if val is None:
         return ''
     if isinstance(val, str):
-            return val.replace('\n', '').replace('\r', '').strip()
+        return val.replace('\n', '').replace('\r', '').strip()
     return str(val).strip()
 
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
@@ -31,7 +31,7 @@ class KisAPI:
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}")
 
     def get_valid_token(self):
-        with KisAPI._token_lock:  # 락으로 동시발급 방지
+        with KisAPI._token_lock:
             now = time.time()
             if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
                 return self._token_cache["token"]
@@ -44,7 +44,6 @@ class KisAPI:
                     self._token_cache["last_issued"] = cache.get("last_issued", 0)
                     logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                     return cache["access_token"]
-            # 1분 이내 중복발급 방지
             if now - self._token_cache["last_issued"] < 61:
                 logger.warning(f"[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
                 if self._token_cache["token"]:
@@ -87,8 +86,6 @@ class KisAPI:
             "content-type": "application/json"
         }
 
-    # 이하 기존 시세, 주문, 잔고, 마켓오픈 판정 등 모든 함수 동일 (TR_ID도 정상 적용)
-
     def get_current_price(self, code):
         tried = []
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -105,17 +102,20 @@ class KisAPI:
                     return float(resp["output"]["stck_prpr"])
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
-    def buy_stock(self, code, qty):
+    def buy_stock(self, code, qty, price=None):
         tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         headers = self._headers(tr_id)
+        # 현재가가 안 들어왔으면 조회
+        if price is None:
+            price = self.get_current_price(code)
         data = {
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",
+            "ORD_DVSN": "00",  # 시장가 (KIS에서 단가 필수!)
             "ORD_QTY": str(qty).strip(),
-            "ORD_UNPR": "0"
+            "ORD_UNPR": str(int(price)),  # ← 반드시 단가 입력!
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
