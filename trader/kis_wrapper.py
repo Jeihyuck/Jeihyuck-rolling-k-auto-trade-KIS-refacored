@@ -114,8 +114,8 @@ class KisAPI:
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
             "ORD_DVSN": "00",  # 시장가 (KIS에서 단가 필수!)
-            "ORD_QTY": str(qty).strip(),
-            "ORD_UNPR": str(int(price)),  # ← 반드시 단가 입력!
+            "ORD_QTY": str(int(float(qty))).strip(),
+            "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
