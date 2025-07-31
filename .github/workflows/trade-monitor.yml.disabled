@@ -1,32 +1,68 @@
-name: Trade Monitor (5‑min)
+name: Trade Monitor
 
 on:
-  workflow_dispatch: {}
+  push:
+    branches: [ KIS/realtimetrade ]
+  pull_request:
+    branches: [ KIS/realtimetrade ]
   schedule:
-  #  - cron: '*/5 * * * *'
+
+    # 한국시간 09:00~15:30(UTC 0~6시) 평일 5분마다 실행
+    #- cron: "*/5 0-6 * * 1-5"
+  #workflow_dispatch:
 
 
 jobs:
   monitor-trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # 기본 6시간에서 더 줄일 수도 있음
+
     env:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python trader/trader.py
+          python-version: "3.11"
 
+      - name: Dependencies 설치
+        run: |
+          pip install -r requirements.txt
 
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 30  # 서버 구동 시간 여유 확보
 
+      - name: trader 자동매매 로직 실행
+        run: |
+          python trader/trader.py
 
+      - name: CEO 리포트 자동 생성
+        run: |
+          python  trader/report_ceo.py
 
-          
+      - name: CEO 리포트 artifact 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: reports/
+
+      - name: FastAPI 로그 출력 (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log
+          echo "::endgroup::"
+
+      - name: FastAPI 로그 업로드 (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+
