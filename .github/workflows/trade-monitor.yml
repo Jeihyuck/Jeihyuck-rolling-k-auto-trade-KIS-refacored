@@ -37,12 +37,16 @@ jobs:
           sleep 30  # 서버 구동 시간 여유 확보
 
       - name: trader 자동매매 로직 실행
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python trader/trader.py
 
       - name: CEO 리포트 자동 생성
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python  trader/report_ceo.py
+          python trader/report_ceo.py
 
       - name: CEO 리포트 artifact 업로드
         uses: actions/upload-artifact@v4
@@ -63,4 +67,3 @@ jobs:
         with:
           name: fastapi-log
           path: fastapi.log
-
