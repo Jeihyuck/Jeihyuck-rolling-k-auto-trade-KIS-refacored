@@ -1,6 +1,6 @@
 import logging
 import requests
-from trader.kis_wrapper import KisAPI
+from .kis_wrapper import KisAPI
 from datetime import datetime
 import json
 from pathlib import Path
