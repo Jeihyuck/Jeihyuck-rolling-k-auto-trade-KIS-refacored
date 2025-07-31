@@ -12,18 +12,13 @@ from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────
-# 1. 시가총액 기준 KOSDAQ‑50 추출 (컬럼 탐색·병합 안전화)
-# ──────────────────────────────────────────────────────────────
-
+# 1. 시가총액 기준 KOSDAQ‑50 추출
 def _find_column(df: pd.DataFrame, keyword: str) -> str | None:
-    """Return the first column whose *normalized* name contains *keyword*."""
     kw = keyword.replace(" ", "")
     for c in df.columns:
         if kw in c.replace(" ", ""):
             return c
     return None
-
 
 def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
     """시가총액 상위 50개 KOSDAQ 종목 반환 (Code, Name, Marcap)."""
@@ -37,8 +32,7 @@ def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
             logger.warning("⚠️  pykrx 시총 DF가 비었습니다 → 종료")
             return pd.DataFrame()
 
-        mktcap_df = mktcap_df.reset_index()  # ticker 가 index 로 올 때 대비
-
+        mktcap_df = mktcap_df.reset_index()
         capcol = _find_column(mktcap_df, "시가총액")
         ticcol = _find_column(mktcap_df, "티커") or _find_column(mktcap_df, "코드")
         if capcol is None or ticcol is None:
@@ -46,11 +40,9 @@ def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
             return pd.DataFrame()
 
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
-        mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
-
+        mktcap_df["Code"] = mktcap_df["Code"].astype(str).zfill(6)
         fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
-        fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
-
+        fdr_df["Code"] = fdr_df["Code"].astype(str).zfill(6)
         merged = pd.merge(fdr_df[["Code", "Name"]], mktcap_df[["Code", "Marcap"]], on="Code", how="inner")
         if "Marcap" not in merged.columns:
             for cand in ("Marcap_x", "Marcap_y", "MarketCap", "MarketCap_x", "MarketCap_y"):
@@ -64,25 +56,19 @@ def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
         top50 = merged.dropna(subset=["Marcap"]).sort_values("Marcap", ascending=False).head(50)
         logger.info(f"✅  시총 Top50 추출 완료 → {len(top50)} 종목")
         return top50[["Code", "Name", "Marcap"]]
-    except Exception:  # pragma: no cover
+    except Exception:
         logger.exception("❌  get_kosdaq_top_50 예외:")
         return pd.DataFrame()
 
-
-# ──────────────────────────────────────────────────────────────
 # 2. K 시뮬레이션 (최근 1달 데이터만)
-# ──────────────────────────────────────────────────────────────
-
 def simulate_k_range_for(
     code: str,
     price_data: List[Dict],
     k_range=np.arange(0.1, 1.0, 0.1),
 ) -> List[Dict]:
-    """최근 1개월 *price_data* 에 대해 K 값을 바꿔가며 성과지표 계산."""
     results: List[Dict] = []
     if not price_data:
         return results
-
     for k in k_range:
         metrics = simulate_with_k_and_get_metrics(code, k, price_data)
         metrics["k"] = k
@@ -91,11 +77,7 @@ def simulate_k_range_for(
         results.append(metrics)
     return results
 
-
-# ──────────────────────────────────────────────────────────────
 # 3. 가격 데이터 수집 (1년·1분기·1개월)
-# ──────────────────────────────────────────────────────────────
-
 def get_price_data_segments(code: str, base_date: datetime.date) -> Dict[str, List[Dict]]:
     try:
         start_date = base_date - timedelta(days=400)
@@ -108,32 +90,24 @@ def get_price_data_segments(code: str, base_date: datetime.date) -> Dict[str, Li
         )
         df["date"] = df["Date"].dt.date
         df = df[["date", "open", "high", "low", "close"]].sort_values("date")
-
         return {
             "year": df[df["date"] >= base_date - timedelta(days=365)].to_dict("records"),
             "quarter": df[df["date"] >= base_date - timedelta(days=90)].to_dict("records"),
             "month": df[df["date"] >= base_date - timedelta(days=30)].to_dict("records"),
         }
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         logger.exception(f"[ERROR] ❌ Failed to fetch data for {code}: {e}")
         return {"year": [], "quarter": [], "month": []}
 
-
-# ──────────────────────────────────────────────────────────────
 # 4. K 최적화 & 필터링 (음수 수익률 제외)
-# ──────────────────────────────────────────────────────────────
-
 def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict]:
     rebalance_date = datetime.strptime(rebalance_date_str, "%Y-%m-%d").date()
-    today = datetime.today().date()
-
     top50_df = get_kosdaq_top_50(rebalance_date_str)
     if top50_df.empty:
         logger.warning("[WARN] get_kosdaq_top_50 결과 없음 → 빈 리스트 반환")
         return []
 
     result_map: Dict[str, Dict] = {}
-
     for _, stock in top50_df.iterrows():
         code, name = stock["Code"], stock["Name"]
         try:
@@ -143,14 +117,11 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict]:
                 logger.debug(f"[SKIP] {name}({code}) 전월 데이터 없음")
                 continue
 
-            # 최근 1달 데이터로 K 최적화
             m_metrics = simulate_k_range_for(code, month_data)
             best_k = get_best_k_meta([], [], m_metrics)
-
-            # best_k 성과 계산 & 음수 필터
             month_perf = simulate_with_k_and_get_metrics(code, best_k, month_data)
             avg_return = month_perf["avg_return_pct"]
-            if avg_return <= 0:  # 음수(0 포함) 수익률 제외
+            if avg_return <= 0:
                 logger.debug(f"[FILTER] {name}({code}) 수익률 {avg_return:.2f}% ≤ 0 → 제외")
                 continue
 
@@ -188,20 +159,15 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict]:
                 "close": close_price,
             }
 
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             logger.exception(f"[ERR] {name}({code}) 시뮬 실패: {e}")
 
     logger.info(f"📊 필터 통과 종목 = {len(result_map)}개")
     return list(result_map.values())
 
-
-# ──────────────────────────────────────────────────────────────
 # 5. 메타 점수 집계 함수 (가중합)
-# ──────────────────────────────────────────────────────────────
-
 def get_best_k_meta(year_metrics: List[Dict], quarter_metrics: List[Dict], month_metrics: List[Dict]) -> float:
     scores: Dict[float, float] = {}
-
     def _update(metrics: List[Dict], weight: float):
         for m in metrics:
             k = round(m["k"], 2)

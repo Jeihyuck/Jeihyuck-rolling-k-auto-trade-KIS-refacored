@@ -106,20 +106,20 @@ class KisAPI:
         tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         headers = self._headers(tr_id)
-        # 현재가가 안 들어왔으면 조회
         if price is None:
             price = self.get_current_price(code)
         data = {
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",  # 시장가 (KIS에서 단가 필수!)
+            "ORD_DVSN": "00",  # 시장가
             "ORD_QTY": str(int(float(qty))).strip(),
             "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
         resp = requests.post(url, headers=headers, json=data).json()
         if resp.get("rt_cd") == "0":
+            logger.info(f"[매수 체결 응답] {resp}")
             return resp["output"]
         elif resp.get("msg1") == "모의투자 장종료 입니다.":
             logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
@@ -130,6 +130,35 @@ class KisAPI:
         else:
             logger.error(f"[ORDER_FAIL] {resp}")
             raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
+
+    def sell_stock(self, code, qty, price=None):
+        tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        headers = self._headers(tr_id)
+        if price is None:
+            price = self.get_current_price(code)
+        data = {
+            "CANO": safe_strip(self.CANO),
+            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
+            "PDNO": str(code).strip(),
+            "ORD_DVSN": "00",  # 시장가
+            "ORD_QTY": str(int(float(qty))).strip(),
+            "ORD_UNPR": str(int(float(price))).strip(),
+        }
+        logger.info(f"[매도주문 요청파라미터] {data}")
+        resp = requests.post(url, headers=headers, json=data).json()
+        if resp.get("rt_cd") == "0":
+            logger.info(f"[매도 체결 응답] {resp}")
+            return resp["output"]
+        elif resp.get("msg1") == "모의투자 장종료 입니다.":
+            logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시(정상)")
+            return None
+        elif "초과" in resp.get("msg1", ""):
+            logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+            return None
+        else:
+            logger.error(f"[SELL_ORDER_FAIL] {resp}")
+            raise Exception(f"매도주문 실패({code}): {resp.get('msg1', resp)}")
 
     def get_cash_balance(self):
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
