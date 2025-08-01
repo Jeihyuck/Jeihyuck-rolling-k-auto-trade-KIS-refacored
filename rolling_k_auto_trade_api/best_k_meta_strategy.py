@@ -40,7 +40,7 @@ def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
             return pd.DataFrame()
 
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
-        mktcap_df["Code"] = mktcap_df["Code"].astype(str).zfill(6)
+        mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
         fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
         fdr_df["Code"] = fdr_df["Code"].astype(str).zfill(6)
         merged = pd.merge(fdr_df[["Code", "Name"]], mktcap_df[["Code", "Marcap"]], on="Code", how="inner")
