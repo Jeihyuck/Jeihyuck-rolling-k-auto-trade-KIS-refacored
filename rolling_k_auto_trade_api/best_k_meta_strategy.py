@@ -42,7 +42,7 @@ def get_kosdaq_top_50(date_str: str | None = None) -> pd.DataFrame:
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
         fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
-        fdr_df["Code"] = fdr_df["Code"].astype(str).zfill(6)
+        fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
         merged = pd.merge(fdr_df[["Code", "Name"]], mktcap_df[["Code", "Marcap"]], on="Code", how="inner")
         if "Marcap" not in merged.columns:
             for cand in ("Marcap_x", "Marcap_y", "MarketCap", "MarketCap_x", "MarketCap_y"):
@@ -182,4 +182,3 @@ def get_best_k_meta(year_metrics: List[Dict], quarter_metrics: List[Dict], month
         return 0.5
     best_k, _ = max(scores.items(), key=lambda x: x[1])
     return round(best_k, 2)
-
