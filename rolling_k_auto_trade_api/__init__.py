@@ -1,1 +1,1 @@
-"""Rolling K Auto Trade API package."""
+"""Rolling K Auto Trade API package.  """
