@@ -1,1 +1,1 @@
-"""Trade API package."""
+"""Trade API package.   """
