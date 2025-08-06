@@ -68,7 +68,7 @@ class KisAPI:
         url = f"{API_BASE_URL}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
-        resp = requests.post(url, json=data, headers=headers).json()
+        resp = requests.post(url, json=data, headers=headers, timeout=5).json()
         if "access_token" in resp:
             logger.info(f"[🔑 토큰발급] 성공: {resp}")
             return resp["access_token"], resp["expires_in"]
@@ -96,10 +96,15 @@ class KisAPI:
                     "fid_cond_mrkt_div_code": market_div,
                     "fid_input_iscd": code_fmt
                 }
-                resp = requests.get(url, headers=headers, params=params).json()
-                tried.append((market_div, code_fmt, resp.get("rt_cd"), resp.get("msg1")))
-                if resp.get("rt_cd") == "0" and "output" in resp:
-                    return float(resp["output"]["stck_prpr"])
+                for i in range(3):
+                    try:
+                        resp = requests.get(url, headers=headers, params=params, timeout=5).json()
+                        tried.append((market_div, code_fmt, resp.get("rt_cd"), resp.get("msg1")))
+                        if resp.get("rt_cd") == "0" and "output" in resp:
+                            return float(resp["output"]["stck_prpr"])
+                    except Exception as e:
+                        logger.error(f"[현재가조회오류][{code}] {e}")
+                        time.sleep(1)
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
     def buy_stock(self, code, qty, price=None):
@@ -112,24 +117,29 @@ class KisAPI:
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",  # 시장가
+            "ORD_DVSN": "00",
             "ORD_QTY": str(int(float(qty))).strip(),
             "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
-        resp = requests.post(url, headers=headers, json=data).json()
-        if resp.get("rt_cd") == "0":
-            logger.info(f"[매수 체결 응답] {resp}")
-            return resp["output"]
-        elif resp.get("msg1") == "모의투자 장종료 입니다.":
-            logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
-            return None
-        elif "초과" in resp.get("msg1", ""):
-            logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
-            return None
-        else:
-            logger.error(f"[ORDER_FAIL] {resp}")
-            raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
+        for i in range(3):
+            try:
+                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
+                if resp.get("rt_cd") == "0":
+                    logger.info(f"[매수 체결 응답] {resp}")
+                    return resp["output"]
+                elif resp.get("msg1") == "모의투자 장종료 입니다.":
+                    logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
+                    return None
+                elif "초과" in resp.get("msg1", ""):
+                    logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+                    return None
+                else:
+                    logger.error(f"[ORDER_FAIL] {resp}")
+            except Exception as e:
+                logger.error(f"[매수주문 예외][{code}] {e}")
+                time.sleep(1)
+        raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
 
     def sell_stock(self, code, qty, price=None):
         tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
@@ -141,24 +151,29 @@ class KisAPI:
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",  # 시장가
+            "ORD_DVSN": "00",
             "ORD_QTY": str(int(float(qty))).strip(),
             "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매도주문 요청파라미터] {data}")
-        resp = requests.post(url, headers=headers, json=data).json()
-        if resp.get("rt_cd") == "0":
-            logger.info(f"[매도 체결 응답] {resp}")
-            return resp["output"]
-        elif resp.get("msg1") == "모의투자 장종료 입니다.":
-            logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시(정상)")
-            return None
-        elif "초과" in resp.get("msg1", ""):
-            logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
-            return None
-        else:
-            logger.error(f"[SELL_ORDER_FAIL] {resp}")
-            raise Exception(f"매도주문 실패({code}): {resp.get('msg1', resp)}")
+        for i in range(3):
+            try:
+                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
+                if resp.get("rt_cd") == "0":
+                    logger.info(f"[매도 체결 응답] {resp}")
+                    return resp["output"]
+                elif resp.get("msg1") == "모의투자 장종료 입니다.":
+                    logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시(정상)")
+                    return None
+                elif "초과" in resp.get("msg1", ""):
+                    logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+                    return None
+                else:
+                    logger.error(f"[SELL_ORDER_FAIL] {resp}")
+            except Exception as e:
+                logger.error(f"[매도주문 예외][{code}] {e}")
+                time.sleep(1)
+        raise Exception(f"매도주문 실패({code}): {resp.get('msg1', resp)}")
 
     def get_cash_balance(self):
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -178,25 +193,43 @@ class KisAPI:
             "CTX_AREA_NK100": ""
         }
         logger.info(f"[잔고조회 요청파라미터] {params}")
-        resp = requests.get(url, headers=headers, params=params).json()
-        logger.info(f"[잔고조회 응답] {resp}")
-        if resp.get("rt_cd") == "0" and "output2" in resp and resp["output2"]:
+        for i in range(3):
             try:
-                cash = int(resp["output2"][0]["dnca_tot_amt"])
-                logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
-                return cash
+                resp = requests.get(url, headers=headers, params=params, timeout=5).json()
+                logger.info(f"[잔고조회 응답] {resp}")
+                if resp.get("rt_cd") == "0" and "output2" in resp and resp["output2"]:
+                    try:
+                        cash = int(resp["output2"][0]["dnca_tot_amt"])
+                        logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
+                        return cash
+                    except Exception as e:
+                        logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
+                        return 0
+                else:
+                    logger.error(f"[CASH_BALANCE_PARSE_FAIL] {resp}")
             except Exception as e:
-                logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
-                return 0
-        else:
-            logger.error(f"[CASH_BALANCE_PARSE_FAIL] {resp}")
-            return 0
+                logger.error(f"[잔고조회 예외]{e}")
+                time.sleep(1)
+        return 0
 
-    def is_market_open(self):
-        KST = pytz.timezone('Asia/Seoul')
-        now = datetime.now(KST)
-        if now.weekday() >= 5:
-            return False
-        open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)  # <=== 여기 15:20으로 변경!
-        return open_time <= now <= close_time
+    def get_balance(self):
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._headers("VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R")
+        params = {
+            "CANO": safe_strip(self.CANO),
+            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
+            "AFHR_FLPR_YN": "N",
+            "UNPR_YN": "N",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "OFL_YN": "N",
+            "INQR_DVSN": "02",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
+        }
+        logger.info(f"[보유잔고 전체조회 요청파라미터] {params}")
+        for i in range(3):
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=5).json()
