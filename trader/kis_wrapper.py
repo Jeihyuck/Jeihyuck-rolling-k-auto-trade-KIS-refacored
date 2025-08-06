@@ -233,3 +233,20 @@ class KisAPI:
         for i in range(3):
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=5).json()
+                if resp.get("rt_cd") == "0" and "output1" in resp:
+                    return resp["output1"]
+                else:
+                    logger.error(f"[잔고 전체조회 실패] {resp}")
+            except Exception as e:
+                logger.error(f"[잔고전체조회 예외]{e}")
+                time.sleep(1)
+        return []
+
+    def is_market_open(self):
+        KST = pytz.timezone('Asia/Seoul')
+        now = datetime.now(KST)
+        if now.weekday() >= 5:
+            return False
+        open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
+        return open_time <= now <= close_time
