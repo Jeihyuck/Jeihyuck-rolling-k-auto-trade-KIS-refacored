@@ -39,12 +39,16 @@ jobs:
           sleep 30  # 서버 구동 시간 여유 확보
 
       - name: trader 자동매매 로직 실행
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python trader/trader.py
+          python -m trader.trader
 
       - name: CEO 리포트 자동 생성
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python  trader/report_ceo.py
+          python -m trader.report_ceo
 
       - name: CEO 리포트 artifact 업로드
         uses: actions/upload-artifact@v4
