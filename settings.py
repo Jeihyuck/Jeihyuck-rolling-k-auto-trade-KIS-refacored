@@ -22,9 +22,6 @@ KIS_ENV        = safe_strip(os.getenv("KIS_ENV", "practice"))
 if KIS_ENV == "real":
     API_BASE_URL = "https://openapi.koreainvestment.com:9443"
 else:
-<<<<<<< HEAD
-    API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
-=======
     API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
 # 추가 옵션 (필요시)
@@ -42,4 +39,3 @@ logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 
 # 필요시 추가 세팅/유틸 함수도 이 파일에 정의
->>>>>>> KIS/realtimetrade
