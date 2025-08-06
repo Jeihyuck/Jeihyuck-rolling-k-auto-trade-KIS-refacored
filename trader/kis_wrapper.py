@@ -22,7 +22,7 @@ logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 class KisAPI:
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
     _cache_path = "kis_token_cache.json"
-    _token_lock = threading.Lock()  # 락 추가
+    _token_lock = threading.Lock()
 
     def __init__(self):
         self.CANO = safe_strip(CANO)
@@ -198,5 +198,5 @@ class KisAPI:
         if now.weekday() >= 5:
             return False
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)  # <=== 여기 15:20으로 변경!
         return open_time <= now <= close_time

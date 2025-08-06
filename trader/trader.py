@@ -46,7 +46,7 @@ def main():
         logger.info("[⏰ 장 종료] 실매수/매도 주문 생략, 현재가만 조회")
 
     holding = {}  # {code: {'qty': int, 'buy_price': float, ...}}
-    sell_conditions = {  # 매도조건을 예시로 세팅 (목표수익률 3%, 손절 -2%)
+    sell_conditions = {  # 매도조건 예시 (익절 3%, 손절 -2%)
         'profit_pct': 3.0,
         'loss_pct': -2.0
     }
@@ -140,22 +140,25 @@ def main():
 
     # 4. 장마감 시 미매도 종목 전량 시장가 매도 (실전 리스크 방지)
     if is_open:
-        for code, info in holding.items():
-            try:
-                qty = info['qty']
-                result = kis.sell_stock(code, qty)
-                logger.info(f"[🏁 장마감 전량매도] {code}, 수량: {qty}, 응답: {result}")
-                trade = {
-                    **info['trade_common'],
-                    "side": "SELL",
-                    "price": kis.get_current_price(code),
-                    "amount": kis.get_current_price(code) * qty,
-                    "result": result,
-                    "reason": "장마감 전 강제전량매도"
-                }
-                log_trade(trade)
-            except Exception as e:
-                logger.error(f"[❌ 장마감 전량매도 실패] 종목: {code}, 오류: {e}")
+        # 15:20에만 동작하게 추가
+        now = datetime.now()
+        if now.hour == 15 and now.minute >= 20:
+            for code, info in holding.items():
+                try:
+                    qty = info['qty']
+                    result = kis.sell_stock(code, qty)
+                    logger.info(f"[🏁 장마감 전량매도] {code}, 수량: {qty}, 응답: {result}")
+                    trade = {
+                        **info['trade_common'],
+                        "side": "SELL",
+                        "price": kis.get_current_price(code),
+                        "amount": kis.get_current_price(code) * qty,
+                        "result": result,
+                        "reason": "장마감 전 강제전량매도"
+                    }
+                    log_trade(trade)
+                except Exception as e:
+                    logger.error(f"[❌ 장마감 전량매도 실패] 종목: {code}, 오류: {e}")
 
 if __name__ == "__main__":
     main()
