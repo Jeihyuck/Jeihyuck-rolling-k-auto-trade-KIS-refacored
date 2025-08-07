@@ -85,9 +85,12 @@ def main():
 
             # ====== 현재 보유 현황 API로 동기화 ======
             try:
-                balances = kis.get_balance()
+                balances = kis.get_balance()  # 반드시 output1만 사용
+                logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
+                for stock in balances:
+                    logger.info(f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, 보유수량: {stock.get('hldg_qty')}")
                 # balances 예시: [{ 'pdno': '005930', 'hldg_qty': '10', ... }]
-                current_holding = {b['pdno']: int(b['hldg_qty']) for b in balances if int(b.get('hldg_qty', 0)) > 0}
+                current_holding = {b['pdno']: int(float(b['hldg_qty'])) for b in balances if int(float(b.get('hldg_qty', 0))) > 0}
                 # 보유 수량 0이면 holding 에서 제거
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:

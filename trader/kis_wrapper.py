@@ -234,24 +234,12 @@ class KisAPI:
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=5).json()
                 logger.info(f"[잔고조회 RAW 응답] {json.dumps(resp, ensure_ascii=False, indent=2)}")
-                if resp.get("rt_cd") == "0":
-                    # 표준: output2가 보유종목 리스트
-                    if resp.get("output2") and isinstance(resp["output2"], list):
-                        logger.info(f"[잔고조회] output2(보유종목리스트) {len(resp['output2'])}개")
-                        return resp["output2"]
-                    # 백업: output1
-                    elif resp.get("output1") and isinstance(resp["output1"], list):
-                        logger.info(f"[잔고조회] output1(보유종목리스트) {len(resp['output1'])}개")
-                        return resp["output1"]
-                    # 마지막 백업: output
-                    elif resp.get("output") and isinstance(resp["output"], list):
-                        logger.info(f"[잔고조회] output(보유종목리스트) {len(resp['output'])}개")
-                        return resp["output"]
-                    else:
-                        logger.warning(f"[잔고조회 결과없음] output2/output1/output 모두 비어있음. resp={resp}")
-                        return []
+                if resp.get("rt_cd") == "0" and "output1" in resp and isinstance(resp["output1"], list):
+                    logger.info(f"[잔고조회] output1(보유종목리스트) {len(resp['output1'])}개")
+                    return resp["output1"]
                 else:
-                    logger.error(f"[잔고조회 실패] {resp}")
+                    logger.warning(f"[잔고조회 결과없음] output1이 비어있음. resp={resp}")
+                    return []
             except Exception as e:
                 logger.error(f"[잔고전체조회 예외]{e}")
                 time.sleep(1)
