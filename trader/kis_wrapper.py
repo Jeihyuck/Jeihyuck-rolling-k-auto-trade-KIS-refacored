@@ -310,3 +310,4 @@ class KisAPI:
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 정규장 15:30
         return open_time <= now <= close_time
+
