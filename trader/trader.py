@@ -48,6 +48,10 @@ def get_month_first_date():
     return month_first.strftime("%Y-%m-%d")
 
 def fetch_rebalancing_targets(date):
+    """
+    /rebalance/run/{date}?force_order=true 호출 결과에서
+    selected 또는 selected_stocks 키를 우선 사용.
+    """
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
     response = requests.post(REBALANCE_API_URL)
     logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")
@@ -96,10 +100,24 @@ def _safe_get_price(kis: KisAPI, code: str):
         logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
         return None
 
+def _to_int(val, default=0):
+    try:
+        return int(float(val))
+    except Exception:
+        return default
+
+def _to_float(val, default=None):
+    try:
+        return float(val)
+    except Exception:
+        return default
+
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     """
     1회 매도 시도(시장가 우선). 현재가는 로깅용이며 실패해도 매도 시도는 진행.
     실패 시 토큰 갱신 후 1회 추가 재시도.
+    - KisAPI에 sell_stock_market이 있으면 우선 사용
+    - 없으면 sell_stock(지정가)로 폴백
     """
     cur_price = _safe_get_price(kis, code)
 
@@ -141,8 +159,11 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
     if not targets_codes:
         return set()
 
+    # 대상 집합 방어: None/공백 제거
+    targets_codes = {c for c in targets_codes if c}
+
     balances = _fetch_balances(kis)
-    qty_map = {b.get("pdno"): int(float(b.get("hldg_qty", 0))) for b in balances}
+    qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances}
     remaining = set()
 
     for code in list(targets_codes):
@@ -151,7 +172,6 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             logger.info(f"[스킵] {code}: 실제 잔고 수량 0")
             continue
 
-        # trade_common 정보는 holding에 없을 수 있으므로 간략 구성
         cur_price, result = _sell_once(kis, code, qty, prefer_market=prefer_market)
         log_trade({
             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -163,7 +183,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             "strategy": "강제전량매도",
             "side": "SELL",
             "price": cur_price if cur_price is not None else 0,
-            "amount": (int(cur_price) if cur_price is not None else 0) * int(qty),
+            "amount": (_to_int(cur_price, 0) * int(qty)) if cur_price is not None else 0,
             "result": result,
             "reason": reason
         })
@@ -171,7 +191,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
     # 1 패스 후 재조회로 잔존 파악
     balances_after = _fetch_balances(kis)
-    after_qty_map = {b.get("pdno"): int(float(b.get("hldg_qty", 0))) for b in balances_after}
+    after_qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances_after}
 
     for code in targets_codes:
         if after_qty_map.get(code, 0) > 0:
@@ -186,14 +206,14 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
     - False 이면 holding에 등록된 종목만 대상
     """
     # 초기 대상 집합 구성
-    target_codes = set(holding.keys())
+    target_codes = set([c for c in holding.keys() if c])
 
     if include_all_balances:
         try:
             balances = _fetch_balances(kis)
             for b in balances:
                 code = b.get("pdno")
-                if code and int(float(b.get("hldg_qty", 0))) > 0:
+                if code and _to_int(b.get("hldg_qty", 0)) > 0:
                     target_codes.add(code)
         except Exception as e:
             logger.error(f"[잔고조회 오류: 전체포함 불가] {e}")
@@ -241,8 +261,8 @@ def main():
 
     # 기본 매도조건(익절/손절)
     sell_conditions = {
-        'profit_pct': 3.0,
-        'loss_pct': -2.0
+        'profit_pct': 3.0,   # +3% 이상 익절
+        'loss_pct':  -2.0    # -2% 이하 손절
     }
 
     loop_sleep_sec = 3
@@ -260,7 +280,7 @@ def main():
                 logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
                 for stock in balances:
                     logger.info(f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, 보유수량: {stock.get('hldg_qty')}")
-                current_holding = {b['pdno']: int(float(b['hldg_qty'])) for b in balances if int(float(b.get('hldg_qty', 0))) > 0}
+                current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
                         logger.info(f"[보유종목 해제] {code} : 실제잔고 없음 → holding 제거")
@@ -270,11 +290,20 @@ def main():
 
             # ====== 매수/매도(전략) LOOP ======
             for code, target in code_to_target.items():
-                qty = target.get("매수수량") or target.get("qty")
-                k_value = target.get("best_k") or target.get("K") or target.get("k")
-                target_price = target.get("목표가") or target.get("target_price")
+                # 입력 방어
+                qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
+                if qty <= 0:
+                    logger.info(f"[SKIP] {code}: 매수수량 없음/0")
+                    continue
+
+                k_value = (target.get("best_k") or target.get("K") or target.get("k"))
+                target_price = _to_float(target.get("목표가") or target.get("target_price"))
                 strategy = target.get("strategy") or "전월 rolling K 최적화"
                 name = target.get("name") or target.get("종목명")
+
+                if target_price is None:
+                    logger.warning(f"[SKIP] {code}: target_price 누락")
+                    continue
 
                 try:
                     current_price = _with_retry(kis.get_current_price, code)
@@ -292,7 +321,7 @@ def main():
 
                     # --- 매수 ---
                     if is_open and code not in holding and code not in traded:
-                        if current_price >= float(target_price):
+                        if current_price is not None and current_price >= float(target_price):
                             result = _with_retry(kis.buy_stock, code, qty)
                             holding[code] = {
                                 'qty': int(qty),
@@ -312,20 +341,24 @@ def main():
                     # --- 익절/손절 매도 ---
                     if is_open and code in holding:
                         buy_info = holding[code]
-                        buy_price = buy_info['buy_price']
-                        bqty = buy_info['qty']
-                        profit_pct = ((current_price - buy_price) / buy_price) * 100
-                        if profit_pct >= sell_conditions['profit_pct'] or profit_pct <= sell_conditions['loss_pct']:
-                            cur_price, result = _sell_once(kis, code, bqty, prefer_market=True)
-                            logger.info(f"[✅ 매도주문] {code}, qty={bqty}, result={result}, 수익률: {profit_pct:.2f}%")
-                            log_trade({**trade_common, "side": "SELL", "price": cur_price,
-                                       "amount": int(cur_price) * int(bqty) if cur_price else 0,
-                                       "result": result,
-                                       "reason": f"매도조건 (수익률: {profit_pct:.2f}%)"})
-                            holding.pop(code, None)
-                            traded.pop(code, None)
-                            save_state(holding, traded)
-                            time.sleep(RATE_SLEEP_SEC)
+                        buy_price = _to_float(buy_info.get('buy_price'))
+                        bqty = _to_int(buy_info.get('qty'), 0)
+
+                        if bqty <= 0 or buy_price is None or current_price is None:
+                            logger.warning(f"[매도조건 판정불가] {code} qty={bqty}, buy_price={buy_price}, cur={current_price}")
+                        else:
+                            profit_pct = ((current_price - buy_price) / buy_price) * 100
+                            if profit_pct >= sell_conditions['profit_pct'] or profit_pct <= sell_conditions['loss_pct']:
+                                cur_price, result = _sell_once(kis, code, bqty, prefer_market=True)
+                                logger.info(f"[✅ 매도주문] {code}, qty={bqty}, result={result}, 수익률: {profit_pct:.2f}%")
+                                log_trade({**trade_common, "side": "SELL", "price": cur_price,
+                                           "amount": (int(cur_price) * int(bqty)) if cur_price else 0,
+                                           "result": result,
+                                           "reason": f"매도조건 (수익률: {profit_pct:.2f}%)"})
+                                holding.pop(code, None)
+                                traded.pop(code, None)
+                                save_state(holding, traded)
+                                time.sleep(RATE_SLEEP_SEC)
 
                 except Exception as e:
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
@@ -333,7 +366,6 @@ def main():
 
             # --- 장중 커트오프(KST) 강제 전량매도 ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
-                # 계좌 전체 포함(기본 True)
                 _force_sell_all(
                     kis=kis,
                     holding=holding,
@@ -365,3 +397,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

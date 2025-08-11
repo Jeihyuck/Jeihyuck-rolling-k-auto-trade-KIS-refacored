@@ -102,6 +102,18 @@ class KisAPI:
         logger.error(f"[🔑 토큰발급 실패]: {resp.get('error_description')}")
         raise Exception(f"토큰 발급 실패: {resp.get('error_description')}")
 
+    def refresh_token(self, force: bool = True):
+        """
+        외부(trader)에서 호출 가능한 강제 토큰 재발급 훅
+        """
+        try:
+            KisAPI._token_cache.update({"token": None, "expires_at": 0})
+            if force and os.path.exists(self._cache_path):
+                os.remove(self._cache_path)
+        except Exception:
+            pass
+        return self.get_valid_token()
+
     def _headers(self, tr_id):
         return {
             "authorization": f"Bearer {self.get_valid_token()}",
@@ -119,7 +131,7 @@ class KisAPI:
         tried = []
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = self._headers("FHKST01010100")
-        for market_div in ["J", "U"]:  # J: 주식, U: ETF/ETN 등 (백업)
+        for market_div in ["J", "U"]:  # J: 주식, U: ETF/ETN 등
             for code_fmt in [code, f"A{code}", code[1:] if str(code).startswith("A") else code]:
                 params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                 for _ in range(3):
@@ -133,6 +145,7 @@ class KisAPI:
                         time.sleep(0.7)
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
+    # ------------------------------ 매수(지정가) ------------------------------
     def buy_stock(self, code, qty, price=None):
         tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
@@ -148,25 +161,28 @@ class KisAPI:
             "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매수주문 요청파라미터] {data}")
+        last_resp = None
         for _ in range(3):
             try:
                 resp = requests.post(url, headers=headers, json=data, timeout=5).json()
+                last_resp = resp
                 if resp.get("rt_cd") == "0":
                     logger.info(f"[매수 체결 응답] {resp}")
                     return resp.get("output")
                 elif resp.get("msg1") == "모의투자 장종료 입니다.":
-                    logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시(정상)")
+                    logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시")
                     return None
                 elif "초과" in (resp.get("msg1") or ""):
-                    logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 주문 무시: {resp.get('msg1')}")
                     return None
                 else:
                     logger.error(f"[ORDER_FAIL] {resp}")
             except Exception as e:
                 logger.error(f"[매수주문 예외][{code}] {e}")
                 time.sleep(0.8)
-        raise Exception(f"매수주문 실패({code}): {resp.get('msg1', resp)}")
+        raise Exception(f"매수주문 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
 
+    # ------------------------------ 매도(지정가) ------------------------------
     def sell_stock(self, code, qty, price=None):
         tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
@@ -177,29 +193,72 @@ class KisAPI:
             "CANO": safe_strip(self.CANO),
             "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
             "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",
+            "ORD_DVSN": "00",         # 지정가
             "ORD_QTY": str(int(float(qty))).strip(),
             "ORD_UNPR": str(int(float(price))).strip(),
         }
         logger.info(f"[매도주문 요청파라미터] {data}")
+        last_resp = None
         for _ in range(3):
             try:
                 resp = requests.post(url, headers=headers, json=data, timeout=5).json()
+                last_resp = resp
                 if resp.get("rt_cd") == "0":
                     logger.info(f"[매도 체결 응답] {resp}")
                     return resp.get("output")
                 elif resp.get("msg1") == "모의투자 장종료 입니다.":
-                    logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시(정상)")
+                    logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시")
                     return None
                 elif "초과" in (resp.get("msg1") or ""):
-                    logger.warning(f"⏰ [KIS] API 사용량 초과(Throttle) — 주문 무시(정상): {resp.get('msg1')}")
+                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 주문 무시: {resp.get('msg1')}")
                     return None
                 else:
                     logger.error(f"[SELL_ORDER_FAIL] {resp}")
             except Exception as e:
                 logger.error(f"[매도주문 예외][{code}] {e}")
                 time.sleep(0.8)
-        raise Exception(f"매도주문 실패({code}): {resp.get('msg1', resp)}")
+        raise Exception(f"매도주문 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
+
+    # ------------------------------ 매도(시장가) ------------------------------
+    def sell_stock_market(self, code, qty):
+        """
+        시장가 매도 (현금)
+        - TR_ID: practice=VTTC0013U, real=TTTC0013U (order-cash 동일)
+        - 규격(일반적): ORD_DVSN='01', ORD_UNPR='0'
+          * 최신 KIS 규격에서 시장가 값이 다르면 ORD_DVSN/ORD_UNPR만 조정
+        """
+        tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        headers = self._headers(tr_id)
+        data = {
+            "CANO": safe_strip(self.CANO),
+            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
+            "PDNO": str(code).strip(),
+            "ORD_DVSN": "01",   # 시장가
+            "ORD_QTY": str(int(float(qty))).strip(),
+            "ORD_UNPR": "0",    # 시장가일 때 0
+        }
+        logger.info(f"[시장가 매도요청] {data}")
+        last_resp = None
+        for _ in range(3):
+            try:
+                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
+                last_resp = resp
+                if resp.get("rt_cd") == "0":
+                    logger.info(f"[시장가 매도 체결 응답] {resp}")
+                    return resp.get("output")
+                elif resp.get("msg1") == "모의투자 장종료 입니다.":
+                    logger.warning("⏰ [KIS] 장운영시간 외 시장가 매도 시도 — 무시")
+                    return None
+                elif "초과" in (resp.get("msg1") or ""):
+                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 무시: {resp.get('msg1')}")
+                    return None
+                else:
+                    logger.error(f"[SELL_MKT_FAIL] {resp}")
+            except Exception as e:
+                logger.error(f"[시장가 매도 예외][{code}] {e}")
+                time.sleep(0.8)
+        raise Exception(f"시장가 매도 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
 
     # ------------------------------------------------------------------
     # balances (with robust pagination)
@@ -222,16 +281,13 @@ class KisAPI:
         }
 
     def _select_holdings_list(self, resp: dict):
-        """KIS 모의/실계좌에서 페이지별로 holdings 위치가 달라질 수 있어 방어적으로 선택."""
-        # output1: 보유종목(가장 일반적)
+        """보유종목 리스트가 위치하는 키를 방어적으로 판별"""
         val = resp.get("output1")
         if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
             return "output1", val
-        # 일부 환경에서 output2가 종목일 때도 존재 (희귀)
         val = resp.get("output2")
         if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
             return "output2", val
-        # 구형/다른 엔드포인트
         val = resp.get("output")
         if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
             return "output", val
@@ -281,20 +337,16 @@ class KisAPI:
                     added += 1
                 logger.info(f"[잔고조회] {which}에서 {len(rows)}개 수신(신규 {added}개) 누적 {len(all_rows)}개")
             else:
-                # holdings가 이 페이지엔 없고 요약(output2)만 있을 수 있음
                 logger.info("[잔고조회] 이 페이지에 보유종목 리스트 없음 (요약 페이지만 수신)")
 
             # 다음 페이지 토큰
             ctx_fk_next = safe_strip(resp.get("ctx_area_fk100", ""))
             ctx_nk_next = safe_strip(resp.get("ctx_area_nk100", ""))
 
-            # 더 없으면 종료
             if not ctx_fk_next and not ctx_nk_next:
                 break
 
-            # 다음 반복 준비
             ctx_fk, ctx_nk = ctx_fk_next, ctx_nk_next
-            # 과도한 QPS 방지
             time.sleep(0.25)
 
         return all_rows
@@ -310,4 +362,3 @@ class KisAPI:
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 정규장 15:30
         return open_time <= now <= close_time
-
