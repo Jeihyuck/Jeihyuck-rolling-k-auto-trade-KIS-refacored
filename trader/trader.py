@@ -16,7 +16,7 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 
 # ====== 장중 강제 전량매도 커트오프 시각 설정 ======
 # 예) "14:30"으로 설정하면 14:30 이후 장중에 보유 종목 전량 매도
-SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:30").strip()
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:15").strip()
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
