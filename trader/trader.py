@@ -2,7 +2,7 @@ import logging
 import requests
 from .kis_wrapper import KisAPI
 from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo  # ✅ KST 비교를 위해 추가
+from zoneinfo import ZoneInfo
 import json
 from pathlib import Path
 import time
@@ -16,12 +16,21 @@ LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"
 
-# ====== 장중 강제 전량매도 커트오프 시각 설정 (KST 기준) ======
-SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:15").strip()
-SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "false").lower() == "true"
-RATE_SLEEP_SEC = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))  # 요청 간격
-
+# ====== 시간대(KST) 및 설정 ======
 KST = ZoneInfo("Asia/Seoul")
+
+# 장중 강제 전량매도 커트오프 (KST 기준)
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:15").strip()
+
+# 커트오프/장마감 시 보유 전 종목(계좌 잔고 전체) 포함 여부 (기본 True)
+SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
+
+# API 호출 간 최소 휴지시간(초)
+RATE_SLEEP_SEC = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
+
+# 커트오프/장마감 매도 시 패스(회차) 수
+FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "3"))
+FORCE_SELL_PASSES_CLOSE  = int(os.getenv("FORCE_SELL_PASSES_CLOSE",  "5"))
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -34,7 +43,7 @@ def _parse_hhmm(hhmm: str) -> dtime:
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 
 def get_month_first_date():
-    today = datetime.now(KST)  # ✅ 리밸런싱 기준일도 KST 기준
+    today = datetime.now(KST)
     month_first = today.replace(day=1)
     return month_first.strftime("%Y-%m-%d")
 
@@ -66,7 +75,7 @@ def load_state():
             return state.get("holding", {}), state.get("traded", {})
     return {}, {}
 
-# ----- 네트워크/게이트웨이 오류 보강: 재시도 공용 함수 -----
+# ----- 공용 재시도 래퍼 -----
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -74,32 +83,36 @@ def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             last_err = e
-            # IGW00008, SSLEOF, RemoteDisconnected 등은 일시 오류 가능성이 높음
-            sleep_sec = base_delay * (1.6 ** (attempt - 1)) + random.uniform(0, 0.2)
+            sleep_sec = base_delay * (1.6 ** (attempt - 1)) + random.uniform(0, 0.25)
             logger.error(f"[재시도 {attempt}/{max_retries}] {func.__name__} 실패: {e} → {sleep_sec:.2f}s 대기 후 재시도")
             time.sleep(sleep_sec)
-    # 최종 실패
     raise last_err
+
+def _safe_get_price(kis: KisAPI, code: str):
+    """현재가 조회 실패해도 매도는 진행할 수 있도록 None을 허용."""
+    try:
+        return _with_retry(kis.get_current_price, code)
+    except Exception as e:
+        logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
+        return None
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     """
-    시장가 매도를 선호. 래퍼가 market 옵션을 지원하면 사용,
-    없으면 기존 sell_stock으로 폴백.
+    1회 매도 시도(시장가 우선). 현재가는 로깅용이며 실패해도 매도 시도는 진행.
+    실패 시 토큰 갱신 후 1회 추가 재시도.
     """
-    # 현재가 1회 조회(로깅·금액 계산용)
-    cur_price = _with_retry(kis.get_current_price, code)
+    cur_price = _safe_get_price(kis, code)
 
     try:
         if prefer_market and hasattr(kis, "sell_stock_market"):
             result = _with_retry(kis.sell_stock_market, code, qty)
         else:
-            # 래퍼가 시장가 옵션을 지원하지 않는 경우 폴백
             result = _with_retry(kis.sell_stock, code, qty)
     except Exception as e:
-        # 토큰 만료/세션 문제 가능성 → 토큰 갱신 후 1회 재도전
-        logger.warning(f"[매도 재시도:토큰갱신] {code} qty={qty} err={e}")
+        logger.warning(f"[매도 재시도: 토큰 갱신 후 1회] {code} qty={qty} err={e}")
         try:
-            kis.refresh_token() if hasattr(kis, "refresh_token") else None
+            if hasattr(kis, "refresh_token"):
+                kis.refresh_token()
         except Exception:
             pass
         if prefer_market and hasattr(kis, "sell_stock_market"):
@@ -110,75 +123,109 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     logger.info(f"[매도호출] {code}, qty={qty}, price(log)={cur_price}, result={result}")
     return cur_price, result
 
-def _force_sell_all(kis: KisAPI, holding: dict, traded: dict, balances: list, reason: str, prefer_market=True):
+def _fetch_balances(kis: KisAPI):
     """
-    보유 전량 강제 매도.
-    - 기본은 프로그램이 매수해 추적 중인 holding 대상
-    - SELL_ALL_BALANCES_AT_CUTOFF=true 이면 계좌 잔고 전체 포함
+    잔고 조회 통합. KisAPI가 get_balance_all을 제공하면 활용,
+    없으면 get_balance() 사용. (get_balance 내부가 페이징을 처리한다고 가정)
     """
-    # 매도 대상 집합 구성
-    codes_to_sell = set(holding.keys())
-    if SELL_ALL_BALANCES_AT_CUTOFF:
-        for b in balances:
-            code = b.get("pdno")
-            if code and int(float(b.get("hldg_qty", 0))) > 0:
-                codes_to_sell.add(code)
+    if hasattr(kis, "get_balance_all"):
+        return _with_retry(kis.get_balance_all)
+    return _with_retry(kis.get_balance)
 
-    if not codes_to_sell:
+def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
+    """
+    주어진 코드 집합에 대해 1 패스 매도 시도.
+    실제 잔고 수량 0이거나 매도 성공 시 집합에서 제거.
+    실패/잔존은 다음 패스에서 재시도.
+    """
+    if not targets_codes:
+        return set()
+
+    balances = _fetch_balances(kis)
+    qty_map = {b.get("pdno"): int(float(b.get("hldg_qty", 0))) for b in balances}
+    remaining = set()
+
+    for code in list(targets_codes):
+        qty = qty_map.get(code, 0)
+        if qty <= 0:
+            logger.info(f"[스킵] {code}: 실제 잔고 수량 0")
+            continue
+
+        # trade_common 정보는 holding에 없을 수 있으므로 간략 구성
+        cur_price, result = _sell_once(kis, code, qty, prefer_market=prefer_market)
+        log_trade({
+            "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "name": None,
+            "qty": qty,
+            "K": None,
+            "target_price": None,
+            "strategy": "강제전량매도",
+            "side": "SELL",
+            "price": cur_price if cur_price is not None else 0,
+            "amount": (int(cur_price) if cur_price is not None else 0) * int(qty),
+            "result": result,
+            "reason": reason
+        })
+        time.sleep(RATE_SLEEP_SEC)
+
+    # 1 패스 후 재조회로 잔존 파악
+    balances_after = _fetch_balances(kis)
+    after_qty_map = {b.get("pdno"): int(float(b.get("hldg_qty", 0))) for b in balances_after}
+
+    for code in targets_codes:
+        if after_qty_map.get(code, 0) > 0:
+            remaining.add(code)
+
+    return remaining
+
+def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True):
+    """
+    강제 전량 매도(여러 패스로 견고하게).
+    - include_all_balances=True 이면 계좌 잔고 전체 대상
+    - False 이면 holding에 등록된 종목만 대상
+    """
+    # 초기 대상 집합 구성
+    target_codes = set(holding.keys())
+
+    if include_all_balances:
+        try:
+            balances = _fetch_balances(kis)
+            for b in balances:
+                code = b.get("pdno")
+                if code and int(float(b.get("hldg_qty", 0))) > 0:
+                    target_codes.add(code)
+        except Exception as e:
+            logger.error(f"[잔고조회 오류: 전체포함 불가] {e}")
+
+    if not target_codes:
+        logger.info("[강제전량매도] 대상 종목 없음")
         return
 
-    logger.info(f"[⚠️ 강제전량매도] 사유: {reason} / 대상 종목수: {len(codes_to_sell)} / 전체잔고포함={SELL_ALL_BALANCES_AT_CUTOFF}")
+    logger.info(f"[⚠️ 강제전량매도] 사유: {reason} / 대상 종목수: {len(target_codes)} / 전체잔고포함={include_all_balances}")
 
-    for code in list(codes_to_sell):
-        try:
-            qty = None
-            # 우선 balances에서 실제 수량 확인
-            for b in balances:
-                if b.get("pdno") == code:
-                    qty = int(float(b.get("hldg_qty", 0)))
-                    break
-            if not qty or qty <= 0:
-                logger.info(f"[스킵] {code}: 실제 잔고 수량 0")
-                continue
+    remaining = target_codes
+    for p in range(1, max(1, passes) + 1):
+        logger.info(f"[강제전량매도 PASS {p}/{passes}] 대상 {len(remaining)}종목 시도")
+        remaining = _force_sell_pass(kis, remaining, reason=reason, prefer_market=prefer_market)
+        if not remaining:
+            logger.info("[강제전량매도] 모든 종목 매도 완료")
+            break
 
-            # trade_common 정보 확보
-            tc = holding.get(code, {}).get("trade_common", {
-                "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                "code": code,
-                "name": None,
-                "qty": qty,
-                "K": None,
-                "target_price": None,
-                "strategy": "강제전량매도"
-            })
+    if remaining:
+        logger.error(f"[강제전량매도] 미매도 잔여 {len(remaining)}종목: {sorted(list(remaining))}")
 
-            cur_price, result = _sell_once(kis, code, qty, prefer_market=prefer_market)
-
-            trade = {
-                **tc,
-                "side": "SELL",
-                "price": cur_price,
-                "amount": int(cur_price) * int(qty),
-                "result": result,
-                "reason": reason
-            }
-            log_trade(trade)
-
-            # 상태 정리
-            if code in holding:
-                holding.pop(code, None)
-            traded.pop(code, None)
-
-            save_state(holding, traded)
-            time.sleep(RATE_SLEEP_SEC)
-        except Exception as e:
-            logger.error(f"[❌ 강제매도 실패] {code} : {e}")
+    # 상태 정리: holding에서 제거(혹시 남아있더라도 이후 루프에서 잔고동기화로 해제됨)
+    for code in list(holding.keys()):
+        holding.pop(code, None)
+    save_state(holding, {})  # traded는 의미 없으므로 비움
 
 def main():
     kis = KisAPI()
     rebalance_date = get_month_first_date()
     logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date}")
-    logger.info(f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도옵션={SELL_ALL_BALANCES_AT_CUTOFF}")
+    logger.info(f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
+                f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}")
 
     # ======== 상태 복구 ========
     holding, traded = load_state()
@@ -192,30 +239,27 @@ def main():
         if code:
             code_to_target[code] = target
 
-    # 기본 매도조건
+    # 기본 매도조건(익절/손절)
     sell_conditions = {
         'profit_pct': 3.0,
         'loss_pct': -2.0
     }
 
-    loop_sleep_sec = 3  # 루프 주기(초)
+    loop_sleep_sec = 3
 
     try:
         while True:
-            # 장 상태 및 현재시각(KST)
             is_open = kis.is_market_open()
             now_dt_kst = datetime.now(KST)
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[⏰ 장상태] {'OPEN' if is_open else 'CLOSED'} / KST={now_str}")
 
-            # ====== 현재 보유 현황 동기화 ======
-            balances = []
+            # ====== 잔고 동기화 ======
             try:
-                balances = _with_retry(kis.get_balance)  # output1만 사용
+                balances = _fetch_balances(kis)
                 logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
                 for stock in balances:
                     logger.info(f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, 보유수량: {stock.get('hldg_qty')}")
-                # 보유 수량 0이면 holding에서 제거
                 current_holding = {b['pdno']: int(float(b['hldg_qty'])) for b in balances if int(float(b.get('hldg_qty', 0))) > 0}
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
@@ -224,7 +268,7 @@ def main():
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
 
-            # ====== 매수/매도 LOOP ======
+            # ====== 매수/매도(전략) LOOP ======
             for code, target in code_to_target.items():
                 qty = target.get("매수수량") or target.get("qty")
                 k_value = target.get("best_k") or target.get("K") or target.get("k")
@@ -246,7 +290,7 @@ def main():
                         "strategy": strategy,
                     }
 
-                    # --- 매수 시도 ---
+                    # --- 매수 ---
                     if is_open and code not in holding and code not in traded:
                         if current_price >= float(target_price):
                             result = _with_retry(kis.buy_stock, code, qty)
@@ -257,21 +301,15 @@ def main():
                             }
                             traded[code] = {"buy_time": now_str, "qty": int(qty), "price": float(current_price)}
                             logger.info(f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}")
-                            trade = {
-                                **trade_common,
-                                "side": "BUY",
-                                "price": current_price,
-                                "amount": int(current_price) * int(qty),
-                                "result": result
-                            }
-                            log_trade(trade)
+                            log_trade({**trade_common, "side": "BUY", "price": current_price,
+                                       "amount": int(current_price) * int(qty), "result": result})
                             save_state(holding, traded)
                             time.sleep(RATE_SLEEP_SEC)
                         else:
                             logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({target_price}), 미매수")
                             continue
 
-                    # --- 매도 조건(익절/손절) ---
+                    # --- 익절/손절 매도 ---
                     if is_open and code in holding:
                         buy_info = holding[code]
                         buy_price = buy_info['buy_price']
@@ -280,15 +318,10 @@ def main():
                         if profit_pct >= sell_conditions['profit_pct'] or profit_pct <= sell_conditions['loss_pct']:
                             cur_price, result = _sell_once(kis, code, bqty, prefer_market=True)
                             logger.info(f"[✅ 매도주문] {code}, qty={bqty}, result={result}, 수익률: {profit_pct:.2f}%")
-                            trade = {
-                                **trade_common,
-                                "side": "SELL",
-                                "price": cur_price,
-                                "amount": int(cur_price) * int(bqty),
-                                "result": result,
-                                "reason": f"매도조건 (수익률: {profit_pct:.2f}%)"
-                            }
-                            log_trade(trade)
+                            log_trade({**trade_common, "side": "SELL", "price": cur_price,
+                                       "amount": int(cur_price) * int(bqty) if cur_price else 0,
+                                       "result": result,
+                                       "reason": f"매도조건 (수익률: {profit_pct:.2f}%)"})
                             holding.pop(code, None)
                             traded.pop(code, None)
                             save_state(holding, traded)
@@ -298,21 +331,27 @@ def main():
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
                     continue
 
-            # --- (신규) 장중 커트오프 시각(KST) 강제 전량매도 ---
-            if is_open and holding and now_dt_kst.time() >= SELL_FORCE_TIME:
+            # --- 장중 커트오프(KST) 강제 전량매도 ---
+            if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
+                # 계좌 전체 포함(기본 True)
                 _force_sell_all(
-                    kis, holding, traded, balances,
+                    kis=kis,
+                    holding=holding,
                     reason=f"장중 강제전량매도(커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} KST)",
+                    passes=FORCE_SELL_PASSES_CUTOFF,
+                    include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
                     prefer_market=True
                 )
-                # 이후에도 루프는 유지(상태 저장은 내부에서 수행)
+                # 이후에도 루프는 유지(남은 상태는 다음 루프에서 다시 동기화)
 
-            # --- 장마감시 전량매도 (기존 구조 유지, 더블세이프) ---
-            if not is_open and holding:
-                logger.info("[🏁 장마감, 전량 시장가 매도]")
+            # --- 장마감 전량매도(더블 세이프) ---
+            if not is_open:
                 _force_sell_all(
-                    kis, holding, traded, balances,
+                    kis=kis,
+                    holding=holding,
                     reason="장마감 전 강제전량매도",
+                    passes=FORCE_SELL_PASSES_CLOSE,
+                    include_all_balances=True,   # 장마감 시에는 무조건 전체 잔고 대상
                     prefer_market=True
                 )
                 logger.info("[✅ 장마감, 루프 종료]")
