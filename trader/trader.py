@@ -20,7 +20,7 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 KST = ZoneInfo("Asia/Seoul")
 
 # 장중 강제 전량매도 커트오프 (KST 기준)
-SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:15").strip()
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "10:25").strip()
 
 # 커트오프/장마감 시 보유 전 종목(계좌 잔고 전체) 포함 여부 (기본 True)
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
