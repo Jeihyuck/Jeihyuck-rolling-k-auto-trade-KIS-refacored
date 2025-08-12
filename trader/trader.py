@@ -42,10 +42,12 @@ def _parse_hhmm(hhmm: str) -> dtime:
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 
+
 def get_month_first_date():
     today = datetime.now(KST)
     month_first = today.replace(day=1)
     return month_first.strftime("%Y-%m-%d")
+
 
 def fetch_rebalancing_targets(date):
     """
@@ -62,15 +64,18 @@ def fetch_rebalancing_targets(date):
     else:
         raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
+
 def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
         f.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
+
 def save_state(holding, traded):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({"holding": holding, "traded": traded}, f, ensure_ascii=False, indent=2)
+
 
 def load_state():
     if STATE_FILE.exists():
@@ -78,6 +83,7 @@ def load_state():
             state = json.load(f)
             return state.get("holding", {}), state.get("traded", {})
     return {}, {}
+
 
 # ----- 공용 재시도 래퍼 -----
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
@@ -92,13 +98,19 @@ def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
             time.sleep(sleep_sec)
     raise last_err
 
+
 def _safe_get_price(kis: KisAPI, code: str):
-    """현재가 조회 실패해도 매도는 진행할 수 있도록 None을 허용."""
+    """현재가 조회 실패/무효(<=0) 시 None 반환하여 의사결정에서 제외."""
     try:
-        return _with_retry(kis.get_current_price, code)
+        price = _with_retry(kis.get_current_price, code)
+        if price is None or price <= 0:
+            logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({price})")
+            return None
+        return price
     except Exception as e:
         logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
         return None
+
 
 def _to_int(val, default=0):
     try:
@@ -106,11 +118,13 @@ def _to_int(val, default=0):
     except Exception:
         return default
 
+
 def _to_float(val, default=None):
     try:
         return float(val)
     except Exception:
         return default
+
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     """
@@ -141,14 +155,32 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     logger.info(f"[매도호출] {code}, qty={qty}, price(log)={cur_price}, result={result}")
     return cur_price, result
 
+
 def _fetch_balances(kis: KisAPI):
     """
-    잔고 조회 통합. KisAPI가 get_balance_all을 제공하면 활용,
-    없으면 get_balance() 사용. (get_balance 내부가 페이징을 처리한다고 가정)
+    잔고 조회 통합: list[dict]를 항상 반환하도록 호환 처리.
+    - KisAPI.get_balance_all()가 있으면 그대로 사용(positions list를 돌려준다고 가정)
+    - 없으면 KisAPI.get_balance() 호출 후 dict면 ['positions']를, list면 그대로 반환
+    - 최후 폴백: KisAPI.get_positions()
     """
     if hasattr(kis, "get_balance_all"):
-        return _with_retry(kis.get_balance_all)
-    return _with_retry(kis.get_balance)
+        bal = _with_retry(kis.get_balance_all)
+        return bal if isinstance(bal, list) else (bal.get("positions", []) if isinstance(bal, dict) else [])
+
+    try:
+        bal = _with_retry(kis.get_balance)
+        if isinstance(bal, list):
+            return bal
+        if isinstance(bal, dict):
+            return bal.get("positions", [])
+    except Exception as e:
+        logger.warning(f"[get_balance 실패, get_positions 폴백] {e}")
+
+    # 최후 폴백
+    if hasattr(kis, "get_positions"):
+        return _with_retry(kis.get_positions)
+    return []
+
 
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
     """
@@ -199,6 +231,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
     return remaining
 
+
 def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True):
     """
     강제 전량 매도(여러 패스로 견고하게).
@@ -239,6 +272,7 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
     for code in list(holding.keys()):
         holding.pop(code, None)
     save_state(holding, {})  # traded는 의미 없으므로 비움
+
 
 def main():
     kis = KisAPI()
@@ -306,8 +340,11 @@ def main():
                     continue
 
                 try:
-                    current_price = _with_retry(kis.get_current_price, code)
+                    current_price = _safe_get_price(kis, code)
                     logger.info(f"[📈 현재가] {code}: {current_price}")
+                    if current_price is None:
+                        logger.info(f"[SKIP] {code}: 현재가 무효(NaN/<=0)")
+                        continue
 
                     trade_common = {
                         "datetime": now_str,
@@ -321,7 +358,7 @@ def main():
 
                     # --- 매수 ---
                     if is_open and code not in holding and code not in traded:
-                        if current_price is not None and current_price >= float(target_price):
+                        if current_price >= float(target_price):
                             result = _with_retry(kis.buy_stock, code, qty)
                             holding[code] = {
                                 'qty': int(qty),
@@ -395,6 +432,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("[🛑 수동 종료]")
 
+
 if __name__ == "__main__":
     main()
+
 
