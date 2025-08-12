@@ -1,21 +1,39 @@
-import requests, os, json, time, logging
-from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
-from datetime import datetime
-import pytz
+# kis_wrapper.py
+import os
+import json
+import time
+import random
+import logging
 import threading
+from datetime import datetime
+
+import requests
+import pytz
+
+from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# helpers
-# -----------------------------------------------------------------------------
-
+# -------------------------------
+# 유틸
+# -------------------------------
 def safe_strip(val):
     if val is None:
-        return ''
+        return ""
     if isinstance(val, str):
-        return val.replace('\n', '').replace('\r', '').strip()
+        return val.replace("\n", "").replace("\r", "").strip()
     return str(val).strip()
+
+
+def _json_dumps(body: dict) -> str:
+    """
+    HashKey/주문 본문 모두 동일 직렬화 문자열을 사용하기 위해 고정 직렬화.
+    - 공백 제거(separators)
+    - 키 순서 보존(sort_keys=False)
+    - 한글 그대로(ensure_ascii=False)
+    """
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+
 
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
@@ -24,10 +42,13 @@ logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 
 
-# -----------------------------------------------------------------------------
-# KIS API Wrapper
-# -----------------------------------------------------------------------------
 class KisAPI:
+    """
+    - 토큰 캐시 + 파일 캐시
+    - HashKey 생성 및 주문 API 호출 시 필수 헤더 준수
+    - 시장가/IOC/최유리 Fallback 및 지수형 백오프
+    - 보유수량 사전 검증
+    """
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
     _cache_path = "kis_token_cache.json"
     _token_lock = threading.Lock()
@@ -35,36 +56,34 @@ class KisAPI:
     def __init__(self):
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
+        self.env = safe_strip(KIS_ENV or "practice").lower()
+        self.session = requests.Session()
         self.token = self.get_valid_token()
-        logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}")
+        logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
 
-    # ------------------------------------------------------------------
-    # token
-    # ------------------------------------------------------------------
+    # -------------------------------
+    # 토큰
+    # -------------------------------
     def get_valid_token(self):
         with KisAPI._token_lock:
             now = time.time()
-            # in-memory cache
             if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
                 return self._token_cache["token"]
 
-            # file cache
             if os.path.exists(self._cache_path):
                 try:
-                    with open(self._cache_path, "r") as f:
+                    with open(self._cache_path, "r", encoding="utf-8") as f:
                         cache = json.load(f)
-                    if "access_token" in cache and now < cache.get("expires_at", 0) - 300:
-                        self._token_cache.update({
-                            "token": cache["access_token"],
-                            "expires_at": cache.get("expires_at", 0),
-                            "last_issued": cache.get("last_issued", 0),
-                        })
-                        logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache.get('expires_at')}")
+                    if "access_token" in cache and now < cache["expires_at"] - 300:
+                        self._token_cache.update(
+                            {"token": cache["access_token"], "expires_at": cache["expires_at"], "last_issued": cache.get("last_issued", 0)}
+                        )
+                        logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                         return cache["access_token"]
                 except Exception as e:
-                    logger.warning(f"[토큰캐시 읽기오류] {e}")
+                    logger.warning(f"[토큰캐시 읽기 실패] {e}")
 
-            # throttle: 1/min issue
+            # 1분 내 재발급 차단
             if now - self._token_cache["last_issued"] < 61:
                 logger.warning("[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
                 if self._token_cache["token"]:
@@ -73,200 +92,113 @@ class KisAPI:
 
             token, expires_in = self._issue_token_and_expire()
             expires_at = now + int(expires_in)
-            self._token_cache.update({
-                "token": token,
-                "expires_at": expires_at,
-                "last_issued": now,
-            })
+            self._token_cache.update({"token": token, "expires_at": expires_at, "last_issued": now})
             try:
-                with open(self._cache_path, "w") as f:
-                    json.dump({
-                        "access_token": token,
-                        "expires_at": expires_at,
-                        "last_issued": now,
-                    }, f)
+                with open(self._cache_path, "w", encoding="utf-8") as f:
+                    json.dump({"access_token": token, "expires_at": expires_at, "last_issued": now}, f, ensure_ascii=False)
             except Exception as e:
-                logger.warning(f"[토큰캐시 쓰기오류] {e}")
-
+                logger.warning(f"[토큰캐시 쓰기 실패] {e}")
             logger.info("[토큰캐시] 새 토큰 발급 및 캐시")
             return token
 
     def _issue_token_and_expire(self):
-        url = f"{API_BASE_URL}/oauth2/tokenP"
+        token_path = "/oauth2/tokenP" if self.env == "practice" else "/oauth2/token"
+        url = f"{API_BASE_URL}{token_path}"
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
-        resp = requests.post(url, json=data, headers=headers, timeout=5).json()
-        if "access_token" in resp:
-            logger.info(f"[🔑 토큰발급] 성공: {resp}")
-            return resp["access_token"], resp["expires_in"]
-        logger.error(f"[🔑 토큰발급 실패]: {resp.get('error_description')}")
-        raise Exception(f"토큰 발급 실패: {resp.get('error_description')}")
-
-    def refresh_token(self, force: bool = True):
-        """
-        외부(trader)에서 호출 가능한 강제 토큰 재발급 훅
-        """
         try:
-            KisAPI._token_cache.update({"token": None, "expires_at": 0})
-            if force and os.path.exists(self._cache_path):
-                os.remove(self._cache_path)
-        except Exception:
-            pass
-        return self.get_valid_token()
+            resp = self.session.post(url, json=data, headers=headers, timeout=(3.0, 7.0))
+            j = resp.json()
+        except Exception as e:
+            logger.error(f"[🔑 토큰발급 예외] {e}")
+            raise
+        if "access_token" in j:
+            logger.info(f"[🔑 토큰발급] 성공: {j}")
+            return j["access_token"], j.get("expires_in", 86400)
+        logger.error(f"[🔑 토큰발급 실패] {j.get('error_description', j)}")
+        raise Exception(f"토큰 발급 실패: {j.get('error_description', j)}")
 
-    def _headers(self, tr_id):
-        return {
+    # -------------------------------
+    # 헤더/HashKey
+    # -------------------------------
+    def _headers(self, tr_id: str, hashkey: str | None = None):
+        h = {
             "authorization": f"Bearer {self.get_valid_token()}",
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
             "tr_id": tr_id,
-            "custtype": "P",
-            "content-type": "application/json",
+            "custtype": "P",  # 개인
+            "content-type": "application/json; charset=utf-8",
         }
+        if hashkey:
+            h["hashkey"] = hashkey
+        return h
 
-    # ------------------------------------------------------------------
-    # quotations / orders
-    # ------------------------------------------------------------------
-    def get_current_price(self, code):
+    def _create_hashkey(self, body_dict: dict) -> str:
+        """
+        HashKey API: /uapi/hashkey
+        - 헤더: appkey, appsecret, content-type
+        - 바디: 주문에 사용할 원본 JSON 문자열과 동일해야 함
+        """
+        url = f"{API_BASE_URL}/uapi/hashkey"
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "appkey": APP_KEY,
+            "appsecret": APP_SECRET,
+        }
+        body_str = _json_dumps(body_dict)
+        try:
+            r = self.session.post(url, headers=headers, data=body_str.encode("utf-8"), timeout=(3.0, 5.0))
+            j = r.json()
+        except Exception as e:
+            logger.error(f"[HASHKEY 예외] {e}")
+            raise
+        hk = j.get("HASH") or j.get("hash") or j.get("hashkey")
+        if not hk:
+            logger.error(f"[HASHKEY 실패] resp={j}")
+            raise Exception(f"HashKey 생성 실패: {j}")
+        return hk
+
+    # -------------------------------
+    # 시세/장운영
+    # -------------------------------
+    def get_current_price(self, code: str) -> float:
         tried = []
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = self._headers("FHKST01010100")
-        for market_div in ["J", "U"]:  # J: 주식, U: ETF/ETN 등
-            for code_fmt in [code, f"A{code}", code[1:] if str(code).startswith("A") else code]:
-                params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                for _ in range(3):
-                    try:
-                        resp = requests.get(url, headers=headers, params=params, timeout=5).json()
-                        tried.append((market_div, code_fmt, resp.get("rt_cd"), resp.get("msg1")))
-                        if resp.get("rt_cd") == "0" and "output" in resp:
-                            return float(resp["output"].get("stck_prpr"))
-                    except Exception as e:
-                        logger.error(f"[현재가조회오류][{code}] {e}")
-                        time.sleep(0.7)
+        for market_div in ["J", "UN"]:  # J: KRX, UN: 통합
+            for code_fmt in [code, f"A{code}" if not code.startswith("A") else code, code[1:] if code.startswith("A") else code]:
+                params = {"FID_COND_MRKT_DIV_CODE": market_div, "FID_INPUT_ISCD": code_fmt}
+                try:
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                    data = resp.json()
+                except Exception as e:
+                    tried.append((market_div, code_fmt, f"EXC:{e}"))
+                    continue
+                tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
+                if resp.status_code == 200 and data.get("rt_cd") == "0" and "output" in data:
+                    return float(data["output"]["stck_prpr"])
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
-    # ------------------------------ 매수(지정가) ------------------------------
-    def buy_stock(self, code, qty, price=None):
-        tr_id = "VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U"
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        headers = self._headers(tr_id)
-        if price is None:
-            price = self.get_current_price(code)
-        data = {
-            "CANO": safe_strip(self.CANO),
-            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
-            "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",  # 지정가
-            "ORD_QTY": str(int(float(qty))).strip(),
-            "ORD_UNPR": str(int(float(price))).strip(),
-        }
-        logger.info(f"[매수주문 요청파라미터] {data}")
-        last_resp = None
-        for _ in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
-                last_resp = resp
-                if resp.get("rt_cd") == "0":
-                    logger.info(f"[매수 체결 응답] {resp}")
-                    return resp.get("output")
-                elif resp.get("msg1") == "모의투자 장종료 입니다.":
-                    logger.warning("⏰ [KIS] 장운영시간 외 주문시도 — 주문 무시")
-                    return None
-                elif "초과" in (resp.get("msg1") or ""):
-                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 주문 무시: {resp.get('msg1')}")
-                    return None
-                else:
-                    logger.error(f"[ORDER_FAIL] {resp}")
-            except Exception as e:
-                logger.error(f"[매수주문 예외][{code}] {e}")
-                time.sleep(0.8)
-        raise Exception(f"매수주문 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
+    def is_market_open(self) -> bool:
+        kst = pytz.timezone("Asia/Seoul")
+        now = datetime.now(kst)
+        if now.weekday() >= 5:
+            return False
+        open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
+        return open_time <= now <= close_time
 
-    # ------------------------------ 매도(지정가) ------------------------------
-    def sell_stock(self, code, qty, price=None):
-        tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+    # -------------------------------
+    # 잔고/보유수량 맵
+    # -------------------------------
+    def get_cash_balance(self) -> int:
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        tr_id = "VTTC8434R" if self.env == "practice" else "TTTC8434R"
         headers = self._headers(tr_id)
-        if price is None:
-            price = self.get_current_price(code)
-        data = {
-            "CANO": safe_strip(self.CANO),
-            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
-            "PDNO": str(code).strip(),
-            "ORD_DVSN": "00",         # 지정가
-            "ORD_QTY": str(int(float(qty))).strip(),
-            "ORD_UNPR": str(int(float(price))).strip(),
-        }
-        logger.info(f"[매도주문 요청파라미터] {data}")
-        last_resp = None
-        for _ in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
-                last_resp = resp
-                if resp.get("rt_cd") == "0":
-                    logger.info(f"[매도 체결 응답] {resp}")
-                    return resp.get("output")
-                elif resp.get("msg1") == "모의투자 장종료 입니다.":
-                    logger.warning("⏰ [KIS] 장운영시간 외 매도 주문시도 — 주문 무시")
-                    return None
-                elif "초과" in (resp.get("msg1") or ""):
-                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 주문 무시: {resp.get('msg1')}")
-                    return None
-                else:
-                    logger.error(f"[SELL_ORDER_FAIL] {resp}")
-            except Exception as e:
-                logger.error(f"[매도주문 예외][{code}] {e}")
-                time.sleep(0.8)
-        raise Exception(f"매도주문 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
-
-    # ------------------------------ 매도(시장가) ------------------------------
-    def sell_stock_market(self, code, qty):
-        """
-        시장가 매도 (현금)
-        - TR_ID: practice=VTTC0013U, real=TTTC0013U (order-cash 동일)
-        - 규격(일반적): ORD_DVSN='01', ORD_UNPR='0'
-          * 최신 KIS 규격에서 시장가 값이 다르면 ORD_DVSN/ORD_UNPR만 조정
-        """
-        tr_id = "VTTC0013U" if KIS_ENV == "practice" else "TTTC0013U"
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        headers = self._headers(tr_id)
-        data = {
-            "CANO": safe_strip(self.CANO),
-            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
-            "PDNO": str(code).strip(),
-            "ORD_DVSN": "01",   # 시장가
-            "ORD_QTY": str(int(float(qty))).strip(),
-            "ORD_UNPR": "0",    # 시장가일 때 0
-        }
-        logger.info(f"[시장가 매도요청] {data}")
-        last_resp = None
-        for _ in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=data, timeout=5).json()
-                last_resp = resp
-                if resp.get("rt_cd") == "0":
-                    logger.info(f"[시장가 매도 체결 응답] {resp}")
-                    return resp.get("output")
-                elif resp.get("msg1") == "모의투자 장종료 입니다.":
-                    logger.warning("⏰ [KIS] 장운영시간 외 시장가 매도 시도 — 무시")
-                    return None
-                elif "초과" in (resp.get("msg1") or ""):
-                    logger.warning(f"⏰ [KIS] API 사용량 초과 — 무시: {resp.get('msg1')}")
-                    return None
-                else:
-                    logger.error(f"[SELL_MKT_FAIL] {resp}")
-            except Exception as e:
-                logger.error(f"[시장가 매도 예외][{code}] {e}")
-                time.sleep(0.8)
-        raise Exception(f"시장가 매도 실패({code}): {last_resp.get('msg1', last_resp) if isinstance(last_resp, dict) else last_resp}")
-
-    # ------------------------------------------------------------------
-    # balances (with robust pagination)
-    # ------------------------------------------------------------------
-    def _balance_params(self, ctx_fk: str = "", ctx_nk: str = ""):
-        return {
-            "CANO": safe_strip(self.CANO),
-            "ACNT_PRDT_CD": safe_strip(self.ACNT_PRDT_CD),
+        params = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
             "AFHR_FLPR_YN": "N",
             "UNPR_YN": "N",
             "UNPR_DVSN": "01",
@@ -275,90 +207,260 @@ class KisAPI:
             "PRCS_DVSN": "01",
             "OFL_YN": "N",
             "INQR_DVSN": "02",
-            # 페이지네이션 토큰 (직전 응답의 ctx 값 그대로 재전송)
-            "CTX_AREA_FK100": safe_strip(ctx_fk),
-            "CTX_AREA_NK100": safe_strip(ctx_nk),
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
         }
+        logger.info(f"[잔고조회 요청파라미터] {params}")
+        try:
+            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+            j = resp.json()
+        except Exception as e:
+            logger.error(f"[잔고조회 예외] {e}")
+            return 0
+        logger.info(f"[잔고조회 응답] {j}")
+        if j.get("rt_cd") == "0" and "output2" in j and j["output2"]:
+            try:
+                cash = int(j["output2"][0]["dnca_tot_amt"])
+                logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
+                return cash
+            except Exception as e:
+                logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
+                return 0
+        logger.error(f"[CASH_BALANCE_PARSE_FAIL] {j}")
+        return 0
 
-    def _select_holdings_list(self, resp: dict):
-        """보유종목 리스트가 위치하는 키를 방어적으로 판별"""
-        val = resp.get("output1")
-        if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
-            return "output1", val
-        val = resp.get("output2")
-        if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
-            return "output2", val
-        val = resp.get("output")
-        if isinstance(val, list) and val and isinstance(val[0], dict) and "pdno" in val[0]:
-            return "output", val
-        return None, []
-
-    def get_balance(self):
+    def get_positions(self) -> list[dict]:
+        """
+        잔고의 output1 배열(보유 종목 리스트) 반환
+        """
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-        headers = self._headers("VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R")
+        tr_id = "VTTC8434R" if self.env == "practice" else "TTTC8434R"
+        headers = self._headers(tr_id)
+        params = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "AFHR_FLPR_YN": "N",
+            "UNPR_YN": "N",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "OFL_YN": "N",
+            "INQR_DVSN": "02",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        try:
+            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+            j = resp.json()
+        except Exception as e:
+            logger.error(f"[포지션조회 예외] {e}")
+            return []
+        arr = j.get("output1") or []
+        return arr
 
-        all_rows = []
-        seen_keys = set()
-        ctx_fk = ""
-        ctx_nk = ""
+    def get_balance_map(self) -> dict:
+        """
+        { '종목코드(pdno)': 주문가능수량(int) } 맵 생성
+        """
+        pos = self.get_positions()
+        mp = {}
+        for row in pos:
+            try:
+                pdno = safe_strip(row.get("pdno"))
+                qty = int(float(row.get("ord_psbl_qty", "0")))
+                if pdno:
+                    mp[pdno] = qty
+            except Exception:
+                continue
+        logger.info(f"[보유수량맵] {len(mp)}종목")
+        return mp
 
-        for page in range(1, 200):  # 안전장치: 최대 200페이지
-            params = self._balance_params(ctx_fk, ctx_nk)
-            logger.info(f"[보유잔고 전체조회 요청파라미터] {params}")
-            resp = None
-            for _ in range(3):
+    # -------------------------------
+    # 주문 공통
+    # -------------------------------
+    def _order_cash(self, body: dict, *, is_sell: bool) -> dict | None:
+        """
+        /uapi/domestic-stock/v1/trading/order-cash
+        - TR_ID: (모의) 매도 VTTC0011U / 매수 VTTC0012U
+                 (실전) 매도 TTTC0011U / 매수 TTTC0012U
+        - HashKey 필수(POST)
+        - 지수형 백오프 + Fallback(시장가 -> IOC시장가 -> 최유리)
+        """
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        tr_id = (
+            ("VTTC0011U" if self.env == "practice" else "TTTC0011U")
+            if is_sell
+            else ("VTTC0012U" if self.env == "practice" else "TTTC0012U")
+        )
+
+        # Fallback 시도 순서
+        ord_dvsn_chain = ["01", "13", "03"]  # 시장가, IOC시장가, 최유리
+        last_err = None
+
+        for idx, ord_dvsn in enumerate(ord_dvsn_chain, start=1):
+            body["ORD_DVSN"] = ord_dvsn
+            # 시장가/최유리 류는 주문단가 0 고정
+            body["ORD_UNPR"] = "0"
+
+            # SLL_TYPE(매도유형): 미입력시 01 일반매도
+            if is_sell and not body.get("SLL_TYPE"):
+                body["SLL_TYPE"] = "01"
+
+            # 거래소 구분(선택) - 모의는 KRX만
+            body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+
+            # HashKey 생성
+            hk = self._create_hashkey(body)
+            headers = self._headers(tr_id, hk)
+
+            # 로깅(민감정보 제외)
+            log_body = dict(body)
+            log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in log_body.items()}
+            logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
+
+            # 지수형 백오프 파라미터
+            attempt = 0
+            while attempt < 3:  # 각 방식 최대 3회 네트워크 재시도
+                attempt += 1
                 try:
-                    resp = requests.get(url, headers=headers, params=params, timeout=7).json()
-                    logger.info(f"[잔고조회 RAW 응답] {json.dumps(resp, ensure_ascii=False, indent=2)}")
-                    break
+                    resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+                    data = resp.json()
                 except Exception as e:
-                    logger.error(f"[잔고전체조회 예외]{e}")
-                    time.sleep(1.0)
+                    backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                    logger.error(f"[ORDER_NET_EX] ord_dvsn={ord_dvsn} attempt={attempt} ex={e} → sleep {backoff:.2f}s")
+                    time.sleep(backoff)
+                    last_err = e
+                    continue
 
-            if not isinstance(resp, dict):
-                logger.error(f"[잔고조회 실패] 잘못된 응답형식: {type(resp)}")
-                break
+                if resp.status_code == 200 and data.get("rt_cd") == "0":
+                    logger.info(f"[ORDER_OK] ord_dvsn={ord_dvsn} output={data.get('output')}")
+                    return data
 
-            if resp.get("rt_cd") != "0":
-                logger.error(f"[잔고조회 실패] {resp}")
-                break
+                msg_cd = data.get("msg_cd", "")
+                msg1 = data.get("msg1", "")
+                # 게이트웨이/내부 오류 패턴 → 백오프 후 재시도
+                if msg_cd in ("IGW00008",) or "MCA" in msg1 or resp.status_code >= 500:
+                    backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                    logger.error(f"[ORDER_FAIL_GATEWAY] ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s")
+                    time.sleep(backoff)
+                    last_err = data
+                    continue
 
-            # 보유종목이 들어있는 키를 판별
-            which, rows = self._select_holdings_list(resp)
-            if rows:
-                # 중복 제거(같은 종목이 다음 페이지로 넘어오는 경우 방지)
-                added = 0
-                for r in rows:
-                    key = (r.get("pdno"), r.get("pchs_avg_pric"), r.get("hldg_qty"))
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    all_rows.append(r)
-                    added += 1
-                logger.info(f"[잔고조회] {which}에서 {len(rows)}개 수신(신규 {added}개) 누적 {len(all_rows)}개")
-            else:
-                logger.info("[잔고조회] 이 페이지에 보유종목 리스트 없음 (요약 페이지만 수신)")
+                # 비즈니스 오류는 즉시 리턴
+                logger.error(f"[ORDER_FAIL_BIZ] ord_dvsn={ord_dvsn} resp={data}")
+                return None
 
-            # 다음 페이지 토큰
-            ctx_fk_next = safe_strip(resp.get("ctx_area_fk100", ""))
-            ctx_nk_next = safe_strip(resp.get("ctx_area_nk100", ""))
+            # 다음 Fallback 방식 시도
+            logger.warning(f"[ORDER_FALLBACK] ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
 
-            if not ctx_fk_next and not ctx_nk_next:
-                break
+        # 모두 실패
+        raise Exception(f"주문 실패: {last_err}")
 
-            ctx_fk, ctx_nk = ctx_fk_next, ctx_nk_next
-            time.sleep(0.25)
+    # -------------------------------
+    # 매수/매도 래퍼
+    # -------------------------------
+    def buy_stock_market(self, pdno: str, qty: int) -> dict | None:
+        """
+        시장가 매수: ORD_DVSN=01, ORD_UNPR=0
+        """
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "01",  # 시장가 (실제 호출 전 Fallback 체인에서 재설정)
+            "ORD_UNPR": "0",
+        }
+        return self._order_cash(body, is_sell=False)
 
-        return all_rows
+    def sell_stock_market(self, pdno: str, qty: int) -> dict | None:
+        """
+        시장가 매도: ORD_DVSN=01, ORD_UNPR=0
+        - 보유수량 사전 검증
+        """
+        # 사전 검증
+        bal_map = self.get_balance_map()
+        ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
+        if ord_psbl <= 0:
+            logger.error(f"[SELL_PRECHECK] 보유 없음 pdno={pdno}")
+            return None
+        if qty > ord_psbl:
+            logger.warning(f"[SELL_PRECHECK] 수량 보정: req={qty} -> ord_psbl={ord_psbl}")
+            qty = ord_psbl
 
-    # ------------------------------------------------------------------
-    # market hours
-    # ------------------------------------------------------------------
-    def is_market_open(self):
-        KST = pytz.timezone('Asia/Seoul')
-        now = datetime.now(KST)
-        if now.weekday() >= 5:
-            return False
-        open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)  # 정규장 15:30
-        return open_time <= now <= close_time
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "SLL_TYPE": "01",   # 일반매도(미입력 시 01)
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "01",   # 시장가 (실제 호출 전 Fallback 체인에서 재설정)
+            "ORD_UNPR": "0",
+        }
+        return self._order_cash(body, is_sell=True)
+
+    # (선택) 지정가 주문이 필요할 때 사용
+    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> dict | None:
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "00",   # 지정가
+            "ORD_UNPR": str(int(price)),
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+        # 지정가/POST도 hashkey 필수
+        hk = self._create_hashkey(body)
+        tr_id = "VTTC0012U" if self.env == "practice" else "TTTC0012U"
+        headers = self._headers(tr_id, hk)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        try:
+            resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"[BUY_LIMIT_NET_EX] {e}")
+            raise
+        if resp.status_code == 200 and data.get("rt_cd") == "0":
+            logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+            return data
+        logger.error(f"[BUY_LIMIT_FAIL] {data}")
+        return None
+
+    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> dict | None:
+        # 보유수량 체크
+        bal_map = self.get_balance_map()
+        ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
+        if ord_psbl <= 0:
+            logger.error(f"[SELL_LIMIT_PRECHECK] 보유 없음 pdno={pdno}")
+            return None
+        if qty > ord_psbl:
+            logger.warning(f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> ord_psbl={ord_psbl}")
+            qty = ord_psbl
+
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "SLL_TYPE": "01",
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "00",   # 지정가
+            "ORD_UNPR": str(int(price)),
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+        hk = self._create_hashkey(body)
+        tr_id = "VTTC0011U" if self.env == "practice" else "TTTC0011U"
+        headers = self._headers(tr_id, hk)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        try:
+            resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"[SELL_LIMIT_NET_EX] {e}")
+            raise
+        if resp.status_code == 200 and data.get("rt_cd") == "0":
+            logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+            return data
+        logger.error(f"[SELL_LIMIT_FAIL] {data}")
+        return None
