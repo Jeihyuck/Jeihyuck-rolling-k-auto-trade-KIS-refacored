@@ -321,13 +321,19 @@ class KisAPI:
         return j.get("output1") or []
 
     def get_balance_map(self) -> Dict[str, int]:
+        """
+        매도/체크에 사용할 수량은 '주문가능수량(ord_psbl_qty)'이 0일 수 있어
+        '보유수량(hldg_qty)'을 우선 사용한다. (체결대기/락 상황 보호)
+        """
         pos = self.get_positions()
         mp: Dict[str, int] = {}
-        for row in pos:
+        for row in pos or []:
             try:
                 pdno = safe_strip(row.get("pdno"))
-                qty = int(float(row.get("ord_psbl_qty", "0")))
-                if pdno:
+                hldg = int(float(row.get("hldg_qty", "0")))
+                ord_psbl = int(float(row.get("ord_psbl_qty", "0")))
+                qty = hldg if hldg > 0 else ord_psbl
+                if pdno and qty > 0:
                     mp[pdno] = qty
             except Exception:
                 continue
@@ -422,14 +428,24 @@ class KisAPI:
         return self._order_cash(body, is_sell=False)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
-        bal_map = self.get_balance_map()
-        ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
-        if ord_psbl <= 0:
-            logger.error(f"[SELL_PRECHECK] 보유 없음 pdno={pdno}")
+        # --- 강화된 사전점검: 보유수량 우선 ---
+        pos = self.get_positions() or []
+        hldg = 0
+        ord_psbl = 0
+        for r in pos:
+            if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                hldg = int(float(r.get("hldg_qty", "0")))
+                ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                break
+
+        base_qty = hldg if hldg > 0 else ord_psbl
+        if base_qty <= 0:
+            logger.error(f"[SELL_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
             return None
-        if qty > ord_psbl:
-            logger.warning(f"[SELL_PRECHECK] 수량 보정: req={qty} -> ord_psbl={ord_psbl}")
-            qty = ord_psbl
+
+        if qty > base_qty:
+            logger.warning(f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})")
+            qty = base_qty
 
         body = {
             "CANO": self.CANO,
@@ -439,6 +455,7 @@ class KisAPI:
             "ORD_QTY": str(int(qty)),
             "ORD_DVSN": "01",
             "ORD_UNPR": "0",
+            "EXCG_ID_DVSN_CD": "KRX",
         }
         return self._order_cash(body, is_sell=True)
 
@@ -465,14 +482,24 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        bal_map = self.get_balance_map()
-        ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
-        if ord_psbl <= 0:
-            logger.error(f"[SELL_LIMIT_PRECHECK] 보유 없음 pdno={pdno}")
+        # --- 강화된 사전점검: 보유수량 우선 ---
+        pos = self.get_positions() or []
+        hldg = 0
+        ord_psbl = 0
+        for r in pos:
+            if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                hldg = int(float(r.get("hldg_qty", "0")))
+                ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                break
+
+        base_qty = hldg if hldg > 0 else ord_psbl
+        if base_qty <= 0:
+            logger.error(f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
             return None
-        if qty > ord_psbl:
-            logger.warning(f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> ord_psbl={ord_psbl}")
-            qty = ord_psbl
+
+        if qty > base_qty:
+            logger.warning(f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})")
+            qty = base_qty
 
         body = {
             "CANO": self.CANO,
