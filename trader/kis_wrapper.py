@@ -6,9 +6,12 @@ import random
 import logging
 import threading
 from datetime import datetime
+from typing import Dict, List, Optional
 
 import requests
 import pytz
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 
@@ -24,16 +27,9 @@ def safe_strip(val):
         return val.replace("\n", "").replace("\r", "").strip()
     return str(val).strip()
 
-
 def _json_dumps(body: dict) -> str:
-    """
-    HashKey/주문 본문 모두 동일 직렬화 문자열을 사용하기 위해 고정 직렬화.
-    - 공백 제거(separators)
-    - 키 순서 보존(sort_keys=False)
-    - 한글 그대로(ensure_ascii=False)
-    """
+    # HashKey/주문 본문 모두 동일 직렬화 문자열을 사용하도록 고정
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
-
 
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
@@ -41,13 +37,35 @@ logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 
+# -------------------------------
+# 간단 레이트리미터(엔드포인트별 최소 간격 유지)
+# -------------------------------
+class _RateLimiter:
+    def __init__(self, min_interval_sec: float = 0.20):
+        self.min_interval = float(min_interval_sec)
+        self.last_at: Dict[str, float] = {}
+        self._lock = threading.Lock()
 
+    def wait(self, key: str):
+        with self._lock:
+            now = time.time()
+            last = self.last_at.get(key, 0.0)
+            delta = now - last
+            if delta < self.min_interval:
+                time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
+            self.last_at[key] = time.time()
+
+# -------------------------------
+# 본체
+# -------------------------------
 class KisAPI:
     """
-    - 토큰 캐시 + 파일 캐시
-    - HashKey 생성 및 주문 API 호출 시 필수 헤더 준수
-    - 시장가/IOC/최유리 Fallback 및 지수형 백오프
-    - 보유수량 사전 검증
+    - TR_ID 최신 스펙
+      * (모의) 매수 VTTC0012U / 매도 VTTC0011U
+      * (실전) 매수 TTTC0012U / 매도 TTTC0011U
+    - HashKey 필수 적용
+    - 시세 조회 레이트리밋 & 백오프
+    - get_balance / buy_stock 호환 셔임(옛 호출부 대응)
     """
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
     _cache_path = "kis_token_cache.json"
@@ -57,7 +75,25 @@ class KisAPI:
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
         self.env = safe_strip(KIS_ENV or "practice").lower()
+
+        # 세션 + 재시도 어댑터
         self.session = requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=0.5,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+        self._limiter = _RateLimiter(min_interval_sec=0.20)  # 초당 제한 회피
+
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
 
@@ -121,13 +157,13 @@ class KisAPI:
     # -------------------------------
     # 헤더/HashKey
     # -------------------------------
-    def _headers(self, tr_id: str, hashkey: str | None = None):
+    def _headers(self, tr_id: str, hashkey: Optional[str] = None):
         h = {
             "authorization": f"Bearer {self.get_valid_token()}",
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
             "tr_id": tr_id,
-            "custtype": "P",  # 개인
+            "custtype": "P",
             "content-type": "application/json; charset=utf-8",
         }
         if hashkey:
@@ -135,11 +171,6 @@ class KisAPI:
         return h
 
     def _create_hashkey(self, body_dict: dict) -> str:
-        """
-        HashKey API: /uapi/hashkey
-        - 헤더: appkey, appsecret, content-type
-        - 바디: 주문에 사용할 원본 JSON 문자열과 동일해야 함
-        """
         url = f"{API_BASE_URL}/uapi/hashkey"
         headers = {
             "content-type": "application/json; charset=utf-8",
@@ -163,21 +194,55 @@ class KisAPI:
     # 시세/장운영
     # -------------------------------
     def get_current_price(self, code: str) -> float:
-        tried = []
+        """
+        - KIS 시세 쿼터(초당 제한)에 걸리면 메시지에 '초당 거래건수'가 포함됨.
+          → 짧게 sleep 후 재시도.
+        - 시장구분은 'J'(KRX)와 'U'만 사용 (불필요 'UN' 제거)
+        - 종목코드는 기본 6자리. 필요 시 'A' prefix도 함께 시도.
+        """
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = self._headers("FHKST01010100")
-        for market_div in ["J", "UN"]:  # J: KRX, UN: 통합
-            for code_fmt in [code, f"A{code}" if not code.startswith("A") else code, code[1:] if code.startswith("A") else code]:
-                params = {"FID_COND_MRKT_DIV_CODE": market_div, "FID_INPUT_ISCD": code_fmt}
+        tr_id = "FHKST01010100"
+        headers = self._headers(tr_id)
+
+        tried = []
+        markets = ["J", "U"]
+        codes = []
+        c = code.strip()
+        if c.startswith("A"):
+            codes = [c, c[1:]]
+        else:
+            codes = [c, f"A{c}"]
+
+        # 레이트리밋(엔드포인트 키: quotes)
+        self._limiter.wait("quotes")
+
+        for market_div in markets:
+            for code_fmt in codes:
+                params = {
+                    # KIS는 보통 lower-case도 수용하지만, 구버전 케이스 대비 소문자로 유지
+                    "fid_cond_mrkt_div_code": market_div,
+                    "fid_input_iscd": code_fmt,
+                }
                 try:
                     resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                     data = resp.json()
                 except Exception as e:
                     tried.append((market_div, code_fmt, f"EXC:{e}"))
                     continue
+
                 tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
+                # 초당 제한 → 짧은 백오프 후 재시도(다음 루프)
+                if "초당 거래건수를 초과" in (data.get("msg1") or ""):
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+
                 if resp.status_code == 200 and data.get("rt_cd") == "0" and "output" in data:
-                    return float(data["output"]["stck_prpr"])
+                    pr = data["output"].get("stck_prpr")
+                    try:
+                        return float(pr)
+                    except Exception:
+                        pass
+
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
     def is_market_open(self) -> bool:
@@ -190,7 +255,7 @@ class KisAPI:
         return open_time <= now <= close_time
 
     # -------------------------------
-    # 잔고/보유수량 맵
+    # 잔고/포지션
     # -------------------------------
     def get_cash_balance(self) -> int:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -229,10 +294,7 @@ class KisAPI:
         logger.error(f"[CASH_BALANCE_PARSE_FAIL] {j}")
         return 0
 
-    def get_positions(self) -> list[dict]:
-        """
-        잔고의 output1 배열(보유 종목 리스트) 반환
-        """
+    def get_positions(self) -> List[Dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
         tr_id = "VTTC8434R" if self.env == "practice" else "TTTC8434R"
         headers = self._headers(tr_id)
@@ -256,15 +318,11 @@ class KisAPI:
         except Exception as e:
             logger.error(f"[포지션조회 예외] {e}")
             return []
-        arr = j.get("output1") or []
-        return arr
+        return j.get("output1") or []
 
-    def get_balance_map(self) -> dict:
-        """
-        { '종목코드(pdno)': 주문가능수량(int) } 맵 생성
-        """
+    def get_balance_map(self) -> Dict[str, int]:
         pos = self.get_positions()
-        mp = {}
+        mp: Dict[str, int] = {}
         for row in pos:
             try:
                 pdno = safe_strip(row.get("pdno"))
@@ -276,17 +334,18 @@ class KisAPI:
         logger.info(f"[보유수량맵] {len(mp)}종목")
         return mp
 
+    # --- 호환 셔임(기존 trader.py 호출 대응) ---
+    def get_balance(self) -> Dict[str, object]:
+        """
+        기존 코드 호환용:
+        반환 구조: {"cash": <int>, "positions": <list[dict]>}
+        """
+        return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
+
     # -------------------------------
     # 주문 공통
     # -------------------------------
-    def _order_cash(self, body: dict, *, is_sell: bool) -> dict | None:
-        """
-        /uapi/domestic-stock/v1/trading/order-cash
-        - TR_ID: (모의) 매도 VTTC0011U / 매수 VTTC0012U
-                 (실전) 매도 TTTC0011U / 매수 TTTC0012U
-        - HashKey 필수(POST)
-        - 지수형 백오프 + Fallback(시장가 -> IOC시장가 -> 최유리)
-        """
+    def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         tr_id = (
             ("VTTC0011U" if self.env == "practice" else "TTTC0011U")
@@ -294,35 +353,30 @@ class KisAPI:
             else ("VTTC0012U" if self.env == "practice" else "TTTC0012U")
         )
 
-        # Fallback 시도 순서
-        ord_dvsn_chain = ["01", "13", "03"]  # 시장가, IOC시장가, 최유리
+        # Fallback: 시장가 → IOC시장가 → 최유리
+        ord_dvsn_chain = ["01", "13", "03"]
         last_err = None
 
-        for idx, ord_dvsn in enumerate(ord_dvsn_chain, start=1):
+        for ord_dvsn in ord_dvsn_chain:
             body["ORD_DVSN"] = ord_dvsn
-            # 시장가/최유리 류는 주문단가 0 고정
             body["ORD_UNPR"] = "0"
-
-            # SLL_TYPE(매도유형): 미입력시 01 일반매도
             if is_sell and not body.get("SLL_TYPE"):
                 body["SLL_TYPE"] = "01"
-
-            # 거래소 구분(선택) - 모의는 KRX만
             body.setdefault("EXCG_ID_DVSN_CD", "KRX")
 
-            # HashKey 생성
+            # HashKey
             hk = self._create_hashkey(body)
             headers = self._headers(tr_id, hk)
 
-            # 로깅(민감정보 제외)
-            log_body = dict(body)
-            log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in log_body.items()}
+            # 레이트리밋(주문은 별 키)
+            self._limiter.wait("orders")
+
+            # 로깅(민감 Mask)
+            log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
             logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
 
-            # 지수형 백오프 파라미터
-            attempt = 0
-            while attempt < 3:  # 각 방식 최대 3회 네트워크 재시도
-                attempt += 1
+            # 네트워크/게이트웨이 재시도
+            for attempt in range(1, 4):
                 try:
                     resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
                     data = resp.json()
@@ -339,47 +393,35 @@ class KisAPI:
 
                 msg_cd = data.get("msg_cd", "")
                 msg1 = data.get("msg1", "")
-                # 게이트웨이/내부 오류 패턴 → 백오프 후 재시도
-                if msg_cd in ("IGW00008",) or "MCA" in msg1 or resp.status_code >= 500:
+                if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
                     backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                     logger.error(f"[ORDER_FAIL_GATEWAY] ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s")
                     time.sleep(backoff)
                     last_err = data
                     continue
 
-                # 비즈니스 오류는 즉시 리턴
                 logger.error(f"[ORDER_FAIL_BIZ] ord_dvsn={ord_dvsn} resp={data}")
                 return None
 
-            # 다음 Fallback 방식 시도
             logger.warning(f"[ORDER_FALLBACK] ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
 
-        # 모두 실패
         raise Exception(f"주문 실패: {last_err}")
 
     # -------------------------------
-    # 매수/매도 래퍼
+    # 매수/매도 (신규)
     # -------------------------------
-    def buy_stock_market(self, pdno: str, qty: int) -> dict | None:
-        """
-        시장가 매수: ORD_DVSN=01, ORD_UNPR=0
-        """
+    def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
             "PDNO": safe_strip(pdno),
             "ORD_QTY": str(int(qty)),
-            "ORD_DVSN": "01",  # 시장가 (실제 호출 전 Fallback 체인에서 재설정)
+            "ORD_DVSN": "01",  # 시장가
             "ORD_UNPR": "0",
         }
         return self._order_cash(body, is_sell=False)
 
-    def sell_stock_market(self, pdno: str, qty: int) -> dict | None:
-        """
-        시장가 매도: ORD_DVSN=01, ORD_UNPR=0
-        - 보유수량 사전 검증
-        """
-        # 사전 검증
+    def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         bal_map = self.get_balance_map()
         ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
         if ord_psbl <= 0:
@@ -393,15 +435,14 @@ class KisAPI:
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
             "PDNO": safe_strip(pdno),
-            "SLL_TYPE": "01",   # 일반매도(미입력 시 01)
+            "SLL_TYPE": "01",  # 일반매도
             "ORD_QTY": str(int(qty)),
-            "ORD_DVSN": "01",   # 시장가 (실제 호출 전 Fallback 체인에서 재설정)
+            "ORD_DVSN": "01",
             "ORD_UNPR": "0",
         }
         return self._order_cash(body, is_sell=True)
 
-    # (선택) 지정가 주문이 필요할 때 사용
-    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> dict | None:
+    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -411,25 +452,19 @@ class KisAPI:
             "ORD_UNPR": str(int(price)),
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        # 지정가/POST도 hashkey 필수
         hk = self._create_hashkey(body)
         tr_id = "VTTC0012U" if self.env == "practice" else "TTTC0012U"
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        try:
-            resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"[BUY_LIMIT_NET_EX] {e}")
-            raise
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
         return None
 
-    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> dict | None:
-        # 보유수량 체크
+    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         bal_map = self.get_balance_map()
         ord_psbl = int(bal_map.get(safe_strip(pdno), 0))
         if ord_psbl <= 0:
@@ -453,14 +488,31 @@ class KisAPI:
         tr_id = "VTTC0011U" if self.env == "practice" else "TTTC0011U"
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        try:
-            resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"[SELL_LIMIT_NET_EX] {e}")
-            raise
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
             return data
         logger.error(f"[SELL_LIMIT_FAIL] {data}")
         return None
+
+    # --- 호환 셔임(기존 trader.py 호출 대응) ---
+    def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매수
+        - price 지정 → 지정가 매수
+        """
+        if price is None:
+            return self.buy_stock_market(code, qty)
+        return self.buy_stock_limit(code, qty, price)
+
+    def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매도
+        - price 지정 → 지정가 매도
+        """
+        if price is None:
+            return self.sell_stock_market(code, qty)
+        return self.sell_stock_limit(code, qty, price)
