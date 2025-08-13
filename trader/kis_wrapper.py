@@ -219,7 +219,6 @@ class KisAPI:
         for market_div in markets:
             for code_fmt in codes:
                 params = {
-                    # KIS는 보통 lower-case도 수용하지만, 구버전 케이스 대비 소문자로 유지
                     "fid_cond_mrkt_div_code": market_div,
                     "fid_input_iscd": code_fmt,
                 }
@@ -253,6 +252,119 @@ class KisAPI:
         open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
         return open_time <= now <= close_time
+
+    # -------- 분봉/일봉 조회 (신규 추가) --------
+    def get_minute_bars(self, code: str, unit: int = 1, count: int = 200):
+        """
+        종목/ETF 1분봉(기본) 시세 조회
+        return: [{"ts": "HHMMSS", "open":..., "high":..., "low":..., "close":..., "vol":...}, ...]
+        """
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        tr_id = "FHKST03010200"
+        headers = self._headers(tr_id)
+
+        tried = []
+        markets = ["J", "U"]
+        code_variants = [code.strip()]
+        if not code_variants[0].startswith("A"):
+            code_variants.insert(0, f"A{code_variants[0]}")
+        else:
+            code_variants.append(code_variants[0][1:])  # 'A' 제외한 6자리도 시도
+
+        self._limiter.wait("minute_bars")
+
+        for mkt in markets:
+            for c in code_variants:
+                params = {
+                    "fid_cond_mrkt_div_code": mkt,   # J: KRX, U: KOSDAQ
+                    "fid_input_iscd": c,             # A+6자리
+                    "fid_time_unit": str(int(unit)), # 1,3,5,10...
+                    "fid_pw_data_incu_yn": "Y",      # 과거 연속조회 포함
+                    "fid_org_adj_prc": "1",          # 수정주가 반영
+                }
+                try:
+                    r = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    j = r.json()
+                except Exception as e:
+                    tried.append((mkt, c, f"EXC:{e}"))
+                    continue
+
+                if r.status_code == 200 and j.get("rt_cd") == "0" and "output2" in j:
+                    rows = j["output2"][:count]
+                    bars = []
+                    for row in rows:
+                        try:
+                            bars.append({
+                                "ts": row.get("stck_cntg_hour") or row.get("cntg_time") or "",
+                                "open": float(row.get("stck_oprc") or row.get("open", 0) or 0),
+                                "high": float(row.get("stck_hgpr") or row.get("high", 0) or 0),
+                                "low": float(row.get("stck_lwpr") or row.get("low", 0) or 0),
+                                "close": float(row.get("stck_prpr") or row.get("close", 0) or 0),
+                                "vol": int(float(row.get("acml_vol") or row.get("cum_vol") or 0)),
+                            })
+                        except Exception:
+                            continue
+                    bars = [b for b in bars if b["close"] > 0]
+                    bars.sort(key=lambda x: x["ts"])
+                    if len(bars) >= 10:
+                        return bars
+                tried.append((mkt, c, j.get("rt_cd"), j.get("msg1")))
+        raise Exception(f"[분봉조회 실패] {code} tried={tried}")
+
+    def get_daily_bars(self, code: str, count: int = 60):
+        """
+        일봉 시세 조회
+        return: [{"date":"YYYYMMDD","open":...,"high":...,"low":...,"close":...,"vol":...}, ...]
+        """
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        tr_id = "FHKST03010100"
+        headers = self._headers(tr_id)
+
+        markets = ["J", "U"]
+        code_variants = [code.strip()]
+        if not code_variants[0].startswith("A"):
+            code_variants.insert(0, f"A{code_variants[0]}")
+        else:
+            code_variants.append(code_variants[0][1:])
+
+        self._limiter.wait("daily_bars")
+
+        tried = []
+        for mkt in markets:
+            for c in code_variants:
+                params = {
+                    "fid_cond_mrkt_div_code": mkt,
+                    "fid_input_iscd": c,
+                    "fid_org_adj_prc": "1",
+                }
+                try:
+                    r = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    j = r.json()
+                except Exception as e:
+                    tried.append((mkt, c, f"EXC:{e}"))
+                    continue
+
+                if r.status_code == 200 and j.get("rt_cd") == "0" and "output2" in j:
+                    rows = j["output2"][:count]
+                    bars = []
+                    for row in rows:
+                        try:
+                            bars.append({
+                                "date": row.get("stck_bsop_date") or row.get("date", ""),
+                                "open": float(row.get("stck_oprc", 0) or 0),
+                                "high": float(row.get("stck_hgpr", 0) or 0),
+                                "low": float(row.get("stck_lwpr", 0) or 0),
+                                "close": float(row.get("stck_clpr", 0) or 0),
+                                "vol": int(float(row.get("acml_vol", 0) or 0)),
+                            })
+                        except Exception:
+                            continue
+                    bars = [b for b in bars if b["close"] > 0]
+                    bars.sort(key=lambda x: x["date"])
+                    if len(bars) >= 10:
+                        return bars
+                tried.append((mkt, c, j.get("rt_cd"), j.get("msg1")))
+        raise Exception(f"[일봉조회 실패] {code} tried={tried}")
 
     # -------------------------------
     # 잔고/포지션
@@ -414,7 +526,7 @@ class KisAPI:
         raise Exception(f"주문 실패: {last_err}")
 
     # -------------------------------
-    # 매수/매도 (신규)
+    # 매수/매도
     # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         body = {
