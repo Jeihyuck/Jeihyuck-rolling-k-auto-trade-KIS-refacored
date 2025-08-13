@@ -165,6 +165,21 @@ def _to_float(val, default=None):
     except Exception:
         return default
 
+# ===== 정규화: 항상 '포지션 리스트'만 반환 =====
+def _fetch_positions(kis: KisAPI):
+    """
+    항상 [포지션 dict, ...] 리스트를 반환.
+    - KisAPI.get_positions()가 있으면 그걸 사용
+    - 없으면 get_balance()의 'positions' 또는 'output1' 키를 사용
+    """
+    if hasattr(kis, "get_positions"):
+        return _with_retry(kis.get_positions)
+
+    b = _with_retry(kis.get_balance)
+    if isinstance(b, dict):
+        return b.get("positions") or b.get("output1") or []
+    return b if isinstance(b, list) else []
+
 # ===== ATR(근사) & 포지션 상태 보조 =====
 def _update_price_hist_and_atr(state: dict, price: float):
     """
@@ -316,23 +331,17 @@ def _do_sell(kis: KisAPI, code: str, qty: int, reason: str):
     })
     time.sleep(RATE_SLEEP_SEC)
 
-def _fetch_balances(kis: KisAPI):
-    """
-    잔고 조회 통합. KisAPI가 get_balance_all을 제공하면 활용,
-    없으면 get_balance() 사용. (get_balance 내부가 페이징을 처리한다고 가정)
-    """
-    if hasattr(kis, "get_balance_all"):
-        return _with_retry(kis.get_balance_all)
-    return _with_retry(kis.get_balance)
-
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
+    """
+    강제 전량매도 1패스: 포지션 리스트를 기준으로 매도 시도 후 잔존 파악
+    """
     if not targets_codes:
         return set()
 
     targets_codes = {c for c in targets_codes if c}
-    balances = _fetch_balances(kis)
-    qty_map      = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances}
-    sellable_map = {b.get("pdno"): _to_int(b.get("ord_psbl_qty", 0)) for b in balances}
+    positions = _fetch_positions(kis)
+    qty_map      = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in positions}
+    sellable_map = {b.get("pdno"): _to_int(b.get("ord_psbl_qty", 0)) for b in positions}
 
     remaining = set()
     for code in list(targets_codes):
@@ -351,8 +360,8 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
         finally:
             time.sleep(RATE_SLEEP_SEC)
 
-    balances_after = _fetch_balances(kis)
-    after_qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances_after}
+    positions_after = _fetch_positions(kis)
+    after_qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in positions_after}
     for code in targets_codes:
         if after_qty_map.get(code, 0) > 0:
             remaining.add(code)
@@ -363,8 +372,8 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
     if include_all_balances:
         try:
-            balances = _fetch_balances(kis)
-            for b in balances:
+            positions = _fetch_positions(kis)
+            for b in positions:
                 code = b.get("pdno")
                 if code and _to_int(b.get("hldg_qty", 0)) > 0:
                     target_codes.add(code)
@@ -427,17 +436,15 @@ def main():
             # ====== 잔고 동기화 ======
             ord_psbl_map = {}
             try:
-                balances_resp = _fetch_balances(kis)
-                balances = balances_resp.get("positions") if isinstance(balances_resp, dict) else balances_resp
-                balances = balances or []
-                logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
-                for stock in balances:
+                positions = _fetch_positions(kis)
+                logger.info(f"[보유잔고 API 결과 종목수] {len(positions)}개")
+                for stock in positions:
                     logger.info(
                         f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, "
                         f"보유수량: {stock.get('hldg_qty')}, 매도가능: {stock.get('ord_psbl_qty')}"
                     )
-                current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
-                ord_psbl_map = {b['pdno']: _to_int(b.get('ord_psbl_qty', 0)) for b in balances}
+                current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in positions if _to_int(b.get('hldg_qty', 0)) > 0}
+                ord_psbl_map    = {b['pdno']: _to_int(b.get('ord_psbl_qty', 0)) for b in positions}
                 # 보유 해제
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
