@@ -1,7 +1,12 @@
 # trader.py
 import logging
 import requests
-from .kis_wrapper import KisAPI
+# 패키지/스크립트 양쪽 실행 호환을 위한 import fallback
+try:
+    from .kis_wrapper import KisAPI
+except ImportError:
+    from kis_wrapper import KisAPI
+
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import json

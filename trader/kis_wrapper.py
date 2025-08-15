@@ -31,7 +31,7 @@ def _json_dumps(body: dict) -> str:
     # HashKey/주문 본문 모두 동일 직렬화 문자열을 사용하도록 고정
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
-logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
+logger.info(f"[환경변수 체크] APP_KEY={'***' if not APP_KEY else APP_KEY[:3]+'***'}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
 logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
@@ -136,6 +136,12 @@ class KisAPI:
                 logger.warning(f"[토큰캐시 쓰기 실패] {e}")
             logger.info("[토큰캐시] 새 토큰 발급 및 캐시")
             return token
+
+    def refresh_token(self) -> str:
+        """외부에서 강제로 토큰 재발급을 원할 때 호출."""
+        with KisAPI._token_lock:
+            KisAPI._token_cache.update({"token": None, "expires_at": 0, "last_issued": 0})
+        return self.get_valid_token()
 
     def _issue_token_and_expire(self):
         token_path = "/oauth2/tokenP" if self.env == "practice" else "/oauth2/token"

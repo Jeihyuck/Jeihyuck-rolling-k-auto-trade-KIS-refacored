@@ -11,6 +11,14 @@ def safe_strip(val):
         return val.replace('\n', '').replace('\r', '').strip()
     return str(val).strip()
 
+def _mask(s: str, head: int = 3, tail: int = 2) -> str:
+    """로그 노출 최소화를 위한 마스킹."""
+    if not s:
+        return ""
+    if len(s) <= head + tail:
+        return s[0:1] + "***"
+    return f"{s[:head]}***{s[-tail:]}"
+
 # 환경변수 읽어서 무조건 safe_strip 적용
 APP_KEY        = safe_strip(os.getenv("KIS_APP_KEY"))
 APP_SECRET     = safe_strip(os.getenv("KIS_APP_SECRET"))
@@ -32,7 +40,7 @@ KIS_WS_URL     = safe_strip(os.getenv("KIS_WS_URL", ""))
 # 로깅 설정 (디버깅/실행 환경별 필요시)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
+logger.info(f"[환경변수 체크] APP_KEY={_mask(APP_KEY)}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
 logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
