@@ -6,11 +6,9 @@ on:
   pull_request:
     branches: [ KIS/realtimetrade ]
   schedule:
-
     # 한국시간 09:00~15:30(UTC 0~6시) 평일 5분마다 실행
     - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
-
 
 jobs:
   monitor-trade:
@@ -36,7 +34,15 @@ jobs:
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30  # 서버 구동 시간 여유 확보
+          echo "⏳ FastAPI 서버 구동 대기 중..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/docs > /dev/null; then
+              echo "✅ FastAPI 서버 준비 완료"
+              break
+            fi
+            echo "대기중... ($i)"
+            sleep 2
+          done
 
       - name: trader 자동매매 로직 실행
         env:
@@ -69,4 +75,3 @@ jobs:
         with:
           name: fastapi-log
           path: fastapi.log
-
