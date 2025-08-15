@@ -44,11 +44,26 @@ jobs:
             sleep 2
           done
 
-      - name: trader 자동매매 로직 실행
+      - name: trader 자동매매 로직 실행 (API 재시도 포함)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.trader
+          MAX_RETRIES=5
+          RETRY_DELAY=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "▶ trader.trader 실행 시도 $i/$MAX_RETRIES"
+            if python -m trader.trader; then
+              echo "✅ trader.trader 실행 성공"
+              break
+            else
+              echo "⚠️ trader.trader 실행 실패, ${RETRY_DELAY}초 후 재시도..."
+              sleep $RETRY_DELAY
+            fi
+            if [ "$i" -eq "$MAX_RETRIES" ]; then
+              echo "❌ trader.trader 실행 실패 (모든 재시도 소진)"
+              exit 1
+            fi
+          done
 
       - name: CEO 리포트 자동 생성
         env:
@@ -75,3 +90,4 @@ jobs:
         with:
           name: fastapi-log
           path: fastapi.log
+
