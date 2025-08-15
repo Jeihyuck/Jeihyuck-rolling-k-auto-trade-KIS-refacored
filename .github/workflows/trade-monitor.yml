@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [ KIS/realtimetrade ]
   schedule:
-    # 한국시간 09:00~15:30(UTC 0~6시) 평일 5분마다 실행
     - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
 
@@ -28,23 +27,31 @@ jobs:
           python-version: "3.11"
 
       - name: Dependencies 설치
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+      - name: 리밸런싱 API 서버 실행
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          echo "⏳ FastAPI 서버 구동 대기 중..."
+          echo "⏳ FastAPI 서버 구동 대기..."
+          # 1단계: 포트 오픈 체크
           for i in {1..30}; do
             if curl -s http://localhost:8000/docs > /dev/null; then
-              echo "✅ FastAPI 서버 준비 완료"
+              echo "✅ /docs 응답 OK"
               break
             fi
-            echo "대기중... ($i)"
+            sleep 2
+          done
+          # 2단계: /rebalance/latest API 준비 체크
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/rebalance/latest | grep -q "status"; then
+              echo "✅ /rebalance/latest 응답 OK"
+              break
+            fi
+            echo "서버 준비중... ($i)"
             sleep 2
           done
 
-      - name: trader 자동매매 로직 실행 (API 재시도 포함)
+      - name: trader 자동매매 실행 (API 재시도 포함)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -68,8 +75,7 @@ jobs:
       - name: CEO 리포트 자동 생성
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m trader.report_ceo
+        run: python -m trader.report_ceo
 
       - name: CEO 리포트 artifact 업로드
         uses: actions/upload-artifact@v4
@@ -77,14 +83,14 @@ jobs:
           name: ceo-report
           path: reports/
 
-      - name: FastAPI 로그 출력 (cat)
+      - name: FastAPI 로그 출력
         if: always()
         run: |
           echo "::group::FastAPI Server Log"
           cat fastapi.log
           echo "::endgroup::"
 
-      - name: FastAPI 로그 업로드 (artifact)
+      - name: FastAPI 로그 업로드
         if: always()
         uses: actions/upload-artifact@v4
         with:
