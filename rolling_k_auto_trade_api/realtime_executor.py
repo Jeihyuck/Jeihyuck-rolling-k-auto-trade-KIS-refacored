@@ -1,65 +1,73 @@
 import time
 from datetime import datetime
-from .kis_api import get_price_data, send_order
-import json
+import logging
 import os
 
-PORTFOLIO_STATE_FILE = "rolling_k_auto_trade_api/portfolio_state.json"
+from trader.strategy_atr import ATRStrategyEngine, StrategyATRParams
+from .kis_api import get_price_data, send_order, get_cash_balance
 
+logger = logging.getLogger(__name__)
 
-def load_portfolio_state():
-    if os.path.exists(PORTFOLIO_STATE_FILE):
-        with open(PORTFOLIO_STATE_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ATR 전략 초기화 (환경변수로 파라미터 조정 가능)
+atr_engine = ATRStrategyEngine(StrategyATRParams())
 
-
-def save_portfolio_state(state):
-    with open(PORTFOLIO_STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def calculate_target_price(prev_high, prev_low, today_open, k):
-    return today_open + (prev_high - prev_low) * k
-
-
-def monitor_and_trade_all(stocks):
+def monitor_and_trade_with_atr(stocks, top_n=None):
     """
-    리밸런싱된 종목 전체에 대해 실시간으로 K값 조건 감시 후 매수/매도 실행
-    stocks: [{stock_code, best_k}]
+    ATR 전략 기반 Top N 매수/매도 실시간 실행
+    stocks: [{'stock_code', 'best_k', 'avg_return_pct', '목표가'}]
+    top_n: None이면 환경변수 TOP_N_STOCKS 사용, 기본=5
     """
-    state = load_portfolio_state()
+    if not stocks:
+        logger.warning("[ATR매매] 리밸런싱 종목이 없습니다.")
+        return
 
+    if top_n is None:
+        top_n = int(os.getenv("TOP_N_STOCKS", 5))
+
+    # 수익률 기준 Top N 선정
+    selected = sorted(stocks, key=lambda x: x.get('avg_return_pct', 0), reverse=True)[:top_n]
+    logger.info(f"[ATR매매] Top {top_n} 종목 선정: {[s['stock_code'] for s in selected]}")
+
+    # 예수금 기반 수량 계산
+    total_cash = get_cash_balance()
+    if total_cash <= 0:
+        logger.warning("[ATR매매] 예수금이 없습니다. 매매를 종료합니다.")
+        return
+    cash_per_stock = total_cash / len(selected)
+
+    # 장중 실시간 매매
     while datetime.now().hour < 15:
-        for stock in stocks:
+        for stock in selected:
             code = stock["stock_code"]
-            k = stock["best_k"]
-            data = get_price_data(code)
+            target_price = stock["목표가"]
+
             try:
-                today_open = int(data["output"][0]["stck_oprc"])
-                prev_high = int(data["output"][1]["stck_hgpr"])
-                prev_low = int(data["output"][1]["stck_lwpr"])
-                current_price = int(data["output"][0]["stck_prpr"])
-            except:
+                data = get_price_data(code)
+                current_price = float(data["output"][0]["stck_prpr"])
+            except Exception as e:
+                logger.warning(f"[가격조회실패] {code}: {e}")
                 continue
 
-            target_price = calculate_target_price(prev_high, prev_low, today_open, k)
+            pos_state = atr_engine.get_position_state(code)
 
-            # 아직 매수하지 않은 경우 → 조건 만족 시 매수
-            if code not in state and current_price > target_price:
-                send_order(code, qty=1, side="buy")
-                state[code] = {
-                    "buy_price": current_price,
-                    "buy_time": datetime.now().isoformat(),
-                    "target_price": target_price,
-                }
+            # 매수 조건: 목표가 돌파 + 미보유
+            if not pos_state and current_price > target_price:
+                qty = max(1, int(cash_per_stock // current_price))
+                send_order(code, qty=qty, side="buy")
+                atr_engine.on_buy_filled(code, qty, current_price)
+                logger.info(f"[매수] {code} {qty}주 @ {current_price} (목표가 {target_price})")
+                continue
 
-            # 보유 중인 경우 → 종가 근접 시 자동 매도 (단순 종료 조건 예시)
-            elif code in state:
-                if datetime.now().hour == 14 and datetime.now().minute > 50:
-                    # TODO: send_sell(code, qty=1)
-                    state[code]["sell_price"] = current_price
-                    state[code]["sell_time"] = datetime.now().isoformat()
+            # 보유 시 ATR 전략 매도 판단
+            if pos_state:
+                decision = atr_engine.feed_tick_and_decide(code, current_price)
+                if decision.type == "SELL_ALL":
+                    send_order(code, qty=pos_state["qty"], side="sell")
+                    atr_engine.on_sell_filled(code, pos_state["qty"])
+                    logger.info(f"[전량매도] {code} {pos_state['qty']}주 @ {current_price} 사유={decision.reason}")
+                elif decision.type == "SELL_PARTIAL" and decision.qty > 0:
+                    send_order(code, qty=decision.qty, side="sell")
+                    atr_engine.on_sell_filled(code, decision.qty)
+                    logger.info(f"[부분매도] {code} {decision.qty}주 @ {current_price} 사유={decision.reason}")
 
-        save_portfolio_state(state)
-        time.sleep(30)
+        time.sleep(10)  # 10초 간격 가격 체크

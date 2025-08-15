@@ -11,11 +11,17 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
 from FinanceDataReader import StockListing, DataReader
+import threading
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50
-from rolling_k_auto_trade_api.kis_api import send_order, inquire_balance, inquire_filled_order
+from rolling_k_auto_trade_api.kis_api import (
+    send_order,
+    inquire_balance,
+    inquire_filled_order,
+    inquire_cash_balance,
+)
 from rolling_k_auto_trade_api.logging_config import configure_logging
-from rolling_k_auto_trade_api.kis_api import inquire_cash_balance
+from rolling_k_auto_trade_api.realtime_executor import monitor_and_trade_with_atr
 
 # ──────────────────────────────────────────────────────────────
 # 0. 로깅 설정 & 전역 상수
@@ -26,6 +32,13 @@ logger = logging.getLogger(__name__)
 rebalance_router = APIRouter()
 latest_rebalance_result: dict[str, any] = {"date": None, "selected_stocks": []}
 TOTAL_CAPITAL = 10_000_000  # 투자금 고정 (1,000만원)
+
+# 전략 옵션 (환경변수로 제어)
+TOP_N_STOCKS = int(os.getenv("TOP_N_STOCKS", 5))
+USE_TOP_N_ONLY = os.getenv("USE_TOP_N_ONLY", "1") == "1"  # True면 Top N만 매수
+RANK_KEY = os.getenv("RANK_KEY", "cumulative_return_pct")  # 정렬 기준: sharpe_m | avg_return_pct | cumulative_return_pct
+ENABLE_ATR_TRADE = os.getenv("ENABLE_ATR_TRADE", "1") == "1"  # ATR 실시간 매매 활성화
+USE_CASH_BALANCE = os.getenv("USE_CASH_BALANCE", "1") == "1"  # 예수금 기준으로 배분
 
 # ──────────────────────────────────────────────────────────────
 # 1. KST 타임존 & 장 운영시간 헬퍼
@@ -52,7 +65,7 @@ async def run_rebalance(
         description="True 로 주면 장 종료 후에도 주문 로직 강제 실행 (테스트 용)",
     ),
 ):
-    """KOSDAQ‑50 대상 Meta‑K 전략 리밸런싱 수행
+    """KOSDAQ‑50 대상 Meta‑K 전략 리밸런싱 수행 + ATR 실시간 매매 연동
 
     Args:
         date: YYYY‑MM‑DD 포맷 리밸런싱 기준일
@@ -120,12 +133,33 @@ async def run_rebalance(
             "selected": [],
         }
 
-    each_invest = TOTAL_CAPITAL // count if count > 0 else 0
+    # 2-1) Top N 선별 (수익률 극대화) — USE_TOP_N_ONLY=1이면 Top N만 사용
+    def _rank_val(d: dict) -> float:
+        # 선호 순서: 환경변수 RANK_KEY > sharpe_m > avg_return_pct > cumulative_return_pct
+        for k in [RANK_KEY, "sharpe_m", "avg_return_pct", "cumulative_return_pct"]:
+            v = d.get(k)
+            try:
+                if v is not None:
+                    return float(v)
+            except Exception:
+                continue
+        return 0.0
+
+    selected_sorted = sorted(selected, key=_rank_val, reverse=True)
+    selected_for_trade = (
+        selected_sorted[:TOP_N_STOCKS] if USE_TOP_N_ONLY else selected_sorted
+    )
+    logger.info(
+        f"[TOPN] USE_TOP_N_ONLY={USE_TOP_N_ONLY}, TOP_N_STOCKS={TOP_N_STOCKS}, "
+        f"rank_key={RANK_KEY}, codes={[s.get('stock_code') for s in selected_for_trade]}"
+    )
 
     # 3) 장중 여부 및 force 플래그
     now = datetime.now(tz=KST)
     allow_after = force_order or os.getenv("ALLOW_AFTER_HOURS", "0") == "1"
-    logger.info(f"[DEBUG] is_market_open={is_market_open(now)}, force_order={force_order}, allow_after={allow_after}")
+    logger.info(
+        f"[DEBUG] is_market_open={is_market_open(now)}, force_order={force_order}, allow_after={allow_after}"
+    )
 
     if not is_market_open(now) and not allow_after:
         logger.info("[SKIP] 장 종료 – 주문·잔고 로직 생략 (force_order=False)")
@@ -136,18 +170,28 @@ async def run_rebalance(
             "selected": [],
         }
 
-    # 1) 예수금 확인
+    # 4) 예수금 확인
     cash = inquire_cash_balance()
+    if cash is None:
+        logger.error("[REBALANCE_ABORT] 예수금 조회 실패")
+        return {"error": "예수금 조회 실패"}
 
     if cash <= 0:
         logger.error(f"[REBALANCE_ABORT] 예수금 부족: {cash:,}원")
         return {"error": "예수금이 0원입니다. 모의투자 계좌에 예수금을 충전하세요."}
 
-    logger.info(f"[REBALANCE] 시작예수금: {cash:,}원")
+    # 실제 배분 기준 금액 결정 (예수금 사용 or TOTAL_CAPITAL)
+    base_capital = cash if USE_CASH_BALANCE else min(TOTAL_CAPITAL, cash)
+    logger.info(f"[REBALANCE] 시작예수금: {cash:,}원 / 배분기준금액: {base_capital:,}원")
 
-    # 4) 주문 실행 - 반드시 selected만!
+    each_invest = base_capital // len(selected_for_trade) if selected_for_trade else 0
+    if each_invest <= 0:
+        logger.error("[REBALANCE_ABORT] 1종목당 배분금이 0원입니다.")
+        return {"error": "1종목당 배분금 0원"}
+
+    # 5) 주문 실행 - 반드시 selected_for_trade만!
     results_list = []
-    for info in selected:
+    for info in selected_for_trade:
         code = info.get("stock_code") or info.get("code")
         price = (
             info.get("목표가") or
@@ -156,11 +200,14 @@ async def run_rebalance(
             info.get("buy_price") or
             info.get("close")
         )
+        if not code:
+            logger.warning(f"[SKIP] 코드 누락: {info}")
+            continue
         if not price or price <= 0:
             logger.warning(f"[SKIP] 목표가 미정의/0원: {code}")
             continue
 
-        price = int(round(price))
+        price = int(round(float(price)))
         quantity = max(each_invest // price, 1)
         info["매수단가"] = price
         info["매수수량"] = quantity
@@ -171,6 +218,7 @@ async def run_rebalance(
             if not resp or not isinstance(resp, dict):
                 info["order_status"] = "실패: 주문 API None/비 dict 응답"
                 logger.error(f"[ORDER_FAIL] code={code}, resp is None/비 dict")
+                results_list.append(info)
                 continue
 
             # ODNO 필드로 주문번호 파싱
@@ -216,7 +264,7 @@ async def run_rebalance(
     logger.info(f"[CANDIDATES_RAW] {json.dumps(candidates, ensure_ascii=False)}")
     logger.info(f"[SELECTED_RAW] {json.dumps(selected, ensure_ascii=False)}")
 
-    # 5) 캐시 업데이트 및 파일 저장 - 반드시 selected 결과만!
+    # 6) 캐시 업데이트 및 파일 저장 - 반드시 selected_for_trade 결과만!
     latest_rebalance_result.update({"date": date, "selected_stocks": results_list})
     out_dir = "rebalance_results"
     os.makedirs(out_dir, exist_ok=True)
@@ -229,11 +277,27 @@ async def run_rebalance(
         logger.exception(f"[SAVE_FAIL] JSON 저장 오류: {e}")
         raise HTTPException(status_code=500, detail="리밸런스 결과 저장 실패")
 
+    # 7) ATR 전략 기반 실시간 매매 시작 (논블로킹)
+    if ENABLE_ATR_TRADE:
+        def _atr_thread():
+            try:
+                monitor_and_trade_with_atr(selected_for_trade, top_n=TOP_N_STOCKS)
+            except Exception:
+                logger.exception("[ATR_THREAD_FAIL] 실시간 ATR 매매 중 예외")
+        th = threading.Thread(target=_atr_thread, name="ATRTradeThread", daemon=True)
+        th.start()
+        logger.info("[ATR] ATR 실시간 매매 스레드 시작")
+    else:
+        logger.info("[ATR] ENABLE_ATR_TRADE=0 — ATR 실시간 매매 비활성화")
+
     return {
         "status": "orders_sent",
         "selected_count": len(results_list),
         "selected_stocks": results_list,
         "force_order": allow_after,
+        "top_n": TOP_N_STOCKS if USE_TOP_N_ONLY else len(selected_sorted),
+        "rank_key": RANK_KEY,
+        "use_top_n_only": USE_TOP_N_ONLY,
     }
 
 # ──────────────────────────────────────────────────────────────
