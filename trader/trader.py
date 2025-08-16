@@ -68,6 +68,14 @@ MAX_PRICE_SAMPLES = int(os.getenv("MAX_PRICE_SAMPLES", "120"))  # 최근 120틱(
 # 메인 루프 슬립
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "3"))
 
+# ====== (추가) 리밸런싱 API 연결 설정 ======
+REBALANCE_API_BASE = os.getenv("REBALANCE_API_BASE", "http://localhost:8000").rstrip("/")
+REBALANCE_API_CONNECT_TIMEOUT = float(os.getenv("REBALANCE_API_CONNECT_TIMEOUT", "4.0"))  # 연결 타임아웃
+REBALANCE_API_READ_TIMEOUT    = float(os.getenv("REBALANCE_API_READ_TIMEOUT", "30.0"))    # 응답 타임아웃
+WAIT_API_READY_TIMEOUT_SEC    = int(os.getenv("WAIT_API_READY_TIMEOUT_SEC", "90"))        # 준비대기 총 시간
+WAIT_API_READY_INTERVAL_SEC   = int(os.getenv("WAIT_API_READY_INTERVAL_SEC", "3"))        # 폴링 간격
+FAIL_IF_API_DOWN              = os.getenv("FAIL_IF_API_DOWN", "false").lower() == "true"  # true면 API 미가동 시 예외
+
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
         hh, mm = hhmm.split(":")
@@ -83,20 +91,70 @@ def get_month_first_date():
     month_first = today.replace(day=1)
     return month_first.strftime("%Y-%m-%d")
 
+# ===== (추가) FastAPI 준비 확인 =====
+def wait_for_api():
+    """
+    FastAPI 서버가 올라와서 200을 줄 때까지 대기.
+    /rebalance/latest → 200이면 준비완료로 간주.
+    """
+    url = f"{REBALANCE_API_BASE}/rebalance/latest"
+    logger.info(f"[⏳ API 준비 확인] {url} (timeout={WAIT_API_READY_TIMEOUT_SEC}s, interval={WAIT_API_READY_INTERVAL_SEC}s)")
+    start = time.time()
+    while True:
+        try:
+            r = requests.get(url, timeout=(REBALANCE_API_CONNECT_TIMEOUT, REBALANCE_API_READ_TIMEOUT))
+            if r.status_code == 200:
+                logger.info("[✅ API 준비 완료]")
+                return True
+            else:
+                logger.info(f"[대기중] API status={r.status_code} body={r.text[:200]}")
+        except Exception as e:
+            logger.info(f"[대기중] API not ready: {e}")
+        if time.time() - start > WAIT_API_READY_TIMEOUT_SEC:
+            msg = f"[❌ API 준비 실패] {WAIT_API_READY_TIMEOUT_SEC}s 내 응답 없음"
+            if FAIL_IF_API_DOWN:
+                raise RuntimeError(msg)
+            else:
+                logger.warning(msg + " → FAIL_IF_API_DOWN=false 이므로 빈 타겟으로 진행")
+                return False
+        time.sleep(WAIT_API_READY_INTERVAL_SEC)
+
 def fetch_rebalancing_targets(date):
     """
     /rebalance/run/{date}?force_order=true 호출 결과에서
     selected 또는 selected_stocks 키를 우선 사용.
     """
-    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
-    response = requests.post(REBALANCE_API_URL)
-    logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")
-    if response.status_code == 200:
-        data = response.json()
-        logger.info(f"[🎯 리밸런싱 종목]: {data.get('selected') or data.get('selected_stocks')}")
-        return data.get("selected") or data.get("selected_stocks") or []
+    url = f"{REBALANCE_API_BASE}/rebalance/run/{date}?force_order=true"
+    max_retries = int(os.getenv("REBALANCE_API_MAX_RETRIES", "5"))
+    base_delay = float(os.getenv("REBALANCE_API_BASE_DELAY", "0.8"))
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(
+                url,
+                timeout=(REBALANCE_API_CONNECT_TIMEOUT, REBALANCE_API_READ_TIMEOUT),
+            )
+            logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text[:2000]}")
+            if response.status_code == 200:
+                data = response.json()
+                stocks = data.get("selected") or data.get("selected_stocks") or []
+                logger.info(f"[🎯 리밸런싱 종목수]: {len(stocks)}")
+                return stocks
+            else:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+        except Exception as e:
+            last_err = e
+            sleep_sec = base_delay * (1.8 ** (attempt - 1)) + random.uniform(0, 0.3)
+            logger.error(f"[리밸런싱 API 재시도 {attempt}/{max_retries}] {e} → {sleep_sec:.2f}s 대기")
+            time.sleep(sleep_sec)
+
+    # 모든 재시도 실패
+    if FAIL_IF_API_DOWN:
+        raise RuntimeError(f"[리밸런싱 API 실패] {last_err}")
     else:
-        raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
+        logger.warning(f"[리밸런싱 API 실패] {last_err} → 빈 타겟으로 진행")
+        return []
 
 def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
@@ -422,6 +480,9 @@ def main():
     for code, st in holding.items():
         if not isinstance(st.get("price_hist"), deque):
             st["price_hist"] = deque(st.get("price_hist", []), maxlen=MAX_PRICE_SAMPLES)
+
+    # ======== (추가) FastAPI 준비 확인 ========
+    wait_for_api()
 
     # ======== 리밸런싱 대상 종목 추출 ========
     targets = fetch_rebalancing_targets(rebalance_date)
