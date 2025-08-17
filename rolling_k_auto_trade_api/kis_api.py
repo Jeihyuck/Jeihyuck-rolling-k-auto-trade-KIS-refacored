@@ -1,3 +1,4 @@
+# kis_api.py
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -17,23 +18,20 @@ ACNT_PRDT_CD = os.getenv("ACNT_PRDT_CD", "01")
 
 KIS_ENV = os.getenv("KIS_ENV", "practice").lower()
 
-
-KIS_ENV = os.getenv("KIS_ENV", "practice").lower()
 if KIS_ENV == "practice":
     DOMAIN        = "https://openapivts.koreainvestment.com:29443"
     ORDER_PATH    = "/uapi/domestic-stock/v1/trading/order-cash"
     BALANCE_TR_ID = "VTTC8434R"
     BUY_TR_ID     = "VTTC0012U"
     SELL_TR_ID    = "VTTC0011U"
-    CUSTTYPE      = "P"  # 개인
+    CUSTTYPE      = "P"
 else:
     DOMAIN        = "https://openapi.koreainvestment.com:9443"
     ORDER_PATH    = "/uapi/domestic-stock/v1/trading/order-cash"
     BALANCE_TR_ID = "TTTC8434R"
     BUY_TR_ID     = "TTTC0012U"
     SELL_TR_ID    = "TTTC0011U"
-    CUSTTYPE      = "E"  # 개인
-
+    CUSTTYPE      = "E"
 
 ORDER_URL   = f"{DOMAIN}{ORDER_PATH}"
 BALANCE_URL = f"{DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -53,10 +51,9 @@ if not logger.handlers:
     logger.addHandler(sh)
 
 # ─────────────── 토큰 관리 ───────────────
-_token_expires_at = 0  # UNIX epoch seconds
+_token_expires_at = 0
 
 def refresh_token() -> str:
-    """KIS OAuth2 토큰 재발급"""
     global ACCESS_TOKEN, _token_expires_at
     url     = f"{REST_DOMAIN}/oauth2/tokenP"
     headers = {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-cache"}
@@ -78,7 +75,6 @@ def get_valid_token() -> str:
 
 # ─────────────── 내부 유틸 함수 ───────────────
 def _create_hashkey(payload: dict) -> str:
-    """주문 payload -> hashkey"""
     url = f"{REST_DOMAIN}/uapi/hashkey"
     headers = {
         "Content-Type": "application/json; charset=utf-8",
@@ -91,7 +87,6 @@ def _create_hashkey(payload: dict) -> str:
     return resp.json()["HASH"]
 
 def _balance_headers():
-    """잔고조회 헤더 세팅"""
     return {
         "authorization": f"Bearer {get_valid_token()}",
         "content-type": "application/json; charset=utf-8",
@@ -101,36 +96,20 @@ def _balance_headers():
         "custtype": CUSTTYPE,
     }
 
-#def _order_headers(hashkey: str):
-#    """주문 헤더 세팅"""
-#    return {
-#        "Content-Type": "application/json; charset=utf-8",
-#        "appkey": APP_KEY,
-#        "appsecret": APP_SECRET,
-#        "tr_id": ORDER_TR_ID,
-#        "custtype": CUSTTYPE,
-#        "hashkey": hashkey,
-#        "Authorization": f"Bearer {get_valid_token()}",
-#    }
-
 # ─────────────── API Wrappers ───────────────
 
 def inquire_cash_balance() -> int:
-    """
-    예수금(출금가능금액) 조회: 잔고조회 API에서 output2에서 추출
-    실패시 0원 반환
-    """
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
         "AFHR_FLPR_YN": "N",
         "UNPR_YN": "N",
-        "UNPR_DVSN": "01",  # ✅ 새로 추가!
+        "UNPR_DVSN": "01",
         "FUND_STTL_ICLD_YN": "N",
         "FNCG_AMT_AUTO_RDPT_YN": "N",
         "PRCS_DVSN": "01",
-        "OFL_YN": "N",  
-        "INQR_DVSN": "02",     # ← ★ 필수 추가! (보통 "02" 전체잔고, "01" 일별잔고 )
+        "OFL_YN": "N",
+        "INQR_DVSN": "02",
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": ""
     }
@@ -150,19 +129,18 @@ def inquire_cash_balance() -> int:
         logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
         return 0
 
-
 def inquire_balance(code: str = None) -> dict:
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
         "AFHR_FLPR_YN": "N",
         "UNPR_YN": "N",
-        "UNPR_DVSN": "01",  # ✅ 새로 추가!
+        "UNPR_DVSN": "01",
         "FUND_STTL_ICLD_YN": "N",
         "FNCG_AMT_AUTO_RDPT_YN": "N",
         "PRCS_DVSN": "02",
         "OFL_YN": "N",
-        "INQR_DVSN": "01",     # ← ★ 필수 추가! (보통 "02" 전체잔고, "01" 일별잔고 등)
+        "INQR_DVSN": "01",
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": ""
     }
@@ -182,18 +160,17 @@ def inquire_balance(code: str = None) -> dict:
         logger.warning(f"[BALANCE_FAIL] {code} | {e}")
         return {"qty": 0, "eval_amt": 0}
 
-
 def send_order(code: str, qty: int, price: int, side: str) -> dict | None:
     body = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
         "PDNO": code,
-        "ORD_DVSN": "00",  # 지정가
+        "ORD_DVSN": "00",  
         "ORD_QTY": str(qty),
         "ORD_UNPR": str(price),
     }
     hashkey = _create_hashkey(body)
-    tr_id = BUY_TR_ID if side == "buy" else SELL_TR_ID  # 매수/매도 구분
+    tr_id = BUY_TR_ID if side == "buy" else SELL_TR_ID
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "appkey": APP_KEY,
@@ -210,9 +187,7 @@ def send_order(code: str, qty: int, price: int, side: str) -> dict | None:
         return None
     return resp_json
 
-
 def inquire_filled_order(ord_no: str) -> dict:
-    """체결 조회"""
     params = {"CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "ORD_UNQ_NO": ord_no}
     headers = {
         "authorization": f"Bearer {get_valid_token()}",
@@ -225,3 +200,38 @@ def inquire_filled_order(ord_no: str) -> dict:
     logger.debug(f"[KIS_FILL_RESP] {resp.status_code} {resp.text}")
     resp.raise_for_status()
     return resp.json()
+
+# ─────────────── FastAPI 연동을 위한 하위호환 래퍼 추가됨 ───────────────
+
+from .kis_wrapper import KisAPI
+_kis = KisAPI()
+
+def get_price_data(code: str):
+    """시세 조회: FastAPI와 realtime_executor 호출 호환용"""
+    try:
+        price = _kis.get_current_price(code)
+        return {"code": code, "price": float(price) if price is not None else None}
+    except Exception as e:
+        logger.error(f"[get_price_data ERROR] code={code} {e}")
+        return {"code": code, "price": None}
+
+def send_order_wrapper(side: str, code: str, qty: int, price: float | None = None):
+    """주문 래퍼: FastAPI/realtime_executor 용"""
+    try:
+        if side.upper() == "BUY":
+            return _kis.buy_stock(code, qty)
+        else:
+            return _kis.sell_stock_market(code, qty)
+    except Exception as e:
+        logger.error(f"[send_order ERROR] side={side}, code={code}, qty={qty}, price={price} {e}")
+        return None
+
+def get_cash_balance_wrapper():
+    """예수금 조회 래퍼: FastAPI/realtime_executor 용"""
+    try:
+        cash = inquire_cash_balance()
+        return {"cash": cash}
+    except Exception as e:
+        logger.error(f"[get_cash_balance ERROR] {e}")
+        return {"cash": 0}
+
