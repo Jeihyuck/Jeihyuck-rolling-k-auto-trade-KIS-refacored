@@ -3,19 +3,16 @@ name: Trade Monitor
 on:
   workflow_dispatch:
   push:
-    branches: [ "KIS/realtimetrade" ]   # 필요시 main으로 변경 가능
-  pull_request:
-    branches: [ "KIS/realtimetrade" ]
+    branches: [ "KIS/realtimetrade" ]   # 원래 쓰던 브랜치명 유지 (필요시 "main"으로 변경)
   schedule:
-    # 평일 09:00 KST에 1회 실행
-    # GitHub Actions cron은 UTC 기준 → 00:00 UTC == 09:00 KST
+    # 평일 09:00 KST에 1회 실행 (GitHub cron은 UTC 기준 → 00:00 UTC == 09:00 KST)
     - cron: "0 0 * * 1-5"
 
 permissions:
   contents: read
 
 concurrency:
-  group: trade-monitor-${{ github.ref }}   # 동일 브랜치 중복 실행 방지
+  group: trade-monitor-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,15 +21,14 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # ✅ Secrets → ENV (코드 키와 1:1 매핑)
       KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
       CANO:             ${{ secrets.CANO }}
       ACNT_PRDT_CD:     ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV:          ${{ secrets.KIS_ENV }}          # "practice" | "real"
-      API_BASE_URL:     ${{ secrets.API_BASE_URL }}     # 선택(미설정 시 settings 기본값)
-      SLACK_WEBHOOK:    ${{ secrets.SLACK_WEBHOOK }}    # 선택
-      TZ:               Asia/Seoul                      # 로그 타임존 KST
+      KIS_ENV:          ${{ secrets.KIS_ENV }}
+      API_BASE_URL:     ${{ secrets.API_BASE_URL }}
+      SLACK_WEBHOOK:    ${{ secrets.SLACK_WEBHOOK }}
+      TZ:               "Asia/Seoul"
       PYTHONPATH:       ${{ github.workspace }}
 
     steps:
@@ -50,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          key: "${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}"
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -59,21 +55,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ▶ 프리플라이트: settings.py가 필수 ENV를 읽는지 즉시 검증(누락 시 실패)
       - name: Preflight config check
+        shell: bash
         run: |
           python - <<'PY'
-from settings import APP_KEY, APP_SECRET, CANO, ACNT_PRDT_CD, KIS_ENV, API_BASE_URL
-print('[ENV_OK] KIS_APP_KEY =', (APP_KEY[:3]+'***') if APP_KEY else None)
-print('[ENV_OK] CANO        =', CANO)
-print('[ENV_OK] ACNT_PRDT_CD=', ACNT_PRDT_CD)
-print('[ENV_OK] KIS_ENV     =', KIS_ENV)
-print('[ENV_OK] API_BASE_URL=', API_BASE_URL)
-assert APP_KEY and APP_SECRET and CANO and ACNT_PRDT_CD, 'Missing required env vars'
-PY
+          from settings import APP_KEY, APP_SECRET, CANO, ACNT_PRDT_CD, KIS_ENV, API_BASE_URL
+          print('[ENV_OK] KIS_APP_KEY =', (APP_KEY[:3]+'***') if APP_KEY else None)
+          print('[ENV_OK] CANO        =', CANO)
+          print('[ENV_OK] ACNT_PRDT_CD=', ACNT_PRDT_CD)
+          print('[ENV_OK] KIS_ENV     =', KIS_ENV)
+          print('[ENV_OK] API_BASE_URL=', API_BASE_URL)
+          assert APP_KEY and APP_SECRET and CANO and ACNT_PRDT_CD, 'Missing required env vars'
+          PY
 
-      # ▶ FastAPI 서버 백그라운드 실행 + 헬스/문서/전략 엔드포인트까지 스모크
       - name: Run API (background) and wait for readiness
+        shell: bash
         run: |
           nohup python -m uvicorn rolling_k_auto_trade_api.main:app --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
           echo $! > uvicorn.pid
@@ -90,8 +86,8 @@ PY
           echo "⏳ Checking /rebalance/latest ..."
           curl -sf http://127.0.0.1:8000/rebalance/latest || (echo '[ERR] /rebalance/latest failed' && exit 1)
 
-      # ▶ 실제 전략 실행(재시도 포함)
       - name: Run trader (with retry)
+        shell: bash
         run: |
           MAX_RETRIES=5
           RETRY_DELAY=5
@@ -110,7 +106,6 @@ PY
             fi
           done
 
-      # ▶ 리포트 생성 및 업로드(선택)
       - name: Generate CEO report
         run: python -m trader.report_ceo
 
@@ -120,9 +115,9 @@ PY
           name: ceo-report
           path: reports/
 
-      # ▶ FastAPI 로그 출력/업로드
       - name: Print FastAPI log
         if: always()
+        shell: bash
         run: |
           echo "::group::FastAPI Server Log"
           test -f fastapi.log && tail -n 500 fastapi.log || echo "fastapi.log not found"
@@ -132,18 +127,10 @@ PY
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trade-logs
+          name: trade-monitor-logs
           path: |
             fastapi.log
             uvicorn.pid
             **/logs/**
-
-      # ▶ 서버 종료(항상)
-      - name: Stop API
-        if: always()
-        run: |
-          if [ -f uvicorn.pid ]; then
-            kill $(cat uvicorn.pid) || true
-          fi
 
 
