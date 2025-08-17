@@ -1,99 +1,149 @@
 name: Trade Monitor
 
 on:
-  push:
-    branches: [ KIS/realtimetrade ]
-  pull_request:
-    branches: [ KIS/realtimetrade ]
-  schedule:
-    - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
+  push:
+    branches: [ "KIS/realtimetrade" ]   # 필요시 main으로 변경 가능
+  pull_request:
+    branches: [ "KIS/realtimetrade" ]
+  schedule:
+    # 평일 09:00 KST에 1회 실행
+    # GitHub Actions cron은 UTC 기준 → 00:00 UTC == 09:00 KST
+    - cron: "0 0 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trade-monitor-${{ github.ref }}   # 동일 브랜치 중복 실행 방지
+  cancel-in-progress: true
 
 jobs:
-  monitor-trade:
+  trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     env:
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
+      # ✅ Secrets → ENV (코드 키와 1:1 매핑)
+      KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+      CANO:             ${{ secrets.CANO }}
+      ACNT_PRDT_CD:     ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV:          ${{ secrets.KIS_ENV }}          # "practice" | "real"
+      API_BASE_URL:     ${{ secrets.API_BASE_URL }}     # 선택(미설정 시 settings 기본값)
+      SLACK_WEBHOOK:    ${{ secrets.SLACK_WEBHOOK }}    # 선택
+      TZ:               Asia/Seoul                      # 로그 타임존 KST
+      PYTHONPATH:       ${{ github.workspace }}
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Dependencies 설치
-        run: pip install -r requirements.txt
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: 리밸런싱 API 서버 실행
+      - name: Install dependencies
         run: |
-          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          echo "⏳ FastAPI 서버 구동 대기..."
-          # 1단계: 포트 오픈 체크
-          for i in {1..30}; do
-            if curl -s http://localhost:8000/docs > /dev/null; then
-              echo "✅ /docs 응답 OK"
-              break
-            fi
-            sleep 2
-          done
-          # 2단계: /rebalance/latest API 준비 체크
-          for i in {1..30}; do
-            if curl -s http://localhost:8000/rebalance/latest | grep -q "status"; then
-              echo "✅ /rebalance/latest 응답 OK"
-              break
-            fi
-            echo "서버 준비중... ($i)"
-            sleep 2
-          done
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: trader 자동매매 실행 (API 재시도 포함)
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+      # ▶ 프리플라이트: settings.py가 필수 ENV를 읽는지 즉시 검증(누락 시 실패)
+      - name: Preflight config check
+        run: |
+          python - <<'PY'
+from settings import APP_KEY, APP_SECRET, CANO, ACNT_PRDT_CD, KIS_ENV, API_BASE_URL
+print('[ENV_OK] KIS_APP_KEY =', (APP_KEY[:3]+'***') if APP_KEY else None)
+print('[ENV_OK] CANO        =', CANO)
+print('[ENV_OK] ACNT_PRDT_CD=', ACNT_PRDT_CD)
+print('[ENV_OK] KIS_ENV     =', KIS_ENV)
+print('[ENV_OK] API_BASE_URL=', API_BASE_URL)
+assert APP_KEY and APP_SECRET and CANO and ACNT_PRDT_CD, 'Missing required env vars'
+PY
+
+      # ▶ FastAPI 서버 백그라운드 실행 + 헬스/문서/전략 엔드포인트까지 스모크
+      - name: Run API (background) and wait for readiness
+        run: |
+          nohup python -m uvicorn rolling_k_auto_trade_api.main:app --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
+          echo $! > uvicorn.pid
+          echo "⏳ Waiting /health ..."
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null; then
+              echo "✅ /health OK"
+              break
+            fi
+            echo "[health] retry $i"; sleep 2
+          done
+          echo "⏳ Checking /docs ..."
+          curl -sf http://127.0.0.1:8000/docs | head -n 1 || (echo '[ERR] /docs not responding' && exit 1)
+          echo "⏳ Checking /rebalance/latest ..."
+          curl -sf http://127.0.0.1:8000/rebalance/latest || (echo '[ERR] /rebalance/latest failed' && exit 1)
+
+      # ▶ 실제 전략 실행(재시도 포함)
+      - name: Run trader (with retry)
         run: |
           MAX_RETRIES=5
           RETRY_DELAY=5
           for i in $(seq 1 $MAX_RETRIES); do
-            echo "▶ trader.trader 실행 시도 $i/$MAX_RETRIES"
+            echo "▶ python -m trader.trader (attempt $i/$MAX_RETRIES)"
             if python -m trader.trader; then
-              echo "✅ trader.trader 실행 성공"
+              echo "✅ trader.trader succeeded"
               break
             else
-              echo "⚠️ trader.trader 실행 실패, ${RETRY_DELAY}초 후 재시도..."
+              echo "⚠️ trader.trader failed; retry in ${RETRY_DELAY}s"
               sleep $RETRY_DELAY
             fi
             if [ "$i" -eq "$MAX_RETRIES" ]; then
-              echo "❌ trader.trader 실행 실패 (모든 재시도 소진)"
+              echo "❌ trader.trader failed after all retries"
               exit 1
             fi
           done
 
-      - name: CEO 리포트 자동 생성
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+      # ▶ 리포트 생성 및 업로드(선택)
+      - name: Generate CEO report
         run: python -m trader.report_ceo
 
-      - name: CEO 리포트 artifact 업로드
+      - name: Upload CEO report artifact
         uses: actions/upload-artifact@v4
         with:
           name: ceo-report
           path: reports/
 
-      - name: FastAPI 로그 출력
+      # ▶ FastAPI 로그 출력/업로드
+      - name: Print FastAPI log
         if: always()
         run: |
           echo "::group::FastAPI Server Log"
-          cat fastapi.log
+          test -f fastapi.log && tail -n 500 fastapi.log || echo "fastapi.log not found"
           echo "::endgroup::"
 
-      - name: FastAPI 로그 업로드
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fastapi-log
-          path: fastapi.log
+          name: trade-logs
+          path: |
+            fastapi.log
+            uvicorn.pid
+            **/logs/**
+
+      # ▶ 서버 종료(항상)
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill $(cat uvicorn.pid) || true
+          fi
+
 

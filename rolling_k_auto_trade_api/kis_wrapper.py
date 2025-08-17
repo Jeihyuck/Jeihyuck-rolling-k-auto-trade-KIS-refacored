@@ -13,6 +13,13 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from typing import Optional, Dict, Any, List
 
+# ✅ settings에서 확정된 값을 우선 사용
+try:
+    from settings import APP_KEY as S_APP_KEY, APP_SECRET as S_APP_SECRET, \
+        CANO as S_CANO, ACNT_PRDT_CD as S_ACNT, KIS_ENV as S_ENV, API_BASE_URL as S_BASE
+except Exception:
+    S_APP_KEY = S_APP_SECRET = S_CANO = S_ACNT = S_ENV = S_BASE = None
+
 logger = logging.getLogger("trader.kis_wrapper")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -22,15 +29,15 @@ if not logger.handlers:
     logger.addHandler(sh)
 
 # ------------------------
-# env / defaults
+# env / defaults (settings 값 우선)
 # ------------------------
-APP_KEY = os.getenv("KIS_APP_KEY")
-APP_SECRET = os.getenv("KIS_APP_SECRET")
-CANO = os.getenv("CANO")
-ACNT_PRDT_CD = os.getenv("ACNT_PRDT_CD", "01")
-KIS_ENV = os.getenv("KIS_ENV", "practice").lower()
+APP_KEY = (S_APP_KEY or os.getenv("KIS_APP_KEY") or "").strip()
+APP_SECRET = (S_APP_SECRET or os.getenv("KIS_APP_SECRET") or "").strip()
+CANO = (S_CANO or os.getenv("CANO") or "").strip()
+ACNT_PRDT_CD = (S_ACNT or os.getenv("ACNT_PRDT_CD") or "01").strip()
+KIS_ENV = (S_ENV or os.getenv("KIS_ENV") or "practice").strip().lower()
 
-API_BASE_URL = os.getenv("API_BASE_URL", "")  # prefer explicit
+API_BASE_URL = (S_BASE or os.getenv("API_BASE_URL") or "").strip()
 if not API_BASE_URL:
     API_BASE_URL = os.getenv("KIS_REST_URL", "") or (
         "https://openapivts.koreainvestment.com:29443" if KIS_ENV == "practice"
@@ -267,7 +274,6 @@ class KisAPI:
         """
         side_norm = side.strip().lower()
         if order_type is None:
-            # 기본 지정가("00") 또는 시장가("01")는 상위 로직에서 넘겨주는 것을 권장
             ord_dvsn = "00" if price else "01"
         else:
             ord_dvsn = order_type
@@ -295,7 +301,7 @@ class KisAPI:
     # ------------------------
     def get_current_price(self, code: str) -> float:
         """
-        단건 현재가 조회. 시장코드 'J'(코스닥), 'U'(코스피)를 시도하고,
+        단건 현재가 조회. 시장코드 'J'(코스닥), 'U'(코스피')를 시도하고,
         'A' 접두어 유무 모두 시도하여 성공값 반환.
         """
         tried: List[tuple] = []
