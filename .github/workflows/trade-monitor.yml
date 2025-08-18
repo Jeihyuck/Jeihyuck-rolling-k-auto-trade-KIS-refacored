@@ -156,4 +156,4 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [ -f uvicorn.pid ]; then kill $(cat uvicorn.pid) || true; fi
+          if [ -f uvicorn.pid ]; then kill $(cat uvicorn.pid) || true; fi 
