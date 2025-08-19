@@ -2,9 +2,9 @@ name: Trade Monitor
  
 on:
   push:
-    branches: [ KIS/realtimetrade ]
+    branches: [ maximus ]
   pull_request:
-    branches: [ KIS/realtimetrade ]
+    branches: [ maximus ]
   schedule:
 
     # 한국시간 09:00~15:30(UTC 0~6시) 평일 5분마다 실행
