@@ -5,11 +5,9 @@ on:
     branches: [ maximus ]
   pull_request:
     branches: [ maximus ]
-  on:
   schedule:
     # 매일 한국시간 08:30 (즉, 장 시작 30분 전)에 실행
     - cron: "30 23 * * 0-4"
-
   workflow_dispatch:
 
 jobs:
