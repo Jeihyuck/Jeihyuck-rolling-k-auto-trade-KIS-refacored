@@ -7,8 +7,7 @@ on:
     branches: [ main ]
   schedule:
     # KST 08:30 = UTC 23:30 (주중만)
-    - cron: "30 10 * * 1-5"
-    #- cron: "30 23 * * 1-5"
+    - cron: "30 23 * * 1-5"
   workflow_dispatch:
 
 jobs:
