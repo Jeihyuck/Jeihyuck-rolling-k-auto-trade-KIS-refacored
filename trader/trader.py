@@ -36,10 +36,10 @@ FORCE_SELL_PASSES_CLOSE  = int(os.getenv("FORCE_SELL_PASSES_CLOSE",  "4"))
 # ====== 실전형 매도/진입 파라미터 ======
 PARTIAL1 = float(os.getenv("PARTIAL1", "0.5"))        # 목표가1 도달 시 매도 비중
 PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))        # 목표가2 도달 시 매도 비중
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))      # 고점대비 -2% 청산
-FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))       # 진입 5분내 -1%
-ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))          # ATR 1.5배 손절(절대값)
-TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")   # 시간 손절 기준
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))     # 고점대비 -2% 청산
+FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))      # 진입 5분내 -1%
+ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))         # ATR 1.5배 손절(절대값)
+TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")  # 시간 손절 기준
 
 # (기존 단일 임계치 대비) 백테/실전 괴리 축소를 위한 기본값 조정
 DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))   # 백업용
@@ -175,6 +175,32 @@ def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float,
         'stop_abs': float(entry_price - ATR_STOP * atr) if atr else float(entry_price * (1 - FAST_STOP)),
         'k_value': k_value,
         'target_price_src': float(target_price) if target_price is not None else None,
+    }
+
+
+def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_price: float, qty: int):
+    """계좌에 이미 들고 있던 종목에 대해 능동관리 상태를 부트스트랩.
+       FAST_STOP 오작동 방지를 위해 entry_time을 10분 전으로 설정."""
+    if qty <= 0 or code in holding:
+        return
+    atr = _get_atr(KisAPI(), code)
+    rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, avg_price * 0.01)
+    t1 = avg_price + 0.5 * rng_eff
+    t2 = avg_price + 1.0 * rng_eff
+    holding[code] = {
+        'qty': int(qty),
+        'buy_price': float(avg_price),
+        'entry_time': (datetime.now(KST) - timedelta(minutes=10)).isoformat(),  # fast stop 회피
+        'high': float(avg_price),
+        'tp1': float(t1),
+        'tp2': float(t2),
+        'sold_p1': False,
+        'sold_p2': False,
+        'trail_pct': TRAIL_PCT,
+        'atr': float(atr) if atr else None,
+        'stop_abs': float(avg_price - ATR_STOP * atr) if atr else float(avg_price * (1 - FAST_STOP)),
+        'k_value': None,
+        'target_price_src': None,
     }
 
 
@@ -399,26 +425,43 @@ def main():
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[⏰ 장상태] {'OPEN' if is_open else 'CLOSED'} / KST={now_str}")
 
-            # ====== 잔고 동기화 ======
+            # ====== 잔고 동기화 & 보유분 능동관리 부트스트랩 ======
             ord_psbl_map = {}
+            name_map: Dict[str, str] = {}
             try:
                 balances = _fetch_balances(kis)
                 logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
                 for stock in balances:
+                    code_b = stock.get('pdno')
+                    name_b = stock.get('prdt_name')
+                    name_map[code_b] = name_b
                     logger.info(
-                        f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, "
+                        f"  [잔고] 종목: {name_b}, 코드: {code_b}, "
                         f"보유수량: {stock.get('hldg_qty')}, 매도가능: {stock.get('ord_psbl_qty')}"
                     )
+
                 current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
                 ord_psbl_map = {b['pdno']: _to_int(b.get('ord_psbl_qty', 0)) for b in balances}
+
+                # 신규 보유분을 능동관리 대상으로 자동 초기화 (A)
+                for b in balances:
+                    code_b = b.get('pdno')
+                    qty_b = _to_int(b.get('hldg_qty', 0))
+                    if qty_b > 0 and code_b and code_b not in holding:
+                        avg_b = _to_float(b.get('pchs_avg_pric') or b.get('avg_price') or 0.0, 0.0)
+                        if avg_b and avg_b > 0:
+                            _init_position_state_from_balance(holding, code_b, avg_b, qty_b)
+
+                # 실제 잔고에서 사라진 보유항목은 정리
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
                         logger.info(f"[보유종목 해제] {code} : 실제잔고 없음 → holding 제거")
                         holding.pop(code, None)
+
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
 
-            # ====== 매수/매도(전략) LOOP ======
+            # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
             for code, target in code_to_target.items():
                 qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
                 if qty <= 0:
@@ -428,7 +471,7 @@ def main():
                 k_value = (target.get("best_k") or target.get("K") or target.get("k"))
                 target_price = _to_float(target.get("목표가") or target.get("target_price"))
                 strategy = target.get("strategy") or "전월 rolling K 최적화"
-                name = target.get("name") or target.get("종목명")
+                name = target.get("name") or target.get("종목명") or name_map.get(code)
 
                 try:
                     current_price = _safe_get_price(kis, code)
@@ -463,16 +506,14 @@ def main():
                             logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({target_price}), 미매수")
                             continue
 
-                    # --- 실전형 청산 ---
+                    # --- 실전형 청산 (타겟 보유포지션) ---
                     if is_open and code in holding:
-                        # 매도가능 0이면 보류(중복주문 방지)
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here <= 0:
                             logger.info(f"[SKIP] {code}: 매도가능수량=0 (대기/체결중/락) → 매도 보류")
                         else:
                             reason = _adaptive_exit(kis, code, holding[code])
                             if reason:
-                                # 포지션 수량은 _adaptive_exit 내부에서 차감
                                 log_trade({**trade_common, "side": "SELL", "price": _safe_get_price(kis, code),
                                            "amount": 0, "result": reason, "reason": reason})
                                 save_state(holding, traded)
@@ -481,6 +522,32 @@ def main():
                 except Exception as e:
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
                     continue
+
+            # ====== (A) 비타겟 보유분도 장중 능동관리 ======
+            if is_open:
+                for code in list(holding.keys()):
+                    if code in code_to_target:
+                        continue  # 위 루프에서 이미 처리
+                    sellable_here = ord_psbl_map.get(code, 0)
+                    if sellable_here <= 0:
+                        logger.info(f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)")
+                        continue
+                    name = name_map.get(code)
+                    trade_common = {
+                        "datetime": now_str,
+                        "code": code,
+                        "name": name,
+                        "qty": holding[code].get("qty"),
+                        "K": holding[code].get("k_value"),
+                        "target_price": holding[code].get("target_price_src"),
+                        "strategy": "기존보유 능동관리",
+                    }
+                    reason = _adaptive_exit(kis, code, holding[code])
+                    if reason:
+                        log_trade({**trade_common, "side": "SELL", "price": _safe_get_price(kis, code),
+                                   "amount": 0, "result": reason, "reason": reason})
+                        save_state(holding, traded)
+                        time.sleep(RATE_SLEEP_SEC)
 
             # --- 장중 커트오프(KST) 강제 전량매도 (마지막 안전장치) ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
