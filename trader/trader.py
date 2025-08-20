@@ -202,10 +202,29 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     return cur_price, result
 
 
+# ====== FIX: 잔고 표준화 반환 (항상 list[dict]) ======
 def _fetch_balances(kis: KisAPI):
+    """
+    항상 포지션 리스트(list[dict])를 반환하도록 표준화.
+    - kis.get_balance() 가 dict({"cash": int, "positions": list[dict]}) → positions 리스트만 추출
+    - kis.get_balance_all() 이 리스트를 준다면 그대로 반환
+    """
     if hasattr(kis, "get_balance_all"):
-        return _with_retry(kis.get_balance_all)
-    return _with_retry(kis.get_balance)
+        res = _with_retry(kis.get_balance_all)
+    else:
+        res = _with_retry(kis.get_balance)
+
+    if isinstance(res, dict):
+        positions = res.get("positions") or []
+        if not isinstance(positions, list):
+            logger.error(f"[BAL_STD_FAIL] positions 타입 이상: {type(positions)}")
+            return []
+        return positions
+    elif isinstance(res, list):
+        return res
+    else:
+        logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
+        return []
 
 
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
