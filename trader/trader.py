@@ -1,6 +1,6 @@
 import logging
 import requests
-from .kis_wrapper import KisAPI
+from .kis_wrapper import KisAPI, append_fill
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import json
@@ -9,6 +9,7 @@ import time
 import os
 import random
 from typing import Optional, Dict, Any
+import csv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -397,6 +398,62 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Optional[str]
     return None
 
 
+# ====== 보조: fills CSV에 name 채워넣기 또는 보완 기록 함수 ======
+def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: float = 0.0):
+    """
+    - 오늘의 fills CSV(fills/fills_YYYYMMDD.csv)를 열어 ODNO 일치 레코드가 있으면 name 컬럼을 채움.
+    - 없으면 append_fill()로 보조 기록을 남김.
+    """
+    try:
+        fills_dir = Path("fills")
+        fills_dir.mkdir(exist_ok=True)
+        today_path = fills_dir / f"fills_{datetime.now().strftime('%Y%m%d')}.csv"
+        updated = False
+        if today_path.exists():
+            # 읽기
+            with open(today_path, "r", encoding="utf-8", newline="") as f:
+                reader = list(csv.reader(f))
+            if not reader:
+                # header missing -> call append_fill later
+                pass
+            else:
+                header = reader[0]
+                # 안전하게 인덱스 찾기
+                try:
+                    idx_odno = header.index("ODNO")
+                    idx_code = header.index("code")
+                    idx_name = header.index("name")
+                except ValueError:
+                    idx_odno = None
+                    idx_code = None
+                    idx_name = None
+
+                if idx_odno is not None and idx_name is not None and idx_code is not None:
+                    for i in range(1, len(reader)):
+                        row = reader[i]
+                        # 보호: 행 길이가 짧으면 패스
+                        if len(row) <= max(idx_odno, idx_code, idx_name):
+                            continue
+                        if (row[idx_odno] == str(odno) or (not row[idx_odno] and str(odno) == "")) and row[idx_code] == str(code):
+                            # 채워넣기 (비어있을 때만)
+                            if not row[idx_name]:
+                                row[idx_name] = name or ""
+                                reader[i] = row
+                                updated = True
+                                logger.info(f"[FILL_NAME_UPDATE] ODNO={odno} code={code} name={name}")
+                                break
+        if updated:
+            # 덮어쓰기
+            with open(today_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(reader)
+            return
+        # 찾지 못하면 append_fill로 보조 기록 남김 (중복 가능성 존재)
+        append_fill("BUY", code, name or "", qty, price or 0.0, odno or "", note="ensure_fill_added_by_trader")
+    except Exception as e:
+        logger.warning(f"[ENSURE_FILL_FAIL] odno={odno} code={code} ex={e}")
+
+
 def main():
     kis = KisAPI()
     rebalance_date = get_month_first_date()
@@ -495,6 +552,15 @@ def main():
                             enter_cond = False
                         if enter_cond:
                             result = _with_retry(kis.buy_stock, code, qty)
+                            # 성공 여부 판별 후 fills에 name 채우기 시도
+                            try:
+                                if isinstance(result, dict) and result.get("rt_cd") == "0":
+                                    out = result.get("output") or {}
+                                    odno = out.get("ODNO") or out.get("ord_no") or out.get("order_no") or ""
+                                    ensure_fill_has_name(odno=odno, code=code, name=name or "", qty=qty, price=current_price or 0.0)
+                            except Exception as e:
+                                logger.warning(f"[BUY_FILL_NAME_FAIL] code={code} ex={e}")
+
                             _init_position_state(holding, code, float(current_price), int(qty), k_value, target_price)
                             traded[code] = {"buy_time": now_str, "qty": int(qty), "price": float(current_price)}
                             logger.info(f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}")

@@ -4,6 +4,7 @@ import time
 import random
 import logging
 import threading
+import csv
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -37,6 +38,45 @@ logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
 logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
+
+# -------------------------------
+# 체결 기록 저장 유틸
+# -------------------------------
+def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: str, note: str = ""):
+    """
+    체결(주문 성공) 기록을 CSV로 저장
+    - side: "BUY" 또는 "SELL"
+    - code: 종목 코드 (문자열)
+    - name: 종목명 (가능하면 전달, 없으면 빈 문자열)
+    - qty: 체결 수량 (int)
+    - price: 체결가(또는 추정가, float)
+    - odno: 주문번호(ODNO) 등 식별자
+    - note: 추가 메모
+    """
+    try:
+        os.makedirs("fills", exist_ok=True)
+        path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
+        header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note"]
+        row = [
+            datetime.now().isoformat(),
+            side,
+            code,
+            name or "",
+            int(qty),
+            float(price) if price is not None else 0.0,
+            str(odno) if odno is not None else "",
+            note or "",
+        ]
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(header)
+            w.writerow(row)
+        logger.info(f"[APPEND_FILL] {side} {code} qty={qty} price={price} odno={odno}")
+    except Exception as e:
+        logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
+
 
 # -------------------------------
 # 간단 레이트리미터(엔드포인트별 최소 간격 유지)
@@ -129,6 +169,12 @@ class KisAPI:
         self.session.mount("http://", adapter)
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
+
+        # 최근 매도 방지(메모리 기반)
+        # 구조: { pdno: last_ts }
+        self._recent_sells: Dict[str, float] = {}
+        self._recent_sells_lock = threading.Lock()
+        self._recent_sells_cooldown = 60.0  # seconds, 동일 종목 연속 매도 방지 기간
 
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
@@ -468,7 +514,13 @@ class KisAPI:
                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
 
                 # HashKey
-                hk = self._create_hashkey(body)
+                try:
+                    hk = self._create_hashkey(body)
+                except Exception as e:
+                    logger.error(f"[ORDER_HASH_FAIL] body={body} ex={e}")
+                    last_err = e
+                    continue
+
                 headers = self._headers(tr_id, hk)
 
                 # 레이트리밋(주문은 별 키)
@@ -496,10 +548,37 @@ class KisAPI:
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
                         logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
+                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
+                        try:
+                            out = data.get("output") or {}
+                            odno = out.get("ODNO") or out.get("ord_no") or ""
+                            pdno = safe_strip(body.get("PDNO", ""))
+                            qty = int(float(body.get("ORD_QTY", "0")))
+                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
+                            price_for_fill = None
+                            try:
+                                ord_unpr = body.get("ORD_UNPR")
+                                if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
+                                    price_for_fill = float(ord_unpr)
+                                else:
+                                    # 시장가의 경우 현재가 조회로 추정(실체 체결가와 다를 수 있음)
+                                    try:
+                                        price_for_fill = float(self.get_current_price(pdno))
+                                    except Exception:
+                                        price_for_fill = 0.0
+                            except Exception:
+                                price_for_fill = 0.0
+
+                            side = "SELL" if is_sell else "BUY"
+                            # name 불명(호출부에서 제공하지 않으므로 빈값 기록). 필요하면 매도/매수 호출부에서 name을 전달하도록 수정.
+                            append_fill(side=side, code=pdno, name="", qty=qty, price=price_for_fill, odno=odno, note=f"tr={tr_id},ord_dvsn={ord_dvsn}")
+                        except Exception as e:
+                            logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
                         return data
 
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
+                    # 게이트웨이/서버 에러류는 재시도
                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
@@ -509,6 +588,7 @@ class KisAPI:
                         last_err = data
                         continue
 
+                    # 비즈니스 실패(예: 잔고부족 등) → 재시도하지 않고 실패 반환
                     logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
                     return None
 
@@ -552,6 +632,16 @@ class KisAPI:
             )
             qty = base_qty
 
+        # --- 중복 매도 방지(메모리 기반) ---
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
+            # 등록은 주문 성공 후 수행하도록 되어 있으나
+            # 여기서도 미리 등록하는 패턴은 race가 있으므로 주문 성공 후 등록한다.
+
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -562,7 +652,17 @@ class KisAPI:
             "ORD_UNPR": "0",
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        return self._order_cash(body, is_sell=True)
+        resp = self._order_cash(body, is_sell=True)
+        # _order_cash 성공 시 append_fill이 이미 기록되므로 최근매도 등록만 하면 됨
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
+                # 청소: 오래된 항목 제거
+                cutoff = time.time() - (self._recent_sells_cooldown * 5)
+                keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
+                for k in keys_to_del:
+                    del self._recent_sells[k]
+        return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         body = {
@@ -585,6 +685,16 @@ class KisAPI:
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+            # append_fill 호출 (지정가이므로 body ORD_UNPR 사용 가능)
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="BUY", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
         return None
@@ -611,6 +721,14 @@ class KisAPI:
             )
             qty = base_qty
 
+        # 중복 매도 방지(메모리 기반)
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
+
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -632,6 +750,19 @@ class KisAPI:
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+            # append_fill (지정가이므로 체결가 추정으로 ORD_UNPR 사용)
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="SELL", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+            # 등록: 최근 매도 기록 추가
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
             return data
         logger.error(f"[SELL_LIMIT_FAIL] {data}")
         return None
@@ -656,3 +787,4 @@ class KisAPI:
         if price is None:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
+
