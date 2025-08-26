@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [ feature/rkmax ]
   schedule:
-    # 매일 한국시간 08:30 (장 시작 30분 전) 실행 — GitHub Actions는 UTC 기준
+    # 매일 한국시간 08:30 (UTC 23:30, 일~목) 실행
     - cron: "30 23 * * 0-4"
   workflow_dispatch:
 
@@ -42,7 +42,7 @@ jobs:
       # 배분
       TOTAL_CAPITAL: "10000000"  # 총 투자한도(원) - 1,000만원
       MIN_QTY_PER_TICKET: "1"    # 최소 주문 수량
-      DAILY_CAPITAL: "10000000"  # (리포트용) 일일 자금 한도
+      DAILY_CAPITAL: "10000000"  # (리포트/전략용) 일일 자금 한도
 
       # K 탐색
       K_MIN: "0.1"
@@ -63,6 +63,7 @@ jobs:
 
       - name: Dependencies 설치
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
@@ -86,7 +87,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ceo-report
-          path: reports/
+          path: trader/reports/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Rebalance JSON artifact 업로드
         if: always()
@@ -96,6 +99,15 @@ jobs:
           path: rebalance_results/*.json
           if-no-files-found: warn
           retention-days: 60
+
+      - name: Trades 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: trader/logs/*.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: FastAPI 로그 출력 (cat)
         if: always()
