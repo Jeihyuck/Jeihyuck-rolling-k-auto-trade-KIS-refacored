@@ -44,7 +44,6 @@ def _to_native(val):
     if isinstance(val, (np.bool_, bool)):
         return bool(val)
     if isinstance(val, (pd.Timestamp, datetime)):
-        # ISO 형식으로 직렬화
         try:
             return val.isoformat()
         except Exception:
@@ -60,6 +59,39 @@ def _fmt_pct(x: Optional[float], ndigits: int = 2) -> str:
         return f"{round(x, ndigits)}%"
     except Exception:
         return "0%"
+
+
+def _strategy_desc() -> Dict[str, str]:
+    """RK-Max 전략 설명(문구 갱신)"""
+    return {
+        "운영K": "종목별 전월 rolling-K 최적값(RK-Max) 자동 적용",
+        "리밸런싱방식": "월초 후보군 산출(필요 시 강제편입 포함), 장중 목표가 돌파 시 실시간 진입",
+        "매수기준": "목표가(전일 종가 + K×(고가−저가)) 이상 돌파 시 진입",
+        "매도기준": (
+            "TP1/TP2 분할익절, 트레일링 스탑(고점 대비 하락), "
+            "FAST_STOP(진입 5분 내 -1%), ATR_STOP(1.5×ATR), "
+            "TIME_STOP(예: 13:00 손실 지속 시 청산), "
+            "커트오프/장마감 강제 전량매도"
+        ),
+    }
+
+
+def _env_runtime_params() -> Dict[str, Any]:
+    """환경변수 기반 운영 파라미터 표기(리포트 참고용)"""
+    def _g(name: str, default: Optional[str] = None) -> Optional[str]:
+        v = os.getenv(name, default)
+        return v if v is not None else default
+
+    return {
+        "PARTIAL1": _g("PARTIAL1", "0.5"),
+        "PARTIAL2": _g("PARTIAL2", "0.3"),
+        "TRAIL_PCT": _g("TRAIL_PCT", "0.02"),
+        "FAST_STOP": _g("FAST_STOP", "0.01"),
+        "ATR_STOP": _g("ATR_STOP", "1.5"),
+        "TIME_STOP_HHMM": _g("TIME_STOP_HHMM", "13:00"),
+        "SELL_FORCE_TIME": _g("SELL_FORCE_TIME", "15:10"),
+        "DAILY_CAPITAL": _g("DAILY_CAPITAL", None),
+    }
 
 
 def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[str, Any]:
@@ -86,17 +118,15 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
         trades.extend(load_trades(d))
 
     market_status = is_market_open(date)
+    runtime_params = _env_runtime_params()
+
     if not trades:
         report_msg = "거래 내역 없음 (시장 미개장 또는 휴일/주말)" if not market_status else "거래 내역 없음 (장 열림/평일)"
         리포트 = {
             "title": title,
             "msg": report_msg,
-            "전략설정": {
-                "운영K": "종목별 전월 rolling K, 백테스트 기반 자동적용",
-                "리밸런싱방식": "월초 리밸런싱 + 실시간 매수, 당일 장마감 익일 매도",
-                "매수기준": "목표가 돌파시 실시간 시장가/지정가 매수",
-                "매도기준": "당일 장마감 전 전량 매도",
-            },
+            "전략설정": _strategy_desc(),
+            "운영파라미터": runtime_params,
             "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "market_open": market_status,
             "거래세부내역": []
@@ -332,33 +362,25 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
             "슬리피지%": _to_native(slip),
         })
 
-    전략설명 = {
-        "운영K": "종목별 전월 rolling K, 백테스트 기반 자동적용",
-        "리밸런싱방식": "월초 리밸런싱 + 실시간 매수, 당일 장마감 익일 매도",
-        "매수기준": "목표가 돌파시 실시간 시장가/지정가 매수",
-        "매도기준": "당일 장마감 전 전량 매도",
-    }
-
     # 거래세부내역: df -> records with native types
     records = []
     for _, r in df.iterrows():
-        rec = {}
-        for k, v in r.items():
-            rec[k] = _to_native(v)
+        rec = {k: _to_native(v) for k, v in r.items()}
         records.append(rec)
 
     # 요약
     pnl_pct_total = round((total_pnl / total_invest) * 100, 2) if total_invest else 0
     리포트 = {
         "title": title,
-        "전략설정": 전략설명,
+        "전략설정": _strategy_desc(),
+        "운영파라미터": runtime_params,
         "요약": {
             "총투자금액": f"{total_invest:,}원",
             "실현수익": f"{total_pnl:,}원 ({pnl_pct_total}%)",
             "MDD": mdd_str,
             "승률": f"{round(win_rate, 1)}%",
             "체결종목수": int(symbol_count),
-            "매매회수": int(total_trade_count)
+            "매매횟수": int(total_trade_count)  # ← 오타 수정
         },
         "수익TOP": [
             {
