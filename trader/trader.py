@@ -62,6 +62,9 @@ SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.15"))  # 슬리피
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
 
+# 리밸런싱 기준일 앵커: "first"(월초·기본) / "today"(당일)
+REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
         hh, mm = hhmm.split(":")
@@ -73,10 +76,16 @@ def _parse_hhmm(hhmm: str) -> dtime:
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 
-def get_month_first_date():
-    today = datetime.now(KST)
-    month_first = today.replace(day=1)
-    return month_first.strftime("%Y-%m-%d")
+def get_rebalance_anchor_date():
+    """리밸런싱 기준일을 환경변수로 제어.
+    - REBALANCE_ANCHOR=first  → 해당 월 1일(기본)
+    - REBALANCE_ANCHOR=today  → 오늘 날짜
+    """
+    today = datetime.now(KST).date()
+    if REBALANCE_ANCHOR == "today":
+        return today.strftime("%Y-%m-%d")
+    # default: first of month
+    return today.replace(day=1).strftime("%Y-%m-%d")
 
 def fetch_rebalancing_targets(date):
     """
@@ -458,20 +467,12 @@ def compute_entry_target(
 ) -> Tuple[int, Optional[float]]:
     """
     월간 K(k_month)에 최근 변동성(ATR20/60)을 블렌딩해 진입 타깃 가격을 계산.
-    - API가 목표가를 이미 제공했다면(given_target), 그 값을 우선 사용.
-    - 그렇지 않으면: 오늘 시가 + K_use * (전일 고-저)
+    - API가 목표가를 이미 제공했더라도(given_target), '월말 보정 K'로 **조정**해 사용.
+    - API 목표가가 없으면: 오늘 시가 + K_use * (전일 고-저)
       ※ 전일 범위를 얻을 수 없으면 백업 규칙: 현재가 * (1 + DEFAULT_PROFIT_PCT/100)
     반환: (target_price:int, k_use:Optional[float])
     """
-    # 1) API 목표가가 있으면 그걸 우선 사용
-    if given_target is not None:
-        try:
-            tgt = int(round(float(given_target)))
-            return tgt, float(k_month) if k_month is not None else None
-        except Exception:
-            pass  # 아래 로직으로 계산 시도
-
-    # 2) 최근 특성
+    # --- 1) 최근 특성 / 전일 고저 / 오늘시가 확보 ---
     feats = {}
     try:
         feats = recent_features(kis, code) or {}
@@ -480,7 +481,6 @@ def compute_entry_target(
     atr20 = feats.get("atr20")
     atr60 = feats.get("atr60")
 
-    # 3) OHLC(오늘 시가/전일 고저) 시도
     today_open = None
     prev_high = None
     prev_low = None
@@ -495,28 +495,53 @@ def compute_entry_target(
     except Exception:
         pass
 
-    # 4) K 블렌딩
+    # --- 2) K 블렌딩 (월말 보정 K) ---
     day = datetime.now(KST).day
     try:
         k_use = blend_k(float(k_month) if k_month is not None else 0.5, day, atr20, atr60)
     except Exception:
         k_use = float(k_month) if k_month is not None else 0.5
+    baseline_k = float(k_month) if k_month is not None else 0.5
 
-    # 5) 타깃 계산
+    # --- 3) API 목표가가 있을 때도 보정(delta) 적용 ---
+    if given_target is not None:
+        try:
+            base = float(given_target)
+            if prev_high is not None and prev_low is not None:
+                rng = max(1.0, float(prev_high) - float(prev_low))
+                delta = (float(k_use) - float(baseline_k)) * rng
+                adjusted = int(round(base + delta))
+                logger.info(
+                    "[TARGET/adjust] %s base=%s baseline_k=%.3f k_use=%.3f rng=%s -> target=%s",
+                    code, base, baseline_k, k_use, rng, adjusted
+                )
+                return adjusted, k_use
+            # 전일 범위를 못 구하면 보정 없이 그대로 사용(안전)
+            tgt = int(round(base))
+            logger.info(
+                "[TARGET/adjust-skip] %s base=%s (no prev range) -> target=%s (k_use=%.3f)",
+                code, base, tgt, k_use
+            )
+            return tgt, k_use
+        except Exception:
+            logger.warning("[TARGET/adjust-fail] %s given_target=%s -> fallback compute", code, given_target)
+            # 아래 일반 계산으로 폴백
+
+    # --- 4) (API 목표가가 없을 때) 표준 계산 ---
     if today_open is not None and prev_high is not None and prev_low is not None:
         rng = max(1.0, float(prev_high) - float(prev_low))
         target = int(round(float(today_open) + float(k_use) * rng))
         logger.info("[TARGET] %s K_use=%.3f open=%s range=%s -> target=%s", code, k_use, today_open, rng, target)
         return target, k_use
 
-    # 6) 백업 규칙: 현재가 기반
+    # --- 5) 백업 규칙: 현재가 기반 ---
     cur = _safe_get_price(kis, code)
     if cur is not None and cur > 0:
         target = int(round(float(cur) * (1.0 + DEFAULT_PROFIT_PCT / 100.0)))
         logger.info("[TARGET/backup] %s cur=%s -> target=%s (%.2f%%)", code, cur, target, DEFAULT_PROFIT_PCT)
         return target, k_use
 
-    # 7) 최후의 보루: 적당한 고정값(매우 보수적)
+    # --- 6) 최후의 보루: 적당한 고정값(매우 보수적) ---
     logger.warning("[TARGET/fallback-last] %s: 모든 소스 실패 → 고정치 사용", code)
     return int(0), k_use
 
@@ -569,8 +594,8 @@ def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) ->
 
 def main():
     kis = KisAPI()
-    rebalance_date = get_month_first_date()
-    logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date}")
+    rebalance_date = get_rebalance_anchor_date()
+    logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date} (anchor={REBALANCE_ANCHOR})")
     logger.info(
         f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
         f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}"
@@ -672,7 +697,7 @@ def main():
                 k_value = (target.get("best_k") or target.get("K") or target.get("k"))
                 k_value_float = None if k_value is None else _to_float(k_value)
 
-                # 목표가(있으면 사용, 없으면 K 블렌딩으로 계산)
+                # 목표가(있으면 사용, 없으면 K 블렌딩으로 계산) — 단, 주어진 목표가도 보정 적용
                 raw_target_price = _to_float(target.get("목표가") or target.get("target_price"))
                 eff_target_price, k_used = compute_entry_target(kis, code, k_month=k_value_float, given_target=raw_target_price)
 
