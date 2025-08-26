@@ -1,3 +1,4 @@
+import os
 import json
 import pandas as pd
 import numpy as np
@@ -51,6 +52,16 @@ def _to_native(val):
     return val
 
 
+def _fmt_pct(x: Optional[float], ndigits: int = 2) -> str:
+    """None 안전 퍼센트 문자열 (소수 포함 % 표현, 0→'0%')"""
+    if x is None:
+        return "0%"
+    try:
+        return f"{round(x, ndigits)}%"
+    except Exception:
+        return "0%"
+
+
 def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[str, Any]:
     # period: daily, weekly, monthly 지원
     if not date:
@@ -99,101 +110,211 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
     df = pd.DataFrame(trades)
 
     # 필수 컬럼 보정 (없으면 기본값 채움)
-    if "side" not in df.columns:
-        df["side"] = None
-    if "code" not in df.columns:
-        df["code"] = None
-    if "name" not in df.columns:
-        df["name"] = None
-    if "qty" not in df.columns:
-        df["qty"] = 0
-    if "price" not in df.columns:
-        df["price"] = 0.0
-    if "amount" not in df.columns:
-        # 로그에 amount가 없을 경우 price * qty 로 추정
+    for col, default in [
+        ("side", None),
+        ("code", None),
+        ("name", None),
+        ("qty", 0),
+        ("price", 0.0),
+        ("amount", None),
+        ("K", None),
+        ("target_price", None),
+        ("strategy", None),
+        ("result", None),
+        ("reason", None),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+
+    # amount 없을 경우 price * qty 로 추정
+    if df["amount"].isna().any():
         df["amount"] = df.get("price", 0).fillna(0).astype(float) * df.get("qty", 0).fillna(0).astype(float)
 
-    # 타입 정규화: 안전하게 숫자/날짜로 변환
+    # 타입 정규화
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
     df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0.0).astype(float)
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-    # datetime 파싱
+    df["K"] = pd.to_numeric(df["K"], errors="coerce")
+    df["target_price"] = pd.to_numeric(df["target_price"], errors="coerce")
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
-    # 수익/수익률/매도단가/매도시간 컬럼 초기화
+    # 수익/수익률/매도단가/매도시간/청산사유 컬럼 초기화
     df["수익"] = 0
     df["수익률"] = 0.0
     df["매도단가"] = None
     df["매도시간"] = None
+    df["청산사유"] = None
 
     # 분리
     buy_df = df[df["side"] == "BUY"].copy().sort_values("datetime")
     sell_df = df[df["side"] == "SELL"].copy().sort_values("datetime")
     sell_df["_matched"] = False
 
-    # 매수-매도 연결 로직:
-    # 각 BUY 행에 대해, 같은 종목(code)이고 같은 수량(qty)이며 매수 시간 이후의 첫 번째 미매칭 SELL을 찾음.
-    # (이 기본 전략은 체결 로그 포맷에 의존. 필요시 partial/분할 체결 처리 추가 가능)
+    # 매수-매도 연결 로직 (기본: 같은 종목, 같은 수량, 매수 이후 첫 SELL)
     for buy_idx, buy_row in buy_df.iterrows():
         matched = False
-        # 우선 정확히 (code, name, qty)로 찾기 (이름도 동일할 때)
+        # 1) 엄격: code + qty + 시간
         candidates = sell_df[
-            (sell_df["_matched"] == False)
+            (~sell_df["_matched"])
             & (sell_df["code"] == buy_row["code"])
             & (sell_df["qty"] == buy_row["qty"])
             & (sell_df["datetime"] >= (buy_row["datetime"] if not pd.isna(buy_row["datetime"]) else pd.Timestamp.min))
         ]
+        # 2) 완화: code + 시간 (qty 불신뢰 로그 대비)
         if candidates.shape[0] == 0:
-            # 이름 불일치/누락 등 대비: code + qty + 시간 조건만으로 시도
             candidates = sell_df[
-                (sell_df["_matched"] == False)
+                (~sell_df["_matched"])
                 & (sell_df["code"] == buy_row["code"])
-                & (sell_df["qty"] == buy_row["qty"])
                 & (sell_df["datetime"] >= (buy_row["datetime"] if not pd.isna(buy_row["datetime"]) else pd.Timestamp.min))
             ]
 
         if candidates.shape[0] > 0:
-            # 가장 이른 sell 선택
             sidx = candidates.index[0]
             sell_row = sell_df.loc[sidx]
-            # 매칭 표시
             sell_df.at[sidx, "_matched"] = True
-            # 계산
+
             sell_price = float(sell_row["price"])
             buy_price = float(buy_row["price"])
             qty = int(buy_row["qty"])
             profit = int(round((sell_price - buy_price) * qty))
-            # 수익률 안전 계산
             try:
                 profit_pct = round((sell_price - buy_price) / buy_price * 100, 2) if buy_price != 0 else 0.0
             except Exception:
                 profit_pct = 0.0
-            # 반영 (원본 df에도 반영)
+
             df.loc[buy_idx, "매도단가"] = sell_price
             df.loc[buy_idx, "매도시간"] = sell_row["datetime"]
             df.loc[buy_idx, "수익"] = profit
             df.loc[buy_idx, "수익률"] = profit_pct
+            # 청산사유(SELL의 reason 또는 result 사용)
+            reason = sell_row.get("reason")
+            if pd.isna(reason) or reason in (None, "", "None"):
+                reason = sell_row.get("result")
+            df.loc[buy_idx, "청산사유"] = None if pd.isna(reason) else str(reason)
             matched = True
 
         if not matched:
-            # 매칭 실패 — 매도 없음: 수익/수익률은 기본값(0/0.0) 유지
-            continue
+            continue  # 미매칭은 0으로 남김
 
-    # buy_trades 기준으로 요약 계산
+    # buy_trades 기준 요약
     buy_trades = df[df["side"] == "BUY"].copy()
 
     total_invest = int(buy_trades["amount"].sum()) if not buy_trades.empty else 0
     total_pnl = int(buy_trades["수익"].sum()) if not buy_trades.empty else 0
     win_rate = (buy_trades["수익"] > 0).mean() * 100 if len(buy_trades) > 0 else 0.0
-    mdd = "-"  # MDD 계산은 필요시 여기에 추가 가능
     total_trade_count = int(len(df))
     symbol_count = int(buy_trades["code"].nunique()) if not buy_trades.empty else 0
+
+    # MDD (매칭된 매도시간 기준 누적 손익 커브로 계산)
+    mdd_str = "-"
+    try:
+        realized = buy_trades.dropna(subset=["매도시간"]).copy()
+        realized = realized.sort_values("매도시간")
+        equity = realized["수익"].cumsum()
+        if not equity.empty:
+            running_max = equity.cummax()
+            drawdown = equity - running_max
+            mdd_abs = int(drawdown.min())  # 음수
+            if total_invest > 0:
+                mdd_pct = round((mdd_abs / total_invest) * 100, 2)
+                mdd_str = f"{mdd_abs:,}원 ({mdd_pct}%)"
+            else:
+                mdd_str = f"{mdd_abs:,}원"
+    except Exception:
+        mdd_str = "-"
 
     top_win = buy_trades.sort_values("수익", ascending=False).head(5)
     top_lose = buy_trades.sort_values("수익", ascending=True).head(3)
 
+    # ===== RK-Max 보강 지표 =====
+    # 1) K 사용값 통계/빈도
+    k_series = pd.to_numeric(buy_trades["K"], errors="coerce").dropna()
+    k_summary = {
+        "평균": _to_native(round(k_series.mean(), 3)) if not k_series.empty else None,
+        "중앙": _to_native(round(k_series.median(), 3)) if not k_series.empty else None,
+        "최소": _to_native(round(k_series.min(), 3)) if not k_series.empty else None,
+        "최대": _to_native(round(k_series.max(), 3)) if not k_series.empty else None,
+    }
+    k_freq_top = []
+    if not k_series.empty:
+        vc = k_series.round(3).value_counts().sort_values(ascending=False).head(5)
+        for k, c in vc.items():
+            k_freq_top.append({"K": _to_native(k), "거래건수": _to_native(c)})
+
+    # 2) 진입 슬리피지(%): (매수가-목표가)/목표가 * 100
+    slippage_series = None
+    if "target_price" in buy_trades.columns:
+        tp = pd.to_numeric(buy_trades["target_price"], errors="coerce")
+        valid = (tp > 0) & (~buy_trades["price"].isna())
+        slippage_series = ((buy_trades.loc[valid, "price"] - tp.loc[valid]) / tp.loc[valid]) * 100
+    slip_summary = {
+        "평균%": _to_native(round(slippage_series.mean(), 2)) if slippage_series is not None and not slippage_series.empty else None,
+        "중앙%": _to_native(round(slippage_series.median(), 2)) if slippage_series is not None and not slippage_series.empty else None,
+        "최대불리%": _to_native(round(slippage_series.max(), 2)) if slippage_series is not None and not slippage_series.empty else None,
+        "최대유리%": _to_native(round(slippage_series.min(), 2)) if slippage_series is not None and not slippage_series.empty else None,
+        "표본수": _to_native(int(slippage_series.shape[0])) if slippage_series is not None else 0,
+    }
+
+    # 3) 청산 사유 분포 및 승률
+    reason_perf = []
+    if "청산사유" in buy_trades.columns:
+        tmp = buy_trades.dropna(subset=["청산사유"]).copy()
+        if not tmp.empty:
+            grp = tmp.groupby("청산사유")
+            for reason, g in grp:
+                cnt = int(g.shape[0])
+                win = float((g["수익"] > 0).mean() * 100) if cnt > 0 else 0.0
+                avg_ret = float(g["수익률"].mean()) if cnt > 0 else 0.0
+                reason_perf.append({
+                    "사유": _to_native(reason),
+                    "건수": cnt,
+                    "승률": _to_native(round(win, 1)),
+                    "평균수익률%": _to_native(round(avg_ret, 2)),
+                })
+            reason_perf = sorted(reason_perf, key=lambda x: x["건수"], reverse=True)
+
+    # 4) 전략별 성과
+    strat_perf = []
+    if "strategy" in buy_trades.columns and not buy_trades.empty:
+        grp = buy_trades.groupby(buy_trades["strategy"].fillna("N/A"))
+        for strat, g in grp:
+            cnt = int(g.shape[0])
+            pnl = int(g["수익"].sum())
+            win = float((g["수익"] > 0).mean() * 100) if cnt > 0 else 0.0
+            avg_ret = float(g["수익률"].mean()) if cnt > 0 else 0.0
+            strat_perf.append({
+                "전략": _to_native(strat),
+                "건수": cnt,
+                "실현손익": _to_native(pnl),
+                "승률": _to_native(round(win, 1)),
+                "평균수익률%": _to_native(round(avg_ret, 2)),
+            })
+        strat_perf = sorted(strat_perf, key=lambda x: x["실현손익"], reverse=True)
+
+    # 5) 일일 자금 사용률(환경변수 DAILY_CAPITAL 기반)
+    daily_capital_env = os.getenv("DAILY_CAPITAL")
+    daily_capital_val = None
+    daily_capital_usage = None
+    if daily_capital_env is not None:
+        try:
+            daily_capital_val = int(float(daily_capital_env))
+            if daily_capital_val > 0:
+                daily_capital_usage = round((total_invest / daily_capital_val) * 100, 2)
+        except Exception:
+            daily_capital_val = None
+            daily_capital_usage = None
+
+    # 종목별 상세
     종목별상세 = []
     for idx, row in buy_trades.iterrows():
+        # 개별 진입 슬리피지
+        slip = None
+        if not pd.isna(row.get("target_price")) and row.get("target_price") not in (None, 0):
+            try:
+                slip = round(((float(row.get("price")) - float(row.get("target_price"))) / float(row.get("target_price"))) * 100, 2)
+            except Exception:
+                slip = None
+
         종목별상세.append({
             "code": _to_native(row.get("code")),
             "name": _to_native(row.get("name")),
@@ -206,7 +327,9 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
             "매도시간": _to_native(row.get("매도시간")),
             "수익률": f'{_to_native(row.get("수익률"))}%' if row.get("수익률") is not None else None,
             "실현손익": _to_native(row.get("수익")),
-            "전략설명": _to_native(row.get("strategy", "N/A"))
+            "청산사유": _to_native(row.get("청산사유")),
+            "전략설명": _to_native(row.get("strategy", "N/A")),
+            "슬리피지%": _to_native(slip),
         })
 
     전략설명 = {
@@ -224,13 +347,15 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
             rec[k] = _to_native(v)
         records.append(rec)
 
+    # 요약
+    pnl_pct_total = round((total_pnl / total_invest) * 100, 2) if total_invest else 0
     리포트 = {
         "title": title,
         "전략설정": 전략설명,
         "요약": {
             "총투자금액": f"{total_invest:,}원",
-            "실현수익": f"{total_pnl:,}원 ({round(total_pnl / total_invest * 100, 2) if total_invest else 0}%)",
-            "MDD": mdd,
+            "실현수익": f"{total_pnl:,}원 ({pnl_pct_total}%)",
+            "MDD": mdd_str,
             "승률": f"{round(win_rate, 1)}%",
             "체결종목수": int(symbol_count),
             "매매회수": int(total_trade_count)
@@ -258,6 +383,15 @@ def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[s
             } for _, r in top_lose.iterrows()
         ],
         "종목별 상세": 종목별상세,
+        "RKMAX_지표": {
+            "K_요약": k_summary,
+            "K_빈도_TOP": k_freq_top,
+            "진입_슬리피지_요약": slip_summary,
+            "청산사유_분포": reason_perf,
+            "전략별_성과": strat_perf,
+            "일일_자금사용률": _fmt_pct(daily_capital_usage) if daily_capital_usage is not None else None,
+            "일일_자금한도": f"{daily_capital_val:,}원" if daily_capital_val is not None else None,
+        },
         "거래세부내역": records,
         "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "market_open": market_status

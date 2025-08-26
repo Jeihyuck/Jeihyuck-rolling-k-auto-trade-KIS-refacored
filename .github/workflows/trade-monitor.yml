@@ -2,11 +2,11 @@ name: Trade Monitor
 
 on:
   push:
-    branches: [ maximus ]
+    branches: [ feature/rkmax ]
   pull_request:
-    branches: [ maximus ]
+    branches: [ feature/rkmax ]
   schedule:
-    # 매일 한국시간 08:30 (즉, 장 시작 30분 전)에 실행
+    # 매일 한국시간 08:30 (장 시작 30분 전) 실행 — GitHub Actions는 UTC 기준
     - cron: "30 23 * * 0-4"
   workflow_dispatch:
 
@@ -42,6 +42,7 @@ jobs:
       # 배분
       TOTAL_CAPITAL: "10000000"  # 총 투자한도(원) - 1,000만원
       MIN_QTY_PER_TICKET: "1"    # 최소 주문 수량
+      DAILY_CAPITAL: "10000000"  # (리포트용) 일일 자금 한도
 
       # K 탐색
       K_MIN: "0.1"
@@ -111,3 +112,4 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
