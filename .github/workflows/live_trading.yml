@@ -1,0 +1,96 @@
+name: Live Trading (09:00~14:35 KST)
+
+on:
+  push:
+    branches: [ feature/rkmax-v2 ]
+  pull_request:
+    branches: [ feature/rkmax-v2 ]
+  schedule:
+    # 매 영업일 KST 09:00 시작 (UTC 00:00, 월~금)
+    - cron: "0 0 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: live-trading
+  cancel-in-progress: true
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 안전망(6h) — 아래 timeout 명령으로도 종료
+    env:
+      # ===== Secrets =====
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+
+      # ===== 전략/리스크 =====
+      PARTIAL1: "0.5"
+      PARTIAL2: "0.3"
+      TRAIL_PCT: "0.02"
+      FAST_STOP: "0.01"
+      ATR_STOP: "1.5"
+      TIME_STOP_HHMM: "13:00"
+
+      # ===== 스케줄/컷오프 =====
+      SELL_FORCE_TIME: "14:30"     # 14:30 강제 전량매도
+      ACTION_KILL_TIME: "14:35"    # 보호 종료시각(정보 제공용)
+
+      # ===== 기타 =====
+      DAILY_CAPITAL: "10000000"
+      SLIPPAGE_ENTER_GUARD_PCT: "1.5"
+      API_RATE_SLEEP_SEC: "0.5"
+      FORCE_SELL_PASSES_CUTOFF: "2"
+      FORCE_SELL_PASSES_CLOSE: "4"
+      SELL_ALL_BALANCES_AT_CUTOFF: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run FastAPI (bg)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 30
+
+      - name: Live trader run (safe timeout)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          # 5h45m로 안전 종료(09:00~14:45) → 14:30 강제청산 후 종료 보장
+          timeout 5h45m python -m trader.trader || true
+
+      - name: Upload trade logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: trader/logs/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: FastAPI log (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log || true
+          echo "::endgroup::"
+
+      - name: Upload fastapi.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,3 +1,5 @@
+# FILE: trader/trader.py
+from __future__ import annotations
 import logging
 import requests
 from .kis_wrapper import KisAPI, append_fill
@@ -10,6 +12,10 @@ import os
 import random
 from typing import Optional, Dict, Any, Tuple
 import csv
+
+# === RK-Max v3+ 최소 패치: 스냅샷·오버레이·킬타임 ===
+from .rebalance_engine import load_latest_snapshot  # Top10 스냅샷 병합
+from .overlay import decide_carry_over              # 스윙 오버레이
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -32,8 +38,10 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 # ====== 시간대(KST) 및 설정 ======
 KST = ZoneInfo("Asia/Seoul")
 
-# 장중 강제 전량매도 커트오프 (KST 기준)
-SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:20").strip()
+# 장중 강제 전량매도 커트오프 (KST 기준) — 기본 14:30으로 변경(RK-Max 권장)
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:30").strip()
+# 루프 종료 킬 타임 (KST 기준) — 14:35 권장
+ACTION_KILL_TIME_STR = os.getenv("ACTION_KILL_TIME", "14:35").strip()
 # 커트오프/장마감 시 보유 전 종목(계좌 잔고 전체) 포함 여부 (기본 True)
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
 # API 호출 간 최소 휴지시간(초)
@@ -72,12 +80,13 @@ def _parse_hhmm(hhmm: str) -> dtime:
         hh, mm = hhmm.split(":")
         return dtime(hour=int(hh), minute=int(mm))
     except Exception:
-        logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 15:20 적용: {hhmm}")
+        logger.warning(f"[설정경고] 시간 형식 오류 → 기본값 적용: {hhmm}")
         return dtime(hour=15, minute=20)
 
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+KILL_TIME = _parse_hhmm(ACTION_KILL_TIME_STR)
 
 
 def get_rebalance_anchor_date():
@@ -342,6 +351,41 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
     if not target_codes:
         logger.info("[강제전량매도] 대상 종목 없음")
         return
+
+    # === RK-Max v3+ 추가: 스윙 오버레이 캐리오버 선별 ===
+    try:
+        carry_cnt = 0
+        for code in list(target_codes):
+            pos = holding.get(code)
+            if not pos:
+                continue
+            try:
+                cur_px = _safe_get_price(kis, code)
+                dec = decide_carry_over(
+                    hit_tp1=bool(pos.get('sold_p1', False)),
+                    close=float(cur_px or pos.get('buy_price') or 0.0),
+                    day_high=float(pos.get('high') or 0.0),
+                    atr=float(pos.get('atr') or 0.0),
+                    close_ge_ma20=False,   # 지표 미존재 시 보수적 False
+                    close_ge_vwap=False,
+                    volume_rank_pct=int(pos.get('volume_rank_pct', 50)),
+                    had_cutoff=True,
+                    carry_days=int(pos.get('carry_days', 0)),
+                    carry_max_days=int(os.getenv('CARRY_MAX_DAYS', '3')),
+                )
+                if dec.carry_over:
+                    pos['carry_over'] = True
+                    pos['carry_days'] = int(pos.get('carry_days', 0)) + 1
+                    target_codes.discard(code)
+                    carry_cnt += 1
+                    logger.info(f"[CARRY-OVER] {code} {dec.reason} carry_frac={dec.carry_frac}")
+            except Exception as e:
+                logger.warning(f"[CARRY-OVER-ERR] {code} {e}")
+        if carry_cnt:
+            save_state(holding, {})
+            logger.info(f"[CARRY-OVER] 강제매도 대상에서 제외된 종목수: {carry_cnt}")
+    except Exception as e:
+        logger.warning(f"[CARRY-OVER-BLOCK-ERR] {e}")
 
     logger.info(f"[⚠️ 강제전량매도] 사유: {reason} / 대상 종목수: {len(target_codes)} / 전체잔고포함={include_all_balances}")
 
@@ -634,6 +678,26 @@ def main():
     # ======== 리밸런싱 대상 종목 추출 ========
     targets = fetch_rebalancing_targets(rebalance_date)  # API 반환 dict 목록
 
+    # === RK-Max v3+ 추가: 08:50/12:00 스냅샷 병합 (core 우선)
+    try:
+        snap = load_latest_snapshot(datetime.now(KST))
+        if snap and isinstance(snap, dict):
+            uni = snap.get('universe') or {}
+            core_list = uni.get('core') or []
+            added = 0
+            for it in core_list:
+                code = (it.get('code') if isinstance(it, dict) else None)
+                if not code:
+                    continue
+                exists = any(((t.get('stock_code') == code) or (t.get('code') == code)) for t in targets)
+                if not exists:
+                    targets.append({"code": code, "weight": it.get('weight', 0.1), "strategy": "Top10Core"})
+                    added += 1
+            if added:
+                logger.info(f"[UNIVERSE SNAPSHOT] core 병합: +{added}개")
+    except Exception as e:
+        logger.warning(f"[UNIVERSE SNAPSHOT LOAD FAIL] {e}")
+
     # 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
     processed_targets: Dict[str, Any] = {}
     for t in targets:
@@ -672,6 +736,12 @@ def main():
             now_dt_kst = datetime.now(KST)
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[⏰ 장상태] {'OPEN' if is_open else 'CLOSED'} / KST={now_str}")
+
+            # === RK-Max v3+ 추가: 14:35 킬 게이트 ===
+            if now_dt_kst.time() >= KILL_TIME:
+                save_state(holding, traded)
+                logger.info("[KILL] ACTION_KILL_TIME 도달 → 안전 종료")
+                break
 
             # ====== 잔고 동기화 & 보유분 능동관리 부트스트랩 ======
             ord_psbl_map: Dict[str, int] = {}

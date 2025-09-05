@@ -1,3 +1,5 @@
+# FILE: trader/kis_wrapper.py
+from __future__ import annotations
 import os
 import json
 import time
@@ -98,7 +100,7 @@ class _RateLimiter:
 
 
 # -------------------------------
-# TR_ID 환경변수 오버라이드 + 후보 폴백
+# TR_ID 환경변수 오버라이드 + 후보 폴백 (엑셀 2025-07-17 기준)
 # -------------------------------
 TR_MAP = {
     "practice": {
@@ -108,6 +110,7 @@ TR_MAP = {
         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+        "DAILY_FILLS": [os.getenv("KIS_TR_ID_DAILY_FILLS", "VTTC0081R")],
         "TOKEN": "/oauth2/tokenP",
     },
     "real": {
@@ -117,6 +120,7 @@ TR_MAP = {
         "PRICE": [os.getenv("KIS_TR_ID_PRICE_REAL", "FHKST01010100")],
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
+        "DAILY_FILLS": [os.getenv("KIS_TR_ID_DAILY_FILLS_REAL", "TTTC0081R")],
         "TOKEN": "/oauth2/token",
     },
 }
@@ -139,6 +143,8 @@ class KisAPI:
     - 시세/호가/일봉/ATR 제공 (실전형 매매 로직용)
     - 레이트리밋 & 백오프 & 네트워크 재시도 강화
     - get_balance / buy_stock 등 기존 호출부 호환
+    - trader.py(옵션 B)에서 사용하는 보조 API까지 포함:
+      * get_today_open(), get_prev_high_low(), check_filled(), get_balance_all()
     """
 
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
@@ -294,7 +300,7 @@ class KisAPI:
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
                 for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                    params = {"FID_COND_MRKT_DIV_CODE": market_div, "FID_INPUT_ISCD": code_fmt}
                     try:
                         resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
@@ -312,6 +318,32 @@ class KisAPI:
                             pass
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
+    def get_today_open(self, code: str) -> Optional[float]:
+        """오늘 시가 추출 (inquire-price의 stck_oprc). 실패 시 None."""
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        for tr in _pick_tr(self.env, "PRICE"):
+            headers = self._headers(tr)
+            params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code if code.startswith("A") else f"A{code}"}
+            try:
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                j = resp.json()
+            except Exception:
+                continue
+            if resp.status_code == 200 and j.get("rt_cd") == "0" and j.get("output"):
+                try:
+                    return float(j["output"].get("stck_oprc"))
+                except Exception:
+                    return None
+        return None
+
+    def get_prev_high_low(self, code: str) -> Optional[Dict[str, float]]:
+        """전일(이전 거래일) 고가/저가."""
+        candles = self.get_daily_candles(code, count=3)
+        if len(candles) >= 2:
+            prev = candles[-2]
+            return {"high": float(prev["high"]), "low": float(prev["low"]) }
+        return None
+
     def get_orderbook_strength(self, code: str) -> Optional[float]:
         """상위 5단 호가 잔량으로 간이 체결강도(매수/매도 비) 계산. 실패 시 None"""
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
@@ -323,7 +355,7 @@ class KisAPI:
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
                 for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                    params = {"FID_COND_MRKT_DIV_CODE": market_div, "FID_INPUT_ISCD": code_fmt}
                     try:
                         resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
@@ -344,10 +376,10 @@ class KisAPI:
         for tr in _pick_tr(self.env, "DAILY_CHART"):
             headers = self._headers(tr)
             params = {
-                "fid_cond_mrkt_div_code": "J",
-                "fid_input_iscd": code if code.startswith("A") else f"A{code}",
-                "fid_org_adj_prc": "0",
-                "fid_period_div_code": "D",
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code if code.startswith("A") else f"A{code}",
+                "FID_ORG_ADJ_PRC": "0",
+                "FID_PERIOD_DIV_CODE": "D",
             }
             try:
                 resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
@@ -492,6 +524,10 @@ class KisAPI:
         """
         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
 
+    def get_balance_all(self) -> List[Dict[str, Any]]:
+        """trader의 표준화 로직과 호환: 포지션 리스트만 반환."""
+        return self.get_positions()
+
     # -------------------------------
     # 주문 공통
     # -------------------------------
@@ -508,7 +544,7 @@ class KisAPI:
         for tr_id in tr_list:
             for ord_dvsn in ord_dvsn_chain:
                 body["ORD_DVSN"] = ord_dvsn
-                body["ORD_UNPR"] = "0"
+                # body["ORD_UNPR"] 는 호출부에서 설정 (시장가=0 / 지정가=가격)
                 if is_sell and not body.get("SLL_TYPE"):
                     body["SLL_TYPE"] = "01"
                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
@@ -788,3 +824,57 @@ class KisAPI:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
 
+    # -------------------------------
+    # 주문/체결 조회 (check_filled 용)
+    # -------------------------------
+    def inquire_daily_orders(self, *, code: str = "", sll_buy: str = "00", ccld_dvsn: str = "00", odno: str = "") -> List[dict]:
+        """일별 주문/체결 조회. 오늘자만. 필요 시 ODNO로 필터링."""
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        today = time.strftime("%Y%m%d")
+        params = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": sll_buy,
+            "PDNO": code,
+            "ORD_GNO_BRNO": "00000",
+            "ODNO": odno,
+            "CCLD_DVSN": ccld_dvsn,  # 00 전체 / 01 체결 / 02 미체결
+            "INQR_DVSN": "00",
+            "INQR_DVSN_1": "0",
+            "INQR_DVSN_3": "00",
+            "EXCG_ID_DVSN_CD": "KRX",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        tr = _pick_tr(self.env, "DAILY_FILLS")[0]
+        r = self.session.get(url, headers=self._headers(tr_id=tr), params=params, timeout=(3.0, 7.0))
+        data = r.json()
+        if r.status_code == 200 and data.get("rt_cd") == "0":
+            out = data.get("output", [])
+            if isinstance(out, list):
+                return out
+            return [out]
+        return []
+
+    def check_filled(self, order_resp_or_id: Any) -> bool:
+        """주문 응답(dict) 또는 ODNO(str)를 받아 체결 여부를 best-effort로 판정."""
+        if isinstance(order_resp_or_id, dict):
+            odno = (order_resp_or_id.get("output") or {}).get("ODNO") or order_resp_or_id.get("ODNO") or ""
+        else:
+            odno = safe_strip(order_resp_or_id)
+        if not odno:
+            return False
+        try:
+            rows = self.inquire_daily_orders(odno=odno, ccld_dvsn="00")
+            # 체결(부분/전체) 여부 판단: ccld_dvsn 값 또는 ccld_qty 등으로 판정(브로커 별 필드차 존재)
+            for r in rows:
+                # 체결수량 > 0 또는 상태코드로 판별
+                qty_ccld = r.get("ccld_qty") or r.get("tot_ccld_qty") or r.get("tot_ccld_amt")
+                stat = safe_strip(r.get("ord_stat_cd"))
+                if (qty_ccld and str(qty_ccld) != "0") or stat in ("02", "03", "04", "06", "07"):
+                    return True
+        except Exception as e:
+            logger.warning(f"[CHECK_FILLED_FAIL] {e}")
+        return False
