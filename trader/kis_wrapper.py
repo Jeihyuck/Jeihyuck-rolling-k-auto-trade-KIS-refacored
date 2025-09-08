@@ -20,14 +20,29 @@ logger = logging.getLogger(__name__)
 # -------------------------------
 # 유틸
 # -------------------------------
+
 def safe_strip(val):
+    """개행과 캐리지리턴 제거 + 앞뒤 공백 제거.
+    복사/붙여넣기 과정에서 문자열 리터럴의 "
+"/"
+"가 깨지는 문제를 피하기 위해
+    숫자 코드(10=
+, 13=
+)를 사용한 translate로 처리합니다.
+    """
     if val is None:
         return ""
-    if isinstance(val, str):
-        return val.replace("
-", "").replace("
-", "").strip()
-    return str(val).strip()
+    # 문자열/비문자 모두 translate로 제어문자 제거 후 strip
+    s = val if isinstance(val, str) else str(val)
+    try:
+        # 10: '
+', 13: '
+'
+        s = s.translate({10: None, 13: None})
+    except Exception:
+        # translate가 실패할 경우를 대비한 보조 경로
+        s = "".join(ch for ch in s if ord(ch) not in (10, 13))
+    return s.strip()
 
 
 def _json_dumps(body: dict) -> str:
@@ -44,6 +59,7 @@ logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 # -------------------------------
 # 체결 기록 저장 유틸
 # -------------------------------
+
 def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: str, note: str = ""):
     """
     체결(주문 성공) 기록을 CSV로 저장
@@ -83,6 +99,7 @@ def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: s
 # -------------------------------
 # 간단 레이트리미터(엔드포인트별 최소 간격 유지)
 # -------------------------------
+
 class _RateLimiter:
     def __init__(self, min_interval_sec: float = 0.20):
         self.min_interval = float(min_interval_sec)
@@ -102,6 +119,7 @@ class _RateLimiter:
 # -------------------------------
 # TR_ID 환경변수 오버라이드 + 후보 폴백
 # -------------------------------
+
 TR_MAP = {
     "practice": {
         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY", "VTTC0012U"), "VTTC0802U"],
@@ -136,6 +154,7 @@ def _pick_tr(env: str, key: str) -> List[str]:
 # -------------------------------
 # 본체
 # -------------------------------
+
 class KisAPI:
     """
     - TR_ID 최신 스펙 + 환경변수 오버라이드 + 후보 폴백 구현
@@ -189,6 +208,7 @@ class KisAPI:
     # -------------------------------
     # 토큰 (lazy + 403 백오프 보호)
     # -------------------------------
+
     def get_valid_token(self):
         with KisAPI._token_lock:
             now = time.time()
@@ -225,7 +245,6 @@ class KisAPI:
             except Exception as e:
                 msg = str(e)
                 if "1분당 1회" in msg or "잠시 후 다시 시도" in msg:
-                    # 너무 빠르게 요청 → 65초 대기 후 1회 재시도
                     wait_s = 65 + random.uniform(0, 3)
                     logger.error(f"[토큰발급 대기] 제한 메시지 감지 → {wait_s:.1f}s 대기 후 재시도")
                     time.sleep(wait_s)
@@ -274,6 +293,7 @@ class KisAPI:
     # -------------------------------
     # 헤더/HashKey
     # -------------------------------
+
     def _headers(self, tr_id: str, hashkey: Optional[str] = None):
         h = {
             "authorization": f"Bearer {self.get_valid_token()}",
@@ -310,6 +330,7 @@ class KisAPI:
     # -------------------------------
     # 시세/장운영
     # -------------------------------
+
     def get_current_price(self, code: str) -> float:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         tried: List[Tuple[str, str, Any]] = []
@@ -398,6 +419,7 @@ class KisAPI:
         return []
 
     # --- 신규: 오늘 시가/전일 고저 ---
+
     def get_today_open(self, code: str) -> Optional[float]:
         try:
             kst = pytz.timezone("Asia/Seoul")
@@ -453,6 +475,7 @@ class KisAPI:
     # -------------------------------
     # 잔고/포지션
     # -------------------------------
+
     def get_cash_balance(self) -> int:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = None
@@ -539,12 +562,14 @@ class KisAPI:
         return mp
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+
     def get_balance(self) -> Dict[str, object]:
         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
 
     # -------------------------------
     # 주문 공통
     # -------------------------------
+
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
 
@@ -604,13 +629,11 @@ class KisAPI:
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
                         logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
-                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
                         try:
                             out = data.get("output") or {}
                             odno = out.get("ODNO") or out.get("ord_no") or ""
                             pdno = safe_strip(body.get("PDNO", ""))
                             qty = int(float(body.get("ORD_QTY", "0")))
-                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
                             price_for_fill = None
                             try:
                                 ord_unpr = body.get("ORD_UNPR")
@@ -651,6 +674,7 @@ class KisAPI:
     # -------------------------------
     # 매수/매도 (신규)
     # -------------------------------
+
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         body = {
             "CANO": self.CANO,
@@ -663,7 +687,6 @@ class KisAPI:
         return self._order_cash(body, is_sell=False)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
-        # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
         ord_psbl = 0
@@ -810,6 +833,7 @@ class KisAPI:
         return None
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+
     def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
         if price is None:
             return self.buy_stock_market(code, qty)
@@ -823,6 +847,7 @@ class KisAPI:
     # -------------------------------
     # (신규) 주문 체결 확인: 주식일별주문체결조회
     # -------------------------------
+
     def check_filled(self, order_resp_or_odno: Union[str, dict], pdno: Optional[str] = None) -> bool:
         """
         지정가 주문 직후 체결 여부 확인.
@@ -867,7 +892,6 @@ class KisAPI:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
-        # 문서 예시상 PDNO, ORD_GNO_BRNO 공란 허용
         try:
             self._limiter.wait("status")
             resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
@@ -881,7 +905,6 @@ class KisAPI:
             if not isinstance(arr, list):
                 logger.debug(f"[check_filled] output1 형식 이상: {type(arr)}")
                 return False
-            # 잔여수량 rmn_qty == 0 또는 tot_ccld_qty>0 이면 체결로 간주
             for row in arr:
                 try:
                     r_odno = safe_strip(row.get("odno"))
