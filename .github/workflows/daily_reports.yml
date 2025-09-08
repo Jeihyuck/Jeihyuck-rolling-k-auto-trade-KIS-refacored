@@ -2,9 +2,9 @@ name: Daily Reports (after close)
 
 on:
   push:
-    branches: [ feature/rkmax-v2 ]
+    branches: [ feature/rkmax, feature/rkmax-v2 ]
   pull_request:
-    branches: [ feature/rkmax-v2 ]
+    branches: [ feature/rkmax, feature/rkmax-v2 ]
   schedule:
     # 장 마감 이후 KST 15:40 (UTC 06:40, 월~금)
     - cron: "40 6 * * 1-5"
@@ -18,14 +18,14 @@ jobs:
   report:
     runs-on: ubuntu-latest
     env:
-      # ===== Secrets (보고서 생성에도 환경 파라미터 노출) =====
+      # ===== Secrets =====
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
 
-      # 리포트에서 읽는 파라미터(없어도 되지만 값 표기용)
+      # 리포트 표기용 파라미터
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.02"
@@ -48,12 +48,14 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || true
+          pip install pandas numpy
 
       - name: Generate CEO report (daily/weekly/monthly)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euxo pipefail
           python -m trader.report_ceo
 
       - name: Upload CEO report artifacts
