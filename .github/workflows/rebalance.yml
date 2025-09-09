@@ -1,4 +1,4 @@
-name: Pre-market Rebalance (08:50 KST)
+name: Rebalance (08:50 KST)
 
 on:
   push:
@@ -6,17 +6,23 @@ on:
   pull_request:
     branches: [ feature/rkmax, feature/rkmax-v2 ]
   schedule:
-    # 매 영업일 KST 08:50 실행 (UTC 23:50, 일~목)
+    # 매 영업일 KST 08:50 = UTC 23:50 (일~목)
     - cron: "50 23 * * 0-4"
   workflow_dispatch:
+    inputs:
+      date:
+        description: "KST 기준 YYYY-MM-DD (미입력 시 현재 KST 날짜)"
+        required: false
+        type: string
 
 concurrency:
   group: rebalance
   cancel-in-progress: true
 
 jobs:
-  run-rebalance:
+  rebalance:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       # ===== Secrets =====
@@ -26,8 +32,16 @@ jobs:
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
 
-      # ===== 결과 저장 디렉터리 =====
-      REBALANCE_OUT_DIR: rebalance_results
+      # ===== 리밸런싱 파라미터(엔진/보고서가 사용) =====
+      TOP_K: "10"
+      LOOKBACK_DAYS: "10"
+      REBALANCE_ANCHOR: "today"
+      REBALANCE_SNAPSHOT_TIME_KST: "08:50"
+
+      # ===== 공통 =====
+      DAILY_CAPITAL: "10000000"
+      ORDER_THROTTLE_SEC: "0.3"
+      REBALANCE_OUT_DIR: "rebalance_results"
 
     steps:
       - uses: actions/checkout@v4
@@ -36,14 +50,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
           pip install fastapi uvicorn requests
 
-      - name: Start FastAPI (background) and wait for health
+      - name: Run FastAPI (bg) with healthcheck
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -63,14 +76,18 @@ jobs:
             sleep 1
           done
 
-      - name: Run rebalance (save JSON with KST date)
+      - name: Trigger rebalance and save JSON
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euxo pipefail
           mkdir -p "${REBALANCE_OUT_DIR}"
-          # KST 날짜(YYYY-MM-DD)
-          KST_DATE=$(TZ=Asia/Seoul date +%F)
+          # 입력값이 있으면 사용, 없으면 현재 KST 날짜 사용
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            KST_DATE="${{ github.event.inputs.date }}"
+          else
+            KST_DATE="$(TZ=Asia/Seoul date +%F)"
+          fi
           OUT="${REBALANCE_OUT_DIR}/rebalance_${KST_DATE}_0850.json"
           curl -sS -X POST "http://127.0.0.1:8000/rebalance/run/${KST_DATE}?force_order=true" -o "${OUT}"
           echo "Saved -> ${OUT}"
@@ -90,7 +107,7 @@ jobs:
           name: rebalance-results
           path: rebalance_results/*.json
           if-no-files-found: warn
-          retention-days: 60
+          retention-days: 30
 
       - name: Upload FastAPI log
         if: always()

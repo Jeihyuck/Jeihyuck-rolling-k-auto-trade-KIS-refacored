@@ -6,9 +6,31 @@ on:
   pull_request:
     branches: [ feature/rkmax, feature/rkmax-v2 ]
   schedule:
-    # 매 영업일 KST 09:00 실행 (UTC 00:00, 월~금)
+    # 매 영업일 KST 09:00 시작 = UTC 00:00 (월~금)
     - cron: "0 0 * * 1-5"
   workflow_dispatch:
+    inputs:
+      ignore_market_status:
+        description: "수동 실행 시 장상태 무시(강제 루프 가동)"
+        required: false
+        default: "false"
+        type: choice
+        options: [ "false", "true" ]
+      sell_force_time:
+        description: "커트오프 시간(KST, HH:MM) ex) 14:30"
+        required: false
+        default: "14:30"
+        type: string
+      kill_time:
+        description: "루프 종료 시간(KST, HH:MM) ex) 14:35"
+        required: false
+        default: "14:35"
+        type: string
+      daily_capital:
+        description: "일일 집행금(원)"
+        required: false
+        default: "10000000"
+        type: string
 
 concurrency:
   group: live-trading
@@ -17,7 +39,7 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 러너 6h 제한 보호
+    timeout-minutes: 360
 
     env:
       # ===== Secrets =====
@@ -36,16 +58,19 @@ jobs:
       TIME_STOP_HHMM: "13:00"
 
       # ===== 스케줄/컷오프 =====
-      SELL_FORCE_TIME: "14:30"
-      ACTION_KILL_TIME: "14:35"
+      SELL_FORCE_TIME: ${{ github.event.inputs.sell_time || github.event.inputs.sell_force_time || '14:30' }}
+      ACTION_KILL_TIME: ${{ github.event.inputs.kill_time || '14:35' }}
 
       # ===== 기타 =====
-      DAILY_CAPITAL: "10000000"
+      DAILY_CAPITAL: ${{ github.event.inputs.daily_capital || '10000000' }}
       SLIPPAGE_ENTER_GUARD_PCT: "1.5"
       API_RATE_SLEEP_SEC: "0.5"
       FORCE_SELL_PASSES_CUTOFF: "2"
       FORCE_SELL_PASSES_CLOSE: "4"
       SELL_ALL_BALANCES_AT_CUTOFF: "true"
+
+      # 수동 실행 시 장상태 무시(트레이더 내부에서 사용)
+      IGNORE_MARKET_STATUS_WHEN_MANUAL: ${{ github.event.inputs.ignore_market_status == 'true' && '1' || '0' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -54,21 +79,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install fastapi uvicorn requests pytz
+          pip install fastapi uvicorn
 
-      - name: Start FastAPI (background) and wait for health
+      - name: Run FastAPI (bg) with healthcheck
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euxo pipefail
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
           SV_PID=$!
-          for i in {1..90}; do
+          for i in {1..120}; do
             if curl -sSf http://127.0.0.1:8000/docs >/dev/null; then
               echo "API UP after $i sec"
               break
@@ -81,25 +105,13 @@ jobs:
             sleep 1
           done
 
-      - name: Run live trader (09:00~14:35 KST loop)
+      - name: Run live trader (safe timeout)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euxo pipefail
           # 5h45m → 09:00~14:45 범위 내 종료 (14:30 강제청산 후 종료 보장)
           timeout 5h45m python -m trader.trader || true
-
-      - name: Generate CEO daily report
-        if: always()
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          from datetime import datetime
-          from trader.report_ceo import ceo_report
-          ceo_report(datetime.now(), period="daily")
-          PY
 
       - name: Upload trade logs
         if: always()
@@ -110,25 +122,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload fills
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fills
-          path: fills/*.csv
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload trader state
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-state
-          path: trader/trade_state.json
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: FastAPI log (cat)
+      - name: Show FastAPI log (tail)
         if: always()
         run: |
           echo "::group::FastAPI Server Log"
@@ -144,11 +138,3 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload CEO report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ceo-report
-          path: trader/reports/*.json
-          if-no-files-found: warn
-          retention-days: 30
