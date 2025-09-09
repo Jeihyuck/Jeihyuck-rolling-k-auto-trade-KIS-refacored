@@ -1,18 +1,6 @@
-# FILE: trader/trader.py
-from __future__ import annotations
-"""
-Live trading loop for RK‑Max v3+.
-- Keeps running during market hours, exits safely at ACTION_KILL_TIME
-- Pulls rebalancing targets from local FastAPI (rolling_k_auto_trade_api.main)
-- Blended-K target computation + slippage guard
-- Adaptive exits: partial take-profit, trailing stop, fast stop, ATR stop, time stop
-- Force-sell at cutoff and at market close (with passes)
-- Robust retry wrappers + token refresh fallback
-- Writes trade logs (JSONL) into trader/logs/
-- Persists state (holding/traded) into trader/trade_state.json
+# FILE: `trader/trader.py`
 
-This file is self-contained and safe to paste into Codespaces as trader/trader.py.
-"""
+from __future__ import annotations
 import logging
 import requests
 from .kis_wrapper import KisAPI, append_fill
@@ -27,32 +15,18 @@ from typing import Optional, Dict, Any, Tuple
 import csv
 
 # === RK-Max v3+ 최소 패치: 스냅샷·오버레이·킬타임 ===
-# (모듈이 없을 수 있으므로 try-import)
-try:
-    from .rebalance_engine import load_latest_snapshot  # Top10 스냅샷 병합
-except Exception:
-    def load_latest_snapshot(ts: datetime):  # type: ignore
-        return None
-
-try:
-    from .overlay import decide_carry_over              # 스윙 오버레이
-except Exception:
-    class _CarryDecision:
-        def __init__(self, carry_over=False, carry_frac=0.0, reason=""):
-            self.carry_over = carry_over
-            self.carry_frac = carry_frac
-            self.reason = reason
-    def decide_carry_over(*args, **kwargs):  # type: ignore
-        return _CarryDecision(False, 0.0, "no-overlay")
+from .rebalance_engine import load_latest_snapshot  # Top10 스냅샷 병합
+from .overlay import decide_carry_over              # 스윙 오버레이
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
     from .rkmax_utils import blend_k, recent_features
 except Exception:
     # 배포 초기에 rkmax_utils가 없을 수 있으므로 더미 함수로 안전가동
-    def blend_k(k_month: float, day: int, atr20: Optional[float], atr60: Optional[float]) -> float:  # type: ignore
+    def blend_k(k_month: float, day: int, atr20: Optional[float], atr60: Optional[float]) -> float:
         return float(k_month) if k_month is not None else 0.5
-    def recent_features(kis, code: str) -> Dict[str, Optional[float]]:  # type: ignore
+
+    def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
         return {"atr20": None, "atr60": None}
 
 logging.basicConfig(level=logging.INFO)
@@ -132,7 +106,8 @@ def fetch_rebalancing_targets(date):
     """ /rebalance/run/{date}?force_order=true 호출 결과에서 selected 또는 selected_stocks 키를 우선 사용.
     (가능하면 각 항목에 weight, k_best, target_price 포함)
     """
-    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
+    # 127.0.0.1로 고정 (GitHub Actions에서 localhost 해석 문제 예방)
+    REBALANCE_API_URL = f"http://127.0.0.1:8000/rebalance/run/{date}?force_order=true"
     response = requests.post(REBALANCE_API_URL)
     logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")
     if response.status_code == 200:

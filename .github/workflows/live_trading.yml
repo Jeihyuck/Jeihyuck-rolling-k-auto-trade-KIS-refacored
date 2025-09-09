@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [ feature/rkmax, feature/rkmax-v2 ]
   schedule:
-    # 매 영업일 09:00 KST = 00:00 UTC (월~금)
+    # 매 영업일 KST 09:00 실행 (UTC 00:00, 월~금)
     - cron: "0 0 * * 1-5"
   workflow_dispatch:
 
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # 러너 6h 제한 보호
 
     env:
       # ===== Secrets =====
@@ -56,11 +56,12 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install fastapi uvicorn
+          pip install fastapi uvicorn requests pytz
 
-      - name: Run FastAPI (bg) with healthcheck
+      - name: Start FastAPI (background) and wait for health
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -80,24 +81,25 @@ jobs:
             sleep 1
           done
 
-      # 수동 실행 시 09:00 KST 이전이면 여기서 대기 → 정확히 09:00에 trader 시작
-      - name: Wait until 09:00 KST (for manual runs)
-        run: |
-          set -euxo pipefail
-          NOW_UTC=$(date -u +%s)
-          TARGET_UTC=$(date -u -d "today 00:00 +9 hours" +%s)
-          if [ $NOW_UTC -lt $TARGET_UTC ]; then
-            echo "Sleeping $((TARGET_UTC - NOW_UTC))s until 09:00 KST..."
-            sleep $((TARGET_UTC - NOW_UTC))
-          fi
-
-      - name: Run live trader (safe timeout)
+      - name: Run live trader (09:00~14:35 KST loop)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euxo pipefail
           # 5h45m → 09:00~14:45 범위 내 종료 (14:30 강제청산 후 종료 보장)
           timeout 5h45m python -m trader.trader || true
+
+      - name: Generate CEO daily report
+        if: always()
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from datetime import datetime
+          from trader.report_ceo import ceo_report
+          ceo_report(datetime.now(), period="daily")
+          PY
 
       - name: Upload trade logs
         if: always()
@@ -108,14 +110,32 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Upload fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fills
+          path: fills/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload trader state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-state
+          path: trader/trade_state.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: FastAPI log (cat)
         if: always()
         run: |
           echo "::group::FastAPI Server Log"
-          cat fastapi.log || true
+          tail -n +1 fastapi.log || true
           echo "::endgroup::"
 
-      - name: Upload fastapi.log
+      - name: Upload FastAPI log
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -123,3 +143,12 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Upload CEO report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: trader/reports/*.json
+          if-no-files-found: warn
+          retention-days: 30
