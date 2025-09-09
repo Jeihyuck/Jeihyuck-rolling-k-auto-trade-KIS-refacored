@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [ feature/rkmax, feature/rkmax-v2 ]
   schedule:
-    # 매 영업일 KST 09:00 시작 (UTC 00:00, 월~금)
+    # 매 영업일 09:00 KST = 00:00 UTC (월~금)
     - cron: "0 0 * * 1-5"
   workflow_dispatch:
 
@@ -17,7 +17,8 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 러너 6h 제한 보호
+    timeout-minutes: 360
+
     env:
       # ===== Secrets =====
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -78,6 +79,17 @@ jobs:
             fi
             sleep 1
           done
+
+      # 수동 실행 시 09:00 KST 이전이면 여기서 대기 → 정확히 09:00에 trader 시작
+      - name: Wait until 09:00 KST (for manual runs)
+        run: |
+          set -euxo pipefail
+          NOW_UTC=$(date -u +%s)
+          TARGET_UTC=$(date -u -d "today 00:00 +9 hours" +%s)
+          if [ $NOW_UTC -lt $TARGET_UTC ]; then
+            echo "Sleeping $((TARGET_UTC - NOW_UTC))s until 09:00 KST..."
+            sleep $((TARGET_UTC - NOW_UTC))
+          fi
 
       - name: Run live trader (safe timeout)
         env:
