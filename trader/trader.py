@@ -10,6 +10,7 @@ import os
 import random
 from typing import Optional, Dict, Any, Tuple
 import csv
+import sys
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -128,6 +129,7 @@ def load_state():
 
 
 # ----- 공용 재시도 래퍼 -----
+
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -170,6 +172,7 @@ def _to_float(val, default=None):
 
 
 # ====== ATR/보조 ======
+
 def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
     if hasattr(kis, "get_atr"):
         try:
@@ -232,6 +235,7 @@ def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_pr
 
 
 # ----- 1회 매도 시도 -----
+
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
     cur_price = _safe_get_price(kis, code)
     try:
@@ -256,6 +260,7 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Op
 
 
 # ====== FIX: 잔고 표준화 반환 (항상 list[dict]) ======
+
 def _fetch_balances(kis: KisAPI):
     """항상 포지션 리스트(list[dict])를 반환하도록 표준화."""
     if hasattr(kis, "get_balance_all"):
@@ -362,6 +367,7 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
 
 # ====== 실전형 청산 로직 ======
+
 def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
     """분할매도/트레일/ATR/시간 손절을 종합 적용.
     실행 시 매도 주문을 내리고 (reason, exec_price, result, sell_qty) 반환."""
@@ -427,6 +433,7 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
 
 
 # ====== 보조: fills CSV에 name 채워넣기 또는 보완 기록 함수 ======
+
 def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: float = 0.0):
     """오늘의 fills CSV를 열어 ODNO 일치 레코드가 있으면 name 컬럼을 채움.
     없으면 append_fill()로 보조 기록을 남김."""
@@ -481,6 +488,7 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 
 
 # ====== RK-Max: 목표가 계산 & 지정가→시장가 Fallback ======
+
 def compute_entry_target(
     kis: KisAPI,
     code: str,
@@ -615,7 +623,28 @@ def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) ->
     return max(0, int(alloc // int(price)))
 
 
+def run_force_sell_only():
+    """명령행 --force-sell 모드: 즉시 전량매도 후 종료."""
+    kis = KisAPI()
+    holding, _traded = load_state()
+    logger.info("[CLI] --force-sell: 커트오프 즉시 전량매도 실행")
+    _force_sell_all(
+        kis=kis,
+        holding=holding,
+        reason=f"CLI 강제전량매도(커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} KST)",
+        passes=FORCE_SELL_PASSES_CUTOFF,
+        include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
+        prefer_market=True,
+    )
+    logger.info("[CLI] 강제전량매도 완료. 종료")
+
+
 def main():
+    # --- CLI 옵션 처리 ---
+    if any(arg in ("--force-sell", "-F") for arg in sys.argv[1:]):
+        run_force_sell_only()
+        return
+
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -869,6 +898,8 @@ def main():
                     include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
                     prefer_market=True
                 )
+                logger.info("[⛔ 커트오프 도달 — 스크립트 종료]")
+                break
 
             # --- 장마감 전량매도(더블 세이프) ---
             if not is_open:

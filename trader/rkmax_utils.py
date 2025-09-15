@@ -8,6 +8,11 @@ RK-Max utilities
 - 최근 특성(mom5, 거래대금 스파이크, ATR20/60)
 - K 블렌딩(월간 K + 최근 변동성)
 - 점착도(Sticky) 교체 기준
+
+[업데이트 요약]
+- kis.get_daily_ohlc()가 없어도 동작하도록 **KisAPI.get_daily_candles() 폴백** 추가
+- 일봉 DataFrame 어댑터 강화: KIS 원본 JSON/가공 list-of-dict 모두 수용
+- 거래대금(trdval) 부재 시 spike=NaN 처리(정상동작)
 """
 from __future__ import annotations
 
@@ -58,13 +63,13 @@ def jaccard(a: Iterable, b: Iterable) -> float:
     return len(sa & sb) / float(max(1, len(sa | sb)))
 
 
-# -------- data helpers --------
+# -------- data adapters --------
 def _kis_ohlc_to_df(js: Dict) -> pd.DataFrame:
     """
-    한국투자증권 일봉 응답(dict)을 pandas DataFrame으로 변환.
-    - 신/구 사양을 모두 견딜 수 있게 'output1' 또는 'output' 키를 수용
-    - 최신 → 과거 순으로 들어오는 경우가 있어, 항상 '과거→최신'으로 정렬
-    필드(일반적): stck_clpr(종가), stck_hgpr(고가), stck_lwpr(저가), stck_trdval(거래대금)
+    한국투자증권 **원본 일봉 응답(dict)** → pandas DataFrame.
+    - 'output1' 또는 'output' 키를 수용
+    - 최신→과거 순으로 들어오는 경우가 있어, 항상 '과거→현재'로 정렬
+    - 컬럼 표준화: stck_oprc, stck_hgpr, stck_lwpr, stck_clpr, stck_trdval
     """
     out = js.get("output1") or js.get("output") or []
     df = pd.DataFrame(out).copy()
@@ -77,7 +82,6 @@ def _kis_ohlc_to_df(js: Dict) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # 날짜 정렬: 과거→현재
-    # API별로 'basDt' 또는 'stck_bsop_date' 등의 필드가 있을 수 있음
     date_col = None
     for cand in ("basDt", "stck_bsop_date", "date"):
         if cand in df.columns:
@@ -85,47 +89,102 @@ def _kis_ohlc_to_df(js: Dict) -> pd.DataFrame:
             break
 
     if date_col:
-        # 날짜 파싱 실패 시 원본 순서 유지
         try:
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.sort_values(date_col).reset_index(drop=True)
         except Exception:
             df = df.reset_index(drop=True)
     else:
-        # 날짜 필드가 없으면 그냥 역순(최신이 위)일 가능성을 고려해 뒤집기
         df = df.iloc[::-1].reset_index(drop=True)
 
+    # 필요한 컬럼 없는 경우 NaN 추가
+    for c in ("stck_oprc", "stck_hgpr", "stck_lwpr", "stck_clpr", "stck_trdval"):
+        if c not in df.columns:
+            df[c] = np.nan
     return df
+
+
+def _candles_list_to_df(rows: Iterable[Dict]) -> pd.DataFrame:
+    """KisAPI.get_daily_candles() 결과(list of dict) → 표준 컬럼 DF로 변환."""
+    df = pd.DataFrame(list(rows) if rows is not None else [])
+    if df.empty:
+        return df
+    # 기대 컬럼: date, open, high, low, close
+    # 표준 컬럼명으로 매핑
+    rename = {
+        "open": "stck_oprc",
+        "high": "stck_hgpr",
+        "low": "stck_lwpr",
+        "close": "stck_clpr",
+    }
+    df = df.rename(columns=rename)
+
+    # 숫자 캐스팅
+    for c in ("stck_oprc", "stck_hgpr", "stck_lwpr", "stck_clpr"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # 거래대금은 제공되지 않을 수 있음
+    if "stck_trdval" not in df.columns:
+        df["stck_trdval"] = np.nan
+
+    # 날짜 처리
+    if "date" in df.columns:
+        try:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.sort_values("date").reset_index(drop=True)
+        except Exception:
+            df = df.reset_index(drop=True)
+    return df
+
+
+def _fetch_daily_df(kis, code: str, need_count: int = 260) -> pd.DataFrame:
+    """일봉 DF를 얻는 통합 헬퍼.
+    - 선호: kis.get_daily_ohlc(code, start, end)  (KIS 원본 JSON)
+    - 폴백: kis.get_daily_candles(code, count=need_count)  (가공 rows)
+    """
+    # 1) 원본 API 경로 지원 시도
+    if hasattr(kis, "get_daily_ohlc"):
+        try:
+            end = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y%m%d")
+            start = (pd.Timestamp.now(tz="Asia/Seoul") - pd.Timedelta(days=need_count * 2)).strftime("%Y%m%d")
+            js = kis.get_daily_ohlc(str(code), start, end)
+            df = _kis_ohlc_to_df(js)
+            if not df.empty:
+                return df
+        except Exception as e:
+            LOG.warning("[rkmax] get_daily_ohlc 실패, candles 폴백 사용: %s", e)
+
+    # 2) 가공 candles 폴백
+    if hasattr(kis, "get_daily_candles"):
+        try:
+            rows = kis.get_daily_candles(str(code), count=need_count)
+            return _candles_list_to_df(rows)
+        except Exception as e:
+            LOG.warning("[rkmax] get_daily_candles 실패: %s", e)
+
+    return pd.DataFrame()
 
 
 # -------- market breadth --------
 def breadth_pos_ratio(kis, codes: Iterable[str], lookback: int = 20) -> int:
     """
-    유니버스에서 '20일 수익률 > 0' 인 종목 비율(%)
-    kis: 한국투자 API 래퍼 인스턴스 (get_daily_ohlc(code, start, end))
+    유니버스에서 'lookback일 수익률 > 0' 비율(%)
+    kis: 한국투자 API 래퍼 인스턴스
     """
     pos = 0
     cnt = 0
-    # 조회 기간 넉넉히
-    end = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y%m%d")
-    start = (pd.Timestamp.now(tz="Asia/Seoul") - pd.Timedelta(days=160)).strftime(
-        "%Y%m%d"
-    )
-
     for code in set(codes or []):
         try:
-            js = kis.get_daily_ohlc(str(code), start, end)
-            df = _kis_ohlc_to_df(js)
+            df = _fetch_daily_df(kis, code, need_count=max(lookback + 10, 60))
             cl = df.get("stck_clpr")
             if cl is None or cl.dropna().shape[0] < (lookback + 1):
                 continue
-            cl = cl.astype(float).to_numpy()
-            ret = cl[-1] / cl[-1 - lookback] - 1.0
+            clv = cl.astype(float).to_numpy()
+            ret = clv[-1] / clv[-1 - lookback] - 1.0
             pos += 1 if ret > 0 else 0
             cnt += 1
         except Exception as e:
             LOG.warning("breadth fail %s: %s", code, e)
-
     return int(round(100 * (pos / cnt))) if cnt > 0 else 0
 
 
@@ -149,29 +208,16 @@ def recent_features(kis, code: str) -> Dict[str, float]:
       - spike: ADTV5 / ADTV20 (거래대금 스파이크)
       - atr20, atr60: 고저 범위 기반 ATR 근사
     """
-    end = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y%m%d")
-    start = (pd.Timestamp.now(tz="Asia/Seoul") - pd.Timedelta(days=260)).strftime(
-        "%Y%m%d"
-    )
-
-    js = kis.get_daily_ohlc(str(code), start, end)
-    df = _kis_ohlc_to_df(js)
-
+    df = _fetch_daily_df(kis, code, need_count=260)
     if df.empty or ("stck_clpr" not in df.columns):
         return dict(mom5=np.nan, spike=np.nan, atr20=np.nan, atr60=np.nan)
 
     cl = df["stck_clpr"].astype(float)
-    mom5 = (
-        (cl.iloc[-1] / cl.iloc[-6] - 1.0) * 100.0
-        if cl.shape[0] >= 6
-        else float("nan")
-    )
+    mom5 = (cl.iloc[-1] / cl.iloc[-6] - 1.0) * 100.0 if cl.shape[0] >= 6 else float("nan")
 
     tv = df.get("stck_trdval")
     adtv5 = float(tv.tail(5).mean()) if (tv is not None and tv.shape[0] >= 5) else np.nan
-    adtv20 = (
-        float(tv.tail(20).mean()) if (tv is not None and tv.shape[0] >= 20) else np.nan
-    )
+    adtv20 = float(tv.tail(20).mean()) if (tv is not None and tv.shape[0] >= 20) else np.nan
     spike = (adtv5 / adtv20) if (adtv5 and adtv20 and adtv20 > 0) else np.nan
 
     atr20 = _atr_from_hl(df, 20)
@@ -199,8 +245,10 @@ def blend_k(k_month: float, day_of_month: int, atr20: float, atr60: float) -> fl
 
     if not atr20 or not atr60 or atr60 <= 0:
         k_use = float(k_month)
-        LOG.info("[K-blend] day=%d w=%.2f Km=%.2f (no recent) -> Ku=%.2f",
-                 day_of_month, w, k_month, k_use)
+        LOG.info(
+            "[K-blend] day=%d w=%.2f Km=%.2f (no recent) -> Ku=%.2f",
+            day_of_month, w, k_month, k_use,
+        )
         return k_use
 
     k_recent = float(k_month) * float(atr20) / float(atr60)

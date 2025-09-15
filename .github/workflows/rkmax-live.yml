@@ -1,0 +1,196 @@
+name: RKMax Live (Unified Trade Monitor)
+
+on:
+  push:
+    branches: [ feature/rkmax, feature/rkmax-week ]
+  pull_request:
+    branches: [ feature/rkmax, feature/rkmax-week ]
+  schedule:
+    # ✅ 평일 KST 09:00에 1회 기동 (UTC 00:00)
+    - cron: '0 0 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  monitor-trade:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: rkmax-live
+      cancel-in-progress: false          # 단일 장기 실행 유지
+    timeout-minutes: 360                 # 6h 제한 내(09:00→14:45=~345m)
+
+    env:
+      TZ: Asia/Seoul
+      # ===== 민감정보(Secrets) =====
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      # ===== 전략/운영(기존 env 값 유지: 코드 호환 목적) =====
+      PARTIAL1: "0.5"                    # 1차 익절 비중(50%)
+      PARTIAL2: "0.3"                    # 2차 익절 비중(30%)
+      TRAIL_PCT: "0.007"                 # 트레일링 0.7% (제안 반영)
+      FAST_STOP: "0.01"                  # 급락 손절 1%
+      ATR_STOP_MULT: "1.5"               # ATR x 1.5
+      TIME_STOP_HHMM: "13:00"            # (옵션) 시간 손절
+      SELL_FORCE_TIME: "14:45"           # 강제청산 시각
+      MIN_TRADES: "5"
+      MAX_MDD_PCT: "30"
+      MIN_WINRATE: "50"
+      MIN_CUMRET: "2"
+      TOP_K_LIMIT: "20"
+      MIN_TARGET_RET_M_PCT: "8"
+      K_MIN: "0.1"
+      K_MAX: "0.9"
+      K_STEP: "0.1"
+      TOTAL_CAPITAL: "10000000"
+      MIN_QTY_PER_TICKET: "1"
+      DAILY_CAPITAL: "10000000"
+      MAX_POSITIONS: "8"
+      CAPITAL_PER_SYMBOL: "100000"
+      ALLOW_AFTER_HOURS: "0"
+      ORDER_THROTTLE_SEC: "0.3"
+      REBALANCE_OUT_DIR: "rebalance_results"
+      REBALANCE_DAYS: "7"
+      LOG_LEVEL: INFO
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencies 설치
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # ⬇️ 전략 파라미터 yaml을 런타임에 생성(별도 config 파일 불필요, 제안값 반영)
+      - name: Create inline strategy config (configs/rkmax-live.yaml)
+        run: |
+          mkdir -p configs
+          cat > configs/rkmax-live.yaml << 'YAML'
+          mode: daytrade
+          universe: KOSDAQ_TOP50
+          k_params:
+            method: rkmax
+            lookback_months: 1
+          slippage:
+            max_pct: 0.0025            # 0.25%
+            max_extra_ticks: 2         # 호가상한 +2틱
+          take_profit:
+            tp1_pct: 0.008             # +0.8%
+            tp2_pct: 0.015             # +1.5%
+          trailing:
+            pct: 0.007                 # 0.7%
+          stops:
+            fast_stop_pct: 0.01        # 1%
+            atr_mult: 1.5              # ATR×1.5
+          sizing:
+            scheme: equal              # equal | inv_vol (inv_vol은 clip 적용)
+            clip_min: 0.5
+            clip_max: 1.5
+          time_rules:
+            trade_start_hhmm: "09:00"
+            trade_end_hhmm:   "14:45"  # ★ 내부 하드스톱(신규주문 중지 & 루프 종료)
+            sell_force_window:
+              start_hhmm: "14:40"
+              end_hhmm:   "14:45"
+          swing:
+            enabled: false
+            hold_days: 3
+            adx_min: 20
+            use_tema_filter: true
+          retries:
+            max_attempts: 5
+            backoff_base_sec: 0.5
+          logging:
+            level: INFO
+            json: true
+          YAML
+
+      # ⬇️ FastAPI 리밸런싱 서버를 백그라운드로 실행(트레이더가 의존 시 필요)
+      - name: 리밸런싱 API 서버 실행 (백그라운드)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app \
+            --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          echo "[API] FastAPI started: PID=$!" && sleep 20
+
+      # ⬇️ 통합 장내 루프: 09:00까지 대기 → 14:45에 강제청산 1회 실행 → 종료
+      - name: Unified live loop (09:00→14:45 KST)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -e
+          echo "[INIT] $(date '+%F %T %Z') — start unified live loop"
+          while true; do
+            NOW=$(date +%H:%M)
+            # 09:00 전이면 대기
+            if [[ "$NOW" < "09:00" ]]; then
+              echo "[WAIT] $NOW < 09:00 — sleep 30s"; sleep 30; continue
+            fi
+            # 14:45 도달 시 강제청산 1회 후 종료
+            if [[ "$NOW" > "14:45" || "$NOW" == "14:45" ]]; then
+              echo "[FORCE-SELL] $NOW — python -m trader.trader --force-sell"
+              python -m trader.trader --force-sell || true
+              break
+            fi
+            echo "[TICK] $(date '+%T') — python -m trader.trader (regular)"
+            python -m trader.trader || true
+            sleep 60
+          done
+          echo "[DONE] $(date '+%F %T %Z') — loop ended"
+
+      - name: CEO 리포트 자동 생성
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.report_ceo || true
+
+      - name: CEO 리포트 artifact 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: trader/reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Rebalance JSON artifact 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebalance-results
+          path: rebalance_results/*.json
+          if-no-files-found: warn
+          retention-days: 60
+
+      - name: Trades 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: |
+            trader/logs/*.json
+            logs/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: FastAPI 로그 출력 (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log || true
+          echo "::endgroup::"
+
+      - name: FastAPI 로그 업로드 (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+          if-no-files-found: ignore
+          retention-days: 14
