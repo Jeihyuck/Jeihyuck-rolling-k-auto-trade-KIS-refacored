@@ -2,9 +2,9 @@ name: RKMax Live (Unified Trade Monitor)
 
 on:
   push:
-    branches: [ feature/rkmax, feature/rkmax-week ]
+    branches: [ rkmax-week ]
   pull_request:
-    branches: [ feature/rkmax, feature/rkmax-week ]
+    branches: [ rkmax-week ]
   schedule:
     # ✅ 평일 KST 09:00에 1회 기동 (UTC 00:00)
     - cron: '0 0 * * 1-5'
