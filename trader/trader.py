@@ -10,7 +10,7 @@ import os
 import random
 from typing import Optional, Dict, Any, Tuple
 import csv
-import sys
+import numpy as np
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -21,7 +21,7 @@ except Exception:
         return float(k_month) if k_month is not None else 0.5
 
     def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
-        return {"atr20": None, "atr60": None}
+        return {"atr20": None, "atr60": None, "mom5": None, "spike": None}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 KST = ZoneInfo("Asia/Seoul")
 
 # 장중 강제 전량매도 커트오프 (KST 기준)
-SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "15:20").strip()
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:45").strip()
 # 커트오프/장마감 시 보유 전 종목(계좌 잔고 전체) 포함 여부 (기본 True)
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
 # API 호출 간 최소 휴지시간(초)
@@ -44,12 +44,21 @@ FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "2"))
 FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
 
 # ====== 실전형 매도/진입 파라미터 ======
-PARTIAL1 = float(os.getenv("PARTIAL1", "0.5"))   # 목표가1 도달 시 매도 비중
-PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))   # 목표가2 도달 시 매도 비중
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))  # 고점대비 -2% 청산
+PARTIAL1 = float(os.getenv("PARTIAL1", "0.4"))   # 목표가1 도달 시 매도 비중 (수익 극대화를 위해 40%)
+PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))   # 목표가2 도달 시 매도 비중 (30%), 잔여는 트레일
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.03"))  # 기본 트레일 3%로 완화
 FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))  # 진입 5분내 -1%
 ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))     # ATR 1.5배 손절(절대값)
-TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")  # 시간 손절 기준
+TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:20")  # 시간 손절 기준(모멘텀이면 옵션으로 해제)
+
+# 트레일 고도화(수익구간에서만 작동)
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "0.8")) / 100.0     # 매수가 대비 +0.8% 수익 나야 arm
+TRAIL_MIN_HOLD_MIN = int(os.getenv("TRAIL_MIN_HOLD_MIN", "5"))        # 최소 보유 5분
+TRAIL_FLOOR_PCT = float(os.getenv("TRAIL_FLOOR_PCT", "0.0")) / 100.0  # 트레일 바닥(매수가 위)
+TRAIL_MOMO_PCT = float(os.getenv("TRAIL_MOMO_PCT", "0.04"))           # 모멘텀 강할 때 트레일 4%
+MOMO_BRK_PCT = float(os.getenv("MOMO_BRK_PCT", "0.5")) / 100.0        # 목표가 대비 +0.5% 돌파면 모멘텀
+MOMO_OBS = float(os.getenv("MOMO_OBS", "130"))                         # 호가강도 130 이상이면 모멘텀
+TIME_STOP_MOMO_DISABLE = os.getenv("TIME_STOP_MOMO_DISABLE", "1") == "1"
 
 # (기존 단일 임계치 대비) 백테/실전 괴리 축소를 위한 기본값 조정
 DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))  # 백업용
@@ -59,13 +68,21 @@ DEFAULT_LOSS_PCT = float(os.getenv("DEFAULT_LOSS_PCT", "-2.0"))     # 백업용
 DAILY_CAPITAL = int(os.getenv("DAILY_CAPITAL", "3000000"))            # 일일 총 집행 금액(원)
 SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.15"))   # 슬리피지 로깅 임계(정보용)
 # 신규: 진입 슬리피지 가드(목표가 대비 불리 체결 한도)
-SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.5"))
+SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.2"))
 # (선택) 단일종목 비중 가드
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "8"))
 
 # 리밸런싱 기준일 앵커: "first"(월초·기본) / "today"(당일)
 REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+
+# 엔트리 품질 필터(모멘텀·거래대금 스파이크)
+MIN_MOM5_PCT = float(os.getenv("MIN_MOM5_PCT", "0"))   # 5일 모멘텀 >= 0% 기본
+MIN_SPIKE = float(os.getenv("MIN_SPIKE", "0.8"))        # ADTV5/ADTV20 >= 0.8 기본(없으면 스킵)
+
+# 지정가→시장가 Fallback 대기
+WAIT_AFTER_LIMIT_SEC = float(os.getenv("WAIT_AFTER_LIMIT_SEC", "2.0"))
 
 
 def _parse_hhmm(hhmm: str) -> dtime:
@@ -73,8 +90,8 @@ def _parse_hhmm(hhmm: str) -> dtime:
         hh, mm = hhmm.split(":")
         return dtime(hour=int(hh), minute=int(mm))
     except Exception:
-        logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 15:20 적용: {hhmm}")
-        return dtime(hour=15, minute=20)
+        logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:45 적용: {hhmm}")
+        return dtime(hour=14, minute=45)
 
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
@@ -129,7 +146,6 @@ def load_state():
 
 
 # ----- 공용 재시도 래퍼 -----
-
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -172,7 +188,6 @@ def _to_float(val, default=None):
 
 
 # ====== ATR/보조 ======
-
 def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
     if hasattr(kis, "get_atr"):
         try:
@@ -204,6 +219,7 @@ def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float,
         'stop_abs': float(entry_price - ATR_STOP * atr) if atr else float(entry_price * (1 - FAST_STOP)),
         'k_value': k_value,
         'target_price_src': float(target_price) if target_price is not None else None,
+        'trail_armed': False,
     }
 
 
@@ -231,11 +247,11 @@ def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_pr
         'stop_abs': float(avg_price - ATR_STOP * atr) if atr else float(avg_price * (1 - FAST_STOP)),
         'k_value': None,
         'target_price_src': None,
+        'trail_armed': False,
     }
 
 
 # ----- 1회 매도 시도 -----
-
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
     cur_price = _safe_get_price(kis, code)
     try:
@@ -260,7 +276,6 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Op
 
 
 # ====== FIX: 잔고 표준화 반환 (항상 list[dict]) ======
-
 def _fetch_balances(kis: KisAPI):
     """항상 포지션 리스트(list[dict])를 반환하도록 표준화."""
     if hasattr(kis, "get_balance_all"):
@@ -366,8 +381,30 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
     save_state(holding, {})
 
 
-# ====== 실전형 청산 로직 ======
+# ====== 모멘텀 판별 ======
+def _is_momentum_strong(kis: KisAPI, code: str, cur: Optional[float], target_price: Optional[float]) -> bool:
+    ok = False
+    try:
+        if cur is not None and target_price:
+            if cur >= float(target_price) * (1.0 + MOMO_BRK_PCT):
+                ok = True
+        obs = kis.get_orderbook_strength(code)
+        if obs and float(obs) >= MOMO_OBS:
+            ok = True
+        feats = {}
+        try:
+            feats = recent_features(kis, code) or {}
+        except Exception:
+            feats = {}
+        mom5 = feats.get("mom5")
+        if mom5 is not None and mom5 >= max(0.0, MIN_MOM5_PCT):
+            ok = True
+    except Exception:
+        pass
+    return ok
 
+
+# ====== 실전형 청산 로직 ======
 def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
     """분할매도/트레일/ATR/시간 손절을 종합 적용.
     실행 시 매도 주문을 내리고 (reason, exec_price, result, sell_qty) 반환."""
@@ -415,25 +452,37 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         pos['sold_p2'] = True
         return "TP2", exec_px, result, sell_qty
 
-    # 4) 트레일링 스탑(고점대비 하락)
-    trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
-    if cur <= trail_line:
-        exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        return "TRAIL", exec_px, result, qty
+    # 4) 트레일링 스탑(고점대비 하락) — 수익구간에서만 arm
+    armed = bool(pos.get('trail_armed'))
+    if not armed:
+        if (now - ent >= timedelta(minutes=TRAIL_MIN_HOLD_MIN)) and (cur >= float(pos['buy_price']) * (1 + TRAIL_ARM_PCT)):
+            pos['trail_armed'] = True
+            armed = True
+            logger.info(f"[TRAIL ARM] {code} armed at cur={cur}")
 
-    # 5) 시간 손절 (예: 13:00까지 수익전환 없으면 청산)
-    if now.time() >= TIME_STOP_TIME:
-        buy_px = float(pos.get('buy_price'))
-        if cur < buy_px:  # 손실 지속 시만 적용(보수적)
+    if armed:
+        is_momo = _is_momentum_strong(kis, code, cur, pos.get('target_price_src'))
+        use_pct = TRAIL_MOMO_PCT if is_momo else float(pos.get('trail_pct', TRAIL_PCT))
+        base_line = float(pos['high']) * (1 - use_pct)
+        floor_line = float(pos['buy_price']) * (1 + TRAIL_FLOOR_PCT)
+        trail_line = max(base_line, floor_line)
+        if cur <= trail_line:
             exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-            return "TIME_STOP", exec_px, result, qty
+            return ("TRAIL_MOMO" if is_momo else "TRAIL"), exec_px, result, qty
+
+    # 5) 시간 손절 (예: 13:20 이후 손실 지속)
+    if now.time() >= TIME_STOP_TIME:
+        if not (_is_momentum_strong(kis, code, cur, pos.get('target_price_src')) and TIME_STOP_MOMO_DISABLE):
+            buy_px = float(pos.get('buy_price'))
+            if cur < buy_px:  # 손실 지속 시만 적용(보수적)
+                exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+                return "TIME_STOP", exec_px, result, qty
 
     # 6) 장 후반 강제 청산은 루프 말미에서 처리
     return None, None, None, None
 
 
 # ====== 보조: fills CSV에 name 채워넣기 또는 보완 기록 함수 ======
-
 def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: float = 0.0):
     """오늘의 fills CSV를 열어 ODNO 일치 레코드가 있으면 name 컬럼을 채움.
     없으면 append_fill()로 보조 기록을 남김."""
@@ -488,7 +537,6 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 
 
 # ====== RK-Max: 목표가 계산 & 지정가→시장가 Fallback ======
-
 def compute_entry_target(
     kis: KisAPI,
     code: str,
@@ -577,7 +625,7 @@ def compute_entry_target(
 
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
-    """지정가 주문(가능시) → 3초 대기 → 미체결이면 시장가 전환. 결과 dict 반환."""
+    """지정가 주문(가능시) → 짧게 대기 → 미체결이면 시장가 전환. 결과 dict 반환."""
     result_limit = None
 
     # 1) 지정가 가능 시 우선 시도
@@ -585,7 +633,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
         if hasattr(kis, "buy_stock_limit") and limit_price and limit_price > 0:
             result_limit = _with_retry(kis.buy_stock_limit, code, qty, int(limit_price))
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, limit_price, result_limit)
-            time.sleep(3.0)
+            time.sleep(WAIT_AFTER_LIMIT_SEC)
             # 1-1) 체결 확인 가능할 때만 Fallback 판단
             if hasattr(kis, "check_filled"):
                 try:
@@ -623,28 +671,7 @@ def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) ->
     return max(0, int(alloc // int(price)))
 
 
-def run_force_sell_only():
-    """명령행 --force-sell 모드: 즉시 전량매도 후 종료."""
-    kis = KisAPI()
-    holding, _traded = load_state()
-    logger.info("[CLI] --force-sell: 커트오프 즉시 전량매도 실행")
-    _force_sell_all(
-        kis=kis,
-        holding=holding,
-        reason=f"CLI 강제전량매도(커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} KST)",
-        passes=FORCE_SELL_PASSES_CUTOFF,
-        include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
-        prefer_market=True,
-    )
-    logger.info("[CLI] 강제전량매도 완료. 종료")
-
-
 def main():
-    # --- CLI 옵션 처리 ---
-    if any(arg in ("--force-sell", "-F") for arg in sys.argv[1:]):
-        run_force_sell_only()
-        return
-
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -738,11 +765,19 @@ def main():
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
 
+            # 현재 보유 종목 수
+            open_positions = sum(1 for q in [holding[k]['qty'] for k in holding] if _to_int(q, 0) > 0)
+
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
             for code, target in code_to_target.items():
                 qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
                 if qty <= 0:
                     logger.info(f"[SKIP] {code}: 매수수량 없음/0")
+                    continue
+
+                # 포지션 상한
+                if open_positions >= MAX_POSITIONS and code not in holding:
+                    logger.info(f"[SKIP] {code}: MAX_POSITIONS={MAX_POSITIONS} 초과 방지")
                     continue
 
                 # 입력 K 값
@@ -772,7 +807,7 @@ def main():
                         "strategy": strategy,
                     }
 
-                    # --- 매수 --- (돌파 진입 + 슬리피지 가드)
+                    # --- 매수 --- (돌파 진입 + 슬리피지/모멘텀 가드)
                     if is_open and code not in holding and code not in traded:
                         enter_cond = (
                             current_price is not None and
@@ -781,6 +816,21 @@ def main():
                         )
 
                         if enter_cond:
+                            # 엔트리 품질 필터 (mom5, spike)
+                            feats = {}
+                            try:
+                                feats = recent_features(kis, code) or {}
+                            except Exception:
+                                feats = {}
+                            mom5 = feats.get("mom5")
+                            spike = feats.get("spike")
+                            if mom5 is not None and mom5 < MIN_MOM5_PCT:
+                                logger.info(f"[ENTER-FILTER] {code} mom5={mom5:.2f}% < {MIN_MOM5_PCT}% → 스킵")
+                                continue
+                            if spike is not None and not (np.isnan(spike)) and spike < MIN_SPIKE:
+                                logger.info(f"[ENTER-FILTER] {code} spike={spike:.2f} < {MIN_SPIKE} → 스킵")
+                                continue
+
                             # 진입 슬리피지 가드
                             guard_ok = True
                             if eff_target_price and eff_target_price > 0 and current_price is not None:
@@ -809,6 +859,7 @@ def main():
                             _init_position_state(holding, code, float(current_price), int(qty),
                                                  (k_value if k_value is not None else k_used), eff_target_price)
                             traded[code] = {"buy_time": now_str, "qty": int(qty), "price": float(current_price)}
+                            open_positions += 1
                             logger.info(f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}")
 
                             log_trade({
@@ -898,7 +949,7 @@ def main():
                     include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
                     prefer_market=True
                 )
-                logger.info("[⛔ 커트오프 도달 — 스크립트 종료]")
+                logger.info("[CUT-OFF] 강제청산 완료 → 루프 종료")
                 break
 
             # --- 장마감 전량매도(더블 세이프) ---
@@ -918,8 +969,7 @@ def main():
             time.sleep(loop_sleep_sec)
 
     except KeyboardInterrupt:
-        logger.info("[🛑 수동 종료]")
-
+    	logger
 
 if __name__ == "__main__":
     main()

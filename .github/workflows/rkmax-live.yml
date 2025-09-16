@@ -16,7 +16,7 @@ jobs:
     concurrency:
       group: rkmax-live
       cancel-in-progress: false          # 단일 장기 실행 유지
-    timeout-minutes: 360                 # 6h 제한 내(09:00→14:45=~345m)
+    timeout-minutes: 360                 # 6h 제한 내(09:00→14:45≈345m)
 
     env:
       TZ: Asia/Seoul
@@ -26,14 +26,33 @@ jobs:
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
-      # ===== 전략/운영(기존 env 값 유지: 코드 호환 목적) =====
-      PARTIAL1: "0.5"                    # 1차 익절 비중(50%)
-      PARTIAL2: "0.3"                    # 2차 익절 비중(30%)
-      TRAIL_PCT: "0.007"                 # 트레일링 0.7% (제안 반영)
-      FAST_STOP: "0.01"                  # 급락 손절 1%
-      ATR_STOP_MULT: "1.5"               # ATR x 1.5
-      TIME_STOP_HHMM: "13:00"            # (옵션) 시간 손절
-      SELL_FORCE_TIME: "14:45"           # 강제청산 시각
+
+      # ===== 전략/운영 파라미터 (trader.py와 키 일치) =====
+      PARTIAL1: "0.4"                    # TP1 매도 비중
+      PARTIAL2: "0.3"                    # TP2 매도 비중
+      TRAIL_PCT: "0.03"                  # 기본 트레일 3%
+      TRAIL_ARM_PCT: "0.8"               # 트레일 암(수익 +0.8% 이후) [%]
+      TRAIL_MIN_HOLD_MIN: "5"            # 최소 보유 분(min)
+      TRAIL_FLOOR_PCT: "0.0"             # 트레일 하한(매수가 위) [%]
+      TRAIL_MOMO_PCT: "0.04"             # 모멘텀 강할 때 트레일 4.0 (소수=비율)
+      MOMO_BRK_PCT: "0.5"                # 목표가 대비 +0.5% 돌파면 모멘텀 [%]
+      MOMO_OBS: "130"                    # 호가강도 임계
+      TIME_STOP_MOMO_DISABLE: "1"        # 모멘텀강하면 시간손절 비활성
+
+      FAST_STOP: "0.01"                  # 진입 5분내 급락손절 1%
+      ATR_STOP: "1.5"                    # ATR×1.5 절대 손절(키 교정: *_MULT 아님)
+      TIME_STOP_HHMM: "13:20"            # 시간 손절 기준
+      SELL_FORCE_TIME: "14:45"           # 커트오프(강제청산)
+
+      # 엔트리 품질 필터
+      MIN_MOM5_PCT: "0"                  # 5일 모멘텀 하한(%) 기본 0
+      MIN_SPIKE: "0.8"                   # ADTV5/ADTV20 하한
+
+      # 슬리피지
+      SLIPPAGE_ENTER_GUARD_PCT: "1.2"    # 목표가 대비 진입 슬리피지 가드(%)
+      API_RATE_SLEEP_SEC: "0.5"          # API 호출 휴지 (키 교정)
+
+      # 리밸런싱/배분 (그대로 유지)
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -68,7 +87,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # ⬇️ 전략 파라미터 yaml을 런타임에 생성(별도 config 파일 불필요, 제안값 반영)
+      # ⬇️ 전략 파라미터 yaml을 런타임 생성(리포트/서버 참고용)
       - name: Create inline strategy config (configs/rkmax-live.yaml)
         run: |
           mkdir -p configs
@@ -79,23 +98,23 @@ jobs:
             method: rkmax
             lookback_months: 1
           slippage:
-            max_pct: 0.0025            # 0.25%
-            max_extra_ticks: 2         # 호가상한 +2틱
+            max_pct: 0.0025
+            max_extra_ticks: 2
           take_profit:
-            tp1_pct: 0.008             # +0.8%
-            tp2_pct: 0.015             # +1.5%
+            tp1_pct: 0.008
+            tp2_pct: 0.015
           trailing:
-            pct: 0.007                 # 0.7%
+            pct: 0.03
           stops:
-            fast_stop_pct: 0.01        # 1%
-            atr_mult: 1.5              # ATR×1.5
+            fast_stop_pct: 0.01
+            atr_mult: 1.5
           sizing:
-            scheme: equal              # equal | inv_vol (inv_vol은 clip 적용)
+            scheme: equal
             clip_min: 0.5
             clip_max: 1.5
           time_rules:
             trade_start_hhmm: "09:00"
-            trade_end_hhmm:   "14:45"  # ★ 내부 하드스톱(신규주문 중지 & 루프 종료)
+            trade_end_hhmm:   "14:45"
             sell_force_window:
               start_hhmm: "14:40"
               end_hhmm:   "14:45"
@@ -112,14 +131,14 @@ jobs:
             json: true
           YAML
 
-      # ⬇️ FastAPI 리밸런싱 서버를 백그라운드로 실행(트레이더가 의존 시 필요)
+      # ⬇️ FastAPI 리밸런싱 서버 (백그라운드)
       - name: 리밸런싱 API 서버 실행 (백그라운드)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app \
             --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
           echo "[API] FastAPI started: PID=$!" && sleep 20
 
-      # ⬇️ 통합 장내 루프: 09:00까지 대기 → 14:45에 강제청산 1회 실행 → 종료
+      # ⬇️ 통합 루프: 09:00까지 대기 → 분당 호출 → 14:45 강제청산 후 종료
       - name: Unified live loop (09:00→14:45 KST)
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -128,11 +147,9 @@ jobs:
           echo "[INIT] $(date '+%F %T %Z') — start unified live loop"
           while true; do
             NOW=$(date +%H:%M)
-            # 09:00 전이면 대기
             if [[ "$NOW" < "09:00" ]]; then
               echo "[WAIT] $NOW < 09:00 — sleep 30s"; sleep 30; continue
             fi
-            # 14:45 도달 시 강제청산 1회 후 종료
             if [[ "$NOW" > "14:45" || "$NOW" == "14:45" ]]; then
               echo "[FORCE-SELL] $NOW — python -m trader.trader --force-sell"
               python -m trader.trader --force-sell || true
