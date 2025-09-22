@@ -10,6 +10,7 @@ import os
 import random
 from typing import Optional, Dict, Any, Tuple
 import csv
+import numpy as np
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -45,10 +46,14 @@ FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
 # ====== 실전형 매도/진입 파라미터 ======
 PARTIAL1 = float(os.getenv("PARTIAL1", "0.5"))   # 목표가1 도달 시 매도 비중
 PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))   # 목표가2 도달 시 매도 비중
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))  # 고점대비 -2% 청산
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))  # 고점대비 -2% 기본 트레일
 FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))  # 진입 5분내 -1%
 ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))     # ATR 1.5배 손절(절대값)
 TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")  # 시간 손절 기준
+
+# 신규: 트레일 관련 보강
+TRAIL_DISABLE_MINUTES = int(os.getenv("TRAIL_DISABLE_MINUTES", "5"))  # 진입 후 트레일 비활성 시간
+TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "0.5"))  # ATR 기반 트레일 계산 곱수
 
 # (기존 단일 임계치 대비) 백테/실전 괴리 축소를 위한 기본값 조정
 DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))  # 백업용
@@ -66,12 +71,6 @@ W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
 # 리밸런싱 기준일 앵커: "first"(월초·기본) / "today"(당일)
 REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
 
-# ====== Patch A 관련 신규 설정 ======
-# 초기 TRAIL 예외(진입 후 이내에는 TRAIL 적용 완화/무시) -- 기본 6분
-TRAIL_GRACE_MIN = int(os.getenv("TRAIL_GRACE_MIN", "6"))
-# 목표가 fallback 클램프 (percent). 예: -5 -> -5% , 30 -> +30%
-TARGET_CLAMP_MIN_PCT = float(os.getenv("TARGET_CLAMP_MIN_PCT", "-5.0"))
-TARGET_CLAMP_MAX_PCT = float(os.getenv("TARGET_CLAMP_MAX_PCT", "30.0"))
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -193,6 +192,9 @@ def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float,
     t1 = entry_price + 0.5 * rng_eff
     t2 = entry_price + 1.0 * rng_eff
 
+    # 트레일 비활성 기간 계산
+    disabled_until = (datetime.now(KST) + timedelta(minutes=TRAIL_DISABLE_MINUTES)).isoformat()
+
     holding[code] = {
         'qty': int(qty),
         'buy_price': float(entry_price),
@@ -207,6 +209,7 @@ def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float,
         'stop_abs': float(entry_price - ATR_STOP * atr) if atr else float(entry_price * (1 - FAST_STOP)),
         'k_value': k_value,
         'target_price_src': float(target_price) if target_price is not None else None,
+        'trail_disabled_until': disabled_until,
     }
 
 
@@ -219,6 +222,8 @@ def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_pr
     rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, avg_price * 0.01)
     t1 = avg_price + 0.5 * rng_eff
     t2 = avg_price + 1.0 * rng_eff
+
+    disabled_until = (datetime.now(KST) - timedelta(minutes=5)).isoformat()  # 이미 보유중이므로 트레일 활성화
 
     holding[code] = {
         'qty': int(qty),
@@ -234,6 +239,7 @@ def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_pr
         'stop_abs': float(avg_price - ATR_STOP * atr) if atr else float(avg_price * (1 - FAST_STOP)),
         'k_value': None,
         'target_price_src': None,
+        'trail_disabled_until': disabled_until,
     }
 
 
@@ -369,7 +375,7 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
 # ====== 실전형 청산 로직 ======
 def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
-    """분할매도/트레일/ATR/시간 손절을 종합 적용.
+    """분할매도/트레일/ATR/시간손절을 종합 적용.
     실행 시 매도 주문을 내리고 (reason, exec_price, result, sell_qty) 반환."""
     now = datetime.now(KST)
     try:
@@ -416,20 +422,34 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         return "TP2", exec_px, result, sell_qty
 
     # 4) 트레일링 스탑(고점대비 하락)
-    # Patch A: 진입 직후(TRAIL_GRACE_MIN) 동안에는 TRAIL 예외 또는 완화 적용
+    # 트레일이 진입 직후 과민하게 동작하지 않도록 진입 후 일정 기간 비활성화 처리
     try:
-        entry_time = datetime.fromisoformat(pos.get('entry_time')).replace(tzinfo=KST)
+        disabled_until = datetime.fromisoformat(pos.get('trail_disabled_until'))
     except Exception:
-        entry_time = now
-    entry_age_min = (now - entry_time).total_seconds() / 60.0
-    if entry_age_min >= float(TRAIL_GRACE_MIN):
-        trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
+        disabled_until = datetime.now(KST) - timedelta(minutes=1)
+
+    if now < disabled_until:
+        # 트레일 비활성 상태
+        pass
+    else:
+        # 적응형 트레일 퍼센트 계산 (ATR 기반으로 확대)
+        base_trail = float(pos.get('trail_pct', TRAIL_PCT))
+        atr = float(pos.get('atr')) if pos.get('atr') else None
+        buy_px = float(pos.get('buy_price') or 1.0)
+        dynamic_trail = base_trail
+        if atr and buy_px > 0:
+            # ATR 대비 비율을 사용해 동적 트레일을 계산
+            try:
+                atr_pct_est = (atr / buy_px) * TRAIL_ATR_MULT
+                # 제한: 0.2(20%) 이하로
+                dynamic_trail = max(base_trail, min(0.2, atr_pct_est))
+            except Exception:
+                dynamic_trail = base_trail
+
+        trail_line = float(pos['high']) * (1 - float(dynamic_trail))
         if cur <= trail_line:
             exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
             return "TRAIL", exec_px, result, qty
-    else:
-        # 진입 직후라면 TRAIL 무시(또는 완화) — 로그로 기록
-        logger.debug(f"[TRAIL-GRACE] {code} in grace period {entry_age_min:.2f}min < {TRAIL_GRACE_MIN}min -> skip TRAIL")
 
     # 5) 시간 손절 (예: 13:00까지 수익전환 없으면 청산)
     if now.time() >= TIME_STOP_TIME:
@@ -541,25 +561,6 @@ def compute_entry_target(
         k_use = float(k_month) if k_month is not None else 0.5
     baseline_k = float(k_month) if k_month is not None else 0.5
 
-    # Detailed debug log for inputs to target calculation (Patch A: 강화된 로깅)
-    try:
-        logger.debug(json.dumps({
-            "compute_entry_target": {
-                "code": code,
-                "given_target": given_target,
-                "today_open": today_open,
-                "prev_high": prev_high,
-                "prev_low": prev_low,
-                "atr20": atr20,
-                "atr60": atr60,
-                "k_month": k_month,
-                "k_use": k_use,
-                "baseline_k": baseline_k,
-            }
-        }, default=str, ensure_ascii=False))
-    except Exception:
-        pass
-
     # --- 3) API 목표가가 있을 때도 보정(delta) 적용 ---
     if given_target is not None:
         try:
@@ -572,6 +573,9 @@ def compute_entry_target(
                     "[TARGET/adjust] %s base=%s baseline_k=%.3f k_use=%.3f rng=%s -> target=%s",
                     code, base, baseline_k, k_use, rng, adjusted
                 )
+                # sanity check: 너무 작은 값 방지
+                if adjusted <= 0:
+                    raise ValueError("adjusted target <= 0")
                 return adjusted, k_use
             # 전일 범위를 못 구하면 보정 없이 그대로 사용(안전)
             tgt = int(round(base))
@@ -579,6 +583,8 @@ def compute_entry_target(
                 "[TARGET/adjust-skip] %s base=%s (no prev range) -> target=%s (k_use=%.3f)",
                 code, base, tgt, k_use
             )
+            if tgt <= 0:
+                raise ValueError("tgt <= 0")
             return tgt, k_use
         except Exception:
             logger.warning("[TARGET/adjust-fail] %s given_target=%s -> fallback compute", code, given_target)
@@ -589,23 +595,15 @@ def compute_entry_target(
         rng = max(1.0, float(prev_high) - float(prev_low))
         target = int(round(float(today_open) + float(k_use) * rng))
         logger.info("[TARGET] %s K_use=%.3f open=%s range=%s -> target=%s", code, k_use, today_open, rng, target)
-        return target, k_use
+        if target <= 0:
+            logger.warning("[TARGET] computed non-positive target -> fallback to cur-based")
+        else:
+            return target, k_use
 
     # --- 5) 백업 규칙: 현재가 기반 ---
     cur = _safe_get_price(kis, code)
     if cur is not None and cur > 0:
         target = int(round(float(cur) * (1.0 + DEFAULT_PROFIT_PCT / 100.0)))
-        # Patch A: fallback-derived target 클램프 (현재가 대비 min/max percent)
-        try:
-            min_allowed = cur * (1.0 + TARGET_CLAMP_MIN_PCT / 100.0)
-            max_allowed = cur * (1.0 + TARGET_CLAMP_MAX_PCT / 100.0)
-            clamped = max(min_allowed, min(max_allowed, float(target)))
-            if clamped != float(target):
-                logger.info("[TARGET/backup/clamp] %s cur=%s raw_target=%s -> clamped_target=%s (min_pct=%s max_pct=%s)",
-                            code, cur, target, int(round(clamped)), TARGET_CLAMP_MIN_PCT, TARGET_CLAMP_MAX_PCT)
-            target = int(round(clamped))
-        except Exception as e:
-            logger.warning(f"[TARGET/backup/clamp-fail] {code} err={e}")
         logger.info("[TARGET/backup] %s cur=%s -> target=%s (%.2f%%)", code, cur, target, DEFAULT_PROFIT_PCT)
         return target, k_use
 
@@ -662,6 +660,13 @@ def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) ->
 
 
 def main():
+    # startup trace for ensuring deployed code version
+    try:
+        mtime = os.path.getmtime(__file__)
+    except Exception:
+        mtime = 0
+    logger.info(f"[STARTUP] trader.py mtime={mtime} GITHUB_SHA={os.getenv('GITHUB_SHA')}")
+
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -672,8 +677,6 @@ def main():
     )
     logger.info(f"[💰 DAILY_CAPITAL] {DAILY_CAPITAL:,}원")
     logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
-    logger.info(f"[🕒 TRAIL_GRACE_MIN] {TRAIL_GRACE_MIN} minutes")
-    logger.info(f"[🔒 TARGET_CLAMP] min_pct={TARGET_CLAMP_MIN_PCT} max_pct={TARGET_CLAMP_MAX_PCT}")
 
     # ======== 상태 복구 ========
     holding, traded = load_state()
@@ -793,24 +796,6 @@ def main():
 
                     # --- 매수 --- (돌파 진입 + 슬리피지 가드)
                     if is_open and code not in holding and code not in traded:
-                        # Patch A: eff_target_price가 None/0/음수일 경우 진입 차단
-                        if eff_target_price is None or eff_target_price <= 0:
-                            logger.warning(f"[ENTER-SKIP/NO_TARGET] {code} eff_target_price invalid: {eff_target_price} (raw_target={raw_target_price})")
-                            # 디버그 상세정보: compute_entry_target 입력/출력 기록을 함께 남김
-                            try:
-                                logger.debug(json.dumps({
-                                    "enter_skip_no_target": {
-                                        "code": code,
-                                        "current_price": current_price,
-                                        "raw_target_price": raw_target_price,
-                                        "eff_target_price": eff_target_price,
-                                        "k_used": k_used
-                                    }
-                                }, ensure_ascii=False, default=str))
-                            except Exception:
-                                pass
-                            continue
-
                         enter_cond = (
                             current_price is not None and
                             eff_target_price is not None and
@@ -818,21 +803,46 @@ def main():
                         )
 
                         if enter_cond:
-                            # 진입 슬리피지 가드
+                            # 추가: 최근 특성 수집(디버그/결정에 도움)
+                            feats = {}
+                            try:
+                                feats = recent_features(kis, code) or {}
+                            except Exception:
+                                feats = {}
+
+                            # 진입 슬리피지 가드 (안전 버전 + 디버그 로그 + suspicious 기록 옵션)
                             guard_ok = True
                             if eff_target_price and eff_target_price > 0 and current_price is not None:
-                                slip_pct = ((float(current_price) - float(eff_target_price)) / float(eff_target_price)) * 100.0
-                                # Patch A: 극단값 보호(클램프)
-                                if slip_pct != slip_pct:  # nan guard
-                                    slip_pct = 999.0
-                                if slip_pct > 1000:
-                                    slip_pct = 1000.0
-                                if slip_pct > SLIPPAGE_ENTER_GUARD_PCT:
-                                    guard_ok = False
-                                    logger.info(
-                                        f"[ENTER-GUARD] {code} 진입슬리피지 {slip_pct:.2f}% > "
-                                        f"{SLIPPAGE_ENTER_GUARD_PCT:.2f}% → 진입 스킵"
-                                    )
+                                denom = float(eff_target_price) if float(eff_target_price) > 0 else 1.0
+                                slip_pct = ((float(current_price) - denom) / denom) * 100.0
+
+                                # 상세 디버그로그
+                                logger.info(
+                                    "[ENTER-GUARD-DEBUG] code=%s cur=%.2f target=%s slip_pct=%.2f K_used=%s given_target=%s feats=%s",
+                                    code, float(current_price), eff_target_price, slip_pct, k_used, raw_target_price, repr(feats)
+                                )
+
+                                # 이상치 판별(비정상적으로 큰 슬립 또는 타깃이 '너무 작음')
+                                if slip_pct > float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", str(SLIPPAGE_ENTER_GUARD_PCT))):
+                                    # 추가 검사: eff_target_price가 현재가의 절반 미만이면 의심
+                                    try:
+                                        if float(eff_target_price) < float(current_price) * 0.5:
+                                            logger.warning("[ENTER-GUARD-SUSPECT] %s target suspicious (target<<cur). Flagging and allowing entry for now.", code)
+                                            # 기록 남김
+                                            with open("suspicious_targets.log", "a", encoding="utf-8") as fh:
+                                                fh.write(json.dumps({
+                                                    "ts": datetime.now().isoformat(), "code": code,
+                                                    "cur": current_price, "target": eff_target_price, "k_used": k_used,
+                                                    "raw_target": raw_target_price, "features": feats
+                                                }, ensure_ascii=False) + "\n")
+                                            # 운영 판단: 의심시 스킵 대신 엔트리 허용(안정성 필요 시 변경 가능)
+                                            guard_ok = True
+                                        else:
+                                            guard_ok = False
+                                            logger.info("[ENTER-GUARD] %s 진입슬리피지 %.2f%% > %.2f%% → 진입 스킵", code, slip_pct, float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", str(SLIPPAGE_ENTER_GUARD_PCT))))
+                                    except Exception:
+                                        guard_ok = False
+                                        logger.info("[ENTER-GUARD] %s 진입슬리피지 %.2f%% -> 스킵(계산오류)", code, slip_pct)
 
                             if not guard_ok:
                                 continue
