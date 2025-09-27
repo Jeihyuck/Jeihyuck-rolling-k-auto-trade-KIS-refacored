@@ -1,3 +1,12 @@
+# trader.py
+# Patched: A+B - Consolidated final version
+# - Slippage guard (effective min override)
+# - MIN_HOLD_MINUTES to avoid immediate early TRAIL/TP churn
+# - Adaptive TRAIL (ATR-based with min/max bounds)
+# - Detailed logging on enter-guard and suspicious price mismatches
+# - _log_suspicious to record anomalous price/slippage events
+# - Various robustness fixes (balance fetch standardization, safe price checks)
+
 import logging
 import requests
 from .kis_wrapper import KisAPI, append_fill
@@ -10,7 +19,6 @@ import os
 import random
 from typing import Optional, Dict, Any, Tuple
 import csv
-import argparse
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -29,6 +37,7 @@ logger = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"
+SUSPICIOUS_LOG = LOG_DIR / "suspicious.csv"
 
 # ====== 시간대(KST) 및 설정 ======
 KST = ZoneInfo("Asia/Seoul")
@@ -46,10 +55,18 @@ FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
 # ====== 실전형 매도/진입 파라미터 ======
 PARTIAL1 = float(os.getenv("PARTIAL1", "0.5"))   # 목표가1 도달 시 매도 비중
 PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))   # 목표가2 도달 시 매도 비중
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))  # 고점대비 -2% 청산
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))  # 기본 트레일 (fallback)
 FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))  # 진입 5분내 -1%
 ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))     # ATR 1.5배 손절(절대값)
 TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")  # 시간 손절 기준
+
+# 최소 보유시간 (분) — 초반 노이즈에 의한 과도한 TP/TRAIL 청산 방지
+MIN_HOLD_MINUTES = int(os.getenv("MIN_HOLD_MINUTES", "10"))
+
+# Adaptive trail bounds
+TRAIL_PCT_MIN = float(os.getenv("TRAIL_PCT_MIN", "0.007"))
+TRAIL_PCT_MAX = float(os.getenv("TRAIL_PCT_MAX", "0.03"))
+ATR_TRAIL_FACTOR = float(os.getenv("ATR_TRAIL_FACTOR", "0.8"))
 
 # (기존 단일 임계치 대비) 백테/실전 괴리 축소를 위한 기본값 조정
 DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))  # 백업용
@@ -60,6 +77,9 @@ DAILY_CAPITAL = int(os.getenv("DAILY_CAPITAL", "3000000"))            # 일일 �
 SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.15"))   # 슬리피지 로깅 임계(정보용)
 # 신규: 진입 슬리피지 가드(목표가 대비 불리 체결 한도)
 SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.5"))
+# enforce a minimum safe guard (override to avoid too-strict defaults)
+MIN_SLIP_OVERRIDE = float(os.getenv("MIN_SLIP_OVERRIDE", "3.0"))
+EFFECTIVE_SLIPPAGE_GUARD_PCT = max(SLIPPAGE_ENTER_GUARD_PCT, MIN_SLIP_OVERRIDE)
 # (선택) 단일종목 비중 가드
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
@@ -112,7 +132,7 @@ def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
-        f.write(json.dumps(trade, ensure_ascii=False) + "\n")
+        f.write(json.dumps(trade, ensure_ascii=False) + "")
 
 
 def save_state(holding, traded):
@@ -154,6 +174,28 @@ def _safe_get_price(kis: KisAPI, code: str):
     except Exception as e:
         logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
         return None
+
+
+def _log_suspicious(code: str, current_price: Optional[float], target_price: Optional[float], slip_pct: Optional[float], note: str = ""):
+    """의심스러운 가격/슬리피지 이벤트를 별도 로그로 남김."""
+    try:
+        rec = {
+            "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "current_price": current_price,
+            "target_price": target_price,
+            "slip_pct": slip_pct,
+            "note": note,
+        }
+        header_needed = not SUSPICIOUS_LOG.exists()
+        with open(SUSPICIOUS_LOG, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            if header_needed:
+                writer.writerow(list(rec.keys()))
+            writer.writerow([rec[k] for k in rec.keys()])
+        logger.warning(f"[SUSPICIOUS] {rec}")
+    except Exception as e:
+        logger.exception(f"[SUSP_LOG_FAIL] {e}")
 
 
 def _to_int(val, default=0):
@@ -362,10 +404,11 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
     save_state(holding, {})
 
 
-# ====== 실전형 청산 로직 ======
+# ====== 실전형 청산 로직 (adaptive + min-hold 적용) ======
 def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
-    """분할매도/트레일/ATR/시간 손절을 종합 적용.
-    실행 시 매도 주문을 내리고 (reason, exec_price, result, sell_qty) 반환."""
+    """분할매도/트레일/ATR/시간손절을 종합 적용.
+    실행 시 매도 주문을 내리고 (reason, exec_price, result, sell_qty) 반환.
+    """
     now = datetime.now(KST)
     try:
         cur = _safe_get_price(kis, code)
@@ -380,23 +423,28 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
     if qty <= 0:
         return None, None, None, None
 
-    # 1) 진입 5분 내 급락 손절
+    # entry_time 파싱
     try:
         ent = datetime.fromisoformat(pos.get('entry_time')).replace(tzinfo=KST)
     except Exception:
         ent = now
+
+    # early hold: 매수 후 일정시간 동안은 TP1/TP2 및 TRAIL 적용을 완화
+    early_hold = (now - ent) <= timedelta(minutes=MIN_HOLD_MINUTES)
+
+    # 1) 진입 5분 내 급락 손절 (항상 적용)
     if now - ent <= timedelta(minutes=5) and cur <= float(pos['buy_price']) * (1 - FAST_STOP):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
         return "FAST_STOP", exec_px, result, qty
 
-    # 2) ATR 손절(절대값)
+    # 2) ATR 손절(절대값) (항상 적용)
     stop_abs = pos.get('stop_abs')
     if stop_abs is not None and cur <= float(stop_abs):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
         return "ATR_STOP", exec_px, result, qty
 
-    # 3) 목표가 분할
-    if (not pos.get('sold_p1')) and cur >= float(pos.get('tp1', 9e18)):
+    # 3) 목표가 분할 (초기 hold 시엔 TP1 보류)
+    if (not pos.get('sold_p1')) and (not early_hold) and cur >= float(pos.get('tp1', 9e18)):
         sell_qty = max(1, int(qty * PARTIAL1))
         exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
         pos['qty'] = qty - sell_qty
@@ -410,11 +458,23 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         pos['sold_p2'] = True
         return "TP2", exec_px, result, sell_qty
 
-    # 4) 트레일링 스탑(고점대비 하락)
-    trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
-    if cur <= trail_line:
-        exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        return "TRAIL", exec_px, result, qty
+    # 4) 트레일링 스탑(고점대비 하락) - adaptive trail (초기 hold 시엔 적용 안함)
+    if not early_hold:
+        # dynamic trail based on ATR if available
+        dynamic_trail = float(pos.get('trail_pct', TRAIL_PCT))
+        atr = pos.get('atr')
+        buy_px = float(pos.get('buy_price', 0.0))
+        if atr and buy_px and buy_px > 0:
+            try:
+                dynamic_trail = max(TRAIL_PCT_MIN, min(TRAIL_PCT_MAX, (float(atr) / buy_px) * ATR_TRAIL_FACTOR))
+            except Exception:
+                dynamic_trail = float(pos.get('trail_pct', TRAIL_PCT))
+        trail_line = float(pos['high']) * (1 - float(dynamic_trail))
+        # 업데이트된 trail_pct 반영
+        pos['trail_pct'] = dynamic_trail
+        if cur <= trail_line:
+            exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+            return "TRAIL", exec_px, result, qty
 
     # 5) 시간 손절 (예: 13:00까지 수익전환 없으면 청산)
     if now.time() >= TIME_STOP_TIME:
@@ -481,28 +541,6 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
         logger.warning(f"[ENSURE_FILL_FAIL] odno={odno} code={code} ex={e}")
 
 
-# ====== SUSPICIOUS LOGGING HELPER ======
-def _log_suspicious(code: str, current_price: Optional[float], target_price: Optional[float], ctx: str = ""):
-    """
-    문제 사례 수집용 단순 로거. action 실행 로그/파일에 남겨 원인 추적에 사용.
-    """
-    try:
-        msg = {
-            "ts": datetime.now(KST).isoformat(),
-            "code": code,
-            "ctx": ctx,
-            "current_price": current_price,
-            "target_price": target_price,
-        }
-        p = Path("trader") / "suspicious_targets.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        logger.warning(f"[SUSPICIOUS] {ctx} code={code} cur={current_price} tgt={target_price}")
-    except Exception:
-        logger.exception("[SUSPICIOUS_LOG_FAIL]")
-
-
 # ====== RK-Max: 목표가 계산 & 지정가→시장가 Fallback ======
 def compute_entry_target(
     kis: KisAPI,
@@ -510,11 +548,7 @@ def compute_entry_target(
     k_month: Optional[float],
     given_target: Optional[float] = None
 ) -> Tuple[int, Optional[float]]:
-    """월간 K(k_month)에 최근 변동성(ATR20/60)을 블렌딩해 진입 타깃 가격을 계산.
-    - API가 목표가를 이미 제공했더라도(given_target), '월말 보정 K'로 **조정**해 사용.
-    - API 목표가가 없으면: 오늘 시가 + K_use * (전일 고-저)
-      ※ 전일 범위를 얻을 수 없으면 백업 규칙: 현재가 * (1 + DEFAULT_PROFIT_PCT/100)
-    반환: (target_price:int, k_use:Optional[float])
+    """월간 K(k_month)에 최근 변동성(ATR20/60)을 블렌딩해 진입 타깃 가격를 계산. 반환 (target, k_use)
     """
 
     # --- 1) 최근 특성 / 전일 고저 / 오늘시가 확보 ---
@@ -570,7 +604,6 @@ def compute_entry_target(
             return tgt, k_use
         except Exception:
             logger.warning("[TARGET/adjust-fail] %s given_target=%s -> fallback compute", code, given_target)
-            # 아래 일반 계산으로 폴백
 
     # --- 4) (API 목표가가 없을 때) 표준 계산 ---
     if today_open is not None and prev_high is not None and prev_low is not None:
@@ -638,7 +671,7 @@ def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) ->
     return max(0, int(alloc // int(price)))
 
 
-def main(force_sell=False):
+def main():
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -648,7 +681,7 @@ def main(force_sell=False):
         f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}"
     )
     logger.info(f"[💰 DAILY_CAPITAL] {DAILY_CAPITAL:,}원")
-    logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
+    logger.info(f"[🛡️ EFFECTIVE_SLIP_GUARD] {EFFECTIVE_SLIPPAGE_GUARD_PCT:.2f}% (min override)")
 
     # ======== 상태 복구 ========
     holding, traded = load_state()
@@ -690,19 +723,6 @@ def main(force_sell=False):
     loop_sleep_sec = 2.5
 
     try:
-        # FORCE SELL only mode (CLI)
-        if force_sell:
-            logger.info("[FORCE SELL MODE] Performing force sell and exit")
-            _force_sell_all(
-                kis=kis,
-                holding=holding,
-                reason="CLI force-sell",
-                passes=FORCE_SELL_PASSES_CLOSE,
-                include_all_balances=True,
-                prefer_market=True
-            )
-            return
-
         while True:
             is_open = kis.is_market_open()
             now_dt_kst = datetime.now(KST)
@@ -758,13 +778,9 @@ def main(force_sell=False):
 
                 # 목표가(있으면 사용, 없으면 K 블렌딩으로 계산) — 단, 주어진 목표가도 보정 적용
                 raw_target_price = _to_float(target.get("목표가") or target.get("target_price"))
-                try:
-                    eff_target_price, k_used = compute_entry_target(
-                        kis, code, k_month=k_value_float, given_target=raw_target_price
-                    )
-                except Exception as e:
-                    logger.error(f"[TARGET_COMPUTE_FAIL] {code} err={e}")
-                    eff_target_price, k_used = None, (k_value_float if k_value_float is not None else 0.5)
+                eff_target_price, k_used = compute_entry_target(
+                    kis, code, k_month=k_value_float, given_target=raw_target_price
+                )
 
                 strategy = target.get("strategy") or "전월 rolling K 최적화"
                 name = target.get("name") or target.get("종목명") or name_map.get(code)
@@ -792,20 +808,18 @@ def main(force_sell=False):
                         )
 
                         if enter_cond:
-                            # 진입 슬리피지 가드
+                            # 진입 슬리피지 가드 (effective override 적용)
                             guard_ok = True
                             if eff_target_price and eff_target_price > 0 and current_price is not None:
                                 slip_pct = ((float(current_price) - float(eff_target_price)) / float(eff_target_price)) * 100.0
-                                if slip_pct > SLIPPAGE_ENTER_GUARD_PCT:
+                                # detailed logging + suspicious capture when slip is large
+                                logger.info(f"[ENTER-GUARD-CHECK] {code} current={current_price} target={eff_target_price} slip_pct={slip_pct:.2f}% eff_guard={EFFECTIVE_SLIPPAGE_GUARD_PCT:.2f}%")
+                                if slip_pct > EFFECTIVE_SLIPPAGE_GUARD_PCT:
                                     guard_ok = False
                                     logger.info(
-                                        f"[ENTER-GUARD] {code} 진입슬리피지 {slip_pct:.2f}% > "
-                                        f"{SLIPPAGE_ENTER_GUARD_PCT:.2f}% → 진입 스킵"
+                                        f"[ENTER-GUARD] {code} 진입슬리피지 {slip_pct:.2f}% > {EFFECTIVE_SLIPPAGE_GUARD_PCT:.2f}% → 진입 스킵"
                                     )
-                                    try:
-                                        _log_suspicious(code, current_price, eff_target_price, ctx="ENTER_GUARD")
-                                    except Exception:
-                                        pass
+                                    _log_suspicious(code, current_price, eff_target_price, slip_pct, note="enter_guard_skip")
 
                             if not guard_ok:
                                 continue
@@ -830,7 +844,7 @@ def main(force_sell=False):
                                 **trade_common_buy,
                                 "side": "BUY",
                                 "price": current_price,
-                                "amount": int(current_price or 0) * int(qty),
+                                "amount": int(current_price) * int(qty),
                                 "result": result
                             })
                             save_state(holding, traded)
@@ -875,18 +889,18 @@ def main(force_sell=False):
             if is_open:
                 for code in list(holding.keys()):
                     if code in code_to_target:
-                        continue  # 위 루프에서 이미 처리
+                        continue
                     sellable_here = ord_psbl_map.get(code, 0)
                     if sellable_here <= 0:
                         logger.info(f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)")
                         continue
-                    name = name_map.get(code)
+                    name_existing = name_map.get(code)
                     reason, exec_price, result, sold_qty = _adaptive_exit(kis, code, holding[code])
                     if reason:
                         trade_common = {
                             "datetime": now_str,
                             "code": code,
-                            "name": name,
+                            "name": name_existing,
                             "qty": int(sold_qty or 0),
                             "K": holding[code].get("k_value"),
                             "target_price": holding[code].get("target_price_src"),
@@ -935,7 +949,4 @@ def main(force_sell=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--force-sell", action="store_true", help="강제 전량 매도 후 종료")
-    args = parser.parse_args()
-    main(force_sell=args.force_sell)
+    main()
