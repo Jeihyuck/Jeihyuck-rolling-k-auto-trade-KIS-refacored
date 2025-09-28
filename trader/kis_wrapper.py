@@ -42,11 +42,13 @@ if not logger.handlers:
 # 유틸
 # =========================
 
+
 def safe_strip(val):
     if val is None:
         return ""
     if isinstance(val, str):
-        return val.replace("", "").replace("", "").strip()
+        # 올바른 이스케이프 처리: \n, \r 제거 후 strip
+        return val.replace("\n", "").replace("\r", "").strip()
     return str(val).strip()
 
 

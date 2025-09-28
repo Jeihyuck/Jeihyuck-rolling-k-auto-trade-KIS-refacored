@@ -131,8 +131,9 @@ def fetch_rebalancing_targets(date):
 def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
+    # append newline to make file valid JSON-lines
     with open(logfile, "a", encoding="utf-8") as f:
-        f.write(json.dumps(trade, ensure_ascii=False) + "")
+        f.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
 
 def save_state(holding, traded):
