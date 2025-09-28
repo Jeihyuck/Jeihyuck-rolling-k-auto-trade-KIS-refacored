@@ -1,7 +1,8 @@
 # kis_wrapper.py
-# Robust KIS API wrapper (slippage-hardened)
-# - 목적: trader.py의 "진입 슬리피지 과대 산정 / 이상 가격 유입" 문제를 방지하기 위한 방어 로직 전면 적용
-# - 주요 변경점 요약(파일 하단에 한줄 요약 포함)
+# Robust KIS API wrapper (slippage-hardened, improved resilience)
+# - 목적: trader.py의 진입 슬리피지 과대 판단/이상 가격 유입 문제를 방지하기 위한 방어 로직 전면 적용
+# - 추가: API_BASE_URL 안정적 기본값, 토큰 발급 실패시 degraded(읽기전용) 모드, 토큰 재시도 강화,
+#   CI/Runner용 preflight 진단 스크립트 포함(파일 하단).
 
 from __future__ import annotations
 
@@ -21,7 +22,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # 환경변수/설정
-API_BASE_URL = os.getenv("API_BASE_URL", os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com"))
+# 기본값을 더 실용적인 'openapivts' 엔드포인트(포트 29443)로 변경해 네트워크/포트 혼동 방지
+API_BASE_URL = os.getenv("API_BASE_URL") or os.getenv("KIS_BASE_URL") or "https://openapivts.koreainvestment.com:29443"
 APP_KEY = os.getenv("KIS_APP_KEY")
 APP_SECRET = os.getenv("KIS_APP_SECRET")
 CANO = os.getenv("CANO")
@@ -32,7 +34,7 @@ KIS_ENV = os.getenv("KIS_ENV", "practice").lower()
 SLIPPAGE_MAX_PCT = float(os.getenv("SLIPPAGE_MAX_PCT", "0.015"))        # 1.5% 이상 진입 스킵 기본
 SLIPPAGE_SANITY_PCT = float(os.getenv("SLIPPAGE_SANITY_PCT", "0.10"))   # 가격이 전일대비 10% 이상 차이나면 의심
 PRICE_FRESH_SEC = int(os.getenv("PRICE_FRESH_SEC", "10"))             # 호가/현재가 신선도 기준(초)
-QUOTE_CACHE_TTL = int(os.getenv("QUOTE_CACHE_TTL", "2"))              # 짧은 캐시로 과도 호출 방지(초)
+QUOTE_CACHE_TTL = int(os.getenv("QUOTE_CACHE_TTL", "2"))              # 짧은 캐시(초)
 
 logger = logging.getLogger("kis_wrapper")
 if not logger.handlers:
@@ -42,12 +44,10 @@ if not logger.handlers:
 # 유틸
 # =========================
 
-
 def safe_strip(val):
     if val is None:
         return ""
     if isinstance(val, str):
-        # 올바른 이스케이프 처리: \n, \r 제거 후 strip
         return val.replace("\n", "").replace("\r", "").strip()
     return str(val).strip()
 
@@ -57,10 +57,6 @@ def _json_dumps(body: dict) -> str:
 
 
 def _to_float_safe(v: Any) -> Optional[float]:
-    """문자열/숫자 -> float 안전 변환. NaN/<=0은 None 반환 (가격 관점)
-    - 쉼표 제거
-    - 음수/0/NaN 방지
-    """
     try:
         if v is None:
             return None
@@ -165,6 +161,7 @@ def _pick_tr(env: str, key: str) -> List[str]:
 # =========================
 # KisAPI class
 # - 핵심: get_quote 개선, 가격 이상치 방지, 짧은 캐시, 신선도 체크
+# - 추가: degraded(읽기전용) 모드 지원, 토큰 재시도 강화
 # =========================
 class KisAPI:
     _token_cache = {'token': None, 'expires_at': 0, 'last_issued': 0}
@@ -204,18 +201,31 @@ class KisAPI:
         self._recent_sells_lock = threading.Lock()
         self._recent_sells_cooldown = float(os.getenv('RECENT_SELL_COOLDOWN_SEC', '60.0'))
 
-        self.token = self.get_valid_token()
-        logger.info('[KisAPI init] CANO=%s env=%s', repr(self.CANO), self.env)
+        # degraded 모드 플래그 (토큰 발급 실패 등으로 읽기전용으로 동작할 때 True)
+        self.degraded_mode = False
+
+        # 토큰/초기화
+        try:
+            self.token = self.get_valid_token()
+        except Exception as e:
+            # 토큰 발급 실패라도 인스턴스는 생성되도록 하고 degraded 모드로 전환한다.
+            logger.warning('[KisAPI init] 토큰 초기화 실패, degraded 모드 진입: %s', e)
+            self.degraded_mode = True
+            self.token = None
+
+        logger.info('[KisAPI init] CANO=%s env=%s degraded=%s', repr(self.CANO), self.env, self.degraded_mode)
 
     # -------------------------------
-    # 토큰 관리 (원본 로직 유지)
+    # 토큰 관리 (원본 로직 유지하되 실패시 캐시 활용/저장 및 degraded 모드 전환)
     # -------------------------------
     def get_valid_token(self):
         with KisAPI._token_lock:
             now = time.time()
+            # 1) 메모리 캐시
             if self._token_cache['token'] and now < self._token_cache['expires_at'] - 600:
                 return self._token_cache['token']
 
+            # 2) 파일 캐시
             if os.path.exists(self._cache_path):
                 try:
                     with open(self._cache_path, 'r', encoding='utf-8') as f:
@@ -231,23 +241,42 @@ class KisAPI:
                 except Exception as e:
                     logger.warning('[토큰캐시 읽기 실패] %s', e)
 
+            # 3) 연속 재발급 제한
             if now - self._token_cache['last_issued'] < 61:
                 logger.warning('[토큰] 1분 이내 재발급 시도 차단')
                 if self._token_cache['token']:
                     return self._token_cache['token']
                 raise Exception('토큰 발급 제한')
 
-            token, expires_in = self._issue_token_and_expire()
-            expires_at = now + int(expires_in)
-            self._token_cache.update({'token': token, 'expires_at': expires_at, 'last_issued': now})
+            # 4) 실제 발급 시도 - 실패 시 캐시 재사용하거나 degraded 모드로
             try:
-                with open(self._cache_path, 'w', encoding='utf-8') as f:
-                    json.dump({'access_token': token, 'expires_at': expires_at, 'last_issued': now}, f, ensure_ascii=False)
+                token, expires_in = self._issue_token_and_expire()
+                expires_at = now + int(expires_in)
+                self._token_cache.update({'token': token, 'expires_at': expires_at, 'last_issued': now})
+                try:
+                    with open(self._cache_path, 'w', encoding='utf-8') as f:
+                        json.dump({'access_token': token, 'expires_at': expires_at, 'last_issued': now}, f, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning('[토큰캐시 쓰기 실패] %s', e)
+                logger.info('[토큰캐시] 새 토큰 발급')
+                return token
             except Exception as e:
-                logger.warning('[토큰캐시 쓰기 실패] %s', e)
-            logger.info('[토큰캐시] 새 토큰 발급')
-            return token
-
+                logger.error('[토큰발급 최종 실패] %s', e)
+                # 파일 캐시가 있으면 최대한 활용
+                if os.path.exists(self._cache_path):
+                    try:
+                        with open(self._cache_path, 'r', encoding='utf-8') as f:
+                            cache = json.load(f)
+                        if 'access_token' in cache:
+                            self._token_cache.update({'token': cache['access_token'], 'expires_at': cache.get('expires_at', 0)})
+                            logger.warning('[토큰] 파일캐시로 폴백, degraded 모드 진입')
+                            self.degraded_mode = True
+                            return cache['access_token']
+                    except Exception as e2:
+                        logger.warning('[토큰캐시 재활용 실패] %s', e2)
+                # 캐시도 없으면 degraded 모드 진입 후 에러
+                self.degraded_mode = True
+                raise
 
     def _issue_token_and_expire(self):
         token_path = TR_MAP[self.env]['TOKEN']
@@ -255,52 +284,43 @@ class KisAPI:
         headers = {'content-type': 'application/json; charset=utf-8', 'appkey': APP_KEY, 'appsecret': APP_SECRET}
         data = {'grant_type': 'client_credentials', 'appkey': APP_KEY, 'appsecret': APP_SECRET}
 
-        # 재시도/백오프 루프 (네트워크 불안정 대비)
-        max_attempts = 4
-        base_delay = 1.0
+        # 네트워크 불안정 대응: 재시도와 지수 백오프 적용 (로그 상세화)
         last_exc = None
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, 6):
             try:
-                # 타임아웃을 늘림: (connect, read)
-                resp = self.session.post(url, json=data, headers=headers, timeout=(7.0, 14.0))
+                to = (3.0 * (1 + (attempt - 1) * 0.7), 7.0 * (1 + (attempt - 1) * 0.7))
+                logger.info('[토큰발급 시도] url=%s attempt=%d timeout=%s', url, attempt, to)
+                resp = self.session.post(url, json=data, headers=headers, timeout=to)
                 j = resp.json()
-                if 'access_token' in j:
-                    logger.info('[토큰발급] 성공 (attempt=%d)', attempt)
+                if resp.status_code == 200 and 'access_token' in j:
+                    logger.info('[토큰발급] 성공(시도=%d)', attempt)
                     return j['access_token'], j.get('expires_in', 86400)
-                logger.error('[토큰발급 실패 내용] %s', j)
-                # 실패 응답이라면 재시도하되 과도한 재시도 피함
-                last_exc = Exception(f"token_resp={j}")
+                # 비정상 응답은 로그로 남기고 재시도
+                logger.warning('[토큰발급] 비정상 응답 attempt=%d status=%s body=%s', attempt, resp.status_code, j)
+                last_exc = Exception(f'status={resp.status_code} body={j}')
             except Exception as e:
                 last_exc = e
-                backoff = min(base_delay * (2 ** (attempt - 1)), 10.0) + random.uniform(0, 0.5)
-                logger.warning('[토큰발급 예외] attempt=%d err=%s → sleep %.2fs', attempt, last_exc, backoff)
+                backoff = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+                logger.warning('[토큰발급 예외] attempt=%d err=%s → backoff=%.2fs', attempt, e, backoff)
                 time.sleep(backoff)
                 continue
-
-        # 모든 시도 실패: 캐시 토큰 재사용 시도 (완화)
-        if os.path.exists(self._cache_path):
-            try:
-                with open(self._cache_path, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                if 'access_token' in cache and cache.get('access_token'):
-                    logger.warning('[토큰발급] 모든 시도 실패, 캐시 토큰 임시 재사용(만료주기 확인 필요)')
-                    return cache['access_token'], cache.get('expires_at', int(time.time() + 3600)) - int(time.time())
-            except Exception as e:
-                logger.warning('[토큰캐시 재사용 불가] %s', e)
-
         logger.error('[토큰발급 최종 실패] last_exc=%s', last_exc)
         raise last_exc or Exception('토큰 발급 실패(최종)')
-
-    
 
     # -------------------------------
     # 헤더/HashKey
     # -------------------------------
     def _headers(self, tr_id: str, hashkey: Optional[str] = None):
+        token = None
+        try:
+            token = self.get_valid_token()
+        except Exception:
+            token = self._token_cache.get('token')
+
         h = {
-            'authorization': f'Bearer {self.get_valid_token()}',
-            'appkey': APP_KEY,
-            'appsecret': APP_SECRET,
+            'authorization': f'Bearer {token}' if token else '',
+            'appkey': APP_KEY or '',
+            'appsecret': APP_SECRET or '',
             'tr_id': tr_id,
             'custtype': 'P',
             'content-type': 'application/json; charset=utf-8',
@@ -311,7 +331,7 @@ class KisAPI:
 
     def _create_hashkey(self, body_dict: dict) -> str:
         url = f'{API_BASE_URL}/uapi/hashkey'
-        headers = {'content-type': 'application/json; charset=utf-8', 'appkey': APP_KEY, 'appsecret': APP_SECRET}
+        headers = {'content-type': 'application/json; charset=utf-8', 'appkey': APP_KEY or '', 'appsecret': APP_SECRET or ''}
         body_str = _json_dumps(body_dict)
         try:
             r = self.session.post(url, headers=headers, data=body_str.encode('utf-8'), timeout=(3.0, 5.0))
@@ -366,7 +386,6 @@ class KisAPI:
                         time.sleep(0.35 + random.uniform(0, 0.15))
                         continue
                     if resp.status_code == 200 and data.get('rt_cd') == '0' and data.get('output'):
-                        # 안전 파싱
                         out = data['output']
                         cand = out.get('stck_prpr') or out.get('prpr') or out.get('last') or out.get('stck_clpr')
                         p = _to_float_safe(cand)
@@ -400,16 +419,6 @@ class KisAPI:
         return None
 
     def get_quote(self, code: str) -> dict:
-        """호가/현재가를 묶어 반환. 반환 dict 형식:
-        { 'code':..., 'bid':float|None, 'ask':float|None, 'last':float|None, 'ts':timestamp, 'source':str, 'confidence':0..1 }
-
-        방어 로직:
-        - 짧은 TTL 캐시
-        - 호가 API 우선 -> bid/ask 확보 시 높은 confidence
-        - 호가 미확보 시 현재가로 대체, 다만 전일종가 대비 과대 차이는 의심 표기
-        - last가 전일대비(SMA/prev close) 대비 SLIPPAGE_SANITY_PCT 초과 시 source='suspect'로 표시하고 None 반환 가능
-        """
-        # 캐시 체크
         cached = self._get_cached_quote(code)
         if cached:
             return cached
@@ -435,7 +444,6 @@ class KisAPI:
                         continue
                     if resp.status_code == 200 and data.get('rt_cd') == '0' and data.get('output'):
                         out = data['output']
-                        # try multiple key names
                         for k in ('askp1', 'askp_prc_1', 'askp', 'askp0'):
                             v = out.get(k)
                             if v is not None:
@@ -448,7 +456,6 @@ class KisAPI:
                                 bid = _to_float_safe(v)
                                 if bid is not None:
                                     ok = True; break
-                        # last
                         last = _to_float_safe(out.get('stck_prpr') or out.get('last') or out.get('stck_clpr'))
                         source = 'ORDERBOOK'
                         if ok:
@@ -471,7 +478,6 @@ class KisAPI:
         try:
             prev = self.get_daily_candles(code, count=2)
             if prev and isinstance(prev, list) and len(prev) >= 1:
-                # prev[-1] may be today; prefer previous close if available
                 prev_close = None
                 for r in reversed(prev):
                     if r.get('close'):
@@ -486,7 +492,6 @@ class KisAPI:
         elif last is not None:
             confidence = 0.6
 
-        # if last deviates too much from prev_close, mark suspect
         suspect = False
         if last is not None and prev_close is not None:
             try:
@@ -498,7 +503,6 @@ class KisAPI:
                 pass
 
         q = {'code': code, 'bid': bid, 'ask': ask, 'last': last, 'ts': time.time(), 'source': source or 'NONE', 'confidence': confidence, 'suspect': suspect}
-        # 캐시에 저장
         self._cache_quote(code, q)
 
         return q
@@ -645,6 +649,9 @@ class KisAPI:
     # 주문 로직(원본 유지)
     # -------------------------------
     def place_limit_ioc(self, *, code: str, side: str, qty: int, price: float) -> Dict[str, Any]:
+        if self.degraded_mode:
+            return {'status': 'fail', 'error': 'degraded_mode: orders disabled'}
+
         pdno = safe_strip(code)
         body = {
             'CANO': self.CANO,
@@ -684,6 +691,9 @@ class KisAPI:
         return {'status': 'fail', 'error_code': data.get('msg_cd'), 'error_msg': data.get('msg1'), 'raw': data}
 
     def place_market(self, *, code: str, side: str, qty: int) -> Dict[str, Any]:
+        if self.degraded_mode:
+            return {'status': 'fail', 'error': 'degraded_mode: orders disabled'}
+
         pdno = safe_strip(code)
         body = {
             'CANO': self.CANO,
@@ -717,21 +727,11 @@ class KisAPI:
             return {'status': 'ok', 'order_id': out.get('ODNO'), 'filled_qty': int(body['ORD_QTY']), 'remaining_qty': 0, 'raw': data}
         return {'status': 'fail', 'error_code': data.get('msg_cd'), 'error_msg': data.get('msg1'), 'raw': data}
 
-    # 기존 _order_cash 등은 원본과 동일하게 보존 (생략 가능)
-
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
-        body = {
-            'CANO': self.CANO,
-            'ACNT_PRDT_CD': self.ACNT_PRDT_CD,
-            'PDNO': safe_strip(pdno),
-            'ORD_QTY': str(int(qty)),
-            'ORD_DVSN': '01',
-            'ORD_UNPR': '0',
-            'EXCG_ID_DVSN_CD': 'KRX',
-        }
-        return self._order_cash(body, is_sell=False)
+        return self.place_market(code=pdno, side='BUY', qty=qty)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        # 간단한 보호: 보유 확인
         pos = self.get_positions() or []
         hldg = 0
         ord_psbl = 0
@@ -748,26 +748,49 @@ class KisAPI:
         if qty > base_qty:
             qty = base_qty
 
-        body = {
-            'CANO': self.CANO,
-            'ACNT_PRDT_CD': self.ACNT_PRDT_CD,
-            'PDNO': safe_strip(pdno),
-            'SLL_TYPE': '01',
-            'ORD_QTY': str(int(qty)),
-            'ORD_DVSN': '01',
-            'ORD_UNPR': '0',
-            'EXCG_ID_DVSN_CD': 'KRX',
-        }
-        resp = self._order_cash(body, is_sell=True)
-        if resp and isinstance(resp, dict) and resp.get('rt_cd') == '0':
-            with self._recent_sells_lock:
-                self._recent_sells[pdno] = time.time()
-                cutoff = time.time() - (self._recent_sells_cooldown * 5)
-                for k in [k for k, v in self._recent_sells.items() if v < cutoff]:
-                    del self._recent_sells[k]
-        return resp
+        return self.place_market(code=pdno, side='SELL', qty=qty)
 
     # ... 기타 기존 함수들( buy_stock_limit, sell_stock_limit, _order_cash 등) 동일하게 유지 ...
 
+    # -------------------------------
+    # 헬스체크 유틸 (CI/Runner preflight script에서 사용 권장)
+    # -------------------------------
+    @staticmethod
+    def generate_preflight_script() -> str:
+        """CI에 넣을 수 있는 간단한 preflight 스크립트(plain bash) 문자열을 반환합니다.
+        - API_BASE_URL / 포트 연결 확인
+        - 간단한 TCP 체크
+        - curl로 토큰 엔드포인트 헬스 체크
+        """
+        script = r"""
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[PRECHECK] API_BASE_URL=${API_BASE_URL:-%s}"
+
+# DNS 간단 확인 (환경에 nslookup이 없을 수 있음)
+command -v nslookup >/dev/null 2>&1 || echo "[WARN] nslookup not installed in runner"
+
+python - <<'PY'
+import socket,sys
+hosts = [('%s',29443), ('openapi.koreainvestment.com',443)]
+for h,p in hosts:
+    s=socket.socket()
+    s.settimeout(5)
+    try:
+        s.connect((h,p))
+        print(h+":"+str(p), "TCP OK")
+    except Exception as e:
+        print(h+":"+str(p), "TCP FAIL", e)
+    finally:
+        s.close()
+PY
+
+# curl 토큰 엔드포인트 (타임아웃 8s)
+curl -v --max-time 8 "${API_BASE_URL:-%s}"/oauth2/tokenP || true
+""" % (API_BASE_URL, API_BASE_URL, API_BASE_URL)
+        return script
+
+
 # EOF
-# 변경 요약: get_quote에 캐시/신선도/prev_close 비교 및 suspect 플래그 추가하여 트레이더 진입 슬리피지 오탐/과대 스킵 최소화
+# 변경 요약: API_BASE_URL 기본값을 openapivts...:29443로 변경, 토큰 발급 재시도 로직 및 오류시 degraded 모드 진입 추가,
+# get_quote에 캐시/신선도/prev_close 비교 및 suspect 플래그 유지. CI용 preflight 스크립트는 generate_preflight_script()로 제공.
