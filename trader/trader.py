@@ -132,8 +132,7 @@ def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
-        f.write(json.dumps(trade, ensure_ascii=False) + "
-")
+        f.write(json.dumps(trade, ensure_ascii=False) + "")
 
 
 def save_state(holding, traded):
