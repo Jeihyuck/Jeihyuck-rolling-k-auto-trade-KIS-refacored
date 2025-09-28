@@ -248,22 +248,50 @@ class KisAPI:
             logger.info('[토큰캐시] 새 토큰 발급')
             return token
 
+
     def _issue_token_and_expire(self):
         token_path = TR_MAP[self.env]['TOKEN']
         url = f'{API_BASE_URL}{token_path}'
         headers = {'content-type': 'application/json; charset=utf-8', 'appkey': APP_KEY, 'appsecret': APP_SECRET}
         data = {'grant_type': 'client_credentials', 'appkey': APP_KEY, 'appsecret': APP_SECRET}
-        try:
-            resp = self.session.post(url, json=data, headers=headers, timeout=(3.0, 7.0))
-            j = resp.json()
-        except Exception as e:
-            logger.error('[토큰발급 예외] %s', e)
-            raise
-        if 'access_token' in j:
-            logger.info('[토큰발급] 성공')
-            return j['access_token'], j.get('expires_in', 86400)
-        logger.error('[토큰발급 실패] %s', j.get('error_description', j))
-        raise Exception('토큰 발급 실패')
+
+        # 재시도/백오프 루프 (네트워크 불안정 대비)
+        max_attempts = 4
+        base_delay = 1.0
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 타임아웃을 늘림: (connect, read)
+                resp = self.session.post(url, json=data, headers=headers, timeout=(7.0, 14.0))
+                j = resp.json()
+                if 'access_token' in j:
+                    logger.info('[토큰발급] 성공 (attempt=%d)', attempt)
+                    return j['access_token'], j.get('expires_in', 86400)
+                logger.error('[토큰발급 실패 내용] %s', j)
+                # 실패 응답이라면 재시도하되 과도한 재시도 피함
+                last_exc = Exception(f"token_resp={j}")
+            except Exception as e:
+                last_exc = e
+                backoff = min(base_delay * (2 ** (attempt - 1)), 10.0) + random.uniform(0, 0.5)
+                logger.warning('[토큰발급 예외] attempt=%d err=%s → sleep %.2fs', attempt, last_exc, backoff)
+                time.sleep(backoff)
+                continue
+
+        # 모든 시도 실패: 캐시 토큰 재사용 시도 (완화)
+        if os.path.exists(self._cache_path):
+            try:
+                with open(self._cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                if 'access_token' in cache and cache.get('access_token'):
+                    logger.warning('[토큰발급] 모든 시도 실패, 캐시 토큰 임시 재사용(만료주기 확인 필요)')
+                    return cache['access_token'], cache.get('expires_at', int(time.time() + 3600)) - int(time.time())
+            except Exception as e:
+                logger.warning('[토큰캐시 재사용 불가] %s', e)
+
+        logger.error('[토큰발급 최종 실패] last_exc=%s', last_exc)
+        raise last_exc or Exception('토큰 발급 실패(최종)')
+
+    
 
     # -------------------------------
     # 헤더/HashKey
