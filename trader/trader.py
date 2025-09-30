@@ -1,55 +1,53 @@
-# trader.py
-# Signals-only 변경: rebalance_api로부터 'signals' (stock_code, best_k, base_close/base_high/base_low 등)
-# 를 받아오고, trader가 매일(장 개시 직전) 최신 전일 OHLC로 목표가를 계산하여 매수/수량 결정을 수행합니다.
-
 import logging
 import requests
 from .kis_wrapper import KisAPI
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import json
 from pathlib import Path
 import time
 import os
 import random
+from typing import Any, Dict, List, Optional
 
-# (외부 의존) FinanceDataReader는 폴백으로 사용
-try:
-    from FinanceDataReader import DataReader
-except Exception:
-    DataReader = None
-
-# 기본 로깅
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 파일/상태
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"
 
-# 시간대(KST)
+# ====== 시간대(KST) 및 설정 ======
 KST = ZoneInfo("Asia/Seoul")
 
-# 환경변수 / 운영 파라미터
+# 장중 강제 전량매도 커트오프 (KST 기준)
 SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "11:15").strip()
+
+# 커트오프/장마감 시 보유 전 종목(계좌 잔고 전체) 포함 여부 (기본 True)
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
+
+# API 호출 간 최소 휴지시간(초)
 RATE_SLEEP_SEC = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
+
+# 커트오프/장마감 매도 시 패스(회차) 수
 FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "3"))
 FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "5"))
 
-# 자금/포지션 관련
-TOTAL_CAPITAL = int(os.getenv("TOTAL_CAPITAL", "10000000"))
-DAILY_CAPITAL = int(os.getenv("DAILY_CAPITAL", str(TOTAL_CAPITAL)))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "8"))
-CAPITAL_PER_SYMBOL = int(os.getenv("CAPITAL_PER_SYMBOL", str(max(1, DAILY_CAPITAL // MAX_POSITIONS))))
-MIN_QTY_PER_TICKET = int(os.getenv("MIN_QTY_PER_TICKET", "1"))
+# Rebalance fetch / fallback settings
+REBALANCE_TIMEOUT = int(os.getenv("REBALANCE_TIMEOUT", "60"))
+REBALANCE_FETCH_RETRIES = int(os.getenv("REBALANCE_FETCH_RETRIES", "3"))
+REBALANCE_OUT_DIR = os.getenv("REBALANCE_OUT_DIR", "rebalance_results")
+REBALANCE_USE_CACHE_FALLBACK = os.getenv("REBALANCE_USE_CACHE_FALLBACK", "1") == "1"
+ALLOW_FORCE_SELL_ON_REBALANCE_FAIL = os.getenv("ALLOW_FORCE_SELL_ON_REBALANCE_FAIL", "0") == "1"
+
+# 기본 안전 제어
 ORDER_THROTTLE_SEC = float(os.getenv("ORDER_THROTTLE_SEC", "0.3"))
+MIN_QTY_PER_TICKET = int(os.getenv("MIN_QTY_PER_TICKET", "1"))
 
-# 목표가 산정 공식 기본값
-TARGET_FORMULA = os.getenv("TARGET_FORMULA", "prev_close + best_k*(prev_high-prev_low)")
+# 내부 상수
+LOG_DAY_FMT = "%Y-%m-%d"
 
-# 헬퍼: hh:mm 파싱
+
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
         hh, mm = hhmm.split(":")
@@ -58,15 +56,29 @@ def _parse_hhmm(hhmm: str) -> dtime:
         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 15:15 적용: {hhmm}")
         return dtime(hour=15, minute=15)
 
+
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 
-# 상태 저장/복구
+
+def get_month_first_date():
+    today = datetime.now(KST)
+    month_first = today.replace(day=1)
+    return month_first.strftime("%Y-%m-%d")
+
+
+def log_trade(trade: dict):
+    today = datetime.now(KST).strftime(LOG_DAY_FMT)
+    logfile = LOG_DIR / f"trades_{today}.json"
+    with open(logfile, "a", encoding="utf-8") as f:
+        f.write(json.dumps(trade, ensure_ascii=False) + "\n")
+
+
 def save_state(holding, traded):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"holding": holding, "traded": traded}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("[STATE_SAVE_FAIL]")
+    except Exception as e:
+        logger.exception(f"[STATE_SAVE_FAIL] {e}")
 
 
 def load_state():
@@ -75,21 +87,12 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
                 return state.get("holding", {}), state.get("traded", {})
-        except Exception:
-            logger.exception("[STATE_LOAD_FAIL]")
+        except Exception as e:
+            logger.exception(f"[STATE_LOAD_FAIL] {e}")
     return {}, {}
 
 
-def log_trade(trade: dict):
-    today = datetime.now(KST).strftime("%Y-%m-%d")
-    logfile = LOG_DIR / f"trades_{today}.json"
-    try:
-        with open(logfile, "a", encoding="utf-8") as f:
-            f.write(json.dumps(trade, ensure_ascii=False) + "\n")
-    except Exception:
-        logger.exception("[LOG_TRADE_FAIL]")
-
-# 재시도 래퍼
+# ----- 공용 재시도 래퍼 -----
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -98,23 +101,29 @@ def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
         except Exception as e:
             last_err = e
             sleep_sec = base_delay * (1.6 ** (attempt - 1)) + random.uniform(0, 0.25)
-            logger.error(f"[재시도 {attempt}/{max_retries}] {func.__name__} 실패: {e} → {sleep_sec:.2f}s 후 재시도")
+            logger.error(f"[재시도 {attempt}/{max_retries}] {func.__name__} 실패: {e} → {sleep_sec:.2f}s 대기 후 재시도")
             time.sleep(sleep_sec)
     raise last_err
 
-# 안전한 현재가 조회
+
 def _safe_get_price(kis: KisAPI, code: str):
+    """현재가 조회 실패해도 매도는 진행할 수 있도록 None을 허용."""
     try:
         price = _with_retry(kis.get_current_price, code)
+        # 가격가드: 0.0 / 음수 / 비정상은 None 처리
         if price is None or (isinstance(price, (int, float)) and price <= 0):
             logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({price})")
             return None
-        return price
+        # 숫자형 문자열도 허용
+        try:
+            return float(price)
+        except Exception:
+            return price
     except Exception as e:
         logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
         return None
 
-# 유틸: 안전한 정수/실수 변환
+
 def _to_int(val, default=0):
     try:
         return int(float(val))
@@ -128,203 +137,67 @@ def _to_float(val, default=None):
     except Exception:
         return default
 
-# 잔고 정규화: KisAPI 응답을 항상 List[dict]로
-def _normalize_balances(raw):
-    # raw may be list, dict with 'output1', or other shapes
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        # common wrapper: {'output1': [ ... ]} or {'output': {'output1': [...]}}
-        if "output1" in raw and isinstance(raw["output1"], list):
-            return raw["output1"]
-        # sometimes it's nested under 'output'
-        if raw.get("output") and isinstance(raw["output"], dict) and isinstance(raw["output"].get("output1"), list):
-            return raw["output"]["output1"]
-        # legacy: some wrappers return list under 'output'
-        if raw.get("output") and isinstance(raw.get("output"), list):
-            return raw.get("output")
-    # unknown -> return empty but log
-    logger.warning(f"[BALANCE_NORMALIZE_WARN] unexpected balance format: {type(raw)}")
-    return []
 
-# 잔고 조회 통합
-def _fetch_balances(kis: KisAPI):
-    if hasattr(kis, "get_balance_all"):
-        raw = _with_retry(kis.get_balance_all)
-    else:
-        raw = _with_retry(kis.get_balance)
-    return _normalize_balances(raw)
-
-# --- 목표가 계산 관련 ---
-# signal: dict with at least stock_code, best_k; optionally base_close/base_high/base_low or base_close_date
-# kis: KisAPI instance - for OHLC 폴백
-
-def fetch_rebalancing_targets(date: str, kis: KisAPI):
-    """
-    rebalance API 호출: signals 우선 파싱.
-    signals 항목을 받아와서, 각 종목에 대해 trader에서 목표가/수량을 계산하도록 정보를 보강해서 반환.
-    """
-    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
+# Balance normalization helper
+def _normalize_balances(raw: Any) -> List[Dict[str, Any]]:
+    """KIS 응답 포맷(여러가지)을 list[dict] 로 정규화 반환."""
     try:
-        resp = requests.post(REBALANCE_API_URL, timeout=20)
-    except Exception as e:
-        raise Exception(f"리밸런싱 API 호출 실패: {e}")
-
-    logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {resp.text}")
-
-    if resp.status_code != 200:
-        raise Exception(f"리밸런싱 API 호출 실패: {resp.status_code} {resp.text}")
-
-    data = resp.json()
-    # 표준: signals 우선, 그다음 selected/selected_stocks
-    raw_signals = data.get("signals") or data.get("selected") or data.get("selected_stocks") or []
-
-    logger.info(f"[🎯 리밸런싱 시그널 수]: {len(raw_signals)}")
-
-    enriched = []
-    for sig in raw_signals:
-        # 표준화
-        code = sig.get("stock_code") or sig.get("code") or sig.get("pdno")
-        if not code:
-            logger.warning(f"[SKIP_SIG] 코드 누락: {sig}")
-            continue
-        best_k = _to_float(sig.get("best_k") or sig.get("K") or sig.get("k"), None)
-        base_close = _to_float(sig.get("base_close") or sig.get("base_close_price") or sig.get("종가"), None)
-        base_high = _to_float(sig.get("base_high") or sig.get("base_high_price") or sig.get("고가"), None)
-        base_low = _to_float(sig.get("base_low") or sig.get("base_low_price") or sig.get("저가"), None)
-        base_date = sig.get("base_close_date") or sig.get("base_date")
-
-        info = {
-            "stock_code": code,
-            "name": sig.get("name") or sig.get("종목명"),
-            "best_k": best_k,
-            "base_close": base_close,
-            "base_high": base_high,
-            "base_low": base_low,
-            "base_date": base_date,
-            "meta": sig.get("meta") or sig.get("메타"),
-        }
-
-        # 폴백: 필요한 OHLC가 빠지면 kis 또는 DataReader로 전일 OHLC 조회
-        if base_close is None or base_high is None or base_low is None:
+        if raw is None:
+            return []
+        # 문자열이면 JSON 파싱 시도
+        if isinstance(raw, str):
             try:
-                ohlc = _get_prev_ohlc_for_code(kis, code, base_date)
-                if ohlc:
-                    info["base_close"] = info["base_close"] or ohlc.get("close")
-                    info["base_high"] = info["base_high"] or ohlc.get("high")
-                    info["base_low"] = info["base_low"] or ohlc.get("low")
-                    info["base_date"] = info["base_date"] or ohlc.get("date")
-                    logger.info(f"[OHLC_FALLBACK] {code} <- {ohlc}")
-            except Exception as e:
-                logger.warning(f"[OHLC_FALLBACK_FAIL] {code} : {e}")
+                parsed = json.loads(raw)
+                raw = parsed
+            except Exception:
+                # 알 수 없는 문자열 포맷
+                logger.warning("[BALANCE_NORMALIZE_WARN] response is raw string and cannot parse JSON")
+                return []
 
-        # 목표가 계산
-        target_price = _compute_target_price(info)
-        if target_price is None:
-            logger.warning(f"[SKIP] {code}: 목표가 산정 불가 (필요 값 부족)")
-            continue
-        info["target_price"] = target_price
+        # dict 형태인 경우
+        if isinstance(raw, dict):
+            # KIS wrapper에서 반환한 dict 형식에 output1 키가 있으면 사용
+            if 'output1' in raw and isinstance(raw['output1'], list):
+                return raw['output1']
+            # 때때로 실제 리스트 자체가 'output' 또는 'output1' 내부에 있는 케이스
+            if 'output' in raw and isinstance(raw['output'], list):
+                return raw['output']
+            # single balance dict
+            if all(k in raw for k in ('pdno', 'hldg_qty')):
+                return [raw]
+            # dict 내에 'output1'이 아닌 다른 래핑이 있을 수 있어 안전하게 빈리스트 반환
+            logger.warning("[BALANCE_NORMALIZE_WARN] unexpected balance format: dict without output1")
+            return []
 
-        # 매수수량 계산: 우선 CAPITAL_PER_SYMBOL 기준
-        qty = max(int(CAPITAL_PER_SYMBOL // target_price), MIN_QTY_PER_TICKET)
-        info["qty"] = qty
-        # debug
-        logger.info(f"[TARGET_CALC] {code} base_close={info.get('base_close')} base_high={info.get('base_high')} base_low={info.get('base_low')} best_k={best_k} -> target={target_price}, qty={qty}")
+        # 이미 리스트면 그대로 반환(리스트 내부 원소 체크는 호출자 책임)
+        if isinstance(raw, list):
+            return raw
 
-        enriched.append(info)
-
-    return enriched
-
-
-def _get_prev_ohlc_for_code(kis: KisAPI, code: str, base_date: str | None = None):
-    """
-    전일 OHLC를 얻는 폴백 함수
-    우선 kis_wrapper의 helper 사용을 시도하고, 없으면 FinanceDataReader로 시도
-    반환: {date: YYYY-MM-DD, open:..., high:..., low:..., close:...} 또는 None
-    """
-    # 1) KisAPI에 helper가 있으면 사용
-    try:
-        if hasattr(kis, "get_prev_day_ohlc"):
-            res = _with_retry(kis.get_prev_day_ohlc, code, base_date)
-            if res:
-                # 예상 포맷을 표준화
-                return {"date": res.get("date") or res.get("base_date"),
-                        "open": _to_float(res.get("open")),
-                        "high": _to_float(res.get("high")),
-                        "low": _to_float(res.get("low")),
-                        "close": _to_float(res.get("close"))}
-    except Exception:
-        logger.debug(f"[KIS_OHLC_FAIL] {code}")
-
-    # 2) FinanceDataReader 폴백
-    if DataReader is None:
-        logger.debug("[DATAFALLBACK] FinanceDataReader 미사용 가능")
-        return None
-
-    try:
-        # base_date가 주어지면 그 날짜의 종가, 고가, 저가를 사용하고
-        # 없으면 최근 2 거래일 데이터를 가져와 전일 값 사용
-        end_date = base_date or datetime.now(KST).strftime("%Y-%m-%d")
-        start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-        df = DataReader(code, start_date, end_date)
-        if df is None or df.empty:
-            return None
-        df.index = df.index.astype("datetime64[ns]")
-        # 최신 거래일을 골라 전일(가장 최근 인덱스 - 1) 값 사용
-        df_sorted = df.sort_index()
-        # 최근 행
-        last = df_sorted.iloc[-1]
-        # 만약 마지막 날짜가 오늘 장중이라면 전일값을 가져오기 위해 -1
-        # 안전하게: 인덱스를 -1이 아닌 -2로 시도
-        if len(df_sorted) >= 2:
-            prev = df_sorted.iloc[-2]
-            return {"date": str(df_sorted.index[-2].date()),
-                    "open": _to_float(prev.get("Open") or prev.get("open")),
-                    "high": _to_float(prev.get("High") or prev.get("high")),
-                    "low": _to_float(prev.get("Low") or prev.get("low")),
-                    "close": _to_float(prev.get("Close") or prev.get("close"))}
-        else:
-            # 데이터가 하나뿐이면 그 값을 사용
-            return {"date": str(df_sorted.index[-1].date()),
-                    "open": _to_float(last.get("Open") or last.get("open")),
-                    "high": _to_float(last.get("High") or last.get("high")),
-                    "low": _to_float(last.get("Low") or last.get("low")),
-                    "close": _to_float(last.get("Close") or last.get("close"))}
+        # 기타 타입
+        logger.warning(f"[BALANCE_NORMALIZE_WARN] unexpected balance format: {type(raw)}")
+        return []
     except Exception as e:
-        logger.exception(f"[DATA_READER_FAIL] {code} : {e}")
-        return None
+        logger.exception(f"[BALANCE_NORMALIZE_FAIL] {e}")
+        return []
 
 
-def _compute_target_price(info: dict):
-    """
-    기본 전략: target = prev_close + best_k * (prev_high - prev_low)
-    info는 base_close/base_high/base_low와 best_k를 포함해야 함
-    반환: int(rounded) 또는 None
-    """
-    best_k = _to_float(info.get("best_k"), None)
-    prev_close = _to_float(info.get("base_close"), None)
-    prev_high = _to_float(info.get("base_high"), None)
-    prev_low = _to_float(info.get("base_low"), None)
-
-    if best_k is None or prev_close is None or prev_high is None or prev_low is None:
-        return None
-
+# 통합 잔고 조회
+def _fetch_balances(kis: KisAPI) -> List[Dict[str, Any]]:
+    """잔고 조회 및 정규화. KisAPI의 get_balance_all 또는 get_balance 사용."""
     try:
-        target = prev_close + best_k * (prev_high - prev_low)
-        # 전략적으로 반올림: 소수 없애고 정수로
-        tp = int(round(target))
-        if tp <= 0:
-            return None
-        return tp
-    except Exception:
-        return None
+        if hasattr(kis, "get_balance_all"):
+            raw = _with_retry(kis.get_balance_all)
+        else:
+            raw = _with_retry(kis.get_balance)
+        return _normalize_balances(raw)
+    except Exception as e:
+        logger.error(f"[잔고조회 오류]{e}")
+        return []
 
-# --- 강제 전량매도 로직 (기존 유지) ---
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True):
     cur_price = _safe_get_price(kis, code)
+
     try:
         if prefer_market and hasattr(kis, "sell_stock_market"):
             result = _with_retry(kis.sell_stock_market, code, qty)
@@ -351,11 +224,13 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
         return set()
 
     targets_codes = {c for c in targets_codes if c}
+
     balances = _fetch_balances(kis)
     qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances}
     sellable_map = {b.get("pdno"): _to_int(b.get("ord_psbl_qty", 0)) for b in balances}
 
     remaining = set()
+
     for code in list(targets_codes):
         qty = qty_map.get(code, 0)
         sellable = sellable_map.get(code, 0)
@@ -391,6 +266,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
     balances_after = _fetch_balances(kis)
     after_qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances_after}
+
     for code in targets_codes:
         if after_qty_map.get(code, 0) > 0:
             remaining.add(code)
@@ -400,6 +276,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
 def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True):
     target_codes = set([c for c in holding.keys() if c])
+
     if include_all_balances:
         try:
             balances = _fetch_balances(kis)
@@ -415,6 +292,7 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
         return
 
     logger.info(f"[⚠️ 강제전량매도] 사유: {reason} / 대상 종목수: {len(target_codes)} / 전체잔고포함={include_all_balances}")
+
     remaining = target_codes
     for p in range(1, max(1, passes) + 1):
         logger.info(f"[강제전량매도 PASS {p}/{passes}] 대상 {len(remaining)}종목 시도")
@@ -422,6 +300,7 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
         if not remaining:
             logger.info("[강제전량매도] 모든 종목 매도 완료")
             break
+
     if remaining:
         logger.error(f"[강제전량매도] 미매도 잔여 {len(remaining)}종목: {sorted(list(remaining))}")
 
@@ -429,40 +308,184 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
         holding.pop(code, None)
     save_state(holding, {})
 
-# ------------------ 메인 루프 ------------------
 
-def main(force_sell=False):
+# ===== New: rebalance fetch with retries and cache fallback =====
+
+def fetch_rebalancing_targets(date: str) -> List[dict]:
+    """
+    안전한 리밸런스 시그널 fetch.
+    - retries + backoff
+    - timeout configurable
+    - cache fallback to REBALANCE_OUT_DIR/rebalance_{date}.json if enabled
+    """
+    REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
+    session = requests.Session()
+    attempt = 0
+    while attempt < REBALANCE_FETCH_RETRIES:
+        attempt += 1
+        try:
+            resp = session.post(REBALANCE_API_URL, timeout=REBALANCE_TIMEOUT)
+            logger.info(f"[🛰️ 리밸런싱 API 응답(시도{attempt})]: status={resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                # 우선 selected 또는 signals 또는 selected_stocks 키를 확인
+                targets = data.get('selected') or data.get('selected_stocks') or data.get('signals')
+                if targets is None:
+                    logger.warning("[REBALANCE_PARSE_WARN] 응답에 selected/signals 키 없음, 전체 JSON 반환 시도")
+                    # 가능하면 전체 JSON이 list일 때만 사용
+                    if isinstance(data, list):
+                        targets = data
+                    else:
+                        targets = []
+                logger.info(f"[🎯 리밸런싱 시그널]: {targets}")
+                return targets or []
+            else:
+                logger.error(f"[REBALANCE_FETCH_FAIL] status_code={resp.status_code} text={resp.text}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[REBALANCE_FETCH_FAIL] 리밸런싱 API 호출 실패(시도{attempt}): {e}")
+        # exponential backoff before next attempt
+        backoff = 0.5 * (2 ** (attempt - 1))
+        time.sleep(backoff)
+
+    # all retries failed -> fallback to cache if enabled
+    cache_fp = Path(REBALANCE_OUT_DIR) / f"rebalance_{date}.json"
+    if REBALANCE_USE_CACHE_FALLBACK and cache_fp.exists():
+        try:
+            with open(cache_fp, 'r', encoding='utf-8') as f:
+                cached = json.load(f)
+            logger.warning(f"[REBALANCE_CACHE_FALLBACK] 캐시 사용: {cache_fp}")
+            # cached expected to be a list of signals or results_list (selected entries)
+            return cached
+        except Exception as e:
+            logger.exception(f"[REBALANCE_CACHE_FAIL] 캐시 파싱 실패: {e}")
+
+    # 최종 실패 처리: 기본 동작은 강제전량매도하지 않고 빈 리스트 반환
+    logger.error("[REBALANCE_FETCH_FAIL] 모든 시도 실패 및 캐시 없음")
+    return []
+
+
+# ===== New: compute daily target (trader-side) =====
+
+def compute_daily_target(kis: KisAPI, signal: dict) -> Optional[int]:
+    """트레이더가 당일(최신) 목표가를 계산한다.
+
+    우선 적절한 OHLC를 KIS에서 직접 가져오려 시도하고, 실패하면
+    signal의 base_close/base_high/base_low에 의존한다.
+    """
+    code = signal.get('stock_code') or signal.get('code')
+    best_k = signal.get('best_k') or signal.get('K') or signal.get('k')
+    if code is None or best_k is None:
+        logger.warning(f"[TARGET_CALC_SKIP] code 또는 best_k 누락: {code}, {best_k}")
+        return None
+
+    # 우선 KIS에서 전일 OHLC 가져오기 시도 (KisAPI가 제공하면 사용)
+    ohlc = None
+    try:
+        if hasattr(kis, 'get_prev_day_ohlc'):
+            ohlc = _with_retry(kis.get_prev_day_ohlc, code)
+            # Expecting dict with keys close/high/low OR numeric values
+    except Exception:
+        logger.debug(f"[TARGET_CALC] kis.get_prev_day_ohlc 실패, 시그널의 base_* 사용 예정: {code}")
+
+    if not ohlc:
+        # fallback to signal's provided base values
+        ohlc = {
+            'close': signal.get('base_close') or signal.get('last_close') or signal.get('종가'),
+            'high': signal.get('base_high') or signal.get('baseHigh') or signal.get('고가'),
+            'low': signal.get('base_low') or signal.get('baseLow') or signal.get('저가'),
+        }
+
+    try:
+        close = float(ohlc.get('close'))
+        high = float(ohlc.get('high'))
+        low = float(ohlc.get('low'))
+    except Exception:
+        logger.warning(f"[TARGET_CALC_FAIL] OHLC 값 부족/변환불가 for {code}: {ohlc}")
+        return None
+
+    try:
+        kf = float(best_k)
+    except Exception:
+        logger.warning(f"[TARGET_CALC_FAIL] best_k 변환불가 for {code}: {best_k}")
+        return None
+
+    target = close + kf * (high - low)
+    target_int = int(round(target))
+    logger.info(f"[TARGET_CALC] {code} close={close}, high={high}, low={low}, k={kf} -> target={target_int}")
+    return target_int
+
+
+def fetch_and_prepare_targets(kis: KisAPI, rebalance_date: str) -> Dict[str, dict]:
+    """리밸런서에서 시그널을 받아 트레이더용 target_price를 계산 후 반환하는 헬퍼.
+
+    반환값은 코드->signal dict 매핑이며 각 dict에는 'computed_target_price' 키가 추가된다.
+    """
+    raw_targets = fetch_rebalancing_targets(rebalance_date)
+    code_to_target: Dict[str, dict] = {}
+
+    if not raw_targets:
+        logger.warning("[PREPARE_TARGETS] 리밸런싱 시그널 없음")
+        return code_to_target
+
+    for sig in raw_targets:
+        code = sig.get('stock_code') or sig.get('code')
+        if not code:
+            logger.warning(f"[PREPARE_TARGETS] 시그널 코드 누락: {sig}")
+            continue
+        try:
+            sig = dict(sig)  # copy
+            # compute daily target (트레이더 주도)
+            computed = compute_daily_target(kis, sig)
+            if computed is not None:
+                sig['computed_target_price'] = computed
+            else:
+                sig['computed_target_price'] = None
+            code_to_target[code] = sig
+            # throttle between per-symbol KIS calls if compute_daily_target used KIS API
+            time.sleep(RATE_SLEEP_SEC)
+        except Exception as e:
+            logger.exception(f"[PREPARE_TARGETS_FAIL] {code}: {e}")
+            continue
+
+    logger.info(f"[PREPARE_TARGETS] Prepared {len(code_to_target)} targets")
+    return code_to_target
+
+
+# ===== main loop =====
+
+def main(force_sell_mode: bool = False):
     kis = KisAPI()
-    rebalance_date = datetime.now(KST).replace(day=1).strftime("%Y-%m-%d")
+    rebalance_date = get_month_first_date()
     logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date}")
-    logger.info(f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / 패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}")
+    logger.info(f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
+                f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}")
 
+    # ======== 상태 복구 ========
     holding, traded = load_state()
     logger.info(f"[상태복구] holding: {list(holding.keys())}, traded: {list(traded.keys())}")
 
-    # 리밸런싱 신호 가져오기 & 트레이더 내부 목표가/수량 산정
-    try:
-        targets = fetch_rebalancing_targets(rebalance_date, kis)
-    except Exception as e:
-        logger.error(f"[REBALANCE_FETCH_FAIL] {e}")
-        targets = []
+    # ======== 리밸런싱 대상 종목 추출 및 준비(트레이더가 목표가 계산) ========
+    code_to_target = fetch_and_prepare_targets(kis, rebalance_date)
 
-    # code -> target map
-    code_to_target = {t['stock_code']: t for t in targets}
+    if not code_to_target and force_sell_mode:
+        logger.info("[FORCE_SELL_MODE] 즉시 강제전량매도 실행")
+        _force_sell_all(
+            kis=kis,
+            holding=holding,
+            reason="force-sell-mode",
+            passes=FORCE_SELL_PASSES_CUTOFF,
+            include_all_balances=True,
+            prefer_market=True
+        )
+        return
 
-    # 매수/매도 조건
+    # 기본 매도조건(익절/손절)
     sell_conditions = {
-        'profit_pct': float(os.getenv('PROFIT_PCT', '3.0')),
-        'loss_pct': float(os.getenv('LOSS_PCT', '-2.0'))
+        'profit_pct': 3.0,   # +3% 이상 익절
+        'loss_pct':  -2.0    # -2% 이하 손절
     }
 
     loop_sleep_sec = 3
-
-    # FORCE_SELL option: 즉시 강제 매도 후 종료
-    if force_sell:
-        logger.info("[FORCE_SELL_MODE] 즉시 강제전량매도 실행")
-        _force_sell_all(kis=kis, holding=holding, reason="수동 강제매도", passes=FORCE_SELL_PASSES_CLOSE, include_all_balances=True)
-        return
 
     try:
         while True:
@@ -471,15 +494,18 @@ def main(force_sell=False):
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[⏰ 장상태] {'OPEN' if is_open else 'CLOSED'} / KST={now_str}")
 
-            # 잔고 동기화
+            # ====== 잔고 동기화 ======
             ord_psbl_map = {}
             try:
                 balances = _fetch_balances(kis)
                 logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
-                for b in balances:
-                    logger.info(f"  [잔고] 종목: {b.get('prdt_name')}, 코드: {b.get('pdno')}, 보유수량: {b.get('hldg_qty')}, 매도가능: {b.get('ord_psbl_qty')}")
-                current_holding = {b.get('pdno'): _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
-                ord_psbl_map = {b.get('pdno'): _to_int(b.get('ord_psbl_qty', 0)) for b in balances}
+                for stock in balances:
+                    logger.info(
+                        f"  [잔고] 종목: {stock.get('prdt_name')}, 코드: {stock.get('pdno')}, "
+                        f"보유수량: {stock.get('hldg_qty')}, 매도가능: {stock.get('ord_psbl_qty')}"
+                    )
+                current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
+                ord_psbl_map = {b['pdno']: _to_int(b.get('ord_psbl_qty', 0)) for b in balances}
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
                         logger.info(f"[보유종목 해제] {code} : 실제잔고 없음 → holding 제거")
@@ -487,23 +513,30 @@ def main(force_sell=False):
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
 
-            # 매수/매도 전략 루프
-            for code, target in code_to_target.items():
+            # ====== 매수/매도(전략) LOOP ======
+            for code, target in list(code_to_target.items()):
+                # 입력 방어
+                qty = _to_int(target.get("매수수량") or target.get("qty") or target.get('매수수량_권장'), 0)
+                if qty <= 0:
+                    # If no explicit qty provided, derive from capital rules
+                    # Conservative fallback: use 1 share minimum
+                    qty = max(MIN_QTY_PER_TICKET, 1)
+
+                k_value = (target.get("best_k") or target.get("K") or target.get("k"))
+                # 트레이더 계산 목표가 우선
+                target_price = _to_float(target.get('computed_target_price'))
+                # fallback: signal에서 내려준 목표가 (권장하지 않음)
+                if target_price is None:
+                    target_price = _to_float(target.get("목표가") or target.get("target_price") or target.get('best_k_price'))
+
+                strategy = target.get("strategy") or target.get('strategy_name') or "전월 rolling K 최적화"
+                name = target.get("name") or target.get("종목명")
+
+                if target_price is None:
+                    logger.warning(f"[SKIP] {code}: target_price 누락 (computed 및 signal 모두 없음)")
+                    continue
+
                 try:
-                    qty = _to_int(target.get('qty', 0))
-                    if qty <= 0:
-                        logger.info(f"[SKIP] {code}: 매수수량 없음/0")
-                        continue
-
-                    k_value = target.get('best_k')
-                    target_price = _to_float(target.get('target_price'))
-                    strategy = target.get('strategy') or "전월 rolling K 최적화"
-                    name = target.get('name')
-
-                    if target_price is None:
-                        logger.warning(f"[SKIP] {code}: target_price 누락")
-                        continue
-
                     current_price = _safe_get_price(kis, code)
                     logger.info(f"[📈 현재가] {code}: {current_price}")
 
@@ -517,7 +550,7 @@ def main(force_sell=False):
                         "strategy": strategy,
                     }
 
-                    # 매수: 장중이고 미보유/미거래
+                    # --- 매수 ---
                     if is_open and code not in holding and code not in traded:
                         if current_price is not None and current_price >= float(target_price):
                             result = _with_retry(kis.buy_stock, code, qty)
@@ -534,8 +567,9 @@ def main(force_sell=False):
                             time.sleep(ORDER_THROTTLE_SEC)
                         else:
                             logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({target_price}), 미매수")
+                            continue
 
-                    # 익절/손절 매도
+                    # --- 익절/손절 매도 ---
                     if is_open and code in holding:
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here <= 0:
@@ -566,7 +600,7 @@ def main(force_sell=False):
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
                     continue
 
-            # 장중 커트오프 강제 전량매도
+            # --- 장중 커트오프(KST) 강제 전량매도 ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
                 _force_sell_all(
                     kis=kis,
@@ -577,14 +611,14 @@ def main(force_sell=False):
                     prefer_market=True
                 )
 
-            # 장마감 전량매도
+            # --- 장마감 전량매도(더블 세이프) ---
             if not is_open:
                 _force_sell_all(
                     kis=kis,
                     holding=holding,
                     reason="장마감 전 강제전량매도",
                     passes=FORCE_SELL_PASSES_CLOSE,
-                    include_all_balances=True,
+                    include_all_balances=True,   # 장마감 시에는 무조건 전체 잔고 대상
                     prefer_market=True
                 )
                 logger.info("[✅ 장마감, 루프 종료]")
@@ -598,8 +632,12 @@ def main(force_sell=False):
 
 
 if __name__ == "__main__":
+    # allow CLI flag for force-sell-only mode
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--force-sell", action="store_true", help="즉시 강제전량매도 후 종료")
     args = p.parse_args()
-    main(force_sell=args.force_sell)
+    try:
+        main(force_sell_mode=args.force_sell)
+    except Exception:
+        logger.exception("[MAIN_FAIL]")
