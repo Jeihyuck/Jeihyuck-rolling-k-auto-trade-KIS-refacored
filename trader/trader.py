@@ -58,7 +58,7 @@ ORDER_THROTTLE_SEC = float(os.getenv("ORDER_THROTTLE_SEC", "0.3"))
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
-        hh, mm = hhmm.split(":")
+        hh, mm = hhmm.split(":" )
         return dtime(hour=int(hh), minute=int(mm))
     except Exception:
         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 15:15 적용: {hhmm}")

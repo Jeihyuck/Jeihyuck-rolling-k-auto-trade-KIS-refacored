@@ -2,11 +2,11 @@ import os
 import json
 import uuid
 import logging
-import time as time_module
 from datetime import datetime, time as dtime, timedelta
+from typing import Any
 
 import pytz
-from fastapi import APIRouter, Query, Request, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Request
 from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
@@ -16,61 +16,55 @@ from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_
 from rolling_k_auto_trade_api.logging_config import configure_logging
 
 # ──────────────────────────────────────────────────────────────
-# 0. 로깅 설정 & 전역 상수
+# 로깅 및 전역
 # ──────────────────────────────────────────────────────────────
 configure_logging()
 logger = logging.getLogger(__name__)
 
 rebalance_router = APIRouter()
-# latest_rebalance_result에 저장되는 것은 "시그널 전용" 데이터입니다.
-latest_rebalance_result: dict[str, any] = {"date": None, "selected_stocks": []}
-TOTAL_CAPITAL = 10_000_000  # 투자금 고정 (1,000만원)
+# 호환성을 위해 selected_stocks와 signals 둘 다 저장
+latest_rebalance_result: dict[str, Any] = {"date": None, "selected_stocks": [], "signals": []}
+REBALANCE_OUT_DIR = os.getenv("REBALANCE_OUT_DIR", "rebalance_results")
+os.makedirs(REBALANCE_OUT_DIR, exist_ok=True)
 
-# ──────────────────────────────────────────────────────────────
-# 1. KST 타임존 & 장 운영시간 헬퍼
-# ──────────────────────────────────────────────────────────────
 KST = pytz.timezone("Asia/Seoul")
 MARKET_OPEN: dtime = dtime(8, 30)
 MARKET_CLOSE: dtime = dtime(16, 0)
 
+
 def is_market_open(ts: datetime | None = None) -> bool:
-    """현재 시각(기본=now KST)이 장중(08:30~16:00)인지 여부"""
     ts = ts or datetime.now(tz=KST)
     if ts.weekday() >= 5:
         return False
     return MARKET_OPEN <= ts.time() <= MARKET_CLOSE
 
 
-# ──────────────────────────────────────────────────────────────
-# 2. 리밸런싱 실행 엔드포인트 (Signals-only 리밸런서)
-#    목적: trader가 사용하도록 시그널(종목, best_k, 기준일자 기준종가 등)만 제공
-#    * 목표가(매수단가)는 제공하지 않음 -> trader가 매일 최신 OHLC로 자체 계산
-# ──────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
+# Signals-only 리밸런서
+# - 주문/잔고 로직 제거
+# - trader가 매일 자체적으로 목표가(전일종가 + K*(high-low)) 계산하도록 OHLC을 포함한 시그널 제공
+# - backward compatibility: 기존 소비자가 "selected_stocks" 키를 요청할 수 있으므로 둘 다 채움
+# -----------------------------------------------------------------
 @rebalance_router.post("/rebalance/run/{date}", tags=["Rebalance"])
-async def run_rebalance(
-    date: str,
-    force_order: bool = Query(
-        False,
-        description="(사용안함) Signals-only 모드: force_order 파라미터는 무시됩니다.",
-    ),
-):
-    """KOSDAQ‑50 대상 Meta‑K 전략 리밸런싱 수행 (Signals-only)
+async def run_rebalance(date: str, force_generate: bool = Query(False, description="강제 생성 (장중/장외 상관없이)")):
+    """Signals-only 리밸런서
 
-    Args:
-        date: YYYY‑MM‑DD 포맷 리밸런싱 기준일
-    Returns:
-        selected_signals: list of dicts with keys: stock_code, name, best_k, base_close_date, base_close, base_high, base_low, 기타 메타
+    반환: status, selected_count, signals (list)
+    각 signal은 최소한 다음 필드를 포함합니다:
+      - stock_code, name, best_k, base_close_date, base_close, base_high, base_low, meta
+
+    파일 저장: rebalance_results/rebalance_signals_{date}.json
     """
-    logger.info(f"[RUN] run_rebalance 호출(시그널 전용): date={date}")
+    logger.info(f"[RUN] run_rebalance 호출: date={date}, force_generate={force_generate}")
 
-    # 1) Best-K 계산 (기존 로직 재사용)
+    # 1) Best-K 계산
     try:
         raw_results = get_best_k_for_kosdaq_50(date)
     except Exception as e:
         logger.exception(f"[ERROR] Best K 계산 실패: {e}")
         raise HTTPException(status_code=500, detail="Best K 계산 실패")
 
-    # 2) 결과 통일 (code → info dict)
+    # 2) 결과 표준화
     results_map: dict[str, dict] = {}
     if isinstance(raw_results, dict):
         results_map = raw_results
@@ -85,128 +79,105 @@ async def run_rebalance(
 
     logger.info(f"[FILTER] 후보 종목 수 = {len(results_map)}개")
 
-    # ⬇️ candidates와 selected 분리
-    candidates: list[dict] = []
-    selected: list[dict] = []
+    # 후보 -> signals 생성 (필터 적용 가능)
+    signals: list[dict] = []
 
-    # 조건: 수익률 2% 초과, 승률 50% 초과, MDD 10% 이하만 selected에
-    for code, stock in results_map.items():
-        info = dict(stock)
-        candidates.append(info)
-        try:
-            cumret = info.get("cumulative_return_pct") or info.get("수익률(%)")
-            win = info.get("win_rate_pct") or info.get("승률(%)")
-            mdd = info.get("mdd_pct") or info.get("MDD(%)")
-            if cumret is not None:
-                cumret = float(cumret)
-            if win is not None:
-                win = float(win)
-            if mdd is not None:
-                mdd = float(mdd)
-        except Exception as e:
-            logger.warning(f"[WARN] 수치 변환 실패: {code}: {e}")
-            continue
-        if (
-            cumret is not None and cumret > 2.0 and
-            win is not None and win > 50.0 and
-            mdd is not None and mdd <= 10.0
-        ):
-            selected.append(info)
-
-    logger.info(f"[SELECTED] 필터 통과 종목 수 = {len(selected)}개")
-    logger.debug(f"selected codes: {[s.get('code') or s.get('stock_code') for s in selected]}")
-
-    count = len(selected)
-    if count == 0:
-        latest_rebalance_result.update({"date": date, "selected_stocks": []})
-        return {
-            "status": "skipped",
-            "reason": "no_qualified_candidates",
-            "candidates": candidates,
-            "selected": [],
-        }
-
-    # 3) Signals만 구성: trader가 목표가를 계산할 수 있도록 기초 데이터(전일 OHLC 등)를 포함
-    signals = []
-
-    # Helper: 이전 영업일(또는 기준일 직전) OHLC를 가져오기
     def _get_base_ohlc(code: str, ref_date: str) -> dict:
-        # ref_date: YYYY-MM-DD (리밸런싱 기준일)
+        """리밸런싱 기준일(ref_date) 이전(또는 동일)의 마지막 영업일 OHLC를 반환
+        반환값: base_close_date(YYYY-MM-DD), base_close, base_high, base_low
+        """
         try:
             ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
-            start = (ref_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+            # 안전 범위: 최근 10거래일 이내
+            start = (ref_dt - timedelta(days=14)).strftime("%Y-%m-%d")
             end = (ref_dt).strftime("%Y-%m-%d")
             df = DataReader(code, start, end)
             if df is None or df.empty:
                 return {"base_close_date": None, "base_close": None, "base_high": None, "base_low": None}
             df.index = pd.to_datetime(df.index)
-            # 기준일(ref_date) 이전 또는 같은 날의 마지막 행을 사용
             df_filtered = df[df.index <= pd.to_datetime(ref_date)]
             if df_filtered.empty:
                 return {"base_close_date": None, "base_close": None, "base_high": None, "base_low": None}
             row = df_filtered.iloc[-1]
+            # DataReader 컬럼 표준화: Open/High/Low/Close 또는 영문/한글
+            close = None
+            if "Close" in row.index:
+                close = row.get("Close")
+            elif "Adj Close" in row.index:
+                close = row.get("Adj Close")
+            elif "종가" in row.index:
+                close = row.get("종가")
+            high = row.get("High") if "High" in row.index else row.get("고가")
+            low = row.get("Low") if "Low" in row.index else row.get("저가")
             return {
                 "base_close_date": str(row.name.date()),
-                "base_close": float(row.get("Close", row.get("Adj Close", None)) if not pd.isna(row.get("Close", None)) else None),
-                "base_high": float(row.get("High", None)) if not pd.isna(row.get("High", None)) else None,
-                "base_low": float(row.get("Low", None)) if not pd.isna(row.get("Low", None)) else None,
+                "base_close": float(close) if close is not None and not pd.isna(close) else None,
+                "base_high": float(high) if high is not None and not pd.isna(high) else None,
+                "base_low": float(low) if low is not None and not pd.isna(low) else None,
             }
         except Exception as e:
             logger.warning(f"[WARN] OHLC 조회 실패: {code} {e}")
             return {"base_close_date": None, "base_close": None, "base_high": None, "base_low": None}
 
-    for info in selected:
-        code = info.get("stock_code") or info.get("code")
-        name = info.get("name") or info.get("종목명")
+    for code, raw in results_map.items():
+        info = dict(raw)
+        name = info.get("name") or info.get("종목명") or ""
         best_k = info.get("best_k") or info.get("K") or info.get("k")
         try:
-            if best_k is not None:
-                best_k = float(best_k)
+            best_k = float(best_k) if best_k is not None else None
         except Exception:
             best_k = None
 
-        base_ohlc = _get_base_ohlc(code, date)
+        # 우선 raw에 이미 base OHLC가 있으면 사용, 없으면 DataReader로 조회
+        base_close = info.get("base_close") or info.get("종가")
+        base_high = info.get("base_high") or info.get("high") or info.get("고가")
+        base_low = info.get("base_low") or info.get("low") or info.get("저가")
+        base_close_date = info.get("base_close_date") or info.get("date")
+
+        if not (base_close and base_high and base_low and base_close_date):
+            ohlc = _get_base_ohlc(code, date)
+            base_close_date = base_close_date or ohlc.get("base_close_date")
+            base_close = base_close or ohlc.get("base_close")
+            base_high = base_high or ohlc.get("base_high")
+            base_low = base_low or ohlc.get("base_low")
+
+        meta = info.get("meta") or {}
+        # numeric meta 정리
+        for k in ["cumulative_return_pct", "win_rate_pct", "mdd_pct"]:
+            if k in meta:
+                try:
+                    meta[k] = float(meta[k])
+                except Exception:
+                    pass
 
         signal = {
             "stock_code": code,
             "name": name,
             "best_k": best_k,
-            # trader가 자체적으로 목표가를 계산하도록 OHLC(기준일 이전값)를 제공
-            "base_close_date": base_ohlc.get("base_close_date"),
-            "base_close": base_ohlc.get("base_close"),
-            "base_high": base_ohlc.get("base_high"),
-            "base_low": base_ohlc.get("base_low"),
-            # 추가 메타 (옵션)
-            "meta": {
-                "cumulative_return_pct": info.get("cumulative_return_pct") or info.get("수익률(%)"),
-                "win_rate_pct": info.get("win_rate_pct") or info.get("승률(%)"),
-                "mdd_pct": info.get("mdd_pct") or info.get("MDD(%)"),
-            }
+            "base_close_date": base_close_date,
+            "base_close": base_close,
+            "base_high": base_high,
+            "base_low": base_low,
+            "meta": meta,
         }
+
         signals.append(signal)
 
-    # 캐시 및 저장: 시그널 전용 결과만 저장
-    latest_rebalance_result.update({"date": date, "selected_stocks": signals})
-    out_dir = "rebalance_results"
-    os.makedirs(out_dir, exist_ok=True)
-    fp = os.path.join(out_dir, f"rebalance_signals_{date}.json")
+    # 캐시(호환성: selected_stocks) 및 파일 저장
+    latest_rebalance_result.update({"date": date, "signals": signals, "selected_stocks": signals})
+    fp = os.path.join(REBALANCE_OUT_DIR, f"rebalance_signals_{date}.json")
     try:
         with open(fp, "w", encoding="utf-8") as f:
             json.dump(signals, f, ensure_ascii=False, indent=2)
         logger.info(f"[SAVE] {fp} 저장 (count={len(signals)})")
     except Exception as e:
         logger.exception(f"[SAVE_FAIL] JSON 저장 오류: {e}")
-        raise HTTPException(status_code=500, detail="리밸런스 결과 저장 실패")
 
-    return {
-        "status": "signals_generated",
-        "selected_count": len(signals),
-        "signals": signals,
-    }
+    return {"status": "signals_generated", "selected_count": len(signals), "signals": signals, "selected_stocks": signals}
 
 
 # ──────────────────────────────────────────────────────────────
-# 3. 최근 리밸런스 결과 조회
+# 조회 엔드포인트
 # ──────────────────────────────────────────────────────────────
 @rebalance_router.get("/rebalance/latest", tags=["Rebalance"])
 def get_latest_rebalance():
@@ -214,26 +185,35 @@ def get_latest_rebalance():
     return latest_rebalance_result
 
 
-# ──────────────────────────────────────────────────────────────
-# 4. 월단위 백테스트 엔드포인트 (원본 로직 유지)
-# ──────────────────────────────────────────────────────────────
-@rebalance_router.get(
-    "/rebalance/backtest-monthly",
-    tags=["Rebalance"],
-    response_class=JSONResponse,
-    response_model=None,
-    responses={200: {"description": "항상 200 OK, 요약 또는 전체 데이터 반환"}},
-)
-def rebalance_backtest_monthly(
-    start_date: str = Query("2020-01-01", description="시작일 (YYYY-MM-DD)"),
-    end_date:   str = Query("2024-04-01", description="종료일 (YYYY-MM-DD)"),
-    request:    Request = None,
-):
-    logger.info(f"[BACKTEST] 호출: {start_date}~{end_date}")
-    ua = (request.headers.get("user-agent") or "").lower() if request else ""
-    referer = (request.headers.get("referer") or "").lower() if request else ""
-    is_curl = ("curl" in ua) or ("/docs" in referer)
+@rebalance_router.get("/rebalance/selected/{date}", tags=["Rebalance"], response_class=JSONResponse)
+def get_selected_stocks(date: str):
+    """
+    리밸런싱 실행 후 selected_stocks(시그널 리스트)만 반환하는 API
+    """
+    if latest_rebalance_result.get("date") == date and latest_rebalance_result.get("selected_stocks"):
+        selected = latest_rebalance_result.get("selected_stocks", [])
+        return {"status": "ready", "rebalance_date": date, "selected": selected}
 
+    # 파일 폴백: rebalance_signals_{date}.json 또는 rebalance_{date}.json
+    candidates = [
+        os.path.join(REBALANCE_OUT_DIR, f"rebalance_signals_{date}.json"),
+        os.path.join(REBALANCE_OUT_DIR, f"rebalance_{date}.json"),
+    ]
+    for fp in candidates:
+        if os.path.exists(fp):
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return {"status": "ready", "rebalance_date": date, "selected": data}
+            except Exception as e:
+                logger.exception(f"[LOAD_FAIL] {fp} 불러오기 실패: {e}")
+
+    return {"status": "not_ready", "rebalance_date": date, "selected": [], "message": "먼저 /rebalance/run/{date} 실행 또는 파일 확인"}
+
+
+# 기존 월간 백테스트 엔드포인트(원본 로직 유지)
+@rebalance_router.get("/rebalance/backtest-monthly", tags=["Rebalance"], response_class=JSONResponse)
+def rebalance_backtest_monthly(start_date: str = Query("2020-01-01"), end_date: str = Query("2024-04-01")):
     try:
         datetime.strptime(start_date, "%Y-%m-%d")
         datetime.strptime(end_date, "%Y-%m-%d")
@@ -254,9 +234,9 @@ def rebalance_backtest_monthly(
         for i in range(len(periods) - 1):
             rebalance_dt = periods[i + 1]
             start_train = (rebalance_dt - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
-            end_train   = (rebalance_dt - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
-            start_test  = rebalance_dt.strftime("%Y-%m-%d")
-            end_test    = (rebalance_dt + pd.DateOffset(months=1) - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            end_train = (rebalance_dt - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            start_test = rebalance_dt.strftime("%Y-%m-%d")
+            end_test = (rebalance_dt + pd.DateOffset(months=1) - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
 
             selected = []
             for code, name in tickers:
@@ -266,7 +246,7 @@ def rebalance_backtest_monthly(
                         continue
                     df.index = pd.to_datetime(df.index)
                     train = df.loc[start_train:end_train].copy()
-                    test  = df.loc[start_test:end_test].copy()
+                    test = df.loc[start_test:end_test].copy()
                     if len(train) < 15 or len(test) < 5:
                         continue
 
@@ -295,9 +275,6 @@ def rebalance_backtest_monthly(
                 continue
 
             df = pd.DataFrame(selected)
-            if "수익률(%)" not in df.columns:
-                logger.error(f"[ERROR] '수익률(%)' 컬럼 없음! keys={list(df.columns)}")
-                continue
             monthly_df = df.sort_values("수익률(%)", ascending=False).head(20)
             if not monthly_df.empty:
                 monthly_df["포트비중(%)"] = round(100 / len(monthly_df), 2)
@@ -308,51 +285,11 @@ def rebalance_backtest_monthly(
 
         final_df = pd.concat(all_results, ignore_index=True)
         filename = f"backtest_result_{uuid.uuid4().hex}.json"
-        out_dir = "rebalance_results"
-        os.makedirs(out_dir, exist_ok=True)
-        filepath = os.path.join(out_dir, filename)
+        filepath = os.path.join(REBALANCE_OUT_DIR, filename)
         final_df.to_json(filepath, force_ascii=False, orient="records", indent=2)
         logger.info(f"[SAVE] 백테스트 결과 저장: {filename} (count={len(final_df)})")
+        return JSONResponse(content={"message": f"{len(final_df)}개 종목 리밸런싱 완료", "filename": filename})
 
-        if is_curl:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return JSONResponse(content=data)
-        else:
-            return JSONResponse(content={
-                "message": f"{len(final_df)}개 종목 리밸런싱 완료",
-                "filename": filename,
-                "tip": "전체 데이터는 curl 또는 파일에서 확인",
-            })
     except Exception as e:
         logger.exception(f"[ERROR] rebalance-backtest 예외: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ──────────────────────────────────────────────────────────────
-# 5. selected_stocks만 반환하는 엔드포인트 (선택적)
-# ──────────────────────────────────────────────────────────────
-@rebalance_router.get(
-    "/rebalance/selected/{date}",
-    tags=["Rebalance"],
-    response_class=JSONResponse,
-)
-def get_selected_stocks(date: str):
-    """
-    리밸런싱 실행 후 selected_stocks(시그널 리스트)만 반환하는 API
-    """
-    if latest_rebalance_result.get("date") == date:
-        selected = latest_rebalance_result.get("selected_stocks", [])
-        return {
-            "status": "ready",
-            "rebalance_date": date,
-            "selected": selected
-        }
-    else:
-        return {
-            "status": "not_ready",
-            "rebalance_date": date,
-            "selected": [],
-            "message": "먼저 /rebalance/run/{date} 엔드포인트로 리밸런싱을 실행하세요."
-        }
-    
