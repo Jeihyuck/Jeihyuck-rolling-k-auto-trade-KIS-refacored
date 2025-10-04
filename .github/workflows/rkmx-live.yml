@@ -36,7 +36,6 @@ jobs:
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:45"
 
-      # 기존 리밸런싱 파라미터 (유지)
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -56,7 +55,7 @@ jobs:
       REBALANCE_OUT_DIR: "rebalance_results"
       REBALANCE_DAYS: "7"
 
-      # === 신규/조정 파라미터 (trader.py 변경과 일치시킬 것) ===
+      # === 신규/조정 파라미터 ===
       SLIPPAGE_ENTER_GUARD_PCT: "1.5"
       TRAIL_DISABLE_MINUTES: "5"
       SUSPICIOUS_LOG: "trader/suspicious_targets.log"
@@ -70,11 +69,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install helpers (jq)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
 
       - name: Dependencies 설치
         run: |
@@ -93,97 +87,81 @@ jobs:
       - name: Create inline strategy config (configs/rkmax-live.yaml)
         run: |
           mkdir -p configs
-          FILE=configs/rkmax-live.yaml
-          : > "$FILE"
-          printf '%s\n' "mode: daytrade" >> "$FILE"
-          printf '%s\n' "universe: KOSDAQ_TOP50" >> "$FILE"
-          printf '%s\n' "k_params:" >> "$FILE"
-          printf '%s\n' "  method: rkmax" >> "$FILE"
-          printf '%s\n' "  lookback_months: 1" >> "$FILE"
-          printf '%s\n' "slippage:" >> "$FILE"
-          printf '%s\n' "  max_pct: 0.0025" >> "$FILE"
-          printf '%s\n' "  max_extra_ticks: 2" >> "$FILE"
-          printf '%s\n' "take_profit:" >> "$FILE"
-          printf '%s\n' "  tp1_pct: 0.008" >> "$FILE"
-          printf '%s\n' "  tp2_pct: 0.015" >> "$FILE"
-          printf '%s\n' "trailing:" >> "$FILE"
-          printf '%s\n' "  pct: 0.007" >> "$FILE"
-          printf '%s\n' "  disable_minutes: %s" "${TRAIL_DISABLE_MINUTES}" >> "$FILE"
-          printf '%s\n' "stops:" >> "$FILE"
-          printf '%s\n' "  fast_stop_pct: 0.01" >> "$FILE"
-          printf '%s\n' "  atr_mult: 1.5" >> "$FILE"
-          printf '%s\n' "sizing:" >> "$FILE"
-          printf '%s\n' "  scheme: equal" >> "$FILE"
-          printf '%s\n' "  clip_min: 0.5" >> "$FILE"
-          printf '%s\n' "  clip_max: 1.5" >> "$FILE"
-          printf '%s\n' "time_rules:" >> "$FILE"
-          printf '%s\n' "  trade_start_hhmm: \"09:00\"" >> "$FILE"
-          printf '%s\n' "  trade_end_hhmm:   \"14:45\"" >> "$FILE"
-          printf '%s\n' "  sell_force_window:" >> "$FILE"
-          printf '%s\n' "    start_hhmm: \"14:40\"" >> "$FILE"
-          printf '%s\n' "    end_hhmm:   \"14:45\"" >> "$FILE"
-          printf '%s\n' "swing:" >> "$FILE"
-          printf '%s\n' "  enabled: false" >> "$FILE"
-          printf '%s\n' "  hold_days: 3" >> "$FILE"
-          printf '%s\n' "  adx_min: 20" >> "$FILE"
-          printf '%s\n' "  use_tema_filter: true" >> "$FILE"
-          printf '%s\n' "retries:" >> "$FILE"
-          printf '%s\n' "  max_attempts: 5" >> "$FILE"
-          printf '%s\n' "  backoff_base_sec: 0.5" >> "$FILE"
-          printf '%s\n' "logging:" >> "$FILE"
-          printf '%s\n' "  level: INFO" >> "$FILE"
-          printf '%s\n' "  json: true" >> "$FILE"
+          cat > configs/rkmax-live.yaml <<-YAML
+          mode: daytrade
+          universe: KOSDAQ_TOP50
+          k_params:
+            method: rkmax
+            lookback_months: 1
+          slippage:
+            max_pct: 0.0025
+            max_extra_ticks: 2
+          take_profit:
+            tp1_pct: 0.008
+            tp2_pct: 0.015
+          trailing:
+            pct: 0.007
+            disable_minutes: ${TRAIL_DISABLE_MINUTES}
+          stops:
+            fast_stop_pct: 0.01
+            atr_mult: 1.5
+          sizing:
+            scheme: equal
+            clip_min: 0.5
+            clip_max: 1.5
+          time_rules:
+            trade_start_hhmm: "09:00"
+            trade_end_hhmm:   "14:45"
+            sell_force_window:
+              start_hhmm: "14:40"
+              end_hhmm:   "14:45"
+          swing:
+            enabled: false
+            hold_days: 3
+            adx_min: 20
+            use_tema_filter: true
+          retries:
+            max_attempts: 5
+            backoff_base_sec: 0.5
+          logging:
+            level: INFO
+            json: true
+          YAML
+
           echo "=== configs/rkmax-live.yaml ==="
-          cat "$FILE"
+          cat configs/rkmax-live.yaml
 
       - name: 리밸런싱 API 서버 실행 (백그라운드)
         run: |
           echo "[API] Starting FastAPI (nohup) ..."
           nohup uvicorn rolling_k_auto_trade_api.main:app \
             --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          FASTAPI_PID=$!
-          echo "[API] FastAPI started: PID=${FASTAPI_PID}"
-          echo "[API] Waiting for FastAPI health & rebalance readiness..."
+          echo "[API] FastAPI started: PID=$!"
+          sleep 5
+          echo "=== fastapi.log (tail 50) ==="
+          tail -n 50 fastapi.log || true
 
-          # 1) wait for /health (if exists) up to 60s
-          HEALTH_OK=0
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
-              HEALTH_OK=1
-              echo "[API] /health OK (after ${i} tries)"
-              break
-            fi
-            sleep 2
-          done
-          if [ "${HEALTH_OK}" -ne 1 ]; then
-            echo "[API] /health not responding (continuing; maybe endpoint not implemented)"
-          fi
+      - name: Preflight (KST open window)
+        id: preflight
+        run: |
+          DOW=$(date +%u)         # 1=Mon ... 7=Sun
+          NOW=$(date +%H:%M)
+          CONTINUE=true
+          if [ "$DOW" -ge 6 ]; then CONTINUE=false; fi
+          if [[ "$NOW" < "09:00" || "$NOW" > "14:45" ]]; then CONTINUE=false; fi
+          echo "continue=${CONTINUE}" >> "$GITHUB_OUTPUT"
+          echo "[PREFLIGHT] DOW=$DOW NOW=$NOW CONTINUE=$CONTINUE"
 
-          # 2) Optional: trigger rebalance generation if endpoint exists (best-effort)
-          DATE=$(date '+%F')
-          echo "[API] Attempting to trigger rebalance generation for ${DATE} (best-effort)..."
-          curl -fsS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" -o /dev/null 2>&1 || echo "[API] POST /rebalance/generate failed or not present (ignored)"
-
-          # 3) Poll /rebalance/selected/${DATE} for non-empty selected_stocks up to 120s
-          READY=0
-          for i in $(seq 1 60); do
-            echo "[API] Poll ${i}/60: checking /rebalance/selected/${DATE} ..."
-            SEL="$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" 2>/dev/null || echo '')"
-            if echo "$SEL" | jq -e '.selected_stocks | length > 0' >/dev/null 2>&1; then
-              READY=1
-              echo "[API] selected_stocks ready."
-              break
-            fi
-            sleep 2
-          done
-          if [ "${READY}" -ne 1 ]; then
-            echo "[API] WARNING: rebalance/selected did not become ready in timeout — continuing anyway. Check fastapi.log for errors."
-          fi
-
-          echo "=== fastapi.log (tail 100) ==="
-          tail -n 100 fastapi.log || true
+      # (선택) 리밸런싱 산출을 API 없이 파일로 미리 생성하고 싶다면, 아래 주석을 프로젝트 CLI에 맞게 켜서 사용
+      # - name: Generate rebalance JSON (optional)
+      #   if: steps.preflight.outputs.continue == 'true'
+      #   env:
+      #     PYTHONPATH: ${{ github.workspace }}
+      #   run: |
+      #     python -m yourproject.rebalance_cli --date "$(date +%F)" --out-dir "${REBALANCE_OUT_DIR}" || echo "[WARN] rebalance CLI failed"
 
       - name: Unified live loop (09:00→14:45 KST)
+        if: steps.preflight.outputs.continue == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
