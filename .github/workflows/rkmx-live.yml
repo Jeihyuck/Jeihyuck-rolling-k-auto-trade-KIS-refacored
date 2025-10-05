@@ -111,11 +111,11 @@ jobs:
             '  clip_min: 0.5' \
             '  clip_max: 1.5' \
             'time_rules:' \
-            '  trade_start_hhmm: "09:00"' \
-            '  trade_end_hhmm:   "14:45"' \
+            '  trade_start_hhmm: \"09:00\"' \
+            '  trade_end_hhmm:   \"14:45\"' \
             '  sell_force_window:' \
-            '    start_hhmm: "14:40"' \
-            '    end_hhmm:   "14:45"' \
+            '    start_hhmm: \"14:40\"' \
+            '    end_hhmm:   \"14:45\"' \
             'swing:' \
             '  enabled: false' \
             '  hold_days: 3' \
@@ -138,7 +138,6 @@ jobs:
           nohup uvicorn rolling_k_auto_trade_api.main:app \
             --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
           echo "[API] FastAPI started: PID=$!"
-          # 짧게 로그 확인만 (실패해도 워크플로우 중단 안 함)
           echo "=== fastapi.log (tail 50) ==="
           tail -n 50 fastapi.log || true
 
@@ -148,41 +147,29 @@ jobs:
           DATE=$(date '+%F')
           echo "[REB] try POST /rebalance/generate?date=${DATE}"
           curl -fsS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" -o /dev/null || echo "[REB] endpoint not found or failed (ignored)."
-          # fallback: latest도 조회만 시도
           curl -fsS "http://127.0.0.1:8000/rebalance/latest" -o /dev/null || true
 
       - name: (ALWAYS) Check rebalance selected list
         run: |
           DATE=$(date '+%F')
           echo "[REB] check /rebalance/selected/${DATE}"
-          RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '')
-          echo "[REB] raw: ${RES}"
-          # selected_stocks 길이 확인(0이면 경고만)
-          python - <<'PY'
-import sys, json
-t = sys.stdin.read()
-try:
-    d = json.loads(t) if t else {}
-except Exception:
-    d = {}
-lst = d.get("selected_stocks") or []
-print(f"[REB] selected_stocks count: {len(lst)}")
-if len(lst) == 0:
-    print("[REB][WARN] no selected_stocks (will still proceed).")
-PY
-          # 위 파이썬에 RES를 넘김
-          # (주의) bash에서 파이썬 stdin으로 전달
-          # shellcheck disable=SC2005
-          echo "${RES}" | python - <<'PY'
-import sys, json
-t = sys.stdin.read()
-try:
-    d = json.loads(t) if t else {}
-except Exception:
-    d = {}
-lst = d.get("selected_stocks") or []
-print(f"[REB] (echo pass) selected_stocks count: {len(lst)}")
-PY
+          RES="$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '')"
+          echo "[REB] raw length: ${#RES}"
+
+          # 작은 파이썬 스크립트를 파일로 만들어 실행 (heredoc 금지)
+          printf '%s\n' \
+            'import sys, json' \
+            't = sys.stdin.read()' \
+            'try:' \
+            '    d = json.loads(t) if t else {}' \
+            'except Exception:' \
+            '    d = {}' \
+            'lst = d.get("selected_stocks") or []' \
+            'print("[REB] selected_stocks count:", len(lst))' \
+            'print("[REB][WARN] no selected_stocks (will still proceed)." if len(lst)==0 else "[REB] OK")' \
+            > /tmp/check_sel.py
+
+          printf '%s' "${RES}" | python /tmp/check_sel.py || true
 
       # ====== 여기부터 라이브 루프만 시간/요일 가드 ======
       - name: Preflight gate for live loop (trading only)
@@ -197,7 +184,7 @@ PY
           echo "[PREFLIGHT] DOW=$DOW NOW=$NOW CONTINUE=$CONTINUE"
 
       - name: Unified live loop (09:00→14:45 KST)
-        if: steps.preflight.outputs.continue == 'true'
+        if: ${{ steps.preflight.outputs.continue == 'true' }}
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
