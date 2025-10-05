@@ -1,32 +1,28 @@
 name: RKMax Live (Unified Trade Monitor)
 
 on:
-  push:
-    branches: [ rkmax-week ]
-  pull_request:
-    branches: [ rkmax-week ]
-  schedule:
-    - cron: '0 0 * * 1-5'   # 09:00 KST
   workflow_dispatch:
+  push:
+    branches:
+      - rkmax-week
+  schedule:
+    # 평일 08:50 KST (23:50 UTC, Sun-Thu)
+    - cron: "50 23 * * 0-4"
 
 jobs:
   monitor-trade:
+    name: Monitor & Rebalance
     runs-on: ubuntu-latest
-    concurrency:
-      group: rkmax-live
-      cancel-in-progress: true
-    timeout-minutes: 420
 
     env:
       TZ: Asia/Seoul
-      # === Secrets ===
+      # KIS / Account
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
-
-      # === Strategy / Ops ===
+      CANO: ${{ secrets.KIS_CANO }}
+      ACNT_PRDT_CD: ${{ secrets.KIS_ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}          # vts or real
+      # 전략 파라미터
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.007"
@@ -34,7 +30,6 @@ jobs:
       ATR_STOP_MULT: "1.5"
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:45"
-
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -51,9 +46,8 @@ jobs:
       CAPITAL_PER_SYMBOL: "100000"
       ALLOW_AFTER_HOURS: "0"
       ORDER_THROTTLE_SEC: "0.3"
-      REBALANCE_OUT_DIR: "rebalance_results"
       REBALANCE_DAYS: "7"
-
+      REBALANCE_OUT_DIR: "rebalance_results"
       SLIPPAGE_ENTER_GUARD_PCT: "1.5"
       TRAIL_DISABLE_MINUTES: "5"
       SUSPICIOUS_LOG: "trader/suspicious_targets.log"
@@ -63,164 +57,131 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (incl. FastAPI / Uvicorn, then project root)
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          # 1) 보장 설치: uvicorn/fastapi (requirements에 없더라도)
-          pip install "fastapi>=0.110" "uvicorn[standard]>=0.27"
-          # 2) 프로젝트 의존성
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # 3) 루트 모듈을 import 가능하게 (pyproject/ setup.* 있으면)
-          if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then pip install -e . || true; fi
+          set -e
+          python -V
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
-      - name: Runtime / Version info
+      - name: Write runtime config
         run: |
-          echo "=== ENV DUMP (filtered) ==="
-          env | sort | sed -E 's/(KEY|SECRET|TOKEN|CANO|ACNT).*=/REDACTED=/g' | sed -E 's/=.+/=***/'
-          echo "=== PYTHON ==="
-          python -c "import sys; print(sys.executable, sys.version)"
-          echo "=== GIT SHA ==="
-          git rev-parse --short HEAD || true
-
-      - name: Create inline strategy config (configs/rkmax-live.yaml)
-        run: |
+          set -e
           mkdir -p configs
-          printf '%s\n' \
-            'mode: daytrade' \
-            'universe: KOSDAQ_TOP50' \
-            'k_params:' \
-            '  method: rkmax' \
-            '  lookback_months: 1' \
-            'slippage:' \
-            '  max_pct: 0.0025' \
-            '  max_extra_ticks: 2' \
-            'take_profit:' \
-            '  tp1_pct: 0.008' \
-            '  tp2_pct: 0.015' \
-            'trailing:' \
-            "  pct: ${TRAIL_PCT}" \
-            "  disable_minutes: ${TRAIL_DISABLE_MINUTES}" \
-            'stops:' \
-            "  fast_stop_pct: ${FAST_STOP}" \
-            "  atr_mult: ${ATR_STOP_MULT}" \
-            'sizing:' \
-            '  scheme: equal' \
-            '  clip_min: 0.5' \
-            '  clip_max: 1.5' \
-            'time_rules:' \
-            '  trade_start_hhmm: "09:00"' \
-            '  trade_end_hhmm:   "14:45"' \
-            '  sell_force_window:' \
-            '    start_hhmm: "14:40"' \
-            '    end_hhmm:   "14:45"' \
-            'swing:' \
-            '  enabled: false' \
-            '  hold_days: 3' \
-            '  adx_min: 20' \
-            '  use_tema_filter: true' \
-            'retries:' \
-            '  max_attempts: 5' \
-            '  backoff_base_sec: 0.5' \
-            'logging:' \
-            "  level: ${LOG_LEVEL}" \
-            '  json: true' \
-            > configs/rkmax-live.yaml
+          cat > configs/rkmax-live.yaml <<'YAML'
+          mode: daytrade
+          universe: KOSDAQ_TOP50
+          k_params:
+            method: rkmax
+            lookback_months: 1
+          slippage:
+            max_pct: 0.0025
+            max_extra_ticks: 2
+          take_profit:
+            tp1_pct: 0.008
+            tp2_pct: 0.015
+          trailing:
+            pct: 0.007
+            disable_minutes: ${TRAIL_DISABLE_MINUTES}
+          stops:
+            fast_stop_pct: ${FAST_STOP}
+            atr_mult: ${ATR_STOP_MULT}
+          sizing:
+            scheme: equal
+            clip_min: 0.5
+            clip_max: 1.5
+          time_rules:
+            trade_start_hhmm: "09:00"
+            trade_end_hhmm:   "14:45"
+            sell_force_window:
+              start_hhmm: "14:40"
+              end_hhmm:   "14:45"
+          swing:
+            enabled: false
+            hold_days: 3
+            adx_min: 20
+            use_tema_filter: true
+          retries:
+            max_attempts: 5
+            backoff_base_sec: 0.5
+          logging:
+            level: ${LOG_LEVEL}
+            json: true
+          YAML
           echo "=== configs/rkmax-live.yaml ==="
           sed -n '1,200p' configs/rkmax-live.yaml
 
-      - name: Start Rebalancing API (FastAPI) and wait until ready
-        id: start_api
-        env:
-          APP_PATH_1: "rolling_k_auto_trade_api.main:app"
-          APP_PATH_2: "rolling_k_auto_trade_api.app:app"
+      - name: Start FastAPI (nohup)
         run: |
           set -e
           echo "[API] Starting FastAPI (nohup) ..."
-          LOG=fastapi.log
 
-          start_uvicorn () {
-            local APP_PATH="$1"
-            echo "[API] Trying app: ${APP_PATH}"
-            nohup python -m uvicorn "${APP_PATH}" --host 127.0.0.1 --port 8000 > "${LOG}" 2>&1 &
-            PID=$!
-            echo "[API] FastAPI started: PID=${PID}"
+          # 앱 모듈 탐색 (heredoc 제거, 한 줄짜리 파이썬)
+          python -c "import importlib; import sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
+            && TARGET="rolling_k_auto_trade_api.main:app" \
+            || TARGET="trader.api:app"
 
-            # wait up to 30s until port responds; if process dies, bail early
-            for i in $(seq 1 30); do
-              if curl -fsS "http://127.0.0.1:8000/docs" >/dev/null 2>&1; then
-                echo "ready=true" >> "$GITHUB_OUTPUT"
-                echo "[API] Ready after ${i}s"
-                return 0
-              fi
-              if ! ps -p "${PID}" >/dev/null 2>&1; then
-                echo "[API][ERROR] Process ${PID} exited during startup (import error likely)."
-                return 1
-              fi
-              sleep 1
-            done
-            echo "[API][ERROR] Not ready within timeout."
-            return 1
-          }
+          nohup uvicorn "${TARGET}" --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
+          PID=$!
+          echo "[API] FastAPI started: PID=${PID}"
 
-          # 1차 시도
-          if ! start_uvicorn "${APP_PATH_1}"; then
-            echo "[API] ---- first attempt failed; dump log ----"
-            sed -n '1,200p' "${LOG}" || true
-            echo "[API] ---- retry with fallback app path ----"
-            # 2차 시도: 다른 엔트리(필요시 추가)
-            if ! start_uvicorn "${APP_PATH_2}"; then
-              echo "[API] ---- second attempt failed; dump log ----"
-              sed -n '1,200p' "${LOG}" || true
-              # 실패해도 워크플로우는 계속: 리밸런싱 단계에서 graceful degrade
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+          # 준비 대기 (/docs 200/401)
+          for i in $(seq 1 30); do
+            sleep 1
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs || echo 000)
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
+              echo "[API] Ready after ${i}s"
+              break
             fi
-          fi
+            if [ "$i" -eq 30 ]; then
+              echo "[API][WARN] not ready within timeout — continuing anyway"
+            fi
+          done
 
           echo "=== fastapi.log (tail 80) ==="
-          tail -n 80 "${LOG}" || true
+          tail -n 80 fastapi.log || true
 
-      # ====== 리밸런싱 생성 & 검증: 항상 실행 ======
-      - name: (ALWAYS) Generate rebalance (best-effort)
+      # 리밸런싱 생성 — 항상 시도
+      - name: Rebalance – Generate (always)
+        if: ${{ always() }}
         run: |
+          set -e
           DATE=$(date '+%F')
           echo "[REB] try POST /rebalance/generate?date=${DATE}"
-          if [ "${{ steps.start_api.outputs.ready }}" = "true" ]; then
-            curl -fsS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" -o /dev/null || echo "[REB] endpoint not found or failed (ignored)."
-            curl -fsS "http://127.0.0.1:8000/rebalance/latest" -o /dev/null || true
-          else
-            echo "[REB][WARN] API not ready — skipping HTTP trigger (will rely on offline backfills if any)."
-          fi
+          curl -sS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" \
+               -H "Content-Type: application/json" \
+               -d '{}' || echo "[REB] endpoint not found or failed (ignored)."
 
-      - name: (ALWAYS) Check rebalance selected list
+      # 리밸런싱 확인/저장 — 항상 실행 (Python heredoc 제거, jq 사용)
+      - name: Rebalance – Verify & Save (always)
+        if: ${{ always() }}
         run: |
+          set -e
           DATE=$(date '+%F')
+          mkdir -p "${REBALANCE_OUT_DIR}"
           echo "[REB] check /rebalance/selected/${DATE}"
-          if [ "${{ steps.start_api.outputs.ready }}" = "true" ]; then
-            RES_JSON="$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')"
-          else
-            RES_JSON="{}"
-          fi
-          export RES_JSON
-          COUNT=$(python -c 'import os, json; t=os.environ.get("RES_JSON","{}"); print(len((json.loads(t) if t else {}).get("selected_stocks") or []))')
-          RAWLEN=$(python -c 'import os; print(len(os.environ.get("RES_JSON","")))')
-          echo "[REB] raw length: ${RAWLEN}"
+          RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')
+          echo "${RES}" > "${REBALANCE_OUT_DIR}/selected-${DATE}.json"
+
+          COUNT=$(jq -r '(.selected_stocks // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
           echo "[REB] selected_stocks count: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
-            echo "[REB][WARN] no selected_stocks (will still proceed)."
-          else
-            echo "[REB] OK"
+            echo "[REB][WARN] no selected_stocks (weekend/after-hours or empty generator output)"
           fi
 
-      # ====== 여기부터 라이브 루프만 시간/요일 가드 ======
-      - name: Preflight gate for live loop (trading only)
-        id: preflight
+      # 라이브 루프 프리플라이트 (평일/장내만 true)
+      - id: preflight
+        name: Preflight guard for live loop
         run: |
-          DOW=$(date +%u)         # 1=Mon ... 7=Sun
+          set -e
+          DOW=$(date +%u)   # 1=Mon ... 7=Sun
           NOW=$(date +%H:%M)
           CONTINUE=true
           if [ "$DOW" -ge 6 ]; then CONTINUE=false; fi
@@ -228,6 +189,7 @@ jobs:
           echo "continue=${CONTINUE}" >> "$GITHUB_OUTPUT"
           echo "[PREFLIGHT] DOW=$DOW NOW=$NOW CONTINUE=$CONTINUE"
 
+      # 라이브 트레이딩 루프 — 장중에만
       - name: Unified live loop (09:00→14:45 KST)
         if: ${{ steps.preflight.outputs.continue == 'true' }}
         env:
@@ -235,62 +197,38 @@ jobs:
         run: |
           set -e
           echo "[INIT] $(date '+%F %T %Z') — start unified live loop"
-          while true; do
-            NOW=$(date +%H:%M)
-            if [[ "$NOW" < "09:00" ]]; then
-              echo "[WAIT] $NOW < 09:00 — sleep 30s"; sleep 30; continue
-            fi
-            if [[ "$NOW" > "14:45" || "$NOW" == "14:45" ]]; then
-              echo "[FORCE-SELL] $NOW — python -m trader.trader --force-sell"
-              python -m trader.trader --force-sell || true
-              break
-            fi
-            echo "[TICK] $(date '+%T') — python -m trader.trader (regular)"
-            python -m trader.trader || true
-            sleep 60
-          done
+          python -m trader.trader || true
           echo "[DONE] $(date '+%F %T %Z') — loop ended"
 
-      - name: CEO 리포트 자동 생성
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+      - name: CEO Report
+        if: ${{ always() }}
         run: |
+          set -e
           python -m trader.report_ceo || true
 
-      - name: CEO 리포트 artifact 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ceo-report
-          path: trader/reports/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Rebalance JSON artifact 업로드
-        if: always()
+      - name: Upload Rebalance Result
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: rebalance-results
           path: rebalance_results/*.json
           if-no-files-found: warn
-          retention-days: 60
 
-      - name: Trades & suspicious logs 업로드
-        if: always()
+      - name: Upload Logs (optional)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: trade-logs
+          name: logs-and-fills
           path: |
             trader/logs/*.json
             logs/*.json
             trader/suspicious_targets.log
             fills/*.csv
           if-no-files-found: warn
-          retention-days: 14
 
-      - name: FastAPI 로그 출력 (tail)
-        if: always()
+      - name: Show FastAPI log tail
+        if: ${{ always() }}
         run: |
           echo "::group::FastAPI Server Log"
-          ( [ -f fastapi.log ] && tail -n 200 fastapi.log ) || echo "(no fastapi.log)"
+          tail -n 200 fastapi.log || true
           echo "::endgroup::"
