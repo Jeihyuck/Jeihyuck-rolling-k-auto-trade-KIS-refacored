@@ -20,6 +20,7 @@ jobs:
 
     env:
       TZ: Asia/Seoul
+
       # ===== 민감정보(Secrets) =====
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
@@ -27,7 +28,7 @@ jobs:
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV: ${{ secrets.KIS_ENV }}
 
-      # ===== 전략/운영 (동일성 유지) =====
+      # ===== 전략/운영 =====
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.007"
@@ -36,6 +37,7 @@ jobs:
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:45"
 
+      # 리밸런싱 파라미터
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -55,7 +57,7 @@ jobs:
       REBALANCE_OUT_DIR: "rebalance_results"
       REBALANCE_DAYS: "7"
 
-      # === 신규/조정 파라미터 ===
+      # 신규/조정
       SLIPPAGE_ENTER_GUARD_PCT: "1.5"
       TRAIL_DISABLE_MINUTES: "5"
       SUSPICIOUS_LOG: "trader/suspicious_targets.log"
@@ -70,7 +72,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Dependencies 설치
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -84,81 +86,66 @@ jobs:
           echo "=== GIT SHA ==="
           git rev-parse --short HEAD || true
 
+      # --- 전략 YAML 안전 생성 (heredoc/멀티라인 printf 사용 안 함) ---
       - name: Create inline strategy config (configs/rkmax-live.yaml)
         run: |
+          set -e
           mkdir -p configs
-          cat > configs/rkmax-live.yaml <<-YAML
-          mode: daytrade
-          universe: KOSDAQ_TOP50
-          k_params:
-            method: rkmax
-            lookback_months: 1
-          slippage:
-            max_pct: 0.0025
-            max_extra_ticks: 2
-          take_profit:
-            tp1_pct: 0.008
-            tp2_pct: 0.015
-          trailing:
-            pct: 0.007
-            disable_minutes: ${TRAIL_DISABLE_MINUTES}
-          stops:
-            fast_stop_pct: 0.01
-            atr_mult: 1.5
-          sizing:
-            scheme: equal
-            clip_min: 0.5
-            clip_max: 1.5
-          time_rules:
-            trade_start_hhmm: "09:00"
-            trade_end_hhmm:   "14:45"
-            sell_force_window:
-              start_hhmm: "14:40"
-              end_hhmm:   "14:45"
-          swing:
-            enabled: false
-            hold_days: 3
-            adx_min: 20
-            use_tema_filter: true
-          retries:
-            max_attempts: 5
-            backoff_base_sec: 0.5
-          logging:
-            level: INFO
-            json: true
-          YAML
+
+          CONTENT=$'mode: daytrade\nuniverse: KOSDAQ_TOP50\nk_params:\n  method: rkmax\n  lookback_months: 1\nslippage:\n  max_pct: 0.0025\n  max_extra_ticks: 2\ntake_profit:\n  tp1_pct: 0.008\n  tp2_pct: 0.015\ntrailing:\n  pct: 0.007\n  disable_minutes: ${TRAIL_DISABLE_MINUTES}\nstops:\n  fast_stop_pct: 0.01\n  atr_mult: 1.5\nsizing:\n  scheme: equal\n  clip_min: 0.5\n  clip_max: 1.5\ntime_rules:\n  trade_start_hhmm: "09:00"\n  trade_end_hhmm:   "14:45"\n  sell_force_window:\n    start_hhmm: "14:40"\n    end_hhmm:   "14:45"\nswing:\n  enabled: false\n  hold_days: 3\n  adx_min: 20\n  use_tema_filter: true\nretries:\n  max_attempts: 5\n  backoff_base_sec: 0.5\nlogging:\n  level: INFO\n  json: true\n'
+
+          # 위 문자열 안의 ${TRAIL_DISABLE_MINUTES}는 아직 리터럴이므로 실제 값으로 치환
+          CONTENT=${CONTENT//\$\{TRAIL_DISABLE_MINUTES\}/${TRAIL_DISABLE_MINUTES}}
+
+          printf '%s\n' "$CONTENT" > configs/rkmax-live.yaml
 
           echo "=== configs/rkmax-live.yaml ==="
           cat configs/rkmax-live.yaml
 
-      - name: 리밸런싱 API 서버 실행 (백그라운드)
+      - name: Start Rebalance API (background)
         run: |
           echo "[API] Starting FastAPI (nohup) ..."
           nohup uvicorn rolling_k_auto_trade_api.main:app \
             --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
           echo "[API] FastAPI started: PID=$!"
-          sleep 5
+          sleep 30
           echo "=== fastapi.log (tail 50) ==="
           tail -n 50 fastapi.log || true
 
-      - name: Preflight (KST open window)
+      - name: Generate rebalance (API or Python fallback)
+        id: gen
+        run: |
+          set -e
+          DATE=$(date '+%F')
+          echo "[GEN] Target date: ${DATE}"
+
+          if curl -fsS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" -o /dev/null ; then
+            echo "[GEN] API /rebalance/generate OK"
+          else
+            echo "[GEN] API generate 404/오류 → Python 직접 호출 시도"
+
+            PYGEN=$'import sys, importlib, os, datetime\n\ndate = os.environ.get("DATE") or datetime.date.today().isoformat()\ncandidates = [\n    ("rolling_k_auto_trade_api.generate", "main"),\n    ("rolling_k_auto_trade_api.jobs.rebalance_daily", "main"),\n    ("rolling_k_auto_trade_api.cli", "generate"),\n]\nok = False\nfor mod_name, fn_name in candidates:\n    try:\n        mod = importlib.import_module(mod_name)\n        fn = getattr(mod, fn_name)\n        try:\n            fn(date=date, out_dir=os.environ.get("REBALANCE_OUT_DIR","rebalance_results"))\n            ok = True; print(f"[PYGEN] {mod_name}.{fn_name} success"); break\n        except TypeError:\n            fn(date)\n            ok = True; print(f"[PYGEN] {mod_name}.{fn_name}(date) success"); break\n    except Exception as e:\n        print(f"[PYGEN] {mod_name}.{fn_name} failed: {e}")\n        continue\nif not ok:\n    print("[PYGEN] no generator worked")\n    sys.exit(2)\n'
+            printf '%s\n' "$PYGEN" > /tmp/pygen.py
+            DATE="${DATE}" python /tmp/pygen.py || exit 101
+          fi
+
+          CHECK=$'import sys, json\nt = sys.stdin.read()\ntry:\n    d = json.loads(t) if t else {}\nexcept Exception:\n    d = {}\nlst = d.get("selected_stocks") or []\nready = len(lst) > 0\nprint(f"[CHECK] selected_stocks_len={len(lst)} ready={ready}")\nsys.exit(0 if ready else 2)\n'
+          printf '%s\n' "$CHECK" > /tmp/check_selected.py
+
+          RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo "")
+          echo "[GEN] selected/${DATE} → ${RES:0:200}..."
+          echo "${RES}" | python /tmp/check_selected.py || (echo "::error::리밸런싱 결과가 비어있습니다. 서버/생성 코드를 점검하세요." && exit 1)
+
+      - name: Preflight (market hour check)
         id: preflight
         run: |
-          DOW=$(date +%u)         # 1=Mon ... 7=Sun
+          DOW=$(date +%u)         # 1=Mon..7=Sun
           NOW=$(date +%H:%M)
           CONTINUE=true
           if [ "$DOW" -ge 6 ]; then CONTINUE=false; fi
           if [[ "$NOW" < "09:00" || "$NOW" > "14:45" ]]; then CONTINUE=false; fi
           echo "continue=${CONTINUE}" >> "$GITHUB_OUTPUT"
           echo "[PREFLIGHT] DOW=$DOW NOW=$NOW CONTINUE=$CONTINUE"
-
-      # (선택) 리밸런싱 산출을 API 없이 파일로 미리 생성하고 싶다면, 아래 주석을 프로젝트 CLI에 맞게 켜서 사용
-      # - name: Generate rebalance JSON (optional)
-      #   if: steps.preflight.outputs.continue == 'true'
-      #   env:
-      #     PYTHONPATH: ${{ github.workspace }}
-      #   run: |
-      #     python -m yourproject.rebalance_cli --date "$(date +%F)" --out-dir "${REBALANCE_OUT_DIR}" || echo "[WARN] rebalance CLI failed"
 
       - name: Unified live loop (09:00→14:45 KST)
         if: steps.preflight.outputs.continue == 'true'
