@@ -124,7 +124,12 @@ jobs:
         run: |
           set -e
           echo "[API] Starting FastAPI (nohup) ..."
-          TARGET="rolling_k_auto_trade_api.main:app"  # 고정
+
+          # 앱 모듈 탐색 (간단한 파이썬 원라이너)
+          python -c "import importlib,sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
+            && TARGET="rolling_k_auto_trade_api.main:app" \
+            || TARGET="trader.api:app"
+
           nohup uvicorn "${TARGET}" --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
           PID=$!
           echo "[API] FastAPI started: PID=${PID}"
@@ -145,7 +150,7 @@ jobs:
           echo "=== fastapi.log (tail 80) ==="
           tail -n 80 fastapi.log || true
 
-      # 리밸런싱 생성 — 항상 시도 (주말/장외 포함)
+      # 리밸런싱 생성 — 항상 시도
       - name: Rebalance – Generate (always)
         if: ${{ always() }}
         run: |
@@ -156,7 +161,7 @@ jobs:
                -H "Content-Type: application/json" \
                -d '{}' || echo "[REB] endpoint not found or failed (ignored)."
 
-      # 리밸런싱 확인/저장 — 항상 실행
+      # 리밸런싱 확인/저장 — 항상 실행 (jq로 selected 키도 지원)
       - name: Rebalance – Verify & Save (always)
         if: ${{ always() }}
         run: |
@@ -167,11 +172,10 @@ jobs:
           RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')
           echo "${RES}" > "${REBALANCE_OUT_DIR}/selected-${DATE}.json"
 
-          COUNT=$(jq -r '(.selected // .signals // .selected_stocks // .data.selected // .data.selected_stocks // []) | length' \
-                 "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
+          COUNT=$(jq -r '(.selected // .selected_stocks // .data.selected // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
           echo "[REB] selected count: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
-            echo "[REB][WARN] empty selection (weekend/after-hours or generator returned empty)"
+            echo "[REB][WARN] no selected signals (weekend/after-hours or empty generator output)"
           fi
 
       # 라이브 루프 프리플라이트 (평일/장내만 true)

@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 if not API_BASE_URL:
     API_BASE_URL = os.getenv("API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
 
+# 표준/별칭 ENV 동시 지원을 위한 헬퍼
+_DEF = object()
+
+def _env_first(*keys: str, default: Optional[str] = None) -> Optional[str]:
+    for k in keys:
+        v = os.getenv(k, _DEF)
+        if v is not _DEF and v is not None and str(v).strip() != "":
+            return str(v)
+    return default
+
+
+def _bool_env(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "y", "yes", "on"}
+
+
 logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
 logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
 logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
@@ -139,7 +157,9 @@ class KisAPI:
     - HashKey 의무 적용(API 문서 기준)
     - 견고한 토큰 캐시/재발급, 지수형 백오프
     - 호환 메서드 유지 + 신규(place_limit_ioc/place_market/get_quote)
-    - degraded mode: 토큰/네트워크 불안 시 읽기전용으로 안전 시작
+    - degraded mode:
+        * 계좌정보(CANO/ACNT_PRDT_CD) 미설정 시 주문 차단(시세/조회만 허용)
+        * 토큰 발급 불가 시 전체를 읽기전용(시세/조회만)으로 시작
     """
 
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
@@ -147,13 +167,14 @@ class KisAPI:
     _token_lock = threading.Lock()
 
     def __init__(self):
-        self.CANO = safe_strip(CANO)
-        self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
-        self.env = safe_strip(KIS_ENV or "practice").lower()
+        # 1) 기본 settings 값을 우선, 비었으면 별칭 ENV(KIS_*)로 보강
+        self.CANO = safe_strip(CANO) or safe_strip(_env_first("KIS_CANO", "CANO", default=""))
+        self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD) or safe_strip(_env_first("KIS_ACNT_PRDT_CD", "ACNT_PRDT_CD", default=""))
+        self.env = safe_strip(KIS_ENV or _env_first("KIS_ENV", default="practice")).lower()
         if self.env not in ("practice", "real"):
             self.env = "practice"
 
-        # 세션 + 재시도 어댑터
+        # 2) 세션 + 재시도 어댑터
         self.session = requests.Session()
         retry = Retry(
             total=3,
@@ -176,18 +197,28 @@ class KisAPI:
         self._recent_sells_lock = threading.Lock()
         self._recent_sells_cooldown = 60.0
 
-        # degraded (읽기전용) 모드 플래그
-        self.degraded = False
+        # degraded 사유 분리
+        self._degraded_account = False  # 계좌정보 누락
+        self._degraded_token = False    # 토큰 발급 실패
 
-        # 토큰 확보 시도 (실패시 degraded mode로 시작)
+        # 계좌 필수값 확인(주문 필요시)
+        if not (self.CANO and self.ACNT_PRDT_CD):
+            self._degraded_account = True
+            logger.warning("[KisAPI init] 계좌 ENV 누락(CANO/ACNT_PRDT_CD) → 주문은 차단됩니다. 시세/조회만 허용")
+
+        # 토큰 확보 시도 (시세/조회에 필요). 실패해도 전체 동작은 계속(조회 일부 제한)
         try:
             self.token = self.get_valid_token()
         except Exception as e:
-            logger.warning(f"[KisAPI init] 토큰 발급 실패 → degraded mode: {e}")
-            self.degraded = True
+            self._degraded_token = True
             self.token = self._token_cache.get("token")
+            logger.warning(f"[KisAPI init] 토큰 발급 실패 → 읽기전용 모드 강화: {e}")
 
-        logger.info(f"[KisAPI init] CANO={repr(self.CANO)} env={self.env} degraded={self.degraded}")
+        self.degraded = self._degraded_account or self._degraded_token
+        logger.info(
+            f"[KisAPI init] CANO={repr('***' if self.CANO else '')} env={self.env} "
+            f"degraded_account={self._degraded_account} degraded_token={self._degraded_token}"
+        )
 
     # -------------------------------
     # 토큰
@@ -238,7 +269,10 @@ class KisAPI:
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
         headers = {"content-type": "application/json"}
-        data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
+        # APP_*와 KIS_* 별칭 모두 지원
+        app_key = APP_KEY or _env_first("APP_KEY", "KIS_APP_KEY", default="")
+        app_secret = APP_SECRET or _env_first("APP_SECRET", "KIS_APP_SECRET", default="")
+        data = {"grant_type": "client_credentials", "appkey": app_key, "appsecret": app_secret}
 
         last_exc = None
         # 지수 백오프 재시도 (추가 로컬 재시도 외에도 session adapter retry 있음)
@@ -266,9 +300,12 @@ class KisAPI:
     # 헤더/HashKey
     # -------------------------------
     def _headers(self, tr_id: str, hashkey: Optional[str] = None):
+        # APP_*와 KIS_* 별칭 모두 지원
+        app_key = APP_KEY or _env_first("APP_KEY", "KIS_APP_KEY", default="")
+        app_secret = APP_SECRET or _env_first("APP_SECRET", "KIS_APP_SECRET", default="")
         h = {
-            "appkey": APP_KEY,
-            "appsecret": APP_SECRET,
+            "appkey": app_key,
+            "appsecret": app_secret,
             "tr_id": tr_id,
             "custtype": "P",
             "content-type": "application/json; charset=utf-8",
@@ -287,11 +324,14 @@ class KisAPI:
         return h
 
     def _create_hashkey(self, body_dict: dict) -> str:
+        # APP_*와 KIS_* 별칭 모두 지원
+        app_key = APP_KEY or _env_first("APP_KEY", "KIS_APP_KEY", default="")
+        app_secret = APP_SECRET or _env_first("APP_SECRET", "KIS_APP_SECRET", default="")
         url = f"{API_BASE_URL}/uapi/hashkey"
         headers = {
             "content-type": "application/json; charset=utf-8",
-            "appkey": APP_KEY,
-            "appsecret": APP_SECRET,
+            "appkey": app_key,
+            "appsecret": app_secret,
         }
         body_str = _json_dumps(body_dict)
         try:
@@ -398,12 +438,18 @@ class KisAPI:
                         bid = None
                         for k in ("askp1", "askp_prc_1", "askp", "askp0"):
                             if out.get(k) is not None:
-                                try: ask = float(out.get(k)); break
-                                except Exception: pass
+                                try:
+                                    ask = float(out.get(k))
+                                    break
+                                except Exception:
+                                    pass
                         for k in ("bidp1", "bidp_prc_1", "bidp", "bidp0"):
                             if out.get(k) is not None:
-                                try: bid = float(out.get(k)); break
-                                except Exception: pass
+                                try:
+                                    bid = float(out.get(k))
+                                    break
+                                except Exception:
+                                    pass
                         last = None
                         try:
                             last = float(out.get("stck_prpr")) if out.get("stck_prpr") is not None else None
@@ -457,7 +503,9 @@ class KisAPI:
                 return None
             trs: List[float] = []
             for i in range(1, len(candles)):
-                h = candles[i]["high"]; l = candles[i]["low"]; c_prev = candles[i - 1]["close"]
+                h = candles[i]["high"]
+                l = candles[i]["low"]
+                c_prev = candles[i - 1]["close"]
                 tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
                 trs.append(tr)
             if not trs:
@@ -568,13 +616,22 @@ class KisAPI:
     # 주문 공통(신규: 라우터 연동을 위한 메서드 제공)
     # =====================================================
 
+    def _order_block_if_degraded(self) -> Optional[dict]:
+        """주문 전 degraded 여부 검사. 차단 시 사유를 명확히 답한다."""
+        if self._degraded_account:
+            return {"status": "fail", "error": "missing_account_env", "message": "CANO/ACNT_PRDT_CD not set"}
+        if self._degraded_token:
+            return {"status": "fail", "error": "token_unavailable", "message": "access token unavailable"}
+        return None
+
     def place_limit_ioc(self, *, code: str, side: str, qty: int, price: float) -> Dict[str, Any]:
         """
         - 실제 IOC 지정가: 실계좌(SOR 가능)에서만 ORD_DVSN='11' + EXCG_ID_DVSN_CD='SOR'
         - 모의계좌(KRX만 가능): ORD_DVSN='00'(지정가)로 에뮬레이션
         """
-        if self.degraded:
-            return {"status": "fail", "error": "degraded_mode"}
+        blocked = self._order_block_if_degraded()
+        if blocked:
+            return blocked
 
         pdno = safe_strip(code)
         body = {
@@ -616,8 +673,9 @@ class KisAPI:
         return {"status": "fail", "error_code": data.get("msg_cd"), "error_msg": data.get("msg1"), "raw": data}
 
     def place_market(self, *, code: str, side: str, qty: int) -> Dict[str, Any]:
-        if self.degraded:
-            return {"status": "fail", "error": "degraded_mode"}
+        blocked = self._order_block_if_degraded()
+        if blocked:
+            return blocked
 
         pdno = safe_strip(code)
         body = {
@@ -656,9 +714,10 @@ class KisAPI:
     # (기존) 범용 주문 래퍼 + 호환 buy/sell_* API
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
-        if self.degraded:
+        blocked = self._order_block_if_degraded()
+        if blocked:
             logger.warning("[ORDER_BLOCKED] degraded mode - 주문 차단")
-            return None
+            return blocked
 
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
