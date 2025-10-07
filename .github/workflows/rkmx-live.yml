@@ -13,16 +13,18 @@ jobs:
   monitor-trade:
     name: Monitor & Rebalance
     runs-on: ubuntu-latest
+    # 만약 Environment 시크릿을 쓰신다면 아래 주석 해제하고 prod 등을 맞춰주세요.
+    # environment: prod
 
     env:
       TZ: Asia/Seoul
 
       # KIS / Account
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       CANO: ${{ secrets.KIS_CANO }}
       ACNT_PRDT_CD: ${{ secrets.KIS_ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}      # vts or real
+      KIS_ENV: ${{ secrets.KIS_ENV }}   # vts or real
 
       # 전략 파라미터
       PARTIAL1: "0.5"
@@ -72,6 +74,18 @@ jobs:
           pip install -r requirements.txt
           sudo apt-get update -y
           sudo apt-get install -y jq
+
+      - name: Check required secrets presence (no value print)
+        run: |
+          set -e
+          for k in APP_KEY APP_SECRET KIS_ENV CANO ACNT_PRDT_CD; do
+            v="${!k}"
+            if [ -n "$v" ]; then
+              echo "::notice title=Secret presence::$k=SET"
+            else
+              echo "::warning title=Secret missing::$k=EMPTY"
+            fi
+          done
 
       - name: Write runtime config
         run: |
@@ -124,9 +138,8 @@ jobs:
         run: |
           set -e
           echo "[API] Starting FastAPI (nohup) ..."
-
-          # 앱 모듈 탐색 (간단한 파이썬 원라이너)
-          python -c "import importlib,sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
+          # 앱 모듈 탐색 (rolling_k_auto_trade_api.main 우선, 없으면 trader.api)
+          python -c "import importlib; import sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
             && TARGET="rolling_k_auto_trade_api.main:app" \
             || TARGET="trader.api:app"
 
@@ -161,7 +174,7 @@ jobs:
                -H "Content-Type: application/json" \
                -d '{}' || echo "[REB] endpoint not found or failed (ignored)."
 
-      # 리밸런싱 확인/저장 — 항상 실행 (jq로 selected 키도 지원)
+      # 리밸런싱 확인/저장 — 항상 실행 (jq 사용)
       - name: Rebalance – Verify & Save (always)
         if: ${{ always() }}
         run: |
@@ -172,10 +185,10 @@ jobs:
           RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')
           echo "${RES}" > "${REBALANCE_OUT_DIR}/selected-${DATE}.json"
 
-          COUNT=$(jq -r '(.selected // .selected_stocks // .data.selected // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
+          COUNT=$(jq -r '(.selected // .selected_stocks // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
           echo "[REB] selected count: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
-            echo "[REB][WARN] no selected signals (weekend/after-hours or empty generator output)"
+            echo "[REB][WARN] no selected_stocks (weekend/after-hours or empty generator output)"
           fi
 
       # 라이브 루프 프리플라이트 (평일/장내만 true)
@@ -198,6 +211,10 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -e
+          # 계좌 필수값이 없으면 루프 시작을 막고 로그만 남김 (실거래 보호)
+          if [ -z "${CANO}" ] || [ -z "${ACNT_PRDT_CD}" ]; then
+            echo "::warning title=Account env missing::CANO/ACNT_PRDT_CD is empty — live loop will not trade."
+          fi
           echo "[INIT] $(date '+%F %T %Z') — start unified live loop"
           python -m trader.trader || true
           echo "[DONE] $(date '+%F %T %Z') — loop ended"
@@ -234,3 +251,4 @@ jobs:
           echo "::group::FastAPI Server Log"
           tail -n 200 fastapi.log || true
           echo "::endgroup::"
+  
