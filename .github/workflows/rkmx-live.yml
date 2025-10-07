@@ -3,8 +3,7 @@ name: RKMax Live (Unified Trade Monitor)
 on:
   workflow_dispatch:
   push:
-    branches:
-      - rkmax-week
+    branches: [ rkmax-week ]
   schedule:
     # 평일 08:50 KST (23:50 UTC, Sun-Thu)
     - cron: "50 23 * * 0-4"
@@ -13,19 +12,28 @@ jobs:
   monitor-trade:
     name: Monitor & Rebalance
     runs-on: ubuntu-latest
-    # ↓ Environment 시크릿을 쓸 경우만 주석을 해제하고 사용하세요 (Settings → Environments → <prod> 에 시크릿 저장)
-    # environment: prod
+
+    # Environments를 쓰는 경우에만 유지 (prod에 시크릿 저장되어 있어야 함)
+    environment: prod
 
     env:
       TZ: Asia/Seoul
-      # KIS / Account  (Repository secrets 또는 Environment secrets에 저장)
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      CANO: ${{ secrets.KIS_CANO }}
-      ACNT_PRDT_CD: ${{ secrets.KIS_ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}            # vts or real
 
-      # 전략 파라미터
+      # KIS / Account secrets (원본/별칭 모두 주입)
+      KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+      APP_KEY:          ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+      APP_SECRET:       ${{ secrets.KIS_APP_SECRET }}
+
+      CANO:             ${{ secrets.KIS_CANO }}
+      KIS_CANO:         ${{ secrets.KIS_CANO }}
+      ACNT_PRDT_CD:     ${{ secrets.KIS_ACNT_PRDT_CD }}
+      KIS_ACNT_PRDT_CD: ${{ secrets.KIS_ACNT_PRDT_CD }}
+
+      # practice or real
+      KIS_ENV:          ${{ secrets.KIS_ENV }}
+
+      # Strategy params
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.007"
@@ -68,11 +76,11 @@ jobs:
       - name: Check required secrets presence
         run: |
           set -e
-          echo "KIS_APP_KEY: $([[ -n "$KIS_APP_KEY" ]] && echo SET || echo EMPTY)"
+          echo "KIS_APP_KEY:    $([[ -n "$KIS_APP_KEY" ]] && echo SET || echo EMPTY)"
           echo "KIS_APP_SECRET: $([[ -n "$KIS_APP_SECRET" ]] && echo SET || echo EMPTY)"
-          echo "CANO: $([[ -n "$CANO" ]] && echo SET || echo EMPTY)"
-          echo "ACNT_PRDT_CD: $([[ -n "$ACNT_PRDT_CD" ]] && echo SET || echo EMPTY)"
-          echo "KIS_ENV: $([[ -n "$KIS_ENV" ]] && echo SET || echo EMPTY)"
+          echo "CANO:           $([[ -n "$CANO" ]] && echo SET || echo EMPTY)"
+          echo "ACNT_PRDT_CD:   $([[ -n "$ACNT_PRDT_CD" ]] && echo SET || echo EMPTY)"
+          echo "KIS_ENV:        $([[ -n "$KIS_ENV" ]] && echo SET || echo EMPTY)"
 
       - name: Install deps
         run: |
@@ -130,37 +138,48 @@ jobs:
           echo "=== configs/rkmax-live.yaml ==="
           sed -n '1,200p' configs/rkmax-live.yaml
 
-      - name: Start FastAPI (nohup)
+      - name: Start FastAPI (nohup) with robust target discovery
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -e
-          echo "[API] Starting FastAPI (nohup) ..."
-          # 앱 모듈 탐색 (rolling_k_auto_trade_api.main 우선)
-          python -c "import importlib,sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
-            && TARGET="rolling_k_auto_trade_api.main:app" \
-            || TARGET="trader.api:app"
+          echo "[API] Discovering FastAPI app module..."
+          CANDIDATES=("rolling_k_auto_trade_api.main:app" "rolling_k_auto_trade_api.api:app" "trader.api:app" "api:app" "main:app")
 
-          nohup uvicorn "${TARGET}" --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
-          PID=$!
-          echo "[API] FastAPI started: PID=${PID}"
-
-          # 준비 대기 (/docs 200/401)
-          for i in $(seq 1 30); do
-            sleep 1
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs || echo 000)
-            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
-              echo "[API] Ready after ${i}s"
+          TARGET=""
+          for C in "${CANDIDATES[@]}"; do
+            if python -c 'import importlib,sys; t=sys.argv[1]; mod,app=t.split(":"); m=importlib.import_module(mod); getattr(m,app)' "$C"; then
+              TARGET="$C"
               break
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "[API][WARN] not ready within timeout — continuing anyway"
             fi
           done
 
-          echo "=== fastapi.log (tail 80) ==="
-          tail -n 80 fastapi.log || true
+          if [ -z "$TARGET" ]; then
+            echo "[API][FATAL] FastAPI app not found in: ${CANDIDATES[*]}"
+            echo "[API][HINT] Ensure one of these exists and exports `app`: ${CANDIDATES[*]}"
+            exit 1
+          fi
 
-      # 리밸런싱 생성 — 항상 시도
-      - name: Rebalance – Generate (always)
+          echo "[API] Starting FastAPI target=${TARGET} ..."
+          nohup uvicorn "$TARGET" --host 127.0.0.1 --port 8000 > fastapi.log 2>&1 &
+
+          # readiness wait
+          for i in $(seq 1 40); do
+            sleep 1
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs || echo 000)
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
+              echo "[API] Ready after ${i}s (http ${CODE})"
+              break
+            fi
+            if [ "$i" -eq 40 ]; then
+              echo "[API][WARN] not ready within timeout — showing log and continuing"
+            fi
+          done
+
+          echo "=== fastapi.log (tail 120) ==="
+          tail -n 120 fastapi.log || true
+
+      - name: Rebalance - Generate (always)
         if: ${{ always() }}
         run: |
           set -e
@@ -170,8 +189,7 @@ jobs:
                -H "Content-Type: application/json" \
                -d '{}' || echo "[REB] endpoint not found or failed (ignored)."
 
-      # 리밸런싱 확인/저장 — 항상 실행
-      - name: Rebalance – Verify & Save (always)
+      - name: Rebalance - Verify & Save (always)
         if: ${{ always() }}
         run: |
           set -e
@@ -180,14 +198,12 @@ jobs:
           echo "[REB] check /rebalance/selected/${DATE}"
           RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')
           echo "${RES}" > "${REBALANCE_OUT_DIR}/selected-${DATE}.json"
-
           COUNT=$(jq -r '(.selected_stocks // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
           echo "[REB] selected_stocks count: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
             echo "[REB][WARN] no selected_stocks (weekend/after-hours or empty generator output)"
           fi
 
-      # 라이브 루프 프리플라이트 (평일/장내만 true)
       - id: preflight
         name: Preflight guard for live loop
         run: |
@@ -200,8 +216,7 @@ jobs:
           echo "continue=${CONTINUE}" >> "$GITHUB_OUTPUT"
           echo "[PREFLIGHT] DOW=$DOW NOW=$NOW CONTINUE=$CONTINUE"
 
-      # 라이브 트레이딩 루프 — 장중에만
-      - name: Unified live loop (09:00→14:45 KST)
+      - name: Unified live loop (09:00->14:45 KST)
         if: ${{ steps.preflight.outputs.continue == 'true' }}
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -243,3 +258,4 @@ jobs:
           echo "::group::FastAPI Server Log"
           tail -n 200 fastapi.log || true
           echo "::endgroup::"
+
