@@ -64,7 +64,6 @@ def _json_dumps(body: dict) -> str:
     """HashKey/주문 본문 모두 동일 직렬화 문자열을 사용."""
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
-
 # =====================================================
 # 체결 기록 CSV 저장
 # =====================================================
@@ -94,7 +93,6 @@ def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: s
     except Exception as e:
         logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
 
-
 # =====================================================
 # 간단 레이트리미터(엔드포인트별 최소 간격 유지)
 # =====================================================
@@ -113,7 +111,6 @@ class _RateLimiter:
             if delta < self.min_interval:
                 time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
             self.last_at[key] = time.time()
-
 
 # =====================================================
 # TR_ID 맵(최신 스펙 반영) + 환경변수 오버라이드
@@ -145,7 +142,6 @@ def _pick_tr(env: str, key: str) -> List[str]:
         return TR_MAP[env][key]
     except Exception:
         return []
-
 
 # =====================================================
 # 본체
@@ -726,7 +722,7 @@ class KisAPI:
         ord_dvsn_chain = ["01"]
         if self.env == "real":
             ord_dvsn_chain.append("13")  # IOC시장가(SOR)
-        ord_dvsn_chain.append("03")      # 최유리
+        ord_dvsn_chain.append("03")     # 최유리
 
         last_err = None
 

@@ -13,18 +13,17 @@ jobs:
   monitor-trade:
     name: Monitor & Rebalance
     runs-on: ubuntu-latest
-    # 만약 Environment 시크릿을 쓰신다면 아래 주석 해제하고 prod 등을 맞춰주세요.
+    # ↓ Environment 시크릿을 쓸 경우만 주석을 해제하고 사용하세요 (Settings → Environments → <prod> 에 시크릿 저장)
     # environment: prod
 
     env:
       TZ: Asia/Seoul
-
-      # KIS / Account
-      APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      # KIS / Account  (Repository secrets 또는 Environment secrets에 저장)
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       CANO: ${{ secrets.KIS_CANO }}
       ACNT_PRDT_CD: ${{ secrets.KIS_ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}   # vts or real
+      KIS_ENV: ${{ secrets.KIS_ENV }}            # vts or real
 
       # 전략 파라미터
       PARTIAL1: "0.5"
@@ -66,6 +65,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check required secrets presence
+        run: |
+          set -e
+          echo "KIS_APP_KEY: $([[ -n "$KIS_APP_KEY" ]] && echo SET || echo EMPTY)"
+          echo "KIS_APP_SECRET: $([[ -n "$KIS_APP_SECRET" ]] && echo SET || echo EMPTY)"
+          echo "CANO: $([[ -n "$CANO" ]] && echo SET || echo EMPTY)"
+          echo "ACNT_PRDT_CD: $([[ -n "$ACNT_PRDT_CD" ]] && echo SET || echo EMPTY)"
+          echo "KIS_ENV: $([[ -n "$KIS_ENV" ]] && echo SET || echo EMPTY)"
+
       - name: Install deps
         run: |
           set -e
@@ -74,18 +82,6 @@ jobs:
           pip install -r requirements.txt
           sudo apt-get update -y
           sudo apt-get install -y jq
-
-      - name: Check required secrets presence (no value print)
-        run: |
-          set -e
-          for k in APP_KEY APP_SECRET KIS_ENV CANO ACNT_PRDT_CD; do
-            v="${!k}"
-            if [ -n "$v" ]; then
-              echo "::notice title=Secret presence::$k=SET"
-            else
-              echo "::warning title=Secret missing::$k=EMPTY"
-            fi
-          done
 
       - name: Write runtime config
         run: |
@@ -138,8 +134,8 @@ jobs:
         run: |
           set -e
           echo "[API] Starting FastAPI (nohup) ..."
-          # 앱 모듈 탐색 (rolling_k_auto_trade_api.main 우선, 없으면 trader.api)
-          python -c "import importlib; import sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
+          # 앱 모듈 탐색 (rolling_k_auto_trade_api.main 우선)
+          python -c "import importlib,sys; importlib.import_module('rolling_k_auto_trade_api.main'); sys.stdout.write('OK')" >/dev/null 2>&1 \
             && TARGET="rolling_k_auto_trade_api.main:app" \
             || TARGET="trader.api:app"
 
@@ -169,24 +165,24 @@ jobs:
         run: |
           set -e
           DATE=$(date '+%F')
-          echo "[REB] POST /rebalance/run/${DATE}?force_generate=true"
-          curl -sS -X POST "http://127.0.0.1:8000/rebalance/run/${DATE}?force_generate=true" \
+          echo "[REB] try POST /rebalance/generate?date=${DATE}"
+          curl -sS -X POST "http://127.0.0.1:8000/rebalance/generate?date=${DATE}" \
                -H "Content-Type: application/json" \
                -d '{}' || echo "[REB] endpoint not found or failed (ignored)."
 
-      # 리밸런싱 확인/저장 — 항상 실행 (jq 사용)
+      # 리밸런싱 확인/저장 — 항상 실행
       - name: Rebalance – Verify & Save (always)
         if: ${{ always() }}
         run: |
           set -e
           DATE=$(date '+%F')
           mkdir -p "${REBALANCE_OUT_DIR}"
-          echo "[REB] GET /rebalance/selected/${DATE}"
+          echo "[REB] check /rebalance/selected/${DATE}"
           RES=$(curl -sS "http://127.0.0.1:8000/rebalance/selected/${DATE}" || echo '{}')
           echo "${RES}" > "${REBALANCE_OUT_DIR}/selected-${DATE}.json"
 
-          COUNT=$(jq -r '(.selected // .selected_stocks // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
-          echo "[REB] selected count: ${COUNT}"
+          COUNT=$(jq -r '(.selected_stocks // .data.selected_stocks // []) | length' "${REBALANCE_OUT_DIR}/selected-${DATE}.json" 2>/dev/null || echo 0)
+          echo "[REB] selected_stocks count: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
             echo "[REB][WARN] no selected_stocks (weekend/after-hours or empty generator output)"
           fi
@@ -211,10 +207,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -e
-          # 계좌 필수값이 없으면 루프 시작을 막고 로그만 남김 (실거래 보호)
-          if [ -z "${CANO}" ] || [ -z "${ACNT_PRDT_CD}" ]; then
-            echo "::warning title=Account env missing::CANO/ACNT_PRDT_CD is empty — live loop will not trade."
-          fi
           echo "[INIT] $(date '+%F %T %Z') — start unified live loop"
           python -m trader.trader || true
           echo "[DONE] $(date '+%F %T %Z') — loop ended"
@@ -251,4 +243,3 @@ jobs:
           echo "::group::FastAPI Server Log"
           tail -n 200 fastapi.log || true
           echo "::endgroup::"
-  
