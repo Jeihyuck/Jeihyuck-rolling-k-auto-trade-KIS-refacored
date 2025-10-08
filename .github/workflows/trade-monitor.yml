@@ -2,9 +2,9 @@ name: Trade Monitor
 
 on:
   push:
-    branches: [ feature/rkmax ]
+    branches: [ change-logic ]
   pull_request:
-    branches: [ feature/rkmax ]
+    branches: [ change-logic ]
   schedule:
     # 매일 한국시간 08:30 (UTC 23:30, 일~목) 실행
     - cron: "30 23 * * 0-4"
