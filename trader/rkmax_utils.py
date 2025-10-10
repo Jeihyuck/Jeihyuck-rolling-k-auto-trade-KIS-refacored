@@ -234,6 +234,40 @@ def rolling_ret_mdd_from_close(closes: pd.Series, window: int = 20) -> Tuple[flo
     dd = (seg / runmax - 1.0) * 100.0
     mdd = abs(dd.min())
     return float(ret), float(mdd)
+def get_best_k_meta(_, __, k_metrics):
+    # 가장 단순하게 avg_return_pct 최대 K 선택
+    if not k_metrics:
+        return 0.5
+    best = max(k_metrics, key=lambda x: x.get('avg_return_pct', -999))
+    return best.get('k', 0.5)
+
+def assign_weights(selected):
+    # 동등가중치 할당 예시
+    if not selected:
+        return []
+    w = 1.0 / len(selected)
+    for s in selected:
+        s['weight'] = w
+    return selected
+
+def _enforce_min_weight_for_forced(selected, forced_codes, min_weight=0.08):
+    # 강제포함 종목의 최소 weight 보장 (예시)
+    total = sum(s['weight'] for s in selected)
+    n_forced = sum(1 for s in selected if s.get('forced_include'))
+    if n_forced == 0:
+        return selected
+    for s in selected:
+        if s.get('forced_include') and s['weight'] < min_weight:
+            s['weight'] = min_weight
+    # 나머지 종목들의 weight는 비율에 맞게 scale down
+    forced_weight_sum = sum(s['weight'] for s in selected if s.get('forced_include'))
+    left = 1.0 - forced_weight_sum
+    others = [s for s in selected if not s.get('forced_include')]
+    if others and left > 0:
+        w = left / len(others)
+        for s in others:
+            s['weight'] = w
+    return selected
 
 # --- (끝) ---
 
