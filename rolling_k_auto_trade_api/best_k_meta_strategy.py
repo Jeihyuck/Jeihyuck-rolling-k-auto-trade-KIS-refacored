@@ -357,5 +357,5 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict[str, Any]]:
     selected = assign_weights(selected)
     # 보유분 최소 비중 하한 보정 (합계 1 유지)
     if selected and HELD_MIN_WEIGHT > 0:
-        selected = _enforce_min_weight_for_forced(selected, min_w=HELD_MIN_WEIGHT)
+        selected = _enforce_min_weight_for_forced(selected, [], min_weight=HELD_MIN_WEIGHT)
     return selected
