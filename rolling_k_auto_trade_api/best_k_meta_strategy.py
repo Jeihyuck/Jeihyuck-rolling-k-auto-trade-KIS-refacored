@@ -8,8 +8,9 @@
 - 보유종목 강제포함/비중하한/rolling top5 통합
 """
 
-from trader.rkmax_utils import get_best_k_meta, assign_weights, _enforce_min_weight_for_forced
 from __future__ import annotations
+
+from trader.rkmax_utils import get_best_k_meta, assign_weights, _enforce_min_weight_for_forced
 from datetime import datetime, timedelta, date
 import logging
 from typing import Dict, List, Any, Optional, Iterable
