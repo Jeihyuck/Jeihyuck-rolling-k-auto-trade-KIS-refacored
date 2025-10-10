@@ -413,3 +413,290 @@ class KisAPI:
     # -------------------------------
 
 # -- (끝) --
+# KisAPI 클래스 안에 아래 블록 전체를 추가
+
+    # -------------------------------
+    # 주문 공통
+    # -------------------------------
+    def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+
+        # TR 후보 순차 시도
+        tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
+
+        # Fallback: 시장가 → IOC시장가 → 최유리
+        ord_dvsn_chain = ["01", "13", "03"]
+        last_err = None
+
+        for tr_id in tr_list:
+            for ord_dvsn in ord_dvsn_chain:
+                body["ORD_DVSN"] = ord_dvsn
+                body["ORD_UNPR"] = "0"
+                if is_sell and not body.get("SLL_TYPE"):
+                    body["SLL_TYPE"] = "01"
+                body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+
+                # HashKey
+                try:
+                    hk = self._create_hashkey(body)
+                except Exception as e:
+                    logger.error(f"[ORDER_HASH_FAIL] body={body} ex={e}")
+                    last_err = e
+                    continue
+
+                headers = self._headers(tr_id, hk)
+
+                # 레이트리밋(주문은 별 키)
+                self._limiter.wait("orders")
+
+                # 로깅(민감 Mask)
+                log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
+                logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
+
+                # 네트워크/게이트웨이 재시도
+                for attempt in range(1, 4):
+                    try:
+                        resp = self.session.post(
+                            url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+                        )
+                        data = resp.json()
+                    except Exception as e:
+                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                        logger.error(
+                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} ex={e} → sleep {backoff:.2f}s"
+                        )
+                        time.sleep(backoff)
+                        last_err = e
+                        continue
+
+                    if resp.status_code == 200 and data.get("rt_cd") == "0":
+                        logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
+                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
+                        try:
+                            out = data.get("output") or {}
+                            odno = out.get("ODNO") or out.get("ord_no") or ""
+                            pdno = safe_strip(body.get("PDNO", ""))
+                            qty = int(float(body.get("ORD_QTY", "0")))
+                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
+                            price_for_fill = None
+                            try:
+                                ord_unpr = body.get("ORD_UNPR")
+                                if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
+                                    price_for_fill = float(ord_unpr)
+                                else:
+                                    try:
+                                        price_for_fill = float(self.get_current_price(pdno))
+                                    except Exception:
+                                        price_for_fill = 0.0
+                            except Exception:
+                                price_for_fill = 0.0
+
+                            side = "SELL" if is_sell else "BUY"
+                            append_fill(side=side, code=pdno, name="", qty=qty, price=price_for_fill, odno=odno, note=f"tr={tr_id},ord_dvsn={ord_dvsn}")
+                        except Exception as e:
+                            logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                        return data
+
+                    msg_cd = data.get("msg_cd", "")
+                    msg1 = data.get("msg1", "")
+                    # 게이트웨이/서버 에러류는 재시도
+                    if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
+                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                        logger.error(
+                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s"
+                        )
+                        time.sleep(backoff)
+                        last_err = data
+                        continue
+
+                    logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
+                    return None
+
+                logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
+
+        raise Exception(f"주문 실패: {last_err}")
+
+    # -------------------------------
+    # 매수/매도 (신규)
+    # -------------------------------
+    def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_UNPR": "0",
+        }
+        return self._order_cash(body, is_sell=False)
+
+    def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        # --- 강화된 사전점검: 보유수량 우선 ---
+        pos = self.get_positions() or []
+        hldg = 0
+        ord_psbl = 0
+        for r in pos:
+            if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                hldg = int(float(r.get("hldg_qty", "0")))
+                ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                break
+
+        base_qty = hldg if hldg > 0 else ord_psbl
+        if base_qty <= 0:
+            logger.error(f"[SELL_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
+            return None
+
+        if qty > base_qty:
+            logger.warning(
+                f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+            )
+            qty = base_qty
+
+        # --- 중복 매도 방지(메모리 기반) ---
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
+
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "SLL_TYPE": "01",  # 일반매도
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "01",
+            "ORD_UNPR": "0",
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+        resp = self._order_cash(body, is_sell=True)
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
+                cutoff = time.time() - (self._recent_sells_cooldown * 5)
+                keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
+                for k in keys_to_del:
+                    del self._recent_sells[k]
+        return resp
+
+    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "00",  # 지정가
+            "ORD_UNPR": str(int(price)),
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+        hk = self._create_hashkey(body)
+        tr_list = _pick_tr(self.env, "ORDER_BUY")
+        if not tr_list:
+            raise Exception("ORDER_BUY TR 미구성")
+        tr_id = tr_list[0]
+        headers = self._headers(tr_id, hk)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        data = resp.json()
+        if resp.status_code == 200 and data.get("rt_cd") == "0":
+            logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="BUY", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
+            return data
+        logger.error(f"[BUY_LIMIT_FAIL] {data}")
+        return None
+
+    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        # --- 강화된 사전점검: 보유수량 우선 ---
+        pos = self.get_positions() or []
+        hldg = 0
+        ord_psbl = 0
+        for r in pos:
+            if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                hldg = int(float(r.get("hldg_qty", "0")))
+                ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                break
+
+        base_qty = hldg if hldg > 0 else ord_psbl
+        if base_qty <= 0:
+            logger.error(f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
+            return None
+
+        if qty > base_qty:
+            logger.warning(
+                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+            )
+            qty = base_qty
+
+        # 중복 매도 방지(메모리 기반)
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
+
+        body = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(pdno),
+            "SLL_TYPE": "01",
+            "ORD_QTY": str(int(qty)),
+            "ORD_DVSN": "00",  # 지정가
+            "ORD_UNPR": str(int(price)),
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+        hk = self._create_hashkey(body)
+        tr_list = _pick_tr(self.env, "ORDER_SELL")
+        if not tr_list:
+            raise Exception("ORDER_SELL TR 미구성")
+        tr_id = tr_list[0]
+        headers = self._headers(tr_id, hk)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        data = resp.json()
+        if resp.status_code == 200 and data.get("rt_cd") == "0":
+            logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="SELL", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
+            return data
+        logger.error(f"[SELL_LIMIT_FAIL] {data}")
+        return None
+
+    # --- 호환 셔임(기존 trader.py 호출 대응) ---
+    def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매수
+        - price 지정 → 지정가 매수
+        """
+        if price is None:
+            return self.buy_stock_market(code, qty)
+        return self.buy_stock_limit(code, qty, price)
+
+    def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매도
+        - price 지정 → 지정가 매도
+        """
+        if price is None:
+            return self.sell_stock_market(code, qty)
+        return self.sell_stock_limit(code, qty, price)
