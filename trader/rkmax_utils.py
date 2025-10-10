@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-RK-Max utilities
+""" RK-Max utilities
 - 환경변수 헬퍼
 - 랭크 지수 가중치
 - Jaccard 유사도
@@ -24,7 +23,6 @@ LOG = logging.getLogger("rkmax")
 if not LOG.handlers:
     LOG.addHandler(logging.NullHandler())
 
-
 # -------- env helper --------
 def _env(key: str, default=None, cast=str):
     """환경변수 안전 읽기 (형변환 실패 시 default 반환)"""
@@ -35,7 +33,6 @@ def _env(key: str, default=None, cast=str):
         return cast(v)
     except Exception:
         return default
-
 
 # -------- weights / set similarity --------
 def rank_weights_exp(n: int, alpha: float = 0.35) -> np.ndarray:
@@ -49,14 +46,12 @@ def rank_weights_exp(n: int, alpha: float = 0.35) -> np.ndarray:
     w = np.exp(alpha * (n + 1 - r))
     return w / w.sum()
 
-
 def jaccard(a: Iterable, b: Iterable) -> float:
     """집합 유사도 지표: |A∩B| / |A∪B|"""
     sa, sb = set(a or []), set(b or [])
     if not sa and not sb:
         return 1.0
     return len(sa & sb) / float(max(1, len(sa | sb)))
-
 
 # -------- data helpers --------
 def _kis_ohlc_to_df(js: Dict) -> pd.DataFrame:
@@ -97,7 +92,6 @@ def _kis_ohlc_to_df(js: Dict) -> pd.DataFrame:
 
     return df
 
-
 # -------- market breadth --------
 def breadth_pos_ratio(kis, codes: Iterable[str], lookback: int = 20) -> int:
     """
@@ -128,7 +122,6 @@ def breadth_pos_ratio(kis, codes: Iterable[str], lookback: int = 20) -> int:
 
     return int(round(100 * (pos / cnt))) if cnt > 0 else 0
 
-
 # -------- recent features / ATR --------
 def _atr_from_hl(df: pd.DataFrame, window: int) -> float:
     """고가-저가 단순 범위 평균으로 ATR 근사(거래량 계산부하 최소화용)"""
@@ -140,7 +133,6 @@ def _atr_from_hl(df: pd.DataFrame, window: int) -> float:
     if rng.shape[0] < window:
         return float("nan")
     return float(rng.tail(window).mean())
-
 
 def recent_features(kis, code: str) -> Dict[str, float]:
     """
@@ -179,7 +171,6 @@ def recent_features(kis, code: str) -> Dict[str, float]:
 
     return dict(mom5=float(mom5), spike=float(spike), atr20=float(atr20), atr60=float(atr60))
 
-
 # -------- K blending --------
 def blend_k(k_month: float, day_of_month: int, atr20: float, atr60: float) -> float:
     """
@@ -217,7 +208,6 @@ def blend_k(k_month: float, day_of_month: int, atr20: float, atr60: float) -> fl
     )
     return float(k_use)
 
-
 # -------- sticky replace --------
 def sticky_replace(old_min_rar: float, new_rar: float, delta: float = 0.10) -> bool:
     """
@@ -229,7 +219,6 @@ def sticky_replace(old_min_rar: float, new_rar: float, delta: float = 0.10) -> b
         return float(new_rar) > float(old_min_rar) * (1.0 + float(delta))
     except Exception:
         return True
-
 
 # ---- (옵션) rolling ret/mdd 근사 ----
 def rolling_ret_mdd_from_close(closes: pd.Series, window: int = 20) -> Tuple[float, float]:
@@ -245,3 +234,6 @@ def rolling_ret_mdd_from_close(closes: pd.Series, window: int = 20) -> Tuple[flo
     dd = (seg / runmax - 1.0) * 100.0
     mdd = abs(dd.min())
     return float(ret), float(mdd)
+
+# --- (끝) ---
+
