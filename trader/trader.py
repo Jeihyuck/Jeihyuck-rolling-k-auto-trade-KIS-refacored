@@ -146,6 +146,22 @@ def _fetch_balances(kis: KisAPI):
         logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
         return []
 
+# === [여기 아래에 추가!] ===
+def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
+    """
+    최근 20일 수익률 (%) 반환 (과거→최근)
+    """
+    try:
+        candles = kis.get_daily_candles(code, count=21)
+        if len(candles) < 20:
+            return None
+        old = float(candles[-21]['close']) if len(candles) > 20 else float(candles[0]['close'])
+        now = float(candles[-1]['close'])
+        return ((now - old) / old) * 100.0
+    except Exception as e:
+        logger.warning(f"[20D_RETURN_FAIL] {code}: {e}")
+        return None
+
 def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) -> int:
     weight = max(0.0, float(weight))
     alloc = int(round(daily_capital * weight))
@@ -714,6 +730,15 @@ def main():
                 for code in list(holding.keys()):
                     if code in code_to_target:
                         continue  # 위 루프에서 이미 처리
+
+                    # === [모멘텀: 최근 20일 수익률 +3% 이상이면 보유 지속] ===
+                    return_pct = get_20d_return_pct(kis, code)
+                    if return_pct is not None and return_pct >= 3.0:
+                        logger.info(
+                            f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속"
+                        )
+                        continue  # 매도하지 않고 보유
+
                     sellable_here = ord_psbl_map.get(code, 0)
                     if sellable_here <= 0:
                         logger.info(f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)")
@@ -740,6 +765,7 @@ def main():
                         })
                         save_state(holding, traded)
                         time.sleep(RATE_SLEEP_SEC)
+
 
             # --- 장중 커트오프(KST) 강제 전량매도 (마지막 안전장치) ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
