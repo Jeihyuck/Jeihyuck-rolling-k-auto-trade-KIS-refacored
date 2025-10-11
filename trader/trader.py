@@ -148,19 +148,28 @@ def _fetch_balances(kis: KisAPI):
 
 # === [여기 아래에 추가!] ===
 def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
-    """
-    최근 20일 수익률 (%) 반환 (과거→최근)
-    """
-    try:
-        candles = kis.get_daily_candles(code, count=21)
-        if len(candles) < 20:
-            return None
-        old = float(candles[-21]['close']) if len(candles) > 20 else float(candles[0]['close'])
-        now = float(candles[-1]['close'])
-        return ((now - old) / old) * 100.0
-    except Exception as e:
-        logger.warning(f"[20D_RETURN_FAIL] {code}: {e}")
-        return None
+    MAX_RETRY = 3
+    for attempt in range(1, MAX_RETRY+1):
+        try:
+            candles = kis.get_daily_candles(code, count=21)
+            if not candles or len(candles) < 20:
+                logger.warning(f"[20D_RETURN_FAIL] {code}: 캔들 {len(candles) if candles else 0}개 (21개 미만) (재시도 {attempt})")
+                time.sleep(1)
+                continue
+            # 모든 캔들에 close값 존재 확인
+            if any('close' not in c or c['close'] is None for c in candles):
+                logger.error(f"[20D_RETURN_FAIL] {code}: 캔들 내 close 결측 {candles}")
+                return None
+            old = float(candles[-21]['close']) if len(candles) > 20 else float(candles[0]['close'])
+            now = float(candles[-1]['close'])
+            return ((now - old) / old) * 100.0
+        except Exception as e:
+            logger.warning(f"[20D_RETURN_FAIL] {code}: {e} (재시도 {attempt})")
+            time.sleep(1)
+            continue
+    logger.error(f"[20D_RETURN_FAIL] {code}: 21개 일봉 불러오기 최종실패 - 종목제외 필요")
+    return None
+
 
 def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) -> int:
     weight = max(0.0, float(weight))
