@@ -403,12 +403,17 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
         # === [모멘텀 매도 예외: 최근 20일 수익률 +3% 이상이면 매도 제외] ===
         return_pct = get_20d_return_pct(kis, code)
+        logger.info(f"[모멘텀 수익률 체크] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}%")
+
         if return_pct is not None and return_pct >= 3.0:
             logger.info(
                 f"[모멘텀 보유 유지] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 강제매도에서 제외"
             )
             continue
-
+        else:
+            logger.info(
+                f"[매도진행] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}% < 3% → 강제매도"
+            )
         try:
             sell_qty = min(qty, sellable) if sellable > 0 else qty
             cur_price, result = _sell_once(kis, code, sell_qty, prefer_market=prefer_market)
