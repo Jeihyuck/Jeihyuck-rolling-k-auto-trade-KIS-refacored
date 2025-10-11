@@ -400,6 +400,15 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             logger.info(f"[스킵] {code}: 매도가능수량=0 (대기/체결중/락) → 이번 패스 보류")
             remaining.add(code)
             continue
+
+        # === [모멘텀 매도 예외: 최근 20일 수익률 +3% 이상이면 매도 제외] ===
+        return_pct = get_20d_return_pct(kis, code)
+        if return_pct is not None and return_pct >= 3.0:
+            logger.info(
+                f"[모멘텀 보유 유지] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 강제매도에서 제외"
+            )
+            continue
+
         try:
             sell_qty = min(qty, sellable) if sellable > 0 else qty
             cur_price, result = _sell_once(kis, code, sell_qty, prefer_market=prefer_market)
@@ -425,6 +434,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
         if after_qty_map.get(code, 0) > 0:
             remaining.add(code)
     return remaining
+
 
 def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True):
     target_codes = set([c for c in holding.keys() if c])
