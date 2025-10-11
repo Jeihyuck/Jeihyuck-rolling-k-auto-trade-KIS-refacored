@@ -170,6 +170,34 @@ def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
     logger.error(f"[20D_RETURN_FAIL] {code}: 21개 일봉 불러오기 최종실패 - 종목제외 필요")
     return None
 
+def is_strong_momentum(kis, code):
+    """
+    강한 상향 추세 모멘텀 여부: 20, 60, 120일 수익률과 MA20/MA60/MA120 위치 기준(자유 조합 가능)
+    """
+    try:
+        candles = kis.get_daily_candles(code, count=121)
+        closes = [float(x['close']) for x in candles if float(x['close']) > 0]
+        if len(closes) < 61:
+            return False  # 데이터 부족
+        today = closes[-1]
+        ma20 = sum(closes[-20:]) / 20
+        ma60 = sum(closes[-60:]) / 60
+        ma120 = sum(closes[-120:]) / 120
+        # 수익률
+        r20 = (today - closes[-21]) / closes[-21] * 100 if len(closes) > 21 else 0
+        r60 = (today - closes[-61]) / closes[-61] * 100 if len(closes) > 61 else 0
+        r120 = (today - closes[0]) / closes[0] * 100
+        # 기준: 최근 20/60/120일 중 하나라도 +10% 이상, or 단기이평(20, 60, 120) 위에 있으면 강세로 간주
+        if r20 > 10 or r60 > 10 or r120 > 10:
+            return True
+        if today > ma20 or today > ma60 or today > ma120:
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"[모멘텀 판별 실패] {code}: {e}")
+        return False
+
+
 
 def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) -> int:
     weight = max(0.0, float(weight))
@@ -410,7 +438,12 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             remaining.add(code)
             continue
 
-        # === [모멘텀 매도 예외: 최근 20일 수익률 +3% 이상이면 매도 제외] ===
+        # === [모멘텀 강세: 매도 제외] ===
+        if is_strong_momentum(kis, code):
+            logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 강제매도 제외")
+            continue
+
+        # 기존 수익률 기반 매도 예외 로직(원하는 경우 병행 가능)
         return_pct = get_20d_return_pct(kis, code)
         logger.info(f"[모멘텀 수익률 체크] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}%")
 
@@ -423,6 +456,8 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             logger.info(
                 f"[매도진행] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}% < 3% → 강제매도"
             )
+        
+        # 이하 기존 매도 로직
         try:
             sell_qty = min(qty, sellable) if sellable > 0 else qty
             cur_price, result = _sell_once(kis, code, sell_qty, prefer_market=prefer_market)
@@ -754,6 +789,11 @@ def main():
                 for code in list(holding.keys()):
                     if code in code_to_target:
                         continue  # 위 루프에서 이미 처리
+
+                    # === [추가: 모멘텀 강세시 매도 스킵] ===
+                    if is_strong_momentum(kis, code):
+                        logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류")
+                        continue
 
                     # === [모멘텀: 최근 20일 수익률 +3% 이상이면 보유 지속] ===
                     return_pct = get_20d_return_pct(kis, code)
