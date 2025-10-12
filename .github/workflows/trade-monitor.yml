@@ -1,0 +1,128 @@
+name: Trade Monitor
+
+on:
+  push:
+    branches: [ main, change-logic ]
+  pull_request:
+    branches: [ main, change-logic ]
+  schedule:
+    # 매일 한국시간 08:50 (UTC 23:50, 일~목) 실행
+    - cron: "50 23 * * 0-5"
+  workflow_dispatch:
+
+jobs:
+  monitor-trade:
+    runs-on: ubuntu-latest
+
+    env:
+      # ===== 민감정보(Secrets) =====
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+
+      # ===== 비밀 아님: 전략/운영 파라미터 =====
+      # 포지션 관리
+      PARTIAL1: "0.5"            # 1차 익절 비중(50%)
+      PARTIAL2: "0.3"            # 2차 익절 비중(30%)
+      TRAIL_PCT: "0.02"          # 트레일링 스탑 2%
+      FAST_STOP: "0.01"          # 진입 5분내 급락 손절 1%
+      ATR_STOP: "1.5"            # ATR x 1.5 절대 손절
+      TIME_STOP_HHMM: "13:00"    # 시간 손절 기준
+      SELL_FORCE_TIME: "14:40"   # 장중 커트오프 전량매도 트리거
+
+      # 후보 필터
+      MIN_TRADES: "5"            # 월 구간 최소 거래수
+      MAX_MDD_PCT: "30"          # 월 최대 허용 MDD(%)
+      MIN_WINRATE: "50"          # 최소 승률(%)
+      MIN_CUMRET: "2"            # 최소 누적수익률(%)
+      TOP_K_LIMIT: "20"          # 상위 N개 컷
+
+      # 배분
+      TOTAL_CAPITAL: "10000000"  # 총 투자한도(원) - 1,000만원
+      MIN_QTY_PER_TICKET: "1"    # 최소 주문 수량
+      DAILY_CAPITAL: "10000000"  # (리포트/전략용) 일일 자금 한도
+
+      # K 탐색
+      K_MIN: "0.1"
+      K_MAX: "0.9"
+      K_STEP: "0.1"
+
+      # 운영/부가
+      ALLOW_AFTER_HOURS: "0"             # 시간외 테스트 허용(1=허용)
+      ORDER_THROTTLE_SEC: "0.3"          # 주문 간 대기(초)
+      REBALANCE_OUT_DIR: "rebalance_results"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencies 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 30  # 서버 구동 시간 여유 확보
+
+      - name: trader 자동매매 로직 실행
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.trader
+
+      - name: CEO 리포트 자동 생성
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.report_ceo
+
+      - name: CEO 리포트 artifact 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: trader/reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Rebalance JSON artifact 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebalance-results
+          path: rebalance_results/*.json
+          if-no-files-found: warn
+          retention-days: 60
+
+      - name: Trades 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: trader/logs/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: FastAPI 로그 출력 (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log || true
+          echo "::endgroup::"
+
+      - name: FastAPI 로그 업로드 (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+          if-no-files-found: ignore
+          retention-days: 14
+        
+          

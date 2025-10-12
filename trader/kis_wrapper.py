@@ -1,12 +1,12 @@
-# kis_wrapper.py
 import os
 import json
 import time
 import random
 import logging
 import threading
+import csv
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any
 
 import requests
 import pytz
@@ -17,9 +17,6 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------
-# 유틸
-# -------------------------------
 def safe_strip(val):
     if val is None:
         return ""
@@ -28,24 +25,38 @@ def safe_strip(val):
     return str(val).strip()
 
 def _json_dumps(body: dict) -> str:
-    # HashKey/주문 본문 모두 동일 직렬화 문자열을 사용하도록 고정
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
-logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
-logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
-logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
-logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
-logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
+def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: str, note: str = ""):
+    try:
+        os.makedirs("fills", exist_ok=True)
+        path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
+        header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note"]
+        row = [
+            datetime.now().isoformat(),
+            side,
+            code,
+            name or "",
+            int(qty),
+            float(price) if price is not None else 0.0,
+            str(odno) if odno is not None else "",
+            note or "",
+        ]
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(header)
+            w.writerow(row)
+        logger.info(f"[APPEND_FILL] {side} {code} qty={qty} price={price} odno={odno}")
+    except Exception as e:
+        logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
 
-# -------------------------------
-# 간단 레이트리미터(엔드포인트별 최소 간격 유지)
-# -------------------------------
 class _RateLimiter:
     def __init__(self, min_interval_sec: float = 0.20):
         self.min_interval = float(min_interval_sec)
         self.last_at: Dict[str, float] = {}
         self._lock = threading.Lock()
-
     def wait(self, key: str):
         with self._lock:
             now = time.time()
@@ -55,18 +66,36 @@ class _RateLimiter:
                 time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
             self.last_at[key] = time.time()
 
-# -------------------------------
-# 본체
-# -------------------------------
+TR_MAP = {
+    "practice": {
+        "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY", "VTTC0012U"), "VTTC0802U"],
+        "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL", "VTTC0011U"), "VTTC0801U"],
+        "BALANCE": [os.getenv("KIS_TR_ID_BALANCE", "VTTC8434R")],
+        "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
+        "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
+        "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+        "TOKEN": "/oauth2/tokenP",
+    },
+    "real": {
+        "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY_REAL", "TTTC0012U")],
+        "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL_REAL", "TTTC0011U")],
+        "BALANCE": [os.getenv("KIS_TR_ID_BALANCE_REAL", "TTTC8434R")],
+        "PRICE": [os.getenv("KIS_TR_ID_PRICE_REAL", "FHKST01010100")],
+        "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
+        "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
+        "TOKEN": "/oauth2/token",
+    },
+}
+def _pick_tr(env: str, key: str) -> List[str]:
+    try:
+        return TR_MAP[env][key]
+    except Exception:
+        return []
+
+# --- KisAPI 이하 실전 전체 로직 (토큰, 주문, 매수/매도, 체결, 실전 전략 등) ---
+# (코드 길이 문제로, "계속" 요청 시 아래 전체 함수/클래스(잔고/주문/시장가/지정가/실전보조 등) 순차적 제공)
+
 class KisAPI:
-    """
-    - TR_ID 최신 스펙
-      * (모의) 매수 VTTC0012U / 매도 VTTC0011U
-      * (실전) 매수 TTTC0012U / 매도 TTTC0011U
-    - HashKey 필수 적용
-    - 시세 조회 레이트리밋 & 백오프
-    - get_balance / buy_stock 호환 셔임(옛 호출부 대응)
-    """
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
     _cache_path = "kis_token_cache.json"
     _token_lock = threading.Lock()
@@ -75,57 +104,48 @@ class KisAPI:
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
         self.env = safe_strip(KIS_ENV or "practice").lower()
-
-        # 세션 + 재시도 어댑터
+        if self.env not in ("practice", "real"):
+            self.env = "practice"
         self.session = requests.Session()
         retry = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            status=3,
-            backoff_factor=0.5,
+            total=3, connect=3, read=3, status=3, backoff_factor=0.5,
             status_forcelist=(500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST"]),
-            raise_on_status=False,
+            allowed_methods=frozenset(["GET", "POST"]), raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-
-        self._limiter = _RateLimiter(min_interval_sec=0.20)  # 초당 제한 회피
-
+        self._limiter = _RateLimiter(min_interval_sec=0.20)
+        self._recent_sells: Dict[str, float] = {}
+        self._recent_sells_lock = threading.Lock()
+        self._recent_sells_cooldown = 60.0
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
 
-    # -------------------------------
-    # 토큰
-    # -------------------------------
     def get_valid_token(self):
         with KisAPI._token_lock:
             now = time.time()
             if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
                 return self._token_cache["token"]
-
             if os.path.exists(self._cache_path):
                 try:
                     with open(self._cache_path, "r", encoding="utf-8") as f:
                         cache = json.load(f)
                     if "access_token" in cache and now < cache["expires_at"] - 300:
-                        self._token_cache.update(
-                            {"token": cache["access_token"], "expires_at": cache["expires_at"], "last_issued": cache.get("last_issued", 0)}
-                        )
+                        self._token_cache.update({
+                            "token": cache["access_token"],
+                            "expires_at": cache["expires_at"],
+                            "last_issued": cache.get("last_issued", 0),
+                        })
                         logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
                         return cache["access_token"]
                 except Exception as e:
                     logger.warning(f"[토큰캐시 읽기 실패] {e}")
-
-            # 1분 내 재발급 차단
             if now - self._token_cache["last_issued"] < 61:
                 logger.warning("[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
                 if self._token_cache["token"]:
                     return self._token_cache["token"]
                 raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
-
             token, expires_in = self._issue_token_and_expire()
             expires_at = now + int(expires_in)
             self._token_cache.update({"token": token, "expires_at": expires_at, "last_issued": now})
@@ -138,7 +158,7 @@ class KisAPI:
             return token
 
     def _issue_token_and_expire(self):
-        token_path = "/oauth2/tokenP" if self.env == "practice" else "/oauth2/token"
+        token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
@@ -154,9 +174,6 @@ class KisAPI:
         logger.error(f"[🔑 토큰발급 실패] {j.get('error_description', j)}")
         raise Exception(f"토큰 발급 실패: {j.get('error_description', j)}")
 
-    # -------------------------------
-    # 헤더/HashKey
-    # -------------------------------
     def _headers(self, tr_id: str, hashkey: Optional[str] = None):
         h = {
             "authorization": f"Bearer {self.get_valid_token()}",
@@ -190,60 +207,110 @@ class KisAPI:
             raise Exception(f"HashKey 생성 실패: {j}")
         return hk
 
-    # -------------------------------
-    # 시세/장운영
-    # -------------------------------
+    # === 실전: 시세, 잔고, 시장가/지정가, 매수/매도, 체결강도, ATR 등 ===
+    # (3부로 계속 이어집니다. 아래 "계속"을 눌러주시면 3부 전체 제공)
+
     def get_current_price(self, code: str) -> float:
-        """
-        - KIS 시세 쿼터(초당 제한)에 걸리면 메시지에 '초당 거래건수'가 포함됨.
-          → 짧게 sleep 후 재시도.
-        - 시장구분은 'J'(KRX)와 'U'만 사용 (불필요 'UN' 제거)
-        - 종목코드는 기본 6자리. 필요 시 'A' prefix도 함께 시도.
-        """
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-        tr_id = "FHKST01010100"
-        headers = self._headers(tr_id)
-
-        tried = []
-        markets = ["J", "U"]
-        codes = []
-        c = code.strip()
-        if c.startswith("A"):
-            codes = [c, c[1:]]
-        else:
-            codes = [c, f"A{c}"]
-
-        # 레이트리밋(엔드포인트 키: quotes)
         self._limiter.wait("quotes")
-
-        for market_div in markets:
-            for code_fmt in codes:
-                params = {
-                    # KIS는 보통 lower-case도 수용하지만, 구버전 케이스 대비 소문자로 유지
-                    "fid_cond_mrkt_div_code": market_div,
-                    "fid_input_iscd": code_fmt,
-                }
-                try:
-                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
-                    data = resp.json()
-                except Exception as e:
-                    tried.append((market_div, code_fmt, f"EXC:{e}"))
-                    continue
-
-                tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
-                # 초당 제한 → 짧은 백오프 후 재시도(다음 루프)
-                if "초당 거래건수를 초과" in (data.get("msg1") or ""):
-                    time.sleep(0.35 + random.uniform(0, 0.15))
-                    continue
-
-                if resp.status_code == 200 and data.get("rt_cd") == "0" and "output" in data:
-                    pr = data["output"].get("stck_prpr")
+        tried = []
+        for tr in _pick_tr(self.env, "PRICE"):
+            headers = self._headers(tr)
+            markets = ["J", "U"]
+            c = code.strip()
+            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+            for market_div in markets:
+                for code_fmt in codes:
+                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
-                        return float(pr)
-                    except Exception:
-                        pass
-
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        data = resp.json()
+                    except Exception as e:
+                        tried.append((market_div, code_fmt, f"EXC:{e}"))
+                        continue
+                    tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
+                    if "초당 거래건수" in (data.get("msg1") or ""):
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        try:
+                            return float(data["output"].get("stck_prpr"))
+                        except Exception:
+                            pass
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
+
+    def get_orderbook_strength(self, code: str) -> Optional[float]:
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        self._limiter.wait("orderbook")
+        for tr in _pick_tr(self.env, "ORDERBOOK"):
+            headers = self._headers(tr)
+            markets = ["J", "U"]
+            c = code.strip()
+            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+            for market_div in markets:
+                for code_fmt in codes:
+                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                    try:
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        data = resp.json()
+                    except Exception:
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        out = data["output"]
+                        bid = sum(float(out.get(f"bidp_rsqn{i}") or 0) for i in range(1, 6))
+                        ask = sum(float(out.get(f"askp_rsqn{i}") or 0) for i in range(1, 6))
+                        if (bid + ask) > 0:
+                            return 100.0 * bid / max(1.0, ask)
+        return None
+
+    def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        self._limiter.wait("daily")
+        for tr in _pick_tr(self.env, "DAILY_CHART"):
+            headers = self._headers(tr)
+            params = {
+                "fid_cond_mrkt_div_code": "J",
+                "fid_input_iscd": code if code.startswith("A") else f"A{code}",
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            }
+            try:
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                data = resp.json()
+            except Exception:
+                continue
+            if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                arr = data["output"]
+                rows = [
+                    {
+                        "date": r.get("stck_bsop_date"),
+                        "open": float(r.get("stck_oprc")),
+                        "high": float(r.get("stck_hgpr")),
+                        "low": float(r.get("stck_lwpr")),
+                        "close": float(r.get("stck_clpr")),
+                    }
+                    for r in arr[: max(count, 20)] if r.get("stck_oprc") is not None
+                ]
+                rows.sort(key=lambda x: x["date"])  # 과거→최근
+                return rows[-count:]
+        return []
+
+    def get_atr(self, code: str, window: int = 14) -> Optional[float]:
+        try:
+            candles = self.get_daily_candles(code, count=window + 2)
+            if len(candles) < window + 1:
+                return None
+            trs: List[float] = []
+            for i in range(1, len(candles)):
+                h = candles[i]["high"]; l = candles[i]["low"]; c_prev = candles[i - 1]["close"]
+                tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+                trs.append(tr)
+            if not trs:
+                return None
+            return sum(trs[-window:]) / float(window)
+        except Exception as e:
+            logger.warning(f"[ATR] 계산 실패 code={code}: {e}")
+            return None
 
     def is_market_open(self) -> bool:
         kst = pytz.timezone("Asia/Seoul")
@@ -254,77 +321,73 @@ class KisAPI:
         close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
         return open_time <= now <= close_time
 
-    # -------------------------------
-    # 잔고/포지션
-    # -------------------------------
+    # ----- 잔고/포지션 -----
     def get_cash_balance(self) -> int:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-        tr_id = "VTTC8434R" if self.env == "practice" else "TTTC8434R"
-        headers = self._headers(tr_id)
-        params = {
-            "CANO": self.CANO,
-            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-            "AFHR_FLPR_YN": "N",
-            "UNPR_YN": "N",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "01",
-            "OFL_YN": "N",
-            "INQR_DVSN": "02",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
-        }
-        logger.info(f"[잔고조회 요청파라미터] {params}")
-        try:
-            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-            j = resp.json()
-        except Exception as e:
-            logger.error(f"[잔고조회 예외] {e}")
-            return 0
-        logger.info(f"[잔고조회 응답] {j}")
-        if j.get("rt_cd") == "0" and "output2" in j and j["output2"]:
+        headers = None
+        for tr in _pick_tr(self.env, "BALANCE"):
+            headers = self._headers(tr)
+            params = {
+                "CANO": self.CANO,
+                "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+                "AFHR_FLPR_YN": "N",
+                "UNPR_YN": "N",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "OFL_YN": "N",
+                "INQR_DVSN": "02",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            logger.info(f"[잔고조회 요청파라미터] {params}")
             try:
-                cash = int(j["output2"][0]["dnca_tot_amt"])
-                logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
-                return cash
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                j = resp.json()
             except Exception as e:
-                logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
-                return 0
-        logger.error(f"[CASH_BALANCE_PARSE_FAIL] {j}")
+                logger.error(f"[잔고조회 예외] {e}")
+                continue
+            logger.info(f"[잔고조회 응답] {j}")
+            if j.get("rt_cd") == "0" and "output2" in j and j["output2"]:
+                try:
+                    cash = int(j["output2"][0]["dnca_tot_amt"])
+                    logger.info(f"[CASH_BALANCE] 현재 예수금: {cash:,}원")
+                    return cash
+                except Exception as e:
+                    logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
+                    continue
+        logger.error("[CASH_BALANCE_FAIL] 모든 TR 실패")
         return 0
 
     def get_positions(self) -> List[Dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-        tr_id = "VTTC8434R" if self.env == "practice" else "TTTC8434R"
-        headers = self._headers(tr_id)
-        params = {
-            "CANO": self.CANO,
-            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-            "AFHR_FLPR_YN": "N",
-            "UNPR_YN": "N",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "01",
-            "OFL_YN": "N",
-            "INQR_DVSN": "02",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
-        }
-        try:
-            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-            j = resp.json()
-        except Exception as e:
-            logger.error(f"[포지션조회 예외] {e}")
-            return []
-        return j.get("output1") or []
+        for tr in _pick_tr(self.env, "BALANCE"):
+            headers = self._headers(tr)
+            params = {
+                "CANO": self.CANO,
+                "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+                "AFHR_FLPR_YN": "N",
+                "UNPR_YN": "N",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "OFL_YN": "N",
+                "INQR_DVSN": "02",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            try:
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                j = resp.json()
+            except Exception:
+                continue
+            if j.get("rt_cd") == "0" and j.get("output1") is not None:
+                return j.get("output1") or []
+        return []
 
     def get_balance_map(self) -> Dict[str, int]:
-        """
-        매도/체크에 사용할 수량은 '주문가능수량(ord_psbl_qty)'이 0일 수 있어
-        '보유수량(hldg_qty)'을 우선 사용한다. (체결대기/락 상황 보호)
-        """
         pos = self.get_positions()
         mp: Dict[str, int] = {}
         for row in pos or []:
@@ -342,74 +405,114 @@ class KisAPI:
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:
-        """
-        기존 코드 호환용:
-        반환 구조: {"cash": <int>, "positions": <list[dict]>}
-        """
         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
+
+    # -------------------------------
+    # 주문 공통, 시장가/지정가, 매수/매도(상세 구현은 1부 참고)
+    # (이미 위 1,2부에서 전부 제공. 필요시 재업로드 안내)
+    # -------------------------------
+
+# -- (끝) --
+# KisAPI 클래스 안에 아래 블록 전체를 추가
 
     # -------------------------------
     # 주문 공통
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        tr_id = (
-            ("VTTC0011U" if self.env == "practice" else "TTTC0011U")
-            if is_sell
-            else ("VTTC0012U" if self.env == "practice" else "TTTC0012U")
-        )
+
+        # TR 후보 순차 시도
+        tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
 
         # Fallback: 시장가 → IOC시장가 → 최유리
         ord_dvsn_chain = ["01", "13", "03"]
         last_err = None
 
-        for ord_dvsn in ord_dvsn_chain:
-            body["ORD_DVSN"] = ord_dvsn
-            body["ORD_UNPR"] = "0"
-            if is_sell and not body.get("SLL_TYPE"):
-                body["SLL_TYPE"] = "01"
-            body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+        for tr_id in tr_list:
+            for ord_dvsn in ord_dvsn_chain:
+                body["ORD_DVSN"] = ord_dvsn
+                body["ORD_UNPR"] = "0"
+                if is_sell and not body.get("SLL_TYPE"):
+                    body["SLL_TYPE"] = "01"
+                body.setdefault("EXCG_ID_DVSN_CD", "KRX")
 
-            # HashKey
-            hk = self._create_hashkey(body)
-            headers = self._headers(tr_id, hk)
-
-            # 레이트리밋(주문은 별 키)
-            self._limiter.wait("orders")
-
-            # 로깅(민감 Mask)
-            log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
-            logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
-
-            # 네트워크/게이트웨이 재시도
-            for attempt in range(1, 4):
+                # HashKey
                 try:
-                    resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
-                    data = resp.json()
+                    hk = self._create_hashkey(body)
                 except Exception as e:
-                    backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
-                    logger.error(f"[ORDER_NET_EX] ord_dvsn={ord_dvsn} attempt={attempt} ex={e} → sleep {backoff:.2f}s")
-                    time.sleep(backoff)
+                    logger.error(f"[ORDER_HASH_FAIL] body={body} ex={e}")
                     last_err = e
                     continue
 
-                if resp.status_code == 200 and data.get("rt_cd") == "0":
-                    logger.info(f"[ORDER_OK] ord_dvsn={ord_dvsn} output={data.get('output')}")
-                    return data
+                headers = self._headers(tr_id, hk)
 
-                msg_cd = data.get("msg_cd", "")
-                msg1 = data.get("msg1", "")
-                if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
-                    backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
-                    logger.error(f"[ORDER_FAIL_GATEWAY] ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s")
-                    time.sleep(backoff)
-                    last_err = data
-                    continue
+                # 레이트리밋(주문은 별 키)
+                self._limiter.wait("orders")
 
-                logger.error(f"[ORDER_FAIL_BIZ] ord_dvsn={ord_dvsn} resp={data}")
-                return None
+                # 로깅(민감 Mask)
+                log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
+                logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
 
-            logger.warning(f"[ORDER_FALLBACK] ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
+                # 네트워크/게이트웨이 재시도
+                for attempt in range(1, 4):
+                    try:
+                        resp = self.session.post(
+                            url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+                        )
+                        data = resp.json()
+                    except Exception as e:
+                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                        logger.error(
+                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} ex={e} → sleep {backoff:.2f}s"
+                        )
+                        time.sleep(backoff)
+                        last_err = e
+                        continue
+
+                    if resp.status_code == 200 and data.get("rt_cd") == "0":
+                        logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
+                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
+                        try:
+                            out = data.get("output") or {}
+                            odno = out.get("ODNO") or out.get("ord_no") or ""
+                            pdno = safe_strip(body.get("PDNO", ""))
+                            qty = int(float(body.get("ORD_QTY", "0")))
+                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
+                            price_for_fill = None
+                            try:
+                                ord_unpr = body.get("ORD_UNPR")
+                                if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
+                                    price_for_fill = float(ord_unpr)
+                                else:
+                                    try:
+                                        price_for_fill = float(self.get_current_price(pdno))
+                                    except Exception:
+                                        price_for_fill = 0.0
+                            except Exception:
+                                price_for_fill = 0.0
+
+                            side = "SELL" if is_sell else "BUY"
+                            append_fill(side=side, code=pdno, name="", qty=qty, price=price_for_fill, odno=odno, note=f"tr={tr_id},ord_dvsn={ord_dvsn}")
+                        except Exception as e:
+                            logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                        return data
+
+                    msg_cd = data.get("msg_cd", "")
+                    msg1 = data.get("msg1", "")
+                    # 게이트웨이/서버 에러류는 재시도
+                    if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
+                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                        logger.error(
+                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s"
+                        )
+                        time.sleep(backoff)
+                        last_err = data
+                        continue
+
+                    logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
+                    return None
+
+                logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
 
         raise Exception(f"주문 실패: {last_err}")
 
@@ -444,8 +547,18 @@ class KisAPI:
             return None
 
         if qty > base_qty:
-            logger.warning(f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})")
+            logger.warning(
+                f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+            )
             qty = base_qty
+
+        # --- 중복 매도 방지(메모리 기반) ---
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
 
         body = {
             "CANO": self.CANO,
@@ -457,7 +570,15 @@ class KisAPI:
             "ORD_UNPR": "0",
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        return self._order_cash(body, is_sell=True)
+        resp = self._order_cash(body, is_sell=True)
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
+                cutoff = time.time() - (self._recent_sells_cooldown * 5)
+                keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
+                for k in keys_to_del:
+                    del self._recent_sells[k]
+        return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         body = {
@@ -465,18 +586,30 @@ class KisAPI:
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
             "PDNO": safe_strip(pdno),
             "ORD_QTY": str(int(qty)),
-            "ORD_DVSN": "00",   # 지정가
+            "ORD_DVSN": "00",  # 지정가
             "ORD_UNPR": str(int(price)),
             "EXCG_ID_DVSN_CD": "KRX",
         }
         hk = self._create_hashkey(body)
-        tr_id = "VTTC0012U" if self.env == "practice" else "TTTC0012U"
+        tr_list = _pick_tr(self.env, "ORDER_BUY")
+        if not tr_list:
+            raise Exception("ORDER_BUY TR 미구성")
+        tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="BUY", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
         return None
@@ -498,8 +631,18 @@ class KisAPI:
             return None
 
         if qty > base_qty:
-            logger.warning(f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})")
+            logger.warning(
+                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+            )
             qty = base_qty
+
+        # 중복 매도 방지(메모리 기반)
+        now_ts = time.time()
+        with self._recent_sells_lock:
+            last = self._recent_sells.get(pdno)
+            if last and (now_ts - last) < self._recent_sells_cooldown:
+                logger.warning(f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                return None
 
         body = {
             "CANO": self.CANO,
@@ -507,18 +650,32 @@ class KisAPI:
             "PDNO": safe_strip(pdno),
             "SLL_TYPE": "01",
             "ORD_QTY": str(int(qty)),
-            "ORD_DVSN": "00",   # 지정가
+            "ORD_DVSN": "00",  # 지정가
             "ORD_UNPR": str(int(price)),
             "EXCG_ID_DVSN_CD": "KRX",
         }
         hk = self._create_hashkey(body)
-        tr_id = "VTTC0011U" if self.env == "practice" else "TTTC0011U"
+        tr_list = _pick_tr(self.env, "ORDER_SELL")
+        if not tr_list:
+            raise Exception("ORDER_SELL TR 미구성")
+        tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+            try:
+                out = data.get("output") or {}
+                odno = out.get("ODNO") or out.get("ord_no") or ""
+                pdno = safe_strip(body.get("PDNO", ""))
+                qty_int = int(float(body.get("ORD_QTY", "0")))
+                price_for_fill = float(body.get("ORD_UNPR", 0))
+                append_fill(side="SELL", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+            except Exception as e:
+                logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+            with self._recent_sells_lock:
+                self._recent_sells[pdno] = time.time()
             return data
         logger.error(f"[SELL_LIMIT_FAIL] {data}")
         return None

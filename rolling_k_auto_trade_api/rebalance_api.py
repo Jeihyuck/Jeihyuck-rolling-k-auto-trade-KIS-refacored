@@ -2,8 +2,8 @@ import os
 import json
 import uuid
 import logging
-import time as time_module
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
+from typing import Any, Dict, List, Optional
 
 import pytz
 from fastapi import APIRouter, Query, Request, HTTPException
@@ -13,62 +13,68 @@ import numpy as np
 from FinanceDataReader import StockListing, DataReader
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50
-from rolling_k_auto_trade_api.kis_api import send_order, inquire_balance, inquire_filled_order
 from rolling_k_auto_trade_api.logging_config import configure_logging
-from rolling_k_auto_trade_api.kis_api import inquire_cash_balance
 
-# ──────────────────────────────────────────────────────────────
-# 0. 로깅 설정 & 전역 상수
-# ──────────────────────────────────────────────────────────────
 configure_logging()
 logger = logging.getLogger(__name__)
 
 rebalance_router = APIRouter()
-latest_rebalance_result: dict[str, any] = {"date": None, "selected_stocks": []}
-TOTAL_CAPITAL = 10_000_000  # 투자금 고정 (1,000만원)
+latest_rebalance_result: Dict[str, Any] = {"date": None, "selected_stocks": []}
 
-# ──────────────────────────────────────────────────────────────
-# 1. KST 타임존 & 장 운영시간 헬퍼
-# ──────────────────────────────────────────────────────────────
+TOTAL_CAPITAL = int(os.getenv("TOTAL_CAPITAL", "10000000"))
+MIN_WINRATE = float(os.getenv("MIN_WINRATE", "50"))
+MAX_MDD = float(os.getenv("MAX_MDD", "10"))
+MIN_CUMRET = float(os.getenv("MIN_CUMRET", "2"))
+TOP_K_LIMIT = int(os.getenv("TOP_K_LIMIT", "20"))
+REBALANCE_OUT_DIR = os.getenv("REBALANCE_OUT_DIR", "rebalance_results")
+REBALANCE_STORE = os.getenv("REBALANCE_STORE", "./data/selected_stocks.json")
+
 KST = pytz.timezone("Asia/Seoul")
-MARKET_OPEN: dtime = dtime(8, 30)
-MARKET_CLOSE: dtime = dtime(16, 0)
+MARKET_OPEN: dtime = dtime(9, 0)
+MARKET_CLOSE: dtime = dtime(15, 20)
 
-def is_market_open(ts: datetime | None = None) -> bool:
-    """현재 시각(기본=now KST)이 장중(08:30~16:00)인지 여부"""
+def is_market_open(ts: Optional[datetime] = None) -> bool:
     ts = ts or datetime.now(tz=KST)
     if ts.weekday() >= 5:
         return False
     return MARKET_OPEN <= ts.time() <= MARKET_CLOSE
 
-# ──────────────────────────────────────────────────────────────
-# 2. 리밸런싱 실행 엔드포인트
-# ──────────────────────────────────────────────────────────────
+def _assign_weights(selected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not selected:
+        return []
+    scores: List[float] = []
+    for it in selected:
+        try:
+            win = float(it.get("win_rate_pct", it.get("승률(%)", 0))) / 100.0
+            ret = float(it.get("avg_return_pct", it.get("수익률(%)", 0))) / 100.0
+            mdd = abs(float(it.get("mdd_pct", it.get("MDD(%)", 0)))) / 100.0
+        except Exception:
+            win, ret, mdd = 0.5, 0.1, 0.1
+        score = (0.6 * win + 0.6 * ret) / max(0.05, (0.4 * mdd))
+        scores.append(max(0.0, score))
+    s = sum(scores) or 1.0
+    weights = [sc / s for sc in scores]
+    out: List[Dict[str, Any]] = []
+    for it, w in zip(selected, weights):
+        o = dict(it)
+        o["weight"] = round(float(w), 6)
+        out.append(o)
+    return out
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
 @rebalance_router.post("/rebalance/run/{date}", tags=["Rebalance"])
-async def run_rebalance(
-    date: str,
-    force_order: bool = Query(
-        False,
-        description="True 로 주면 장 종료 후에도 주문 로직 강제 실행 (테스트 용)",
-    ),
-):
-    """KOSDAQ‑50 대상 Meta‑K 전략 리밸런싱 수행
+async def run_rebalance(date: str):
+    logger.info(f"[RUN] run_rebalance 호출: date={date}")
 
-    Args:
-        date: YYYY‑MM‑DD 포맷 리밸런싱 기준일
-        force_order: 장 종료 이후에도 주문 처리 실행 여부
-    """
-    logger.info(f"[RUN] run_rebalance 호출: date={date}, force_order={force_order}")
-
-    # 1) Best-K 계산
     try:
         raw_results = get_best_k_for_kosdaq_50(date)
     except Exception as e:
         logger.exception(f"[ERROR] Best K 계산 실패: {e}")
         raise HTTPException(status_code=500, detail="Best K 계산 실패")
 
-    # 2) 결과 통일 (code → info dict)
-    results_map: dict[str, dict] = {}
+    results_map: Dict[str, Dict[str, Any]] = {}
     if isinstance(raw_results, dict):
         results_map = raw_results
     else:
@@ -82,36 +88,40 @@ async def run_rebalance(
 
     logger.info(f"[FILTER] 후보 종목 수 = {len(results_map)}개")
 
-    # ⬇️ candidates와 selected 분리
-    candidates: list[dict] = []
-    selected: list[dict] = []
-
-    # 조건: 수익률 2% 초과, 승률 50% 초과, MDD 10% 이하만 selected에
-    for code, stock in results_map.items():
-        info = dict(stock)
+    candidates: List[Dict[str, Any]] = []
+    selected: List[Dict[str, Any]] = []
+    for code, info0 in results_map.items():
+        info = dict(info0)
         candidates.append(info)
         try:
-            cumret = info.get("cumulative_return_pct") or info.get("수익률(%)")
-            win = info.get("win_rate_pct") or info.get("승률(%)")
-            mdd = info.get("mdd_pct") or info.get("MDD(%)")
-            if cumret is not None: cumret = float(cumret)
-            if win is not None: win = float(win)
-            if mdd is not None: mdd = float(mdd)
+            cumret = float(info.get("cumulative_return_pct", info.get("수익률(%)", 0)))
+            win = float(info.get("win_rate_pct", info.get("승률(%)", 0)))
+            mdd = float(info.get("mdd_pct", info.get("MDD(%)", 0)))
         except Exception as e:
             logger.warning(f"[WARN] 수치 변환 실패: {code}: {e}")
             continue
         if (
-            cumret is not None and cumret > 2.0 and
-            win is not None and win > 50.0 and
-            mdd is not None and mdd <= 10.0
+            cumret > MIN_CUMRET and
+            win > MIN_WINRATE and
+            mdd <= MAX_MDD
         ):
             selected.append(info)
+
+    if TOP_K_LIMIT and len(selected) > TOP_K_LIMIT:
+        selected = sorted(
+            selected,
+            key=lambda x: (
+                float(x.get("avg_return_pct", x.get("수익률(%)", 0))),
+                float(x.get("win_rate_pct", x.get("승률(%)", 0))),
+                -float(abs(x.get("mdd_pct", x.get("MDD(%)", 0))))
+            ),
+            reverse=True,
+        )[:TOP_K_LIMIT]
 
     logger.info(f"[SELECTED] 필터 통과 종목 수 = {len(selected)}개")
     logger.debug(f"selected codes: {[s.get('code') or s.get('stock_code') for s in selected]}")
 
-    count = len(selected)
-    if count == 0:
+    if len(selected) == 0:
         latest_rebalance_result.update({"date": date, "selected_stocks": []})
         return {
             "status": "skipped",
@@ -120,133 +130,59 @@ async def run_rebalance(
             "selected": [],
         }
 
-    each_invest = TOTAL_CAPITAL // count if count > 0 else 0
+    has_weight = any("weight" in s for s in selected)
+    if not has_weight:
+        selected = _assign_weights(selected)
 
-    # 3) 장중 여부 및 force 플래그
-    now = datetime.now(tz=KST)
-    allow_after = force_order or os.getenv("ALLOW_AFTER_HOURS", "0") == "1"
-    logger.info(f"[DEBUG] is_market_open={is_market_open(now)}, force_order={force_order}, allow_after={allow_after}")
-
-    if not is_market_open(now) and not allow_after:
-        logger.info("[SKIP] 장 종료 – 주문·잔고 로직 생략 (force_order=False)")
-        return {
-            "status": "skipped",
-            "reason": "market_closed",
-            "candidates": candidates,
-            "selected": [],
-        }
-
-    # 1) 예수금 확인
-    cash = inquire_cash_balance()
-
-    if cash <= 0:
-        logger.error(f"[REBALANCE_ABORT] 예수금 부족: {cash:,}원")
-        return {"error": "예수금이 0원입니다. 모의투자 계좌에 예수금을 충전하세요."}
-
-    logger.info(f"[REBALANCE] 시작예수금: {cash:,}원")
-
-    # 4) 주문 실행 - 반드시 selected만!
-    results_list = []
+    enriched: List[Dict[str, Any]] = []
     for info in selected:
         code = info.get("stock_code") or info.get("code")
-        price = (
-            info.get("목표가") or
-            info.get("target_price") or
-            info.get("best_k_price") or
-            info.get("buy_price") or
-            info.get("close")
-        )
-        if not price or price <= 0:
-            logger.warning(f"[SKIP] 목표가 미정의/0원: {code}")
-            continue
-
-        price = int(round(price))
-        quantity = max(each_invest // price, 1)
-        info["매수단가"] = price
-        info["매수수량"] = quantity
-
-        logger.info(f"[DEBUG] 주문예정 code={code}, price={price}, qty={quantity}")
+        name = info.get("name") or info.get("stock_name")
+        row = dict(info)
+        row.setdefault("code", code)
+        row.setdefault("name", name)
         try:
-            resp = send_order(code, qty=quantity, price=price, side="buy")
-            if not resp or not isinstance(resp, dict):
-                info["order_status"] = "실패: 주문 API None/비 dict 응답"
-                logger.error(f"[ORDER_FAIL] code={code}, resp is None/비 dict")
-                continue
-
-            # ODNO 필드로 주문번호 파싱
-            ord_no = None
-            if resp.get("output") and resp["output"].get("ODNO"):
-                ord_no = resp["output"]["ODNO"]
-            elif resp.get("ordNo"):
-                ord_no = resp["ordNo"]
-
-            info["order_response"] = resp
-            if ord_no:
-                info["order_status"] = f"접수번호={ord_no}, qty={quantity}, price={price}"
-            else:
-                logger.error(f"[PARSE_FAIL] code={code}, resp missing ODNO: {resp}")
-                info["order_status"] = "실패: 응답에서 주문번호(ODNO) 없음"
-
-            logger.info(f"[ORDER] code={code}, qty={quantity}, price={price}, ord_no={ord_no}")
-
-            # 잔고 조회
-            try:
-                bal = inquire_balance(code)
-                info["balance_after"] = bal
-                logger.info(f"[BALANCE] code={code}, balance={bal}")
-            except Exception:
-                logger.exception(f"[BALANCE_FAIL] code={code}")
-
-            # 체결 조회
-            if ord_no:
-                try:
-                    fill = inquire_filled_order(ord_no)
-                    info["fill_info"] = fill
-                    logger.info(f"[FILL] ord_no={ord_no}, fill={fill}")
-                except Exception:
-                    logger.exception(f"[FILL_FAIL] ord_no={ord_no}")
-
+            df = DataReader(code)
+            if df is not None and len(df) >= 2:
+                prev = df.iloc[-2]
+                row["prev_open"] = float(prev.get("Open", 0))
+                row["prev_high"] = float(prev.get("High", 0))
+                row["prev_low"] = float(prev.get("Low", 0))
+                row["prev_close"] = float(prev.get("Close", 0))
+                row["prev_volume"] = float(prev.get("Volume", 0))
+                row["prev_turnover"] = float(prev.get("Close", 0)) * float(prev.get("Volume", 0))
         except Exception as e:
-            info["order_status"] = f"실패: {e}"
-            logger.exception(f"[ORDER_FAIL] code={code}, error={e}")
+            logger.warning(f"[REBAL] OHLC enrich fail {code}: {e}")
+        enriched.append(row)
 
-        results_list.append(info)
-
-    logger.info(f"[ORDER_COUNT] 주문 시도 종목 수 = {len(results_list)}개")
-    logger.info(f"[CANDIDATES_RAW] {json.dumps(candidates, ensure_ascii=False)}")
-    logger.info(f"[SELECTED_RAW] {json.dumps(selected, ensure_ascii=False)}")
-
-    # 5) 캐시 업데이트 및 파일 저장 - 반드시 selected 결과만!
-    latest_rebalance_result.update({"date": date, "selected_stocks": results_list})
-    out_dir = "rebalance_results"
-    os.makedirs(out_dir, exist_ok=True)
-    fp = os.path.join(out_dir, f"rebalance_{date}.json")
+    latest_rebalance_result.update({"date": date, "selected_stocks": enriched})
+    os.makedirs(REBALANCE_OUT_DIR, exist_ok=True)
+    fp = os.path.join(REBALANCE_OUT_DIR, f"rebalance_{date}.json")
     try:
         with open(fp, "w", encoding="utf-8") as f:
-            json.dump(results_list, f, ensure_ascii=False, indent=2)
-        logger.info(f"[SAVE] {fp} 저장 (count={len(results_list)})")
+            json.dump(enriched, f, ensure_ascii=False, indent=2)
+        logger.info(f"[SAVE] {fp} 저장 (count={len(enriched)})")
     except Exception as e:
         logger.exception(f"[SAVE_FAIL] JSON 저장 오류: {e}")
         raise HTTPException(status_code=500, detail="리밸런스 결과 저장 실패")
 
+    os.makedirs(os.path.dirname(REBALANCE_STORE), exist_ok=True)
+    with open(REBALANCE_STORE, "w", encoding="utf-8") as f:
+        json.dump({"date": date, "selected_stocks": enriched}, f, ensure_ascii=False, indent=2)
+
     return {
-        "status": "orders_sent",
-        "selected_count": len(results_list),
-        "selected_stocks": results_list,
-        "force_order": allow_after,
+        "status": "saved",
+        "selected_count": len(enriched),
+        "selected_stocks": enriched,
+        "store": REBALANCE_STORE,
+        "out_file": fp,
+        "total_capital_hint": TOTAL_CAPITAL,
     }
 
-# ──────────────────────────────────────────────────────────────
-# 3. 최근 리밸런스 결과 조회
-# ──────────────────────────────────────────────────────────────
 @rebalance_router.get("/rebalance/latest", tags=["Rebalance"])
 def get_latest_rebalance():
-    """최근 run_rebalance 결과 캐시 반환"""
     return latest_rebalance_result
 
-# ──────────────────────────────────────────────────────────────
-# 4. 월단위 백테스트 엔드포인트 (원본 로직 유지)
-# ──────────────────────────────────────────────────────────────
 @rebalance_router.get(
     "/rebalance/backtest-monthly",
     tags=["Rebalance"],
@@ -273,8 +209,6 @@ def rebalance_backtest_monthly(
     try:
         top50_df = StockListing("KOSDAQ").sort_values("Marcap", ascending=False).head(50)
         tickers = list(zip(top50_df["Code"], top50_df["Name"]))
-        fee = 0.0015
-        k_values = np.arange(0.1, 1.01, 0.05)
         periods = pd.date_range(start=start_date, end=end_date, freq="MS")
 
         if len(periods) < 2:
@@ -338,9 +272,8 @@ def rebalance_backtest_monthly(
 
         final_df = pd.concat(all_results, ignore_index=True)
         filename = f"backtest_result_{uuid.uuid4().hex}.json"
-        out_dir = "rebalance_results"
-        os.makedirs(out_dir, exist_ok=True)
-        filepath = os.path.join(out_dir, filename)
+        os.makedirs(REBALANCE_OUT_DIR, exist_ok=True)
+        filepath = os.path.join(REBALANCE_OUT_DIR, filename)
         final_df.to_json(filepath, force_ascii=False, orient="records", indent=2)
         logger.info(f"[SAVE] 백테스트 결과 저장: {filename} (count={len(final_df)})")
 
@@ -358,18 +291,12 @@ def rebalance_backtest_monthly(
         logger.exception(f"[ERROR] rebalance-backtest 예외: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# ──────────────────────────────────────────────────────────────
-# 5. selected_stocks만 반환하는 엔드포인트 (선택적)
-# ──────────────────────────────────────────────────────────────
 @rebalance_router.get(
     "/rebalance/selected/{date}",
     tags=["Rebalance"],
     response_class=JSONResponse,
 )
 def get_selected_stocks(date: str):
-    """
-    리밸런싱 실행 후 selected_stocks(실매매 종목 리스트)만 반환하는 API
-    """
     if latest_rebalance_result.get("date") == date:
         selected = latest_rebalance_result.get("selected_stocks", [])
         return {
@@ -384,3 +311,4 @@ def get_selected_stocks(date: str):
             "selected": [],
             "message": "먼저 /rebalance/run/{date} 엔드포인트로 리밸런싱을 실행하세요."
         }
+# TOTAL_LINES: 320

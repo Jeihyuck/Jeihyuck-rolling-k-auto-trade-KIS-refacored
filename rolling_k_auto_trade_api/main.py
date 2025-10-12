@@ -1,13 +1,12 @@
+import logging_config  # 루트에 위치. 이 한 줄로 전역 로깅 설정이 바로 적용됨
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from logging_config import setup_logging
 from rolling_k_auto_trade_api.rebalance_api import rebalance_router
 from trader.kis_wrapper import KisAPI
 
-# 1) 로거 설정
-setup_logging()
+# 1) 로거 인스턴스
 logger = logging.getLogger(__name__)
 
 # 2) FastAPI 앱 생성
@@ -23,7 +22,7 @@ async def catch_exceptions_middleware(request: Request, call_next):
         try:
             body = await request.body()
             logger.debug(f"Request body: {body.decode('utf-8', 'ignore')}")
-        except:
+        except Exception:
             pass
         return JSONResponse(
             status_code=500,
@@ -58,3 +57,4 @@ def sell_order(req: OrderRequest):
     except Exception as e:
         logger.error(f"[SELL_ORDER_FAIL] {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
