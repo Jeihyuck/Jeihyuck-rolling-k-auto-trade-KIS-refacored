@@ -2,12 +2,12 @@ name: Trade Monitor
 
 on:
   push:
-    branches: [ change-logic ]
+    branches: [ main, change-logic ]
   pull_request:
-    branches: [ change-logic ]
+    branches: [ main, change-logic ]
   schedule:
     # 매일 한국시간 08:50 (UTC 23:50, 일~목) 실행
-    - cron: "50 23 * * 0-4"
+    - cron: "50 23 * * 0-5"
   workflow_dispatch:
 
 jobs:
