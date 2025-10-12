@@ -6,8 +6,8 @@ on:
   pull_request:
     branches: [ change-logic ]
   schedule:
-    # 매일 한국시간 08:30 (UTC 23:30, 일~목) 실행
-    - cron: "30 23 * * 0-4"
+    # 매일 한국시간 08:50 (UTC 23:50, 일~목) 실행
+    - cron: "50 23 * * 0-4"
   workflow_dispatch:
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       FAST_STOP: "0.01"          # 진입 5분내 급락 손절 1%
       ATR_STOP: "1.5"            # ATR x 1.5 절대 손절
       TIME_STOP_HHMM: "13:00"    # 시간 손절 기준
-      SELL_FORCE_TIME: "15:10"   # 장중 커트오프 전량매도 트리거
+      SELL_FORCE_TIME: "14:40"   # 장중 커트오프 전량매도 트리거
 
       # 후보 필터
       MIN_TRADES: "5"            # 월 구간 최소 거래수
