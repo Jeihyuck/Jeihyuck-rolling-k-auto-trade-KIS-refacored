@@ -346,64 +346,35 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 
 # ... 이하 [3/5]에서 계속 ...
 # trader.py [3/??] (약 331~500)
-def compute_entry_target(
-    kis: KisAPI,
-    code: str,
-    k_month: Optional[float],
-    given_target: Optional[float] = None
-) -> Tuple[int, Optional[float]]:
-    """
-    목표가 = 오늘 시초가 + K * (전일고 - 전일저)
-    - 리밸런싱이 주는 given_target(월초/전일 open/임의 목표가)은 **절대 사용하지 않음**
-    - 개장 전 today_open 미확정이면 0을 반환해서 진입을 보류
-    """
-    # 최근 피처 (ATR가 있으면 blend_k에 반영)
-    try:
-        feats = recent_features(kis, code) or {}
-    except Exception:
-        feats = {}
-    atr20 = feats.get("atr20")
-    atr60 = feats.get("atr60")
+# === 앵커: 목표가 계산 함수 정의부 ===
+def compute_entry_target(kis, stk) -> Optional[Tuple[float, float]]:
+    code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
+    if not code:
+        return None
 
-    # 오늘 시초가 / 전일 고저
-    today_open: Optional[float] = None
-    prev_high: Optional[float] = None
-    prev_low: Optional[float] = None
-    try:
-        if hasattr(kis, "get_today_open"):
-            today_open = _to_float(_with_retry(kis.get_today_open, code))
-        if hasattr(kis, "get_prev_high_low"):
-            prev = _with_retry(kis.get_prev_high_low, code)
-            if isinstance(prev, dict):
-                prev_high = _to_float(prev.get("high"))
-                prev_low = _to_float(prev.get("low"))
-    except Exception:
-        pass
+    today_open = kis.get_today_open(code)
+    if not today_open or today_open <= 0:
+        logger.info(f"[TARGET/wait_open] {code} 오늘 시초가 미확정 → 목표가 계산 보류")
+        return None
 
-    # 오늘 시초가가 아직 확정되지 않았다면(개장 전) 진입 보류
-    if today_open is None:
-        logger.info("[TARGET/wait_open] %s 오늘 시초가 미확정 → 목표가 계산 보류", code)
-        return 0, None
+    prev_candles = kis.get_daily_candles(code, count=2)
+    if len(prev_candles) < 2:
+        logger.warning(f"[TARGET/prev_candle_fail] {code} 전일 캔들 부족")
+        return None
 
-    # 사용 K 산출 (리밸런싱에서 준 best_k를 기본으로, ATR/일자 가중 blend)
-    day = datetime.now(KST).day
-    try:
-        k_use = blend_k(float(k_month) if k_month is not None else 0.5, day, atr20, atr60)
-    except Exception:
-        k_use = float(k_month) if k_month is not None else 0.5
+    prev = prev_candles[-2]
+    rng = max(0.0, (prev.get("high", 0.0) - prev.get("low", 0.0)))
 
-    # 전일 고저폭 없으면 최소 1원 보정
-    rng = None
-    if prev_high is not None and prev_low is not None:
-        rng = max(1.0, float(prev_high) - float(prev_low))
-    else:
-        # 전일 고저폭 조회 실패 시, 보수적으로 1% 대체폭 사용
-        rng = max(1.0, float(today_open) * 0.01)
+    k_used = float(
+        stk.get("best_k")
+        or stk.get("K")
+        or stk.get("k")
+        or stk.get("bestK")
+        or 0.5  # 안전 기본값
+    )
+    eff_target_price = float(today_open) + (float(rng) * k_used)
+    return float(today_open), float(eff_target_price)
 
-    target = int(round(float(today_open) + float(k_use) * rng))
-    logger.info("[TARGET/today_open] %s K_use=%.3f open=%s range=%s -> target=%s",
-                code, k_use, today_open, rng, target)
-    return target, k_use
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
     result_limit = None
