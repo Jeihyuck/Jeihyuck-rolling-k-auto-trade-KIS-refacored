@@ -347,33 +347,53 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 # ... 이하 [3/5]에서 계속 ...
 # trader.py [3/??] (약 331~500)
 # === 앵커: 목표가 계산 함수 정의부 ===
-def compute_entry_target(kis, stk) -> Optional[Tuple[float, float]]:
+# === 앵커: 목표가 계산 함수 정의부 ===
+def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    입력: kis 인스턴스, 리밸런싱 대상 1개(stk dict)
+    반환: (eff_target_price, k_used)
+    - eff_target_price: 오늘 시초가 + 전일 고저폭 * k_used
+    - k_used: 종목별 best_k (없으면 0.5)
+    실패 시: (None, None)
+    """
     code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
     if not code:
-        return None
+        return None, None
 
-    today_open = kis.get_today_open(code)
+    # 오늘 시초가
+    try:
+        today_open = kis.get_today_open(code)
+    except Exception:
+        today_open = None
+
     if not today_open or today_open <= 0:
         logger.info(f"[TARGET/wait_open] {code} 오늘 시초가 미확정 → 목표가 계산 보류")
-        return None
+        return None, None
 
-    prev_candles = kis.get_daily_candles(code, count=2)
-    if len(prev_candles) < 2:
+    # 전일 캔들(고저폭)
+    try:
+        prev_candles = kis.get_daily_candles(code, count=2)
+    except Exception:
+        prev_candles = []
+
+    if not prev_candles or len(prev_candles) < 2:
         logger.warning(f"[TARGET/prev_candle_fail] {code} 전일 캔들 부족")
-        return None
+        return None, None
 
     prev = prev_candles[-2]
-    rng = max(0.0, (prev.get("high", 0.0) - prev.get("low", 0.0)))
+    rng = max(0.0, (float(prev.get("high", 0.0)) - float(prev.get("low", 0.0))))
 
+    # k 값(리밸런싱 응답 우선)
     k_used = float(
         stk.get("best_k")
         or stk.get("K")
         or stk.get("k")
-        or stk.get("bestK")
-        or 0.5  # 안전 기본값
+        or 0.5
     )
+
     eff_target_price = float(today_open) + (float(rng) * k_used)
-    return float(today_open), float(eff_target_price)
+    return float(eff_target_price), float(k_used)
+
 
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
@@ -690,10 +710,9 @@ def main():
                 k_value_float = None if k_value is None else _to_float(k_value)
 
                 # 리밸런싱이 제공한 목표가/오픈값은 절대 사용하지 않기 위해 None 고정
+                # 리밸런싱이 제공한 목표가/오픈값은 절대 사용하지 않기 위해 None 고정
                 raw_target_price = None
-                eff_target_price, k_used = compute_entry_target(
-                    kis, code, k_month=k_value_float, given_target=raw_target_price
-                )
+                eff_target_price, k_used = compute_entry_target(kis, target)
 
                 strategy = target.get("strategy") or "전월 rolling K 최적화"
                 name = target.get("name") or target.get("종목명") or name_map.get(code)
