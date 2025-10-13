@@ -48,6 +48,8 @@ SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.5"))
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
 REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+MOMENTUM_OVERRIDES_FORCE_SELL = os.getenv("MOMENTUM_OVERRIDES_FORCE_SELL", "true").lower() == "true"
+
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -117,6 +119,25 @@ def _to_float(val, default=None):
         return float(val)
     except Exception:
         return default
+    
+def _log_realized_pnl(code: str, exec_px: Optional[float], sell_qty: int, buy_price: Optional[float]):
+    """
+    매도 체결 후 실현손익 로그 출력:
+      - 몇 주를 얼마에 팔았는지
+      - 평균 매수가 대비 수익률(%), 금액(원)
+    """
+    try:
+        if exec_px is None or sell_qty <= 0 or not buy_price or buy_price <= 0:
+            return
+        pnl_pct = ((float(exec_px) - float(buy_price)) / float(buy_price)) * 100.0
+        profit  = (float(exec_px) - float(buy_price)) * int(sell_qty)
+        logger.info(
+            f"[P&L] {code} SELL {int(sell_qty)}@{float(exec_px):.2f} / BUY={float(buy_price):.2f} "
+            f"→ PnL={pnl_pct:.2f}% (₩{int(round(profit)):,.0f})"
+        )
+    except Exception as e:
+        logger.warning(f"[P&L_LOG_FAIL] {code} err={e}")
+
 
 def _safe_get_price(kis: KisAPI, code: str):
     try:
@@ -331,16 +352,23 @@ def compute_entry_target(
     k_month: Optional[float],
     given_target: Optional[float] = None
 ) -> Tuple[int, Optional[float]]:
-    feats = {}
+    """
+    목표가 = 오늘 시초가 + K * (전일고 - 전일저)
+    - 리밸런싱이 주는 given_target(월초/전일 open/임의 목표가)은 **절대 사용하지 않음**
+    - 개장 전 today_open 미확정이면 0을 반환해서 진입을 보류
+    """
+    # 최근 피처 (ATR가 있으면 blend_k에 반영)
     try:
         feats = recent_features(kis, code) or {}
     except Exception:
         feats = {}
     atr20 = feats.get("atr20")
     atr60 = feats.get("atr60")
-    today_open = None
-    prev_high = None
-    prev_low = None
+
+    # 오늘 시초가 / 전일 고저
+    today_open: Optional[float] = None
+    prev_high: Optional[float] = None
+    prev_low: Optional[float] = None
     try:
         if hasattr(kis, "get_today_open"):
             today_open = _to_float(_with_retry(kis.get_today_open, code))
@@ -351,44 +379,31 @@ def compute_entry_target(
                 prev_low = _to_float(prev.get("low"))
     except Exception:
         pass
+
+    # 오늘 시초가가 아직 확정되지 않았다면(개장 전) 진입 보류
+    if today_open is None:
+        logger.info("[TARGET/wait_open] %s 오늘 시초가 미확정 → 목표가 계산 보류", code)
+        return 0, None
+
+    # 사용 K 산출 (리밸런싱에서 준 best_k를 기본으로, ATR/일자 가중 blend)
     day = datetime.now(KST).day
     try:
         k_use = blend_k(float(k_month) if k_month is not None else 0.5, day, atr20, atr60)
     except Exception:
         k_use = float(k_month) if k_month is not None else 0.5
-    baseline_k = float(k_month) if k_month is not None else 0.5
-    if given_target is not None:
-        try:
-            base = float(given_target)
-            if prev_high is not None and prev_low is not None:
-                rng = max(1.0, float(prev_high) - float(prev_low))
-                delta = (float(k_use) - float(baseline_k)) * rng
-                adjusted = int(round(base + delta))
-                logger.info(
-                    "[TARGET/adjust] %s base=%s baseline_k=%.3f k_use=%.3f rng=%s -> target=%s",
-                    code, base, baseline_k, k_use, rng, adjusted
-                )
-                return adjusted, k_use
-            tgt = int(round(base))
-            logger.info(
-                "[TARGET/adjust-skip] %s base=%s (no prev range) -> target=%s (k_use=%.3f)",
-                code, base, tgt, k_use
-            )
-            return tgt, k_use
-        except Exception:
-            logger.warning("[TARGET/adjust-fail] %s given_target=%s -> fallback compute", code, given_target)
-    if today_open is not None and prev_high is not None and prev_low is not None:
+
+    # 전일 고저폭 없으면 최소 1원 보정
+    rng = None
+    if prev_high is not None and prev_low is not None:
         rng = max(1.0, float(prev_high) - float(prev_low))
-        target = int(round(float(today_open) + float(k_use) * rng))
-        logger.info("[TARGET] %s K_use=%.3f open=%s range=%s -> target=%s", code, k_use, today_open, rng, target)
-        return target, k_use
-    cur = _safe_get_price(kis, code)
-    if cur is not None and cur > 0:
-        target = int(round(float(cur) * (1.0 + DEFAULT_PROFIT_PCT / 100.0)))
-        logger.info("[TARGET/backup] %s cur=%s -> target=%s (%.2f%%)", code, cur, target, DEFAULT_PROFIT_PCT)
-        return target, k_use
-    logger.warning("[TARGET/fallback-last] %s: 모든 소스 실패 → 고정치 사용", code)
-    return int(0), k_use
+    else:
+        # 전일 고저폭 조회 실패 시, 보수적으로 1% 대체폭 사용
+        rng = max(1.0, float(today_open) * 0.01)
+
+    target = int(round(float(today_open) + float(k_use) * rng))
+    logger.info("[TARGET/today_open] %s K_use=%.3f open=%s range=%s -> target=%s",
+                code, k_use, today_open, rng, target)
+    return target, k_use
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
     result_limit = None
@@ -426,6 +441,8 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
     balances = _fetch_balances(kis)
     qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances}
     sellable_map = {b.get("pdno"): _to_int(b.get("ord_psbl_qty", 0)) for b in balances}
+    avg_price_map = {b.get("pdno"): _to_float(b.get("pchs_avg_pric") or b.get("avg_price") or 0.0, 0.0) for b in balances}
+
     remaining = set()
     for code in list(targets_codes):
         qty = qty_map.get(code, 0)
@@ -439,9 +456,11 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             continue
 
         # === [모멘텀 강세: 매도 제외] ===
-        if is_strong_momentum(kis, code):
-            logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 강제매도 제외")
+        # === [모멘텀 강세: 매도 제외] (정책 토글) ===
+        if MOMENTUM_OVERRIDES_FORCE_SELL and is_strong_momentum(kis, code):
+            logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 강제매도 제외 (policy=MOMENTUM_OVERRIDES_FORCE_SELL=true)")
             continue
+
 
         # 기존 수익률 기반 매도 예외 로직(원하는 경우 병행 가능)
         return_pct = get_20d_return_pct(kis, code)
@@ -461,6 +480,11 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
         try:
             sell_qty = min(qty, sellable) if sellable > 0 else qty
             cur_price, result = _sell_once(kis, code, sell_qty, prefer_market=prefer_market)
+            # 실현손익 로그
+            buy_px_for_pnl = avg_price_map.get(code) or None
+            if buy_px_for_pnl:
+                _log_realized_pnl(code, cur_price, sell_qty, buy_px_for_pnl)
+
             log_trade({
                 "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                 "code": code,
@@ -473,6 +497,8 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
                 "price": cur_price if cur_price is not None else 0,
                 "amount": (_to_int(cur_price, 0) * int(sell_qty)) if cur_price is not None else 0,
                 "result": result,
+                "pnl_pct": ( ( (float(cur_price) - float(buy_px_for_pnl)) / float(buy_px_for_pnl) * 100.0) if (cur_price is not None and buy_px_for_pnl) else None ),
+                "profit": ( int(round( (float(cur_price) - float(buy_px_for_pnl)) * int(sell_qty) )) if (cur_price is not None and buy_px_for_pnl) else None ),
                 "reason": reason
             })
         finally:
@@ -522,6 +548,14 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         cur = _safe_get_price(kis, code)
         if cur is None:
             return None, None, None, None
+        # === [SELL GUARD ①] 모멘텀 강세면 매도 스킵 (최우선) ===
+        try:
+            if is_strong_momentum(kis, code):
+                logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
+                return None, None, None, None
+        except Exception as e:
+            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
+
     except Exception:
         return None, None, None, None
 
@@ -536,16 +570,19 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         ent = now
     if now - ent <= timedelta(minutes=5) and cur <= float(pos['buy_price']) * (1 - FAST_STOP):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
         return "FAST_STOP", exec_px, result, qty
 
     stop_abs = pos.get('stop_abs')
     if stop_abs is not None and cur <= float(stop_abs):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
         return "ATR_STOP", exec_px, result, qty
 
     if (not pos.get('sold_p1')) and cur >= float(pos.get('tp1', 9e18)):
         sell_qty = max(1, int(qty * PARTIAL1))
         exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
+        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)))
         pos['qty'] = qty - sell_qty
         pos['sold_p1'] = True
         return "TP1", exec_px, result, sell_qty
@@ -553,6 +590,7 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
     if (not pos.get('sold_p2')) and cur >= float(pos.get('tp2', 9e18)):
         sell_qty = max(1, int(qty * PARTIAL2))
         exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
+        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)))
         pos['qty'] = qty - sell_qty
         pos['sold_p2'] = True
         return "TP2", exec_px, result, sell_qty
@@ -560,12 +598,14 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
     trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
     if cur <= trail_line:
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
         return "TRAIL", exec_px, result, qty
 
     if now.time() >= TIME_STOP_TIME:
         buy_px = float(pos.get('buy_price'))
         if cur < buy_px:
             exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+            _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
             return "TIME_STOP", exec_px, result, qty
 
     return None, None, None, None
@@ -678,7 +718,8 @@ def main():
                 k_value = (target.get("best_k") or target.get("K") or target.get("k"))
                 k_value_float = None if k_value is None else _to_float(k_value)
 
-                raw_target_price = _to_float(target.get("목표가") or target.get("target_price"))
+                # 리밸런싱이 제공한 목표가/오픈값은 절대 사용하지 않기 위해 None 고정
+                raw_target_price = None
                 eff_target_price, k_used = compute_entry_target(
                     kis, code, k_month=k_value_float, given_target=raw_target_price
                 )
@@ -754,6 +795,14 @@ def main():
 
                     # --- 실전형 청산 (타겟 보유포지션) ---
                     if is_open and code in holding:
+                        # === [SELL GUARD ②] 모멘텀 강세면 이 루프에서도 즉시 스킵 ===
+                        try:
+                            if is_strong_momentum(kis, code):
+                                logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → 타겟 보유 매도 스킵")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
+
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here <= 0:
                             logger.info(f"[SKIP] {code}: 매도가능수량=0 (대기/체결중/락) → 매도 보류")
@@ -769,12 +818,17 @@ def main():
                                     "target_price": eff_target_price,
                                     "strategy": strategy,
                                 }
+                                _bp = float(holding[code].get("buy_price", 0.0)) if code in holding else 0.0
+                                _pnl_pct = ( ((float(exec_price) - _bp) / _bp) * 100.0 ) if (exec_price and _bp > 0) else None
+                                _profit  = ( (float(exec_price) - _bp) * int(sold_qty) ) if (exec_price and _bp > 0 and sold_qty) else None
                                 log_trade({
                                     **trade_common_sell,
                                     "side": "SELL",
                                     "price": exec_price,
                                     "amount": int(exec_price or 0) * int(sold_qty or 0),
                                     "result": result,
+                                    "pnl_pct": (_pnl_pct if _pnl_pct is not None else None),
+                                    "profit": ( int(round(_profit)) if _profit is not None else None ),
                                     "reason": reason
                                 })
                                 save_state(holding, traded)
@@ -819,14 +873,21 @@ def main():
                             "target_price": holding[code].get("target_price_src"),
                             "strategy": "기존보유 능동관리",
                         }
+                        _bp = float(holding[code].get("buy_price", 0.0)) if code in holding else 0.0
+                        _pnl_pct = ( ((float(exec_price) - _bp) / _bp) * 100.0 ) if (exec_price and _bp > 0) else None
+                        _profit  = ( (float(exec_price) - _bp) * int(sold_qty) ) if (exec_price and _bp > 0 and sold_qty) else None
+
                         log_trade({
                             **trade_common,
                             "side": "SELL",
                             "price": exec_price,
                             "amount": int(exec_price or 0) * int(sold_qty or 0),
                             "result": result,
-                            "reason": reason
+                            "reason": reason,
+                            "pnl_pct": (_pnl_pct if _pnl_pct is not None else None),
+                            "profit": ( int(round(_profit)) if _profit is not None else None )
                         })
+
                         save_state(holding, traded)
                         time.sleep(RATE_SLEEP_SEC)
 
