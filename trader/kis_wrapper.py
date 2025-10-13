@@ -336,33 +336,46 @@ class KisAPI:
     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
+        markets = ["J", "U"]  # ← 추가
+        last_err = None
         for tr in _pick_tr(self.env, "DAILY_CHART"):
             headers = self._headers(tr)
-            params = {
-                "fid_cond_mrkt_div_code": "J",
-                "fid_input_iscd": code if code.startswith("A") else f"A{code}",
-                "fid_org_adj_prc": "0",
-                "fid_period_div_code": "D",
-            }
-            try:
-                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                data = resp.json()
-            except Exception:
-                continue
-            if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                arr = data["output"]
-                rows = [
-                    {
-                        "date": r.get("stck_bsop_date"),
-                        "open": float(r.get("stck_oprc")),
-                        "high": float(r.get("stck_hgpr")),
-                        "low": float(r.get("stck_lwpr")),
-                        "close": float(r.get("stck_clpr")),
-                    }
-                    for r in arr[: max(count, 20)] if r.get("stck_oprc") is not None
-                ]
-                rows.sort(key=lambda x: x["date"])  # 과거→최근
-                return rows[-count:]
+            # A접두 처리
+            iscd = code if code.startswith("A") else f"A{code}"
+            for mrk in markets:  # ← J→U 순차 시도
+                params = {
+                    "fid_cond_mrkt_div_code": mrk,
+                    "fid_input_iscd": iscd,
+                    "fid_org_adj_prc": "0",
+                    "fid_period_div_code": "D",
+                }
+                for attempt in range(1, 3):  # 가벼운 재시도 2회
+                    try:
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                        data = resp.json()
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.4 * attempt)
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        arr = data["output"]
+                        rows = [{
+                            "date": r.get("stck_bsop_date"),
+                            "open": float(r.get("stck_oprc")),
+                            "high": float(r.get("stck_hgpr")),
+                            "low":  float(r.get("stck_lwpr")),
+                            "close":float(r.get("stck_clpr")),
+                        } for r in arr if r.get("stck_oprc") is not None]
+                        rows.sort(key=lambda x: x["date"])
+                        # 최소 2개 확보 보장
+                        if len(rows) >= 2:
+                            return rows[-max(count, 20):][-count:]
+                    # 게이트웨이/한도 문구면 잠깐 쉼
+                    if "초당 거래건수" in (data.get("msg1") or ""):
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+        # 실패
+        if last_err:
+            logger.warning(f"[DAILY_FAIL] {code}: {last_err}")
         return []
 
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:

@@ -347,52 +347,52 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 # ... 이하 [3/5]에서 계속 ...
 # trader.py [3/??] (약 331~500)
 # === 앵커: 목표가 계산 함수 정의부 ===
-# === 앵커: 목표가 계산 함수 정의부 ===
 def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    입력: kis 인스턴스, 리밸런싱 대상 1개(stk dict)
-    반환: (eff_target_price, k_used)
-    - eff_target_price: 오늘 시초가 + 전일 고저폭 * k_used
-    - k_used: 종목별 best_k (없으면 0.5)
-    실패 시: (None, None)
-    """
     code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
     if not code:
         return None, None
 
-    # 오늘 시초가
+    # 1) 오늘 시초가
+    today_open = None
     try:
         today_open = kis.get_today_open(code)
     except Exception:
-        today_open = None
-
+        pass
+    if not today_open or today_open <= 0:
+        # 스냅샷 현재가를 임시 대체(야간 대비)
+        try:
+            snap = kis.get_current_price(code)
+            if snap and snap > 0:
+                today_open = float(snap)
+        except Exception:
+            pass
     if not today_open or today_open <= 0:
         logger.info(f"[TARGET/wait_open] {code} 오늘 시초가 미확정 → 목표가 계산 보류")
         return None, None
 
-    # 전일 캔들(고저폭)
+    # 2) 전일 범위: 일봉 → 실패 시 prev_* 백업
+    prev_high = prev_low = None
     try:
         prev_candles = kis.get_daily_candles(code, count=2)
+        if prev_candles and len(prev_candles) >= 2:
+            prev = prev_candles[-2]
+            prev_high = _to_float(prev.get("high"))
+            prev_low  = _to_float(prev.get("low"))
     except Exception:
-        prev_candles = []
+        pass
+    if prev_high is None or prev_low is None:
+        # 백업: 리밸런싱 응답 필드 사용
+        prev_high = _to_float(stk.get("prev_high"))
+        prev_low  = _to_float(stk.get("prev_low"))
+        if prev_high is None or prev_low is None:
+            logger.warning(f"[TARGET/prev_candle_fail] {code} 전일 캔들/백업 모두 부재")
+            return None, None
 
-    if not prev_candles or len(prev_candles) < 2:
-        logger.warning(f"[TARGET/prev_candle_fail] {code} 전일 캔들 부족")
-        return None, None
-
-    prev = prev_candles[-2]
-    rng = max(0.0, (float(prev.get("high", 0.0)) - float(prev.get("low", 0.0))))
-
-    # k 값(리밸런싱 응답 우선)
-    k_used = float(
-        stk.get("best_k")
-        or stk.get("K")
-        or stk.get("k")
-        or 0.5
-    )
-
-    eff_target_price = float(today_open) + (float(rng) * k_used)
+    rng = max(0.0, float(prev_high) - float(prev_low))
+    k_used = float(stk.get("best_k") or stk.get("K") or stk.get("k") or 0.5)
+    eff_target_price = float(today_open) + rng * k_used
     return float(eff_target_price), float(k_used)
+
 
 
 
