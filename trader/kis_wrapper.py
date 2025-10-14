@@ -121,6 +121,8 @@ class KisAPI:
         self._recent_sells_cooldown = 60.0
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
+        self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
+        self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
 
     def get_valid_token(self):
         with KisAPI._token_lock:
@@ -238,6 +240,74 @@ class KisAPI:
                         except Exception:
                             pass
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
+    
+        # --- 오늘 시초가 캐시 (선택) ---
+        # __init__ 끝부분에 추가
+
+
+    def _get_cached_today_open(self, code: str) -> Optional[float]:
+        try:
+            op, ts = self._today_open_cache.get(code, (None, 0.0))
+            if op and (time.time() - ts) < self._today_open_ttl:
+                return op
+        except Exception:
+         pass
+        return None
+
+    def _set_cached_today_open(self, code: str, price: float):
+        try:
+            if price and price > 0:
+                self._today_open_cache[code] = (float(price), time.time())
+        except Exception:
+            pass
+
+    def get_today_open(self, code: str) -> Optional[float]:
+        """
+        오늘 시초가(09:00 기준)를 반환한다.
+        1순위: 실시간 스냅샷(inquire-price)의 stck_oprc
+        2순위: 시간체결(첫 틱가) 등 보조 수단(미구현 시 생략 가능)
+        """
+        code = safe_strip(code)
+        # 0) 캐시
+        cached = self._get_cached_today_open(code)
+        if cached:
+            return cached
+
+        # 1) 스냅샷에서 stck_oprc (장중에도 유지됨)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        self._limiter.wait("quotes-open")
+        tried = []
+        for tr in _pick_tr(self.env, "PRICE"):
+            headers = self._headers(tr)
+            # 스냅샷은 보통 접두사 없이 '277810' 형태가 기본이지만, 혼용을 대비해 둘 다 시도
+            markets = ["J", "U"]
+            c = code
+            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+            for market_div in markets:
+                for code_fmt in codes:
+                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                    try:
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        data = resp.json()
+                    except Exception as e:
+                        tried.append((market_div, code_fmt, f"EXC:{e}"))
+                        continue
+                    tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
+                    if "초당 거래건수" in (data.get("msg1") or ""):
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        op_str = data["output"].get("stck_oprc")
+                        try:
+                            op = float(op_str) if op_str is not None else 0.0
+                            if op > 0:
+                                self._set_cached_today_open(code, op)
+                                return op
+                        except Exception:
+                            pass
+        # 2) (옵션) 시간체결 첫 틱가 보조 → 필요하면 별도 구현
+        return None
+
 
     def get_orderbook_strength(self, code: str) -> Optional[float]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
@@ -266,33 +336,46 @@ class KisAPI:
     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
+        markets = ["J", "U"]  # ← 추가
+        last_err = None
         for tr in _pick_tr(self.env, "DAILY_CHART"):
             headers = self._headers(tr)
-            params = {
-                "fid_cond_mrkt_div_code": "J",
-                "fid_input_iscd": code if code.startswith("A") else f"A{code}",
-                "fid_org_adj_prc": "0",
-                "fid_period_div_code": "D",
-            }
-            try:
-                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                data = resp.json()
-            except Exception:
-                continue
-            if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                arr = data["output"]
-                rows = [
-                    {
-                        "date": r.get("stck_bsop_date"),
-                        "open": float(r.get("stck_oprc")),
-                        "high": float(r.get("stck_hgpr")),
-                        "low": float(r.get("stck_lwpr")),
-                        "close": float(r.get("stck_clpr")),
-                    }
-                    for r in arr[: max(count, 20)] if r.get("stck_oprc") is not None
-                ]
-                rows.sort(key=lambda x: x["date"])  # 과거→최근
-                return rows[-count:]
+            # A접두 처리
+            iscd = code if code.startswith("A") else f"A{code}"
+            for mrk in markets:  # ← J→U 순차 시도
+                params = {
+                    "fid_cond_mrkt_div_code": mrk,
+                    "fid_input_iscd": iscd,
+                    "fid_org_adj_prc": "0",
+                    "fid_period_div_code": "D",
+                }
+                for attempt in range(1, 3):  # 가벼운 재시도 2회
+                    try:
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                        data = resp.json()
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.4 * attempt)
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        arr = data["output"]
+                        rows = [{
+                            "date": r.get("stck_bsop_date"),
+                            "open": float(r.get("stck_oprc")),
+                            "high": float(r.get("stck_hgpr")),
+                            "low":  float(r.get("stck_lwpr")),
+                            "close":float(r.get("stck_clpr")),
+                        } for r in arr if r.get("stck_oprc") is not None]
+                        rows.sort(key=lambda x: x["date"])
+                        # 최소 2개 확보 보장
+                        if len(rows) >= 2:
+                            return rows[-max(count, 20):][-count:]
+                    # 게이트웨이/한도 문구면 잠깐 쉼
+                    if "초당 거래건수" in (data.get("msg1") or ""):
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+        # 실패
+        if last_err:
+            logger.warning(f"[DAILY_FAIL] {code}: {last_err}")
         return []
 
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:
