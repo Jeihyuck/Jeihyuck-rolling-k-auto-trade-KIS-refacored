@@ -648,6 +648,11 @@ def main():
             "target_price": target_price,
             "qty": qty,
             "strategy": strategy,
+        # === 여기 추가 ===
+            "prev_open": t.get("prev_open"),
+            "prev_high": t.get("prev_high"),
+            "prev_low": t.get("prev_low"),
+            "prev_close": t.get("prev_close"),
         }
     code_to_target: Dict[str, Any] = processed_targets
 
