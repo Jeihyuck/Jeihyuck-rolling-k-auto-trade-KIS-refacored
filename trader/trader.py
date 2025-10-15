@@ -120,23 +120,31 @@ def _to_float(val, default=None):
     except Exception:
         return default
     
-def _log_realized_pnl(code: str, exec_px: Optional[float], sell_qty: int, buy_price: Optional[float]):
+def _log_realized_pnl(
+    code: str,
+    exec_px: Optional[float],
+    sell_qty: int,
+    buy_price: Optional[float],
+    reason: str = ""
+):
     """
-    매도 체결 후 실현손익 로그 출력:
-      - 몇 주를 얼마에 팔았는지
-      - 평균 매수가 대비 수익률(%), 금액(원)
+    매도 체결 후 실현손익 로그 출력 + 매도 사유도 함께 남김
     """
     try:
         if exec_px is None or sell_qty <= 0 or not buy_price or buy_price <= 0:
             return
         pnl_pct = ((float(exec_px) - float(buy_price)) / float(buy_price)) * 100.0
         profit  = (float(exec_px) - float(buy_price)) * int(sell_qty)
-        logger.info(
+        msg = (
             f"[P&L] {code} SELL {int(sell_qty)}@{float(exec_px):.2f} / BUY={float(buy_price):.2f} "
             f"→ PnL={pnl_pct:.2f}% (₩{int(round(profit)):,.0f})"
         )
+        if reason:
+            msg += f" / REASON={reason}"
+        logger.info(msg)
     except Exception as e:
         logger.warning(f"[P&L_LOG_FAIL] {code} err={e}")
+
 
 
 def _safe_get_price(kis: KisAPI, code: str):
@@ -532,21 +540,15 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
 # ... 이하 [4/??]에서 계속 ...
 # trader.py [4/??]
-
 def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
     now = datetime.now(KST)
     try:
         cur = _safe_get_price(kis, code)
         if cur is None:
             return None, None, None, None
-        # === [SELL GUARD ①] 모멘텀 강세면 매도 스킵 (최우선) ===
-        try:
-            if is_strong_momentum(kis, code):
-                logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
-                return None, None, None, None
-        except Exception as e:
-            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
-
+        if is_strong_momentum(kis, code):
+            logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
+            return None, None, None, None
     except Exception:
         return None, None, None, None
 
@@ -559,47 +561,61 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         ent = datetime.fromisoformat(pos.get('entry_time')).replace(tzinfo=KST)
     except Exception:
         ent = now
+
+    # FAST_STOP
     if now - ent <= timedelta(minutes=5) and cur <= float(pos['buy_price']) * (1 - FAST_STOP):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="FAST_STOP")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=FAST_STOP qty={qty} price={exec_px}")
         return "FAST_STOP", exec_px, result, qty
 
+    # ATR_STOP
     stop_abs = pos.get('stop_abs')
     if stop_abs is not None and cur <= float(stop_abs):
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="ATR_STOP")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=ATR_STOP qty={qty} price={exec_px}")
         return "ATR_STOP", exec_px, result, qty
 
+    # TP1
     if (not pos.get('sold_p1')) and cur >= float(pos.get('tp1', 9e18)):
         sell_qty = max(1, int(qty * PARTIAL1))
         exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)))
+        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)), reason="TP1")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=TP1 qty={sell_qty} price={exec_px}")
         pos['qty'] = qty - sell_qty
         pos['sold_p1'] = True
         return "TP1", exec_px, result, sell_qty
 
+    # TP2
     if (not pos.get('sold_p2')) and cur >= float(pos.get('tp2', 9e18)):
         sell_qty = max(1, int(qty * PARTIAL2))
         exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)))
+        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)), reason="TP2")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=TP2 qty={sell_qty} price={exec_px}")
         pos['qty'] = qty - sell_qty
         pos['sold_p2'] = True
         return "TP2", exec_px, result, sell_qty
 
+    # TRAIL
     trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
     if cur <= trail_line:
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="TRAIL")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=TRAIL qty={qty} price={exec_px}")
         return "TRAIL", exec_px, result, qty
 
+    # TIME_STOP
     if now.time() >= TIME_STOP_TIME:
         buy_px = float(pos.get('buy_price'))
         if cur < buy_px:
             exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-            _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)))
+            _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="TIME_STOP")
+            logger.info(f"[SELL-TRIGGER] {code} REASON=TIME_STOP qty={qty} price={exec_px}")
             return "TIME_STOP", exec_px, result, qty
 
     return None, None, None, None
+
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
 def main():
