@@ -30,7 +30,7 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 
 KST = ZoneInfo("Asia/Seoul")
 SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:40").strip()
-SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
+SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "false").lower() == "true"
 RATE_SLEEP_SEC = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
 FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "2"))
 FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
@@ -546,74 +546,42 @@ def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optiona
         cur = _safe_get_price(kis, code)
         if cur is None:
             return None, None, None, None
+        # 강한 모멘텀이면 청산 보류 (원래대로 유지)
         if is_strong_momentum(kis, code):
             logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
             return None, None, None, None
     except Exception:
         return None, None, None, None
 
+    # 최고가(high) 갱신
     pos['high'] = max(float(pos.get('high', cur)), float(cur))
     qty = _to_int(pos.get('qty'), 0)
     if qty <= 0:
         return None, None, None, None
 
-    try:
-        ent = datetime.fromisoformat(pos.get('entry_time')).replace(tzinfo=KST)
-    except Exception:
-        ent = now
-
-    # FAST_STOP
-    if now - ent <= timedelta(minutes=5) and cur <= float(pos['buy_price']) * (1 - FAST_STOP):
+    # === 익절(3%) ===
+    if cur >= float(pos['buy_price']) * 1.03:
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="FAST_STOP")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=FAST_STOP qty={qty} price={exec_px}")
-        return "FAST_STOP", exec_px, result, qty
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="익절 3%")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=익절 3% qty={qty} price={exec_px}")
+        return "익절 3%", exec_px, result, qty
 
-    # ATR_STOP
-    stop_abs = pos.get('stop_abs')
-    if stop_abs is not None and cur <= float(stop_abs):
+    # === 트레일링스톱(최고가 4% 돌파후 1.5% 이상 하락) ===
+    max_price = pos.get('high', float(pos['buy_price']))
+    if max_price >= float(pos['buy_price']) * 1.04 and cur <= max_price * 0.985:
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="ATR_STOP")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=ATR_STOP qty={qty} price={exec_px}")
-        return "ATR_STOP", exec_px, result, qty
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="트레일링스톱")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=트레일링스톱 qty={qty} price={exec_px}")
+        return "트레일링스톱", exec_px, result, qty
 
-    # TP1
-    if (not pos.get('sold_p1')) and cur >= float(pos.get('tp1', 9e18)):
-        sell_qty = max(1, int(qty * PARTIAL1))
-        exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)), reason="TP1")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=TP1 qty={sell_qty} price={exec_px}")
-        pos['qty'] = qty - sell_qty
-        pos['sold_p1'] = True
-        return "TP1", exec_px, result, sell_qty
-
-    # TP2
-    if (not pos.get('sold_p2')) and cur >= float(pos.get('tp2', 9e18)):
-        sell_qty = max(1, int(qty * PARTIAL2))
-        exec_px, result = _sell_once(kis, code, sell_qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, sell_qty, float(pos.get('buy_price', 0.0)), reason="TP2")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=TP2 qty={sell_qty} price={exec_px}")
-        pos['qty'] = qty - sell_qty
-        pos['sold_p2'] = True
-        return "TP2", exec_px, result, sell_qty
-
-    # TRAIL
-    trail_line = float(pos['high']) * (1 - float(pos.get('trail_pct', TRAIL_PCT)))
-    if cur <= trail_line:
+    # === 손절(-3%) ===
+    if cur <= float(pos['buy_price']) * 0.97:
         exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="TRAIL")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=TRAIL qty={qty} price={exec_px}")
-        return "TRAIL", exec_px, result, qty
+        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="손절 -3%")
+        logger.info(f"[SELL-TRIGGER] {code} REASON=손절 -3% qty={qty} price={exec_px}")
+        return "손절 -3%", exec_px, result, qty
 
-    # TIME_STOP
-    if now.time() >= TIME_STOP_TIME:
-        buy_px = float(pos.get('buy_price'))
-        if cur < buy_px:
-            exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-            _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="TIME_STOP")
-            logger.info(f"[SELL-TRIGGER] {code} REASON=TIME_STOP qty={qty} price={exec_px}")
-            return "TIME_STOP", exec_px, result, qty
-
+    # 더 이상 당일청산(TIME_STOP), ATR_STOP 등 없음
     return None, None, None, None
 
 
@@ -904,26 +872,26 @@ def main():
 
 
             # --- 장중 커트오프(KST) 강제 전량매도 (마지막 안전장치) ---
-            if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
-                _force_sell_all(
-                    kis=kis,
-                    holding=holding,
-                    reason=f"장중 강제전량매도(커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} KST)",
-                    passes=FORCE_SELL_PASSES_CUTOFF,
-                    include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
-                    prefer_market=True
-                )
+            #if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
+            #    _force_sell_all(
+            #        kis=kis,
+            #        holding=holding,
+            #        reason=f"장중 강제전량매도(커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} KST)",
+            #        passes=FORCE_SELL_PASSES_CUTOFF,
+            #        include_all_balances=SELL_ALL_BALANCES_AT_CUTOFF,
+            #        prefer_market=True
+            #    )
 
             # --- 장마감 전량매도(더블 세이프) ---
-            if not is_open:
-                _force_sell_all(
-                    kis=kis,
-                    holding=holding,
-                    reason="장마감 전 강제전량매도",
-                    passes=FORCE_SELL_PASSES_CLOSE,
-                    include_all_balances=True,
-                    prefer_market=True
-                )
+            #if not is_open:
+            #    _force_sell_all(
+            #        kis=kis,
+            #        holding=holding,
+            #        reason="장마감 전 강제전량매도",
+            #        passes=FORCE_SELL_PASSES_CLOSE,
+            #        include_all_balances=True,
+            #        prefer_market=True
+            #    )
                 logger.info("[✅ 장마감, 루프 종료]")
                 break
 
