@@ -89,7 +89,7 @@ def _env_runtime_params() -> Dict[str, Any]:
         "TIME_STOP_HHMM": _g("TIME_STOP_HHMM", "13:00"),
         "SELL_FORCE_TIME": _g("SELL_FORCE_TIME", "15:20"),
         "DAILY_CAPITAL": _g("DAILY_CAPITAL", None),
-        "SLIPPAGE_ENTER_GUARD_PCT": _g("SLIPPAGE_ENTER_GUARD_PCT", "1.5"),
+        "SLIPPAGE_ENTER_GUARD_PCT": _g("SLIPPAGE_ENTER_GUARD_PCT", "2.5"),
     }
 
 

@@ -43,7 +43,7 @@ SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").l
 API_RATE_SLEEP_SEC    = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
 FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "2"))
 FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
-SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.5"))
+SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
 W_MAX_ONE             = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE             = float(os.getenv("W_MIN_ONE", "0.03"))
 
