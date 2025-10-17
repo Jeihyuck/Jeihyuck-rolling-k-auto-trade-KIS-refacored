@@ -893,7 +893,7 @@ def main():
             #        prefer_market=True
             #    )
             #    logger.info("[✅ 장마감, 루프 종료]")
-            ""    break
+            #    break
 
             save_state(holding, traded)
             time.sleep(loop_sleep_sec)
