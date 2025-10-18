@@ -29,7 +29,7 @@ KIS_WS_URL     = safe_strip(os.getenv("KIS_WS_URL", ""))
 # === 실전 전략/실험 환경 변수 ===
 REBALANCE_ANCHOR      = os.getenv("REBALANCE_ANCHOR", "first")
 DAILY_CAPITAL         = int(os.getenv("DAILY_CAPITAL", "3000000"))
-SLIPPAGE_LIMIT_PCT    = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.15"))
+SLIPPAGE_LIMIT_PCT    = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 PARTIAL1              = float(os.getenv("PARTIAL1", "0.5"))
 PARTIAL2              = float(os.getenv("PARTIAL2", "0.3"))
 TRAIL_PCT             = float(os.getenv("TRAIL_PCT", "0.02"))
@@ -43,7 +43,7 @@ SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").l
 API_RATE_SLEEP_SEC    = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
 FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "2"))
 FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
-SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "1.5"))
+SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
 W_MAX_ONE             = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE             = float(os.getenv("W_MIN_ONE", "0.03"))
 
