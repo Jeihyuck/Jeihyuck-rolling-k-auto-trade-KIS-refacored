@@ -50,7 +50,8 @@ def _assign_weights(selected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             mdd = abs(float(it.get("mdd_pct", it.get("MDD(%)", 0)))) / 100.0
         except Exception:
             win, ret, mdd = 0.5, 0.1, 0.1
-        score = (0.6 * win + 0.6 * ret) / max(0.05, (0.4 * mdd))
+        vol = float(it.get("prev_volume", 1))
+        score = (0.6 * win + 0.6 * ret + 0.1 * np.log1p(vol)) / max(0.05, (0.4 * mdd))
         scores.append(max(0.0, score))
     s = sum(scores) or 1.0
     weights = [sc / s for sc in scores]
@@ -106,6 +107,21 @@ async def run_rebalance(date: str):
             mdd <= MAX_MDD
         ):
             selected.append(info)
+    # 거래량 내림차순 정렬
+    candidates_with_vol = sorted(candidates, key=lambda x: x.get("prev_volume", 0), reverse=True)
+    # === [anchor] 거래량 Top5(상승 종목만) 산출 및 강제편입 ===
+    # 1. 거래량 상위 후보 중에서, 전일 '상승(양봉)' 종목만 필터
+    rising_vol_candidates = [
+        c for c in candidates_with_vol if c.get("prev_close", 0) > c.get("prev_open", 0)
+    ]
+    # 2. 거래량 기준 내림차순으로 Top5 추출
+    top5_rising_vol = rising_vol_candidates[:5]
+    # 3. 기존 selected에 없는 경우만 강제 편입
+    codes_in_selected = {s["code"] for s in selected}
+    for cand in top5_rising_vol:
+        if cand["code"] not in codes_in_selected:
+            selected.append(cand)
+
 
     if TOP_K_LIMIT and len(selected) > TOP_K_LIMIT:
         selected = sorted(

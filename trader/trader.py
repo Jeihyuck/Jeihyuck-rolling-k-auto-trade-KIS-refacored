@@ -637,6 +637,7 @@ def main():
             "prev_high": t.get("prev_high"),
             "prev_low": t.get("prev_low"),
             "prev_close": t.get("prev_close"),
+            "prev_volume": t.get("prev_volume"),  # << 반드시 이 줄 추가!
         }
     code_to_target: Dict[str, Any] = processed_targets
 
@@ -690,6 +691,13 @@ def main():
 
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
             for code, target in code_to_target.items():
+                # === [anchor] 거래량 및 양봉 정보 활용 ===
+                prev_volume = _to_float(target.get("prev_volume"))
+                prev_open   = _to_float(target.get("prev_open"))
+                prev_close  = _to_float(target.get("prev_close"))
+                # 참고: prev_volume, prev_open, prev_close 값이 없으면 None/0으로 들어감
+                logger.debug(f"[prev_volume 체크] {code} 거래량:{prev_volume}, 전일시가:{prev_open}, 전일종가:{prev_close}")
+
                 qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
                 if qty <= 0:
                     logger.info(f"[SKIP] {code}: 매수수량 없음/0")
