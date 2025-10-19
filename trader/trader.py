@@ -47,9 +47,9 @@ SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
-REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+#REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+REBALANCE_ANCHOR="weekly"
 MOMENTUM_OVERRIDES_FORCE_SELL = os.getenv("MOMENTUM_OVERRIDES_FORCE_SELL", "true").lower() == "true"
-
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -66,7 +66,13 @@ def get_rebalance_anchor_date():
     today = datetime.now(KST).date()
     if REBALANCE_ANCHOR == "today":
         return today.strftime("%Y-%m-%d")
-    return today.replace(day=1).strftime("%Y-%m-%d")
+    elif REBALANCE_ANCHOR == "weekly":
+        # 이번 주 월요일
+        week_monday = today - timedelta(days=today.weekday())
+        return week_monday.strftime("%Y-%m-%d")
+    else:  # 기본값 = monthly(월초)
+        return today.replace(day=1).strftime("%Y-%m-%d")
+
 
 def fetch_rebalancing_targets(date):
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
