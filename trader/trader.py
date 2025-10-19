@@ -64,14 +64,17 @@ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 
 def get_rebalance_anchor_date():
     today = datetime.now(KST).date()
+    if REBALANCE_ANCHOR == "weekly":
+        # 이번 주 일요일(한국기준) 반환: weekday() == 6이 일요일
+        # 오늘이 일요일이면 오늘, 평일이면 "이번주 일요일"
+        # 일요일: weekday() == 6, 월요일: 0
+        days_to_sunday = 6 - today.weekday() if today.weekday() <= 6 else 0
+        anchor_date = today + timedelta(days=days_to_sunday)
+        return anchor_date.strftime("%Y-%m-%d")
     if REBALANCE_ANCHOR == "today":
         return today.strftime("%Y-%m-%d")
-    elif REBALANCE_ANCHOR == "weekly":
-        # 이번 주 월요일
-        week_monday = today - timedelta(days=today.weekday())
-        return week_monday.strftime("%Y-%m-%d")
-    else:  # 기본값 = monthly(월초)
-        return today.replace(day=1).strftime("%Y-%m-%d")
+    return today.replace(day=1).strftime("%Y-%m-%d")
+
 
 
 def fetch_rebalancing_targets(date):
