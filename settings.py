@@ -78,3 +78,13 @@ logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 logger.info(f"[환경변수 체크] 기타 옵션들 정상 적용됨")
+
+# ===== [CANDLE FETCH STABILITY] 최소 캔들·재시도·캐시 =====
+CANDLE_MIN_BARS = int(os.getenv("CANDLE_MIN_BARS", 21))  # 최소 필요 캔들 수
+CANDLE_LOOKBACK_DAYS = int(os.getenv("CANDLE_LOOKBACK_DAYS", 60))  # 휴일 포함 여유 조회
+CANDLE_MAX_RETRY = int(os.getenv("CANDLE_MAX_RETRY", 6))  # 재시도 횟수(기존 3 → 6 권장)
+CANDLE_BACKOFF_BASE = float(os.getenv("CANDLE_BACKOFF_BASE", 0.6))  # 지수형 백오프 시작값
+CANDLE_COOLDOWN_SEC = int(os.getenv("CANDLE_COOLDOWN_SEC", 90))  # 마지막 쿨다운(초)
+CANDLE_ALLOW_CACHE = os.getenv("CANDLE_ALLOW_CACHE", "1") == "1"  # 장중 캐시 사용
+CANDLE_CACHE_TTL_MIN = int(os.getenv("CANDLE_CACHE_TTL_MIN", 240))  # 캐시 TTL(분)
+

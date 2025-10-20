@@ -8,7 +8,31 @@ import csv
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+import logging
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger(__name__)
+
 import requests
+# 공용 세션 + 재시도/커넥션풀
+_session = requests.Session()
+_retry = Retry(
+    total=10, connect=10, read=10,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=50, pool_maxsize=50)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+DEFAULT_TIMEOUT = (3, 7)  # (connect, read)
+
+def _get(url, headers=None, params=None, timeout=DEFAULT_TIMEOUT):
+    return _session.get(url, headers=headers, params=params, timeout=timeout)
+
+
 import pytz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -783,3 +807,174 @@ class KisAPI:
         if price is None:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
+    
+    # ===== [CANDLE FETCH: Ensure >= 21 bars with retry/market-switch/cache] =====
+import os, json, pathlib, time, datetime as dt, random
+from settings import (
+    API_BASE_URL,                 # << 누락되면 Pylance가 찾지 못함
+    CANDLE_MIN_BARS,
+    CANDLE_LOOKBACK_DAYS,
+    CANDLE_MAX_RETRY,
+    CANDLE_BACKOFF_BASE,
+    CANDLE_COOLDOWN_SEC,
+    CANDLE_ALLOW_CACHE,
+    CANDLE_CACHE_TTL_MIN,
+)
+
+# 캐시 디렉토리 준비
+CACHE_DIR = pathlib.Path(".cache/candles")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(code: str, lookback: int) -> pathlib.Path:
+    return CACHE_DIR / f"{code}_{lookback}d.json"
+
+def _cache_load(code: str, lookback: int):
+    p = _cache_path(code, lookback)
+    if not p.exists():
+        return None
+    try:
+        age = dt.datetime.now() - dt.datetime.fromtimestamp(p.stat().st_mtime)
+        if age > dt.timedelta(minutes=CANDLE_CACHE_TTL_MIN):
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _cache_save(code: str, lookback: int, data):
+    try:
+        _cache_path(code, lookback).write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        # 캐시 실패는 무시
+        pass
+
+# ----- [AUTH HEADER RESOLVER] -----
+from typing import Callable, Optional
+
+# 다른 곳(클래스/모듈)에서 헤더 가져오는 콜백을 주입하려면 이걸 써도 됨
+_AUTH_HEADERS_FN: Optional[Callable[[], dict]] = None
+
+def set_auth_headers_fn(fn: Callable[[], dict]):
+    global _AUTH_HEADERS_FN
+    _AUTH_HEADERS_FN = fn
+
+def _auth_headers() -> dict:
+    """
+    가능한 여러 위치에서 인증 헤더를 해석해서 반환.
+    1) set_auth_headers_fn으로 주입된 콜백
+    2) 모듈 전역의 auth_headers()
+    3) 모듈 전역의 get_auth_headers()
+    없으면 RuntimeError
+    """
+    if _AUTH_HEADERS_FN:
+        return _AUTH_HEADERS_FN()
+
+    # 모듈 전역 함수로 존재하는 경우
+    fn = globals().get("auth_headers")
+    if callable(fn):
+        return fn()
+
+    fn = globals().get("get_auth_headers")
+    if callable(fn):
+        return fn()
+
+    raise RuntimeError("auth_headers provider not found. "
+                       "Define auth_headers()/get_auth_headers() or call set_auth_headers_fn().")
+# ----------------------------------
+
+
+def fetch_daily_ensure_21(code: str):
+    """
+    KIS 일봉 API 안정화:
+      - 캐시 우선
+      - 코스닥/유가증권 마켓코드 스위칭(J <-> U)
+      - 지수형 백오프 + 지터
+      - 마지막 쿨다운 후 1회 재시도
+    성공: 캔들 리스트(len >= CANDLE_MIN_BARS)
+    실패: None 반환
+    """
+    lookback = CANDLE_LOOKBACK_DAYS
+
+    # 1) 캐시 히트
+    if CANDLE_ALLOW_CACHE:
+        cached = _cache_load(code, lookback)
+        if cached and len(cached) >= CANDLE_MIN_BARS:
+            return cached
+
+    markets = ["J", "U"]
+    last_err = None
+
+    for attempt in range(1, CANDLE_MAX_RETRY + 1):
+        market = markets[(attempt - 1) % len(markets)]
+        try:
+            params = {
+                "fid_cond_mrkt_div_code": market,
+                "fid_input_iscd": f"A{code}",
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            }
+
+            # ---- build headers (with tr_id) before request ----
+            tr_ids = _pick_tr(KIS_ENV, "DAILY_CHART") or []
+            headers = _auth_headers()
+            if tr_ids:
+                headers["tr_id"] = tr_ids[0]
+            # ---------------------------------------------------
+
+            r = _get(
+                f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                headers=headers,
+                params=params,
+            )
+            r.raise_for_status()
+            data = r.json()
+            candles = data.get("output2") or data.get("output") or []
+            if len(candles) >= CANDLE_MIN_BARS:
+                if CANDLE_ALLOW_CACHE:
+                    _cache_save(code, lookback, candles)
+                return candles
+            last_err = f"candles={len(candles)}"
+        except Exception as e:
+            last_err = repr(e)
+
+        # 지수형 백오프 + 지터
+        sleep_s = CANDLE_BACKOFF_BASE * (2 ** (attempt - 1)) + random.random() * 0.15
+        time.sleep(sleep_s)
+
+    # 2) 쿨다운 후 마지막 1회
+    time.sleep(CANDLE_COOLDOWN_SEC)
+    try:
+        market = markets[-1]
+
+        # ---- build headers (with tr_id) before request ----
+        tr_ids = _pick_tr(KIS_ENV, "DAILY_CHART") or []
+        headers = _auth_headers()
+        if tr_ids:
+            headers["tr_id"] = tr_ids[0]
+        # ---------------------------------------------------
+
+        r = _get(
+            f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            headers=headers,
+            params={
+                "fid_cond_mrkt_div_code": market,
+                "fid_input_iscd": f"A{code}",
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        candles = data.get("output2") or data.get("output") or []
+        if len(candles) >= CANDLE_MIN_BARS:
+            if CANDLE_ALLOW_CACHE:
+                _cache_save(code, lookback, candles)
+            return candles
+        last_err = f"candles={len(candles)}"
+    except Exception as e:
+        last_err = repr(e)
+
+    logger.error(f"[20D_RETURN_FAIL] {code}: 21개 일봉 확보 실패 - {last_err}")
+    return None

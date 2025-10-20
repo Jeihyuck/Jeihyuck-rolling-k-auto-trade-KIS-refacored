@@ -40,9 +40,9 @@ jobs:
       TOP_K_LIMIT: "20"          # 상위 N개 컷
 
       # 배분
-      TOTAL_CAPITAL: "10000000"  # 총 투자한도(원) - 1,000만원
+      TOTAL_CAPITAL: "500000000"  # 총 투자한도(원) - 50,000만원
       MIN_QTY_PER_TICKET: "1"    # 최소 주문 수량
-      DAILY_CAPITAL: "10000000"  # (리포트/전략용) 일일 자금 한도
+      DAILY_CAPITAL: "500000000"  # (리포트/전략용) 일일 자금 한도
 
       # K 탐색
       K_MIN: "0.1"
