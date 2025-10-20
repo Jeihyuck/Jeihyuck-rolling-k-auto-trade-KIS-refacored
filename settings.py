@@ -27,7 +27,9 @@ KIS_REST_URL   = safe_strip(os.getenv("KIS_REST_URL", ""))
 KIS_WS_URL     = safe_strip(os.getenv("KIS_WS_URL", ""))
 
 # === 실전 전략/실험 환경 변수 ===
-REBALANCE_ANCHOR      = os.getenv("REBALANCE_ANCHOR", "first")
+#REBALANCE_ANCHOR      = os.getenv("REBALANCE_ANCHOR", "first")
+REBALANCE_ANCHOR="weekly"
+
 DAILY_CAPITAL         = int(os.getenv("DAILY_CAPITAL", "3000000"))
 SLIPPAGE_LIMIT_PCT    = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 PARTIAL1              = float(os.getenv("PARTIAL1", "0.5"))

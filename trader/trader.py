@@ -47,9 +47,9 @@ SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
 W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
 W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
-REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+#REBALANCE_ANCHOR = os.getenv("REBALANCE_ANCHOR", "first").lower().strip()
+REBALANCE_ANCHOR="weekly"
 MOMENTUM_OVERRIDES_FORCE_SELL = os.getenv("MOMENTUM_OVERRIDES_FORCE_SELL", "true").lower() == "true"
-
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -64,9 +64,18 @@ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 
 def get_rebalance_anchor_date():
     today = datetime.now(KST).date()
+    if REBALANCE_ANCHOR == "weekly":
+        # 이번 주 일요일(한국기준) 반환: weekday() == 6이 일요일
+        # 오늘이 일요일이면 오늘, 평일이면 "이번주 일요일"
+        # 일요일: weekday() == 6, 월요일: 0
+        days_to_sunday = 6 - today.weekday() if today.weekday() <= 6 else 0
+        anchor_date = today + timedelta(days=days_to_sunday)
+        return anchor_date.strftime("%Y-%m-%d")
     if REBALANCE_ANCHOR == "today":
         return today.strftime("%Y-%m-%d")
     return today.replace(day=1).strftime("%Y-%m-%d")
+
+
 
 def fetch_rebalancing_targets(date):
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
@@ -637,6 +646,7 @@ def main():
             "prev_high": t.get("prev_high"),
             "prev_low": t.get("prev_low"),
             "prev_close": t.get("prev_close"),
+            "prev_volume": t.get("prev_volume"),  # << 반드시 이 줄 추가!
         }
     code_to_target: Dict[str, Any] = processed_targets
 
@@ -690,6 +700,13 @@ def main():
 
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
             for code, target in code_to_target.items():
+                # === [anchor] 거래량 및 양봉 정보 활용 ===
+                prev_volume = _to_float(target.get("prev_volume"))
+                prev_open   = _to_float(target.get("prev_open"))
+                prev_close  = _to_float(target.get("prev_close"))
+                # 참고: prev_volume, prev_open, prev_close 값이 없으면 None/0으로 들어감
+                logger.debug(f"[prev_volume 체크] {code} 거래량:{prev_volume}, 전일시가:{prev_open}, 전일종가:{prev_close}")
+
                 qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
                 if qty <= 0:
                     logger.info(f"[SKIP] {code}: 매수수량 없음/0")
