@@ -28,6 +28,18 @@ LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"
 
+# 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
+MARKET_MAP = {
+    # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
+}
+def get_market(code: str) -> str:
+    # 모르면 J로 고정. 실패해도 U로 스왑하지 않음.
+    return MARKET_MAP.get(code, "J")
+
+# 데이터 없음 1차 감지 상태 저장(연속 DATA_EMPTY 확인용)
+EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
+
+
 KST = ZoneInfo("Asia/Seoul")
 SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:40").strip()
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "false").lower() == "true"
@@ -184,29 +196,66 @@ def _fetch_balances(kis: KisAPI):
         logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
         return []
 
+from .kis_wrapper import NetTemporaryError, DataEmptyError, DataShortError
+
 # === [여기 아래에 추가!] ===
 def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
+    """
+    20D 수익률 계산.
+    - NetTemporaryError: 네트워크/SSL 등 일시 실패 → 여기서 재시도, 최종 실패 시 상위에서 TEMP_SKIP 처리하도록 재-raise
+    - DataEmptyError: 0캔들(실제 데이터 없음) → 상위에서 2회 확인 후 제외 판단
+    - DataShortError: 21개 미만 → 상위에서 즉시 제외 판단
+    """
     MAX_RETRY = 3
-    for attempt in range(1, MAX_RETRY+1):
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, MAX_RETRY + 1):
         try:
+            # 보장: 정상일 때 최소 21개 반환, 아니면 전용 예외 발생
             candles = kis.get_daily_candles(code, count=21)
-            if not candles or len(candles) < 20:
-                logger.warning(f"[20D_RETURN_FAIL] {code}: 캔들 {len(candles) if candles else 0}개 (21개 미만) (재시도 {attempt})")
-                time.sleep(1)
-                continue
-            # 모든 캔들에 close값 존재 확인
-            if any('close' not in c or c['close'] is None for c in candles):
-                logger.error(f"[20D_RETURN_FAIL] {code}: 캔들 내 close 결측 {candles}")
-                return None
-            old = float(candles[-21]['close']) if len(candles) > 20 else float(candles[0]['close'])
+            # 길이 가드: 21개 미만이면 명시적으로 DataShortError 발생
+            if not candles or len(candles) < 21:
+                raise DataShortError("need at least 21 candles")
+
+            # close 결측 방지
+            if any(('close' not in c) or (c['close'] is None) for c in candles):
+                logger.error("[20D_RETURN_FAIL] %s: 캔들 close 결측", code)
+                # 데이터 불완전 → 데이터 없음 계열로 처리
+                raise DataEmptyError("close missing")
+
+            # 21개 확보를 전제(-21은 20거래일 전 종가)
+            old = float(candles[-21]['close'])
             now = float(candles[-1]['close'])
             return ((now - old) / old) * 100.0
-        except Exception as e:
-            logger.warning(f"[20D_RETURN_FAIL] {code}: {e} (재시도 {attempt})")
-            time.sleep(1)
+
+        except NetTemporaryError as e:
+            # 네트워크/SSL 등 일시 실패 → 여기서만 재시도, 종목 ‘제외’ 금지
+            last_err = e
+            logger.warning("[CANDLE_TEMP_SKIP] %s 20D 계산 네트워크 실패 (재시도 %d/%d)", code, attempt, MAX_RETRY)
+            time.sleep(1.0 * attempt)
             continue
-    logger.error(f"[20D_RETURN_FAIL] {code}: 21개 일봉 불러오기 최종실패 - 종목제외 필요")
-    return None
+
+        except DataEmptyError as e:
+            # 진짜 0캔들 → 상위 루프에서 2회 확인 후 제외 판단
+            logger.warning("[DATA_EMPTY] %s 0캔들(20D 계산 불가) - 상위에서 재확인/제외 판단", code)
+            raise
+
+        except DataShortError as e:
+            # 21개 미만 → 상위 루프에서 즉시 제외 판단
+            logger.warning("[DATA_SHORT] %s 21개 미만(20D 계산 불가) - 상위에서 제외 판단", code)
+            raise
+
+        except Exception as e:
+            # 기타 예외(파싱 등) → 재시도 후 최종 NetTemporary로 승격
+            last_err = e
+            logger.warning("[20D_RETURN_FAIL] %s: 예외 %s (재시도 %d/%d)", code, e, attempt, MAX_RETRY)
+            time.sleep(1.0 * attempt)
+            continue
+
+    # 모든 재시도 실패 → 상위에서 TEMP_SKIP 처리 가능하도록 NetTemporaryError로 승격
+    if last_err:
+        logger.warning("[20D_RETURN_FAIL] %s 최종 실패: %s", code, last_err)
+    raise NetTemporaryError("20D return calc failed")
 
 def is_strong_momentum(kis, code):
     """
@@ -471,8 +520,25 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
 
 
         # 기존 수익률 기반 매도 예외 로직(원하는 경우 병행 가능)
-        return_pct = get_20d_return_pct(kis, code)
-        logger.info(f"[모멘텀 수익률 체크] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}%")
+        try:
+            return_pct = get_20d_return_pct(kis, code)
+            logger.info(f"[모멘텀 수익률 체크] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}%")
+        except NetTemporaryError:
+            # 네트워크/SSL 등 일시 실패 → 이번 패스에서만 스킵(제외 금지)
+            logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 패스 스킵")
+            remaining.add(code)
+            continue
+        except DataEmptyError:
+            # 진짜 0캔들: 상위 정책대로 다음 루프에서 한 번 더 확인 후 제외
+            logger.warning(f"[DATA_EMPTY] {code}: 0캔들 감지 → 다음 루프에서 재확인")
+            remaining.add(code)
+            continue
+        except DataShortError:
+            # 21개 미만: 즉시 제외(여기서는 강제매도 판단 불가이므로 스킵)
+            logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 강제매도 판단 스킵")
+            remaining.add(code)
+            continue
+
 
         if return_pct is not None and return_pct >= 3.0:
             logger.info(
@@ -846,12 +912,21 @@ def main():
                         continue
 
                     # === [모멘텀: 최근 20일 수익률 +3% 이상이면 보유 지속] ===
-                    return_pct = get_20d_return_pct(kis, code)
+                    try:
+                        return_pct = get_20d_return_pct(kis, code)
+                    except NetTemporaryError:
+                        logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵")
+                        continue
+                    except DataEmptyError:
+                        logger.warning(f"[DATA_EMPTY] {code}: 0캔들 → 다음 루프에서 재확인")
+                        continue
+                    except DataShortError:
+                        logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 이번 루프 판단 스킵")
+                        continue 
+                    
                     if return_pct is not None and return_pct >= 3.0:
-                        logger.info(
-                            f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속"
-                        )
-                        continue  # 매도하지 않고 보유
+                        logger.info(f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속")
+                        continue
 
                     sellable_here = ord_psbl_map.get(code, 0)
                     if sellable_here <= 0:

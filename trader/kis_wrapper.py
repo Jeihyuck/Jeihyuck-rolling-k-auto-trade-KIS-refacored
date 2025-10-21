@@ -17,6 +17,47 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 
 logger = logging.getLogger(__name__)
 
+class NetTemporaryError(Exception):
+    """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+    pass
+
+class DataEmptyError(Exception):
+    """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
+    pass
+
+class DataShortError(Exception):
+    """정상응답이나 캔들이 need_n 미만."""
+    pass
+
+def _build_session():
+    s = requests.Session()
+    retry = Retry(
+        total=6, connect=5, read=5, status=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "RKMax/1.0"})
+    return s
+
+SESSION = _build_session()
+
+def _get_json(url, params=None, timeout=(3.0, 7.0)):
+    try:
+        r = SESSION.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.SSLError as e:
+        logger.warning("[NET:SSL_ERROR] %s %s", url, e)
+        raise NetTemporaryError()
+    except requests.exceptions.RequestException as e:
+        logger.warning("[NET:REQ_ERROR] %s %s", url, e)
+        raise NetTemporaryError()
+
+
 def safe_strip(val):
     if val is None:
         return ""
@@ -240,10 +281,6 @@ class KisAPI:
                         except Exception:
                             pass
         raise Exception(f"현재가 조회 실패({code}): tried={tried}")
-    
-        # --- 오늘 시초가 캐시 (선택) ---
-        # __init__ 끝부분에 추가
-
 
     def _get_cached_today_open(self, code: str) -> Optional[float]:
         try:
@@ -334,49 +371,95 @@ class KisAPI:
         return None
 
     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
+        """
+        일봉 조회 (시장코드 고정, 네트워크 실패/데이터 부족 분리)
+        - 네트워크/SSL 실패: NetTemporaryError (제외 금지, 상위 루프에서 TEMP_SKIP)
+        - 데이터 없음(0개): DataEmptyError (연속 확인 후 제외)
+        - 데이터 부족(<21개): DataShortError (즉시 제외)
+        """
+        # 1) 시장코드 고정 (J/U 스왑 금지)
+        #    - 실전은 마스터테이블/캐시에서 로드. 모르면 J로 고정
+        market_code = self.market_map.get(code.lstrip("A"), "J") if hasattr(self, "market_map") else "J"
+
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
-        markets = ["J", "U"]  # ← 추가
+
+        # A접두 처리
+        iscd = code if code.startswith("A") else f"A{code}"
+
+        # 가벼운 재시도(세션은 전역 재사용 가정; HTTPAdapter+Retry는 세션 생성 시 설정)
         last_err = None
         for tr in _pick_tr(self.env, "DAILY_CHART"):
             headers = self._headers(tr)
-            # A접두 처리
-            iscd = code if code.startswith("A") else f"A{code}"
-            for mrk in markets:  # ← J→U 순차 시도
-                params = {
-                    "fid_cond_mrkt_div_code": mrk,
-                    "fid_input_iscd": iscd,
-                    "fid_org_adj_prc": "0",
-                    "fid_period_div_code": "D",
-                }
-                for attempt in range(1, 3):  # 가벼운 재시도 2회
-                    try:
-                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                        data = resp.json()
-                    except Exception as e:
-                        last_err = e
-                        time.sleep(0.4 * attempt)
-                        continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        arr = data["output"]
-                        rows = [{
-                            "date": r.get("stck_bsop_date"),
-                            "open": float(r.get("stck_oprc")),
-                            "high": float(r.get("stck_hgpr")),
-                            "low":  float(r.get("stck_lwpr")),
-                            "close":float(r.get("stck_clpr")),
-                        } for r in arr if r.get("stck_oprc") is not None]
-                        rows.sort(key=lambda x: x["date"])
-                        # 최소 2개 확보 보장
-                        if len(rows) >= 2:
-                            return rows[-max(count, 20):][-count:]
-                    # 게이트웨이/한도 문구면 잠깐 쉼
-                    if "초당 거래건수" in (data.get("msg1") or ""):
-                        time.sleep(0.35 + random.uniform(0, 0.15))
-        # 실패
+            params = {
+                "fid_cond_mrkt_div_code": market_code,
+                "fid_input_iscd": iscd,
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            }
+            for attempt in range(1, 4):  # 3회 정도 (세션의 Retry와 중첩돼 실효 재시도↑)
+                try:
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    # HTTP 에러코드면 raise → 아래 except에서 NetTemporaryError 처리
+                    resp.raise_for_status()
+                    data = resp.json()
+                except requests.exceptions.SSLError as e:
+                    last_err = e
+                    logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except requests.exceptions.RequestException as e:
+                    last_err = e
+                    logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except Exception as e:
+                    last_err = e
+                    logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+
+                # 게이트웨이/쿼터 문구면 잠깐 쉼 후 재시도
+                if "초당 거래건수" in (data.get("msg1") or ""):
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+
+                # 정상 응답 체크
+                if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                    arr = data["output"]
+                    rows = [{
+                        "date": r.get("stck_bsop_date"),
+                        "open": float(r.get("stck_oprc")),
+                        "high": float(r.get("stck_hgpr")),
+                        "low":  float(r.get("stck_lwpr")),
+                        "close":float(r.get("stck_clpr")),
+                    } for r in arr if r.get("stck_oprc") is not None and r.get("stck_bsop_date")]
+
+                    # 날짜 오름차순 정렬
+                    rows.sort(key=lambda x: x["date"])
+
+                    # --- 핵심 판정 로직 ---
+                    if len(rows) == 0:
+                        # 진짜 데이터 없음 → DataEmptyError
+                        raise DataEmptyError(f"{iscd} 0 candles")
+                    if len(rows) < 21:
+                        # 21개 미만 → DataShortError
+                        raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
+
+                    # 최소 21개 확보 보장. count가 21보다 작아도 21은 확보된 상태
+                    # 최근 count개 반환 (기본 동작 유지)
+                    need = max(count, 21)
+                    return rows[-need:][-count:]
+
+                # rt_cd != 0 or output 없음 → 재시도
+                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
+                time.sleep(0.35 + random.uniform(0, 0.15))
+
+        # 여기까지 왔으면 네트워크/게이트웨이 등으로 정상 확보 실패
         if last_err:
-            logger.warning(f"[DAILY_FAIL] {code}: {last_err}")
-        return []
+            logger.warning("[DAILY_FAIL] %s: %s", iscd, last_err)
+        # ❗ 네트워크 실패를 []로 내려보내면 '0캔들'로 오인됨 → 예외로 올려서 TEMP_SKIP 처리
+        raise NetTemporaryError(f"DAILY {iscd} net fail")
 
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:
         try:
@@ -494,10 +577,6 @@ class KisAPI:
     # 주문 공통, 시장가/지정가, 매수/매도(상세 구현은 1부 참고)
     # (이미 위 1,2부에서 전부 제공. 필요시 재업로드 안내)
     # -------------------------------
-
-# -- (끝) --
-# KisAPI 클래스 안에 아래 블록 전체를 추가
-
     # -------------------------------
     # 주문 공통
     # -------------------------------
