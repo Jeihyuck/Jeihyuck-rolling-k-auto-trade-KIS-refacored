@@ -39,7 +39,7 @@ FAST_STOP             = float(os.getenv("FAST_STOP", "0.01"))
 ATR_STOP              = float(os.getenv("ATR_STOP", "1.5"))
 TIME_STOP_HHMM        = os.getenv("TIME_STOP_HHMM", "13:00")
 DEFAULT_PROFIT_PCT    = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))
-DEFAULT_LOSS_PCT      = float(os.getenv("DEFAULT_LOSS_PCT", "-2.0"))
+DEFAULT_LOSS_PCT      = float(os.getenv("DEFAULT_LOSS_PCT", "-5.0"))
 SELL_FORCE_TIME       = os.getenv("SELL_FORCE_TIME", "14:40")
 SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "true").lower() == "true"
 API_RATE_SLEEP_SEC    = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))

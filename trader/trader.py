@@ -53,7 +53,7 @@ FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))
 ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))
 TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")
 DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))
-DEFAULT_LOSS_PCT = float(os.getenv("DEFAULT_LOSS_PCT", "-2.0"))
+DEFAULT_LOSS_PCT = float(os.getenv("DEFAULT_LOSS_PCT", "-5.0"))
 DAILY_CAPITAL = int(os.getenv("DAILY_CAPITAL", "3000000"))
 SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
@@ -176,8 +176,12 @@ def _safe_get_price(kis: KisAPI, code: str):
             return None
         return price
     except Exception as e:
-        logger.warning(f"[현재가 조회 실패: 계속 진행] {code} err={e}")
-        return None
+        logger.error(f"[NET/API 장애] {code} 현재가 조회 실패, fallback 시도: {e}")
+        # 예시) 로컬 캐시/이전 가격 사용
+        price = None
+        # 이전 loop의 가격 캐시 등에서 불러오는 코드가 있다면 삽입
+        # price = local_price_cache.get(code, None)
+        return price
 
 def _fetch_balances(kis: KisAPI):
     if hasattr(kis, "get_balance_all"):
@@ -463,33 +467,123 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
 
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
+    """
+    매수 주문(지정가 우선, 실패시 시장가 Fallback) + 체결가/슬리피지/네트워크 장애/실패 상세 로깅
+    """
     result_limit = None
+    order_price = limit_price
+    fill_price = None
+    trade_logged = False
+
     try:
         if hasattr(kis, "buy_stock_limit") and limit_price and limit_price > 0:
             result_limit = _with_retry(kis.buy_stock_limit, code, qty, int(limit_price))
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, limit_price, result_limit)
             time.sleep(3.0)
+            # --- 체결 확인 ---
+            filled = False
             if hasattr(kis, "check_filled"):
                 try:
                     filled = bool(_with_retry(kis.check_filled, result_limit))
                 except Exception:
                     filled = False
-                if filled:
-                    return result_limit
+            if filled:
+                # 체결가 추출 시도
+                try:
+                    fill_price = float(result_limit.get("output", {}).get("prdt_price", 0)) or None
+                except Exception:
+                    fill_price = None
+                if fill_price is None:
+                    try:
+                        fill_price = kis.get_current_price(code)
+                    except Exception:
+                        fill_price = None
+                slippage = (fill_price - order_price) / order_price * 100 if (fill_price and order_price) else 0
+                log_trade({
+                    "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                    "code": code,
+                    "side": "BUY",
+                    "order_price": order_price,
+                    "fill_price": fill_price,
+                    "slippage_pct": round(slippage, 2) if fill_price and order_price else None,
+                    "qty": qty,
+                    "result": result_limit,
+                    "status": "filled",
+                    "fail_reason": None
+                })
+                trade_logged = True
+                # 슬리피지 과다 경고
+                if abs(slippage) > SLIPPAGE_LIMIT_PCT:
+                    logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
+                return result_limit
         else:
             logger.info("[BUY-LIMIT] API 미지원 또는 limit_price 무효 → 시장가로 진행")
     except Exception as e:
-        logger.warning("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, limit_price, e)
+        logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, limit_price, e)
+        log_trade({
+            "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "side": "BUY",
+            "order_price": order_price,
+            "fill_price": None,
+            "slippage_pct": None,
+            "qty": qty,
+            "result": None,
+            "status": "failed",
+            "fail_reason": str(e)
+        })
+        trade_logged = True
+
+    # --- Fallback: 시장가 ---
     try:
         if hasattr(kis, "buy_stock_market"):
             result_mkt = _with_retry(kis.buy_stock_market, code, qty)
         else:
             result_mkt = _with_retry(kis.buy_stock, code, qty)
         logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, limit_price, result_mkt)
+        try:
+            fill_price = float(result_mkt.get("output", {}).get("prdt_price", 0)) or None
+        except Exception:
+            fill_price = None
+        if fill_price is None:
+            try:
+                fill_price = kis.get_current_price(code)
+            except Exception:
+                fill_price = None
+        slippage = (fill_price - order_price) / order_price * 100 if (fill_price and order_price) else 0
+        log_trade({
+            "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "side": "BUY",
+            "order_price": order_price,
+            "fill_price": fill_price,
+            "slippage_pct": round(slippage, 2) if fill_price and order_price else None,
+            "qty": qty,
+            "result": result_mkt,
+            "status": "filled" if result_mkt and result_mkt.get("rt_cd") == "0" else "failed",
+            "fail_reason": None if result_mkt and result_mkt.get("rt_cd") == "0" else "체결실패"
+        })
+        trade_logged = True
+        if abs(slippage) > SLIPPAGE_LIMIT_PCT:
+            logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
         return result_mkt
     except Exception as e:
         logger.error("[BUY-MKT-FAIL] %s qty=%s err=%s", code, qty, e)
+        if not trade_logged:
+            log_trade({
+                "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                "code": code,
+                "side": "BUY",
+                "order_price": order_price,
+                "fill_price": None,
+                "slippage_pct": None,
+                "qty": qty,
+                "result": None,
+                "status": "failed",
+                "fail_reason": str(e)
+            })
         raise
+
 
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
     if not targets_codes:
@@ -615,49 +709,104 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
 # ... 이하 [4/??]에서 계속 ...
 # trader.py [4/??]
-def _adaptive_exit(kis: KisAPI, code: str, pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
+def _adaptive_exit(
+    kis: KisAPI, code: str, pos: Dict[str, Any]
+) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
+    """
+    - 매도 조건 트리거별(익절/트레일링/손절) 강건성, 체결 상세, 실패시 로깅 보강
+    - 모든 매도 결과를 log_trade로 남김(사유, 체결가, 슬리피지, 실패사유 포함)
+    """
     now = datetime.now(KST)
+    reason = None
+    exec_px, result, sold_qty = None, None, None
+    trade_logged = False
     try:
         cur = _safe_get_price(kis, code)
         if cur is None:
+            logger.warning(f"[EXIT-FAIL] {code} 현재가 조회 실패")
             return None, None, None, None
-        # 강한 모멘텀이면 청산 보류 (원래대로 유지)
+
+        # 강한 모멘텀이면 청산 보류
         if is_strong_momentum(kis, code):
             logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
             return None, None, None, None
-    except Exception:
+    except Exception as e:
+        logger.error(f"[EXIT-FAIL] {code} 현재가/모멘텀 예외: {e}")
         return None, None, None, None
 
     # 최고가(high) 갱신
     pos['high'] = max(float(pos.get('high', cur)), float(cur))
     qty = _to_int(pos.get('qty'), 0)
     if qty <= 0:
+        logger.warning(f"[EXIT-FAIL] {code} qty<=0")
         return None, None, None, None
 
+    buy_price = float(pos.get('buy_price', 0.0))
+    max_price = pos.get('high', buy_price)
+    slippage = None
+
     # === 익절(3%) ===
-    if cur >= float(pos['buy_price']) * 1.03:
-        exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="익절 3%")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=익절 3% qty={qty} price={exec_px}")
-        return "익절 3%", exec_px, result, qty
-
+    if cur >= buy_price * 1.03:
+        reason = "익절 3%"
     # === 트레일링스톱(최고가 4% 돌파후 1.5% 이상 하락) ===
-    max_price = pos.get('high', float(pos['buy_price']))
-    if max_price >= float(pos['buy_price']) * 1.04 and cur <= max_price * 0.985:
-        exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="트레일링스톱")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=트레일링스톱 qty={qty} price={exec_px}")
-        return "트레일링스톱", exec_px, result, qty
+    elif max_price >= buy_price * 1.04 and cur <= max_price * 0.985:
+        reason = "트레일링스톱"
+    # === 손절(-5%) ===
+    elif cur <= float(pos['buy_price']) * (1 + DEFAULT_LOSS_PCT / 100.0):
 
-    # === 손절(-3%) ===
-    if cur <= float(pos['buy_price']) * 0.97:
-        exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-        _log_realized_pnl(code, exec_px, qty, float(pos.get('buy_price', 0.0)), reason="손절 -3%")
-        logger.info(f"[SELL-TRIGGER] {code} REASON=손절 -3% qty={qty} price={exec_px}")
-        return "손절 -3%", exec_px, result, qty
 
-    # 더 이상 당일청산(TIME_STOP), ATR_STOP 등 없음
+    if reason:
+        try:
+            exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+            sold_qty = qty
+            if exec_px and buy_price > 0:
+                slippage = (exec_px - buy_price) / buy_price * 100.0
+            else:
+                slippage = None
+
+            _log_realized_pnl(code, exec_px, qty, buy_price, reason=reason)
+            logger.info(f"[SELL-TRIGGER] {code} REASON={reason} qty={qty} price={exec_px}")
+
+            log_trade({
+                "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "code": code,
+                "side": "SELL",
+                "reason": reason,
+                "order_price": buy_price,
+                "fill_price": exec_px,
+                "slippage_pct": round(slippage, 2) if slippage is not None else None,
+                "qty": sold_qty,
+                "result": result,
+                "status": "filled" if result and result.get("rt_cd") == "0" else "failed",
+                "fail_reason": None if result and result.get("rt_cd") == "0" else "체결실패"
+            })
+            trade_logged = True
+            # 슬리피지 과다시 경고
+            if slippage is not None and abs(slippage) > SLIPPAGE_LIMIT_PCT:
+                logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
+        except Exception as e:
+            logger.error(f"[SELL-FAIL] {code} qty={qty} err={e}")
+            if not trade_logged:
+                log_trade({
+                    "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "code": code,
+                    "side": "SELL",
+                    "reason": reason,
+                    "order_price": buy_price,
+                    "fill_price": None,
+                    "slippage_pct": None,
+                    "qty": qty,
+                    "result": None,
+                    "status": "failed",
+                    "fail_reason": str(e)
+                })
+            return None, None, None, None
+
+        return reason, exec_px, result, sold_qty
+
+    # 당일청산(TIME_STOP), ATR_STOP 등 기타 전략은 필요시 추가
     return None, None, None, None
+
 
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
