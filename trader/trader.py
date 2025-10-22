@@ -115,6 +115,9 @@ def _parse_hhmm(hhmm: str) -> dtime:
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+# >>> ADD (마켓 마감 시 데이터 호출 차단 플래그)
+ALLOW_WHEN_CLOSED = os.getenv("MARKET_DATA_WHEN_CLOSED", "false").lower() == "true"
+
 
 def get_rebalance_anchor_date():
     today = datetime.now(KST).date()
@@ -215,18 +218,35 @@ _LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts
 _PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
 
 def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
-    """
-    - 1차: get_current_price (리트라이 내장)
-    - 실패/무효: 보조소스 시도(get_quote_snapshot / get_best_ask,bid 등 있으면)
-    - 모두 실패: 캐시가 'stale_ok_sec' 내면 그 값 반환(전략 지속), 아니면 None
-    - 연속 실패 서킷브레이커: 일정 시간(primary 호출 생략)
-    """
     import time as _t
     now = _t.time()
 
     # 0) 서킷브레이커: 최근 실패 누적이면 잠시 건너뛴다
     cb = _PRICE_CB.get(code, {"fail": 0, "until": 0})
     primary_allowed = now >= cb.get("until", 0)
+
+    # >>> ADD (장마감이면 가격 조회를 캐시/종가로 대체)
+    try:
+        if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
+            ent = _LAST_PRICE_CACHE.get(code)
+            if ent:
+                return float(ent["px"])
+            # 종가 제공 함수가 있으면 활용
+            if hasattr(kis, "get_close_price"):
+                try:
+                    close_px = kis.get_close_price(code)
+                    if close_px and float(close_px) > 0:
+                        val = float(close_px)
+                        _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
+                        return val
+                except Exception:
+                    pass
+            # 줄 게 없으면 None
+            return None
+    except Exception:
+        # is_market_open() 실패 포함 — 그냥 기존 흐름으로 진행
+        pass
+
 
     # 1) 캐시가 아주 최신(ttl_sec)이라면 그대로 반환
     ent = _LAST_PRICE_CACHE.get(code)
@@ -312,6 +332,11 @@ def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
     - DataEmptyError: 0캔들(실제 데이터 없음) → 상위에서 2회 확인 후 제외 판단
     - DataShortError: 21개 미만 → 상위에서 즉시 제외 판단
     """
+    
+    # >>> ADD (장마감이면 일시 실패로 올려보내 상위 루프가 스킵)
+    if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
+        raise NetTemporaryError("market closed skip")
+    
     MAX_RETRY = 3
     last_err: Optional[Exception] = None
 
@@ -367,6 +392,16 @@ def is_strong_momentum(kis, code):
     """
     강한 상향 추세 모멘텀 여부: 20, 60, 120일 수익률과 MA20/MA60/MA120 위치 기준(자유 조합 가능)
     """
+    # >>> ADD
+    try:
+        if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
+            # 마감이면 모멘텀 판단을 하지 않음(보수적으로 False 반환)
+            return False
+    except Exception:
+        # is_market_open 실패 시엔 계속 진행
+        pass
+
+
     try:
         candles = kis.get_daily_candles(code, count=121)
         closes = [float(x['close']) for x in candles if float(x['close']) > 0]
@@ -1011,6 +1046,13 @@ def main():
 
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
+
+            # >>> ADD (여기서 마감 Early-Continue)
+            if not is_open:
+                logger.info("[마감상태] 캔들/ATR/모멘텀/매매 로직 스킵 → 잔고만 동기화 후 대기")
+                save_state(holding, traded)
+                time.sleep(5.0)  # 마감 땐 천천히 폴링
+                continue
 
 # ... 이하 [5/??]에서 계속 ...
 # trader.py [5/??]
