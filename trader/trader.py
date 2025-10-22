@@ -20,6 +20,48 @@ except Exception:
         return float(k_month) if k_month is not None else 0.5
     def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
         return {"atr20": None, "atr60": None}
+    
+# === [ANCHOR: TICK_UTILS] KRX 호가단위 & 라운딩 ===
+def _krx_tick(price: float) -> int:
+    p = float(price or 0)
+
+    # KRX(코스피/코스닥) 공통 호가단위
+    # 500,000 이상: 1,000
+    # 100,000 ~ 499,999: 500
+    # 50,000 ~ 99,999: 100
+    # 10,000 ~ 49,999: 50
+    # 5,000 ~ 9,999: 10
+    # 1,000 ~ 4,999: 5
+    # 1,000 미만: 1
+    if p >= 500_000:
+        return 1_000
+    if p >= 100_000:
+        return 500
+    if p >= 50_000:
+        return 100
+    if p >= 10_000:
+        return 50
+    if p >= 5_000:
+        return 10
+    if p >= 1_000:
+        return 5
+    return 1
+
+
+def _round_to_tick(price: float, mode: str = "nearest") -> int:
+    """mode: 'down' | 'up' | 'nearest'"""
+    if price is None or price <= 0:
+        return 0
+    tick = _krx_tick(price)
+    q = price / tick
+    if mode == "down":
+        q = int(q)
+    elif mode == "up":
+        q = int(q) if q == int(q) else int(q) + 1
+    else:
+        q = int(q + 0.5)
+    return int(q * tick)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -168,20 +210,80 @@ def _log_realized_pnl(
 
 
 
-def _safe_get_price(kis: KisAPI, code: str):
+# === [ANCHOR: PRICE_CACHE] 현재가 캐시 & 서킷브레이커 ===
+_LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts": epoch}
+_PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
+
+def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
+    """
+    - 1차: get_current_price (리트라이 내장)
+    - 실패/무효: 보조소스 시도(get_quote_snapshot / get_best_ask,bid 등 있으면)
+    - 모두 실패: 캐시가 'stale_ok_sec' 내면 그 값 반환(전략 지속), 아니면 None
+    - 연속 실패 서킷브레이커: 일정 시간(primary 호출 생략)
+    """
+    import time as _t
+    now = _t.time()
+
+    # 0) 서킷브레이커: 최근 실패 누적이면 잠시 건너뛴다
+    cb = _PRICE_CB.get(code, {"fail": 0, "until": 0})
+    primary_allowed = now >= cb.get("until", 0)
+
+    # 1) 캐시가 아주 최신(ttl_sec)이라면 그대로 반환
+    ent = _LAST_PRICE_CACHE.get(code)
+    if ent and (now - ent["ts"] <= ttl_sec):
+        return float(ent["px"])
+
+    # 2) 1차 소스: 기본 API (가능하면 호출)
+    if primary_allowed:
+        try:
+            px = _with_retry(kis.get_current_price, code)
+            if px is not None and float(px) > 0:
+                val = float(px)
+                _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
+                _PRICE_CB[code] = {"fail": 0, "until": 0}
+                return val
+            else:
+                logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({px})")
+        except Exception as e:
+            # 실패 누적 → 서킷 오픈(점증 backoff)
+            fail = int(cb.get("fail", 0)) + 1
+            cool = min(60, 3 * fail)  # 3s, 6s, 9s ... 최대 60s
+            _PRICE_CB[code] = {"fail": fail, "until": now + cool}
+            logger.error(f"[NET/API 장애] {code} 현재가 1차조회 실패({e}) → cool {cool}s")
+
+    # 3) 보조 소스 시도(있을 때만): 스냅샷/호가로 근사
+    #   - 구현되어 있지 않으면 자동으로 건너뜀
     try:
-        price = _with_retry(kis.get_current_price, code)
-        if price is None or (isinstance(price, (int, float)) and price <= 0):
-            logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({price})")
-            return None
-        return price
+        if hasattr(kis, "get_quote_snapshot"):
+            q = kis.get_quote_snapshot(code)  # {'tp': 현재가, 'ap': 매도호가, 'bp': 매수호가 ...} 같은 형태 가정
+            cand = None
+            for k in ("tp", "trade_price", "prpr", "close", "price"):
+                v = q.get(k) if isinstance(q, dict) else None
+                if v and float(v) > 0:
+                    cand = float(v); break
+            if cand and cand > 0:
+                _LAST_PRICE_CACHE[code] = {"px": cand, "ts": now}
+                return cand
+
+        # 호가로 근사(mid) — 메서드가 있으면 사용
+        if hasattr(kis, "get_best_ask") and hasattr(kis, "get_best_bid"):
+            ask = kis.get_best_ask(code)
+            bid = kis.get_best_bid(code)
+            if ask and bid and float(ask) > 0 and float(bid) > 0:
+                mid = (float(ask) + float(bid)) / 2.0
+                _LAST_PRICE_CACHE[code] = {"px": mid, "ts": now}
+                return mid
     except Exception as e:
-        logger.error(f"[NET/API 장애] {code} 현재가 조회 실패, fallback 시도: {e}")
-        # 예시) 로컬 캐시/이전 가격 사용
-        price = None
-        # 이전 loop의 가격 캐시 등에서 불러오는 코드가 있다면 삽입
-        # price = local_price_cache.get(code, None)
-        return price
+        logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 보조소스 실패: {e}")
+
+    # 4) 최후: 캐시가 있으면 'stale_ok_sec' 내에서는 그 값이라도 반환(전략 지속성)
+    ent = _LAST_PRICE_CACHE.get(code)
+    if ent and (now - ent["ts"] <= stale_ok_sec):
+        return float(ent["px"])
+
+    # 5) 정말로 줄 게 없으면 None
+    return None
+
 
 def _fetch_balances(kis: KisAPI):
     if hasattr(kis, "get_balance_all"):
@@ -417,6 +519,7 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 # ... 이하 [3/5]에서 계속 ...
 # trader.py [3/??] (약 331~500)
 # === 앵커: 목표가 계산 함수 정의부 ===
+# === 앵커: 목표가 계산 함수 정의부 ===
 def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
     if not code:
@@ -429,7 +532,6 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
     except Exception:
         pass
     if not today_open or today_open <= 0:
-        # 스냅샷 현재가를 임시 대체(야간 대비)
         try:
             snap = kis.get_current_price(code)
             if snap and snap > 0:
@@ -440,7 +542,7 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
         logger.info(f"[TARGET/wait_open] {code} 오늘 시초가 미확정 → 목표가 계산 보류")
         return None, None
 
-    # 2) 전일 범위: 일봉 → 실패 시 prev_* 백업
+    # 2) 전일 범위
     prev_high = prev_low = None
     try:
         prev_candles = kis.get_daily_candles(code, count=2)
@@ -451,7 +553,6 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
     except Exception:
         pass
     if prev_high is None or prev_low is None:
-        # 백업: 리밸런싱 응답 필드 사용
         prev_high = _to_float(stk.get("prev_high"))
         prev_low  = _to_float(stk.get("prev_low"))
         if prev_high is None or prev_low is None:
@@ -460,10 +561,11 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
 
     rng = max(0.0, float(prev_high) - float(prev_low))
     k_used = float(stk.get("best_k") or stk.get("K") or stk.get("k") or 0.5)
-    eff_target_price = float(today_open) + rng * k_used
+    raw_target = float(today_open) + rng * k_used
+
+    # === 핵심: 호가단위 보정 ===
+    eff_target_price = float(_round_to_tick(raw_target, mode="up"))
     return float(eff_target_price), float(k_used)
-
-
 
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
@@ -471,16 +573,16 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     매수 주문(지정가 우선, 실패시 시장가 Fallback) + 체결가/슬리피지/네트워크 장애/실패 상세 로깅
     """
     result_limit = None
-    order_price = limit_price
+    # === 핵심: 지정가를 호가단위에 맞춰 보정 ===
+    order_price = _round_to_tick(limit_price, mode="up") if (limit_price and limit_price > 0) else 0
     fill_price = None
     trade_logged = False
 
     try:
-        if hasattr(kis, "buy_stock_limit") and limit_price and limit_price > 0:
-            result_limit = _with_retry(kis.buy_stock_limit, code, qty, int(limit_price))
-            logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, limit_price, result_limit)
-            time.sleep(3.0)
-            # --- 체결 확인 ---
+        if hasattr(kis, "buy_stock_limit") and order_price and order_price > 0:
+            result_limit = _with_retry(kis.buy_stock_limit, code, qty, int(order_price))
+            logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
+            time.sleep(2.0)
             filled = False
             if hasattr(kis, "check_filled"):
                 try:
@@ -488,7 +590,6 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                 except Exception:
                     filled = False
             if filled:
-                # 체결가 추출 시도
                 try:
                     fill_price = float(result_limit.get("output", {}).get("prdt_price", 0)) or None
                 except Exception:
@@ -498,28 +599,27 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                         fill_price = kis.get_current_price(code)
                     except Exception:
                         fill_price = None
-                slippage = (fill_price - order_price) / order_price * 100 if (fill_price and order_price) else 0
+                slippage = ((fill_price - order_price) / order_price * 100.0) if (fill_price and order_price) else None
                 log_trade({
                     "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                     "code": code,
                     "side": "BUY",
                     "order_price": order_price,
                     "fill_price": fill_price,
-                    "slippage_pct": round(slippage, 2) if fill_price and order_price else None,
+                    "slippage_pct": round(slippage, 2) if slippage is not None else None,
                     "qty": qty,
                     "result": result_limit,
                     "status": "filled",
                     "fail_reason": None
                 })
                 trade_logged = True
-                # 슬리피지 과다 경고
-                if abs(slippage) > SLIPPAGE_LIMIT_PCT:
+                if slippage is not None and abs(slippage) > SLIPPAGE_LIMIT_PCT:
                     logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
                 return result_limit
         else:
             logger.info("[BUY-LIMIT] API 미지원 또는 limit_price 무효 → 시장가로 진행")
     except Exception as e:
-        logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, limit_price, e)
+        logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, order_price, e)
         log_trade({
             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "code": code,
@@ -534,13 +634,13 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
         })
         trade_logged = True
 
-    # --- Fallback: 시장가 ---
+    # --- 시장가 Fallback ---
     try:
         if hasattr(kis, "buy_stock_market"):
             result_mkt = _with_retry(kis.buy_stock_market, code, qty)
         else:
             result_mkt = _with_retry(kis.buy_stock, code, qty)
-        logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, limit_price, result_mkt)
+        logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, order_price, result_mkt)
         try:
             fill_price = float(result_mkt.get("output", {}).get("prdt_price", 0)) or None
         except Exception:
@@ -550,21 +650,21 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                 fill_price = kis.get_current_price(code)
             except Exception:
                 fill_price = None
-        slippage = (fill_price - order_price) / order_price * 100 if (fill_price and order_price) else 0
+        slippage = ((fill_price - order_price) / order_price * 100.0) if (fill_price and order_price) else None
         log_trade({
             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "code": code,
             "side": "BUY",
-            "order_price": order_price,
+            "order_price": order_price or None,
             "fill_price": fill_price,
-            "slippage_pct": round(slippage, 2) if fill_price and order_price else None,
+            "slippage_pct": round(slippage, 2) if slippage is not None else None,
             "qty": qty,
             "result": result_mkt,
             "status": "filled" if result_mkt and result_mkt.get("rt_cd") == "0" else "failed",
             "fail_reason": None if result_mkt and result_mkt.get("rt_cd") == "0" else "체결실패"
         })
         trade_logged = True
-        if abs(slippage) > SLIPPAGE_LIMIT_PCT:
+        if slippage is not None and abs(slippage) > SLIPPAGE_LIMIT_PCT:
             logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
         return result_mkt
     except Exception as e:
@@ -574,7 +674,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                 "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                 "code": code,
                 "side": "BUY",
-                "order_price": order_price,
+                "order_price": order_price or None,
                 "fill_price": None,
                 "slippage_pct": None,
                 "qty": qty,
@@ -583,6 +683,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                 "fail_reason": str(e)
             })
         raise
+
 
 
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
