@@ -370,125 +370,143 @@ class KisAPI:
                             return 100.0 * bid / max(1.0, ask)
         return None
 
-    def get_daily_candles(self, code: str, count: int = 30):
+    from typing import List, Dict, Any
+    import os, time, random, requests
+
+    def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
         """
-        KIS 일봉 조회 (국내 주식 전용)
-        - 시장코드: J 고정
-        - 종목코드: 항상 A접두 + 6자리
-        - 네트워크/SSL: NetTemporaryError
-        - 데이터 없음: DataEmptyError
-        - 데이터 < 21: DataShortError
+        일봉 조회 (시장코드 고정, 네트워크 실패/데이터 부족 분리)
+        - 네트워크/SSL 실패: NetTemporaryError (제외 금지, 상위 루프에서 TEMP_SKIP)
+        - 데이터 없음(0개): DataEmptyError (연속 확인 후 제외)
+        - 데이터 부족(<21개): DataShortError (즉시 제외)
+
+        추가:
+        - 응답 RAW 디버깅 로그 출력
+        - output2 / output1 / output 자동 탐색
+        - .env의 DAILY_CAPITAL 미설정 시 1회 경고 로그
         """
+        # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) -----------------------
+        try:
+            if not getattr(self, "_env_checked_daily_capital", False):
+                if os.getenv("DAILY_CAPITAL") in (None, ""):
+                    # settings에서 기본값(10_000_000)으로 떨어질 가능성을 알림
+                    logger.warning("[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
+                                   "settings의 기본값(10,000,000)이 사용될 수 있습니다.")
+                self._env_checked_daily_capital = True
+        except Exception:
+            # 환경 점검 로직은 거래와 무관하므로 안전하게 무시
+            pass
+
+        # ---- (1) 시장코드 고정 (J/U 스왑 금지) ------------------------------------------------
+        # 실전은 마스터테이블/캐시에서 로드. 모르면 J로 고정
+        market_code = self.market_map.get(code.lstrip("A"), "J") if hasattr(self, "market_map") else "J"
+
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
 
-        base = code.lstrip("A").strip()
-        iscd = f"A{base}"
-
-        # ★ 이 엔드포인트 전용 TR-ID 강제 (매핑 문제 우회)
-        #   - 국내 일봉차트: FHKST03010100
-        def _headers_daily(tr_id_override: str = "FHKST03010100"):
-            # self._headers 가 tr_id 키워드를 안 받는다면, 내부에서 tr_id 세팅 로직을 따로 두셨을 텐데
-            # 해당 함수가 dict를 리턴한다면 아래처럼 덮어쓰기
-            h = self._headers("DAILY_CHART")  # 기존 키 사용
-            h["tr_id"] = tr_id_override
-            return h
-
-        params = {
-        "fid_cond_mrkt_div_code": "J",   # ★ 국내 주식 J 고정
-        "fid_input_iscd": iscd,          # ★ A접두 고정
-        "fid_org_adj_prc": "0",          # 수정주가 적용여부(필요에 따라 1로 바꿔도 됨)
-        "fid_period_div_code": "D",
-    }
+        # A접두 처리
+        iscd = code if code.startswith("A") else f"A{code}"
 
         last_err = None
-        tried_header_swap = False
 
-        # 세션 재시도 (HTTPAdapter Retry와 중첩)
-        for attempt in range(1, 4):
-            try:
-                # 첫 시도: 표준 TR-ID
-                headers = _headers_daily("FHKST03010100")
-                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                resp.raise_for_status()
-                data = resp.json()
+        for tr in _pick_tr(self.env, "DAILY_CHART"):   # TR 후보를 순차적으로 시도
+            headers = self._headers(tr)
+            params = {
+                "fid_cond_mrkt_div_code": market_code,  # J: 코스피, U: 코스닥 등
+                "fid_input_iscd": iscd,
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            }
 
-                # 초당 거래건수 제한 문구 → 잠깐 쉼
-                if "초당 거래건수" in (data.get("msg1") or ""):
-                    time.sleep(0.35)
+            for attempt in range(1, 4):  # 가벼운 재시도 (세션 레벨 Retry와 중첩)
+                try:
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp.raise_for_status()
+                    data = resp.json()
+                    # ✅ RAW 응답 디버깅
+                    logger.debug("[DAILY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
+                except requests.exceptions.SSLError as e:
+                    last_err = e
+                    logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except requests.exceptions.RequestException as e:
+                    last_err = e
+                    logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except ValueError as e:
+                    # JSON 디코드 실패 → 일시적 응답깨짐으로 보고 재시도
+                    last_err = e
+                    logger.warning("[NET:JSON_DECODE] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+                except Exception as e:
+                    last_err = e
+                    logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
                     continue
 
-                if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                    arr = data["output"]
-                    rows = [{
-                        "date": r.get("stck_bsop_date"),
-                        "open": float(r.get("stck_oprc")),
-                        "high": float(r.get("stck_hgpr")),
-                        "low":  float(r.get("stck_lwpr")),
-                        "close":float(r.get("stck_clpr")),
-                    } for r in arr if r.get("stck_bsop_date") and r.get("stck_oprc") is not None]
+                # 게이트웨이/쿼터 문구면 잠깐 쉼 후 재시도
+                if "초당 거래건수" in str(data.get("msg1") or ""):
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
 
+                # ---- (2) 성공 케이스 판정: rt_cd / output 키 셀렉션 --------------------------
+                rt_cd = data.get("rt_cd", "")
+               # 일부 환경(특히 모의)에서는 rt_cd가 아예 비어있는 {}가 올 수 있음 → 키 존재에 의존 X
+                arr = data.get("output2") or data.get("output1") or data.get("output")
+
+                if resp.status_code == 200 and arr:
+                    # 정상 파싱
+                    rows = []
+                    for r in arr:
+                        try:
+                            d = r.get("stck_bsop_date")
+                            o = r.get("stck_oprc")
+                            h = r.get("stck_hgpr")
+                            l = r.get("stck_lwpr")
+                            c = r.get("stck_clpr")
+                            if d and o is not None and h is not None and l is not None and c is not None:
+                                rows.append({
+                                    "date": d,
+                                    "open": float(o),
+                                    "high": float(h),
+                                    "low":  float(l),
+                                    "close":float(c),
+                                })
+                        except Exception as e:
+                            # 개별 레코드 파싱 실패는 스킵
+                            logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+
+                    # 날짜 오름차순 정렬
                     rows.sort(key=lambda x: x["date"])
+
+                    # --- 핵심 판정 로직 ---
                     if len(rows) == 0:
+                        # 진짜 데이터 없음 → DataEmptyError
                         raise DataEmptyError(f"{iscd} 0 candles")
                     if len(rows) < 21:
+                        # 21개 미만 → DataShortError
                         raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
 
+                    # 최소 21개 확보 보장. count가 21보다 작아도 21은 확보된 상태
+                    # 최근 count개 반환 (기본 동작 유지)
                     need = max(count, 21)
                     return rows[-need:][-count:]
 
-                # rt_cd != 0 처리
-                msg = (data.get("msg1") or "").upper()
-                if data.get("rt_cd") != "0":
-                    # 시장코드 에러 문구면 1회 헤더 스왑 재시도
-                    if ("FID_COND_MRKT_DIV_CODE" in msg or "INVALID" in msg) and not tried_header_swap:
-                        tried_header_swap = True
-                        time.sleep(0.2)
-                        # 두 번째 시도: 동일 호출 + 헤더만 재셋 (혹시 매퍼가 덮어쓰는 이슈 방지)
-                        headers = _headers_daily("FHKST03010100")  # 동일하지만 재구성
-                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                        resp.raise_for_status()
-                        data = resp.json()
-                        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                            arr = data["output"]
-                            rows = [{
-                                "date": r.get("stck_bsop_date"),
-                                "open": float(r.get("stck_oprc")),
-                                "high": float(r.get("stck_hgpr")),
-                                "low":  float(r.get("stck_lwpr")),
-                                "close":float(r.get("stck_clpr")),
-                            } for r in arr if r.get("stck_bsop_date") and r.get("stck_oprc") is not None]
-                            rows.sort(key=lambda x: x["date"])
-                            if len(rows) == 0:
-                                raise DataEmptyError(f"{iscd} 0 candles")
-                            if len(rows) < 21:
-                                raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
-                            need = max(count, 21)
-                            return rows[-need:][-count:]
-                    # 일반 실패 → 소폭 대기 후 루프 재시도
-                    last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
-                    time.sleep(0.35)
-                    continue
+                # 여기까지 왔는데 arr가 비었으면, 응답 자체가 비정상인 케이스
+                # rt_cd가 "0"이 아니거나, 아예 키가 없는 {} 등
+                last_err = RuntimeError(f"BAD_RESP rt_cd={rt_cd} msg={data.get('msg1')} arr=None")
+                logger.warning("[DAILY_FAIL] %s: %s | raw=%s", iscd, last_err, data)
+                time.sleep(0.35 + random.uniform(0, 0.15))
 
-            except requests.exceptions.SSLError as e:
-                last_err = e
-                logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                time.sleep(0.4 * attempt)
-                continue
-            except requests.exceptions.RequestException as e:
-                last_err = e
-                logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                time.sleep(0.4 * attempt)
-                continue
-            except Exception as e:
-                last_err = e
-                logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
-                time.sleep(0.4 * attempt)
-                continue
-
+        # 모든 TR/재시도 실패 → 네트워크/게이트웨이 등으로 정상 확보 실패
         if last_err:
             logger.warning("[DAILY_FAIL] %s: %s", iscd, last_err)
+        # ❗ 네트워크 실패를 []로 내려보내면 '0캔들'로 오인됨 → 예외로 올려서 TEMP_SKIP 처리
         raise NetTemporaryError(f"DAILY {iscd} net fail")
+
 
 
 
