@@ -30,7 +30,7 @@ KIS_WS_URL     = safe_strip(os.getenv("KIS_WS_URL", ""))
 #REBALANCE_ANCHOR      = os.getenv("REBALANCE_ANCHOR", "first")
 REBALANCE_ANCHOR="weekly"
 
-DAILY_CAPITAL         = int(os.getenv("DAILY_CAPITAL", "3000000"))
+DAILY_CAPITAL         = int(os.getenv("DAILY_CAPITAL", "50000000"))
 SLIPPAGE_LIMIT_PCT    = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
 PARTIAL1              = float(os.getenv("PARTIAL1", "0.5"))
 PARTIAL2              = float(os.getenv("PARTIAL2", "0.3"))
