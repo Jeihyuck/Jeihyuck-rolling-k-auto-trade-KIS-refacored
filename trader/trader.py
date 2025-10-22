@@ -427,12 +427,42 @@ def is_strong_momentum(kis, code):
 
 
 
-def _weight_to_qty(kis: KisAPI, code: str, weight: float, daily_capital: int) -> int:
+def _weight_to_qty(
+    kis: KisAPI,
+    code: str,
+    weight: float,
+    daily_capital: int,
+    ref_price: Optional[float] = None
+) -> int:
+    """
+    - 장중: 현재가(_safe_get_price)
+    - 마감: ref_price 우선(리밸런싱 API의 close/prev_close), 없으면 kis.get_close_price()
+    """
     weight = max(0.0, float(weight))
     alloc = int(round(daily_capital * weight))
-    price = _safe_get_price(kis, code) or 0
-    if price <= 0:
+
+    price = None
+    # 1) 외부에서 힌트가 오면 (리밸런싱 API의 close/prev_close) 그걸 우선
+    if ref_price is not None and float(ref_price) > 0:
+        price = float(ref_price)
+
+    # 2) 힌트가 없으면 장상태에 따라 결정
+    if price is None:
+        try:
+            if kis.is_market_open():
+                price = _safe_get_price(kis, code)
+            else:
+                if hasattr(kis, "get_close_price"):
+                    try:
+                        price = float(kis.get_close_price(code))
+                    except Exception:
+                        price = None
+        except Exception:
+            price = None
+
+    if price is None or price <= 0:
         return 0
+
     return max(0, int(alloc // int(price)))
 
 # ... 이하 2/3에서 계속 ...
@@ -446,7 +476,11 @@ def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
             return None
     return None
 
-def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float, qty: int, k_value: Any, target_price: Optional[float]):
+def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_price: float, qty: int, k_value: Any, target_price: Optional[float]):
+    try:
+        use_atr = kis.is_market_open()
+    except Exception:
+        use_atr = True
     atr = _get_atr(KisAPI(), code)
     rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, entry_price * 0.01)
     t1 = entry_price + 0.5 * rng_eff
@@ -467,9 +501,17 @@ def _init_position_state(holding: Dict[str, Any], code: str, entry_price: float,
         'target_price_src': float(target_price) if target_price is not None else None,
     }
 
-def _init_position_state_from_balance(holding: Dict[str, Any], code: str, avg_price: float, qty: int):
+def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code: str, avg_price: float, qty: int):
     if qty <= 0 or code in holding:
         return
+    try:
+        use_atr = kis.is_market_open()
+    except Exception:
+        use_atr = True
+    atr = _get_atr(kis, code) if use_atr else None
+    rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, avg_price * 0.01)
+    ...
+
     atr = _get_atr(KisAPI(), code)
     rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, avg_price * 0.01)
     t1 = avg_price + 0.5 * rng_eff
@@ -560,6 +602,13 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
     if not code:
         return None, None
 
+    # >>> ADD: 마감이면 prev_*만 사용, 네트워크 콜 스킵
+    try:
+        market_open = kis.is_market_open()
+    except Exception:
+        market_open = True
+
+
     # 1) 오늘 시초가
     today_open = None
     try:
@@ -579,6 +628,13 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
 
     # 2) 전일 범위
     prev_high = prev_low = None
+    try:
+        if market_open:  # <<< ADD
+            prev_candles = kis.get_daily_candles(code, count=2)
+            ...
+    except Exception:
+        pass
+
     try:
         prev_candles = kis.get_daily_candles(code, count=2)
         if prev_candles and len(prev_candles) >= 2:
@@ -980,11 +1036,14 @@ def main():
         strategy = t.get("strategy") or "전월 rolling K 최적화"
 
         if qty <= 0 and weight is not None:
+            # 마감 시에는 리밸런싱 응답의 close/prev_close를 힌트 가격으로 사용
+            ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
             try:
-                qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL)
-                logger.info(f"[ALLOC->QTY] {code} weight={weight} → qty={qty}")
+                qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
+                logger.info(f"[ALLOC->QTY] {code} weight={weight} ref_px={ref_px} → qty={qty}")
             except Exception:
                 qty = 0
+
 
         processed_targets[code] = {
             "code": code,
@@ -1130,8 +1189,9 @@ def main():
                             except Exception as e:
                                 logger.warning(f"[BUY_FILL_NAME_FAIL] code={code} ex={e}")
 
-                            _init_position_state(holding, code, float(current_price), int(qty),
+                            _init_position_state(kis, holding, code, float(current_price), int(qty),
                                                  (k_value if k_value is not None else k_used), eff_target_price)
+
                             traded[code] = {"buy_time": now_str, "qty": int(qty), "price": float(current_price)}
                             logger.info(f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}")
 
