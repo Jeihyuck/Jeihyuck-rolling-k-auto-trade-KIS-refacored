@@ -753,6 +753,7 @@ def _adaptive_exit(
         reason = "트레일링스톱"
     # === 손절(-5%) ===
     elif cur <= float(pos['buy_price']) * (1 + DEFAULT_LOSS_PCT / 100.0):
+        reason = "손절 -5%"
 
 
     if reason:
