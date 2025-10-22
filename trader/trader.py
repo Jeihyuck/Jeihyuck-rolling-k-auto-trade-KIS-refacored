@@ -1090,12 +1090,17 @@ def main():
 
                 # 신규 보유분을 능동관리 대상으로 자동 초기화 (A)
                 for b in balances:
-                    code_b = b.get('pdno')
-                    qty_b = _to_int(b.get('hldg_qty', 0))
-                    if qty_b > 0 and code_b and code_b not in holding:
-                        avg_b = _to_float(b.get('pchs_avg_pric') or b.get('avg_price') or 0.0, 0.0)
-                        if avg_b and avg_b > 0:
-                            _init_position_state_from_balance(holding, code_b, avg_b, qty_b)
+                    code_b = str(b.get('pdno', '')).strip()
+                    qty_b  = _to_int(b.get('hldg_qty', 0))                  # "7", "7,000" 모두 OK
+                    avg_b  = _to_float(b.get('pchs_avg_pric') or b.get('avg_price') or 0.0, 0.0)
+
+                    if qty_b > 0 and code_b and code_b not in holding and avg_b > 0:
+                        _init_position_state_from_balance(kis, holding, code_b, avg_b, qty_b)
+                        logger.info(f"[잔고초기화] code={code_b} qty={qty_b} avg={avg_b}")
+                    try:
+                        _init_position_state_from_balance(kis, holding, code_b, avg_b, qty_b)
+                    except TypeError as e:
+                        logger.error(f"[잔고조회 오류] {e} code={code_b} qty={qty_b} avg={avg_b}")
 
                 # 실제 잔고에서 사라진 보유항목은 정리
                 for code in list(holding.keys()):
