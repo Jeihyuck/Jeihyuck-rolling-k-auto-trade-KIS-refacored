@@ -372,94 +372,119 @@ class KisAPI:
 
     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
         """
-        일봉 조회 (시장코드 고정, 네트워크 실패/데이터 부족 분리)
+        일봉 조회 (시장코드/종목포맷 다중 시도 + 네트워크 실패/데이터 부족 분리)
         - 네트워크/SSL 실패: NetTemporaryError (제외 금지, 상위 루프에서 TEMP_SKIP)
         - 데이터 없음(0개): DataEmptyError (연속 확인 후 제외)
         - 데이터 부족(<21개): DataShortError (즉시 제외)
         """
-        # 1) 시장코드 고정 (J/U 스왑 금지)
-        #    - 실전은 마스터테이블/캐시에서 로드. 모르면 J로 고정
-        market_code = self.market_map.get(code.lstrip("A"), "J") if hasattr(self, "market_map") else "J"
-
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
 
-        # A접두 처리
-        iscd = code if code.startswith("A") else f"A{code}"
+        c_raw = safe_strip(code)
+        base_code = c_raw.lstrip("A")
 
-        # 가벼운 재시도(세션은 전역 재사용 가정; HTTPAdapter+Retry는 세션 생성 시 설정)
+        # 종목 포맷 후보 (A접두/무접두 모두 시도, 중복 제거)
+        code_candidates = []
+        a_form = c_raw if c_raw.startswith("A") else f"A{c_raw}"
+        na_form = base_code
+        for cand in (a_form, na_form):
+            if cand and cand not in code_candidates:
+                code_candidates.append(cand)
+
+        # 시장코드 후보: 캐시가 있으면 우선, 그다음 나머지
+        cached_market = None
+        if hasattr(self, "market_map"):
+            cached_market = self.market_map.get(base_code)
+        market_candidates = ["J", "U"]
+        if cached_market in ("J", "U"):
+            # 캐시 우선, 나머지 보조
+            market_candidates = [cached_market] + [m for m in market_candidates if m != cached_market]
+
         last_err = None
+
         for tr in _pick_tr(self.env, "DAILY_CHART"):
             headers = self._headers(tr)
-            params = {
-                "fid_cond_mrkt_div_code": market_code,
-                "fid_input_iscd": iscd,
-                "fid_org_adj_prc": "0",
-                "fid_period_div_code": "D",
-            }
-            for attempt in range(1, 4):  # 3회 정도 (세션의 Retry와 중첩돼 실효 재시도↑)
-                try:
-                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                    # HTTP 에러코드면 raise → 아래 except에서 NetTemporaryError 처리
-                    resp.raise_for_status()
-                    data = resp.json()
-                except requests.exceptions.SSLError as e:
-                    last_err = e
-                    logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except requests.exceptions.RequestException as e:
-                    last_err = e
-                    logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except Exception as e:
-                    last_err = e
-                    logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
+            for market_div in market_candidates:
+                for iscd in code_candidates:
+                    params = {
+                        "fid_cond_mrkt_div_code": market_div,
+                        "fid_input_iscd": iscd,
+                        "fid_org_adj_prc": "0",
+                        "fid_period_div_code": "D",
+                    }
+                    # 세션 내 가벼운 재시도 (HTTPAdapter+Retry와 중첩되어 실효 재시도↑)
+                    for attempt in range(1, 4):
+                        try:
+                            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                            resp.raise_for_status()
+                            data = resp.json()
+                        except requests.exceptions.SSLError as e:
+                            last_err = e
+                            logger.warning("[NET:SSL_ERROR] DAILY %s/%s attempt=%s %s", market_div, iscd, attempt, e)
+                            time.sleep(0.4 * attempt)
+                            continue
+                        except requests.exceptions.RequestException as e:
+                            last_err = e
+                            logger.warning("[NET:REQ_ERROR] DAILY %s/%s attempt=%s %s", market_div, iscd, attempt, e)
+                            time.sleep(0.4 * attempt)
+                            continue
+                        except Exception as e:
+                            last_err = e
+                            logger.warning("[NET:UNEXPECTED] DAILY %s/%s attempt=%s %s", market_div, iscd, attempt, e)
+                            time.sleep(0.4 * attempt)
+                            continue
 
-                # 게이트웨이/쿼터 문구면 잠깐 쉼 후 재시도
-                if "초당 거래건수" in (data.get("msg1") or ""):
-                    time.sleep(0.35 + random.uniform(0, 0.15))
-                    continue
+                        # 게이트웨이/쿼터 문구면 잠깐 쉼 후 재시도
+                        if "초당 거래건수" in (data.get("msg1") or ""):
+                            time.sleep(0.35 + random.uniform(0, 0.15))
+                            continue
 
-                # 정상 응답 체크
-                if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                    arr = data["output"]
-                    rows = [{
-                        "date": r.get("stck_bsop_date"),
-                        "open": float(r.get("stck_oprc")),
-                        "high": float(r.get("stck_hgpr")),
-                        "low":  float(r.get("stck_lwpr")),
-                        "close":float(r.get("stck_clpr")),
-                    } for r in arr if r.get("stck_oprc") is not None and r.get("stck_bsop_date")]
+                        # 정상 응답 판정
+                        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                            arr = data["output"]
+                            rows = [{
+                                "date": r.get("stck_bsop_date"),
+                                "open": float(r.get("stck_oprc")),
+                                "high": float(r.get("stck_hgpr")),
+                                "low":  float(r.get("stck_lwpr")),
+                                "close":float(r.get("stck_clpr")),
+                            } for r in arr if r.get("stck_oprc") is not None and r.get("stck_bsop_date")]
 
-                    # 날짜 오름차순 정렬
-                    rows.sort(key=lambda x: x["date"])
+                            # 날짜 오름차순 정렬
+                            rows.sort(key=lambda x: x["date"])
 
-                    # --- 핵심 판정 로직 ---
-                    if len(rows) == 0:
-                        # 진짜 데이터 없음 → DataEmptyError
-                        raise DataEmptyError(f"{iscd} 0 candles")
-                    if len(rows) < 21:
-                        # 21개 미만 → DataShortError
-                        raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
+                            # --- 핵심 판정 로직 ---
+                            if len(rows) == 0:
+                                # 진짜 데이터 없음 → DataEmptyError
+                                raise DataEmptyError(f"{iscd} 0 candles")
+                            if len(rows) < 21:
+                                # 21개 미만 → DataShortError
+                                raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
 
-                    # 최소 21개 확보 보장. count가 21보다 작아도 21은 확보된 상태
-                    # 최근 count개 반환 (기본 동작 유지)
-                    need = max(count, 21)
-                    return rows[-need:][-count:]
+                            # 성공한 시장코드를 캐시에 반영
+                            try:
+                                if not hasattr(self, "market_map"):
+                                    self.market_map = {}
+                                self.market_map[base_code] = market_div
+                            except Exception:
+                                pass
 
-                # rt_cd != 0 or output 없음 → 재시도
-                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
-                time.sleep(0.35 + random.uniform(0, 0.15))
+                            # 최소 21개 확보 보장. count가 21보다 작아도 21은 확보된 상태
+                            # 최근 count개 반환
+                            need = max(count, 21)
+                            return rows[-need:][-count:]
+
+                        # rt_cd != 0 or output 없음 → 다음 후보/재시도
+                        last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
+                        time.sleep(0.35 + random.uniform(0, 0.15))
 
         # 여기까지 왔으면 네트워크/게이트웨이 등으로 정상 확보 실패
+        norm_code = c_raw if c_raw.startswith("A") else f"A{c_raw}"
         if last_err:
-            logger.warning("[DAILY_FAIL] %s: %s", iscd, last_err)
+            logger.warning("[DAILY_FAIL] %s: %s", norm_code, last_err)
         # ❗ 네트워크 실패를 []로 내려보내면 '0캔들'로 오인됨 → 예외로 올려서 TEMP_SKIP 처리
-        raise NetTemporaryError(f"DAILY {iscd} net fail")
+        raise NetTemporaryError(f"DAILY {norm_code} net fail")
+
 
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:
         try:
