@@ -5,7 +5,7 @@ import random
 import logging
 import threading
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import requests
@@ -17,21 +17,17 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 
 logger = logging.getLogger(__name__)
 
-
 class NetTemporaryError(Exception):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
     pass
-
 
 class DataEmptyError(Exception):
     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
     pass
 
-
 class DataShortError(Exception):
     """정상응답이나 캔들이 need_n 미만."""
     pass
-
 
 def _build_session():
     s = requests.Session()
@@ -39,7 +35,7 @@ def _build_session():
         total=6, connect=5, read=5, status=3,
         backoff_factor=0.6,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        allowed_methods=["GET", "POST"]
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
     s.mount("https://", adapter)
@@ -47,9 +43,7 @@ def _build_session():
     s.headers.update({"User-Agent": "RKMax/1.0"})
     return s
 
-
 SESSION = _build_session()
-
 
 def _get_json(url, params=None, timeout=(3.0, 7.0)):
     try:
@@ -71,10 +65,8 @@ def safe_strip(val):
         return val.replace("\n", "").replace("\r", "").strip()
     return str(val).strip()
 
-
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
-
 
 def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: str, note: str = ""):
     try:
@@ -101,13 +93,11 @@ def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: s
     except Exception as e:
         logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
 
-
 class _RateLimiter:
     def __init__(self, min_interval_sec: float = 0.20):
         self.min_interval = float(min_interval_sec)
         self.last_at: Dict[str, float] = {}
         self._lock = threading.Lock()
-
     def wait(self, key: str):
         with self._lock:
             now = time.time()
@@ -116,7 +106,6 @@ class _RateLimiter:
             if delta < self.min_interval:
                 time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
             self.last_at[key] = time.time()
-
 
 TR_MAP = {
     "practice": {
@@ -138,14 +127,13 @@ TR_MAP = {
         "TOKEN": "/oauth2/token",
     },
 }
-
-
 def _pick_tr(env: str, key: str) -> List[str]:
     try:
         return TR_MAP[env][key]
     except Exception:
         return []
 
+# --- KisAPI 이하 실전 전체 로직 (토큰, 주문, 매수/매도, 체결, 실전 전략 등) ---
 
 class KisAPI:
     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
@@ -234,11 +222,8 @@ class KisAPI:
             "appkey": APP_KEY,
             "appsecret": APP_SECRET,
             "tr_id": tr_id,
-            "custtype": "P",           # 개인
-            "tr_cont": "N",            # 연속조회 아님
-            "accept": "application/json",
+            "custtype": "P",
             "content-type": "application/json; charset=utf-8",
-            "Connection": "close",     # 게이트웨이 조기 종료 완화
         }
         if hashkey:
             h["hashkey"] = hashkey
@@ -264,7 +249,7 @@ class KisAPI:
             raise Exception(f"HashKey 생성 실패: {j}")
         return hk
 
-    # === 실전: 시세, 잔고, 시장가/지정가, 매수/매도, 체결강도, ATR 등 ===
+    # === 시세/호가/시초가 ===
 
     def get_current_price(self, code: str) -> float:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -272,7 +257,7 @@ class KisAPI:
         tried = []
         for tr in _pick_tr(self.env, "PRICE"):
             headers = self._headers(tr)
-            markets = ["J", "Q", "U"]
+            markets = ["J", "U"]
             c = code.strip()
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
@@ -329,7 +314,7 @@ class KisAPI:
         tried = []
         for tr in _pick_tr(self.env, "PRICE"):
             headers = self._headers(tr)
-            markets = ["J", "Q", "U"]
+            markets = ["J", "U"]
             c = code
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
@@ -354,6 +339,7 @@ class KisAPI:
                                 return op
                         except Exception:
                             pass
+        # 2) (옵션) 시간체결 첫 틱가 보조 → 필요하면 별도 구현
         return None
 
     def get_orderbook_strength(self, code: str) -> Optional[float]:
@@ -361,7 +347,7 @@ class KisAPI:
         self._limiter.wait("orderbook")
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "Q", "U"]
+            markets = ["J", "U"]
             c = code.strip()
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
@@ -380,130 +366,129 @@ class KisAPI:
                             return 100.0 * bid / max(1.0, ask)
         return None
 
+    # === 일봉 ===
+
     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
         """
-        일봉 조회 (시장코드 폴백 포함, 네트워크 실패/데이터 부족 분리)
-        - 네트워크/SSL 실패: NetTemporaryError (제외 금지, 상위 루프에서 TEMP_SKIP)
-        - 데이터 없음(0개): DataEmptyError (연속 확인 후 제외)
-        - 데이터 부족(<21개): DataShortError (즉시 제외)
-
-        추가:
-        - 응답 RAW 디버깅 로그 출력
-        - output2 / output1 / output 자동 탐색
-        - .env의 DAILY_CAPITAL 미설정 시 1회 경고 로그
+        KIS 일봉 조회 (FHKST03010100)
+        - 날짜 파라미터(fid_input_date_1, fid_input_date_2) 필수
+        - 시장코드 J 고정
+        - 종목코드 'A' 접두사 제거(6자리)
+        - 0개 → DataEmptyError, 21개 미만 → DataShortError, 네트워크/게이트웨이 → NetTemporaryError
         """
-        # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) -----------------------
+        # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
         try:
             if not getattr(self, "_env_checked_daily_capital", False):
                 if os.getenv("DAILY_CAPITAL") in (None, ""):
-                    logger.warning("[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. settings의 기본값(10,000,000)이 사용될 수 있습니다.")
+                    logger.warning("[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
+                                   "settings의 기본값(10,000,000)이 사용될 수 있습니다.")
                 self._env_checked_daily_capital = True
         except Exception:
             pass
 
-        # ---- (1) 시장코드 후보 구성 (+ 폴백: J → Q → U) --------------------------------------
-        first_guess = None
-        try:
-            if hasattr(self, "market_map"):
-                first_guess = self.market_map.get(code.lstrip("A"))
-        except Exception:
-            first_guess = None
-        market_candidates = []
-        if first_guess:
-            market_candidates.append(first_guess)
-        for mk in ("J", "Q", "U"):
-            if mk not in market_candidates:
-                market_candidates.append(mk)
+        # ---- (1) 파라미터 구성 ----
+        market_code = "J"                         # 시장코드: J 고정
+        iscd = code.strip().lstrip("A")           # 종목코드: 'A' 제거(6자리)
+
+        # 기간: 충분히 넉넉하게(휴장/결측 대비)
+        kst = pytz.timezone("Asia/Seoul")
+        now_kst = datetime.now(kst)
+        to_ymd = now_kst.strftime("%Y%m%d")
+        back_days = max(200, count * 4 + 100)
+        from_ymd = (now_kst - timedelta(days=back_days)).strftime("%Y%m%d")
 
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
 
-        # A접두 처리
-        iscd = code if code.startswith("A") else f"A{code}"
-
         last_err = None
 
-        for tr in _pick_tr(self.env, "DAILY_CHART"):
+        for tr in _pick_tr(self.env, "DAILY_CHART"):   # TR 후보를 순차적으로 시도
             headers = self._headers(tr)
-            for mk in market_candidates:
-                params = {
-                    "fid_cond_mrkt_div_code": mk,  # J:KOSPI, Q:KOSDAQ, U:환경별 호환용
-                    "fid_input_iscd": iscd,
-                    "fid_org_adj_prc": "0",
-                    "fid_period_div_code": "D",
-                }
+            headers.setdefault("accept", "*/*")
+            headers.setdefault("tr_cont", "N")
+            headers.setdefault("Connection", "keep-alive")
 
-                for attempt in range(1, 4):
-                    try:
-                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-                        resp.raise_for_status()
-                        data = resp.json()
-                        logger.debug("[DAILY_RAW_JSON] %s TR=%s mk=%s attempt=%d → %s", iscd, tr, mk, attempt, data)
-                    except requests.exceptions.SSLError as e:
-                        last_err = e
-                        logger.warning("[NET:SSL_ERROR] DAILY %s mk=%s attempt=%s %s", iscd, mk, attempt, e)
-                        time.sleep(0.4 * attempt)
-                        continue
-                    except requests.exceptions.RequestException as e:
-                        last_err = e
-                        logger.warning("[NET:REQ_ERROR] DAILY %s mk=%s attempt=%s %s", iscd, mk, attempt, e)
-                        time.sleep(0.4 * attempt)
-                        continue
-                    except ValueError as e:
-                        last_err = e
-                        logger.warning("[NET:JSON_DECODE] DAILY %s mk=%s attempt=%s %s", iscd, mk, attempt, e)
-                        time.sleep(0.35 + random.uniform(0, 0.15))
-                        continue
-                    except Exception as e:
-                        last_err = e
-                        logger.warning("[NET:UNEXPECTED] DAILY %s mk=%s attempt=%s %s", iscd, mk, attempt, e)
-                        time.sleep(0.4 * attempt)
-                        continue
+            params = {
+                "fid_cond_mrkt_div_code": market_code,  # 반드시 'J'
+                "fid_input_iscd": iscd,                 # 'A' 없이 6자리
+                "fid_input_date_1": from_ymd,           # 시작일(YYYYMMDD)
+                "fid_input_date_2": to_ymd,             # 종료일(YYYYMMDD)
+                "fid_org_adj_prc": "0",
+                "fid_period_div_code": "D",
+            }
 
-                    if "초당 거래건수" in str(data.get("msg1") or ""):
-                        time.sleep(0.35 + random.uniform(0, 0.15))
-                        continue
-
-                    rt_cd = data.get("rt_cd", "")
-                    arr = data.get("output2") or data.get("output1") or data.get("output")
-
-                    if resp.status_code == 200 and arr:
-                        rows: List[Dict[str, Any]] = []
-                        for r in arr:
-                            try:
-                                d = r.get("stck_bsop_date")
-                                o = r.get("stck_oprc")
-                                h = r.get("stck_hgpr")
-                                l = r.get("stck_lwpr")
-                                c = r.get("stck_clpr")
-                                if d and o is not None and h is not None and l is not None and c is not None:
-                                    rows.append({
-                                        "date": d,
-                                        "open": float(o),
-                                        "high": float(h),
-                                        "low": float(l),
-                                        "close": float(c),
-                                    })
-                            except Exception as e:
-                                logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
-
-                        rows.sort(key=lambda x: x["date"])  # 오름차순
-
-                        if len(rows) == 0:
-                            raise DataEmptyError(f"{iscd} 0 candles")
-                        if len(rows) < 21:
-                            raise DataShortError(f"{iscd} {len(rows)} candles (<21)")
-
-                        need = max(count, 21)
-                        return rows[-need:][-count:]
-
-                    last_err = RuntimeError(f"BAD_RESP rt_cd={rt_cd} msg={data.get('msg1')} arr=None mk={mk}")
-                    logger.warning("[DAILY_FAIL] %s: %s | raw=%s", iscd, last_err, data)
+            for attempt in range(1, 4):  # 가벼운 재시도
+                try:
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp.raise_for_status()
+                    data = resp.json()
+                    logger.debug("[DAILY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
+                except requests.exceptions.SSLError as e:
+                    last_err = e
+                    logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except requests.exceptions.RequestException as e:
+                    last_err = e
+                    logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except ValueError as e:
+                    last_err = e
+                    logger.warning("[NET:JSON_DECODE] DAILY %s attempt=%s %s", iscd, attempt, e)
                     time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+                except Exception as e:
+                    last_err = e
+                    logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+
+                if "초당 거래건수" in str(data.get("msg1") or ""):
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+
+                arr = data.get("output2") or data.get("output1") or data.get("output")
+
+                if resp.status_code == 200 and arr:
+                    rows: List[Dict[str, Any]] = []
+                    for r in arr:
+                        try:
+                            d = r.get("stck_bsop_date")
+                            o = r.get("stck_oprc")
+                            h = r.get("stck_hgpr")
+                            l = r.get("stck_lwpr")
+                            c = r.get("stck_clpr")
+                            if d and o is not None and h is not None and l is not None and c is not None:
+                                rows.append({
+                                    "date": d,
+                                    "open": float(o),
+                                    "high": float(h),
+                                    "low":  float(l),
+                                    "close":float(c),
+                                })
+                        except Exception as e:
+                            logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+
+                    rows.sort(key=lambda x: x["date"])
+
+                    if len(rows) == 0:
+                        raise DataEmptyError(f"A{iscd} 0 candles")
+                    if len(rows) < 21:
+                        raise DataShortError(f"A{iscd} {len(rows)} candles (<21)")
+
+                    need = max(count, 21)
+                    return rows[-need:][-count:]
+
+                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')} arr=None")
+                logger.warning("[DAILY_FAIL] A%s: %s | raw=%s", iscd, last_err, data)
+                time.sleep(0.35 + random.uniform(0, 0.15))
 
         if last_err:
-            logger.warning("[DAILY_FAIL] %s: %s", iscd, last_err)
-        raise NetTemporaryError(f"DAILY {iscd} net fail")
+            logger.warning("[DAILY_FAIL] A%s: %s", iscd, last_err)
+        raise NetTemporaryError(f"DAILY A{iscd} net fail")
+
+    # === ATR ===
 
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:
         try:
@@ -623,8 +608,11 @@ class KisAPI:
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
 
+        # TR 후보 순차 시도
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
-        ord_dvsn_chain = ["01", "13", "03"]  # 시장가 → IOC시장가 → 최유리
+
+        # Fallback: 시장가 → IOC시장가 → 최유리
+        ord_dvsn_chain = ["01", "13", "03"]
         last_err = None
 
         for tr_id in tr_list:
@@ -635,6 +623,7 @@ class KisAPI:
                     body["SLL_TYPE"] = "01"
                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
 
+                # HashKey
                 try:
                     hk = self._create_hashkey(body)
                 except Exception as e:
@@ -643,11 +632,15 @@ class KisAPI:
                     continue
 
                 headers = self._headers(tr_id, hk)
+
+                # 레이트리밋(주문은 별 키)
                 self._limiter.wait("orders")
 
+                # 로깅(민감 Mask)
                 log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
                 logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
 
+                # 네트워크/게이트웨이 재시도
                 for attempt in range(1, 4):
                     try:
                         resp = self.session.post(
@@ -665,11 +658,13 @@ class KisAPI:
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
                         logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
+                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
                         try:
                             out = data.get("output") or {}
                             odno = out.get("ODNO") or out.get("ord_no") or ""
                             pdno = safe_strip(body.get("PDNO", ""))
                             qty = int(float(body.get("ORD_QTY", "0")))
+                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
                             price_for_fill = None
                             try:
                                 ord_unpr = body.get("ORD_UNPR")
@@ -691,6 +686,7 @@ class KisAPI:
 
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
+                    # 게이트웨이/서버 에러류는 재시도
                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
@@ -707,6 +703,9 @@ class KisAPI:
 
         raise Exception(f"주문 실패: {last_err}")
 
+    # -------------------------------
+    # 매수/매도 (신규)
+    # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         body = {
             "CANO": self.CANO,
@@ -719,6 +718,7 @@ class KisAPI:
         return self._order_cash(body, is_sell=False)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
         ord_psbl = 0
@@ -734,9 +734,12 @@ class KisAPI:
             return None
 
         if qty > base_qty:
-            logger.warning(f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})")
+            logger.warning(
+                f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+            )
             qty = base_qty
 
+        # --- 중복 매도 방지(메모리 기반) ---
         now_ts = time.time()
         with self._recent_sells_lock:
             last = self._recent_sells.get(pdno)
@@ -799,6 +802,7 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
         ord_psbl = 0
@@ -819,6 +823,7 @@ class KisAPI:
             )
             qty = base_qty
 
+        # 중복 매도 방지(메모리 기반)
         now_ts = time.time()
         with self._recent_sells_lock:
             last = self._recent_sells.get(pdno)
