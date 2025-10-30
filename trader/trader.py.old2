@@ -1019,8 +1019,10 @@ def _adaptive_exit(
             logger.warning(f"[EXIT-FAIL] {code} 현재가 조회 실패")
             return None, None, None, None
 
-        # [FIXED] 모멘텀 강세라도 '익절/트레일링/손절'은 평가/집행하도록 스킵 제거
-        # (이전 코드: is_strong_momentum → return 스킵)
+        # 강한 모멘텀이면 청산 보류 (종목 개별 모멘텀)
+        if is_strong_momentum(kis, code):
+            logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → _adaptive_exit 스킵")
+            return None, None, None, None
     except Exception as e:
         logger.error(f"[EXIT-FAIL] {code} 현재가/모멘텀 예외: {e}")
         return None, None, None, None
@@ -1349,7 +1351,14 @@ def main():
                                     save_state(holding, traded)
                                     time.sleep(RATE_SLEEP_SEC)
 
-                        # [FIXED] 먼저 트리거 기반 청산을 평가/집행
+                        # === [SELL GUARD] 모멘텀 강세면 매도 스킵 ===
+                        try:
+                            if is_strong_momentum(kis, code):
+                                logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → 타겟 보유 매도 스킵")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
+
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here <= 0:
                             logger.info(f"[SKIP] {code}: 매도가능수량=0 (대기/체결중/락) → 매도 보류")
@@ -1380,13 +1389,6 @@ def main():
                                 })
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
-                            else:
-                                # 트리거가 없을 때만 모멘텀 강세 보류 로그를 남김(액션 차단 아님)
-                                try:
-                                    if is_strong_momentum(kis, code):
-                                        logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → 트리거 부재, 매도 보류")
-                                except Exception as e:
-                                    logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
 
                 except Exception as e:
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
@@ -1436,18 +1438,39 @@ def main():
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
 
-                    # [FIXED] 비타겟도 우선 트리거 기반 청산 평가/집행
+                    # === [추가: 모멘텀 강세시 매도 스킵] ===
+                    if is_strong_momentum(kis, code):
+                        logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류")
+                        continue
+
+                    # === [모멘텀: 최근 20일 수익률 +3% 이상이면 보유 지속] ===
+                    try:
+                        return_pct = get_20d_return_pct(kis, code)
+                    except NetTemporaryError:
+                        logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵")
+                        continue
+                    except DataEmptyError:
+                        logger.warning(f"[DATA_EMPTY] {code}: 0캔들 → 다음 루프에서 재확인")
+                        continue
+                    except DataShortError:
+                        logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 이번 루프 판단 스킵")
+                        continue
+
+                    if return_pct is not None and return_pct >= 3.0:
+                        logger.info(f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속")
+                        continue
+
                     sellable_here = ord_psbl_map.get(code, 0)
                     if sellable_here <= 0:
                         logger.info(f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)")
                         continue
-
+                    name = name_map.get(code)
                     reason, exec_price, result, sold_qty = _adaptive_exit(kis, code, holding[code], regime_mode=regime["mode"])
                     if reason:
                         trade_common = {
                             "datetime": now_str,
                             "code": code,
-                            "name": name_map.get(code),
+                            "name": name,
                             "qty": int(sold_qty or 0),
                             "K": holding[code].get("k_value"),
                             "target_price": holding[code].get("target_price_src"),
@@ -1470,30 +1493,6 @@ def main():
 
                         save_state(holding, traded)
                         time.sleep(RATE_SLEEP_SEC)
-                    else:
-                        # 트리거가 없을 때만 모멘텀·20D 보유 지속 판단
-                        try:
-                            if is_strong_momentum(kis, code):
-                                logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류")
-                                continue
-                        except Exception as e:
-                            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
-
-                        try:
-                            return_pct = get_20d_return_pct(kis, code)
-                        except NetTemporaryError:
-                            logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵")
-                            continue
-                        except DataEmptyError:
-                            logger.warning(f"[DATA_EMPTY] {code}: 0캔들 → 다음 루프에서 재확인")
-                            continue
-                        except DataShortError:
-                            logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 이번 루프 판단 스킵")
-                            continue
-
-                        if return_pct is not None and return_pct >= 3.0:
-                            logger.info(f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속")
-                            continue
 
             # --- 장중 커트오프(KST): 14:40 도달 시 "전량매도 없이" 리포트 생성 후 정상 종료 ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:

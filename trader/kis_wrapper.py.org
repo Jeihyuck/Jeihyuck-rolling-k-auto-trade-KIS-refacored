@@ -164,7 +164,6 @@ class KisAPI:
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
 
-    # ===== 토큰 처리 =====
     def get_valid_token(self):
         with KisAPI._token_lock:
             now = time.time()
@@ -230,24 +229,6 @@ class KisAPI:
             h["hashkey"] = hashkey
         return h
 
-    def refresh_token(self):
-        """
-        강제 토큰 재발급: 주문 실패 등에서 재시도 전에 호출.
-        """
-        try:
-            with KisAPI._token_lock:
-                KisAPI._token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
-                if os.path.exists(self._cache_path):
-                    try:
-                        os.remove(self._cache_path)
-                    except Exception:
-                        pass
-            self.get_valid_token()
-            logger.info("[토큰] 강제 재발급 완료")
-        except Exception as e:
-            logger.error(f"[토큰 재발급 실패] {e}")
-
-    # HashKey
     def _create_hashkey(self, body_dict: dict) -> str:
         url = f"{API_BASE_URL}/uapi/hashkey"
         headers = {
@@ -535,118 +516,6 @@ class KisAPI:
         close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
         return open_time <= now <= close_time
 
-    # ===== 보조 시세/지수/스냅샷 (trader.py 보완용) =====
-
-    def get_close_price(self, code: str) -> Optional[float]:
-        """
-        최근 일봉의 종가(전일 또는 당일 종가)를 반환.
-        """
-        try:
-            candles = self.get_daily_candles(code, count=30)
-            if candles:
-                return float(candles[-1]["close"])
-        except Exception as e:
-            logger.warning(f"[get_close_price] fail {code}: {e}")
-        # 스냅샷 fallback
-        try:
-            return float(self.get_current_price(code))
-        except Exception:
-            return None
-
-    def get_prev_close(self, code: str) -> Optional[float]:
-        """
-        전일 종가(일봉 마지막-1)를 반환.
-        """
-        try:
-            candles = self.get_daily_candles(code, count=30)
-            if len(candles) >= 2:
-                return float(candles[-2]["close"])
-        except Exception as e:
-            logger.warning(f"[get_prev_close] fail {code}: {e}")
-        return None
-
-    def get_quote_snapshot(self, code: str) -> Dict[str, Any]:
-        """
-        간이 스냅샷: 현재가 및 최우선 호가를 묶어서 제공.
-        반환 예: {'tp': 12345.0, 'ap': 12350.0, 'bp': 12340.0, 'close': 12345.0}
-        """
-        out: Dict[str, Any] = {}
-        try:
-            out["tp"] = float(self.get_current_price(code))
-        except Exception:
-            out["tp"] = None
-        try:
-            out["ap"] = float(self.get_best_ask(code)) if self.get_best_ask(code) is not None else None
-            out["bp"] = float(self.get_best_bid(code)) if self.get_best_bid(code) is not None else None
-        except Exception:
-            out["ap"], out["bp"] = None, None
-        out["close"] = out.get("tp")
-        return out
-
-    def get_best_ask(self, code: str) -> Optional[float]:
-        """
-        최우선 매도호가(askp1).
-        """
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
-        self._limiter.wait("orderbook-best")
-        for tr in _pick_tr(self.env, "ORDERBOOK"):
-            headers = self._headers(tr)
-            markets = ["J", "U"]
-            c = code.strip()
-            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-            for market_div in markets:
-                for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                    try:
-                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
-                        data = resp.json()
-                    except Exception:
-                        continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        try:
-                            return float(data["output"].get("askp1"))
-                        except Exception:
-                            return None
-        return None
-
-    def get_best_bid(self, code: str) -> Optional[float]:
-        """
-        최우선 매수호가(bidp1).
-        """
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
-        self._limiter.wait("orderbook-best")
-        for tr in _pick_tr(self.env, "ORDERBOOK"):
-            headers = self._headers(tr)
-            markets = ["J", "U"]
-            c = code.strip()
-            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-            for market_div in markets:
-                for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                    try:
-                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
-                        data = resp.json()
-                    except Exception:
-                        continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        try:
-                            return float(data["output"].get("bidp1"))
-                        except Exception:
-                            return None
-        return None
-
-    def get_index_quote(self, index_code: str) -> Dict[str, Optional[float]]:
-        """
-        (간이) 지수 스냅샷. KIS 인덱스 TR을 쓰지 않고, 현재는 빈 값 위주로 반환.
-        필요 시 별도 인덱스 조회 TR로 교체 가능.
-        """
-        # 최소한의 필드만 제공(레짐 로직이 None을 안전 처리함)
-        return {
-            "price": None,
-            "prev_close": None,
-            "vwap": None,
-        }
-
     # ----- 잔고/포지션 -----
     def get_cash_balance(self) -> int:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -732,12 +601,6 @@ class KisAPI:
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:
         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
-
-    def get_balance_all(self) -> Dict[str, object]:
-        """
-        trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드.
-        """
-        return self.get_balance()
 
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도
@@ -1024,14 +887,3 @@ class KisAPI:
         if price is None:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
-
-    # ===== 주문 후 확인/보조 =====
-    def check_filled(self, order_resp: Optional[dict]) -> bool:
-        """
-        간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주.
-        (실전 체결조회 TR로 대체 가능)
-        """
-        try:
-            return bool(order_resp and isinstance(order_resp, dict) and order_resp.get("rt_cd") == "0")
-        except Exception:
-            return False
