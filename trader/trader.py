@@ -75,6 +75,7 @@ STATE_FILE = Path(__file__).parent / "trade_state.json"
 MARKET_MAP = {
     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
 }
+
 def get_market(code: str) -> str:
     # 모르면 J로 고정. 실패해도 U로 스왑하지 않음.
     return MARKET_MAP.get(code, "J")
@@ -105,6 +106,7 @@ W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
 REBALANCE_ANCHOR = "weekly"
 MOMENTUM_OVERRIDES_FORCE_SELL = os.getenv("MOMENTUM_OVERRIDES_FORCE_SELL", "true").lower() == "true"
 
+
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
         hh, mm = hhmm.split(":")
@@ -113,10 +115,12 @@ def _parse_hhmm(hhmm: str) -> dtime:
         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
         return dtime(hour=14, minute=40)
 
+
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 # >>> ADD (마켓 마감 시 데이터 호출 차단 플래그)
 ALLOW_WHEN_CLOSED = os.getenv("MARKET_DATA_WHEN_CLOSED", "false").lower() == "true"
+
 
 def get_rebalance_anchor_date():
     today = datetime.now(KST).date()
@@ -131,6 +135,7 @@ def get_rebalance_anchor_date():
         return today.strftime("%Y-%m-%d")
     return today.replace(day=1).strftime("%Y-%m-%d")
 
+
 def fetch_rebalancing_targets(date):
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
     response = requests.post(REBALANCE_API_URL)
@@ -142,15 +147,18 @@ def fetch_rebalancing_targets(date):
     else:
         raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
+
 def log_trade(trade: dict):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
         f.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
+
 def save_state(holding, traded):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({"holding": holding, "traded": traded}, f, ensure_ascii=False, indent=2)
+
 
 def load_state():
     if STATE_FILE.exists():
@@ -158,6 +166,7 @@ def load_state():
             state = json.load(f)
         return state.get("holding", {}), state.get("traded", {})
     return {}, {}
+
 
 def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
     last_err = None
@@ -171,17 +180,20 @@ def _with_retry(func, *args, max_retries=5, base_delay=0.6, **kwargs):
             time.sleep(sleep_sec)
     raise last_err
 
+
 def _to_int(val, default=0):
     try:
         return int(float(val))
     except Exception:
         return default
 
+
 def _to_float(val, default=None):
     try:
         return float(val)
     except Exception:
         return default
+
 
 def _log_realized_pnl(
     code: str,
@@ -208,9 +220,11 @@ def _log_realized_pnl(
     except Exception as e:
         logger.warning(f"[P&L_LOG_FAIL] {code} err={e}")
 
+
 # === [ANCHOR: PRICE_CACHE] 현재가 캐시 & 서킷브레이커 ===
 _LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts": epoch}
 _PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
+
 
 def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
     import time as _t
@@ -296,6 +310,7 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
     # 5) 정말로 줄 게 없으면 None
     return None
 
+
 def _fetch_balances(kis: KisAPI):
     if hasattr(kis, "get_balance_all"):
         res = _with_retry(kis.get_balance_all)
@@ -312,6 +327,7 @@ def _fetch_balances(kis: KisAPI):
     else:
         logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
         return []
+
 
 from .kis_wrapper import NetTemporaryError, DataEmptyError, DataShortError
 
@@ -364,6 +380,7 @@ def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
         logger.warning("[20D_RETURN_FAIL] %s 최종 실패: %s", code, last_err)
     raise NetTemporaryError("20D return calc failed")
 
+
 def is_strong_momentum(kis, code):
     """
     강한 상향 추세 모멘텀 여부: 20, 60, 120일 수익률과 MA20/MA60/MA120 위치 기준
@@ -394,6 +411,7 @@ def is_strong_momentum(kis, code):
     except Exception as e:
         logger.warning(f"[모멘텀 판별 실패] {code}: {e}")
         return False
+
 
 def _weight_to_qty(
     kis: KisAPI,
@@ -431,7 +449,9 @@ def _weight_to_qty(
 
     return max(0, int(alloc // int(price)))
 
+
 # === ATR, 상태 초기화 ===
+
 def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
     if hasattr(kis, "get_atr"):
         try:
@@ -441,12 +461,14 @@ def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
             return None
     return None
 
+
 def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_price: float, qty: int, k_value: Any, target_price: Optional[float]):
     try:
         use_atr = kis.is_market_open()
     except Exception:
         use_atr = True
-    atr = _get_atr(KisAPI(), code)
+    # BUGFIX: 기존에는 KisAPI() 인스턴스를 새로 만들어 ATR을 조회함 → 전달받은 kis로 조회하도록 수정
+    atr = _get_atr(kis, code) if use_atr else None
     rng_eff = (atr * 1.5) if (atr and atr > 0) else max(1.0, entry_price * 0.01)
     t1 = entry_price + 0.5 * rng_eff
     t2 = entry_price + 1.0 * rng_eff
@@ -468,6 +490,7 @@ def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_
         'bear_s1_done': False,
         'bear_s2_done': False,
     }
+
 
 def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code: str, avg_price: float, qty: int):
     if qty <= 0 or code in holding:
@@ -499,6 +522,7 @@ def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code
         'bear_s2_done': False,
     }
 
+
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
     cur_price = _safe_get_price(kis, code)
     try:
@@ -519,6 +543,7 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Op
             result = _with_retry(kis.sell_stock, code, qty)
     logger.info(f"[매도호출] {code}, qty={qty}, price(log)={cur_price}, result={result}")
     return cur_price, result
+
 
 def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: float = 0.0):
     try:
@@ -560,7 +585,9 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
     except Exception as e:
         logger.warning(f"[ENSURE_FILL_FAIL] odno={odno} code={code} ex={e}")
 
+
 # === 앵커: 목표가 계산 함수 ===
+
 def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
     if not code:
@@ -623,6 +650,7 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
 
     eff_target_price = float(_round_to_tick(raw_target, mode="up"))
     return float(eff_target_price), float(k_used)
+
 
 def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
     """
@@ -739,6 +767,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
             })
         raise
 
+
 # === [ANCHOR: REGIME PARAMS] 코스닥 레짐 파라미터 ===
 REGIME_ENABLED = True
 KOSDAQ_CODE = os.getenv("KOSDAQ_INDEX_CODE", "KOSDAQ")
@@ -771,6 +800,7 @@ REGIME_STATE: Dict[str, Any] = {
     "prev_close": None,         # 전일 종가
     "pct_change": None          # 등락률(%)
 }
+
 
 def _get_kosdaq_snapshot(kis: KisAPI) -> Dict[str, Optional[float]]:
     """
@@ -815,6 +845,7 @@ def _get_kosdaq_snapshot(kis: KisAPI) -> Dict[str, Optional[float]]:
         above_vwap = None
 
     return {"price": price, "prev_close": prev_close, "pct_change": pct_change, "vwap": vwap, "above_vwap": above_vwap}
+
 
 def _update_market_regime(kis: KisAPI) -> Dict[str, Any]:
     """
@@ -897,7 +928,9 @@ def _update_market_regime(kis: KisAPI) -> Dict[str, Any]:
 
     return REGIME_STATE
 
+
 # === 매도 로직 ===
+
 def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True):
     if not targets_codes:
         return set()
@@ -974,6 +1007,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
             remaining.add(code)
     return remaining
 
+
 def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True):
     target_codes = set([c for c in holding.keys() if c])
     if include_all_balances:
@@ -1002,7 +1036,9 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
         holding.pop(code, None)
     save_state(holding, {})
 
+
 # === [ANCHOR: EXIT] 동적 트레일링/TP + 손절 ===
+
 def _adaptive_exit(
     kis: KisAPI, code: str, pos: Dict[str, Any], regime_mode: str = "neutral"
 ) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
@@ -1105,7 +1141,9 @@ def _adaptive_exit(
 
     return None, None, None, None
 
+
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
+
 def main():
     kis = KisAPI()
 
@@ -1518,6 +1556,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("[🛑 수동 종료]")
 
+
 # 실행부
 if __name__ == "__main__":
     main()
+
