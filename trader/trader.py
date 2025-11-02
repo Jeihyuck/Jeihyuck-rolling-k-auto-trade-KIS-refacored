@@ -599,8 +599,9 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     trade_logged = False
 
     try:
-        if hasattr(kis, "buy_stock_limit") and order_price and order_price > 0:
-            result_limit = _with_retry(kis.buy_stock_limit, code, qty, int(order_price))
+        # [PATCH] 예수금/과매수 방지: 가드형 지정가 사용
+        if hasattr(kis, "buy_stock_limit_guarded") and order_price and order_price > 0:  # [PATCH]
+            result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price))  # [PATCH]
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
             time.sleep(2.0)
             filled = False
@@ -656,7 +657,10 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
 
     # --- 시장가 Fallback ---
     try:
-        if hasattr(kis, "buy_stock_market"):
+        # [PATCH] 예수금/과매수 방지: 가드형 시장가 사용
+        if hasattr(kis, "buy_stock_market_guarded"):  # [PATCH]
+            result_mkt = _with_retry(kis.buy_stock_market_guarded, code, qty)  # [PATCH]
+        elif hasattr(kis, "buy_stock_market"):
             result_mkt = _with_retry(kis.buy_stock_market, code, qty)
         else:
             result_mkt = _with_retry(kis.buy_stock, code, qty)
@@ -1472,3 +1476,4 @@ def main():
 # 실행부
 if __name__ == "__main__":
     main()
+
