@@ -106,6 +106,51 @@ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 ALLOW_WHEN_CLOSED = os.getenv("MARKET_DATA_WHEN_CLOSED", "false").lower() == "true"
 
+# === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+
+def _this_iso_week_key(now=None):
+    now = now or datetime.now(KST)
+    return f"{now.year}-W{now.isocalendar().week:02d}"
+
+def _read_last_weekly():
+    if not STATE_WEEKLY_PATH.exists():
+        return None
+    try:
+        return (json.loads(STATE_WEEKLY_PATH.read_text(encoding="utf-8"))).get("weekly_rebalanced_at")
+    except Exception:
+        return None
+
+def _write_last_weekly(now=None):
+    now = now or datetime.now(KST)
+    try:
+        STATE_WEEKLY_PATH.write_text(
+            json.dumps({"weekly_rebalanced_at": _this_iso_week_key(now)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"[STATE_WRITE_FAIL] weekly: {e}")
+
+def should_weekly_rebalance_now(now=None):
+    """
+    규칙:
+      - 이번 주에 아직 리밸런싱 기록이 없으면 True
+      - FORCE_WEEKLY_REBALANCE=1 이면 시간/요일 무시하고 True (단 1회)
+    """
+    now = now or datetime.now(KST)
+    force = os.getenv("FORCE_WEEKLY_REBALANCE", "0") == "1"
+    last = _read_last_weekly()
+    cur = _this_iso_week_key(now)
+    if force:
+        logger.info("[REBALANCE] FORCE_WEEKLY_REBALANCE=1 → 주간 리밸런싱 강제 트리거")
+        return True
+    if last != cur:
+        return True
+    return False
+
+def stamp_weekly_done(now=None):
+    _write_last_weekly(now)
+
 def get_rebalance_anchor_date() -> str:
     today = datetime.now(KST).date()
     if REBALANCE_ANCHOR == "weekly":
@@ -1088,10 +1133,34 @@ def main():
     holding, traded = load_state()
     logger.info(f"[상태복구] holding: {list(holding.keys())}, traded: {list(traded.keys())}")
 
-    # 리밸런싱 대상 종목 추출
-    targets = fetch_rebalancing_targets(rebalance_date)
+    # === [NEW] 주간 리밸런싱 강제/중복 방지 ===
+    targets: List[Dict[str, Any]] = []
+    if REBALANCE_ANCHOR == "weekly":
+        if should_weekly_rebalance_now():
+            targets = fetch_rebalancing_targets(rebalance_date)
+            # 중복 실행 방지를 위해 즉시 스탬프(필요 시 FORCE로 재실행 가능)
+            stamp_weekly_done()
+            logger.info(f"[REBALANCE] 이번 주 리밸런싱 실행 기록 저장({_this_iso_week_key()})")
+        else:
+            logger.info("[REBALANCE] 이번 주 이미 실행됨 → 신규 리밸런싱 생략 (보유 관리만)")
+    else:
+        # today/monthly 등 다른 앵커 모드는 기존 방식으로 바로 호출
+        targets = fetch_rebalancing_targets(rebalance_date)
 
-    # 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
+    # === [NEW] 예산 가드: 예수금이 0/부족이면 신규 매수만 스킵 ===
+    can_buy = True
+    try:
+        cash = kis.get_cash_available_today()
+        logger.info(f"[BUDGET] today cash available = {cash:,} KRW")
+        if cash <= 0:
+            can_buy = False
+            logger.warning("[BUDGET] 가용현금 0 → 신규 매수 스킵(보유 관리만 수행)")
+    except Exception as e:
+        logger.error(f"[BUDGET_FAIL] 예수금 조회 실패: {e}")
+        # 실패 시에는 일단 보수적으로 신규매수 스킵
+        can_buy = False
+
+    # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
     processed_targets: Dict[str, Any] = {}
     for t in targets:
         code = t.get("stock_code") or t.get("code")
@@ -1220,8 +1289,12 @@ def main():
                         "strategy": strategy,
                     }
 
-                    # --- 매수 --- (돌파 진입 + 슬리피지 가드)
+                    # --- 매수 --- (돌파 진입 + 슬리피지 가드 + 예산 가드)
                     if is_open and code not in holding and code not in traded:
+                        if not can_buy:
+                            logger.info(f"[BUDGET_SKIP] {code}: 예산 없음 → 신규 매수 스킵")
+                            continue
+
                         enter_cond = (
                             current_price is not None and
                             eff_target_price is not None and
@@ -1476,4 +1549,3 @@ def main():
 # 실행부
 if __name__ == "__main__":
     main()
-
