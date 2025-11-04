@@ -4,10 +4,7 @@
 # - 토큰 캐시
 # - 시세/일봉/ATR
 # - 잔고/주문
-# - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
-# - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
-# - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
-# - ✅ 잔고 페이징(ctx_area_*), empty 순간응답 디바운스
+# - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt)
 
 import os
 import json
@@ -186,8 +183,6 @@ class KisAPI:
         self._recent_sells_lock = threading.Lock()
         self._recent_sells_cooldown = 60.0
 
-        self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
-
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
 
@@ -264,7 +259,9 @@ class KisAPI:
         return h
 
     def refresh_token(self):
-        """강제 토큰 재발급: 주문 실패 등에서 재시도 전에 호출."""
+        """
+        강제 토큰 재발급: 주문 실패 등에서 재시도 전에 호출.
+        """
         try:
             with KisAPI._token_lock:
                 KisAPI._token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
@@ -304,7 +301,7 @@ class KisAPI:
         """
         당일 매수 가능 예수금(가용현금) 반환.
         ✅ output2.ord_psbl_cash → nrcvb_buy_amt → dnca_tot_amt 순으로 파싱.
-        실패/0원 시 최근 조회값 캐시 사용.
+        음수/파싱 실패 시 0으로 클램프.
         """
         try:
             cash = self.get_cash_balance()
@@ -314,10 +311,13 @@ class KisAPI:
             return cash
         except Exception as e:
             logger.error(f"[CASH_QUERY_FAIL] 예수금 조회 실패: {e}")
-            return int(self._last_cash or 0)
+            return 0
 
     def _estimate_buy_cost(self, price: float, qty: int, fee_pct: float = 0.00015, tax_pct: float = 0.0) -> int:
-        """매수 예상금액(수수료/세금 포함, 반올림)."""
+        """
+        매수 예상금액(수수료/세금 포함, 반올림).
+        KOSDAQ 현물은 보통 매수 시 거래세 없음 → tax_pct=0.0 유지.
+        """
         try:
             price = float(price)
         except Exception:
@@ -347,6 +347,7 @@ class KisAPI:
         if cash <= 0:
             return 0
 
+        # 빠른 상한선
         try:
             max_qty = int(cash // price)
         except Exception:
@@ -355,6 +356,7 @@ class KisAPI:
         if max_qty <= 0:
             return 0
 
+        # 수수료/세금 포함 안전 이진 탐색
         lo, hi = 0, max_qty
         while lo < hi:
             mid = (lo + hi + 1) // 2
@@ -365,55 +367,36 @@ class KisAPI:
                 hi = mid - 1
         return lo
 
-    # === 시세 ===
-    def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Optional[float]:
-        """단일 TR/마켓/코드 조합으로 현재가 1회 조회(성공시 float 반환, 실패/0원시 None)."""
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = self._headers(tr_id)
-        params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-        try:
-            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
-            data = resp.json()
-        except Exception as e:
-            logger.debug("[PRICE_ONCE_EX] %s/%s %s → %s", market_div, code_fmt, tr_id, e)
-            return None
-
-        if "초당 거래건수" in (data.get("msg1") or ""):
-            return None
-        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-            try:
-                px = float(data["output"].get("stck_prpr") or 0)
-                return px if px > 0 else None
-            except Exception:
-                return None
-        return None
-
-    def get_last_price(self, code: str, *, attempts: int = 2) -> float:
-        """
-        견고한 현재가 조회:
-        - J/U 교차 + 'A' 접두/무접두 교차
-        - 0원/실패 시 지수 백오프 후 재시도
-        """
-        c = safe_strip(code)
-        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-        markets = ("J", "U")
-        tr_list = _pick_tr(self.env, "PRICE")
-        for round_i in range(attempts):
-            for tr in tr_list:
-                for m in markets:
-                    for cf in code_variants:
-                        px = self._inquire_price_once(tr, m, cf)
-                        if px and px > 0:
-                            return px
-            # 백오프 후 재시도
-            time.sleep(0.6 * (1.5 ** round_i) + random.uniform(0, 0.2))
-        raise RuntimeError(f"invalid last price 0 for {code}")
-
+    # === 시세/호가/시초가 ===
     def get_current_price(self, code: str) -> float:
-        """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
-        return self.get_last_price(code)
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        self._limiter.wait("quotes")
+        tried = []
+        for tr in _pick_tr(self.env, "PRICE"):
+            headers = self._headers(tr)
+            markets = ["J", "U"]
+            c = code.strip()
+            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+            for market_div in markets:
+                for code_fmt in codes:
+                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                    try:
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        data = resp.json()
+                    except Exception as e:
+                        tried.append((market_div, code_fmt, f"EXC:{e}"))
+                        continue
+                    tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
+                    if "초당 거래건수" in (data.get("msg1") or ""):
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+                        continue
+                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        try:
+                            return float(data["output"].get("stck_prpr"))
+                        except Exception:
+                            pass
+        raise Exception(f"현재가 조회 실패({code}): tried={tried}")
 
-    # --- 시초가 캐시 ---
     def _get_cached_today_open(self, code: str) -> Optional[float]:
         try:
             op, ts = self._today_open_cache.get(code, (None, 0.0))
@@ -432,19 +415,24 @@ class KisAPI:
 
     def get_today_open(self, code: str) -> Optional[float]:
         """
-        오늘 시초가(09:00 기준).
-        1순위: inquire-price stck_oprc
+        오늘 시초가(09:00 기준)를 반환한다.
+        1순위: 실시간 스냅샷(inquire-price)의 stck_oprc
+        2순위: (옵션) 분봉 첫 캔들 등 보조 수단
         """
+        code = safe_strip(code)
+        # 0) 캐시
         cached = self._get_cached_today_open(code)
         if cached:
             return cached
 
+        # 1) 스냅샷에서 stck_oprc
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         self._limiter.wait("quotes-open")
+        tried = []
         for tr in _pick_tr(self.env, "PRICE"):
             headers = self._headers(tr)
             markets = ["J", "U"]
-            c = safe_strip(code)
+            c = code
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
                 for code_fmt in codes:
@@ -452,8 +440,10 @@ class KisAPI:
                     try:
                         resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
-                    except Exception:
+                    except Exception as e:
+                        tried.append((market_div, code_fmt, f"EXC:{e}"))
                         continue
+                    tried.append((market_div, code_fmt, data.get("rt_cd"), data.get("msg1")))
                     if "초당 거래건수" in (data.get("msg1") or ""):
                         time.sleep(0.35 + random.uniform(0, 0.15))
                         continue
@@ -466,6 +456,7 @@ class KisAPI:
                                 return op
                         except Exception:
                             pass
+        # 2) (옵션) 시간체결/분봉 첫 캔들 보조 → 필요 시 구현
         return None
 
     def get_orderbook_strength(self, code: str) -> Optional[float]:
@@ -642,20 +633,25 @@ class KisAPI:
 
     # ===== 보조 시세/지수/스냅샷 =====
     def get_close_price(self, code: str) -> Optional[float]:
-        """최근 일봉 종가(전일 또는 당일 종가) → 실패 시 현재가 폴백."""
+        """
+        최근 일봉의 종가(전일 또는 당일 종가)를 반환.
+        """
         try:
             candles = self.get_daily_candles(code, count=30)
             if candles:
                 return float(candles[-1]["close"])
         except Exception as e:
             logger.warning(f"[get_close_price] fail {code}: {e}")
+        # 스냅샷 fallback
         try:
-            return float(self.get_last_price(code))
+            return float(self.get_current_price(code))
         except Exception:
             return None
 
     def get_prev_close(self, code: str) -> Optional[float]:
-        """전일 종가."""
+        """
+        전일 종가(일봉 마지막-1)를 반환.
+        """
         try:
             candles = self.get_daily_candles(code, count=30)
             if len(candles) >= 2:
@@ -671,13 +667,12 @@ class KisAPI:
         """
         out: Dict[str, Any] = {}
         try:
-            out["tp"] = float(self.get_last_price(code))
+            out["tp"] = float(self.get_current_price(code))
         except Exception:
             out["tp"] = None
         try:
-            ask = self.get_best_ask(code); bid = self.get_best_bid(code)
-            out["ap"] = float(ask) if ask is not None else None
-            out["bp"] = float(bid) if bid is not None else None
+            out["ap"] = float(self.get_best_ask(code)) if self.get_best_ask(code) is not None else None
+            out["bp"] = float(self.get_best_bid(code)) if self.get_best_bid(code) is not None else None
         except Exception:
             out["ap"], out["bp"] = None, None
         out["close"] = out.get("tp")
@@ -732,8 +727,16 @@ class KisAPI:
         return None
 
     def get_index_quote(self, index_code: str) -> Dict[str, Optional[float]]:
-        """(간이) 지수 스냅샷 placeholder."""
-        return {"price": None, "prev_close": None, "vwap": None}
+        """
+        (간이) 지수 스냅샷. KIS 인덱스 TR을 쓰지 않고, 현재는 빈 값 위주로 반환.
+        필요 시 별도 인덱스 조회 TR로 교체 가능.
+        """
+        # 최소한의 필드만 제공(레짐 로직이 None을 안전 처리함)
+        return {
+            "price": None,
+            "prev_close": None,
+            "vwap": None,
+        }
 
     # ----- 잔고/포지션 -----
     def _parse_cash_from_output2(self, out2: Any) -> int:
@@ -752,6 +755,7 @@ class KisAPI:
             except Exception:
                 return 0
 
+        # output2 가 배열/단일 모두 지원
         row = None
         if isinstance(out2, list) and out2:
             row = out2[0]
@@ -772,106 +776,76 @@ class KisAPI:
 
         return cash
 
-    def _inquire_balance_page(self, fk: str, nk: str) -> dict:
-        """잔고 1페이지 호출(예외는 상위에서 처리)."""
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-        tr_list = _pick_tr(self.env, "BALANCE")
-        if not tr_list:
-            raise RuntimeError("BALANCE TR 미구성")
-        tr = tr_list[0]
-        headers = self._headers(tr)
-        params = {
-            "CANO": self.CANO,
-            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-            "AFHR_FLPR_YN": "N",
-            "UNPR_YN": "N",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "01",
-            "OFL_YN": "N",
-            "INQR_DVSN": "02",
-            "CTX_AREA_FK100": fk,
-            "CTX_AREA_NK100": nk,
-        }
-        logger.info(f"[잔고조회 요청파라미터] {params}")
-        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
-        return resp.json()
-
-    def inquire_balance_all(self, *, max_empty_retry: int = 2) -> dict:
-        """
-        ✅ 페이징/디바운스 적용 잔고 전체 조회
-        반환: {'output1': [...], 'output2': {...}, 'ctx_area_fk100': '...', 'ctx_area_nk100': '...'}
-        """
-        fk = nk = ""
-        all_rows: List[dict] = []
-        out2_last = None
-        empty_cnt = 0
-        while True:
-            try:
-                j = self._inquire_balance_page(fk, nk)
-            except Exception as e:
-                logger.error("[잔고조회 예외] %s", e)
-                if empty_cnt < max_empty_retry:
-                    empty_cnt += 1
-                    time.sleep(0.7)
-                    continue
-                break
-
-            logger.info(f"[잔고조회 응답] {j}")
-
-            rows = j.get("output1") or []
-            if not rows:
-                empty_cnt += 1
-                if empty_cnt <= max_empty_retry:
-                    time.sleep(0.6)
-                    continue
-                else:
-                    break
-            empty_cnt = 0
-            all_rows.extend(rows)
-            if j.get("output2") is not None:
-                out2_last = j.get("output2")
-
-            fk = (j.get("ctx_area_fk100") or "").strip()
-            nk = (j.get("ctx_area_nk100") or "").strip()
-            if not fk and not nk:
-                break
-
-        return {"output1": all_rows, "output2": out2_last, "ctx_area_fk100": fk, "ctx_area_nk100": nk}
-
     def get_cash_balance(self) -> int:
         """
         ✅ 예수금: output2.ord_psbl_cash 우선.
-        실패/0원 시 최근 캐시(self._last_cash) 폴백.
+        실패 시 0 반환.
         """
-        try:
-            j = self.inquire_balance_all()
-            out2 = j.get("output2")
-            cash = self._parse_cash_from_output2(out2)
-            if cash > 0:
-                self._last_cash = cash
-                logger.info("[CASH_BALANCE_OK] ord_psbl_cash≈%s원", f"{cash:,}")
-                return cash
-            # 0원이면 캐시 폴백
-            if self._last_cash is not None and self._last_cash > 0:
-                logger.warning("[CASH_FALLBACK] live=0 → use last=%s", f"{self._last_cash:,}")
-                return self._last_cash
-        except Exception as e:
-            logger.error(f"[CASH_BALANCE_FAIL] {e}")
-            if self._last_cash is not None and self._last_cash > 0:
-                logger.warning("[CASH_FALLBACK] netfail → use last=%s", f"{self._last_cash:,}")
-                return self._last_cash
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        for tr in _pick_tr(self.env, "BALANCE"):
+            headers = self._headers(tr)
+            params = {
+                "CANO": self.CANO,
+                "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+                "AFHR_FLPR_YN": "N",
+                "UNPR_YN": "N",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "OFL_YN": "N",
+                "INQR_DVSN": "02",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            logger.info(f"[잔고조회 요청파라미터] {params}")
+            try:
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                j = resp.json()
+            except Exception as e:
+                logger.error(f"[잔고조회 예외] {e}")
+                continue
+
+            logger.info(f"[잔고조회 응답] {j}")
+
+            if j.get("rt_cd") == "0" and j.get("output2") is not None:
+                try:
+                    cash = self._parse_cash_from_output2(j.get("output2"))
+                    logger.info("[CASH_BALANCE_OK] ord_psbl_cash≈%s원", f"{cash:,}")
+                    return cash
+                except Exception as e:
+                    logger.error(f"[CASH_BALANCE_PARSE_FAIL] {e}")
+                    continue
+
+        logger.error("[CASH_BALANCE_FAIL] 모든 TR 실패")
         return 0
 
     def get_positions(self) -> List[Dict]:
-        """보유 종목 전체(페이징 병합)."""
-        try:
-            j = self.inquire_balance_all()
-            return j.get("output1") or []
-        except Exception as e:
-            logger.error("[GET_POSITIONS_FAIL] %s", e)
-            return []
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        for tr in _pick_tr(self.env, "BALANCE"):
+            headers = self._headers(tr)
+            params = {
+                "CANO": self.CANO,
+                "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+                "AFHR_FLPR_YN": "N",
+                "UNPR_YN": "N",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "OFL_YN": "N",
+                "INQR_DVSN": "02",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            try:
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
+                j = resp.json()
+            except Exception:
+                continue
+            if j.get("rt_cd") == "0" and j.get("output1") is not None:
+                return j.get("output1") or []
+        return []
 
     def get_balance_map(self) -> Dict[str, int]:
         pos = self.get_positions()
@@ -967,7 +941,7 @@ class KisAPI:
                                     price_for_fill = float(ord_unpr)
                                 else:
                                     try:
-                                        price_for_fill = float(self.get_last_price(pdno))
+                                        price_for_fill = float(self.get_current_price(pdno))
                                     except Exception:
                                         price_for_fill = 0.0
                             except Exception:
@@ -1179,7 +1153,7 @@ class KisAPI:
 
         # 기준가격: 지정가와 현재가 중 더 보수적인 값 사용(더 높은 값)
         try:
-            cur = self.get_last_price(code)
+            cur = self.get_current_price(code)
             ref_px = float(cur) if cur is not None else None
         except Exception:
             ref_px = None
@@ -1200,15 +1174,18 @@ class KisAPI:
         """
         시장가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
         """
+        # 기준가격: 현재가 → 실패 시 스냅샷 근사
         try:
-            cur = self.get_last_price(code)
+            cur = self.get_current_price(code)
             ref_px = float(cur) if cur is not None else 0.0
         except Exception:
             ref_px = 0.0
-
         if ref_px <= 0:
-            snap = self.get_quote_snapshot(code)
-            ref_px = float(snap.get("tp") or 0.0)
+            try:
+                snap = self.get_quote_snapshot(code)
+                ref_px = float(snap.get("tp") or snap.get("trade_price") or snap.get("prpr") or 0.0)
+            except Exception:
+                ref_px = 0.0
 
         adj_qty = self.affordable_qty(code, ref_px, qty)
         if adj_qty <= 0:
@@ -1222,21 +1199,33 @@ class KisAPI:
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
-        """기존 코드 호환용."""
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매수
+        - price 지정 → 지정가 매수
+        """
         if price is None:
             return self.buy_stock_market(code, qty)
         return self.buy_stock_limit(code, qty, price)
 
     def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
-        """기존 코드 호환용."""
+        """
+        기존 코드 호환용:
+        - price 가 None → 시장가 매도
+        - price 지정 → 지정가 매도
+        """
         if price is None:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
 
     # ===== 주문 후 확인/보조 =====
     def check_filled(self, order_resp: Optional[dict]) -> bool:
-        """간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주."""
+        """
+        간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주.
+        (실전 체결조회 TR로 대체 가능)
+        """
         try:
             return bool(order_resp and isinstance(order_resp, dict) and order_resp.get("rt_cd") == "0")
         except Exception:
             return False
+

@@ -1,652 +1,395 @@
-import os
+# -*- coding: utf-8 -*-
+# report_ceo.py — 거래 요약/리포트 생성(로컬 로그 기반)
+
+from __future__ import annotations
+
 import json
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import math
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
-LOG_DIR = Path(__file__).parent / "logs"
-REPORT_DIR = Path(__file__).parent / "reports"
-REPORT_DIR.mkdir(exist_ok=True)
+import logging
 
-# ===== [NEW] 잔고 조회 유틸 =====
-def fetch_balances(date: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """
-    1) KisAPI가 있으면 실시간 잔고 조회
-    2) 실패/미존재 시 reports/balances_YYYYMMDD.json 폴백(선택)
-       - 운영 중 balances 덤프를 저장하고 싶다면 별도 작업에서 파일로 저장해두면 됨.
-    반환 형식(표준화):
-      [
-        {
-          'pdno': 종목코드(str),
-          'prdt_name': 종목명(str),
-          'hldg_qty': 보유수량(int),
-          'pchs_avg_pric': 평균매입가(float),
-          'prpr': 현재가(float)
-        }, ...
-      ]
-    """
-    # 1) 실시간 조회 시도
+logger = logging.getLogger(__name__)
+
+KST = ZoneInfo("Asia/Seoul")
+BASE_DIR = Path(__file__).parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 데이터 구조
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TradeRow:
+    dt: datetime
+    code: str
+    side: str                 # BUY / SELL
+    qty: int
+    price: Optional[float]    # 'price' or 'fill_price'
+    order_price: Optional[float]
+    pnl_pct: Optional[float]
+    profit: Optional[float]   # 원화 손익 (가능 시)
+    name: Optional[str] = None
+    reason: Optional[str] = None
+    raw: Dict[str, Any] = None
+
+@dataclass
+class CodeAgg:
+    code: str
+    name: Optional[str]
+    buy_qty: int = 0
+    sell_qty: int = 0
+    gross_profit: float = 0.0
+    wins: int = 0
+    losses: int = 0
+    last_reason: Optional[str] = None
+
+@dataclass
+class SummaryAgg:
+    n_trades: int = 0
+    n_buy: int = 0
+    n_sell: int = 0
+    wins: int = 0
+    losses: int = 0
+    gross_profit: float = 0.0
+    avg_pnl_pct: Optional[float] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_trade_line(line: str) -> Optional[Dict[str, Any]]:
     try:
-        from .kis_wrapper import KisAPI
-        kis = KisAPI()
-        res = None
-        if hasattr(kis, "get_balance_all"):
-            res = kis.get_balance_all()
-        elif hasattr(kis, "get_balance"):
-            res = kis.get_balance()
-
-        if isinstance(res, dict):
-            pos = res.get("positions") or []
-        elif isinstance(res, list):
-            pos = res
-        else:
-            pos = []
-
-        out = []
-        for b in pos:
-            code = str(b.get("pdno") or b.get("code") or "")
-            if not code:
-                continue
-            name = b.get("prdt_name") or b.get("name")
-            qty = _to_int(b.get("hldg_qty", 0))
-            avg = _to_float(b.get("pchs_avg_pric") or b.get("avg_price") or 0.0, 0.0)
-            cur = _to_float(
-                b.get("prpr") or b.get("now_price") or b.get("eval_pric") or 0.0,
-                0.0
-            )
-            out.append({
-                "pdno": code,
-                "prdt_name": name,
-                "hldg_qty": qty,
-                "pchs_avg_pric": avg,
-                "prpr": cur,
-            })
-        # prpr(현재가)가 비어있는 경우가 있으면 평균매입가로 대체(보수적)
-        for r in out:
-            if not r["prpr"] or r["prpr"] <= 0:
-                r["prpr"] = r["pchs_avg_pric"] or 0.0
-        if out:
-            return out
+        return json.loads(line)
     except Exception:
-        pass
-
-    # 2) 파일 폴백(선택)
-    try:
-        if not date:
-            date = datetime.now()
-        fallback = REPORT_DIR / f"balances_{date.strftime('%Y%m%d')}.json"
-        if fallback.exists():
-            with open(fallback, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            out = []
-            for b in raw:
-                out.append({
-                    "pdno": str(b.get("pdno") or b.get("code") or ""),
-                    "prdt_name": b.get("prdt_name") or b.get("name"),
-                    "hldg_qty": _to_int(b.get("hldg_qty", 0)),
-                    "pchs_avg_pric": _to_float(b.get("pchs_avg_pric") or b.get("avg_price") or 0.0, 0.0),
-                    "prpr": _to_float(b.get("prpr") or b.get("now_price") or 0.0, 0.0),
-                })
-            for r in out:
-                if not r["prpr"] or r["prpr"] <= 0:
-                    r["prpr"] = r["pchs_avg_pric"] or 0.0
-            return out
-    except Exception:
-        pass
-
-    return []
-
-
-def load_trades(date: datetime) -> List[dict]:
-    log_file = LOG_DIR / f"trades_{date.strftime('%Y-%m-%d')}.json"
-    trades = []
-    if log_file.exists():
-        with open(log_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    trades.append(json.loads(line))
-                except Exception:
-                    continue
-    return trades
-
-
-def is_market_open(date: datetime) -> bool:
-    # 한국 기준 평일 09:00~15:30
-    if date.weekday() >= 5:
-        return False
-    open_time = date.replace(hour=9, minute=0, second=0, microsecond=0)
-    close_time = date.replace(hour=15, minute=30, second=0, microsecond=0)
-    return open_time <= date <= close_time
-
-
-def _to_native(val):
-    """pandas / numpy 타입을 순수 python 타입으로 변환 (JSON 직렬화 안전)"""
-    if pd.isna(val):
         return None
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return float(val)
-    if isinstance(val, (np.bool_, bool)):
-        return bool(val)
-    if isinstance(val, (pd.Timestamp, datetime)):
-        try:
-            return val.isoformat()
-        except Exception:
-            return str(val)
-    return val
 
-
-def _pct_int(x: Optional[float]) -> str:
-    """정수 % 문자열 (None→'0%')"""
-    if x is None:
-        return "0%"
+def _to_float(x: Any) -> Optional[float]:
     try:
-        return f"{int(round(x))}%"
+        if x is None:
+            return None
+        f = float(x)
+        if math.isnan(f):
+            return None
+        return f
     except Exception:
-        return "0%"
+        return None
 
-
-def _strategy_desc() -> Dict[str, str]:
-    return {
-        "운영K": "종목별 전월 rolling-K 최적값(RK-Max) 자동 적용",
-        "리밸런싱방식": "월초 후보군 산출(필요 시 강제편입 포함), 장중 목표가 돌파 시 실시간 진입",
-        "매수기준": "목표가(전일 종가 + K×(고가−저가)) 이상 돌파 시 진입",
-        "매도기준": (
-            "TP1/TP2 분할익절, 트레일링 스탑(고점 대비 하락), "
-            "FAST_STOP(진입 5분 내 -1%), ATR_STOP(1.5×ATR), "
-            "TIME_STOP(예: 13:00 손실 지속 시 청산), "
-            "커트오프/장마감 강제 전량매도"
-        ),
-    }
-
-
-def _env_runtime_params() -> Dict[str, Any]:
-    def _g(name: str, default: Optional[str] = None) -> Optional[str]:
-        v = os.getenv(name, default)
-        return v if v is not None else default
-
-    return {
-        "PARTIAL1": _g("PARTIAL1", "0.5"),
-        "PARTIAL2": _g("PARTIAL2", "0.3"),
-        "TRAIL_PCT": _g("TRAIL_PCT", "0.02"),
-        "FAST_STOP": _g("FAST_STOP", "0.01"),
-        "ATR_STOP": _g("ATR_STOP", "1.5"),
-        "TIME_STOP_HHMM": _g("TIME_STOP_HHMM", "13:00"),
-        "SELL_FORCE_TIME": _g("SELL_FORCE_TIME", "15:20"),
-        "DAILY_CAPITAL": _g("DAILY_CAPITAL", None),
-        "SLIPPAGE_ENTER_GUARD_PCT": _g("SLIPPAGE_ENTER_GUARD_PCT", "2.5"),
-    }
-
-# ===== [NEW] 포트폴리오 평가손익 계산 =====
-def compute_portfolio_eval(balances: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    balances 표준화 입력을 받아 포트폴리오 평가손익을 계산.
-    반환:
-      {
-        "원가합": int,              # 총취득가(= 평균매입가*수량 합)
-        "평가금액": int,            # 현재가*수량 합
-        "평가손익": int,            # 평가금액 - 원가합
-        "평가수익률": float,        # 평가손익 / 원가합 * 100
-        "보유상세": [ ... ],        # 종목별 평가 테이블
-        "보유TOP": [ ... ],         # 평가수익률 상위 5
-        "보유WORST": [ ... ]        # 평가수익률 하위 3
-      }
-    """
-    rows = []
-    total_cost = 0
-    total_eval = 0
-
-    for b in balances:
-        code = str(b.get("pdno") or "")
-        name = b.get("prdt_name")
-        qty = _to_int(b.get("hldg_qty", 0))
-        avg = _to_float(b.get("pchs_avg_pric") or 0.0, 0.0)
-        cur = _to_float(b.get("prpr") or 0.0, 0.0)
-
-        if qty <= 0 or not code:
-            continue
-
-        cost = avg * qty
-        eval_amt = cur * qty
-        pnl = eval_amt - cost
-        pnl_pct = ((cur - avg) / avg * 100.0) if avg > 0 else 0.0
-
-        total_cost += cost
-        total_eval += eval_amt
-
-        rows.append({
-            "종목명": name,
-            "코드": code,
-            "보유수량": int(qty),
-            "평균매입가": float(round(avg, 2)),
-            "현재가": float(round(cur, 2)),
-            "평가금액": int(round(eval_amt)),
-            "보유원가": int(round(cost)),
-            "평가손익": int(round(pnl)),
-            "평가수익률": float(round(pnl_pct, 2)),
-        })
-
-    rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
-        "종목명","코드","보유수량","평균매입가","현재가","평가금액","보유원가","평가손익","평가수익률"
-    ])
-
-    if total_cost > 0:
-        total_pnl = int(round(total_eval - total_cost))
-        total_pct = ((total_eval - total_cost) / total_cost) * 100.0
-    else:
-        total_pnl = 0
-        total_pct = 0.0
-
-    # TOP/WORST
-    top = []
-    worst = []
-    if not rows_df.empty:
-        top_df = rows_df.sort_values("평가수익률", ascending=False).head(5)
-        worst_df = rows_df.sort_values("평가수익률", ascending=True).head(3)
-        top = [
-            {
-                "종목명": _to_native(r["종목명"]),
-                "코드": _to_native(r["코드"]),
-                "평가수익률": f"{_to_native(r['평가수익률']):.2f}%",
-                "평가손익": f"{_to_native(r['평가손익']):,}원",
-            } for _, r in top_df.iterrows()
-        ]
-        worst = [
-            {
-                "종목명": _to_native(r["종목명"]),
-                "코드": _to_native(r["코드"]),
-                "평가수익률": f"{_to_native(r['평가수익률']):.2f}%",
-                "평가손익": f"{_to_native(r['평가손익']):,}원",
-            } for _, r in worst_df.iterrows()
-        ]
-
-    # 보유상세 -> 네이티브
-    detail = []
-    for _, r in rows_df.iterrows():
-        detail.append({
-            "종목명": _to_native(r["종목명"]),
-            "코드": _to_native(r["코드"]),
-            "보유수량": _to_native(r["보유수량"]),
-            "평균매입가": _to_native(r["평균매입가"]),
-            "현재가": _to_native(r["현재가"]),
-            "평가금액": _to_native(r["평가금액"]),
-            "보유원가": _to_native(r["보유원가"]),
-            "평가손익": _to_native(r["평가손익"]),
-            "평가수익률": f"{_to_native(r['평가수익률']):.2f}%"
-        })
-
-    return {
-        "원가합": int(round(total_cost)),
-        "평가금액": int(round(total_eval)),
-        "평가손익": int(round(total_pnl)),
-        "평가수익률": float(round(total_pct, 2)),
-        "보유상세": detail,
-        "보유TOP": top,
-        "보유WORST": worst,
-    }
-
-
-def ceo_report(date: Optional[datetime] = None, period: str = "daily") -> Dict[str, Any]:
-    if not date:
-        date = datetime.now()
-
-    if period == "daily":
-        trade_days = [date]
-        title = f"{date.strftime('%Y-%m-%d')} Rolling K 실전 리포트 (일간)"
-    elif period == "weekly":
-        week_start = date - timedelta(days=date.weekday())
-        trade_days = [week_start + timedelta(days=i) for i in range(7)]
-        title = f"{week_start.strftime('%Y-%m-%d')}~{(week_start + timedelta(days=6)).strftime('%Y-%m-%d')} Rolling K 리포트 (주간)"
-    elif period == "monthly":
-        month_start = date.replace(day=1)
-        next_month = (month_start + timedelta(days=32)).replace(day=1)
-        trade_days = [month_start + timedelta(days=i) for i in range((next_month - month_start).days)]
-        title = f"{month_start.strftime('%Y-%m')} Rolling K 리포트 (월간)"
-    else:
-        raise ValueError("period must be daily, weekly, monthly")
-
-    trades: List[dict] = []
-    for d in trade_days:
-        trades.extend(load_trades(d))
-
-    market_status = is_market_open(date)
-    runtime_params = _env_runtime_params()
-
-    # ===== [NEW] 보유잔고 가져와서 평가손익 집계 =====
-    balances = fetch_balances(date)
-    port_eval = compute_portfolio_eval(balances) if balances else {
-        "원가합": 0, "평가금액": 0, "평가손익": 0, "평가수익률": 0.0,
-        "보유상세": [], "보유TOP": [], "보유WORST": []
-    }
-
-    if not trades:
-        report_msg = "거래 내역 없음 (시장 미개장 또는 휴일/주말)" if not market_status else "거래 내역 없음 (장 열림/평일)"
-        리포트 = {
-            "title": title,
-            "msg": report_msg,
-            "전략설정": _strategy_desc(),
-            "운영파라미터": runtime_params,
-            "요약": {
-                "총투자금액(실현기준)": "0원",
-                "실현수익": "0원 (0%)",
-                "총평가금액": f"{port_eval['평가금액']:,}원",
-                "보유원가(총취득가)": f"{port_eval['원가합']:,}원",
-                "평가손익(미실현)": f"{port_eval['평가손익']:,}원 ({port_eval['평가수익률']:.2f}%)",
-                "총손익(실현+미실현)": f"{port_eval['평가손익']:,}원 (미실현)",
-                "총손익률(실현+미실현)": f"{port_eval['평가수익률']:.2f}%",
-            },
-            "보유수익TOP": port_eval["보유TOP"],
-            "보유상세": port_eval["보유상세"],
-            "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "market_open": market_status,
-            "거래세부내역": []
-        }
-        filename = f"ceo_report_{period}_{date.strftime('%Y-%m-%d')}.json"
-        with open(REPORT_DIR / filename, "w", encoding="utf-8") as f:
-            json.dump(리포트, f, indent=2, ensure_ascii=False)
-        return 리포트
-
-    # ========= 이하 기존 실현손익 로직 유지 =========
-    df = pd.DataFrame(trades)
-
-    # 필수 컬럼 보정
-    for col, default in [
-        ("side", None), ("code", None), ("name", None), ("qty", 0),
-        ("price", 0.0), ("amount", None), ("K", None), ("target_price", None),
-        ("strategy", None), ("result", None), ("reason", None),
-    ]:
-        if col not in df.columns:
-            df[col] = default
-
-    if df["amount"].isna().any():
-        df["amount"] = df.get("price", 0).fillna(0).astype(float) * df.get("qty", 0).fillna(0).astype(float)
-
-    # 타입 정규화
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0.0).astype(float)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-    df["K"] = pd.to_numeric(df["K"], errors="coerce")
-    df["target_price"] = pd.to_numeric(df["target_price"], errors="coerce")
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-
-    # 결과 컬럼 초기화
-    df["수익"] = 0
-    df["수익률"] = 0.0
-    df["매도단가"] = None
-    df["매도시간"] = None
-    df["청산사유"] = None
-
-    # 분리
-    buy_df = df[df["side"] == "BUY"].copy().sort_values("datetime")
-    sell_df = df[df["side"] == "SELL"].copy().sort_values("datetime")
-    sell_df["_matched"] = False
-
-    # 매수-매도 연결
-    for buy_idx, buy_row in buy_df.iterrows():
-        matched = False
-
-        # (1) 엄격: code + qty + 시간 + 체결가>0
-        candidates = sell_df[
-            (~sell_df["_matched"]) &
-            (sell_df["code"] == buy_row["code"]) &
-            (sell_df["qty"] == buy_row["qty"]) &
-            (sell_df["price"] > 0) &
-            (sell_df["datetime"] >= (buy_row["datetime"] if not pd.isna(buy_row["datetime"]) else pd.Timestamp.min))
-        ]
-        # (2) 완화: code + 시간 + 체결가>0
-        if candidates.shape[0] == 0:
-            candidates = sell_df[
-                (~sell_df["_matched"]) &
-                (sell_df["code"] == buy_row["code"]) &
-                (sell_df["price"] > 0) &
-                (sell_df["datetime"] >= (buy_row["datetime"] if not pd.isna(buy_row["datetime"]) else pd.Timestamp.min))
-            ]
-
-        if candidates.shape[0] > 0:
-            sidx = candidates.index[0]
-            sell_row = sell_df.loc[sidx]
-            sell_df.at[sidx, "_matched"] = True
-
-            sell_price = float(sell_row["price"]) or 0.0
-            buy_price = float(buy_row["price"]) or 0.0
-            qty = int(buy_row["qty"]) or 0
-
-            profit = int(round((sell_price - buy_price) * qty))
-            try:
-                profit_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price != 0 else 0.0
-            except Exception:
-                profit_pct = 0.0
-
-            df.loc[buy_idx, "매도단가"] = sell_price
-            df.loc[buy_idx, "매도시간"] = sell_row["datetime"]
-            df.loc[buy_idx, "수익"] = profit
-            df.loc[buy_idx, "수익률"] = float(profit_pct)
-
-            reason = sell_row.get("reason")
-            if pd.isna(reason) or reason in (None, "", "None"):
-                reason = sell_row.get("result")
-            df.loc[buy_idx, "청산사유"] = None if pd.isna(reason) else str(reason)
-            matched = True
-
-        if not matched:
-            continue
-
-    buy_trades = df[df["side"] == "BUY"].copy()
-
-    total_invest = int(buy_trades["amount"].sum()) if not buy_trades.empty else 0
-    total_pnl_realized = int(buy_trades["수익"].sum()) if not buy_trades.empty else 0
-    win_rate = (buy_trades["수익"] > 0).mean() * 100 if len(buy_trades) > 0 else 0.0
-    total_trade_count = int(len(df))
-    symbol_count = int(buy_trades["code"].nunique()) if not buy_trades.empty else 0
-
-    # MDD
-    mdd_str = "-"
+def _to_int(x: Any) -> int:
     try:
-        realized = buy_trades.dropna(subset=["매도시간"]).copy()
-        realized = realized.sort_values("매도시간")
-        equity = realized["수익"].cumsum()
-        if not equity.empty:
-            running_max = equity.cummax()
-            drawdown = equity - running_max
-            mdd_abs = int(drawdown.min())
-            if total_invest > 0:
-                mdd_pct = (mdd_abs / total_invest) * 100
-                mdd_str = f"{mdd_abs:,}원 ({int(round(mdd_pct))}%)"
+        i = int(float(x))
+        return i
+    except Exception:
+        return 0
+
+def _pick_price(obj: Dict[str, Any]) -> Optional[float]:
+    """
+    로그 포맷이 case-by-case라서, 우선순위로 체결가 후보를 고른다.
+    """
+    for k in ("fill_price", "price"):
+        v = _to_float(obj.get(k))
+        if v and v > 0:
+            return v
+    # 일부 result.output.prdt_price 경로
+    try:
+        v = _to_float(((obj.get("result") or {}).get("output") or {}).get("prdt_price"))
+        if v and v > 0:
+            return v
+    except Exception:
+        pass
+    return None
+
+def _collect_trade_rows(start_dt_kst: datetime, end_dt_kst: datetime) -> List[TradeRow]:
+    """
+    기간 내 trades_YYYY-MM-DD.json 파일들을 읽어 TradeRow 배열로 만든다.
+    """
+    rows: List[TradeRow] = []
+
+    d = start_dt_kst.date()
+    while d <= end_dt_kst.date():
+        fpath = LOG_DIR / f"trades_{d.strftime('%Y-%m-%d')}.json"
+        if fpath.exists():
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        rec = _parse_trade_line(line)
+                        if not rec or not isinstance(rec, dict):
+                            continue
+                        # 시간
+                        ts = rec.get("datetime") or rec.get("time") or rec.get("ts")
+                        try:
+                            dt = datetime.fromisoformat(ts) if isinstance(ts, str) else None
+                        except Exception:
+                            dt = None
+                        if dt is None:
+                            # 파일 날짜라도 사용
+                            dt = datetime(d.year, d.month, d.day, tzinfo=KST)
+                        elif dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=KST)
+
+                        if not (start_dt_kst <= dt <= end_dt_kst + timedelta(seconds=86399)):
+                            continue
+
+                        side = str(rec.get("side") or "").upper()
+                        if side not in ("BUY", "SELL"):
+                            continue
+
+                        code = str(rec.get("code") or "").strip()
+                        if not code:
+                            continue
+
+                        qty = _to_int(rec.get("qty"))
+                        name = rec.get("name")
+                        # 가격 후보
+                        price = _pick_price(rec)
+                        order_price = _to_float(rec.get("order_price"))
+                        pnl_pct = _to_float(rec.get("pnl_pct"))
+                        profit = _to_float(rec.get("profit"))
+                        reason = rec.get("reason")
+
+                        rows.append(
+                            TradeRow(
+                                dt=dt, code=code, side=side, qty=qty, price=price,
+                                order_price=order_price, pnl_pct=pnl_pct, profit=profit,
+                                name=name, reason=reason, raw=rec
+                            )
+                        )
+            except Exception as e:
+                logger.warning(f"[REPORT] 로그 파일 읽기 실패: {fpath.name} err={e}")
+        d += timedelta(days=1)
+
+    rows.sort(key=lambda r: (r.dt, r.code, r.side))
+    return rows
+
+def _aggregate(rows: List[TradeRow]) -> Tuple[SummaryAgg, Dict[str, CodeAgg]]:
+    summ = SummaryAgg()
+    by_code: Dict[str, CodeAgg] = {}
+    pnl_pct_accum = 0.0
+    pnl_pct_count = 0
+
+    for r in rows:
+        summ.n_trades += 1
+        if r.side == "BUY":
+            summ.n_buy += 1
+        elif r.side == "SELL":
+            summ.n_sell += 1
+
+        ca = by_code.get(r.code)
+        if ca is None:
+            ca = CodeAgg(code=r.code, name=r.name)
+            by_code[r.code] = ca
+
+        if r.side == "BUY":
+            ca.buy_qty += max(0, r.qty)
+        else:
+            ca.sell_qty += max(0, r.qty)
+
+        # 수익률 집계(가능 시)
+        if r.pnl_pct is not None:
+            pnl_pct_accum += r.pnl_pct
+            pnl_pct_count += 1
+
+        # 손익 집계: SELL 로그에 profit이 기록되는 경우가 많음.
+        realized = None
+        if r.side == "SELL":
+            if r.profit is not None:
+                realized = r.profit
             else:
-                mdd_str = f"{mdd_abs:,}원"
+                # 백업: price와 raw.buy_price가 있다면 계산해보지만
+                # 대부분의 케이스에서 매수평균이 로그에 없으므로 보수적으로 0 처리.
+                realized = None
+
+            if realized is not None:
+                summ.gross_profit += realized
+                ca.gross_profit += realized
+                if realized >= 0:
+                    summ.wins += 1
+                    ca.wins += 1
+                else:
+                    summ.losses += 1
+                    ca.losses += 1
+
+        ca.last_reason = r.reason or ca.last_reason
+
+    if pnl_pct_count > 0:
+        summ.avg_pnl_pct = round(pnl_pct_accum / pnl_pct_count, 2)
+    else:
+        summ.avg_pnl_pct = None
+
+    return summ, by_code
+
+def _period_range(base_dt_kst: datetime, period: str) -> Tuple[datetime, datetime]:
+    p = (period or "daily").lower()
+    if p == "weekly":
+        # 월요일~일요일 범위로 보고서(혹은 최근 7일): 여기선 최근 7일로 단순화
+        end_dt = base_dt_kst.replace(hour=23, minute=59, second=59, microsecond=0)
+        start_dt = (end_dt - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_dt, end_dt
+    if p == "monthly":
+        end_dt = base_dt_kst.replace(hour=23, minute=59, second=59, microsecond=0)
+        first_day = date(end_dt.year, end_dt.month, 1)
+        start_dt = datetime(first_day.year, first_day.month, first_day.day, tzinfo=KST)
+        return start_dt, end_dt
+    # daily
+    day = base_dt_kst.date()
+    start_dt = datetime(day.year, day.month, day.day, tzinfo=KST)
+    end_dt = start_dt.replace(hour=23, minute=59, second=59)
+    return start_dt, end_dt
+
+def _fmt_krw(v: Optional[float]) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"{int(round(v)):,.0f}원"
     except Exception:
-        mdd_str = "-"
+        return str(v)
 
-    top_win = buy_trades.sort_values("수익", ascending=False).head(5)
-    top_lose = buy_trades.sort_values("수익", ascending=True).head(3)
+def _mk_md_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    head = rows[0]
+    body = rows[1:]
+    md = "| " + " | ".join(head) + " |\n"
+    md += "| " + " | ".join(["---"] * len(head)) + " |\n"
+    for r in body:
+        md += "| " + " | ".join(r) + " |\n"
+    return md
 
-    # ===== RK-Max 지표 =====
-    k_series = pd.to_numeric(buy_trades["K"], errors="coerce").dropna()
-    k_summary = {
-        "평균": _to_native(round(k_series.mean(), 3)) if not k_series.empty else None,
-        "중앙": _to_native(round(k_series.median(), 3)) if not k_series.empty else None,
-        "최소": _to_native(round(k_series.min(), 3)) if not k_series.empty else None,
-        "최대": _to_native(round(k_series.max(), 3)) if not k_series.empty else None,
-    }
-    k_freq_top = []
-    if not k_series.empty:
-        vc = k_series.round(3).value_counts().sort_values(ascending=False).head(5)
-        for k, c in vc.items():
-            k_freq_top.append({"K": _to_native(k), "거래건수": _to_native(c)})
+# ──────────────────────────────────────────────────────────────────────────────
+# 메인: CEO 리포트
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # 진입 슬리피지(%)
-    slippage_series = None
-    if "target_price" in buy_trades.columns:
-        tp = pd.to_numeric(buy_trades["target_price"], errors="coerce")
-        valid = (tp > 0) & (~buy_trades["price"].isna())
-        slippage_series = ((buy_trades.loc[valid, "price"] - tp.loc[valid]) / tp.loc[valid]) * 100
-    slip_summary = {
-        "평균%": _to_native(int(round(slippage_series.mean()))) if slippage_series is not None and not slippage_series.empty else None,
-        "중앙%": _to_native(int(round(slippage_series.median()))) if slippage_series is not None and not slippage_series.empty else None,
-        "최대불리%": _to_native(int(round(slippage_series.max()))) if slippage_series is not None and not slippage_series.empty else None,
-        "최대유리%": _to_native(int(round(slippage_series.min()))) if slippage_series is not None and not slippage_series.empty else None,
-        "표본수": _to_native(int(slippage_series.shape[0])) if slippage_series is not None else 0,
-    }
+def ceo_report(base_dt_kst: Optional[datetime] = None, period: str = "daily") -> Dict[str, Any]:
+    """
+    거래 로그(trades_YYYY-MM-DD.json) 기반 요약 리포트를 생성하고 저장한다.
+    Args:
+        base_dt_kst: 기준 시각(KST). None이면 현재 KST 사용.
+        period: 'daily' | 'weekly' | 'monthly'
+    Returns:
+        {
+          "title": "...",
+          "period": "...",
+          "start": "YYYY-MM-DD",
+          "end":   "YYYY-MM-DD",
+          "path":  "<markdown path>",
+          "summary": {...},
+          "top_winners": [...],
+          "top_losers":  [...]
+        }
+    """
+    base_dt_kst = base_dt_kst or datetime.now(KST)
+    start_dt, end_dt = _period_range(base_dt_kst, period)
 
-    # 청산사유/전략별
-    reason_perf = []
-    if "청산사유" in buy_trades.columns:
-        tmp = buy_trades.dropna(subset=["청산사유"]).copy()
-        if not tmp.empty:
-            grp = tmp.groupby("청산사유")
-            for reason, g in grp:
-                cnt = int(g.shape[0])
-                win = (g["수익"] > 0).mean() * 100 if cnt > 0 else 0.0
-                avg_ret = g["수익률"].mean() if cnt > 0 else 0.0
-                reason_perf.append({
-                    "사유": _to_native(reason),
-                    "건수": cnt,
-                    "승률": _to_native(int(round(win))),
-                    "평균수익률%": _to_native(int(round(avg_ret))),
-                })
-            reason_perf = sorted(reason_perf, key=lambda x: x["건수"], reverse=True)
+    rows = _collect_trade_rows(start_dt, end_dt)
+    summ, by_code = _aggregate(rows)
 
-    strat_perf = []
-    if "strategy" in buy_trades.columns and not buy_trades.empty:
-        grp = buy_trades.groupby(buy_trades["strategy"].fillna("N/A"))
-        for strat, g in grp:
-            cnt = int(g.shape[0])
-            pnl = int(g["수익"].sum())
-            win = (g["수익"] > 0).mean() * 100 if cnt > 0 else 0.0
-            avg_ret = g["수익률"].mean() if cnt > 0 else 0.0
-            strat_perf.append({
-                "전략": _to_native(strat),
-                "건수": cnt,
-                "실현손익": _to_native(pnl),
-                "승률": _to_native(int(round(win))),
-                "평균수익률%": _to_native(int(round(avg_ret))),
-            })
-        strat_perf = sorted(strat_perf, key=lambda x: x["실현손익"], reverse=True)
+    # 상/하위 종목(손익 기준)
+    code_aggs = list(by_code.values())
+    code_aggs.sort(key=lambda x: x.gross_profit, reverse=True)
+    top_w = code_aggs[:5]
+    top_l = list(reversed(code_aggs))[:5]  # 손익 오름차순의 상위 5개
 
-    # 종목별 상세(실현 중심)
-    종목별상세 = []
-    for _, row in buy_trades.iterrows():
-        slip = None
-        if not pd.isna(row.get("target_price")) and row.get("target_price") not in (None, 0):
-            try:
-                slip = ((float(row.get("price")) - float(row.get("target_price"))) / float(row.get("target_price"))) * 100
-                slip = int(round(slip))
-            except Exception:
-                slip = None
+    # 마크다운 생성
+    title = f"CEO Report — {end_dt.strftime('%Y-%m-%d')} ({period})"
+    md_lines: List[str] = []
+    md_lines.append(f"# {title}")
+    md_lines.append("")
+    md_lines.append(f"- 기간: **{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}** (KST)")
+    md_lines.append(f"- 총 거래수: **{summ.n_trades}**건 (BUY {summ.n_buy} / SELL {summ.n_sell})")
+    md_lines.append(f"- 승/패: **{summ.wins} / {summ.losses}**")
+    md_lines.append(f"- 총 손익: **{_fmt_krw(summ.gross_profit)}**")
+    md_lines.append(f"- 평균 수익률: **{str(summ.avg_pnl_pct) + '%' if summ.avg_pnl_pct is not None else '-'}**")
+    md_lines.append("")
 
-        종목별상세.append({
-            "code": _to_native(row.get("code")),
-            "name": _to_native(row.get("name")),
-            "K": _to_native(row.get("K", "-")),
-            "목표가": _to_native(row.get("target_price", "-")),
-            "매수수량": _to_native(row.get("qty")),
-            "매수단가": _to_native(row.get("price")),
-            "매수시간": _to_native(row.get("datetime")),
-            "매도단가": _to_native(row.get("매도단가")),
-            "매도시간": _to_native(row.get("매도시간")),
-            "수익률": f"{int(round(_to_native(row.get('수익률')) or 0))}%",
-            "실현손익": _to_native(row.get("수익")),
-            "청산사유": _to_native(row.get("청산사유")),
-            "전략설명": _to_native(row.get("strategy", "N/A")),
-            "슬리피지%": _to_native(slip),
-        })
+    # Top Winners
+    md_lines.append("## Top Winners (by Profit)")
+    if top_w:
+        rows_w = [["코드", "종목명", "손익", "승/패", "비고"]]
+        for c in top_w:
+            rows_w.append([
+                c.code,
+                c.name or "-",
+                _fmt_krw(c.gross_profit),
+                f"{c.wins}/{c.losses}",
+                (c.last_reason or "").replace("|", "/")
+            ])
+        md_lines.append(_mk_md_table(rows_w))
+    else:
+        md_lines.append("> 데이터 없음")
+    md_lines.append("")
 
-    # 거래세부내역: df -> records
-    records = []
-    for _, r in df.iterrows():
-        rec = {k: _to_native(v) for k, v in r.items()}
-        rec["수익률"] = int(round(rec.get("수익률") or 0)) if rec.get("수익률") is not None else 0
-        records.append(rec)
+    # Top Losers
+    md_lines.append("## Top Losers (by Profit)")
+    if top_l:
+        rows_l = [["코드", "종목명", "손익", "승/패", "비고"]]
+        for c in top_l:
+            rows_l.append([
+                c.code,
+                c.name or "-",
+                _fmt_krw(c.gross_profit),
+                f"{c.wins}/{c.losses}",
+                (c.last_reason or "").replace("|", "/")
+            ])
+        md_lines.append(_mk_md_table(rows_l))
+    else:
+        md_lines.append("> 데이터 없음")
+    md_lines.append("")
 
-    # 요약: 실현 + 미실현(보유평가)
-    pnl_pct_realized = (total_pnl_realized / total_invest) * 100 if total_invest else 0.0
-    total_pnl_combined = total_pnl_realized + port_eval["평가손익"]
-    total_base_for_pct = (port_eval["원가합"] + total_invest) if (port_eval["원가합"] + total_invest) > 0 else None
-    total_pct_combined = (total_pnl_combined / total_base_for_pct * 100.0) if total_base_for_pct else 0.0
+    # 거래 상세(선택)
+    md_lines.append("## 거래 상세 (최근 순)")
+    if rows:
+        rows_d = [["시간", "코드", "종목명", "Side", "수량", "체결가", "손익(원)", "사유"]]
+        for r in reversed(rows[-200:]):  # 너무 길어지는 걸 방지: 최근 200건만
+            rows_d.append([
+                r.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                r.code,
+                r.name or "-",
+                r.side,
+                str(r.qty),
+                f"{r.price:.2f}" if r.price is not None else "-",
+                _fmt_krw(r.profit) if (r.side == "SELL" and r.profit is not None) else "-",
+                (r.reason or "").replace("|", "/")
+            ])
+        md_lines.append(_mk_md_table(rows_d))
+    else:
+        md_lines.append("> 해당 기간 거래 없음")
+    md_lines.append("")
 
-    리포트 = {
+    # 저장
+    md_name = f"CEO_Report_{end_dt.strftime('%Y%m%d')}_{period}.md"
+    md_path = LOG_DIR / md_name
+    try:
+        md_path.write_text("\n".join(md_lines), encoding="utf-8")
+        logger.info(f"[CEO REPORT] 마크다운 저장: {md_path}")
+    except Exception as e:
+        logger.error(f"[CEO REPORT] 저장 실패: {e}")
+
+    # 반환 payload
+    payload = {
         "title": title,
-        "전략설정": _strategy_desc(),
-        "운영파라미터": runtime_params,
-        "요약": {
-            "총투자금액(실현기준)": f"{total_invest:,}원",
-            "실현수익": f"{total_pnl_realized:,}원 ({int(round(pnl_pct_realized))}%)",
-            "MDD": mdd_str,
-            "승률": _pct_int(win_rate),
-            "체결종목수": int(symbol_count),
-            "매매횟수": int(total_trade_count),
-            # ===== [NEW] 평가손익/총손익 =====
-            "총평가금액": f"{port_eval['평가금액']:,}원",
-            "보유원가(총취득가)": f"{port_eval['원가합']:,}원",
-            "평가손익(미실현)": f"{port_eval['평가손익']:,}원 ({port_eval['평가수익률']:.2f}%)",
-            "총손익(실현+미실현)": f"{total_pnl_combined:,}원",
-            "총손익률(실현+미실현)": f"{total_pct_combined:.2f}%"
-        },
-        "수익TOP": [
-            {
-                "종목명": _to_native(r["name"]),
-                "K": _to_native(r.get("K", "-")),
-                "매수": _to_native(r["price"]),
-                "매도": _to_native(r.get("매도단가")),
-                "수익률": f"{int(round(_to_native(r.get('수익률')) or 0))}%",
-                "매수시간": _to_native(r.get("datetime")),
-                "매도시간": _to_native(r.get("매도시간"))
-            }
-            for _, r in top_win.iterrows()
-        ],
-        "손실TOP": [
-            {
-                "종목명": _to_native(r["name"]),
-                "K": _to_native(r.get("K", "-")),
-                "매수": _to_native(r["price"]),
-                "매도": _to_native(r.get("매도단가")),
-                "수익률": f"{int(round(_to_native(r.get('수익률')) or 0))}%",
-                "매수시간": _to_native(r.get("datetime")),
-                "매도시간": _to_native(r.get("매도시간"))
-            }
-            for _, r in top_lose.iterrows()
-        ],
-        # ===== [NEW] 보유 평가손익 리포트 =====
-        "보유수익TOP": port_eval["보유TOP"],
-        "보유상세": port_eval["보유상세"],
-        "RKMAX_지표": {
-            "K_요약": k_summary,
-            "K_빈도_TOP": k_freq_top,
-            "진입_슬리피지_요약": slip_summary,
-            "청산사유_분포": reason_perf,
-            "전략별_성과": strat_perf,
-        },
-        "거래세부내역": records,
-        "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "market_open": market_status
+        "period": period,
+        "start": start_dt.strftime("%Y-%m-%d"),
+        "end": end_dt.strftime("%Y-%m-%d"),
+        "path": str(md_path),
+        "summary": asdict(summ),
+        "top_winners": [asdict(x) for x in top_w],
+        "top_losers": [asdict(x) for x in top_l],
     }
-
-    filename = f"ceo_report_{period}_{date.strftime('%Y-%m-%d')}.json"
-    with open(REPORT_DIR / filename, "w", encoding="utf-8") as f:
-        json.dump(리포트, f, indent=2, ensure_ascii=False)
-
-    return 리포트
+    return payload
 
 
-def _to_int(val, default=0):
-    try:
-        return int(float(val))
-    except Exception:
-        return default
-
-
-def _to_float(val, default=None):
-    try:
-        return float(val)
-    except Exception:
-        return default
-
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI 테스트용
+# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    today = datetime.now()
-    print(ceo_report(today, period="daily"))
-    print(ceo_report(today, period="weekly"))
-    print(ceo_report(today, period="monthly"))
+    logging.basicConfig(level=logging.INFO)
+    out = ceo_report(datetime.now(KST), period=os.getenv("CEO_REPORT_PERIOD", "daily"))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
