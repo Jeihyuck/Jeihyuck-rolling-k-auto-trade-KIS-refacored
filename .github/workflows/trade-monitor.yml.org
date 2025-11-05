@@ -83,12 +83,16 @@ jobs:
         run: |
           python -m trader.report_ceo
 
+      - name: Verify CEO report exists
+        run: |
+          ls -al trader/logs || true
+
       - name: CEO 리포트 artifact 업로드
         uses: actions/upload-artifact@v4
         with:
           name: ceo-report
-          path: trader/reports/
-          if-no-files-found: warn
+          path: trader/logs/*.md
+          if-no-files-found: error
           retention-days: 30
 
       - name: Rebalance JSON artifact 업로드
@@ -124,4 +128,3 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
-              

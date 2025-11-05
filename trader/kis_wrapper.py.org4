@@ -7,8 +7,7 @@
 # - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
 # - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
 # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
-# - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
-# - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+# - ✅ 잔고 페이징(ctx_area_*), empty 순간응답 디바운스
 
 import os
 import json
@@ -56,7 +55,7 @@ def _build_session():
     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers.update({"User-Agent": "RKMax/1.0", "Connection": "keep-alive"})
+    s.headers.update({"User-Agent": "RKMax/1.0"})
     return s
 
 
@@ -172,12 +171,15 @@ class KisAPI:
         if self.env not in ("practice", "real"):
             self.env = "practice"
 
-        # [CHG] 세션 생성 → 멤버로 보관
-        self.session = _build_session()
-
-        # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
-        self._safe_attempts = 5
-        self._safe_backoff_base = 0.2
+        self.session = requests.Session()
+        retry = Retry(
+            total=3, connect=3, read=3, status=3, backoff_factor=0.5,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]), raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
         self._recent_sells: Dict[str, float] = {}
@@ -191,40 +193,6 @@ class KisAPI:
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
-
-    # ===== [NEW] 안전요청 & 세션리셋 =====
-    def _reset_session(self):
-        try:
-            old = self.session
-            self.session = _build_session()
-            try:
-                old.close()
-            except Exception:
-                pass
-            logger.warning("[NET] session reset")
-        except Exception as e:
-            logger.warning("[NET] session reset failed: %s", e)
-
-    def _safe_request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """
-        공통 안전요청 래퍼:
-        - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
-        - 기본 시도 self._safe_attempts
-        """
-        attempts = self._safe_attempts
-        for i in range(1, attempts + 1):
-            try:
-                return self.session.request(method, url, timeout=kwargs.pop("timeout", (3.0, 7.0)), **kwargs)
-            except requests.exceptions.SSLError as e:
-                logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
-                self._reset_session()
-            except requests.exceptions.RequestException as e:
-                logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
-                if i in (1, 2):  # 초기 2회엔 세션 리셋도 수행
-                    self._reset_session()
-            # backoff
-            time.sleep((2 ** i) * self._safe_backoff_base + random.uniform(0, 0.2))
-        raise NetTemporaryError(f"request failed after retries: {url}")
 
     # ===== 토큰 처리 =====
     def get_valid_token(self):
@@ -271,8 +239,7 @@ class KisAPI:
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
         try:
-            # [CHG] 안전요청 사용
-            resp = self._safe_request("POST", url, json=data, headers=headers)
+            resp = self.session.post(url, json=data, headers=headers, timeout=(3.0, 7.0))
             j = resp.json()
         except Exception as e:
             logger.error(f"[🔑 토큰발급 예외] {e}")
@@ -321,8 +288,7 @@ class KisAPI:
         }
         body_str = _json_dumps(body_dict)
         try:
-            # [CHG] 안전요청 사용
-            r = self._safe_request("POST", url, headers=headers, data=body_str.encode("utf-8"))
+            r = self.session.post(url, headers=headers, data=body_str.encode("utf-8"), timeout=(3.0, 5.0))
             j = r.json()
         except Exception as e:
             logger.error(f"[HASHKEY 예외] {e}")
@@ -406,8 +372,7 @@ class KisAPI:
         headers = self._headers(tr_id)
         params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
         try:
-            # [CHG] 안전요청 사용
-            resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+            resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
             data = resp.json()
         except Exception as e:
             logger.debug("[PRICE_ONCE_EX] %s/%s %s → %s", market_div, code_fmt, tr_id, e)
@@ -485,8 +450,7 @@ class KisAPI:
                 for code_fmt in codes:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
                     except Exception:
                         continue
@@ -516,8 +480,7 @@ class KisAPI:
                 for code_fmt in codes:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
                     except Exception:
                         continue
@@ -572,8 +535,7 @@ class KisAPI:
 
             params = {
                 "fid_cond_mrkt_div_code": market_code,  # 반드시 'J'
-                "fid_input_iscd": iscd,
-                # 'A' 없이 6자리
+                "fid_input_iscd": iscd,                 # 'A' 없이 6자리
                 "fid_input_date_1": from_ymd,           # 시작일(YYYYMMDD)
                 "fid_input_date_2": to_ymd,             # 종료일(YYYYMMDD)
                 "fid_org_adj_prc": "0",
@@ -582,8 +544,7 @@ class KisAPI:
 
             for attempt in range(1, 4):  # 가벼운 재시도
                 try:
-                    # [CHG] 안전요청 사용
-                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
                     resp.raise_for_status()
                     data = resp.json()
                     logger.debug("[DAILY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
@@ -735,8 +696,7 @@ class KisAPI:
                 for code_fmt in codes:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
                     except Exception:
                         continue
@@ -760,8 +720,7 @@ class KisAPI:
                 for code_fmt in codes:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 5.0))
                         data = resp.json()
                     except Exception:
                         continue
@@ -836,8 +795,7 @@ class KisAPI:
             "CTX_AREA_NK100": nk,
         }
         logger.info(f"[잔고조회 요청파라미터] {params}")
-        # [CHG] 안전요청 사용
-        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+        resp = self.session.get(url, headers=headers, params=params, timeout=(3.0, 7.0))
         return resp.json()
 
     def inquire_balance_all(self, *, max_empty_retry: int = 2) -> dict:
@@ -980,8 +938,9 @@ class KisAPI:
                 # 네트워크/게이트웨이 재시도
                 for attempt in range(1, 4):
                     try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"))
+                        resp = self.session.post(
+                            url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+                        )
                         data = resp.json()
                     except Exception as e:
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
@@ -1121,8 +1080,7 @@ class KisAPI:
         tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        # [CHG] 안전요청 사용
-        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
@@ -1186,8 +1144,7 @@ class KisAPI:
         tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        # [CHG] 안전요청 사용
-        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        resp = self.session.post(url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
@@ -1276,28 +1233,7 @@ class KisAPI:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
 
-    # ===== [NEW] 주문 후 확인/보조: 체결 후 잔고 동기화 =====
-    def refresh_after_order(self, wait_sec: float = 3.0, max_tries: int = 5) -> dict:
-        """
-        체결 직후 잔고/현금 재조회 (네트워크/지연 내성).
-        - 여러 번(기본 5회) 짧게 시도하여 output1/2가 채워진 시점에 반환
-        - 실패 시 마지막 성공 스냅샷 또는 빈 dict
-        """
-        snap: dict = {}
-        tries = max(1, int(max_tries))
-        delay = max(0.2, float(wait_sec) / tries)
-        for i in range(tries):
-            try:
-                j = self.inquire_balance_all()
-                if j and (j.get("output1") or j.get("output2")):
-                    snap = j
-                    logger.info("[SYNC] balance refreshed (try=%s)", i + 1)
-                    break
-            except Exception as e:
-                logger.warning("[SYNC] balance refresh failed: %s", e)
-            time.sleep(delay)
-        return snap
-
+    # ===== 주문 후 확인/보조 =====
     def check_filled(self, order_resp: Optional[dict]) -> bool:
         """간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주."""
         try:

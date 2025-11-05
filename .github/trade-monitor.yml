@@ -1,0 +1,161 @@
+name: Trade Monitor
+
+on:
+  push:
+    branches: [ main, change-logic ]
+  pull_request:
+    branches: [ main, change-logic ]
+  schedule:
+    # 매일 한국시간 08:57 (UTC 23:57, 월~금) 실행
+    - cron: "57 23 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  monitor-trade:
+    runs-on: ubuntu-latest
+
+    env:
+      # ===== 민감정보(Secrets) - KisAPI가 기대하는 키명 =====
+      APP_KEY: ${{ secrets.APP_KEY }}            # ✅ 기존 로그 기준 변수명
+      APP_SECRET: ${{ secrets.APP_SECRET }}      # ✅ 기존 로그 기준 변수명
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}           # vts/prod 선택 (코드에서 사용)
+      API_BASE_URL: ${{ secrets.API_BASE_URL }} # 예: https://openapivts.koreainvestment.com:29443
+
+      # ===== trader.py 운영 파라미터(명시 권장) =====
+      # 포지션 관리
+      PARTIAL1: "0.5"
+      PARTIAL2: "0.3"
+      TRAIL_PCT: "0.02"
+      FAST_STOP: "0.01"
+      ATR_STOP: "1.5"
+      TIME_STOP_HHMM: "13:00"
+      SELL_FORCE_TIME: "14:40"
+      SELL_ALL_BALANCES_AT_CUTOFF: "false"          # 전량매도 off
+      FORCE_SELL_PASSES_CUTOFF: "2"
+      FORCE_SELL_PASSES_CLOSE: "4"
+
+      DEFAULT_PROFIT_PCT: "3.0"
+      DEFAULT_LOSS_PCT: "-5.0"
+
+      SLIPPAGE_LIMIT_PCT: "0.25"
+      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+
+      W_MAX_ONE: "0.25"
+      W_MIN_ONE: "0.03"
+
+      REBALANCE_ANCHOR: "weekly"                    # trader.py 기본값과 동일
+      FORCE_WEEKLY_REBALANCE: "0"                   # 1이면 이번 주 1회 강제 실행
+
+      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+
+      # 레짐/지수 관련
+      KOSDAQ_INDEX_CODE: "KOSDAQ"
+      KOSDAQ_ETF_FALLBACK: "229200"
+      REG_BULL_MIN_UP_PCT: "0.5"
+      REG_BULL_MIN_MINUTES: "10"
+      REG_BEAR_VWAP_MINUTES: "10"
+      REG_BEAR_DROP_FROM_HIGH: "0.7"
+      REG_BEAR_STAGE1_MINUTES: "20"
+      REG_BEAR_STAGE2_ADD_DROP: "0.5"
+      REG_PARTIAL_S1: "0.30"
+      REG_PARTIAL_S2: "0.30"
+      TRAIL_PCT_BULL: "0.025"
+      TRAIL_PCT_BEAR: "0.012"
+      TP_PROFIT_PCT_BULL: "3.5"
+
+      MARKET_DATA_WHEN_CLOSED: "false"
+
+      # 배분/속도
+      DAILY_CAPITAL: "50000000"                     # ← 5천만(의도면 5억으로 유지)
+      API_RATE_SLEEP_SEC: "0.3"                     # ✅ trader.py가 읽는 이름
+
+      # ===== FastAPI 리밸런싱 서버용(선정 필터) =====
+      MIN_TRADES: "5"
+      MAX_MDD_PCT: "30"
+      MIN_WINRATE: "50"
+      MIN_CUMRET: "2"
+      TOP_K_LIMIT: "20"
+      TOTAL_CAPITAL: "10000000"
+      MIN_QTY_PER_TICKET: "1"
+      K_MIN: "0.1"
+      K_MAX: "0.9"
+      K_STEP: "0.1"
+      ALLOW_AFTER_HOURS: "0"
+      REBALANCE_OUT_DIR: "rebalance_results"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencies 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+        run: |
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 30  # 서버 구동 시간 여유 확보
+
+      - name: trader 자동매매 로직 실행
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.trader
+
+      - name: CEO 리포트 자동 생성
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.report_ceo
+
+      - name: Verify CEO report exists
+        run: |
+          ls -al trader/logs || true
+
+      - name: CEO 리포트 artifact 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceo-report
+          path: trader/logs/*.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Rebalance JSON artifact 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebalance-results
+          path: rebalance_results/*.json
+          if-no-files-found: warn
+          retention-days: 60
+
+      - name: Trades 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: trader/logs/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: FastAPI 로그 출력 (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log || true
+          echo "::endgroup::"
+
+      - name: FastAPI 로그 업로드 (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+          if-no-files-found: ignore
+          retention-days: 14

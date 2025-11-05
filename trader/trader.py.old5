@@ -15,55 +15,6 @@ from typing import Optional, Dict, Any, Tuple, List
 import csv
 from .report_ceo import ceo_report
 
-# =========================
-# [CONFIG] .env 없이도 동작
-# - 아래 값을 기본으로 사용
-# - (선택) 동일 키를 환경변수로 넘기면 override
-# =========================
-CONFIG = {
-    "SELL_FORCE_TIME": "14:40",
-    "SELL_ALL_BALANCES_AT_CUTOFF": "false",   # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
-    "API_RATE_SLEEP_SEC": "0.5",
-    "FORCE_SELL_PASSES_CUTOFF": "2",
-    "FORCE_SELL_PASSES_CLOSE": "4",
-    "PARTIAL1": "0.5",
-    "PARTIAL2": "0.3",
-    "TRAIL_PCT": "0.02",
-    "FAST_STOP": "0.01",
-    "ATR_STOP": "1.5",
-    "TIME_STOP_HHMM": "13:00",
-    "DEFAULT_PROFIT_PCT": "3.0",
-    "DEFAULT_LOSS_PCT": "-5.0",
-    "DAILY_CAPITAL": "50000000",
-    "SLIPPAGE_LIMIT_PCT": "0.25",
-    "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
-    "W_MAX_ONE": "0.25",
-    "W_MIN_ONE": "0.03",
-    "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
-    "MOMENTUM_OVERRIDES_FORCE_SELL": "true",
-    # 레짐(코스닥) 파라미터
-    "KOSDAQ_INDEX_CODE": "KOSDAQ",
-    "KOSDAQ_ETF_FALLBACK": "229200",
-    "REG_BULL_MIN_UP_PCT": "0.5",
-    "REG_BULL_MIN_MINUTES": "10",
-    "REG_BEAR_VWAP_MINUTES": "10",
-    "REG_BEAR_DROP_FROM_HIGH": "0.7",
-    "REG_BEAR_STAGE1_MINUTES": "20",
-    "REG_BEAR_STAGE2_ADD_DROP": "0.5",
-    "REG_PARTIAL_S1": "0.30",
-    "REG_PARTIAL_S2": "0.30",
-    "TRAIL_PCT_BULL": "0.025",
-    "TRAIL_PCT_BEAR": "0.012",
-    "TP_PROFIT_PCT_BULL": "3.5",
-    # 기타
-    "MARKET_DATA_WHEN_CLOSED": "false",
-    "FORCE_WEEKLY_REBALANCE": "0",
-}
-
-def _cfg(key: str) -> str:
-    """환경변수 > CONFIG 기본값"""
-    return os.getenv(key, CONFIG.get(key, ""))
-
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
     from .rkmax_utils import blend_k, recent_features
@@ -122,28 +73,26 @@ def get_market(code: str) -> str:
 EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
 
 KST = ZoneInfo("Asia/Seoul")
-
-# ===== 매개변수(.env 없이도 CONFIG 기본을 사용) =====
-SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
-SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "true"
-RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
-FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
-FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
-PARTIAL1 = float(_cfg("PARTIAL1"))
-PARTIAL2 = float(_cfg("PARTIAL2"))
-TRAIL_PCT = float(_cfg("TRAIL_PCT"))
-FAST_STOP = float(_cfg("FAST_STOP"))
-ATR_STOP = float(_cfg("ATR_STOP"))
-TIME_STOP_HHMM = _cfg("TIME_STOP_HHMM")
-DEFAULT_PROFIT_PCT = float(_cfg("DEFAULT_PROFIT_PCT"))
-DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
-DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
-SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
-SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
-W_MAX_ONE = float(_cfg("W_MAX_ONE"))
-W_MIN_ONE = float(_cfg("W_MIN_ONE"))
-REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
-MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
+SELL_FORCE_TIME_STR = os.getenv("SELL_FORCE_TIME", "14:40").strip()
+SELL_ALL_BALANCES_AT_CUTOFF = os.getenv("SELL_ALL_BALANCES_AT_CUTOFF", "false").lower() == "true"
+RATE_SLEEP_SEC = float(os.getenv("API_RATE_SLEEP_SEC", "0.5"))
+FORCE_SELL_PASSES_CUTOFF = int(os.getenv("FORCE_SELL_PASSES_CUTOFF", "2"))
+FORCE_SELL_PASSES_CLOSE = int(os.getenv("FORCE_SELL_PASSES_CLOSE", "4"))
+PARTIAL1 = float(os.getenv("PARTIAL1", "0.5"))
+PARTIAL2 = float(os.getenv("PARTIAL2", "0.3"))
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.02"))
+FAST_STOP = float(os.getenv("FAST_STOP", "0.01"))
+ATR_STOP = float(os.getenv("ATR_STOP", "1.5"))
+TIME_STOP_HHMM = os.getenv("TIME_STOP_HHMM", "13:00")
+DEFAULT_PROFIT_PCT = float(os.getenv("DEFAULT_PROFIT_PCT", "3.0"))
+DEFAULT_LOSS_PCT = float(os.getenv("DEFAULT_LOSS_PCT", "-5.0"))
+DAILY_CAPITAL = int(os.getenv("DAILY_CAPITAL", "50000000"))
+SLIPPAGE_LIMIT_PCT = float(os.getenv("SLIPPAGE_LIMIT_PCT", "0.25"))
+SLIPPAGE_ENTER_GUARD_PCT = float(os.getenv("SLIPPAGE_ENTER_GUARD_PCT", "2.5"))
+W_MAX_ONE = float(os.getenv("W_MAX_ONE", "0.25"))
+W_MIN_ONE = float(os.getenv("W_MIN_ONE", "0.03"))
+REBALANCE_ANCHOR = "weekly"
+MOMENTUM_OVERRIDES_FORCE_SELL = os.getenv("MOMENTUM_OVERRIDES_FORCE_SELL", "true").lower() == "true"
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -155,7 +104,7 @@ def _parse_hhmm(hhmm: str) -> dtime:
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
-ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
+ALLOW_WHEN_CLOSED = os.getenv("MARKET_DATA_WHEN_CLOSED", "false").lower() == "true"
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
@@ -189,7 +138,7 @@ def should_weekly_rebalance_now(now=None):
       - FORCE_WEEKLY_REBALANCE=1 이면 시간/요일 무시하고 True (단 1회)
     """
     now = now or datetime.now(KST)
-    force = _cfg("FORCE_WEEKLY_REBALANCE") == "1"
+    force = os.getenv("FORCE_WEEKLY_REBALANCE", "0") == "1"
     last = _read_last_weekly()
     cur = _this_iso_week_key(now)
     if force:
@@ -366,7 +315,7 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
     # 4) 최후: 캐시가 있으면 stale_ok_sec 내 제공
     ent = _LAST_PRICE_CACHE.get(code)
     if ent and (now - ent["ts"] <= stale_ok_sec):
-        return float(ent["ts"])
+        return float(ent["px"])
     return None
 
 def _fetch_balances(kis: KisAPI) -> List[Dict[str, Any]]:
@@ -806,23 +755,23 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
 
 # === [ANCHOR: REGIME PARAMS] 코스닥 레짐 파라미터 ===
 REGIME_ENABLED = True
-KOSDAQ_CODE = _cfg("KOSDAQ_INDEX_CODE")
-KOSDAQ_ETF_FALLBACK = _cfg("KOSDAQ_ETF_FALLBACK")  # KODEX 코스닥150
+KOSDAQ_CODE = os.getenv("KOSDAQ_INDEX_CODE", "KOSDAQ")
+KOSDAQ_ETF_FALLBACK = os.getenv("KOSDAQ_ETF_FALLBACK", "229200")  # KODEX 코스닥150
 
-REG_BULL_MIN_UP_PCT = float(_cfg("REG_BULL_MIN_UP_PCT"))
-REG_BULL_MIN_MINUTES = int(_cfg("REG_BULL_MIN_MINUTES"))
-REG_BEAR_VWAP_MINUTES = int(_cfg("REG_BEAR_VWAP_MINUTES"))
-REG_BEAR_DROP_FROM_HIGH = float(_cfg("REG_BEAR_DROP_FROM_HIGH"))
+REG_BULL_MIN_UP_PCT = float(os.getenv("REG_BULL_MIN_UP_PCT", "0.5"))
+REG_BULL_MIN_MINUTES = int(os.getenv("REG_BULL_MIN_MINUTES", "10"))
+REG_BEAR_VWAP_MINUTES = int(os.getenv("REG_BEAR_VWAP_MINUTES", "10"))
+REG_BEAR_DROP_FROM_HIGH = float(os.getenv("REG_BEAR_DROP_FROM_HIGH", "0.7"))
 
-REG_BEAR_STAGE1_MINUTES = int(_cfg("REG_BEAR_STAGE1_MINUTES"))
-REG_BEAR_STAGE2_ADD_DROP = float(_cfg("REG_BEAR_STAGE2_ADD_DROP"))
-REG_PARTIAL_S1 = float(_cfg("REG_PARTIAL_S1"))
-REG_PARTIAL_S2 = float(_cfg("REG_PARTIAL_S2"))
+REG_BEAR_STAGE1_MINUTES = int(os.getenv("REG_BEAR_STAGE1_MINUTES", "20"))
+REG_BEAR_STAGE2_ADD_DROP = float(os.getenv("REG_BEAR_STAGE2_ADD_DROP", "0.5"))
+REG_PARTIAL_S1 = float(os.getenv("REG_PARTIAL_S1", "0.30"))
+REG_PARTIAL_S2 = float(os.getenv("REG_PARTIAL_S2", "0.30"))
 
-TRAIL_PCT_BULL = float(_cfg("TRAIL_PCT_BULL"))
-TRAIL_PCT_BEAR = float(_cfg("TRAIL_PCT_BEAR"))
+TRAIL_PCT_BULL = float(os.getenv("TRAIL_PCT_BULL", "0.025"))
+TRAIL_PCT_BEAR = float(os.getenv("TRAIL_PCT_BEAR", "0.012"))
 TP_PROFIT_PCT_BASE = DEFAULT_PROFIT_PCT
-TP_PROFIT_PCT_BULL = float(_cfg("TP_PROFIT_PCT_BULL"))
+TP_PROFIT_PCT_BULL = float(os.getenv("TP_PROFIT_PCT_BULL", str(TP_PROFIT_PCT_BASE + 0.5)))
 
 # === [ANCHOR: REGIME STATE] 코스닥 레짐 상태 ===
 REGIME_STATE: Dict[str, Any] = {
