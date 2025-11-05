@@ -15,16 +15,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ===== 민감정보(Secrets) - KisAPI가 기대하는 키명 =====
-      APP_KEY: ${{ secrets.APP_KEY }}            # ✅ 기존 로그 기준 변수명
-      APP_SECRET: ${{ secrets.APP_SECRET }}      # ✅ 기존 로그 기준 변수명
+      # ===== 민감정보(Secrets) — settings.py가 기대하는 키명 =====
+      KIS_APP_KEY: ${{ secrets.APP_KEY }}          # ✅ secrets 이름이 APP_KEY라면 이렇게 매핑
+      KIS_APP_SECRET: ${{ secrets.APP_SECRET }}    # ✅ secrets 이름이 APP_SECRET라면 이렇게 매핑
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}           # vts/prod 선택 (코드에서 사용)
-      API_BASE_URL: ${{ secrets.API_BASE_URL }} # 예: https://openapivts.koreainvestment.com:29443
+      KIS_ENV: ${{ secrets.KIS_ENV }}              # vts/practice 또는 real
+      API_BASE_URL: ${{ secrets.API_BASE_URL }}    # (선택) 비워두면 KIS_ENV로 자동 결정
 
-      # ===== trader.py 운영 파라미터(명시 권장) =====
-      # 포지션 관리
+      # ===== trader.py 운영 파라미터 =====
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.02"
@@ -32,7 +31,7 @@ jobs:
       ATR_STOP: "1.5"
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:40"
-      SELL_ALL_BALANCES_AT_CUTOFF: "false"          # 전량매도 off
+      SELL_ALL_BALANCES_AT_CUTOFF: "false"
       FORCE_SELL_PASSES_CUTOFF: "2"
       FORCE_SELL_PASSES_CLOSE: "4"
 
@@ -45,9 +44,8 @@ jobs:
       W_MAX_ONE: "0.25"
       W_MIN_ONE: "0.03"
 
-      REBALANCE_ANCHOR: "weekly"                    # trader.py 기본값과 동일
-      FORCE_WEEKLY_REBALANCE: "0"                   # 1이면 이번 주 1회 강제 실행
-
+      REBALANCE_ANCHOR: "weekly"
+      FORCE_WEEKLY_REBALANCE: "0"
       MOMENTUM_OVERRIDES_FORCE_SELL: "true"
 
       # 레짐/지수 관련
@@ -68,8 +66,8 @@ jobs:
       MARKET_DATA_WHEN_CLOSED: "false"
 
       # 배분/속도
-      DAILY_CAPITAL: "50000000"                     # ← 5천만(의도면 5억으로 유지)
-      API_RATE_SLEEP_SEC: "0.3"                     # ✅ trader.py가 읽는 이름
+      DAILY_CAPITAL: "50000000"
+      API_RATE_SLEEP_SEC: "0.3"
 
       # ===== FastAPI 리밸런싱 서버용(선정 필터) =====
       MIN_TRADES: "5"
@@ -100,7 +98,7 @@ jobs:
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30  # 서버 구동 시간 여유 확보
+          sleep 30
 
       - name: trader 자동매매 로직 실행
         env:
@@ -158,4 +156,4 @@ jobs:
           name: fastapi-log
           path: fastapi.log
           if-no-files-found: ignore
-          retention-days: 14 
+          retention-days: 14
