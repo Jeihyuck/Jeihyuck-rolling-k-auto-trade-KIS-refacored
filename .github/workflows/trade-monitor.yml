@@ -6,8 +6,8 @@ on:
   pull_request:
     branches: [ main, change-logic ]
   schedule:
-    # 매일 한국시간 08:57 (UTC 23:57, 월–금)
-    - cron: "57 23 * * 1-5"
+    # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~목) = 0-4
+    - cron: "57 23 * * 0-4"
   workflow_dispatch:
 
 jobs:
@@ -15,15 +15,20 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ===== settings.py가 기대하는 키명 =====
-      KIS_APP_KEY: ${{ secrets.APP_KEY }}        # 시크릿 이름이 APP_KEY라면 이렇게 매핑
-      KIS_APP_SECRET: ${{ secrets.APP_SECRET }}  # 시크릿 이름이 APP_SECRET라면 이렇게 매핑
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}            # "practice" 또는 "real"
-      # API_BASE_URL은 settings.py가 KIS_ENV로 자동 결정하므로 생략 가능
+      # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
+      KIS_APP_KEY:     ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET:  ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
+      APP_KEY:         ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET:      ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
 
-      # ===== trader.py 운영 파라미터 =====
+      CANO:            ${{ secrets.CANO }}
+      ACNT_PRDT_CD:    ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV:         ${{ secrets.KIS_ENV }}              # practice / real
+      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
+      API_BASE_URL:    ${{ secrets.API_BASE_URL }}
+
+      # === trader.py 운영 파라미터 ===
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.02"
@@ -34,15 +39,21 @@ jobs:
       SELL_ALL_BALANCES_AT_CUTOFF: "false"
       FORCE_SELL_PASSES_CUTOFF: "2"
       FORCE_SELL_PASSES_CLOSE: "4"
+
       DEFAULT_PROFIT_PCT: "3.0"
       DEFAULT_LOSS_PCT: "-5.0"
+
       SLIPPAGE_LIMIT_PCT: "0.25"
       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+
       W_MAX_ONE: "0.25"
       W_MIN_ONE: "0.03"
+
       REBALANCE_ANCHOR: "weekly"
       FORCE_WEEKLY_REBALANCE: "0"
       MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+
+      # 레짐/지수
       KOSDAQ_INDEX_CODE: "KOSDAQ"
       KOSDAQ_ETF_FALLBACK: "229200"
       REG_BULL_MIN_UP_PCT: "0.5"
@@ -56,9 +67,14 @@ jobs:
       TRAIL_PCT_BULL: "0.025"
       TRAIL_PCT_BEAR: "0.012"
       TP_PROFIT_PCT_BULL: "3.5"
+
       MARKET_DATA_WHEN_CLOSED: "false"
+
+      # 배분/속도
       DAILY_CAPITAL: "50000000"
       API_RATE_SLEEP_SEC: "0.3"
+
+      # === FastAPI 리밸런싱 서버(선정 필터) ===
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -84,10 +100,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드)
+      - name: (진단) 핵심 환경변수 주입 여부만 확인
+        run: |
+          python - << 'PY'
+          import os
+          def chk(k):
+              v = os.getenv(k) or ''
+              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
+          for k in [
+              'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
+              'CANO','ACNT_PRDT_CD','KIS_ENV'
+          ]:
+              chk(k)
+          PY
+
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30
+          sleep 30  # 서버 기동 대기
 
       - name: trader 자동매매 로직 실행
         env:
@@ -96,16 +126,19 @@ jobs:
           python -m trader.trader
 
       - name: CEO 리포트 자동 생성
+        if: always()
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.report_ceo
+          python -m trader.report_ceo || true
 
       - name: Verify CEO report exists
+        if: always()
         run: |
           ls -al trader/logs || true
 
       - name: CEO 리포트 artifact 업로드
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ceo-report
