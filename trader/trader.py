@@ -22,7 +22,7 @@ from .report_ceo import ceo_report
 # =========================
 CONFIG = {
     "SELL_FORCE_TIME": "14:40",
-    "SELL_ALL_BALANCES_AT_CUTOFF": "false",   # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
+    "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
     "API_RATE_SLEEP_SEC": "0.5",
     "FORCE_SELL_PASSES_CUTOFF": "2",
     "FORCE_SELL_PASSES_CLOSE": "4",
@@ -40,6 +40,7 @@ CONFIG = {
     "W_MAX_ONE": "0.25",
     "W_MIN_ONE": "0.03",
     "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
+    "WEEKLY_ANCHOR_REF": "last",              # NEW: 'last'(직전 일요일) | 'next'(다음 일요일)
     "MOMENTUM_OVERRIDES_FORCE_SELL": "true",
     # 레짐(코스닥) 파라미터
     "KOSDAQ_INDEX_CODE": "KOSDAQ",
@@ -116,7 +117,7 @@ MARKET_MAP: Dict[str, str] = {
     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
 }
 def get_market(code: str) -> str:
-    return MARKET_MAP.get(code, "J")
+    return MARKET_MAP.get(code, "J")  # 데이터 없음
 
 # 데이터 없음 1차 감지 상태 저장(연속 DATA_EMPTY 확인용)
 EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
@@ -143,6 +144,7 @@ SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
 W_MAX_ONE = float(_cfg("W_MAX_ONE"))
 W_MIN_ONE = float(_cfg("W_MIN_ONE"))
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
+WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
 MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
 
 def _parse_hhmm(hhmm: str) -> dtime:
@@ -202,14 +204,31 @@ def should_weekly_rebalance_now(now=None):
 def stamp_weekly_done(now=None):
     _write_last_weekly(now)
 
-def get_rebalance_anchor_date() -> str:
-    today = datetime.now(KST).date()
+def get_rebalance_anchor_date(now: Optional[datetime] = None) -> str:
+    """
+    weekly 모드에서 기준일 산정:
+      - WEEKLY_ANCHOR_REF='last'  → 직전 일요일(기본)
+      - WEEKLY_ANCHOR_REF='next'  → 다음 일요일
+    """
+    now = now or datetime.now(KST)
+    today = now.date()
+
     if REBALANCE_ANCHOR == "weekly":
-        days_to_sunday = (6 - today.weekday()) % 7
-        anchor_date = today + timedelta(days=days_to_sunday)
+        ref = WEEKLY_ANCHOR_REF if WEEKLY_ANCHOR_REF in ("last", "next", "prev", "previous") else "last"
+        if ref in ("last", "prev", "previous"):
+            # 월(0)~일(6). '일요일로부터 지난 일수' = (weekday+1) % 7
+            days_since_sun = (today.weekday() + 1) % 7
+            anchor_date = today - timedelta(days=days_since_sun)
+        else:
+            # 다음 일요일까지 남은 일수
+            days_to_sun = (6 - today.weekday()) % 7
+            anchor_date = today + timedelta(days=days_to_sun)
         return anchor_date.strftime("%Y-%m-%d")
+
     if REBALANCE_ANCHOR == "today":
         return today.strftime("%Y-%m-%d")
+
+    # monthly
     return today.replace(day=1).strftime("%Y-%m-%d")
 
 def fetch_rebalancing_targets(date: str) -> List[Dict[str, Any]]:
@@ -363,10 +382,10 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
     except Exception as e:
         logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 보조소스 실패: {e}")
 
-    # 4) 최후: 캐시가 있으면 stale_ok_sec 내 제공
+    # 4) 최후: 캐시가 있으면 stale_ok_sec 내 제공  (BUGFIX: px 반환)
     ent = _LAST_PRICE_CACHE.get(code)
     if ent and (now - ent["ts"] <= stale_ok_sec):
-        return float(ent["ts"])
+        return float(ent["px"])
     return None
 
 def _fetch_balances(kis: KisAPI) -> List[Dict[str, Any]]:
@@ -808,7 +827,6 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
 REGIME_ENABLED = True
 KOSDAQ_CODE = _cfg("KOSDAQ_INDEX_CODE")
 KOSDAQ_ETF_FALLBACK = _cfg("KOSDAQ_ETF_FALLBACK")  # KODEX 코스닥150
-
 REG_BULL_MIN_UP_PCT = float(_cfg("REG_BULL_MIN_UP_PCT"))
 REG_BULL_MIN_MINUTES = int(_cfg("REG_BULL_MIN_MINUTES"))
 REG_BEAR_VWAP_MINUTES = int(_cfg("REG_BEAR_VWAP_MINUTES"))
@@ -1172,7 +1190,7 @@ def main():
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
-    logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date} (anchor={REBALANCE_ANCHOR})")
+    logger.info(f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date} (anchor={REBALANCE_ANCHOR}, ref={WEEKLY_ANCHOR_REF})")
     logger.info(
         f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
         f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}"
@@ -1362,7 +1380,6 @@ def main():
                                         f"[ENTER-GUARD] {code} 진입슬리피지 {slip_pct:.2f}% > "
                                         f"{SLIPPAGE_ENTER_GUARD_PCT:.2f}% → 진입 스킵"
                                     )
-
                             if not guard_ok:
                                 continue
 
