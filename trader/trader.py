@@ -14,6 +14,7 @@ import random
 from typing import Optional, Dict, Any, Tuple, List
 import csv
 from .report_ceo import ceo_report
+from .metrics import vwap_guard   # 🔸 VWAP 가드 함수
 
 # =========================
 # [CONFIG] .env 없이도 동작
@@ -37,6 +38,7 @@ CONFIG = {
     "DAILY_CAPITAL": "50000000",
     "SLIPPAGE_LIMIT_PCT": "0.25",
     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
+    "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
     "W_MAX_ONE": "0.25",
     "W_MIN_ONE": "0.03",
     "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
@@ -141,6 +143,7 @@ DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
 DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
 SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
 SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
+VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
 W_MAX_ONE = float(_cfg("W_MAX_ONE"))
 W_MIN_ONE = float(_cfg("W_MIN_ONE"))
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
