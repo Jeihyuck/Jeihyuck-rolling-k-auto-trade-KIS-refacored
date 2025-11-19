@@ -1372,6 +1372,8 @@ def main():
 
                         if enter_cond:
                             guard_ok = True
+
+                            # 1) 진입 슬리피지 가드 (기존)
                             if eff_target_price and eff_target_price > 0 and current_price is not None:
                                 slip_pct = ((float(current_price) - float(eff_target_price)) / float(eff_target_price)) * 100.0
                                 if slip_pct > SLIPPAGE_ENTER_GUARD_PCT:
@@ -1380,6 +1382,20 @@ def main():
                                         f"[ENTER-GUARD] {code} 진입슬리피지 {slip_pct:.2f}% > "
                                         f"{SLIPPAGE_ENTER_GUARD_PCT:.2f}% → 진입 스킵"
                                     )
+
+                            # 2) VWAP 가드: 현재가가 VWAP*(1 - tol) 이상인지 체크
+                            if guard_ok and current_price is not None:
+                                vwap_val = kis.get_vwap_today(code)
+                                if vwap_val is None:
+                                    logger.info(f"[VWAP-SKIP] {code}: VWAP 데이터 없음 → VWAP 가드 생략")
+                                else:
+                                    if not vwap_guard(float(current_price), float(vwap_val), VWAP_TOL):
+                                        guard_ok = False
+                                        logger.info(
+                                            f"[VWAP-GUARD] {code}: 현재가({current_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
+                                            f"→ 진입 스킵 (VWAP={vwap_val:.2f})"
+                                        )
+
                             if not guard_ok:
                                 continue
 
