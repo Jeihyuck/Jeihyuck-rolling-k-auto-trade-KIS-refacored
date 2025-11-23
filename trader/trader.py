@@ -69,29 +69,12 @@ def _cfg(key: str) -> str:
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
-    from .rkmax_utils import blend_k, recent_features, decide_position_limit, select_champions
+    from .rkmax_utils import blend_k, recent_features
 except Exception:
-    # rkmax_utils 임포트 실패 시, 보수적인 기본값 사용
     def blend_k(k_month: float, day: int, atr20: Optional[float], atr60: Optional[float]) -> float:
         return float(k_month) if k_month is not None else 0.5
-
     def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
         return {"atr20": None, "atr60": None}
-
-    def decide_position_limit(candidates):
-        # 정보가 없을 때는 종목 1개만 가져가도록 안전하게 조정
-        try:
-            n = len(list(candidates or []))
-        except Exception:
-            n = 0
-        if n <= 0:
-            return 0
-        return 1
-
-    def select_champions(candidates, position_limit):
-        # 임포트 실패 시에는 상위 N개를 그대로 사용 (스코어링 없음)
-        arr = list(candidates or [])
-        return arr[: max(0, position_limit or 0)]
 
 # === [ANCHOR: TICK_UTILS] KRX 호가단위 & 라운딩 ===
 def _krx_tick(price: float) -> int:
@@ -1249,35 +1232,7 @@ def main():
         # 실패 시에는 일단 보수적으로 신규매수 스킵
         can_buy = False
 
-
-    # [CHAMPION MODE] 오늘 가져갈 종목 수 결정 + 챔피언 종목만 선별
-    try:
-        position_limit = decide_position_limit(targets)
-    except Exception:
-        logger.exception("[CHAMPION] decide_position_limit 실패 → 기본값 2개 사용")
-        position_limit = 2
-
-    if position_limit <= 0:
-        logger.info("[CHAMPION] position_limit<=0 → 오늘은 신규 매수 없음 (targets=%s)", len(targets))
-        targets = []
-    else:
-        if targets:
-            logger.info(
-                "[CHAMPION] candidates=%s → position_limit=%s, 챔피언 선별 시작",
-                len(targets),
-                position_limit,
-            )
-            targets = select_champions(targets, position_limit)
-            logger.info(
-                "[CHAMPION] 최종 챔피언 종목: %s",
-                [
-                    (t.get("stock_code") or t.get("code"), t.get("champ_score"), t.get("champ_rank"))
-                    for t in targets
-                ],
-            )
-
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
-
 
     processed_targets: Dict[str, Any] = {}
     for t in targets:
@@ -1343,7 +1298,7 @@ def main():
     for code, info in processed_targets.items():
         # 20일 수익률을 기본 점수로 사용 (rolling K 백테스트 결과와 결을 맞추기 위함)
         try:
-            ret_20d = _get_20d_return(kis, code)
+            ret_20d = get_20d_return_pct(kis, code)
         except Exception:
             ret_20d = 0.0
 
