@@ -14,7 +14,7 @@ on:
 jobs:
   monitor-trade:
     # 🔒 안전장치: 혹시라도 main에서 실행되더라도 vwap 브랜치가 아닐 땐 스킵
-    if: github.ref == 'refs/heads/vwap'
+    if: github.ref == 'refs/heads/vwap-ch'
     runs-on: ubuntu-latest
 
     env:
