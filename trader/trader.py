@@ -69,12 +69,29 @@ def _cfg(key: str) -> str:
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
-    from .rkmax_utils import blend_k, recent_features
+    from .rkmax_utils import blend_k, recent_features, decide_position_limit, select_champions
 except Exception:
+    # rkmax_utils 임포트 실패 시, 보수적인 기본값 사용
     def blend_k(k_month: float, day: int, atr20: Optional[float], atr60: Optional[float]) -> float:
         return float(k_month) if k_month is not None else 0.5
+
     def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
         return {"atr20": None, "atr60": None}
+
+    def decide_position_limit(candidates):
+        # 정보가 없을 때는 종목 1개만 가져가도록 안전하게 조정
+        try:
+            n = len(list(candidates or []))
+        except Exception:
+            n = 0
+        if n <= 0:
+            return 0
+        return 1
+
+    def select_champions(candidates, position_limit):
+        # 임포트 실패 시에는 상위 N개를 그대로 사용 (스코어링 없음)
+        arr = list(candidates or [])
+        return arr[: max(0, position_limit or 0)]
 
 # === [ANCHOR: TICK_UTILS] KRX 호가단위 & 라운딩 ===
 def _krx_tick(price: float) -> int:
@@ -1232,7 +1249,36 @@ def main():
         # 실패 시에는 일단 보수적으로 신규매수 스킵
         can_buy = False
 
+
+    # [CHAMPION MODE] 오늘 가져갈 종목 수 결정 + 챔피언 종목만 선별
+    try:
+        position_limit = decide_position_limit(targets)
+    except Exception:
+        logger.exception("[CHAMPION] decide_position_limit 실패 → 기본값 2개 사용")
+        position_limit = 2
+
+    if position_limit <= 0:
+        logger.info("[CHAMPION] position_limit<=0 → 오늘은 신규 매수 없음 (targets=%s)", len(targets))
+        targets = []
+    else:
+        if targets:
+            logger.info(
+                "[CHAMPION] candidates=%s → position_limit=%s, 챔피언 선별 시작",
+                len(targets),
+                position_limit,
+            )
+            targets = select_champions(targets, position_limit)
+            logger.info(
+                "[CHAMPION] 최종 챔피언 종목: %s",
+                [
+                    (t.get("stock_code") or t.get("code"), t.get("champ_score"), t.get("champ_rank"))
+                    for t in targets
+                ],
+            )
+
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
+
+
     processed_targets: Dict[str, Any] = {}
     for t in targets:
         code = t.get("stock_code") or t.get("code")
@@ -1249,8 +1295,8 @@ def main():
             ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
             try:
                 qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
-                logger.info(f"[ALLOC->QTY] {code} weight={weight} ref_px={ref_px} → qty={qty}")
-            except Exception:
+            except Exception as e:
+                logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
                 qty = 0
 
         processed_targets[code] = {
@@ -1266,7 +1312,83 @@ def main():
             "prev_close": t.get("prev_close"),
             "prev_volume": t.get("prev_volume"),
         }
-    code_to_target: Dict[str, Any] = processed_targets
+
+    # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 ===
+    # - rolling K 리밸런싱 결과 중에서 최근 모멘텀/수익률이 가장 강한 소수 종목만 실매매 대상으로 사용
+    # - 레짐(mode)에 따라 신규 편입 허용 종목 수를 1~2개로 자동 조절
+    #   * bull / neutral: 최대 2개
+    #   * bear: 최대 1개 (방어적 운용)
+    # - intraday 진입은 기존 VWAP 가드(is_vwap_ok_for_entry)로 필터링됨
+    selected_targets: Dict[str, Any] = {}
+
+    try:
+        # 가능하면 당일 레짐을 한번 계산해서 사용
+        regime_snapshot = _update_market_regime(kis)
+        mode = (regime_snapshot or {}).get("mode") or "neutral"
+        pct_change = float((regime_snapshot or {}).get("pct_change") or 0.0)
+    except Exception as e:
+        logger.warning("[REBALANCE] 레짐 스냅샷 계산 실패, neutral로 대체: %s", e)
+        mode = "neutral"
+        pct_change = 0.0
+
+    # 레짐 기반 신규 편입 상한
+    if mode == "bear":
+        max_new = 1
+    else:
+        # neutral / bull 모두 2개까지 허용 (향후 pct_change 구간별로 더 쪼갤 수 있음)
+        max_new = 2
+
+    scored: List[Tuple[str, float, bool]] = []
+
+    for code, info in processed_targets.items():
+        # 20일 수익률을 기본 점수로 사용 (rolling K 백테스트 결과와 결을 맞추기 위함)
+        try:
+            ret_20d = _get_20d_return(kis, code)
+        except Exception:
+            ret_20d = 0.0
+
+        # 단기 모멘텀 강세 여부 (is_strong_momentum)로 버킷 구분
+        try:
+            strong = is_strong_momentum(kis, code)
+        except Exception as e:
+            logger.warning("[REBALANCE] 모멘텀 판별 실패 %s: %s", code, e)
+            strong = False
+
+        scored.append((code, ret_20d, strong))
+
+    # 모멘텀 strong 버킷 우선, 그 다음 나머지 중에서 점수 순으로 채우기
+    strong_bucket = [x for x in scored if x[2]]
+    weak_bucket = [x for x in scored if not x[2]]
+
+    strong_bucket.sort(key=lambda x: x[1], reverse=True)
+    weak_bucket.sort(key=lambda x: x[1], reverse=True)
+
+    picked: List[str] = []
+
+    for code, score, _ in strong_bucket:
+        if len(picked) >= max_new:
+            break
+        picked.append(code)
+
+    for code, score, _ in weak_bucket:
+        if len(picked) >= max_new:
+            break
+        picked.append(code)
+
+    for code in picked:
+        selected_targets[code] = processed_targets[code]
+
+    logger.info(
+        "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
+        mode,
+        pct_change,
+        len(processed_targets),
+        len(selected_targets),
+        ",".join(selected_targets.keys()),
+    )
+
+    code_to_target: Dict[str, Any] = selected_targets
+
 
     loop_sleep_sec = 2.5
 
