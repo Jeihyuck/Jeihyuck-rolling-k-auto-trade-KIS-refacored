@@ -1049,7 +1049,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
                 "amount": (_to_int(cur_price, 0) * int(sell_qty)) if cur_price is not None else 0,
                 "result": result,
                 "pnl_pct": (((float(cur_price) - float(buy_px_for_pnl)) / float(buy_px_for_pnl) * 100.0) if (cur_price is not None and buy_px_for_pnl) else None),
-                "profit": (int(round((float(cur_price) - float(buy_px_for_pnl)) * int(sell_qty))) if (cur_price is not None and buy_px_for_pnl) else None),
+                "profit": (int(round((float(cur_price) - float(buy_px_for_pnl) * int(sell_qty)))) if (cur_price is not None and buy_px_for_pnl) else None),
                 "reason": reason
             })
         finally:
@@ -1250,6 +1250,7 @@ def main():
             ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
             try:
                 qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
+                logger.info(f"[ALLOC->QTY] {code} weight={weight} ref_px={ref_px} → qty={qty}")
             except Exception as e:
                 logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
                 qty = 0
@@ -1343,7 +1344,6 @@ def main():
     )
 
     code_to_target: Dict[str, Any] = selected_targets
-
 
     loop_sleep_sec = 2.5
 
@@ -1713,3 +1713,4 @@ def main():
 # 실행부
 if __name__ == "__main__":
     main()
+    
