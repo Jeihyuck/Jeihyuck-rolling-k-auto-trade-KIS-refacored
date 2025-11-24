@@ -1190,6 +1190,9 @@ def _adaptive_exit(
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
 def main():
+    logger.info("[SANITY] RK-VWAP-REGIME SELECTOR ACTIVE")
+    logger.info(f"[SANITY] trader.trader file = {__file__}")
+
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
