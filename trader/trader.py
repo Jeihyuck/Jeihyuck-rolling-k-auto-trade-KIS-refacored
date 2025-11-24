@@ -1234,11 +1234,7 @@ def main():
 
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
 
-    
-    # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산하기 전에
-    # 전체 후보 스냅샷(processed_targets_full)을 먼저 만들고,
-    # 레짐/모멘텀 기반 챔피언 1~2개를 고른 뒤에만 qty를 계산한다.
-    processed_targets_full: Dict[str, Any] = {}
+    processed_targets: Dict[str, Any] = {}
     for t in targets:
         code = t.get("stock_code") or t.get("code")
         if not code:
@@ -1246,17 +1242,24 @@ def main():
         name = t.get("name") or t.get("종목명")
         k_best = t.get("best_k") or t.get("K") or t.get("k")
         target_price = _to_float(t.get("목표가") or t.get("target_price"))
-        raw_qty = _to_int(t.get("매수수량") or t.get("qty"), 0)
+        qty = _to_int(t.get("매수수량") or t.get("qty"), 0)
         weight = t.get("weight")
         strategy = t.get("strategy") or "전월 rolling K 최적화"
 
-        processed_targets_full[code] = {
+        if qty <= 0 and weight is not None:
+            ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
+            try:
+                qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
+            except Exception as e:
+                logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
+                qty = 0
+
+        processed_targets[code] = {
             "code": code,
             "name": name,
             "best_k": k_best,
             "target_price": target_price,
-            "raw_qty": raw_qty,
-            "weight": weight,
+            "qty": qty,
             "strategy": strategy,
             "prev_open": t.get("prev_open"),
             "prev_high": t.get("prev_high"),
@@ -1265,10 +1268,16 @@ def main():
             "prev_volume": t.get("prev_volume"),
         }
 
-    # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 (Champion) ===
+    # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 ===
+    # - rolling K 리밸런싱 결과 중에서 최근 모멘텀/수익률이 가장 강한 소수 종목만 실매매 대상으로 사용
+    # - 레짐(mode)에 따라 신규 편입 허용 종목 수를 1~2개로 자동 조절
+    #   * bull / neutral: 최대 2개
+    #   * bear: 최대 1개 (방어적 운용)
+    # - intraday 진입은 기존 VWAP 가드(is_vwap_ok_for_entry)로 필터링됨
     selected_targets: Dict[str, Any] = {}
 
     try:
+        # 가능하면 당일 레짐을 한번 계산해서 사용
         regime_snapshot = _update_market_regime(kis)
         mode = (regime_snapshot or {}).get("mode") or "neutral"
         pct_change = float((regime_snapshot or {}).get("pct_change") or 0.0)
@@ -1277,19 +1286,23 @@ def main():
         mode = "neutral"
         pct_change = 0.0
 
+    # 레짐 기반 신규 편입 상한
     if mode == "bear":
         max_new = 1
     else:
+        # neutral / bull 모두 2개까지 허용 (A안)
         max_new = 2
 
     scored: List[Tuple[str, float, bool]] = []
 
-    for code, info in processed_targets_full.items():
+    for code, info in processed_targets.items():
+        # 20일 수익률을 기본 점수로 사용 (rolling K 백테스트 결과와 결을 맞추기 위함)
         try:
             ret_20d = get_20d_return_pct(kis, code)
         except Exception:
             ret_20d = 0.0
 
+        # 단기 모멘텀 강세 여부 (is_strong_momentum)로 버킷 구분
         try:
             strong = is_strong_momentum(kis, code)
         except Exception as e:
@@ -1298,6 +1311,7 @@ def main():
 
         scored.append((code, ret_20d, strong))
 
+    # 모멘텀 strong 버킷 우선, 그 다음 나머지 중에서 점수 순으로 채우기
     strong_bucket = [x for x in scored if x[2]]
     weak_bucket = [x for x in scored if not x[2]]
 
@@ -1316,42 +1330,14 @@ def main():
             break
         picked.append(code)
 
-    # 챔피언만 qty 계산
     for code in picked:
-        base = processed_targets_full[code]
-        weight = base.get("weight")
-        raw_qty = _to_int(base.get("raw_qty", 0), 0)
-
-        qty = raw_qty
-        if qty <= 0 and weight is not None:
-            ref_px = _to_float(base.get("prev_close")) or _to_float(base.get("prev_open"))
-            try:
-                qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
-            except Exception as e:
-                logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
-                qty = 0
-
-        selected_targets[code] = {**base, "qty": qty}
-
-    champion_qty_str = ",".join(
-        f"{code}:{selected_targets.get(code, {}).get('qty', 0)}" for code in picked
-    ) or "-"
-
-    logger.info(
-        "[CHAMPION] 레짐=%s pct=%.2f%%, max_new=%d, 후보=%d개 → 챔피언=%s (qty=%s)",
-        mode,
-        pct_change,
-        max_new,
-        len(processed_targets_full),
-        ",".join(picked) or "-",
-        champion_qty_str,
-    )
+        selected_targets[code] = processed_targets[code]
 
     logger.info(
         "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
         mode,
         pct_change,
-        len(processed_targets_full),
+        len(processed_targets),
         len(selected_targets),
         ",".join(selected_targets.keys()),
     )
