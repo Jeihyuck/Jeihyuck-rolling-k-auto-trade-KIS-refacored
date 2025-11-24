@@ -491,30 +491,76 @@ def _weight_to_qty(
     daily_capital: int,
     ref_price: Optional[float] = None
 ) -> int:
-    weight = max(W_MIN_ONE, min(max(0.0, float(weight)), W_MAX_ONE))
-    alloc = int(round(daily_capital * weight))
+    """
+    weight(비중) -> 일일 예산(daily_capital) 기준 매수 수량으로 변환
+    - weight는 W_MIN_ONE ~ W_MAX_ONE 사이로 클램프
+    - ref_price가 있으면 우선 사용, 없으면 장중 현재가 / 장외 종가 사용
+    - 디버깅을 위해 [ALLOC->QTY] 로그를 남김
+    """
+    # 1) weight 클램프
+    try:
+        raw_weight = float(weight)
+    except Exception:
+        raw_weight = 0.0
+    clamped_weight = max(W_MIN_ONE, min(max(0.0, raw_weight), W_MAX_ONE))
 
-    price = None
-    if ref_price is not None and float(ref_price) > 0:
-        price = float(ref_price)
+    # 2) 배분 금액
+    alloc = int(round(daily_capital * clamped_weight))
+
+    # 3) 기준 가격 결정
+    price: Optional[float] = None
+    if ref_price is not None:
+        try:
+            if float(ref_price) > 0:
+                price = float(ref_price)
+        except Exception:
+            price = None
 
     if price is None:
         try:
             if kis.is_market_open():
+                # 장중이면 현재가
                 price = _safe_get_price(kis, code)
             else:
+                # 장외면 종가 폴백
                 if hasattr(kis, "get_close_price"):
                     try:
-                        price = float(kis.get_close_price(code))
+                        close_px = kis.get_close_price(code)
+                        if close_px is not None and float(close_px) > 0:
+                            price = float(close_px)
                     except Exception:
                         price = None
         except Exception:
             price = None
 
+    # 4) 가격을 끝까지 못 구한 경우 → 0 리턴 + 로그
     if price is None or price <= 0:
+        logger.warning(
+            f"[ALLOC->QTY] {code} price invalid (price={price}, ref_price={ref_price}) "
+            f"weight={raw_weight}→{clamped_weight}, alloc={alloc:,} → qty=0"
+        )
         return 0
 
-    return max(0, int(alloc // int(price)))
+    # 5) 최종 수량 계산
+    try:
+        tick_price = int(price)
+        if tick_price <= 0:
+            raise ValueError("non-positive price")
+        qty = max(0, alloc // tick_price)
+    except Exception:
+        logger.warning(
+            f"[ALLOC->QTY] {code} price convert fail (price={price}) "
+            f"weight={raw_weight}→{clamped_weight}, alloc={alloc:,} → qty=0"
+        )
+        return 0
+
+    # 6) 디버깅 로그
+    logger.info(
+        f"[ALLOC->QTY] {code} weight={clamped_weight:.6f} "
+        f"alloc={alloc:,} ref_px={price:.2f} → qty={qty}"
+    )
+
+    return int(qty)
 
 # === ATR, 상태 초기화 ===
 def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
@@ -1713,4 +1759,3 @@ def main():
 # 실행부
 if __name__ == "__main__":
     main()
-    
