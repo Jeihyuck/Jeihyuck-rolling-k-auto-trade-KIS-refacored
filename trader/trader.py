@@ -61,7 +61,11 @@ CONFIG = {
     # 기타
     "MARKET_DATA_WHEN_CLOSED": "false",
     "FORCE_WEEKLY_REBALANCE": "0",
+    "CHAMPION_ENABLE": "true",
+    "CHAMPION_TOP_N": "2",
+    "CHAMPION_SCORE_FIELD": "sharpe_m",
 }
+
 
 def _cfg(key: str) -> str:
     """환경변수 > CONFIG 기본값"""
@@ -149,6 +153,12 @@ W_MIN_ONE = float(_cfg("W_MIN_ONE"))
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
 WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
 MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
+CHAMPION_ENABLE = _cfg("CHAMPION_ENABLE").lower() == "true"
+try:
+    CHAMPION_TOP_N = max(1, int(_cfg("CHAMPION_TOP_N")))
+except Exception:
+    CHAMPION_TOP_N = 2
+CHAMPION_SCORE_FIELD = _cfg("CHAMPION_SCORE_FIELD")
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -1049,7 +1059,7 @@ def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market
                 "amount": (_to_int(cur_price, 0) * int(sell_qty)) if cur_price is not None else 0,
                 "result": result,
                 "pnl_pct": (((float(cur_price) - float(buy_px_for_pnl)) / float(buy_px_for_pnl) * 100.0) if (cur_price is not None and buy_px_for_pnl) else None),
-                "profit": (int(round((float(cur_price) - float(buy_px_for_pnl) * int(sell_qty)))) if (cur_price is not None and buy_px_for_pnl) else None),
+                "profit": (int(round((float(cur_price) - float(buy_px_for_pnl)) * int(sell_qty))) if (cur_price is not None and buy_px_for_pnl) else None),
                 "reason": reason
             })
         finally:
@@ -1190,9 +1200,6 @@ def _adaptive_exit(
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
 def main():
-    logger.info("[SANITY] RK-VWAP-REGIME SELECTOR ACTIVE")
-    logger.info(f"[SANITY] trader.trader file = {__file__}")
-
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -1253,7 +1260,6 @@ def main():
             ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
             try:
                 qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
-                logger.info(f"[ALLOC->QTY] {code} weight={weight} ref_px={ref_px} → qty={qty}")
             except Exception as e:
                 logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
                 qty = 0
@@ -1270,83 +1276,83 @@ def main():
             "prev_low": t.get("prev_low"),
             "prev_close": t.get("prev_close"),
             "prev_volume": t.get("prev_volume"),
+            "sharpe_m": t.get("sharpe_m"),
+            "avg_return_pct": t.get("avg_return_pct"),
+            "cumulative_return_pct": t.get("cumulative_return_pct"),
+            "win_rate_pct": t.get("win_rate_pct"),
+            "mdd_pct": t.get("mdd_pct"),
         }
 
-    # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 ===
-    # - rolling K 리밸런싱 결과 중에서 최근 모멘텀/수익률이 가장 강한 소수 종목만 실매매 대상으로 사용
-    # - 레짐(mode)에 따라 신규 편입 허용 종목 수를 1~2개로 자동 조절
-    #   * bull / neutral: 최대 2개
-    #   * bear: 최대 1개 (방어적 운용)
-    # - intraday 진입은 기존 VWAP 가드(is_vwap_ok_for_entry)로 필터링됨
+        # === [NEW] Champion 로직: 레짐 + Rolling-K 메타 기반 상위 N 종목만 사용 ===
+    # - 리밸런싱 결과 중 Sharpe/수익률이 가장 좋은 소수 종목만 실매매 대상으로 사용
+    # - 레짐(mode)에 따라 최대 편입 종목 수를 조절
     selected_targets: Dict[str, Any] = {}
 
     try:
-        # 가능하면 당일 레짐을 한번 계산해서 사용
-        regime_snapshot = _update_market_regime(kis)
-        mode = (regime_snapshot or {}).get("mode") or "neutral"
-        pct_change = float((regime_snapshot or {}).get("pct_change") or 0.0)
+        if not CHAMPION_ENABLE:
+            logger.info("[CHAMPION] 비활성화 → 리밸런싱 전체 %d개 종목 사용", len(processed_targets))
+            selected_targets = dict(processed_targets)
+        else:
+            regime = _update_market_regime(kis)
+            mode = getattr(regime, "mode", "neutral") or "neutral"
+            pct = float(getattr(regime, "pct", 0.0) or 0.0)
+
+            # 레짐별 최대 신규 편입 종목 수
+            if mode == "bear":
+                max_new = 1
+            else:
+                max_new = CHAMPION_TOP_N
+
+            def _to_f(x: Any) -> float:
+                try:
+                    return float(x)
+                except Exception:
+                    return 0.0
+
+            scored: List[Tuple[str, float]] = []
+            for code, info in processed_targets.items():
+                sharpe = _to_f(info.get("sharpe_m"))
+                avg_ret = _to_f(info.get("avg_return_pct"))
+                cum_ret = _to_f(info.get("cumulative_return_pct"))
+
+                if CHAMPION_SCORE_FIELD == "sharpe_m" and sharpe != 0.0:
+                    score = sharpe * 10.0 + avg_ret
+                elif CHAMPION_SCORE_FIELD == "avg_return_pct" and avg_ret != 0.0:
+                    score = avg_ret
+                elif CHAMPION_SCORE_FIELD == "cumulative_return_pct" and cum_ret != 0.0:
+                    score = cum_ret
+                else:
+                    # fallback: Sharpe 우선, 없으면 평균/누적 수익률 순
+                    if sharpe != 0.0:
+                        score = sharpe * 10.0 + avg_ret
+                    elif avg_ret != 0.0:
+                        score = avg_ret
+                    else:
+                        score = cum_ret
+
+                scored.append((code, score))
+
+            if not scored:
+                logger.warning("[CHAMPION] 점수 계산 실패 → 전체 종목 사용")
+                selected_targets = dict(processed_targets)
+            else:
+                scored.sort(key=lambda x: x[1], reverse=True)
+                picked_codes = [c for c, _ in scored[:max_new]]
+                selected_targets = {c: processed_targets[c] for c in picked_codes}
+                logger.info(
+                    "[CHAMPION] mode=%s pct=%.2f%% 전체 %d개 중 상위 %d개 선정: %s",
+                    mode,
+                    pct,
+                    len(processed_targets),
+                    len(selected_targets),
+                    ",".join(picked_codes),
+                )
     except Exception as e:
-        logger.warning("[REBALANCE] 레짐 스냅샷 계산 실패, neutral로 대체: %s", e)
-        mode = "neutral"
-        pct_change = 0.0
-
-    # 레짐 기반 신규 편입 상한
-    if mode == "bear":
-        max_new = 1
-    else:
-        # neutral / bull 모두 2개까지 허용 (향후 pct_change 구간별로 더 쪼갤 수 있음)
-        max_new = 2
-
-    scored: List[Tuple[str, float, bool]] = []
-
-    for code, info in processed_targets.items():
-        # 20일 수익률을 기본 점수로 사용 (rolling K 백테스트 결과와 결을 맞추기 위함)
-        try:
-            ret_20d = get_20d_return_pct(kis, code)
-        except Exception:
-            ret_20d = 0.0
-
-        # 단기 모멘텀 강세 여부 (is_strong_momentum)로 버킷 구분
-        try:
-            strong = is_strong_momentum(kis, code)
-        except Exception as e:
-            logger.warning("[REBALANCE] 모멘텀 판별 실패 %s: %s", code, e)
-            strong = False
-
-        scored.append((code, ret_20d, strong))
-
-    # 모멘텀 strong 버킷 우선, 그 다음 나머지 중에서 점수 순으로 채우기
-    strong_bucket = [x for x in scored if x[2]]
-    weak_bucket = [x for x in scored if not x[2]]
-
-    strong_bucket.sort(key=lambda x: x[1], reverse=True)
-    weak_bucket.sort(key=lambda x: x[1], reverse=True)
-
-    picked: List[str] = []
-
-    for code, score, _ in strong_bucket:
-        if len(picked) >= max_new:
-            break
-        picked.append(code)
-
-    for code, score, _ in weak_bucket:
-        if len(picked) >= max_new:
-            break
-        picked.append(code)
-
-    for code in picked:
-        selected_targets[code] = processed_targets[code]
-
-    logger.info(
-        "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
-        mode,
-        pct_change,
-        len(processed_targets),
-        len(selected_targets),
-        ",".join(selected_targets.keys()),
-    )
+        logger.exception("[CHAMPION] 예외 발생 → 전체 종목 사용: %s", e)
+        selected_targets = dict(processed_targets)
 
     code_to_target: Dict[str, Any] = selected_targets
+
 
     loop_sleep_sec = 2.5
 
@@ -1716,5 +1722,3 @@ def main():
 # 실행부
 if __name__ == "__main__":
     main()
-     
-     
