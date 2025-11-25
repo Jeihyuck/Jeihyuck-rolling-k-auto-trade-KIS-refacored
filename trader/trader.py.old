@@ -1352,6 +1352,7 @@ def main():
     except Exception as e:
         logger.exception("[CHAMPION] 예외 발생 → 전체 종목 사용: %s", e)
         selected_targets = dict(processed_targets)
+        
     code_to_target: Dict[str, Any] = selected_targets
 
 
