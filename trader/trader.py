@@ -64,8 +64,8 @@ CONFIG = {
     "CHAMPION_ENABLE": "true",
     "CHAMPION_TOP_N": "2",
     "CHAMPION_SCORE_FIELD": "sharpe_m",
-}
 
+}
 
 def _cfg(key: str) -> str:
     """환경변수 > CONFIG 기본값"""
@@ -159,6 +159,7 @@ try:
 except Exception:
     CHAMPION_TOP_N = 2
 CHAMPION_SCORE_FIELD = _cfg("CHAMPION_SCORE_FIELD")
+
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -1276,13 +1277,14 @@ def main():
             "prev_low": t.get("prev_low"),
             "prev_close": t.get("prev_close"),
             "prev_volume": t.get("prev_volume"),
-            "sharpe_m": t.get("sharpe_m"),
-            "avg_return_pct": t.get("avg_return_pct"),
-            "cumulative_return_pct": t.get("cumulative_return_pct"),
-            "win_rate_pct": t.get("win_rate_pct"),
-            "mdd_pct": t.get("mdd_pct"),
         }
 
+    # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 ===
+    # - rolling K 리밸런싱 결과 중에서 최근 모멘텀/수익률이 가장 강한 소수 종목만 실매매 대상으로 사용
+    # - 레짐(mode)에 따라 신규 편입 허용 종목 수를 1~2개로 자동 조절
+    #   * bull / neutral: 최대 2개
+    #   * bear: 최대 1개 (방어적 운용)
+    # - intraday 진입은 기존 VWAP 가드(is_vwap_ok_for_entry)로 필터링됨
         # === [NEW] Champion 로직: 레짐 + Rolling-K 메타 기반 상위 N 종목만 사용 ===
     # - 리밸런싱 결과 중 Sharpe/수익률이 가장 좋은 소수 종목만 실매매 대상으로 사용
     # - 레짐(mode)에 따라 최대 편입 종목 수를 조절
@@ -1294,8 +1296,8 @@ def main():
             selected_targets = dict(processed_targets)
         else:
             regime = _update_market_regime(kis)
-            mode = getattr(regime, "mode", "neutral") or "neutral"
-            pct = float(getattr(regime, "pct", 0.0) or 0.0)
+            mode = regime.get("mode", "neutral") or "neutral"
+            pct = float(regime.get("pct_change") or 0.0)
 
             # 레짐별 최대 신규 편입 종목 수
             if mode == "bear":
@@ -1350,7 +1352,7 @@ def main():
     except Exception as e:
         logger.exception("[CHAMPION] 예외 발생 → 전체 종목 사용: %s", e)
         selected_targets = dict(processed_targets)
-
+        
     code_to_target: Dict[str, Any] = selected_targets
 
 
