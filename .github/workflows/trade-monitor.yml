@@ -108,9 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # 🔸 항상 vwap 브랜치 코드 기준으로 체크아웃
-          # 실제 브랜치명이 vwap-ch면 여기 ref도 vwap-ch로 맞춰야 합니다.
-          ref: vwap
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
