@@ -1232,21 +1232,47 @@ def log_champion_and_regime(
         elif isinstance(champion, dict):
             code = champion.get("code") or champion.get("symbol") or champion.get("stock_code") or "?"
             name = champion.get("name") or champion.get("stock_name") or champion.get("nm") or "?"
-            # 점수/모멘텀/거래량 관련 키가 있으면 최대한 찾아서 함께 로깅
-            score = champion.get("score") or champion.get("total_score") or champion.get("rank_score")
-            mom = champion.get("mom_score") or champion.get("momentum") or champion.get("momentum_score")
-            vol = champion.get("vol_score") or champion.get("volume_score")
-            vwap_gap = champion.get("vwap_gap") or champion.get("gap_from_vwap")
+
+            # 메타-K 리밸런싱 결과에 실제로 존재하는 필드들 위주로 사유 구성
+            best_k = champion.get("best_k")
+            avg_ret = champion.get("avg_return_pct")
+            win = champion.get("win_rate_pct")
+            mdd = champion.get("mdd_pct")
+            cumret = champion.get("cumulative_return_pct")
+            trades = champion.get("trades")
+            sharpe_m = champion.get("sharpe_m")
+            tgt = champion.get("target_price") or champion.get("목표가")
+            close = champion.get("close")
+            turnover = champion.get("prev_turnover")
+
             detail_parts = []
-            if score is not None:
-                detail_parts.append(f"score={score}")
-            if mom is not None:
-                detail_parts.append(f"mom={mom}")
-            if vol is not None:
-                detail_parts.append(f"vol={vol}")
-            if vwap_gap is not None:
-                detail_parts.append(f"vwap_gap={vwap_gap}")
-            detail = ", ".join(detail_parts) if detail_parts else "score/momentum 정보 없음"
+
+            if best_k is not None:
+                detail_parts.append(f"best_k={best_k}")
+            if avg_ret is not None:
+                detail_parts.append(f"avg_ret={avg_ret}%")
+            if win is not None:
+                detail_parts.append(f"winrate={win}%")
+            if mdd is not None:
+                detail_parts.append(f"mdd={mdd}%")
+            if cumret is not None:
+                detail_parts.append(f"cumret={cumret}%")
+            if trades is not None:
+                detail_parts.append(f"trades={trades}")
+            if sharpe_m is not None:
+                detail_parts.append(f"sharpe_m={sharpe_m}")
+            if tgt is not None and close is not None:
+                # 목표가/현재가 차이도 한 줄로 요약
+                try:
+                    gap_pct = (tgt - close) / close * 100.0
+                    detail_parts.append(f"target={tgt}, close={close}, gap={gap_pct:.2f}%")
+                except Exception:
+                    detail_parts.append(f"target={tgt}, close={close}")
+            if turnover is not None:
+                detail_parts.append(f"prev_turnover={turnover}")
+
+            detail = ", ".join(detail_parts) if detail_parts else "meta-K 백테스트 기반 정보 없음"
+
         else:
             code = str(champion)
             name = "-"
