@@ -1571,13 +1571,13 @@ def main():
 
     code_to_target: Dict[str, Any] = selected_targets
 
-    loop_sleep_sec = 2.5
+    loop_sleep_sec = 2.5  # 메인 루프 대기 시간(초)
 
     try:
         while True:
             # === 코스닥 레짐 업데이트 ===
             regime = _update_market_regime(kis)
-            pct_txt = f"{regime.get('pct_change'):.2f}%" if regime.get('pct_change') is not None else "N/A"
+            pct_txt = f"{regime.get('pct_change'):.2f}%" if regime.get("pct_change") is not None else "N/A"
             logger.info(f"[REGIME] mode={regime['mode']} stage={regime['bear_stage']} pct={pct_txt}")
 
             # 장 상태
@@ -1596,54 +1596,86 @@ def main():
                 balances = _fetch_balances(kis)
                 logger.info(f"[보유잔고 API 결과 종목수] {len(balances)}개")
                 for stock in balances:
-                    code_b = stock.get('pdno')
-                    name_b = stock.get('prdt_name')
+                    code_b = stock.get("pdno")
+                    name_b = stock.get("prdt_name")
                     name_map[code_b] = name_b
-                    logger.debug(" [잔고] 종목:%s, 코드:%s, 보유:%s, 매도가능:%s",
-                                 name_b, code_b, stock.get('hldg_qty'), stock.get('ord_psbl_qty'))
+                    logger.debug(
+                        " [잔고] 종목:%s, 코드:%s, 보유:%s, 매도가능:%s",
+                        name_b,
+                        code_b,
+                        stock.get("hldg_qty"),
+                        stock.get("ord_psbl_qty"),
+                    )
 
-                current_holding = {b['pdno']: _to_int(b.get('hldg_qty', 0)) for b in balances if _to_int(b.get('hldg_qty', 0)) > 0}
-                ord_psbl_map = {b['pdno']: _to_int(b.get('ord_psbl_qty', 0)) for b in balances}
+                current_holding = {
+                    b["pdno"]: _to_int(b.get("hldg_qty", 0))
+                    for b in balances
+                    if _to_int(b.get("hldg_qty", 0)) > 0
+                }
+                ord_psbl_map = {
+                    b["pdno"]: _to_int(b.get("ord_psbl_qty", 0))
+                    for b in balances
+                }
 
                 # 신규 보유분을 능동관리 대상으로 자동 초기화
                 for b in balances:
-                    code_b = str(b.get('pdno', '')).strip()
-                    qty_b  = _to_int(b.get('hldg_qty', 0))
-                    avg_b  = _to_float(b.get('pchs_avg_pric') or b.get('avg_price') or 0.0, 0.0)
+                    code_b = str(b.get("pdno", "")).strip()
+                    qty_b = _to_int(b.get("hldg_qty", 0))
+                    avg_b = _to_float(
+                        b.get("pchs_avg_pric") or b.get("avg_price") or 0.0,
+                        0.0,
+                    )
 
-                    if qty_b > 0 and code_b and code_b not in holding and (avg_b is not None) and avg_b > 0:
-                        _init_position_state_from_balance(kis, holding, code_b, float(avg_b), int(qty_b))
-                        logger.info(f"[잔고초기화] code={code_b} qty={qty_b} avg={avg_b}")
+                    if (
+                        qty_b > 0
+                        and code_b
+                        and code_b not in holding
+                        and (avg_b is not None)
+                        and avg_b > 0
+                    ):
+                        _init_position_state_from_balance(
+                            kis, holding, code_b, float(avg_b), int(qty_b)
+                        )
+                        logger.info(
+                            f"[잔고초기화] code={code_b} qty={qty_b} avg={avg_b}"
+                        )
 
                 # 실제 잔고에서 사라진 보유항목은 정리
                 for code in list(holding.keys()):
                     if code not in current_holding or current_holding[code] == 0:
-                        logger.info(f"[보유종목 해제] {code} : 실제잔고 없음 → holding 제거")
+                        logger.info(
+                            f"[보유종목 해제] {code} : 실제잔고 없음 → holding 제거"
+                        )
                         holding.pop(code, None)
 
             except Exception as e:
                 logger.error(f"[잔고조회 오류]{e}")
 
-            # 마감 상태: 캔들/ATR/모멘텀/매매 로직 스킵
+            # 장 마감 시: 캔들/ATR/모멘텀/매매 로직 스킵
             if not is_open:
-                logger.info("[마감상태] 캔들/ATR/모멘텀/매매 로직 스킵 → 잔고만 동기화 후 대기")
+                logger.info(
+                    "[마감상태] 캔들/ATR/모멘텀/매매 로직 스킵 → 잔고만 동기화 후 대기"
+                )
                 save_state(holding, traded)
                 time.sleep(60.0)
                 continue
 
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
+            can_buy = True  # 예산 가드는 필요시 추가 구현
             for code, target in code_to_target.items():
                 prev_volume = _to_float(target.get("prev_volume"))
-                prev_open   = _to_float(target.get("prev_open"))
-                prev_close  = _to_float(target.get("prev_close"))
-                logger.debug(f"[prev_volume 체크] {code} 거래량:{prev_volume}, 전일시가:{prev_open}, 전일종가:{prev_close}")
+                prev_open = _to_float(target.get("prev_open"))
+                prev_close = _to_float(target.get("prev_close"))
+                logger.debug(
+                    f"[prev_volume 체크] {code} 거래량:{prev_volume}, 전일시가:{prev_open}, 전일종가:{prev_close}"
+                )
 
                 qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
                 if qty <= 0:
                     logger.info(f"[SKIP] {code}: 매수수량 없음/0")
                     continue
 
-                k_value = (target.get("best_k") or target.get("K") or target.get("k"))
+                k_value = target.get("best_k") or target.get("K") or target.get("k")
                 _ = None if k_value is None else _to_float(k_value)
 
                 eff_target_price, k_used = compute_entry_target(kis, target)
@@ -1667,21 +1699,33 @@ def main():
                     # --- 매수 --- (돌파 진입 + 슬리피지 가드 + 예산 가드)
                     if is_open and code not in holding and code not in traded:
                         if not can_buy:
-                            logger.info(f"[BUDGET_SKIP] {code}: 예산 없음 → 신규 매수 스킵")
+                            logger.info(
+                                f"[BUDGET_SKIP] {code}: 예산 없음 → 신규 매수 스킵"
+                            )
                             continue
 
                         enter_cond = (
-                            current_price is not None and
-                            eff_target_price is not None and
-                            int(current_price) >= int(eff_target_price)
+                            current_price is not None
+                            and eff_target_price is not None
+                            and int(current_price) >= int(eff_target_price)
                         )
 
                         if enter_cond:
                             guard_ok = True
 
-                            # 1) 진입 슬리피지 가드 (기존)
-                            if eff_target_price and eff_target_price > 0 and current_price is not None:
-                                slip_pct = ((float(current_price) - float(eff_target_price)) / float(eff_target_price)) * 100.0
+                            # 1) 진입 슬리피지 가드
+                            if (
+                                eff_target_price
+                                and eff_target_price > 0
+                                and current_price is not None
+                            ):
+                                slip_pct = (
+                                    (
+                                        float(current_price)
+                                        - float(eff_target_price)
+                                    )
+                                    / float(eff_target_price)
+                                ) * 100.0
                                 if slip_pct > SLIPPAGE_ENTER_GUARD_PCT:
                                     guard_ok = False
                                     logger.info(
@@ -1689,13 +1733,19 @@ def main():
                                         f"{SLIPPAGE_ENTER_GUARD_PCT:.2f}% → 진입 스킵"
                                     )
 
-                            # 2) VWAP 가드: 현재가가 VWAP*(1 - tol) 이상인지 체크
+                            # 2) VWAP 가드
                             if guard_ok and current_price is not None:
                                 vwap_val = kis.get_vwap_today(code)
                                 if vwap_val is None:
-                                    logger.info(f"[VWAP-SKIP] {code}: VWAP 데이터 없음 → VWAP 가드 생략")
+                                    logger.info(
+                                        f"[VWAP-SKIP] {code}: VWAP 데이터 없음 → VWAP 가드 생략"
+                                    )
                                 else:
-                                    if not vwap_guard(float(current_price), float(vwap_val), VWAP_TOL):
+                                    if not vwap_guard(
+                                        float(current_price),
+                                        float(vwap_val),
+                                        VWAP_TOL,
+                                    ):
                                         guard_ok = False
                                         logger.info(
                                             f"[VWAP-GUARD] {code}: 현재가({current_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
@@ -1704,33 +1754,64 @@ def main():
                             if not guard_ok:
                                 continue
 
-                            result = place_buy_with_fallback(kis, code, qty, limit_price=int(eff_target_price))
-                            # fills에 name 채우기 시도
+                            result = place_buy_with_fallback(
+                                kis, code, qty, limit_price=int(eff_target_price)
+                            )
                             try:
                                 if isinstance(result, dict) and result.get("rt_cd") == "0":
                                     out = result.get("output") or {}
-                                    odno = out.get("ODNO") or out.get("ord_no") or out.get("order_no") or ""
-                                    ensure_fill_has_name(odno=odno, code=code, name=name or "", qty=qty, price=current_price or 0.0)
+                                    odno = (
+                                        out.get("ODNO")
+                                        or out.get("ord_no")
+                                        or out.get("order_no")
+                                        or ""
+                                    )
+                                    ensure_fill_has_name(
+                                        odno=odno,
+                                        code=code,
+                                        name=name or "",
+                                        qty=qty,
+                                        price=current_price or 0.0,
+                                    )
                             except Exception as e:
-                                logger.warning(f"[BUY_FILL_NAME_FAIL] code={code} ex={e}")
+                                logger.warning(
+                                    f"[BUY_FILL_NAME_FAIL] code={code} ex={e}"
+                                )
 
-                            _init_position_state(kis, holding, code, float(current_price), int(qty),
-                                                 (k_value if k_value is not None else k_used), eff_target_price)
+                            _init_position_state(
+                                kis,
+                                holding,
+                                code,
+                                float(current_price),
+                                int(qty),
+                                (k_value if k_value is not None else k_used),
+                                eff_target_price,
+                            )
 
-                            traded[code] = {"buy_time": now_str, "qty": int(qty), "price": float(current_price)}
-                            logger.info(f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}")
+                            traded[code] = {
+                                "buy_time": now_str,
+                                "qty": int(qty),
+                                "price": float(current_price),
+                            }
+                            logger.info(
+                                f"[✅ 매수주문] {code}, qty={qty}, price={current_price}, result={result}"
+                            )
 
-                            log_trade({
-                                **trade_common_buy,
-                                "side": "BUY",
-                                "price": current_price,
-                                "amount": int(current_price) * int(qty),
-                                "result": result
-                            })
+                            log_trade(
+                                {
+                                    **trade_common_buy,
+                                    "side": "BUY",
+                                    "price": current_price,
+                                    "amount": int(current_price) * int(qty),
+                                    "result": result,
+                                }
+                            )
                             save_state(holding, traded)
                             time.sleep(RATE_SLEEP_SEC)
                         else:
-                            logger.info(f"[SKIP] {code}: 현재가({current_price}) < 목표가({eff_target_price}), 미매수")
+                            logger.info(
+                                f"[SKIP] {code}: 현재가({current_price}) < 목표가({eff_target_price}), 미매수"
+                            )
                             continue
 
                     # --- 실전형 청산 (타겟 보유포지션) ---
@@ -1739,75 +1820,155 @@ def main():
                         if regime["mode"] == "bear":
                             sellable_here = ord_psbl_map.get(code, 0)
                             if sellable_here > 0:
-                                if regime["bear_stage"] >= 1 and not holding[code].get("bear_s1_done"):
-                                    cut_qty = max(1, int(holding[code]['qty'] * REG_PARTIAL_S1))
-                                    logger.info(f"[REGIME-REDUCE-S1] {code} 약세1단계 {REG_PARTIAL_S1*100:.0f}% 축소 → {cut_qty}")
-                                    exec_px, result = _sell_once(kis, code, cut_qty, prefer_market=True)
-                                    holding[code]['qty'] -= int(cut_qty)
-                                    holding[code]['bear_s1_done'] = True
-                                    log_trade({
-                                        "datetime": now_str, "code": code, "name": name, "qty": int(cut_qty),
-                                        "K": k_value if k_value is not None else k_used, "target_price": eff_target_price,
-                                        "strategy": strategy, "side": "SELL", "price": exec_px,
-                                        "amount": int((exec_px or 0)) * int(cut_qty),
-                                        "result": result, "reason": "시장약세 1단계 축소"
-                                    })
+                                if (
+                                    regime["bear_stage"] >= 1
+                                    and not holding[code].get("bear_s1_done")
+                                ):
+                                    cut_qty = max(
+                                        1, int(holding[code]["qty"] * REG_PARTIAL_S1)
+                                    )
+                                    logger.info(
+                                        f"[REGIME-REDUCE-S1] {code} 약세1단계 {REG_PARTIAL_S1 * 100:.0f}% 축소 → {cut_qty}"
+                                    )
+                                    exec_px, result = _sell_once(
+                                        kis, code, cut_qty, prefer_market=True
+                                    )
+                                    holding[code]["qty"] -= int(cut_qty)
+                                    holding[code]["bear_s1_done"] = True
+                                    log_trade(
+                                        {
+                                            "datetime": now_str,
+                                            "code": code,
+                                            "name": name,
+                                            "qty": int(cut_qty),
+                                            "K": k_value
+                                            if k_value is not None
+                                            else k_used,
+                                            "target_price": eff_target_price,
+                                            "strategy": strategy,
+                                            "side": "SELL",
+                                            "price": exec_px,
+                                            "amount": int((exec_px or 0))
+                                            * int(cut_qty),
+                                            "result": result,
+                                            "reason": "시장약세 1단계 축소",
+                                        }
+                                    )
                                     save_state(holding, traded)
                                     time.sleep(RATE_SLEEP_SEC)
 
-                                if regime["bear_stage"] >= 2 and not holding[code].get("bear_s2_done"):
-                                    cut_qty = max(1, int(holding[code]['qty'] * REG_PARTIAL_S2))
-                                    logger.info(f"[REGIME-REDUCE-S2] {code} 약세2단계 {REG_PARTIAL_S2*100:.0f}% 축소 → {cut_qty}")
-                                    exec_px, result = _sell_once(kis, code, cut_qty, prefer_market=True)
-                                    holding[code]['qty'] -= int(cut_qty)
-                                    holding[code]['bear_s2_done'] = True
-                                    log_trade({
-                                        "datetime": now_str, "code": code, "name": name, "qty": int(cut_qty),
-                                        "K": k_value if k_value is not None else k_used, "target_price": eff_target_price,
-                                        "strategy": strategy, "side": "SELL", "price": exec_px,
-                                        "amount": int((exec_px or 0)) * int(cut_qty),
-                                        "result": result, "reason": "시장약세 2단계 축소"
-                                    })
+                                if (
+                                    regime["bear_stage"] >= 2
+                                    and not holding[code].get("bear_s2_done")
+                                ):
+                                    cut_qty = max(
+                                        1, int(holding[code]["qty"] * REG_PARTIAL_S2)
+                                    )
+                                    logger.info(
+                                        f"[REGIME-REDUCE-S2] {code} 약세2단계 {REG_PARTIAL_S2 * 100:.0f}% 축소 → {cut_qty}"
+                                    )
+                                    exec_px, result = _sell_once(
+                                        kis, code, cut_qty, prefer_market=True
+                                    )
+                                    holding[code]["qty"] -= int(cut_qty)
+                                    holding[code]["bear_s2_done"] = True
+                                    log_trade(
+                                        {
+                                            "datetime": now_str,
+                                            "code": code,
+                                            "name": name,
+                                            "qty": int(cut_qty),
+                                            "K": k_value
+                                            if k_value is not None
+                                            else k_used,
+                                            "target_price": eff_target_price,
+                                            "strategy": strategy,
+                                            "side": "SELL",
+                                            "price": exec_px,
+                                            "amount": int((exec_px or 0))
+                                            * int(cut_qty),
+                                            "result": result,
+                                            "reason": "시장약세 2단계 축소",
+                                        }
+                                    )
                                     save_state(holding, traded)
                                     time.sleep(RATE_SLEEP_SEC)
 
                         # 먼저 트리거 기반 청산 평가/집행
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here <= 0:
-                            logger.info(f"[SKIP] {code}: 매도가능수량=0 (대기/체결중/락) → 매도 보류")
+                            logger.info(
+                                f"[SKIP] {code}: 매도가능수량=0 (대기/체결중/락) → 매도 보류"
+                            )
                         else:
-                            reason, exec_price, result, sold_qty = _adaptive_exit(kis, code, holding[code], regime_mode=regime["mode"])
+                            reason, exec_price, result, sold_qty = _adaptive_exit(
+                                kis, code, holding[code], regime_mode=regime["mode"]
+                            )
                             if reason:
                                 trade_common_sell = {
                                     "datetime": now_str,
                                     "code": code,
                                     "name": name,
                                     "qty": int(sold_qty or 0),
-                                    "K": k_value if k_value is not None else k_used,
+                                    "K": k_value
+                                    if k_value is not None
+                                    else k_used,
                                     "target_price": eff_target_price,
                                     "strategy": strategy,
                                 }
-                                _bp = float(holding[code].get("buy_price", 0.0)) if code in holding else 0.0
-                                _pnl_pct = (((float(exec_price) - _bp) / _bp) * 100.0) if (exec_price and _bp > 0) else None
-                                _profit  = (((float(exec_price) - _bp) * int(sold_qty)) if (exec_price and _bp > 0 and sold_qty) else None)
-                                log_trade({
-                                    **trade_common_sell,
-                                    "side": "SELL",
-                                    "price": exec_price,
-                                    "amount": int((exec_price or 0)) * int(sold_qty or 0),
-                                    "result": result,
-                                    "pnl_pct": (_pnl_pct if _pnl_pct is not None else None),
-                                    "profit": (int(round(_profit)) if _profit is not None else None),
-                                    "reason": reason
-                                })
+                                _bp = (
+                                    float(holding[code].get("buy_price", 0.0))
+                                    if code in holding
+                                    else 0.0
+                                )
+                                _pnl_pct = (
+                                    (
+                                        (float(exec_price) - _bp)
+                                        / _bp
+                                    )
+                                    * 100.0
+                                    if (exec_price and _bp > 0)
+                                    else None
+                                )
+                                _profit = (
+                                    (
+                                        (float(exec_price) - _bp)
+                                        * int(sold_qty)
+                                    )
+                                    if (exec_price and _bp > 0 and sold_qty)
+                                    else None
+                                )
+                                log_trade(
+                                    {
+                                        **trade_common_sell,
+                                        "side": "SELL",
+                                        "price": exec_price,
+                                        "amount": int((exec_price or 0))
+                                        * int(sold_qty or 0),
+                                        "result": result,
+                                        "pnl_pct": (
+                                            _pnl_pct if _pnl_pct is not None else None
+                                        ),
+                                        "profit": (
+                                            int(round(_profit))
+                                            if _profit is not None
+                                            else None
+                                        ),
+                                        "reason": reason,
+                                    }
+                                )
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
                             else:
                                 try:
                                     if is_strong_momentum(kis, code):
-                                        logger.info(f"[SELL_GUARD] {code} 모멘텀 강세 → 트리거 부재, 매도 보류")
+                                        logger.info(
+                                            f"[SELL_GUARD] {code} 모멘텀 강세 → 트리거 부재, 매도 보류"
+                                        )
                                 except Exception as e:
-                                    logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
+                                    logger.warning(
+                                        f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}"
+                                    )
 
                 except Exception as e:
                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
@@ -1823,45 +1984,91 @@ def main():
                     if regime["mode"] == "bear":
                         sellable_here = ord_psbl_map.get(code, 0)
                         if sellable_here > 0:
-                            if regime["bear_stage"] >= 1 and not holding[code].get("bear_s1_done"):
-                                cut_qty = max(1, int(holding[code]['qty'] * REG_PARTIAL_S1))
-                                logger.info(f"[REGIME-REDUCE-S1/비타겟] {code} 약세1단계 {REG_PARTIAL_S1*100:.0f}% 축소 → {cut_qty}")
-                                exec_px, result = _sell_once(kis, code, cut_qty, prefer_market=True)
-                                holding[code]['qty'] -= int(cut_qty)
-                                holding[code]['bear_s1_done'] = True
-                                log_trade({
-                                    "datetime": now_str, "code": code, "name": None, "qty": int(cut_qty),
-                                    "K": holding[code].get("k_value"), "target_price": holding[code].get("target_price_src"),
-                                    "strategy": "기존보유 능동관리", "side": "SELL", "price": exec_px,
-                                    "amount": int((exec_px or 0)) * int(cut_qty),
-                                    "result": result, "reason": "시장약세 1단계 축소(비타겟)"
-                                })
+                            if (
+                                regime["bear_stage"] >= 1
+                                and not holding[code].get("bear_s1_done")
+                            ):
+                                cut_qty = max(
+                                    1, int(holding[code]["qty"] * REG_PARTIAL_S1)
+                                )
+                                logger.info(
+                                    f"[REGIME-REDUCE-S1/비타겟] {code} 약세1단계 {REG_PARTIAL_S1 * 100:.0f}% 축소 → {cut_qty}"
+                                )
+                                exec_px, result = _sell_once(
+                                    kis, code, cut_qty, prefer_market=True
+                                )
+                                holding[code]["qty"] -= int(cut_qty)
+                                holding[code]["bear_s1_done"] = True
+                                log_trade(
+                                    {
+                                        "datetime": now_str,
+                                        "code": code,
+                                        "name": None,
+                                        "qty": int(cut_qty),
+                                        "K": holding[code].get("k_value"),
+                                        "target_price": holding[code].get(
+                                            "target_price_src"
+                                        ),
+                                        "strategy": "기존보유 능동관리",
+                                        "side": "SELL",
+                                        "price": exec_px,
+                                        "amount": int((exec_px or 0))
+                                        * int(cut_qty),
+                                        "result": result,
+                                        "reason": "시장약세 1단계 축소(비타겟)",
+                                    }
+                                )
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
 
-                            if regime["bear_stage"] >= 2 and not holding[code].get("bear_s2_done"):
-                                cut_qty = max(1, int(holding[code]['qty'] * REG_PARTIAL_S2))
-                                logger.info(f"[REGIME-REDUCE-S2/비타겟] {code} 약세2단계 {REG_PARTIAL_S2*100:.0f}% 축소 → {cut_qty}")
-                                exec_px, result = _sell_once(kis, code, cut_qty, prefer_market=True)
-                                holding[code]['qty'] -= int(cut_qty)
-                                holding[code]['bear_s2_done'] = True
-                                log_trade({
-                                    "datetime": now_str, "code": code, "name": None, "qty": int(cut_qty),
-                                    "K": holding[code].get("k_value"), "target_price": holding[code].get("target_price_src"),
-                                    "strategy": "기존보유 능동관리", "side": "SELL", "price": exec_px,
-                                    "amount": int((exec_px or 0)) * int(cut_qty),
-                                    "result": result, "reason": "시장약세 2단계 축소(비타겟)"
-                                })
+                            if (
+                                regime["bear_stage"] >= 2
+                                and not holding[code].get("bear_s2_done")
+                            ):
+                                cut_qty = max(
+                                    1, int(holding[code]["qty"] * REG_PARTIAL_S2)
+                                )
+                                logger.info(
+                                    f"[REGIME-REDUCE-S2/비타겟] {code} 약세2단계 {REG_PARTIAL_S2 * 100:.0f}% 축소 → {cut_qty}"
+                                )
+                                exec_px, result = _sell_once(
+                                    kis, code, cut_qty, prefer_market=True
+                                )
+                                holding[code]["qty"] -= int(cut_qty)
+                                holding[code]["bear_s2_done"] = True
+                                log_trade(
+                                    {
+                                        "datetime": now_str,
+                                        "code": code,
+                                        "name": None,
+                                        "qty": int(cut_qty),
+                                        "K": holding[code].get("k_value"),
+                                        "target_price": holding[code].get(
+                                            "target_price_src"
+                                        ),
+                                        "strategy": "기존보유 능동관리",
+                                        "side": "SELL",
+                                        "price": exec_px,
+                                        "amount": int((exec_px or 0))
+                                        * int(cut_qty),
+                                        "result": result,
+                                        "reason": "시장약세 2단계 축소(비타겟)",
+                                    }
+                                )
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
 
                     # 트리거 기반 청산 평가/집행
                     sellable_here = ord_psbl_map.get(code, 0)
                     if sellable_here <= 0:
-                        logger.info(f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)")
+                        logger.info(
+                            f"[SKIP-기존보유] {code}: 매도가능수량=0 (대기/체결중/락)"
+                        )
                         continue
 
-                    reason, exec_price, result, sold_qty = _adaptive_exit(kis, code, holding[code], regime_mode=regime["mode"])
+                    reason, exec_price, result, sold_qty = _adaptive_exit(
+                        kis, code, holding[code], regime_mode=regime["mode"]
+                    )
                     if reason:
                         trade_common = {
                             "datetime": now_str,
@@ -1872,56 +2079,100 @@ def main():
                             "target_price": holding[code].get("target_price_src"),
                             "strategy": "기존보유 능동관리",
                         }
-                        _bp = float(holding[code].get("buy_price", 0.0)) if code in holding else 0.0
-                        _pnl_pct = (((float(exec_price) - _bp) / _bp) * 100.0) if (exec_price and _bp > 0) else None
-                        _profit  = (((float(exec_price) - _bp) * int(sold_qty)) if (exec_price and _bp > 0 and sold_qty) else None)
+                        _bp = (
+                            float(holding[code].get("buy_price", 0.0))
+                            if code in holding
+                            else 0.0
+                        )
+                        _pnl_pct = (
+                            (
+                                (float(exec_price) - _bp)
+                                / _bp
+                            )
+                            * 100.0
+                            if (exec_price and _bp > 0)
+                            else None
+                        )
+                        _profit = (
+                            (
+                                (float(exec_price) - _bp)
+                                * int(sold_qty)
+                            )
+                            if (exec_price and _bp > 0 and sold_qty)
+                            else None
+                        )
 
-                        log_trade({
-                            **trade_common,
-                            "side": "SELL",
-                            "price": exec_price,
-                            "amount": int((exec_price or 0)) * int(sold_qty or 0),
-                            "result": result,
-                            "reason": reason,
-                            "pnl_pct": (_pnl_pct if _pnl_pct is not None else None),
-                            "profit": (int(round(_profit)) if _profit is not None else None)
-                        })
+                        log_trade(
+                            {
+                                **trade_common,
+                                "side": "SELL",
+                                "price": exec_price,
+                                "amount": int((exec_price or 0))
+                                * int(sold_qty or 0),
+                                "result": result,
+                                "reason": reason,
+                                "pnl_pct": (
+                                    _pnl_pct if _pnl_pct is not None else None
+                                ),
+                                "profit": (
+                                    int(round(_profit))
+                                    if _profit is not None
+                                    else None
+                                ),
+                            }
+                        )
 
                         save_state(holding, traded)
                         time.sleep(RATE_SLEEP_SEC)
                     else:
                         try:
                             if is_strong_momentum(kis, code):
-                                logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류")
+                                logger.info(
+                                    f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류"
+                                )
                                 continue
                         except Exception as e:
-                            logger.warning(f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}")
+                            logger.warning(
+                                f"[SELL_GUARD_FAIL] {code} 모멘텀 평가 실패: {e}"
+                            )
 
-                        try:
-                            return_pct = get_20d_return_pct(kis, code)
-                        except NetTemporaryError:
-                            logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵")
-                            continue
-                        except DataEmptyError:
-                            logger.warning(f"[DATA_EMPTY] {code}: 0캔들 → 다음 루프에서 재확인")
-                            continue
-                        except DataShortError:
-                            logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 이번 루프 판단 스킵")
-                            continue
+                    try:
+                        return_pct = get_20d_return_pct(kis, code)
+                    except NetTemporaryError:
+                        logger.warning(
+                            f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵"
+                        )
+                        continue
+                    except DataEmptyError:
+                        logger.warning(
+                            f"[DATA_EMPTY] {code}: 0캔들 → 다음 루프에서 재확인"
+                        )
+                        continue
+                    except DataShortError:
+                        logger.error(
+                            f"[DATA_SHORT] {code}: 21개 미만 → 이번 루프 판단 스킵"
+                        )
+                        continue
 
-                        if return_pct is not None and return_pct >= 3.0:
-                            logger.info(f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속")
-                            continue
+                    if return_pct is not None and return_pct >= 3.0:
+                        logger.info(
+                            f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속"
+                        )
+                        continue
 
             # --- 장중 커트오프(KST): 14:40 도달 시 "전량매도 없이" 리포트 생성 후 정상 종료 ---
             if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
-                logger.info(f"[⏰ 커트오프] {SELL_FORCE_TIME.strftime('%H:%M')} 도달: 전량 매도 없이 리포트 생성 후 종료")
+                logger.info(
+                    f"[⏰ 커트오프] {SELL_FORCE_TIME.strftime('%H:%M')} 도달: 전량 매도 없이 리포트 생성 후 종료"
+                )
 
                 save_state(holding, traded)
 
                 try:
                     _report = ceo_report(datetime.now(KST), period="daily")
-                    logger.info(f"[📄 CEO Report 생성 완료] title={_report.get('title')}")
+                    logger.info(
+                        f"[📄 CEO Report 생성 완료] title={_report.get('title')}"
+                    )
                 except Exception as e:
                     logger.error(f"[CEO Report 생성 실패] {e}")
 
@@ -1933,8 +2184,9 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("[🛑 수동 종료]")
+    except Exception as e:
+        logger.exception(f"[FATAL] 메인 루프 예외 발생: {e}")
 
 # 실행부
 if __name__ == "__main__":
     main()
-
