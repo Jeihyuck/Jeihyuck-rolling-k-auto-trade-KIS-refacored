@@ -1216,15 +1216,27 @@ def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, includ
 
 # === [ANCHOR: EXIT] 동적 트레일링/TP + 손절 ===
 def _adaptive_exit(
-    kis: KisAPI, code: str, pos: Dict[str, Any], regime_mode: str = "neutral"
+    kis: KisAPI,
+    code: str,
+    pos: Dict[str, Any],
+    regime_mode: str = "neutral",
 ) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
     """
-    레짐(강세/약세/중립)에 따라 TP/트레일링을 동적으로 적용하고, 체결/로그를 남김
+    레짐(강세/약세/중립) + 1분봉 모멘텀 기반
+    - 부분 익절(1차/2차)
+    - 트레일링 스탑
+    - 손절
+    을 동적으로 적용하는 매도 엔진.
+    한 번 호출에서 "한 번의 매도"만 실행하고, 그 결과만 반환한다.
     """
     now = datetime.now(KST)
-    reason = None
-    exec_px, result, sold_qty = None, None, None
+    reason: Optional[str] = None
+    exec_px: Optional[float] = None
+    result: Optional[Any] = None
+    sold_qty: Optional[int] = None
     trade_logged = False
+
+    # === 현재가 조회 ===
     try:
         cur = _safe_get_price(kis, code)
         if cur is None:
@@ -1234,83 +1246,160 @@ def _adaptive_exit(
         logger.error(f"[EXIT-FAIL] {code} 현재가 조회 예외: {e}")
         return None, None, None, None
 
-    # 최고가(high) 갱신
-    pos['high'] = max(float(pos.get('high', cur)), float(cur))
-    qty = _to_int(pos.get('qty'), 0)
+    # === 상태/기초 값 ===
+    qty = _to_int(pos.get("qty"), 0)
     if qty <= 0:
         logger.warning(f"[EXIT-FAIL] {code} qty<=0")
         return None, None, None, None
 
-    buy_price = float(pos.get('buy_price', 0.0))
-    max_price = pos.get('high', buy_price)
-    slippage = None
+    buy_price = float(pos.get("buy_price", 0.0)) or 0.0
+    if buy_price <= 0:
+        logger.warning(f"[EXIT-FAIL] {code} buy_price<=0")
+        return None, None, None, None
 
-    # === 레짐 기반 임계값 ===
-    tp_profit_pct = TP_PROFIT_PCT_BASE               # 기본 3.0%
-    trail_down_frac = 0.015                          # 기본 1.5% 되돌림
+    # 최고가(high) 갱신
+    pos["high"] = max(float(pos.get("high", cur)), float(cur))
+    max_price = float(pos["high"])
+
+    # 현재 누적 수익률
+    pnl_pct = (cur - buy_price) / buy_price * 100.0
+
+    # 부분 익절 플래그 & 비율
+    sold_p1 = bool(pos.get("sold_p1", False))
+    sold_p2 = bool(pos.get("sold_p2", False))
+    qty_p1 = max(1, int(qty * PARTIAL1))
+    qty_p2 = max(1, int(qty * PARTIAL2))
+
+    # === 레짐 + 모멘텀 기반 TP/트레일링 설정 ===
+    base_tp1 = DEFAULT_PROFIT_PCT        # 보통 3.0
+    base_tp2 = DEFAULT_PROFIT_PCT * 2    # 6.0
+
+    # 모멘텀 강세 여부
+    strong_mom = False
+    try:
+        strong_mom = is_strong_momentum(kis, code)
+    except Exception as e:
+        logger.warning(f"[MOM_CHECK_FAIL] {code} 모멘텀 평가 실패: {e}")
+        strong_mom = False
+
+    tp1 = base_tp1
+    tp2 = base_tp2
+    trail_down_frac = 0.018  # 기본: 고점대비 1.8% 되돌리면 컷
+
     if regime_mode == "bull":
-        tp_profit_pct = TP_PROFIT_PCT_BULL           # 예: 3.5%
-        trail_down_frac = TRAIL_PCT_BULL             # 예: 2.5%
+        # 좋은 장: 기본 목표 상향
+        tp1 = base_tp1 + 1.0      # 4%
+        tp2 = base_tp2 + 2.0      # 8%
+        trail_down_frac = 0.025   # 2.5%
+
+        if strong_mom:
+            # 장도 좋고 모멘텀도 강하면 한 번 더 상향
+            tp1 += 1.0            # 5%
+            tp2 += 2.0            # 10%
+            trail_down_frac = 0.03
+
+    elif regime_mode == "neutral":
+        tp1 = base_tp1            # 3%
+        tp2 = base_tp2            # 6%
+        trail_down_frac = 0.018
+
+        if strong_mom:
+            tp1 = base_tp1 + 1.0  # ✅ 4%
+            tp2 = base_tp2 + 2.0  # ✅ 8%
+            trail_down_frac = 0.02  # ✅ -2%
+
     elif regime_mode == "bear":
-        trail_down_frac = TRAIL_PCT_BEAR             # 예: 1.2%
+        # 약세장: 보수적으로
+        tp1 = 2.0
+        tp2 = 4.0
+        trail_down_frac = 0.01
 
-    # === 익절(동적) ===
-    if cur >= buy_price * (1 + tp_profit_pct / 100.0):
-        reason = f"익절 {tp_profit_pct:.1f}%"
-    # === 트레일링스톱(최고가 4% 돌파 후 동적 되돌림) ===
-    elif max_price >= buy_price * 1.04 and cur <= max_price * (1 - trail_down_frac):
-        reason = f"트레일링스톱({int(trail_down_frac*100)}%)"
-    # === 손절(-5%) ===
-    elif cur <= float(pos['buy_price']) * (1 + DEFAULT_LOSS_PCT / 100.0):
-        reason = "손절 -5%"
+    # 손절 기준 (-5%)
+    stop_loss_pct = DEFAULT_LOSS_PCT  # 보통 -5.0
 
-    if reason:
-        try:
-            exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
-            sold_qty = qty
-            if exec_px and buy_price > 0:
-                slippage = (exec_px - buy_price) / buy_price * 100.0
+    # ✅ 항상 초기화: 예외가 나도 sell_size는 존재하도록
+    sell_size: int = qty
+
+    # === 1) 손절 먼저 체크 ===
+    if pnl_pct <= stop_loss_pct:
+        reason = f"손절 {stop_loss_pct:.1f}%"
+        sell_size = qty  # 전량
+    else:
+        # === 2) 2차 TP (더 높은 수익 구간) ===
+        if (pnl_pct >= tp2) and (not sold_p2) and qty > 1:
+            reason = f"2차 익절 {tp2:.1f}%"
+            sell_size = min(qty, qty_p2)
+            pos["sold_p2"] = True
+
+        # === 3) 1차 TP ===
+        elif (pnl_pct >= tp1) and (not sold_p1) and qty > 1:
+            reason = f"1차 익절 {tp1:.1f}%"
+            sell_size = min(qty, qty_p1)
+            pos["sold_p1"] = True
+
+        else:
+            # === 4) 트레일링 스탑 ===
+            if max_price >= buy_price * (1 + tp1 / 100.0) and cur <= max_price * (1 - trail_down_frac):
+                reason = f"트레일링스톱({trail_down_frac*100:.1f}%)"
+                sell_size = qty
             else:
-                slippage = None
+                # 청산 조건 없음 → 보유 유지
+                return None, None, None, None
 
-            _log_realized_pnl(code, exec_px, qty, buy_price, reason=reason)
-            logger.info(f"[SELL-TRIGGER] {code} REASON={reason} qty={qty} price={exec_px}")
+    # === 실제 매도 실행 ===
+    try:
+        exec_px, result = _sell_once(kis, code, sell_size, prefer_market=True)
+        sold_qty = sell_size
 
-            log_trade({
+        # 보유 수량 감소
+        pos["qty"] = max(0, qty - sell_size)
+
+        # 실현손익 로그
+        _log_realized_pnl(code, exec_px, sold_qty, buy_price, reason=reason)
+
+        logger.info(
+            f"[SELL-TRIGGER] {code} REASON={reason} qty={sold_qty} price={exec_px} "
+            f"(pnl={pnl_pct:.2f}%, regime={regime_mode}, strong_mom={strong_mom})"
+        )
+
+        # trade 로그
+        log_trade(
+            {
                 "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "code": code,
                 "side": "SELL",
                 "reason": reason,
                 "order_price": buy_price,
                 "fill_price": exec_px,
-                "slippage_pct": round(slippage, 2) if slippage is not None else None,
                 "qty": sold_qty,
+                "pnl_pct": pnl_pct,
                 "result": result,
                 "status": "filled" if result and result.get("rt_cd") == "0" else "failed",
-                "fail_reason": None if result and result.get("rt_cd") == "0" else "체결실패"
-            })
-            trade_logged = True
-        except Exception as e:
-            logger.error(f"[SELL-FAIL] {code} qty={qty} err={e}")
-            if not trade_logged:
-                log_trade({
+            }
+        )
+        trade_logged = True
+
+    except Exception as e:
+        logger.error(f"[SELL-FAIL] {code} qty={sell_size} err={e}")
+        if not trade_logged:
+            log_trade(
+                {
                     "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
                     "code": code,
                     "side": "SELL",
-                    "reason": reason,
+                    "reason": reason or "UNKNOWN",
                     "order_price": buy_price,
                     "fill_price": None,
-                    "slippage_pct": None,
-                    "qty": qty,
+                    "qty": sell_size,
                     "result": None,
                     "status": "failed",
-                    "fail_reason": str(e)
-                })
-            return None, None, None, None
+                    "fail_reason": str(e),
+                }
+            )
+        return None, None, None, None
 
-        return reason, exec_px, result, sold_qty
+    return reason, exec_px, result, sold_qty
 
-    return None, None, None, None
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
 
