@@ -61,6 +61,10 @@ CONFIG = {
     # 기타
     "MARKET_DATA_WHEN_CLOSED": "false",
     "FORCE_WEEKLY_REBALANCE": "0",
+    # NEW: 1분봉 VWAP 모멘텀 파라미터
+    "MOM_FAST": "5",        # 1분봉 fast MA 길이
+    "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+    "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
 }
 
 def _cfg(key: str) -> str:
@@ -73,6 +77,7 @@ try:
 except Exception:
     def blend_k(k_month: float, day: int, atr20: Optional[float], atr60: Optional[float]) -> float:
         return float(k_month) if k_month is not None else 0.5
+
     def recent_features(kis, code: str) -> Dict[str, Optional[float]]:
         return {"atr20": None, "atr60": None}
 
@@ -149,6 +154,11 @@ W_MIN_ONE = float(_cfg("W_MIN_ONE"))
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
 WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
 MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
+
+# NEW: 1분봉 모멘텀 파라미터
+MOM_FAST = int(_cfg("MOM_FAST") or "5")
+MOM_SLOW = int(_cfg("MOM_SLOW") or "20")
+MOM_TH_PCT = float(_cfg("MOM_TH_PCT") or "0.5")
 
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
@@ -319,6 +329,9 @@ def _log_realized_pnl(
 _LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts": epoch}
 _PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
 
+# === [ANCHOR: BALANCE_CACHE] 잔고 캐싱 (루프 15초 단일 호출) ===
+_BALANCE_CACHE: Dict[str, Any] = {"ts": 0.0, "balances": []}
+
 def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
     import time as _t
     now = _t.time()
@@ -398,24 +411,148 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
         return float(ent["px"])
     return None
 
-def _fetch_balances(kis: KisAPI) -> List[Dict[str, Any]]:
+def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
+    """
+    get_balance / get_balance_all 호출을 15초 캐시.
+    초당 루프를 돌려도 실제 API는 15초에 1번만 두드리도록 한다.
+    """
+    now = time.time()
+    try:
+        if _BALANCE_CACHE["balances"] and (now - float(_BALANCE_CACHE["ts"])) <= ttl_sec:
+            return list(_BALANCE_CACHE["balances"])
+    except Exception:
+        pass
+
     if hasattr(kis, "get_balance_all"):
         res = _with_retry(kis.get_balance_all)
     else:
         res = _with_retry(kis.get_balance)
+
     if isinstance(res, dict):
         positions = res.get("positions") or res.get("output1") or []
         if not isinstance(positions, list):
             logger.error(f"[BAL_STD_FAIL] positions 타입 이상: {type(positions)}")
-            return []
-        return positions
+            positions = []
     elif isinstance(res, list):
-        return res
+        positions = res
     else:
         logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
-        return []
+        positions = []
+
+    _BALANCE_CACHE["ts"] = now
+    _BALANCE_CACHE["balances"] = list(positions)
+    return positions
+
+# === [ANCHOR: DAILY_CANDLE_CACHE] 일봉 완전 캐싱 ===
+_DAILY_CANDLE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def _get_daily_candles_cached(kis: KisAPI, code: str, count: int) -> List[Dict[str, Any]]:
+    """
+    코드별 일봉을 당일 기준으로 캐싱.
+    - 동일 코드/거래일에서는 최초 요청 시에만 API 호출
+    - 이후 더 긴 count가 들어오면 한 번 더 호출해서 캐시 갱신
+    """
+    today = datetime.now(KST).date()
+    entry = _DAILY_CANDLE_CACHE.get(code)
+    if entry and entry.get("date") == today and len(entry.get("candles") or []) >= count:
+        return entry["candles"]
+
+    candles = kis.get_daily_candles(code, count=count)
+    if candles:
+        _DAILY_CANDLE_CACHE[code] = {"date": today, "candles": candles}
+    return candles or []
 
 from .kis_wrapper import NetTemporaryError, DataEmptyError, DataShortError
+
+# === [ANCHOR: INTRADAY_MOMENTUM] 1분봉 VWAP + 단기 모멘텀 ===
+def _get_intraday_1min(kis: KisAPI, code: str, count: int = 60) -> List[Dict[str, Any]]:
+    """
+    KisAPI에 1분봉 메서드가 있으면 사용하고, 없으면 호환 메서드로 fallback.
+    반환은 최소한 'close'와 'volume' 정보를 가진 dict 리스트라고 가정한다.
+    """
+    try:
+        if hasattr(kis, "get_intraday_1min"):
+            return kis.get_intraday_1min(code, count=count)
+        if hasattr(kis, "get_minute_candles"):
+            return kis.get_minute_candles(code, unit=1, count=count)
+        if hasattr(kis, "get_intraday_candles"):
+            return kis.get_intraday_candles(code, unit="1", count=count)
+    except Exception as e:
+        logger.warning(f"[INTRADAY_1M_FAIL] {code}: {e}")
+    return []
+
+def _compute_vwap_from_1min(candles: List[Dict[str, Any]]) -> Optional[float]:
+    if not candles:
+        return None
+    pv = 0.0
+    vol_sum = 0.0
+    for c in candles:
+        try:
+            price = float(c.get("close") or c.get("trade_price") or c.get("price") or 0.0)
+            vol = float(c.get("volume") or c.get("trade_volume") or 0.0)
+        except Exception:
+            continue
+        if price <= 0 or vol <= 0:
+            continue
+        pv += price * vol
+        vol_sum += vol
+    if vol_sum <= 0:
+        return None
+    return pv / vol_sum
+
+def _compute_intraday_momentum(candles: List[Dict[str, Any]], fast: int = MOM_FAST, slow: int = MOM_SLOW) -> float:
+    closes: List[float] = []
+    for c in candles:
+        try:
+            px = float(c.get("close") or c.get("trade_price") or c.get("price") or 0.0)
+        except Exception:
+            continue
+        if px > 0:
+            closes.append(px)
+    if len(closes) < max(fast, slow):
+        return 0.0
+    fast_ma = sum(closes[-fast:]) / float(fast)
+    slow_ma = sum(closes[-slow:]) / float(slow)
+    if slow_ma <= 0:
+        return 0.0
+    return (fast_ma - slow_ma) / slow_ma * 100.0
+
+def is_strong_momentum_vwap(kis: KisAPI, code: str) -> bool:
+    """
+    1분봉 VWAP + 단기 모멘텀 기반 모멘텀 강세 판정.
+    - 최근 가격이 VWAP 위
+    - fast/slow 모멘텀 >= MOM_TH_PCT
+    """
+    try:
+        if hasattr(kis, "is_market_open") and not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
+            return False
+    except Exception:
+        pass
+
+    candles = _get_intraday_1min(kis, code, count=max(MOM_SLOW * 3, 60))
+    if not candles:
+        return False
+
+    try:
+        last_candle = candles[-1]
+        last_price = float(last_candle.get("close") or last_candle.get("trade_price") or last_candle.get("price") or 0.0)
+    except Exception:
+        return False
+    if last_price <= 0:
+        return False
+
+    vwap_val = _compute_vwap_from_1min(candles)
+    if vwap_val is None or vwap_val <= 0:
+        return False
+
+    mom = _compute_intraday_momentum(candles)
+    strong = (last_price > vwap_val) and (mom >= MOM_TH_PCT)
+    if strong:
+        logger.info(
+            f"[모멘텀 강세] {code}: 강한 상승추세, 능동관리 매도 보류 "
+            f"(VWAP/1분봉 기준, last={last_price:.2f}, vwap={vwap_val:.2f}, mom={mom:.2f}%)"
+        )
+    return strong
 
 # === 20D 수익률 ===
 def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
@@ -430,7 +567,7 @@ def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
 
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            candles = kis.get_daily_candles(code, count=21)
+            candles = _get_daily_candles_cached(kis, code, count=21)
             if not candles or len(candles) < 21:
                 raise DataShortError("need at least 21 candles")
 
@@ -464,32 +601,11 @@ def get_20d_return_pct(kis: KisAPI, code: str) -> Optional[float]:
     raise NetTemporaryError("20D return calc failed")
 
 def is_strong_momentum(kis: KisAPI, code: str) -> bool:
-    try:
-        if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
-            return False
-    except Exception:
-        pass
-
-    try:
-        candles = kis.get_daily_candles(code, count=121)
-        closes = [float(x['close']) for x in candles if 'close' in x and x['close'] is not None and float(x['close']) > 0]
-        if len(closes) < 61:
-            return False
-        today = closes[-1]
-        ma20 = sum(closes[-20:]) / 20
-        ma60 = sum(closes[-60:]) / 60
-        ma120 = sum(closes[-120:]) / 120 if len(closes) >= 120 else ma60
-        r20 = (today - closes[-21]) / closes[-21] * 100 if len(closes) > 21 else 0
-        r60 = (today - closes[-61]) / closes[-61] * 100 if len(closes) > 61 else 0
-        r120 = (today - closes[0]) / closes[0] * 100 if len(closes) >= 120 else r60
-        if r20 > 10 or r60 > 10 or r120 > 10:
-            return True
-        if today > ma20 or today > ma60 or today > ma120:
-            return True
-        return False
-    except Exception as e:
-        logger.warning(f"[모멘텀 판별 실패] {code}: {e}")
-        return False
+    """
+    기존 일봉 기반 모멘텀 대신,
+    1분봉 VWAP + 단기 모멘텀 기준으로 강세를 판별한다.
+    """
+    return is_strong_momentum_vwap(kis, code)
 
 def _weight_to_qty(
     kis: KisAPI,
@@ -682,7 +798,7 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
     prev_high = prev_low = None
     try:
         if market_open:
-            prev_candles = kis.get_daily_candles(code, count=2)
+            prev_candles = _get_daily_candles_cached(kis, code, count=2)
             if prev_candles and len(prev_candles) >= 2:
                 prev = prev_candles[-2]
                 prev_high = _to_float(prev.get("high"))
@@ -692,7 +808,7 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
 
     if prev_high is None or prev_low is None:
         try:
-            prev_candles = kis.get_daily_candles(code, count=2)
+            prev_candles = _get_daily_candles_cached(kis, code, count=2)
             if prev_candles and len(prev_candles) >= 2:
                 prev = prev_candles[-2]
                 prev_high = _to_float(prev.get("high"))
@@ -837,6 +953,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
 REGIME_ENABLED = True
 KOSDAQ_CODE = _cfg("KOSDAQ_INDEX_CODE")
 KOSDAQ_ETF_FALLBACK = _cfg("KOSDAQ_ETF_FALLBACK")  # KODEX 코스닥150
+
 REG_BULL_MIN_UP_PCT = float(_cfg("REG_BULL_MIN_UP_PCT"))
 REG_BULL_MIN_MINUTES = int(_cfg("REG_BULL_MIN_MINUTES"))
 REG_BEAR_VWAP_MINUTES = int(_cfg("REG_BEAR_VWAP_MINUTES"))
@@ -1197,7 +1314,6 @@ def _adaptive_exit(
 
 # ====== 메인 진입부 및 실전 rolling_k 루프 ======
 
-
 def log_champion_and_regime(
     logger: logging.Logger,
     champion,
@@ -1345,7 +1461,6 @@ def main():
         can_buy = False
 
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
-
     processed_targets: Dict[str, Any] = {}
     for t in targets:
         code = t.get("stock_code") or t.get("code")
@@ -1455,7 +1570,6 @@ def main():
     )
 
     code_to_target: Dict[str, Any] = selected_targets
-
 
     loop_sleep_sec = 2.5
 
@@ -1587,12 +1701,10 @@ def main():
                                             f"[VWAP-GUARD] {code}: 현재가({current_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
                                             f"→ 진입 스킵 (VWAP={vwap_val:.2f})"
                                         )
-
                             if not guard_ok:
                                 continue
 
                             result = place_buy_with_fallback(kis, code, qty, limit_price=int(eff_target_price))
-
                             # fills에 name 채우기 시도
                             try:
                                 if isinstance(result, dict) and result.get("rt_cd") == "0":
