@@ -83,7 +83,7 @@ jobs:
       MARKET_DATA_WHEN_CLOSED: "false"
 
       # 배분/속도
-      DAILY_CAPITAL: "50000000"
+      DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
       # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===

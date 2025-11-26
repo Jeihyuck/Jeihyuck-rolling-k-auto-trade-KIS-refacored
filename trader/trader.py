@@ -35,7 +35,7 @@ CONFIG = {
     "TIME_STOP_HHMM": "13:00",
     "DEFAULT_PROFIT_PCT": "3.0",
     "DEFAULT_LOSS_PCT": "-5.0",
-    "DAILY_CAPITAL": "50000000",
+    "DAILY_CAPITAL": "250000000",
     "SLIPPAGE_LIMIT_PCT": "0.25",
     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
