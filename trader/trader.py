@@ -36,6 +36,7 @@ CONFIG = {
     "DEFAULT_PROFIT_PCT": "3.0",
     "DEFAULT_LOSS_PCT": "-5.0",
     "DAILY_CAPITAL": "250000000",
+    "CAP_CAP": "0.8",
     "SLIPPAGE_LIMIT_PCT": "0.25",
     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
@@ -146,6 +147,7 @@ TIME_STOP_HHMM = _cfg("TIME_STOP_HHMM")
 DEFAULT_PROFIT_PCT = float(_cfg("DEFAULT_PROFIT_PCT"))
 DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
 DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
+CAP_CAP = float(_cfg("CAP_CAP"))
 SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
 SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
 VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
@@ -639,6 +641,47 @@ def _weight_to_qty(
 
     return max(0, int(alloc // int(price)))
 
+
+
+def _notional_to_qty(
+    kis: KisAPI,
+    code: str,
+    notional: int,
+    ref_price: Optional[float] = None
+) -> int:
+    """Target Notional(원)을 기준으로 수량 계산 (weight 클램프 없이 직접 계산)."""
+    try:
+        notional = int(notional)
+    except Exception:
+        return 0
+    if notional <= 0:
+        return 0
+
+    price = None
+    if ref_price is not None:
+        try:
+            if float(ref_price) > 0:
+                price = float(ref_price)
+        except Exception:
+            price = None
+
+    if price is None:
+        try:
+            if kis.is_market_open():
+                price = _safe_get_price(kis, code)
+            else:
+                if hasattr(kis, "get_close_price"):
+                    try:
+                        price = float(kis.get_close_price(code))
+                    except Exception:
+                        price = None
+        except Exception:
+            price = None
+
+    if price is None or price <= 0:
+        return 0
+
+    return max(0, int(notional // int(price)))
 # === ATR, 상태 초기화 ===
 def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
     if hasattr(kis, "get_atr"):
@@ -674,6 +717,13 @@ def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_
         'target_price_src': float(target_price) if target_price is not None else None,
         'bear_s1_done': False,
         'bear_s2_done': False,
+        # 눌림목 3단계 진입 관련 기본값 (신규 매수 직후 overwrite 가능)
+        'entry_stage': 1,
+        'max_price_after_entry': float(entry_price),
+        'planned_total_qty': int(qty),
+        'stage1_qty': int(qty),
+        'stage2_qty': 0,
+        'stage3_qty': 0,
     }
 
 def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code: str, avg_price: float, qty: int) -> None:
@@ -703,7 +753,194 @@ def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code
         'target_price_src': None,
         'bear_s1_done': False,
         'bear_s2_done': False,
+        # 기존 보유분은 추가 진입(stage 3 완료 상태)으로 간주
+        'entry_stage': 3,
+        'max_price_after_entry': float(avg_price),
+        'planned_total_qty': int(qty),
+        'stage1_qty': int(qty),
+        'stage2_qty': 0,
+        'stage3_qty': 0,
     }
+
+
+def _maybe_scale_in_dips(
+    kis: KisAPI,
+    holding: Dict[str, Any],
+    code: str,
+    target: Dict[str, Any],
+    now_str: str,
+    regime_mode: str,
+) -> None:
+    """
+    눌림목 3단계(40/35/25%) 진입 로직.
+    - entry_stage: 1 → 2차 진입 후보, 2 → 3차 진입 후보, 3 → 모든 진입 완료
+    - bull / neutral 모드에서만 동작, bear 모드에서는 추가 진입 금지
+    - max_price_after_entry 기준으로 -1.5%, -3.0% 조정 시점에만 추가 진입
+    """
+    pos = holding.get(code)
+    if not pos:
+        return
+
+    # 약세 레짐에서는 추가 진입 금지
+    if regime_mode not in ("bull", "neutral"):
+        return
+
+    entry_stage = int(pos.get("entry_stage") or 1)
+    if entry_stage >= 3:
+        return
+
+    # 현재가 조회
+    try:
+        cur_price = _safe_get_price(kis, code)
+    except Exception:
+        cur_price = None
+    if cur_price is None or cur_price <= 0:
+        return
+
+    # 손절선 이하면 추가 진입 금지
+    try:
+        stop_abs = pos.get("stop_abs")
+        if stop_abs is not None and cur_price <= float(stop_abs):
+            logger.info(
+                f"[SCALE-IN-GUARD] {code}: 현재가({cur_price}) <= stop_abs({stop_abs}) → 추가 진입 금지"
+            )
+            return
+    except Exception:
+        pass
+
+    # VWAP 가드: 과도한 추세 붕괴 구간에서는 추가 진입하지 않음
+    try:
+        vwap_val = kis.get_vwap_today(code)
+    except Exception:
+        vwap_val = None
+    if vwap_val is None or vwap_val <= 0:
+        logger.debug(f"[SCALE-IN-VWAP-SKIP] {code}: VWAP 데이터 없음 → VWAP 가드 생략")
+    else:
+        if not vwap_guard(float(cur_price), float(vwap_val), VWAP_TOL):
+            logger.info(
+                f"[SCALE-IN-VWAP-GUARD] {code}: 현재가({cur_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
+                f"→ 눌림목 추가 진입 스킵 (VWAP={vwap_val:.2f})"
+            )
+            return
+
+    # max_price_after_entry 업데이트
+    max_px = pos.get("max_price_after_entry") or pos.get("high") or pos.get("buy_price") or cur_price
+    try:
+        max_px = float(max_px)
+    except Exception:
+        max_px = float(cur_price)
+    if cur_price > max_px:
+        max_px = float(cur_price)
+    pos["max_price_after_entry"] = float(max_px)
+
+    # 계획 수량 계산
+    planned_total_qty = int(
+        pos.get("planned_total_qty")
+        or _to_int(target.get("매수수량") or target.get("qty"), 0)
+    )
+    if planned_total_qty <= 0:
+        return
+
+    # 스테이지별 목표 수량(부족 시 재계산)
+    s1 = int(pos.get("stage1_qty") or max(1, int(planned_total_qty * ENTRY_LADDERS[0])))
+    s2 = int(pos.get("stage2_qty") or max(0, int(planned_total_qty * ENTRY_LADDERS[1])))
+    s3 = int(pos.get("stage3_qty") or max(0, planned_total_qty - s1 - s2))
+
+    pos["planned_total_qty"] = int(planned_total_qty)
+    pos["stage1_qty"] = int(s1)
+    pos["stage2_qty"] = int(s2)
+    pos["stage3_qty"] = int(s3)
+
+    current_qty = int(pos.get("qty") or 0)
+    if current_qty <= 0:
+        return
+
+    # 고점 대비 조정률
+    try:
+        drawdown_pct = (float(cur_price) / float(max_px) - 1.0) * 100.0
+    except Exception:
+        drawdown_pct = 0.0
+
+    add_qty = 0
+    next_stage = entry_stage
+
+    if entry_stage == 1:
+        # 2차 진입: 고점 대비 -1.5% 이상 조정, 목표 수량 s1+s2까지 확대
+        if drawdown_pct <= -1.5 and current_qty < (s1 + s2):
+            add_qty = max(0, (s1 + s2) - current_qty)
+            next_stage = 2
+    elif entry_stage == 2:
+        # 3차 진입: 고점 대비 -3.0% 이상 조정, 전체 planned_total_qty까지 확대
+        if drawdown_pct <= -3.0 and current_qty < planned_total_qty:
+            add_qty = max(0, planned_total_qty - current_qty)
+            next_stage = 3
+    else:
+        return
+
+    if add_qty <= 0:
+        return
+
+    logger.info(
+        f"[SCALE-IN] {code} stage={entry_stage}->{next_stage} "
+        f"drawdown={drawdown_pct:.2f}% cur={cur_price} max={max_px} add_qty={add_qty}"
+    )
+
+    # 추가 매수 실행 (현재가 기준 가드형 지정가/시장가)
+    try:
+        result = place_buy_with_fallback(
+            kis, code, int(add_qty), limit_price=int(cur_price)
+        )
+    except Exception as e:
+        logger.error(f"[SCALE-IN-ORDER-FAIL] {code}: {e}")
+        return
+
+    # fills CSV 보강
+    try:
+        odno = ""
+        if isinstance(result, dict):
+            out = result.get("output") or {}
+            odno = (
+                out.get("ODNO")
+                or out.get("ord_no")
+                or out.get("order_no")
+                or ""
+            )
+        ensure_fill_has_name(
+            odno=odno,
+            code=code,
+            name=str(target.get("name") or target.get("종목명") or ""),
+            qty=int(add_qty),
+            price=float(cur_price),
+        )
+    except Exception as e:
+        logger.warning(f"[SCALE-IN-FILL-NAME-FAIL] code={code} ex={e}")
+
+    # 상태 업데이트
+    pos["qty"] = int(current_qty + add_qty)
+    pos["entry_stage"] = int(next_stage)
+    holding[code] = pos
+
+    # 매수 로그 기록
+    try:
+        log_trade(
+            {
+                "datetime": now_str,
+                "code": code,
+                "name": target.get("name") or target.get("종목명"),
+                "qty": int(add_qty),
+                "K": pos.get("k_value"),
+                "target_price": pos.get("target_price_src"),
+                "strategy": "눌림목 3단계 진입",
+                "side": "BUY",
+                "price": float(cur_price),
+                "amount": int(float(cur_price)) * int(add_qty),
+                "result": result,
+                "reason": f"scale_in_stage_{entry_stage}_to_{next_stage}",
+            }
+        )
+    except Exception as e:
+        logger.warning(f"[SCALE-IN-LOG-FAIL] {code}: {e}")
+
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
     cur_price = _safe_get_price(kis, code)
@@ -980,8 +1217,41 @@ REGIME_STATE: Dict[str, Any] = {
     "last_snapshot_ts": None,   # 최근 스냅샷 시간
     "vwap": None,               # 가능하면 채움
     "prev_close": None,         # 전일 종가
-    "pct_change": None          # 등락률(%)
+    "pct_change": None,          # 등락률(%)
+    "stage": 0,
+    "R20": None,
+    "D1": None
 }
+
+# === [ANCHOR: REGIME TABLES] 레짐별 자본 스케일 / 최대 보유 종목 수 / 챔피언 비중 ===
+# mode ∈ {'bull','bear','neutral'}, stage ∈ {0,1,2}
+REGIME_CAPITAL_SCALE: Dict[Tuple[str, int], float] = {
+    ("bull", 2): 1.00,
+    ("bull", 1): 0.75,
+    ("neutral", 0): 0.50,
+    ("bear", 1): 0.30,
+    ("bear", 2): 0.15,
+}
+
+REGIME_MAX_ACTIVE: Dict[Tuple[str, int], int] = {
+    ("bull", 2): 7,
+    ("bull", 1): 5,
+    ("neutral", 0): 3,
+    ("bear", 1): 2,
+    ("bear", 2): 1,
+}
+
+# 순위별 비중 (합계 1.0 기준)
+REGIME_WEIGHTS: Dict[Tuple[str, int], List[float]] = {
+    ("bull", 2): [0.25, 0.18, 0.15, 0.13, 0.11, 0.09, 0.09],
+    ("bull", 1): [0.28, 0.22, 0.18, 0.17, 0.15],
+    ("neutral", 0): [0.40, 0.35, 0.25],
+    ("bear", 1): [0.60, 0.40],
+    ("bear", 2): [1.00],
+}
+
+# 각 종목 Target Notional 내에서 3단계 눌림목 진입 비중
+ENTRY_LADDERS: List[float] = [0.40, 0.35, 0.25]
 
 def _get_kosdaq_snapshot(kis: KisAPI) -> Dict[str, Optional[float]]:
     """
@@ -1030,379 +1300,84 @@ def _get_kosdaq_snapshot(kis: KisAPI) -> Dict[str, Optional[float]]:
 
     return {"price": price, "prev_close": prev_close, "pct_change": pct_change, "vwap": vwap, "above_vwap": above_vwap}
 
+
 def _update_market_regime(kis: KisAPI) -> Dict[str, Any]:
-    """
-    코스닥 지수 기반 레짐 판정 및 상태 업데이트.
+    """코스닥 지수 20일 수익률(R20) + 당일 수익률(D1) 기반 레짐 판정.
+
+    - R20, D1은 KOSDAQ 지수 또는 ETF(KOSDAQ_ETF_FALLBACK)의 일봉으로 계산
+    - 레짐(mode, stage) 규칙
+
+      * bull-2:  R20 ≥ +6%  AND D1 ≥ +2.5%
+      * bull-1:  R20 ≥ +3%  AND D1 ≥ +0.5%  (단, bull-2는 제외)
+      * bear-2:  R20 ≤ -6%  AND D1 ≤ -2.5%
+      * bear-1:  R20 ≤ -3%  AND D1 ≤ -0.5%  (단, bear-2는 제외)
+      * neutral: -3% < R20 < +3%
+                 또는 (|R20| ≥ 3% 이지만 D1이 -0.5% ~ +0.5% 사이인 흔들리는 날)
+
+    stage:
+      * bull: 1/2
+      * bear: 1/2
+      * neutral: 0
     """
     if not REGIME_ENABLED:
         return REGIME_STATE
 
-    snap = _get_kosdaq_snapshot(kis)
     now = datetime.now(KST)
+
+    # 스냅샷(전일 종가, 일중 등락률) 업데이트
+    snap = _get_kosdaq_snapshot(kis)
     REGIME_STATE["last_snapshot_ts"] = now
     REGIME_STATE["prev_close"] = snap.get("prev_close")
     REGIME_STATE["pct_change"] = snap.get("pct_change")
 
-    px = snap.get("price")
-    if px is not None:
-        if REGIME_STATE["session_high"] is None:
-            REGIME_STATE["session_high"] = px
-        else:
-            REGIME_STATE["session_high"] = max(REGIME_STATE["session_high"], px)
-
-    if snap.get("above_vwap") is True:
-        if REGIME_STATE["last_above_vwap_ts"] is None:
-            REGIME_STATE["last_above_vwap_ts"] = now
-        REGIME_STATE["last_below_vwap_ts"] = None
-    elif snap.get("above_vwap") is False:
-        if REGIME_STATE["last_below_vwap_ts"] is None:
-            REGIME_STATE["last_below_vwap_ts"] = now
-        REGIME_STATE["last_above_vwap_ts"] = None
-
-    # 강세 조건: +0.5% 이상 & VWAP 상방 10분 이상
-    bull_ok = False
+    # R20 / D1 계산 (기본: KOSDAQ ETF 일봉)
+    R20 = None
+    D1 = None
     try:
-        if (snap.get("pct_change") is not None and snap["pct_change"] >= REG_BULL_MIN_UP_PCT):
-            if REGIME_STATE["last_above_vwap_ts"]:
-                mins = (now - REGIME_STATE["last_above_vwap_ts"]).total_seconds() / 60.0
-                bull_ok = mins >= REG_BULL_MIN_MINUTES
-    except Exception:
-        bull_ok = False
+        etf = KOSDAQ_ETF_FALLBACK
+        candles = kis.get_daily_candles(etf, count=21)
+        if candles and len(candles) >= 21:
+            # candles는 과거→현재 순서로 정렬되어 있음
+            close_20ago = float(candles[0]["close"])
+            close_yday = float(candles[-2]["close"])
+            close_today = float(candles[-1]["close"])
+            if close_20ago > 0 and close_yday > 0:
+                R20 = (close_today / close_20ago - 1.0) * 100.0
+                D1 = (close_today / close_yday - 1.0) * 100.0
+    except Exception as e:
+        logger.warning(f"[REGIME] R20/D1 계산 실패: {e}")
 
-    # 약세 조건: VWAP 하방 10분 이상 or 당일고점 대비 -0.7% 이상
-    bear_ok = False
-    drop_ok = False
-    try:
-        below_ok = False
-        if REGIME_STATE["last_below_vwap_ts"]:
-            mins_below = (now - REGIME_STATE["last_below_vwap_ts"]).total_seconds() / 60.0
-            below_ok = mins_below >= REG_BEAR_VWAP_MINUTES
+    REGIME_STATE["R20"] = R20
+    REGIME_STATE["D1"] = D1
 
-        if px is not None and REGIME_STATE["session_high"]:
-            drop_ok = (REGIME_STATE["session_high"] - px) / REGIME_STATE["session_high"] * 100.0 >= REG_BEAR_DROP_FROM_HIGH
+    mode = REGIME_STATE.get("mode") or "neutral"
+    stage = int(REGIME_STATE.get("stage") or 0)
 
-        bear_ok = below_ok or drop_ok
-    except Exception:
-        bear_ok = False
-
-    new_mode = REGIME_STATE["mode"]
-    if bear_ok:
-        if new_mode != "bear":
-            REGIME_STATE["mode"] = "bear"
-            REGIME_STATE["since"] = now
-            REGIME_STATE["bear_stage"] = 0
-        else:
-            mins_bear = (now - (REGIME_STATE["since"] or now)).total_seconds() / 60.0
-            if REGIME_STATE["bear_stage"] < 1 and mins_bear >= REG_BEAR_STAGE1_MINUTES:
-                REGIME_STATE["bear_stage"] = 1
-            if REGIME_STATE["bear_stage"] >= 1 and drop_ok:
-                REGIME_STATE["bear_stage"] = 2
-    elif bull_ok:
-        REGIME_STATE["mode"] = "bull"
-        if new_mode != "bull":
-            REGIME_STATE["since"] = now
-            REGIME_STATE["bear_stage"] = 0
+    if R20 is None or D1 is None:
+        # 데이터가 없으면 보수적으로 neutral-0
+        mode, stage = "neutral", 0
     else:
-        REGIME_STATE["mode"] = "neutral"
-        if new_mode != "neutral":
-            REGIME_STATE["since"] = now
-            REGIME_STATE["bear_stage"] = 0
+        # 우선순위: 강한 강세/약세 → 일반 강세/약세 → 중립
+        if R20 >= 6.0 and D1 >= 2.5:
+            mode, stage = "bull", 2
+        elif R20 >= 3.0 and D1 >= 0.5:
+            mode, stage = "bull", 1
+        elif R20 <= -6.0 and D1 <= -2.5:
+            mode, stage = "bear", 2
+        elif R20 <= -3.0 and D1 <= -0.5:
+            mode, stage = "bear", 1
+        elif (-3.0 < R20 < 3.0) or (abs(R20) >= 3.0 and -0.5 <= D1 <= 0.5):
+            mode, stage = "neutral", 0
+        else:
+            # 나머지 애매한 케이스는 보수적으로 neutral-0 처리
+            mode, stage = "neutral", 0
+
+    REGIME_STATE["mode"] = mode
+    REGIME_STATE["stage"] = stage
+    # 기존 bear_stage는 약세일 때만 stage를 반영(하위 로직 호환용)
+    REGIME_STATE["bear_stage"] = stage if mode == "bear" else 0
 
     return REGIME_STATE
-
-# === 매도 로직 ===
-def _force_sell_pass(kis: KisAPI, targets_codes: set, reason: str, prefer_market=True) -> set:
-    if not targets_codes:
-        return set()
-    targets_codes = {c for c in targets_codes if c}
-    balances = _fetch_balances(kis)
-    qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances}
-    sellable_map = {b.get("pdno"): _to_int(b.get("ord_psbl_qty", 0)) for b in balances}
-    avg_price_map = {b.get("pdno"): _to_float(b.get("pchs_avg_pric") or b.get("avg_price") or 0.0, 0.0) for b in balances}
-
-    remaining = set()
-    for code in list(targets_codes):
-        qty = qty_map.get(code, 0)
-        sellable = sellable_map.get(code, 0)
-        if qty <= 0:
-            logger.info(f"[스킵] {code}: 실제 잔고 수량 0")
-            continue
-        if sellable <= 0:
-            logger.info(f"[스킵] {code}: 매도가능수량=0 (대기/체결중/락) → 이번 패스 보류")
-            remaining.add(code)
-            continue
-
-        if MOMENTUM_OVERRIDES_FORCE_SELL and is_strong_momentum(kis, code):
-            logger.info(f"[모멘텀 강세] {code}: 강한 상승추세, 강제매도 제외 (policy=true)")
-            continue
-
-        try:
-            return_pct = get_20d_return_pct(kis, code)
-            logger.info(f"[모멘텀 수익률 체크] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}%")
-        except NetTemporaryError:
-            logger.warning(f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 패스 스킵")
-            remaining.add(code)
-            continue
-        except DataEmptyError:
-            logger.warning(f"[DATA_EMPTY] {code}: 0캔들 감지 → 다음 루프에서 재확인")
-            remaining.add(code)
-            continue
-        except DataShortError:
-            logger.error(f"[DATA_SHORT] {code}: 21개 미만 → 강제매도 판단 스킵")
-            remaining.add(code)
-            continue
-
-        if return_pct is not None and return_pct >= 3.0:
-            logger.info(f"[모멘텀 보유 유지] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 강제매도 제외")
-            continue
-        else:
-            logger.info(f"[매도진행] {code}: 최근 20일 수익률 {return_pct if return_pct is not None else 'N/A'}% < 3% → 강제매도")
-
-        try:
-            sell_qty = min(qty, sellable) if sellable > 0 else qty
-            cur_price, result = _sell_once(kis, code, sell_qty, prefer_market=prefer_market)
-            buy_px_for_pnl = avg_price_map.get(code) or None
-            if buy_px_for_pnl:
-                _log_realized_pnl(code, cur_price, sell_qty, buy_px_for_pnl)
-
-            log_trade({
-                "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                "code": code, "name": None, "qty": sell_qty, "K": None,
-                "target_price": None, "strategy": "강제전량매도",
-                "side": "SELL", "price": cur_price if cur_price is not None else 0,
-                "amount": (_to_int(cur_price, 0) * int(sell_qty)) if cur_price is not None else 0,
-                "result": result,
-                "pnl_pct": (((float(cur_price) - float(buy_px_for_pnl)) / float(buy_px_for_pnl) * 100.0) if (cur_price is not None and buy_px_for_pnl) else None),
-                "profit": (int(round((float(cur_price) - float(buy_px_for_pnl)) * int(sell_qty))) if (cur_price is not None and buy_px_for_pnl) else None),
-                "reason": reason
-            })
-        finally:
-            time.sleep(RATE_SLEEP_SEC)
-
-    balances_after = _fetch_balances(kis)
-    after_qty_map = {b.get("pdno"): _to_int(b.get("hldg_qty", 0)) for b in balances_after}
-    for code in targets_codes:
-        if after_qty_map.get(code, 0) > 0:
-            remaining.add(code)
-    return remaining
-
-def _force_sell_all(kis: KisAPI, holding: dict, reason: str, passes: int, include_all_balances: bool, prefer_market=True) -> None:
-    target_codes = set([c for c in holding.keys() if c])
-    if include_all_balances:
-        try:
-            balances = _fetch_balances(kis)
-            for b in balances:
-                code = b.get("pdno")
-                if code and _to_int(b.get("hldg_qty", 0)) > 0:
-                    target_codes.add(code)
-        except Exception as e:
-            logger.error(f"[잔고조회 오류: 전체포함 불가] {e}")
-    if not target_codes:
-        logger.info("[강제전량매도] 대상 종목 없음")
-        return
-    logger.info(f"[⚠️ 강제전량매도] 사유: {reason} / 대상 종목수: {len(target_codes)} / 전체잔고포함={include_all_balances}")
-    remaining = target_codes
-    for p in range(1, max(1, passes) + 1):
-        logger.info(f"[강제전량매도 PASS {p}/{passes}] 대상 {len(remaining)}종목 시도")
-        remaining = _force_sell_pass(kis, remaining, reason=reason, prefer_market=prefer_market)
-        if not remaining:
-            logger.info("[강제전량매도] 모든 종목 매도 완료")
-            break
-    if remaining:
-        logger.error(f"[강제전량매도] 미매도 잔여 {len(remaining)}종목: {sorted(list(remaining))}")
-    for code in list(holding.keys()):
-        holding.pop(code, None)
-    save_state(holding, {})
-
-# === [ANCHOR: EXIT] 동적 트레일링/TP + 손절 ===
-def _adaptive_exit(
-    kis: KisAPI,
-    code: str,
-    pos: Dict[str, Any],
-    regime_mode: str = "neutral",
-) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
-    """
-    레짐(강세/약세/중립) + 1분봉 모멘텀 기반
-    - 부분 익절(1차/2차)
-    - 트레일링 스탑
-    - 손절
-    을 동적으로 적용하는 매도 엔진.
-    한 번 호출에서 "한 번의 매도"만 실행하고, 그 결과만 반환한다.
-    """
-    now = datetime.now(KST)
-    reason: Optional[str] = None
-    exec_px: Optional[float] = None
-    result: Optional[Any] = None
-    sold_qty: Optional[int] = None
-    trade_logged = False
-
-    # === 현재가 조회 ===
-    try:
-        cur = _safe_get_price(kis, code)
-        if cur is None:
-            logger.warning(f"[EXIT-FAIL] {code} 현재가 조회 실패")
-            return None, None, None, None
-    except Exception as e:
-        logger.error(f"[EXIT-FAIL] {code} 현재가 조회 예외: {e}")
-        return None, None, None, None
-
-    # === 상태/기초 값 ===
-    qty = _to_int(pos.get("qty"), 0)
-    if qty <= 0:
-        logger.warning(f"[EXIT-FAIL] {code} qty<=0")
-        return None, None, None, None
-
-    buy_price = float(pos.get("buy_price", 0.0)) or 0.0
-    if buy_price <= 0:
-        logger.warning(f"[EXIT-FAIL] {code} buy_price<=0")
-        return None, None, None, None
-
-    # 최고가(high) 갱신
-    pos["high"] = max(float(pos.get("high", cur)), float(cur))
-    max_price = float(pos["high"])
-
-    # 현재 누적 수익률
-    pnl_pct = (cur - buy_price) / buy_price * 100.0
-
-    # 부분 익절 플래그 & 비율
-    sold_p1 = bool(pos.get("sold_p1", False))
-    sold_p2 = bool(pos.get("sold_p2", False))
-    qty_p1 = max(1, int(qty * PARTIAL1))
-    qty_p2 = max(1, int(qty * PARTIAL2))
-
-    # === 레짐 + 모멘텀 기반 TP/트레일링 설정 ===
-    base_tp1 = DEFAULT_PROFIT_PCT        # 보통 3.0
-    base_tp2 = DEFAULT_PROFIT_PCT * 2    # 6.0
-
-    # 모멘텀 강세 여부
-    strong_mom = False
-    try:
-        strong_mom = is_strong_momentum(kis, code)
-    except Exception as e:
-        logger.warning(f"[MOM_CHECK_FAIL] {code} 모멘텀 평가 실패: {e}")
-        strong_mom = False
-
-    tp1 = base_tp1
-    tp2 = base_tp2
-    trail_down_frac = 0.018  # 기본: 고점대비 1.8% 되돌리면 컷
-
-    if regime_mode == "bull":
-        # 좋은 장: 기본 목표 상향
-        tp1 = base_tp1 + 1.0      # 4%
-        tp2 = base_tp2 + 2.0      # 8%
-        trail_down_frac = 0.025   # 2.5%
-
-        if strong_mom:
-            # 장도 좋고 모멘텀도 강하면 한 번 더 상향
-            tp1 += 1.0            # 5%
-            tp2 += 2.0            # 10%
-            trail_down_frac = 0.03
-
-    elif regime_mode == "neutral":
-        tp1 = base_tp1            # 3%
-        tp2 = base_tp2            # 6%
-        trail_down_frac = 0.018
-
-        if strong_mom:
-            tp1 = base_tp1 + 1.0  # ✅ 4%
-            tp2 = base_tp2 + 2.0  # ✅ 8%
-            trail_down_frac = 0.02  # ✅ -2%
-
-    elif regime_mode == "bear":
-        # 약세장: 보수적으로
-        tp1 = 2.0
-        tp2 = 4.0
-        trail_down_frac = 0.01
-
-    # 손절 기준 (-5%)
-    stop_loss_pct = DEFAULT_LOSS_PCT  # 보통 -5.0
-
-    # ✅ 항상 초기화: 예외가 나도 sell_size는 존재하도록
-    sell_size: int = qty
-
-    # === 1) 손절 먼저 체크 ===
-    if pnl_pct <= stop_loss_pct:
-        reason = f"손절 {stop_loss_pct:.1f}%"
-        sell_size = qty  # 전량
-    else:
-        # === 2) 2차 TP (더 높은 수익 구간) ===
-        if (pnl_pct >= tp2) and (not sold_p2) and qty > 1:
-            reason = f"2차 익절 {tp2:.1f}%"
-            sell_size = min(qty, qty_p2)
-            pos["sold_p2"] = True
-
-        # === 3) 1차 TP ===
-        elif (pnl_pct >= tp1) and (not sold_p1) and qty > 1:
-            reason = f"1차 익절 {tp1:.1f}%"
-            sell_size = min(qty, qty_p1)
-            pos["sold_p1"] = True
-
-        else:
-            # === 4) 트레일링 스탑 ===
-            if max_price >= buy_price * (1 + tp1 / 100.0) and cur <= max_price * (1 - trail_down_frac):
-                reason = f"트레일링스톱({trail_down_frac*100:.1f}%)"
-                sell_size = qty
-            else:
-                # 청산 조건 없음 → 보유 유지
-                return None, None, None, None
-
-    # === 실제 매도 실행 ===
-    try:
-        exec_px, result = _sell_once(kis, code, sell_size, prefer_market=True)
-        sold_qty = sell_size
-
-        # 보유 수량 감소
-        pos["qty"] = max(0, qty - sell_size)
-
-        # 실현손익 로그
-        _log_realized_pnl(code, exec_px, sold_qty, buy_price, reason=reason)
-
-        logger.info(
-            f"[SELL-TRIGGER] {code} REASON={reason} qty={sold_qty} price={exec_px} "
-            f"(pnl={pnl_pct:.2f}%, regime={regime_mode}, strong_mom={strong_mom})"
-        )
-
-        # trade 로그
-        log_trade(
-            {
-                "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "code": code,
-                "side": "SELL",
-                "reason": reason,
-                "order_price": buy_price,
-                "fill_price": exec_px,
-                "qty": sold_qty,
-                "pnl_pct": pnl_pct,
-                "result": result,
-                "status": "filled" if result and result.get("rt_cd") == "0" else "failed",
-            }
-        )
-        trade_logged = True
-
-    except Exception as e:
-        logger.error(f"[SELL-FAIL] {code} qty={sell_size} err={e}")
-        if not trade_logged:
-            log_trade(
-                {
-                    "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "code": code,
-                    "side": "SELL",
-                    "reason": reason or "UNKNOWN",
-                    "order_price": buy_price,
-                    "fill_price": None,
-                    "qty": sell_size,
-                    "result": None,
-                    "status": "failed",
-                    "fail_reason": str(e),
-                }
-            )
-        return None, None, None, None
-
-    return reason, exec_px, result, sold_qty
-
-
-# ====== 메인 진입부 및 실전 rolling_k 루프 ======
-
 def log_champion_and_regime(
     logger: logging.Logger,
     champion,
@@ -1506,6 +1481,167 @@ def log_champion_and_regime(
             regime_state.get("comment"),
         )
 
+def _adaptive_exit(
+    kis: KisAPI,
+    code: str,
+    pos: Dict[str, Any],
+    regime_mode: str = "neutral",
+) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
+    """
+    레짐(강세/약세/중립) + 1분봉 모멘텀 기반
+    - 부분 익절(1차/2차)
+    - 트레일링 스탑
+    - 손절
+    을 동적으로 적용하는 매도 엔진.
+    한 번 호출에서 "한 번의 매도"만 실행하고, 그 결과만 반환한다.
+    """
+    now = datetime.now(KST)
+    reason: Optional[str] = None
+
+    # 현재가 조회
+    try:
+        cur = _safe_get_price(kis, code)
+        if cur is None or cur <= 0:
+            logger.warning(f"[EXIT-FAIL] {code} 현재가 조회 실패")
+            return None, None, None, None
+    except Exception as e:
+        logger.error(f"[EXIT-FAIL] {code} 현재가 조회 예외: {e}")
+        return None, None, None, None
+
+    # === 상태/기초 값 ===
+    qty = _to_int(pos.get("qty"), 0)
+    if qty <= 0:
+        logger.warning(f"[EXIT-FAIL] {code} qty<=0")
+        return None, None, None, None
+
+    buy_price = float(pos.get("buy_price", 0.0)) or 0.0
+    if buy_price <= 0:
+        logger.warning(f"[EXIT-FAIL] {code} buy_price<=0")
+        return None, None, None, None
+
+    # 최고가(high) 갱신
+    pos["high"] = max(float(pos.get("high", cur)), float(cur))
+    max_price = float(pos["high"])
+
+    # 현재 누적 수익률
+    pnl_pct = (cur - buy_price) / buy_price * 100.0
+
+    # 부분 익절 플래그 & 비율
+    sold_p1 = bool(pos.get("sold_p1", False))
+    sold_p2 = bool(pos.get("sold_p2", False))
+    qty_p1 = max(1, int(qty * PARTIAL1))
+    qty_p2 = max(1, int(qty * PARTIAL2))
+
+    # === 레짐 기반 TP/트레일링 설정 ===
+    base_tp1 = DEFAULT_PROFIT_PCT        # 보통 3.0
+    base_tp2 = DEFAULT_PROFIT_PCT * 2    # 6.0
+    trail_down_frac = 0.018              # 기본: 고점대비 1.8% 되돌리면 컷
+
+    # (선택) 모멘텀 정보를 쓰고 싶으면 여기서 strong_mom 계산
+    strong_mom = False
+    try:
+        # metrics에 is_strong_momentum이 있다면 사용, 없으면 False 유지
+        strong_mom = bool(is_strong_momentum(kis, code))
+    except Exception:
+        strong_mom = False
+
+    if regime_mode == "bull":
+        # 좋은 장: 기본 목표 상향
+        tp1 = base_tp1 + 1.0      # 4%
+        tp2 = base_tp2 + 2.0      # 8%
+        trail_down_frac = 0.025   # 2.5%
+
+        if strong_mom:
+            # 장도 좋고 모멘텀도 강하면 한 번 더 상향
+            tp1 += 1.0            # 5%
+            tp2 += 2.0            # 10%
+            trail_down_frac = 0.03
+
+    elif regime_mode == "neutral":
+        tp1 = base_tp1            # 3%
+        tp2 = base_tp2            # 6%
+        trail_down_frac = 0.018
+
+        if strong_mom:
+            tp1 = base_tp1 + 1.0  # 4%
+            tp2 = base_tp2 + 2.0  # 8%
+            trail_down_frac = 0.02
+
+    elif regime_mode == "bear":
+        # 약세장: 보수적으로
+        tp1 = 2.0
+        tp2 = 4.0
+        trail_down_frac = 0.01
+    else:
+        tp1 = base_tp1
+        tp2 = base_tp2
+        trail_down_frac = 0.018
+
+    # 손절 기준
+    hard_stop_pct = DEFAULT_LOSS_PCT
+
+    sell_size: int = 0
+
+    # === 1) 손절 ===
+    if pnl_pct <= -hard_stop_pct:
+        reason = f"손절 {hard_stop_pct:.1f}%"
+        sell_size = qty
+
+    # === 2) 2차 TP (더 높은 수익 구간) ===
+    elif (pnl_pct >= tp2) and (not sold_p2) and qty > 1:
+        reason = f"2차 익절 {tp2:.1f}%"
+        sell_size = min(qty, qty_p2)
+        pos["sold_p2"] = True
+
+    # === 3) 1차 TP ===
+    elif (pnl_pct >= tp1) and (not sold_p1) and qty > 1:
+        reason = f"1차 익절 {tp1:.1f}%"
+        sell_size = min(qty, qty_p1)
+        pos["sold_p1"] = True
+
+    else:
+        # === 4) 트레일링 스탑 ===
+        if max_price >= buy_price * (1 + tp1 / 100.0) and cur <= max_price * (1 - trail_down_frac):
+            reason = f"트레일링스톱({trail_down_frac*100:.1f}%)"
+            sell_size = qty
+        else:
+            # 청산 조건 없음 → 보유 유지
+            return None, None, None, None
+
+    # === 실제 매도 실행 ===
+    try:
+        exec_px, result = _sell_once(kis, code, sell_size, prefer_market=True)
+        sold_qty = sell_size
+
+        # 보유 수량 감소
+        pos["qty"] = max(0, qty - sell_size)
+
+        # 실현손익 로그
+        try:
+            log_trade(
+                {
+                    "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "code": code,
+                    "name": pos.get("name"),
+                    "side": "SELL",
+                    "qty": int(sold_qty),
+                    "price": float(exec_px) if exec_px is not None else float(cur),
+                    "amount": int(sold_qty) * int(exec_px or cur),
+                    "reason": reason,
+                    "regime_mode": regime_mode,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[EXIT-LOG-FAIL] {code}: {e}")
+
+    except Exception as e:
+        logger.error(f"[SELL-FAIL] {code} qty={sell_size} err={e}")
+        # 매도 실패 시에는 상태 원복하지 않고, 다음 루프에서 다시 판단
+        return None, None, None, None
+
+    return reason, exec_px, result, sold_qty
+
+
 def main():
     kis = KisAPI()
 
@@ -1592,22 +1728,45 @@ def main():
     # - intraday 진입은 기존 VWAP 가드(is_vwap_ok_for_entry)로 필터링됨
     selected_targets: Dict[str, Any] = {}
 
+
     try:
         # 가능하면 당일 레짐을 한번 계산해서 사용
         regime_snapshot = _update_market_regime(kis)
         mode = (regime_snapshot or {}).get("mode") or "neutral"
-        pct_change = float((regime_snapshot or {}).get("pct_change") or 0.0)
+        stage = int((regime_snapshot or {}).get("stage") or 0)
+        R20 = regime_snapshot.get("R20")
+        D1 = regime_snapshot.get("D1")
+
+        # 🔹 로그/조건식에서 쓰는 등락률(%): 새 레짐에서는 D1을 그대로 사용
+        pct_change = float(D1 or 0.0)
     except Exception as e:
-        logger.warning("[REBALANCE] 레짐 스냅샷 계산 실패, neutral로 대체: %s", e)
+        logger.warning("[REBALANCE] 레짐 스냅샷 계산 실패, neutral-0로 대체: %s", e)
         mode = "neutral"
+        stage = 0
+        R20 = None
+        D1 = None
         pct_change = 0.0
 
-    # 레짐 기반 신규 편입 상한
-    if mode == "bear":
-        max_new = 1
-    else:
-        # neutral / bull 모두 2개까지 허용 (향후 pct_change 구간별로 더 쪼갤 수 있음)
-        max_new = 2
+    regime_key = (mode, stage)
+    cap_scale = REGIME_CAPITAL_SCALE.get(regime_key, REGIME_CAPITAL_SCALE.get(("neutral", 0), 0.5))
+
+    # 레짐 + 예수금 기반 실제 사용 자본 계산
+    try:
+        ord_cash = kis.get_cash_available_today()
+    except Exception as e:
+        logger.error("[BUDGET_FAIL] 예수금 조회 실패(regime-capital): %s", e)
+        ord_cash = 0
+
+    capital_base = int(max(0, int(ord_cash * CAP_CAP)))
+    capital_active = int(min(capital_base * cap_scale, DAILY_CAPITAL))
+    logger.info(
+        f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} D1={D1 if D1 is not None else 'N/A'} "
+        f"ord_cash={ord_cash:,} base={capital_base:,} active={capital_active:,} scale={cap_scale:.2f}"
+    )
+
+
+    # 레짐별 최대 보유 종목 수
+    n_active = REGIME_MAX_ACTIVE.get(regime_key, REGIME_MAX_ACTIVE.get(("neutral", 0), 3))
 
     scored: List[Tuple[str, float, bool]] = []
 
@@ -1636,18 +1795,50 @@ def main():
 
     picked: List[str] = []
 
+    # 모멘텀 강한 버킷을 우선 사용하되, 전체 보유 종목 수는 레짐별 n_active로 제한
     for code, score, _ in strong_bucket:
-        if len(picked) >= max_new:
+        if len(picked) >= n_active:
             break
         picked.append(code)
 
     for code, score, _ in weak_bucket:
-        if len(picked) >= max_new:
+        if len(picked) >= n_active:
             break
         picked.append(code)
 
+    # === [NEW] 레짐별 챔피언 비중 & Target Notional 계산 ===
+    regime_weights = REGIME_WEIGHTS.get(regime_key, REGIME_WEIGHTS.get(("neutral", 0), [1.0]))
+    # 선택된 종목 수만큼 비중 슬라이스
+    weights_for_picked: List[float] = list(regime_weights[: len(picked)])
+
+    for idx, code in enumerate(picked):
+        if code not in processed_targets:
+            continue
+        w = weights_for_picked[idx] if idx < len(weights_for_picked) else 0.0
+        t = processed_targets[code]
+        t["regime_weight"] = float(w)
+        t["capital_active"] = int(capital_active)
+        target_notional = int(round(capital_active * w))
+        t["target_notional"] = target_notional
+
+        ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
+        planned_qty = _notional_to_qty(kis, code, target_notional, ref_price=ref_px)
+        t["qty"] = int(planned_qty)
+        t["매수수량"] = int(planned_qty)
+        processed_targets[code] = t
+
     for code in picked:
-        selected_targets[code] = processed_targets[code]
+        if code in processed_targets:
+            selected_targets[code] = processed_targets[code]
+
+    logger.info(
+        "[REGIME-CHAMPIONS] mode=%s stage=%s n_active=%s picked=%s capital_active=%s",
+        mode,
+        stage,
+        n_active,
+        picked,
+        f"{capital_active:,}",
+    )
 
     logger.info(
         "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
@@ -1750,7 +1941,6 @@ def main():
                 continue
 
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
-            can_buy = True  # 예산 가드는 필요시 추가 구현
             for code, target in code_to_target.items():
                 prev_volume = _to_float(target.get("prev_volume"))
                 prev_open = _to_float(target.get("prev_open"))
@@ -1759,10 +1949,18 @@ def main():
                     f"[prev_volume 체크] {code} 거래량:{prev_volume}, 전일시가:{prev_open}, 전일종가:{prev_close}"
                 )
 
-                qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
-                if qty <= 0:
+                planned_total_qty = _to_int(target.get("매수수량") or target.get("qty"), 0)
+                if planned_total_qty <= 0:
                     logger.info(f"[SKIP] {code}: 매수수량 없음/0")
                     continue
+
+                # 눌림목 3단계 진입(40/35/25%)을 위한 스테이지별 목표 수량
+                stage1_qty = max(1, int(planned_total_qty * ENTRY_LADDERS[0]))
+                stage2_qty = max(0, int(planned_total_qty * ENTRY_LADDERS[1]))
+                stage3_qty = max(0, int(planned_total_qty - stage1_qty - stage2_qty))
+
+                # 1차 진입 시 실제 매수 수량은 stage1(40%)만 사용
+                qty = stage1_qty
 
                 k_value = target.get("best_k") or target.get("K") or target.get("k")
                 _ = None if k_value is None else _to_float(k_value)
@@ -1877,6 +2075,19 @@ def main():
                                 eff_target_price,
                             )
 
+                            # 눌림목 3단계 진입용 상태값 세팅
+                            try:
+                                pos = holding.get(code, {})
+                                pos["entry_stage"] = 1
+                                pos["max_price_after_entry"] = float(current_price)
+                                pos["planned_total_qty"] = int(planned_total_qty)
+                                pos["stage1_qty"] = int(stage1_qty)
+                                pos["stage2_qty"] = int(stage2_qty)
+                                pos["stage3_qty"] = int(stage3_qty)
+                                holding[code] = pos
+                            except Exception as e:
+                                logger.warning(f"[INIT-SCALEIN-STATE-FAIL] {code}: {e}")
+
                             traded[code] = {
                                 "buy_time": now_str,
                                 "qty": int(qty),
@@ -1905,6 +2116,19 @@ def main():
 
                     # --- 실전형 청산 (타겟 보유포지션) ---
                     if is_open and code in holding:
+                        # (눌림목 3단계 진입) 추가 매수 평가
+                        try:
+                            _maybe_scale_in_dips(
+                                kis=kis,
+                                holding=holding,
+                                code=code,
+                                target=target,
+                                now_str=now_str,
+                                regime_mode=regime["mode"],
+                            )
+                        except Exception as e:
+                            logger.warning(f"[SCALE-IN-EVAL-FAIL] {code}: {e}")
+
                         # (약세 레짐) 단계적 축소
                         if regime["mode"] == "bear":
                             sellable_here = ord_psbl_map.get(code, 0)
