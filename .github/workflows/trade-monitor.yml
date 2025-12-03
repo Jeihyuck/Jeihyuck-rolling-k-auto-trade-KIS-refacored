@@ -2,9 +2,9 @@ name: Trade Monitor (VWAP branch)
 
 on:
   push:
-    branches: [ vwap-ch ]
+    branches: [ main ]
   pull_request:
-    branches: [ vwap-ch ]
+    branches: [ main ]
   schedule:
     # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~토) = 0-6
     - cron: "57 23 * * 0-6"
@@ -13,8 +13,8 @@ on:
 
 jobs:
   monitor-trade:
-    # 🔒 안전장치: 혹시라도 main에서 실행되더라도 vwap 브랜치가 아닐 땐 스킵
-    if: github.ref == 'refs/heads/vwap-ch'
+    # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     env:
