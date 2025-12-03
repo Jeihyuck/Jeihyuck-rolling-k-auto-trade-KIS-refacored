@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import math
 import logging
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, Any, List
 
 import numpy as np
 import pandas as pd
@@ -271,3 +271,127 @@ def _enforce_min_weight_for_forced(selected, forced_codes, min_weight=0.08):
 
 # --- (끝) ---
 
+# === Champion Mode: dynamic position sizing & top-N selection ===
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        if val is None or (isinstance(val, str) and not str(val).strip()):
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+
+def compute_champion_score(candidate: Dict[str, Any]) -> float:
+    """RK-Max용 챔피언 종목 스코어링 함수.
+
+    기대되는 필드 (없으면 0으로 처리):
+      - meta_score: Meta-K 통합 스코어
+      - momentum_5d or mom5: 단기 모멘텀
+      - win_rate: 백테스트 승률 (%)
+      - mdd: 백테스트 MDD (% / -값일 수 있음)
+      - vwap_premium: (종가 - VWAP)/VWAP * 100 (%)
+    """
+    base = _safe_float(
+        candidate.get("meta_score")
+        or candidate.get("score")
+        or candidate.get("rk_score")
+    )
+    momo = _safe_float(
+        candidate.get("momentum_5d")
+        or candidate.get("mom5")
+        or candidate.get("momentum")
+    )
+    win = _safe_float(candidate.get("win_rate"))
+    mdd = _safe_float(candidate.get("mdd"))
+    vwap = _safe_float(candidate.get("vwap_premium"))
+
+    # 가중합 기반 스코어
+    score = (
+        base * 0.4 +
+        momo * 0.3 +
+        win * 0.2 -
+        abs(mdd) * 0.05 +
+        vwap * 0.1
+    )
+    return score
+
+
+def decide_position_limit(candidates: Iterable[Dict[str, Any]]) -> int:
+    """오늘 가져갈 포지션 개수(0~4개)를 결정.
+
+    - 후보 수가 적으면(<=2) → 그 수만큼만
+    - 평균/상위 모멘텀이 강하면 포지션 수를 늘림
+    - 전체적으로 약하면 1~2개로 축소
+    """
+    candidates = list(candidates or [])
+    n = len(candidates)
+    if n == 0:
+        return 0
+    if n <= 2:
+        return n
+
+    # 모멘텀 기준으로 강도 측정
+    momos: List[float] = []
+    for c in candidates:
+        mom = _safe_float(
+            c.get("momentum_5d")
+            or c.get("mom5")
+            or c.get("momentum")
+        )
+        if mom != 0:
+            momos.append(mom)
+
+    if not momos:
+        # 정보 없으면 기본 2개
+        return min(2, n)
+
+    momos.sort(reverse=True)
+    top_k = momos[: min(5, len(momos))]
+    avg_top = sum(top_k) / len(top_k)
+
+    # 임계값은 경험적 설정 (단기 모멘텀 % 기준 가정)
+    if avg_top >= 10:
+        # 아주 강한 장 → 최대 4개
+        return min(4, n)
+    elif avg_top >= 5:
+        # 적당히 강한 장 → 3개
+        return min(3, n)
+    elif avg_top >= 2:
+        # 애매한 장 → 2개
+        return min(2, n)
+    else:
+        # 약한 장 → 1개만
+        return 1
+
+
+def select_champions(candidates: Iterable[Dict[str, Any]], position_limit: int) -> list[Dict[str, Any]]:
+    """후보군 중에서 챔피언 종목만 선별.
+
+    - compute_champion_score() 기준으로 내림차순 정렬
+    - 상위 position_limit개 반환
+    - 각 종목에 champ_score / champ_rank 필드 부여
+    """
+    if position_limit <= 0:
+        return []
+
+    arr = list(candidates or [])
+    if not arr:
+        return []
+
+    scored = []
+    for c in arr:
+        s = compute_champion_score(c)
+        scored.append((s, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[: position_limit]
+
+    champions: list[Dict[str, Any]] = []
+    for rank, (s, c) in enumerate(top, start=1):
+        c = dict(c)  # 복사해서 부가 정보 부여
+        c["champ_score"] = s
+        c["champ_rank"] = rank
+        champions.append(c)
+
+    return champions

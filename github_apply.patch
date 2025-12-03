@@ -1,0 +1,228 @@
+From 1207517b1cf3821f7410c478d3dae58727d6ee7e Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 2 Dec 2025 01:21:08 +0000
+Subject: [PATCH] Separate pullback entry scan from champion trades
+
+## Summary
+- decouple champion Rolling-K entries from the pullback gate so they no longer stall on pattern checks
+- build a dedicated pullback watchlist from KOSDAQ top-N market-cap names and trade them with the reversal pattern
+- expose configuration for pullback scan universe size and per-trade capital weight
+
+## Testing
+- python -m compileall trader
+---
+ trader/trader.py | 158 ++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 137 insertions(+), 21 deletions(-)
+
+diff --git a/trader/trader.py b/trader/trader.py
+index 5322d4b..216ab95 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, Tuple, List
+ import csv
+ from .report_ceo import ceo_report
+ from .metrics import vwap_guard   # 🔸 VWAP 가드 함수
++from rolling_k_auto_trade_api.best_k_meta_strategy import get_kosdaq_top_n
+ 
+ # =========================
+ # [CONFIG] .env 없이도 동작
+@@ -64,6 +65,8 @@ CONFIG = {
+     "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
+     "PULLBACK_DAYS": "3",                  # 연속 하락 일수
+     "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
++    "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
++    "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+@@ -171,6 +174,8 @@ USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
+ PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
+ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+ PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
++PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
++PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+@@ -1978,6 +1983,28 @@ def main():
+ 
+     code_to_target: Dict[str, Any] = selected_targets
+ 
++    # 눌림목 스캔용 코스닥 시총 상위 리스트 (챔피언과 별도로 관리)
++    pullback_watch: Dict[str, Dict[str, Any]] = {}
++    if USE_PULLBACK_ENTRY:
++        try:
++            pb_weight = max(0.0, min(PULLBACK_UNIT_WEIGHT, 1.0))
++            base_notional = int(round(capital_active * pb_weight))
++            pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
++            for _, row in pb_df.iterrows():
++                code = str(row.get("Code") or row.get("code") or "").zfill(6)
++                if not code:
++                    continue
++                pullback_watch[code] = {
++                    "code": code,
++                    "name": row.get("Name") or row.get("name"),
++                    "notional": base_notional,
++                }
++            logger.info(
++                f"[PULLBACK-WATCH] 코스닥 시총 Top{PULLBACK_TOPN} {len(pullback_watch)}종목 스캔 준비"
++            )
++        except Exception as e:
++            logger.warning(f"[PULLBACK-WATCH-FAIL] 시총 상위 로드 실패: {e}")
++
+     loop_sleep_sec = 2.5  # 메인 루프 대기 시간(초)
+ 
+     try:
+@@ -2101,32 +2128,14 @@ def main():
+                     logger.info(f"[📈 현재가] {code}: {current_price}")
+ 
+                     pullback_info: Dict[str, Any] = {}
+-                    if USE_PULLBACK_ENTRY:
++                    try:
+                         pullback_info = _detect_pullback_reversal(
+                             kis=kis,
+                             code=code,
+                             current_price=float(current_price) if current_price else None,
+                         )
+-                        if not pullback_info.get("setup"):
+-                            logger.info(
+-                                f"[PULLBACK-SKIP] {code}: 신고가 눌림 패턴 미충족 → reason={pullback_info.get('reason')}"
+-                            )
+-                            continue
+-                        if not pullback_info.get("reversing"):
+-                            rev_px = pullback_info.get("reversal_price")
+-                            logger.info(
+-                                f"[PULLBACK-WAIT] {code}: 현재가({current_price}) < 반등확인선({rev_px}) → 매수 대기"
+-                            )
+-                            continue
+-                    else:
+-                        try:
+-                            pullback_info = _detect_pullback_reversal(
+-                                kis=kis,
+-                                code=code,
+-                                current_price=float(current_price) if current_price else None,
+-                            )
+-                        except Exception:
+-                            pullback_info = {}
++                    except Exception:
++                        pullback_info = {}
+ 
+                     trade_common_buy = {
+                         "datetime": now_str,
+@@ -2456,6 +2465,113 @@ def main():
+                     logger.error(f"[❌ 주문/조회 실패] {code} : {e}")
+                     continue
+ 
++            # ====== 눌림목 전용 매수 (챔피언과 독립적으로 Top-N 시총 리스트 스캔) ======
++            if USE_PULLBACK_ENTRY and is_open and pullback_watch:
++                for code, info in pullback_watch.items():
++                    if code in code_to_target:
++                        continue  # 챔피언 루프와 별도로만 처리
++                    if code in holding or code in traded:
++                        continue
++                    if not can_buy:
++                        logger.info(
++                            f"[PULLBACK-BUDGET-SKIP] {code}: 예산 없음 → 눌림목 신규 매수 스킵"
++                        )
++                        continue
++
++                    try:
++                        current_price = _safe_get_price(kis, code)
++                    except Exception:
++                        current_price = None
++                    if current_price is None or current_price <= 0:
++                        continue
++
++                    try:
++                        pullback_info = _detect_pullback_reversal(
++                            kis=kis,
++                            code=code,
++                            current_price=float(current_price),
++                        )
++                    except Exception as e:
++                        logger.warning(f"[PULLBACK-DETECT-FAIL] {code}: {e}")
++                        continue
++                    if not pullback_info.get("setup"):
++                        logger.info(
++                            f"[PULLBACK-SKIP] {code}: 신고가 눌림 패턴 미충족 → reason={pullback_info.get('reason')}"
++                        )
++                        continue
++                    if not pullback_info.get("reversing"):
++                        rev_px = pullback_info.get("reversal_price")
++                        logger.info(
++                            f"[PULLBACK-WAIT] {code}: 현재가({current_price}) < 반등확인선({rev_px}) → 눌림목 대기"
++                        )
++                        continue
++
++                    trigger_price = float(pullback_info.get("reversal_price") or current_price)
++                    notional = int(info.get("notional") or 0)
++                    if notional <= 0:
++                        logger.info(
++                            f"[PULLBACK-SKIP] {code}: notional=0 → 매수 스킵"
++                        )
++                        continue
++
++                    qty = _notional_to_qty(kis, code, notional, ref_price=current_price)
++                    if qty <= 0:
++                        logger.info(f"[PULLBACK-SKIP] {code}: 수량 0 → 매수 스킵")
++                        continue
++
++                    vwap_val = kis.get_vwap_today(code)
++                    if vwap_val is not None and vwap_val > 0:
++                        if not vwap_guard(float(current_price), float(vwap_val), VWAP_TOL):
++                            logger.info(
++                                f"[PULLBACK-VWAP-GUARD] {code}: 현재가({current_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
++                                f"→ 눌림목 진입 스킵 (VWAP={vwap_val:.2f})"
++                            )
++                            continue
++
++                    if int(current_price) >= int(trigger_price):
++                        result = place_buy_with_fallback(
++                            kis, code, int(qty), limit_price=int(trigger_price)
++                        )
++                        try:
++                            _init_position_state(
++                                kis,
++                                holding,
++                                code,
++                                float(current_price),
++                                int(qty),
++                                None,
++                                trigger_price,
++                            )
++                        except Exception as e:
++                            logger.warning(f"[PULLBACK-INIT-FAIL] {code}: {e}")
++
++                        traded[code] = {
++                            "buy_time": now_str,
++                            "qty": int(qty),
++                            "price": float(current_price),
++                        }
++                        logger.info(
++                            f"[✅ 눌림목 매수] {code}, qty={qty}, price={current_price}, trigger={trigger_price}, result={result}"
++                        )
++
++                        log_trade(
++                            {
++                                "datetime": now_str,
++                                "code": code,
++                                "name": info.get("name"),
++                                "qty": int(qty),
++                                "K": None,
++                                "target_price": trigger_price,
++                                "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
++                                "side": "BUY",
++                                "price": float(current_price),
++                                "amount": int(float(current_price) * int(qty)),
++                                "result": result,
++                            }
++                        )
++                        save_state(holding, traded)
++                        time.sleep(RATE_SLEEP_SEC)
++
+             # ====== (A) 비타겟 보유분도 장중 능동관리 ======
+             if is_open:
+                 for code in list(holding.keys()):
+-- 
+2.43.0
+

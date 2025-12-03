@@ -138,6 +138,7 @@ TR_MAP = {
         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+        "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
         "TOKEN": "/oauth2/tokenP",
     },
     "real": {
@@ -147,6 +148,7 @@ TR_MAP = {
         "PRICE": [os.getenv("KIS_TR_ID_PRICE_REAL", "FHKST01010100")],
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
+        "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART_REAL", "FHKST03010200")],
         "TOKEN": "/oauth2/token",
     },
 }
@@ -669,6 +671,126 @@ class KisAPI:
         except Exception as e:
             logger.warning(f"[ATR] 계산 실패 code={code}: {e}")
             return None
+
+    def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000") -> List[Dict[str, Any]]:
+        """KIS 주식당일분봉조회 (FHKST03010200 / inquire-time-itemchartprice)
+        - FID_COND_MRKT_DIV_CODE: 'J'
+        - FID_INPUT_ISCD: 6자리 종목코드('A' 제거)
+        - FID_INPUT_HOUR_1: 시작 시간(HHMMSS), 예: '090000'
+        - FID_PW_DATA_INCU_YN: 'Y'
+        - FID_ETC_CLS_CODE: ''
+        """
+        market_code = "J"
+        iscd = code.strip().lstrip("A")
+
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        self._limiter.wait("intraday")
+
+        last_err = None
+
+        for tr in _pick_tr(self.env, "INTRADAY_CHART"):
+            headers = self._headers(tr)
+            headers.setdefault("accept", "*/*")
+            headers.setdefault("tr_cont", "N")
+            headers.setdefault("Connection", "keep-alive")
+
+            params = {
+                "fid_cond_mrkt_div_code": market_code,
+                "fid_input_iscd": iscd,
+                "fid_input_hour_1": start_hhmm,
+                "fid_pw_data_incu_yn": "Y",
+                "fid_etc_cls_code": "",
+            }
+
+            for attempt in range(1, 4):
+                try:
+                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp.raise_for_status()
+                    data = resp.json()
+                    logger.debug("[INTRADAY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
+                except requests.exceptions.SSLError as e:
+                    last_err = e
+                    logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except requests.exceptions.RequestException as e:
+                    last_err = e
+                    logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+                except ValueError as e:
+                    last_err = e
+                    logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+                except Exception as e:
+                    last_err = e
+                    logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                    time.sleep(0.4 * attempt)
+                    continue
+
+                if "초당 거래건수" in str(data.get("msg1") or ""):
+                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    continue
+
+                arr = data.get("output2") or []
+                if resp.status_code == 200 and arr:
+                    rows: List[Dict[str, Any]] = []
+                    for r in arr:
+                        try:
+                            hhmmss = r.get("stck_cntg_hour")
+                            price = r.get("stck_prpr")
+                            vol = r.get("cntg_vol")
+                            if hhmmss and price is not None and vol is not None:
+                                rows.append({
+                                    "time": str(hhmmss),
+                                    "price": float(price),
+                                    "volume": float(vol),
+                                })
+                        except Exception as e:
+                            logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+
+                    rows.sort(key=lambda x: x["time"])
+                    if len(rows) == 0:
+                        raise DataEmptyError(f"A{iscd} 0 intraday candles")
+                    return rows
+
+                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
+                logger.warning("[INTRADAY_BAD_RESP] %s %s", iscd, data)
+                time.sleep(0.4 + random.uniform(0, 0.2))
+
+        if last_err:
+            raise last_err
+        raise RuntimeError(f"INTRADAY_FAIL A{iscd}")
+
+    def get_vwap_today(self, code: str, start_hhmm: str = "090000") -> float | None:
+        """당일 분봉 기준 체결 가격/거래량으로 단순 VWAP 계산."""
+        try:
+            candles = self.get_intraday_candles_today(code, start_hhmm=start_hhmm)
+        except DataEmptyError:
+            return None
+        except Exception as e:
+            logger.warning("[VWAP_FAIL] %s %s", code, e)
+            return None
+
+        total_vol = 0.0
+        total_tr = 0.0
+        for c in candles:
+            try:
+                v = float(c.get("volume") or 0.0)
+                p = float(c.get("price") or 0.0)
+            except Exception:
+                continue
+            if v <= 0 or p <= 0:
+                continue
+            total_vol += v
+            total_tr += v * p
+
+        if total_vol <= 0:
+            return None
+        return total_tr / total_vol
+
+
 
     def is_market_open(self) -> bool:
         kst = pytz.timezone("Asia/Seoul")

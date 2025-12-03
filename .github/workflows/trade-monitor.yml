@@ -1,32 +1,36 @@
-name: Trade Monitor
+name: Trade Monitor (VWAP branch)
 
 on:
   push:
-    branches: [ main, change-logic ]
+    branches: [ vwap-ch ]
   pull_request:
-    branches: [ main, change-logic ]
+    branches: [ vwap-ch ]
   schedule:
-    # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~목) = 0-4
-    - cron: "57 23 * * 0-4"
+    # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~토) = 0-6
+    - cron: "57 23 * * 0-6"
   workflow_dispatch:
+
 
 jobs:
   monitor-trade:
+    # 🔒 안전장치: 혹시라도 main에서 실행되더라도 vwap 브랜치가 아닐 땐 스킵
+    if: github.ref == 'refs/heads/vwap-ch'
     runs-on: ubuntu-latest
 
     env:
       # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
-      KIS_APP_KEY:     ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET:  ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
       # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
-      APP_KEY:         ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET:      ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
 
-      CANO:            ${{ secrets.CANO }}
-      ACNT_PRDT_CD:    ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV:         ${{ secrets.KIS_ENV }}              # practice / real
+      CANO:           ${{ secrets.CANO }}
+      ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+
       # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
-      API_BASE_URL:    ${{ secrets.API_BASE_URL }}
+      API_BASE_URL:   ${{ secrets.API_BASE_URL }}
 
       # === trader.py 운영 파라미터 ===
       PARTIAL1: "0.5"
@@ -34,6 +38,7 @@ jobs:
       TRAIL_PCT: "0.02"
       FAST_STOP: "0.01"
       ATR_STOP: "1.5"
+
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:40"
       SELL_ALL_BALANCES_AT_CUTOFF: "false"
@@ -41,10 +46,14 @@ jobs:
       FORCE_SELL_PASSES_CLOSE: "4"
 
       DEFAULT_PROFIT_PCT: "3.0"
-      DEFAULT_LOSS_PCT: "-5.0"
+      DEFAULT_LOSS_PCT: "5.0"
 
       SLIPPAGE_LIMIT_PCT: "0.25"
       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+
+      # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
+      # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
+      VWAP_TOL: "0.003"
 
       W_MAX_ONE: "0.25"
       W_MIN_ONE: "0.03"
@@ -56,14 +65,17 @@ jobs:
       # 레짐/지수
       KOSDAQ_INDEX_CODE: "KOSDAQ"
       KOSDAQ_ETF_FALLBACK: "229200"
+
       REG_BULL_MIN_UP_PCT: "0.5"
       REG_BULL_MIN_MINUTES: "10"
       REG_BEAR_VWAP_MINUTES: "10"
       REG_BEAR_DROP_FROM_HIGH: "0.7"
       REG_BEAR_STAGE1_MINUTES: "20"
       REG_BEAR_STAGE2_ADD_DROP: "0.5"
+
       REG_PARTIAL_S1: "0.30"
       REG_PARTIAL_S2: "0.30"
+
       TRAIL_PCT_BULL: "0.025"
       TRAIL_PCT_BEAR: "0.012"
       TP_PROFIT_PCT_BULL: "3.5"
@@ -71,8 +83,13 @@ jobs:
       MARKET_DATA_WHEN_CLOSED: "false"
 
       # 배분/속도
-      DAILY_CAPITAL: "50000000"
+      DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
+
+      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
+      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
+      KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
+      KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
 
       # === FastAPI 리밸런싱 서버(선정 필터) ===
       MIN_TRADES: "5"
@@ -90,6 +107,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -112,6 +131,28 @@ jobs:
               'CANO','ACNT_PRDT_CD','KIS_ENV'
           ]:
               chk(k)
+          PY
+
+      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
+      - name: (디버그) trader 모듈 경로 및 내용 확인
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - << 'PY'
+          import trader
+          from trader import trader as t
+          print("trader package path:", trader.__file__)
+          print("trader.trader module path:", t.__file__)
+          print("=== HEAD OF trader.trader ===")
+          try:
+              with open(t.__file__, 'r', encoding='utf-8') as f:
+                  for i in range(1, 80):
+                      line = f.readline()
+                      if not line:
+                          break
+                      print(f"{i:03}: {line.rstrip()}")
+          except Exception as e:
+              print("ERROR while reading trader.trader:", e)
           PY
 
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
@@ -179,4 +220,7 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
-   
+
+
+            
+          

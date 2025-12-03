@@ -1,0 +1,220 @@
+diff --git a/trader/trader.py b/trader/trader.py
+index 216ab95..3cace83 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -67,6 +67,11 @@ CONFIG = {
+     "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
+     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
+     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
++    # 챔피언 후보 필터
++    "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
++    "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
++    "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
++    "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+@@ -176,6 +181,10 @@ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+ PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
+ PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
+ PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
++CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
++CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
++CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
++CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+@@ -732,6 +741,60 @@ def is_strong_momentum(kis: KisAPI, code: str) -> bool:
+     """
+     return is_strong_momentum_vwap(kis, code)
+ 
++def _percentile_rank(values: List[float], value: float, higher_is_better: bool = True) -> float:
++    if not values:
++        return 0.0
++    vals = [float(v) for v in values if v is not None]
++    if not vals:
++        return 0.0
++
++    if higher_is_better:
++        count = sum(1 for v in vals if v <= value)
++    else:
++        count = sum(1 for v in vals if v >= value)
++    return (count / len(vals)) * 100.0
++
++def _has_bullish_trend_structure(kis: KisAPI, code: str) -> Tuple[bool, Dict[str, float]]:
++    """
++    보유 지속 여부 판단용: 5/10/20일선 정배열 + 20일선 상승 + 종가>20일선 체크.
++    """
++    candles = _get_daily_candles_cached(kis, code, count=25)
++    if not candles or len(candles) < 21:
++        raise DataShortError("not enough candles")
++
++    today = datetime.now(KST).strftime("%Y%m%d")
++    completed = list(candles)
++    if completed and str(completed[-1].get("date")) == today:
++        completed = completed[:-1]
++
++    if len(completed) < 21:
++        raise DataShortError("insufficient completed candles")
++
++    closes: List[float] = []
++    for c in completed:
++        close = c.get("close")
++        if close is None:
++            raise DataEmptyError("close missing")
++        closes.append(float(close))
++
++    if len(closes) < 21:
++        raise DataShortError("need at least 21 closes")
++
++    ma5 = sum(closes[-5:]) / 5.0
++    ma10 = sum(closes[-10:]) / 10.0
++    ma20 = sum(closes[-20:]) / 20.0
++    prev_ma20 = sum(closes[-21:-1]) / 20.0
++    last_close = closes[-1]
++
++    aligned = last_close > ma20 and ma5 > ma10 > ma20 and ma20 > prev_ma20
++    return aligned, {
++        "ma5": ma5,
++        "ma10": ma10,
++        "ma20": ma20,
++        "ma20_prev": prev_ma20,
++        "last_close": last_close,
++    }
++
+ def _weight_to_qty(
+     kis: KisAPI,
+     code: str,
+@@ -1829,6 +1892,12 @@ def main():
+         qty = _to_int(t.get("매수수량") or t.get("qty"), 0)
+         weight = t.get("weight")
+         strategy = t.get("strategy") or "전월 rolling K 최적화"
++        avg_return_pct = _to_float(t.get("avg_return_pct") or t.get("수익률(%)"), 0.0)
++        win_rate_pct = _to_float(t.get("win_rate_pct") or t.get("승률(%)"), 0.0)
++        mdd_pct = _to_float(t.get("mdd_pct") or t.get("MDD(%)"), 0.0)
++        trades = _to_int(t.get("trades"), 0)
++        sharpe_m = _to_float(t.get("sharpe_m"), 0.0)
++        cumret_pct = _to_float(t.get("cumulative_return_pct") or t.get("수익률(%)"), 0.0)
+ 
+         if qty <= 0 and weight is not None:
+             ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
+@@ -1845,6 +1914,12 @@ def main():
+             "target_price": target_price,
+             "qty": qty,
+             "strategy": strategy,
++            "avg_return_pct": avg_return_pct,
++            "win_rate_pct": win_rate_pct,
++            "mdd_pct": mdd_pct,
++            "trades": trades,
++            "sharpe_m": sharpe_m,
++            "cumulative_return_pct": cumret_pct,
+             "prev_open": t.get("prev_open"),
+             "prev_high": t.get("prev_high"),
+             "prev_low": t.get("prev_low"),
+@@ -1852,6 +1927,54 @@ def main():
+             "prev_volume": t.get("prev_volume"),
+         }
+ 
++    filtered_targets: Dict[str, Any] = {}
++    for code, info in processed_targets.items():
++        trades = _to_int(info.get("trades"), 0)
++        win_rate = _to_float(info.get("win_rate_pct"), 0.0)
++        mdd = abs(_to_float(info.get("mdd_pct"), 0.0) or 0.0)
++        sharpe = _to_float(info.get("sharpe_m"), 0.0)
++
++        if (
++            trades < CHAMPION_MIN_TRADES
++            or win_rate < CHAMPION_MIN_WINRATE
++            or mdd > CHAMPION_MAX_MDD
++            or sharpe < CHAMPION_MIN_SHARPE
++        ):
++            logger.info(
++                f"[CHAMPION_FILTER_SKIP] {code}: trades={trades}, win={win_rate:.1f}%, mdd={mdd:.1f}%, sharpe={sharpe:.2f}"
++            )
++            continue
++
++        filtered_targets[code] = info
++
++    processed_targets = filtered_targets
++
++    if processed_targets:
++        cumrets = [
++            _to_float(info.get("cumulative_return_pct"), 0.0) or 0.0 for info in processed_targets.values()
++        ]
++        win_rates = [_to_float(info.get("win_rate_pct"), 0.0) or 0.0 for info in processed_targets.values()]
++        sharpes = [_to_float(info.get("sharpe_m"), 0.0) or 0.0 for info in processed_targets.values()]
++        mdds = [abs(_to_float(info.get("mdd_pct"), 0.0) or 0.0) for info in processed_targets.values()]
++
++        for code, info in processed_targets.items():
++            cum = _to_float(info.get("cumulative_return_pct"), 0.0) or 0.0
++            win = _to_float(info.get("win_rate_pct"), 0.0) or 0.0
++            sharpe = _to_float(info.get("sharpe_m"), 0.0) or 0.0
++            mdd_val = abs(_to_float(info.get("mdd_pct"), 0.0) or 0.0)
++
++            score = (
++                _percentile_rank(cumrets, cum) * 0.35
++                + _percentile_rank(win_rates, win) * 0.25
++                + _percentile_rank(sharpes, sharpe) * 0.25
++                + _percentile_rank(mdds, mdd_val, higher_is_better=False) * 0.15
++            )
++
++            info["composite_score"] = round(score, 4)
++            processed_targets[code] = info
++    else:
++        logger.warning("[CHAMPION_FILTER] 조건 충족 종목 없음 → 챔피언 루프 스킵")
++
+     # === [NEW] Regime + 모멘텀 기반 상위 1~2종목 자동 선택 ===
+     # - rolling K 리밸런싱 결과 중에서 최근 모멘텀/수익률이 가장 강한 소수 종목만 실매매 대상으로 사용
+     # - 레짐(mode)에 따라 신규 편입 허용 종목 수를 1~2개로 자동 조절
+@@ -1903,11 +2026,7 @@ def main():
+     scored: List[Tuple[str, float, bool]] = []
+ 
+     for code, info in processed_targets.items():
+-        # 20일 수익률을 기본 점수로 사용 (rolling K 백테스트 결과와 결을 맞추기 위함)
+-        try:
+-            ret_20d = get_20d_return_pct(kis, code)
+-        except Exception:
+-            ret_20d = 0.0
++        score = _to_float(info.get("composite_score"), 0.0) or 0.0
+ 
+         # 단기 모멘텀 강세 여부 (is_strong_momentum)로 버킷 구분
+         try:
+@@ -1916,7 +2035,7 @@ def main():
+             logger.warning("[REBALANCE] 모멘텀 판별 실패 %s: %s", code, e)
+             strong = False
+ 
+-        scored.append((code, ret_20d, strong))
++        scored.append((code, score, strong))
+ 
+     # 모멘텀 strong 버킷 우선, 그 다음 나머지 중에서 점수 순으로 채우기
+     strong_bucket = [x for x in scored if x[2]]
+@@ -2735,10 +2854,10 @@ def main():
+                             )
+ 
+                     try:
+-                        return_pct = get_20d_return_pct(kis, code)
++                        momentum_intact, trend_ctx = _has_bullish_trend_structure(kis, code)
+                     except NetTemporaryError:
+                         logger.warning(
+-                            f"[20D_RETURN_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵"
++                            f"[20D_TREND_TEMP_SKIP] {code}: 네트워크 일시 실패 → 이번 루프 스킵"
+                         )
+                         continue
+                     except DataEmptyError:
+@@ -2752,9 +2871,13 @@ def main():
+                         )
+                         continue
+ 
+-                    if return_pct is not None and return_pct >= 3.0:
++                    if momentum_intact:
+                         logger.info(
+-                            f"[모멘텀 보유] {code}: 최근 20일 수익률 {return_pct:.2f}% >= 3% → 보유 지속"
++                            (
++                                f"[모멘텀 보유] {code}: 5/10/20 정배열 & 20일선 상승 & 종가>20일선 유지 "
++                                f"(close={trend_ctx.get('last_close'):.2f}, ma5={trend_ctx.get('ma5'):.2f}, "
++                                f"ma10={trend_ctx.get('ma10'):.2f}, ma20={trend_ctx.get('ma20'):.2f}→{trend_ctx.get('ma20_prev'):.2f})"
++                            )
+                         )
+                         continue
+ 
