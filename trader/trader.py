@@ -186,6 +186,26 @@ CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
 CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
 CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
 
+# 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
+CHAMPION_A_RULES = {
+    "min_trades": 30,
+    "min_cumret_pct": 40.0,
+    "max_mdd_pct": 25.0,
+    "min_win_pct": 50.0,
+    "min_sharpe": 1.2,
+    "min_turnover": 3_000_000_000,  # 30억
+}
+
+GOOD_ENTRY_PULLBACK_RANGE = (5.0, 15.0)  # 신고가 대비 눌림폭(%): 최소~최대
+GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
+GOOD_ENTRY_MAX_FROM_PEAK = 0.97  # 현재가/최근고점 최대치(≤0.97)
+GOOD_ENTRY_MIN_RR = 2.0  # 기대수익/리스크 최소 비율
+GOOD_ENTRY_MIN_INTRADAY_SIG = 2  # GOOD 타점으로 인정하기 위한 최소 intraday 시그널 개수
+
+BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+
 def _parse_hhmm(hhmm: str) -> dtime:
     try:
         hh, mm = hhmm.split(":")
@@ -595,6 +615,243 @@ def _detect_pullback_reversal(
         "peak_date": window[peak_idx].get("date"),
         "last_down_date": last_down.get("date"),
     }
+
+
+def _classify_champion_grade(info: Dict[str, Any]) -> str:
+    trades = _to_int(info.get("trades"), 0)
+    win = _to_float(info.get("win_rate_pct"), 0.0)
+    mdd = abs(_to_float(info.get("mdd_pct"), 0.0) or 0.0)
+    sharpe = _to_float(info.get("sharpe_m") or info.get("sharpe"), 0.0)
+    cumret = _to_float(
+        info.get("cumulative_return_pct") or info.get("avg_return_pct"), 0.0
+    )
+    turnover = _to_float(
+        info.get("prev_turnover") or info.get("avg_turnover") or info.get("turnover"),
+        0.0,
+    )
+
+    turnover_ok = turnover <= 0 or turnover >= CHAMPION_A_RULES["min_turnover"]
+    if (
+        trades >= CHAMPION_A_RULES["min_trades"]
+        and cumret >= CHAMPION_A_RULES["min_cumret_pct"]
+        and mdd <= CHAMPION_A_RULES["max_mdd_pct"]
+        and win >= CHAMPION_A_RULES["min_win_pct"]
+        and sharpe >= CHAMPION_A_RULES["min_sharpe"]
+        and turnover_ok
+    ):
+        return "A"
+
+    if (
+        trades >= CHAMPION_MIN_TRADES
+        and win >= CHAMPION_MIN_WINRATE
+        and mdd <= CHAMPION_MAX_MDD
+        and sharpe >= CHAMPION_MIN_SHARPE
+    ):
+        return "B"
+
+    return "C"
+
+
+def _compute_daily_entry_context(
+    kis: KisAPI, code: str, current_price: Optional[float]
+) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {"current_price": current_price}
+    try:
+        candles = _get_daily_candles_cached(kis, code, count=max(PULLBACK_LOOKBACK, 60))
+    except Exception:
+        return ctx
+
+    today = datetime.now(KST).strftime("%Y%m%d")
+    completed = list(candles)
+    if completed and str(completed[-1].get("date")) == today:
+        completed = completed[:-1]
+
+    if not completed:
+        return ctx
+
+    closes = [float(c.get("close") or 0.0) for c in completed if c.get("close")]
+    highs = [float(c.get("high") or 0.0) for c in completed if c.get("high")]
+    lows = [float(c.get("low") or 0.0) for c in completed if c.get("low")]
+
+    if len(closes) >= 20:
+        ma20 = sum(closes[-20:]) / 20.0
+        ctx["ma20"] = ma20
+        if current_price:
+            ctx["ma20_ratio"] = current_price / ma20
+            ctx["ma20_risk"] = max(0.0, current_price - ma20)
+
+    if highs:
+        window_60 = highs[-60:] if len(highs) >= 60 else highs
+        peak_price = max(window_60)
+        ctx["peak_price"] = peak_price
+        if current_price and peak_price > 0:
+            ctx["distance_to_peak"] = current_price / peak_price
+            ctx["pullback_depth_pct"] = (peak_price - current_price) / peak_price * 100.0
+
+    # 연속 하락 일수 체크 (신고가 이후 눌림 판단)
+    down_streak = 0
+    for idx in range(len(completed) - 1, 0, -1):
+        cur = float(completed[idx].get("close") or 0.0)
+        prev = float(completed[idx - 1].get("close") or 0.0)
+        if cur <= 0 or prev <= 0:
+            break
+        if cur < prev:
+            down_streak += 1
+        else:
+            break
+    ctx["down_streak"] = down_streak
+
+    try:
+        atr = _get_atr(kis, code)
+        if atr:
+            ctx["atr"] = float(atr)
+    except Exception:
+        pass
+
+    if closes and highs:
+        recent_high = max(highs[-20:])
+        ctx["recent_high_20"] = recent_high
+        ctx["setup_ok"] = bool(
+            down_streak >= 2
+            and ctx.get("pullback_depth_pct") is not None
+            and ctx.get("pullback_depth_pct") >= GOOD_ENTRY_PULLBACK_RANGE[0]
+            and (ctx.get("ma20_ratio") or 0) >= GOOD_ENTRY_MA20_RANGE[0]
+            and recent_high >= max(highs[-60:]) * 0.95
+        )
+
+    return ctx
+
+
+def _compute_intraday_entry_context(
+    kis: KisAPI, code: str, prev_high: Optional[float] = None
+) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {}
+    candles = _get_intraday_1min(kis, code, count=120)
+    if not candles:
+        return ctx
+
+    vwap_val = _compute_vwap_from_1min(candles)
+    ctx["vwap"] = vwap_val
+    last = candles[-1]
+    last_close = _to_float(last.get("close"), None)
+    last_high = _to_float(last.get("high") or last.get("close"), None)
+    last_low = _to_float(last.get("low") or last.get("close"), None)
+    ctx["last_close"] = last_close
+    ctx["last_high"] = last_high
+    ctx["last_low"] = last_low
+
+    if vwap_val and last_close:
+        ctx["vwap_reclaim"] = last_close >= vwap_val
+
+    highs = [
+        float(c.get("high") or c.get("close") or 0.0)
+        for c in candles
+        if c.get("high") or c.get("close")
+    ]
+    lows = [
+        float(c.get("low") or c.get("close") or 0.0)
+        for c in candles
+        if c.get("low") or c.get("close")
+    ]
+    vols = [float(c.get("volume") or 0.0) for c in candles]
+
+    if highs:
+        box_high = max(highs[-20:])
+        box_low = min(lows[-20:]) if lows else None
+        if last_high is not None and box_high:
+            ctx["range_break"] = last_high >= box_high * 0.999
+        if last_low is not None and box_low:
+            ctx["box_floor"] = box_low
+
+    if vols and len(vols) >= 10:
+        recent_vol = sum(vols[-5:]) / 5.0
+        base_vol = sum(vols[:-5]) / max(1, len(vols) - 5)
+        if base_vol > 0:
+            ctx["volume_spike"] = recent_vol >= base_vol * 1.5
+
+    if vwap_val:
+        below = sum(1 for c in candles if _to_float(c.get("close"), 0.0) < vwap_val)
+        ctx["below_vwap_ratio"] = below / len(candles)
+
+    if prev_high and last_high:
+        ctx["prev_high_retest"] = last_high >= float(prev_high) * 0.999
+
+    return ctx
+
+
+def is_bad_entry(
+    code: str,
+    daily_ctx: Dict[str, Any],
+    intraday_ctx: Dict[str, Any],
+    regime_state: Optional[Dict[str, Any]] = None,
+) -> bool:
+    ma20_ratio = daily_ctx.get("ma20_ratio")
+    if ma20_ratio and ma20_ratio > BAD_ENTRY_MAX_MA20_DIST:
+        return True
+
+    pullback = daily_ctx.get("pullback_depth_pct")
+    if pullback and pullback > BAD_ENTRY_MAX_PULLBACK:
+        return True
+
+    if regime_state:
+        try:
+            kosdaq_drop = _to_float(regime_state.get("pct_change"), None)
+            if kosdaq_drop is not None and kosdaq_drop <= -2.5:
+                return True
+        except Exception:
+            pass
+
+    below_vwap_ratio = intraday_ctx.get("below_vwap_ratio")
+    if below_vwap_ratio is not None and below_vwap_ratio >= BAD_ENTRY_MAX_BELOW_VWAP_RATIO:
+        return True
+
+    return False
+
+
+def is_good_entry(
+    code: str,
+    daily_ctx: Dict[str, Any],
+    intraday_ctx: Dict[str, Any],
+    prev_high: Optional[float] = None,
+) -> bool:
+    if not daily_ctx.get("setup_ok"):
+        return False
+
+    pullback = daily_ctx.get("pullback_depth_pct")
+    if pullback is None or not (
+        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= GOOD_ENTRY_PULLBACK_RANGE[1]
+    ):
+        return False
+
+    ma20_ratio = daily_ctx.get("ma20_ratio")
+    if ma20_ratio is None or not (
+        GOOD_ENTRY_MA20_RANGE[0] <= ma20_ratio <= GOOD_ENTRY_MA20_RANGE[1]
+    ):
+        return False
+
+    dist_peak = daily_ctx.get("distance_to_peak")
+    if dist_peak is None or dist_peak > GOOD_ENTRY_MAX_FROM_PEAK:
+        return False
+
+    cur_px = daily_ctx.get("current_price")
+    atr = daily_ctx.get("atr") or 0.0
+    ma_risk = daily_ctx.get("ma20_risk") or 0.0
+    risk = max(atr, ma_risk, (cur_px or 0) * 0.03)
+    reward = max(0.0, (daily_ctx.get("peak_price") or 0) - (cur_px or 0)) + atr
+    if risk <= 0 or reward / risk < GOOD_ENTRY_MIN_RR:
+        return False
+
+    signals = []
+    if intraday_ctx.get("vwap_reclaim"):
+        signals.append("vwap")
+    if intraday_ctx.get("range_break"):
+        signals.append("range")
+    if intraday_ctx.get("volume_spike"):
+        signals.append("volume")
+    if prev_high and intraday_ctx.get("prev_high_retest"):
+        signals.append("prev_high")
+
+    return len(signals) >= GOOD_ENTRY_MIN_INTRADAY_SIG
 
 from .kis_wrapper import NetTemporaryError, DataEmptyError, DataShortError
 
@@ -1949,6 +2206,31 @@ def main():
 
     processed_targets = filtered_targets
 
+    # 챔피언 등급화 (A/B/C) → 실제 매수 후보는 A급만 사용
+    graded_targets: Dict[str, Any] = {}
+    grade_counts = {"A": 0, "B": 0, "C": 0}
+    for code, info in processed_targets.items():
+        grade = _classify_champion_grade(info)
+        info["champion_grade"] = grade
+        graded_targets[code] = info
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+
+    logger.info(
+        "[CHAMPION-GRADE] A:%d / B:%d / C:%d (A급만 실제 매수)",
+        grade_counts.get("A", 0),
+        grade_counts.get("B", 0),
+        grade_counts.get("C", 0),
+    )
+
+    processed_targets = {code: info for code, info in graded_targets.items() if info.get("champion_grade") == "A"}
+    non_a = [code for code, info in graded_targets.items() if info.get("champion_grade") != "A"]
+    if non_a:
+        logger.info(
+            "[CHAMPION-HOLD] B/C급 %d종목은 관찰만 하고 매수 제외: %s",
+            len(non_a),
+            ",".join(non_a),
+        )
+
     if processed_targets:
         cumrets = [
             _to_float(info.get("cumulative_return_pct"), 0.0) or 0.0 for info in processed_targets.values()
@@ -2235,6 +2517,13 @@ def main():
                 # 1차 진입 시 실제 매수 수량은 stage1(40%)만 사용
                 qty = stage1_qty
 
+                grade = target.get("champion_grade") or "C"
+                if grade != "A":
+                    logger.info(
+                        f"[CHAMPION-SKIP] {code}: grade={grade} → 매수 루프에서 제외"
+                    )
+                    continue
+
                 k_value = target.get("best_k") or target.get("K") or target.get("k")
                 _ = None if k_value is None else _to_float(k_value)
 
@@ -2265,6 +2554,30 @@ def main():
                         "target_price": eff_target_price,
                         "strategy": strategy,
                     }
+
+                    daily_ctx = _compute_daily_entry_context(
+                        kis, code, float(current_price) if current_price else None
+                    )
+                    intraday_ctx = _compute_intraday_entry_context(
+                        kis, code, prev_high=target.get("prev_high")
+                    )
+
+                    if is_bad_entry(code, daily_ctx, intraday_ctx, REGIME_STATE):
+                        logger.info(
+                            f"[CHAMPION-HOLD] {code}: A급이지만 BAD 타점 → 오늘은 매수 보류"
+                        )
+                        continue
+
+                    if not is_good_entry(
+                        code,
+                        daily_ctx,
+                        intraday_ctx,
+                        prev_high=target.get("prev_high"),
+                    ):
+                        logger.info(
+                            f"[WAIT] {code}: A급이나 GOOD 타점 미충족 → 눌림 대기"
+                        )
+                        continue
 
                     # --- 매수 --- (돌파 진입 + 슬리피지 가드 + 예산 가드)
                     if is_open and code not in holding and code not in traded:
