@@ -79,31 +79,31 @@ def _find_column(df: pd.DataFrame, keyword: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# 1) 시가총액 기준 KOSDAQ Top-N
+# 1) 시가총액 기준 Top-N 유니버스 (KOSDAQ/KOSPI)
 # -----------------------------
-def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
-    """시가총액 상위 n개 KOSDAQ 종목 반환 (Code, Name, Marcap)."""
+def _get_top_n_by_market(market: str, date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
+    """시가총액 상위 n개 종목을 반환 (Code, Name, Marcap, market)."""
     try:
         target_dt = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
         from_date = get_nearest_business_day_in_a_week(target_dt.strftime("%Y%m%d"))
-        logger.info(f"📅 pykrx 시총 조회일 → {from_date}")
+        logger.info(f"📅 pykrx 시총 조회일 → {from_date} market={market}")
 
-        mktcap_df = get_market_cap_by_ticker(from_date, market="KOSDAQ")
+        mktcap_df = get_market_cap_by_ticker(from_date, market=market)
         if mktcap_df is None or len(mktcap_df) == 0:
             logger.warning("⚠️  pykrx 시총 DF가 비었습니다 → 빈 DF 반환")
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return pd.DataFrame(columns=["Code", "Name", "Marcap", "market"])
 
         mktcap_df = mktcap_df.reset_index()
         capcol = _find_column(mktcap_df, "시가총액")
         ticcol = _find_column(mktcap_df, "티커") or _find_column(mktcap_df, "코드")
         if capcol is None or ticcol is None:
             logger.error("❌  시총/티커 컬럼 탐색 실패 → 빈 DF 반환")
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return pd.DataFrame(columns=["Code", "Name", "Marcap", "market"])
 
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
 
-        fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
+        fdr_df = fdr.StockListing(market).rename(columns={"Symbol": "Code", "Name": "Name"})
         fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
 
         merged = pd.merge(
@@ -119,14 +119,53 @@ def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataF
                     break
         if "Marcap" not in merged.columns:
             logger.error("❌  병합 후에도 'Marcap' 없음 → 빈 DF 반환")
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return pd.DataFrame(columns=["Code", "Name", "Marcap", "market"])
 
         topn = merged.dropna(subset=["Marcap"]).sort_values("Marcap", ascending=False).head(n)
-        logger.info(f"✅  시총 Top{n} 추출 완료 → {len(topn)} 종목")
-        return topn[["Code", "Name", "Marcap"]]
+        topn["market"] = market.upper()
+        logger.info(f"✅  {market} 시총 Top{n} 추출 완료 → {len(topn)} 종목")
+        return topn[["Code", "Name", "Marcap", "market"]]
     except Exception:
-        logger.exception("❌  get_kosdaq_top_n 예외:")
-        return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+        logger.exception(f"❌  get_{market.lower()}_top_n 예외:")
+        return pd.DataFrame(columns=["Code", "Name", "Marcap", "market"])
+
+
+def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N, **kwargs) -> pd.DataFrame:
+    """시가총액 상위 n개 KOSDAQ 종목 반환 (Code, Name, Marcap)."""
+    return _get_top_n_by_market("KOSDAQ", date_str=date_str, n=n)
+
+
+def get_kospi_top_n(
+    kis: Any = None,
+    top_n: int = TOP_N,
+    as_of: Optional[datetime] = None,
+    date_str: Optional[str] = None,
+    **kwargs,
+) -> pd.DataFrame:
+    """시가총액 상위 top_n KOSPI 종목 반환 (Code, Name, Marcap, market)."""
+    ref_date = date_str
+    if as_of:
+        ref_date = as_of.strftime("%Y-%m-%d")
+    return _get_top_n_by_market("KOSPI", date_str=ref_date, n=top_n)
+
+
+def get_kosdaq_kospi_top_n(
+    kis: Any = None,
+    top_n_kosdaq: int = 50,
+    top_n_kospi: int = 50,
+    as_of: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """코스닥/코스피 상위 종목을 통합 리스트로 반환 (시장 필드 포함)."""
+    ref_date = as_of.strftime("%Y-%m-%d") if as_of else None
+    kosdaq_df = _get_top_n_by_market("KOSDAQ", date_str=ref_date, n=top_n_kosdaq)
+    kospi_df = _get_top_n_by_market("KOSPI", date_str=ref_date, n=top_n_kospi)
+
+    merged: List[Dict[str, Any]] = []
+    for df in (kosdaq_df, kospi_df):
+        if df is None or len(df) == 0:
+            continue
+        merged.extend(df.to_dict(orient="records"))
+    return merged
 
 # -----------------------------
 # ATR 계산(월 데이터 레코드에서)
