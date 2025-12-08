@@ -9,11 +9,13 @@ from zoneinfo import ZoneInfo
 import json
 from pathlib import Path
 import time
-import os
 import random
 from typing import Optional, Dict, Any, Tuple, List
 import csv
-from dataclasses import dataclass
+
+from .close_betting import CloseBettingEngine
+from .core_positions import CorePositionEngine
+from .time_modes import TimeModeController, TimeModeState
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,96 +59,7 @@ except Exception as import_err:
         logger.warning("[UNIVERSE-FALLBACK] 통합 유니버스 미지원 → 코스닥만 사용")
         return []
 
-# =========================
-# [CONFIG] .env 없이도 동작
-# - 아래 값을 기본으로 사용
-# - (선택) 동일 키를 환경변수로 넘기면 override
-# =========================
-CONFIG = {
-    "SELL_FORCE_TIME": "15:25",
-    "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
-    "API_RATE_SLEEP_SEC": "0.5",
-    "FORCE_SELL_PASSES_CUTOFF": "2",
-    "FORCE_SELL_PASSES_CLOSE": "4",
-    "PARTIAL1": "0.5",
-    "PARTIAL2": "0.3",
-    "TRAIL_PCT": "0.02",
-    "FAST_STOP": "0.01",
-    "ATR_STOP": "1.5",
-    "TIME_STOP_HHMM": "13:00",
-    "DEFAULT_PROFIT_PCT": "3.0",
-    "DEFAULT_LOSS_PCT": "5.0",
-    "DAILY_CAPITAL": "250000000",
-    "CAP_CAP": "0.8",
-    "SLIPPAGE_LIMIT_PCT": "0.25",
-    "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
-    "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
-    "W_MAX_ONE": "0.25",
-    "W_MIN_ONE": "0.03",
-    "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
-    "WEEKLY_ANCHOR_REF": "last",              # NEW: 'last'(직전 일요일) | 'next'(다음 일요일)
-    "MOMENTUM_OVERRIDES_FORCE_SELL": "true",
-    # 레짐(코스닥) 파라미터
-    "KOSDAQ_INDEX_CODE": "KOSDAQ",
-    "KOSDAQ_ETF_FALLBACK": "229200",
-    "REG_BULL_MIN_UP_PCT": "0.5",
-    "REG_BULL_MIN_MINUTES": "10",
-    "REG_BEAR_VWAP_MINUTES": "10",
-    "REG_BEAR_DROP_FROM_HIGH": "0.7",
-    "REG_BEAR_STAGE1_MINUTES": "20",
-    "REG_BEAR_STAGE2_ADD_DROP": "0.5",
-    "REG_PARTIAL_S1": "0.30",
-    "REG_PARTIAL_S2": "0.30",
-    "TRAIL_PCT_BULL": "0.025",
-    "TRAIL_PCT_BEAR": "0.012",
-    "TP_PROFIT_PCT_BULL": "3.5",
-    # 신고가 돌파 후 3일 눌림 + 반등 매수용 파라미터
-    "USE_PULLBACK_ENTRY": "true",          # true면 '신고가 → 3일 연속 하락 → 반등' 패턴 충족 시에만 눌림목 진입 허용
-    "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
-    "PULLBACK_DAYS": "3",                  # 연속 하락 일수
-    "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
-    "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 각 시장별 시총 상위 종목 수
-    "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
-    # 챔피언 후보 필터
-    "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
-    "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
-    "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
-    "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
-    # 기타
-    "MARKET_DATA_WHEN_CLOSED": "false",
-    "FORCE_WEEKLY_REBALANCE": "0",
-    # NEW: 1분봉 VWAP 모멘텀 파라미터
-    "MOM_FAST": "5",        # 1분봉 fast MA 길이
-    "MOM_SLOW": "20",       # 1분봉 slow MA 길이
-    "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
-    # 시간 구간
-    "ACTIVE_START_HHMM": "09:30",
-    "FULL_ACTIVE_END_HHMM": "14:30",
-    "CLOSE_BET_PREP_START_HHMM": "14:30",
-    "CLOSE_BET_ENTRY_START_HHMM": "15:10",
-    "MARKET_CLOSE_HHMM": "15:30",
-    # 종가 베팅
-    "CLOSE_BET_TOPN": "5",
-    "CLOSE_BET_CAP_FRACTION": "0.2",
-    "CLOSE_BET_MIN_RET_PCT": "3.0",
-    "CLOSE_BET_MAX_PULLBACK_PCT": "3.0",
-    "CLOSE_BET_MIN_VOL_SPIKE": "2.0",
-    # 코어 포지션
-    "ENABLE_CORE_POSITIONS": "true",
-    "CORE_MAX_FRACTION": "0.6",
-    "CORE_W_MAX_ONE": "0.10",
-    "CORE_SCAN_TOPN": "250",
-    "CORE_BOX_RANGE_PCT": "5.0",
-    "CORE_BREAKOUT_PCT": "2.0",
-    # 유니버스 구성 (코스닥/코스피 비율 및 사용 여부)
-    "UNIVERSE_INCLUDE_MARKETS": "KOSDAQ,KOSPI",  # "KOSDAQ", "KOSPI", "KOSDAQ,KOSPI"
-    "UNIVERSE_KOSDAQ_TOPN": "50",
-    "UNIVERSE_KOSPI_TOPN": "50",
-}
-
-def _cfg(key: str) -> str:
-    """환경변수 > CONFIG 기본값"""
-    return os.getenv(key, CONFIG.get(key, ""))
+from .config import CONFIG, cfg as _cfg
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -326,320 +239,6 @@ MARKET_CLOSE_TIME = _parse_hhmm(MARKET_CLOSE_HHMM)
 ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
 
 
-@dataclass
-class TimeModeState:
-    mode: str
-    allow_intraday_entries: bool
-    allow_close_bet_scan: bool
-    allow_close_bet_entry: bool
-
-
-class TimeModeController:
-    def __init__(
-        self,
-        active_start: dtime,
-        full_active_end: dtime,
-        close_bet_prep: dtime,
-        close_bet_entry: dtime,
-        cutoff: dtime,
-        market_close: dtime,
-    ):
-        self.active_start = active_start
-        self.full_active_end = full_active_end
-        self.close_bet_prep = close_bet_prep
-        self.close_bet_entry = close_bet_entry
-        self.cutoff = cutoff
-        self.market_close = market_close
-        self._last_mode: Optional[str] = None
-
-    def evaluate(self, now_dt: datetime) -> TimeModeState:
-        now_time = now_dt.time()
-        if now_time >= self.cutoff:
-            mode = "shutdown"
-            return TimeModeState(mode, False, False, False)
-        if now_time >= self.close_bet_entry:
-            mode = "close_bet_entry"
-            return TimeModeState(mode, False, False, True)
-        if now_time >= self.close_bet_prep:
-            mode = "light_active"
-            return TimeModeState(mode, False, True, False)
-        if now_time >= self.active_start:
-            mode = "full_active"
-            return TimeModeState(mode, True, False, False)
-        mode = "pre_open"
-        return TimeModeState(mode, False, False, False)
-
-    def log_if_changed(self, logger: logging.Logger, state: TimeModeState) -> None:
-        if state.mode != self._last_mode:
-            self._last_mode = state.mode
-            if state.mode == "full_active":
-                logger.info(
-                    f"[TIME-MODE] FULL_ACTIVE ({ACTIVE_START_TIME.strftime('%H:%M')}~{FULL_ACTIVE_END_TIME.strftime('%H:%M')})"
-                )
-            elif state.mode == "light_active":
-                logger.info(
-                    f"[TIME-MODE] LIGHT_ACTIVE ({CLOSE_BET_PREP_START_TIME.strftime('%H:%M')}~{CLOSE_BET_ENTRY_START_TIME.strftime('%H:%M')}) 신규 진입 제한, 종가 베팅 준비"
-                )
-            elif state.mode == "close_bet_entry":
-                logger.info(
-                    f"[TIME-MODE] CLOSE_BET_ENTRY ({CLOSE_BET_ENTRY_START_TIME.strftime('%H:%M')}~{SELL_FORCE_TIME.strftime('%H:%M')})"
-                )
-            elif state.mode == "shutdown":
-                logger.info(
-                    f"[TIME-MODE] SHUTDOWN 준비 (커트오프 {SELL_FORCE_TIME.strftime('%H:%M')} 도달 예정)"
-                )
-            else:
-                logger.info(
-                    f"[TIME-MODE] PRE_OPEN (장 시작 전 준비)"
-                )
-
-
-class CloseBettingEngine:
-    def __init__(self, topn: int, cap_fraction: float):
-        self.topn = topn
-        self.cap_fraction = cap_fraction
-        self.candidates: List[Dict[str, Any]] = []
-        self.entered: Dict[str, Any] = {}
-
-    def _score_candidate(self, daily_ctx: Dict[str, Any], intraday_ctx: Dict[str, Any]) -> float:
-        ret = daily_ctx.get("ret_today_pct") or 0.0
-        vol_ratio = daily_ctx.get("volume_ratio") or 0.0
-        from_high = intraday_ctx.get("from_high_pct") or 0.0
-        m5 = daily_ctx.get("ma5") or 0.0
-        m20 = daily_ctx.get("ma20") or 0.0
-        trend_bonus = 2.0 if (m5 and m20 and m5 > m20) else 0.0
-        location_score = max(0.0, 5.0 - from_high)
-        return ret * 0.6 + vol_ratio * 3.0 + location_score + trend_bonus
-
-    def scan_candidates(
-        self,
-        kis: KisAPI,
-        now_dt: datetime,
-        universe: Dict[str, Dict[str, Any]],
-        holding: Dict[str, Any],
-        traded: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        self.candidates = []
-        for code, info in universe.items():
-            if code in holding or code in traded:
-                continue
-            try:
-                price = _safe_get_price(kis, code)
-            except Exception:
-                price = None
-            if price is None or price <= 0:
-                continue
-            daily_ctx = _compute_daily_entry_context(kis, code, price)
-            intraday_ctx = _compute_intraday_entry_context(kis, code, prev_high=info.get("prev_high"))
-
-            ret_pct = daily_ctx.get("ret_today_pct")
-            if ret_pct is None or ret_pct < CLOSE_BET_MIN_RET_PCT:
-                continue
-            vol_ratio = daily_ctx.get("volume_ratio") or 0.0
-            if vol_ratio < CLOSE_BET_MIN_VOL_SPIKE:
-                continue
-            from_high = intraday_ctx.get("from_high_pct")
-            if from_high is not None and from_high > CLOSE_BET_MAX_PULLBACK_PCT:
-                continue
-            if intraday_ctx.get("vwap") and intraday_ctx.get("last_close"):
-                if intraday_ctx["last_close"] < intraday_ctx["vwap"]:
-                    continue
-            if daily_ctx.get("ma5") and daily_ctx.get("ma20"):
-                if daily_ctx["ma5"] <= daily_ctx["ma20"]:
-                    continue
-
-            score = self._score_candidate(daily_ctx, intraday_ctx)
-            self.candidates.append(
-                {
-                    "code": code,
-                    "name": info.get("name"),
-                    "price": price,
-                    "score": score,
-                    "daily_ctx": daily_ctx,
-                    "intraday_ctx": intraday_ctx,
-                }
-            )
-
-        self.candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        picked = self.candidates[: self.topn]
-        if picked:
-            logger.info(
-                "[CLOSE-BET-SCAN] 종가 베팅 후보 %d종목 탐색 완료: %s",
-                len(picked),
-                ",".join([p.get("code", "") for p in picked]),
-            )
-        else:
-            logger.info("[CLOSE-BET-SCAN] 종가 베팅 후보 없음")
-        return picked
-
-    def enter_close_bets(
-        self,
-        kis: KisAPI,
-        now_dt: datetime,
-        capital_active: int,
-        holding: Dict[str, Any],
-        traded: Dict[str, Any],
-        can_buy: bool,
-    ) -> None:
-        if not can_buy:
-            logger.info("[CLOSE-BET-ENTRY] 예수금 부족 → 종가 베팅 매수 스킵")
-            return
-        if not self.candidates:
-            return
-        per_notional = int(max(0, capital_active * self.cap_fraction) / max(1, len(self.candidates)))
-        for cand in self.candidates[: self.topn]:
-            code = cand.get("code")
-            if not code or code in holding or code in traded:
-                continue
-            qty = _notional_to_qty(kis, code, per_notional, ref_price=cand.get("price"))
-            if qty <= 0:
-                continue
-            result = place_buy_with_fallback(kis, code, qty, limit_price=int(cand.get("price") or 0))
-            _init_position_state(
-                kis,
-                holding,
-                code,
-                float(cand.get("price") or 0.0),
-                int(qty),
-                None,
-                cand.get("price"),
-                strategy="CLOSE_BET",
-            )
-            traded[code] = {
-                "buy_time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "qty": int(qty),
-                "price": float(cand.get("price") or 0.0),
-                "strategy": "CLOSE_BET",
-            }
-            logger.info(
-                "[CLOSE-BET-ENTRY] code=%s qty=%s price=%s score=%.2f",
-                code,
-                qty,
-                cand.get("price"),
-                cand.get("score", 0.0),
-            )
-            log_trade(
-                {
-                    "datetime": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    "code": code,
-                    "name": cand.get("name"),
-                    "qty": int(qty),
-                    "side": "BUY",
-                    "price": cand.get("price"),
-                    "amount": int(qty) * int(cand.get("price") or 0),
-                    "strategy": "종가 베팅",
-                    "result": result,
-                }
-            )
-
-
-class CorePositionEngine:
-    def __init__(self):
-        self.candidates: List[Dict[str, Any]] = []
-
-    def _is_core_candidate(self, kis: KisAPI, code: str) -> Tuple[bool, Dict[str, Any]]:
-        ctx: Dict[str, Any] = {}
-        try:
-            candles = _get_daily_candles_cached(kis, code, count=220)
-        except Exception as e:
-            return False, {"reason": f"fetch_fail:{e}"}
-        if not candles or len(candles) < 200:
-            return False, {"reason": "not_enough_candles"}
-        today = datetime.now(KST).strftime("%Y%m%d")
-        completed = list(candles)
-        if completed and str(completed[-1].get("date")) == today:
-            completed = completed[:-1]
-        if len(completed) < 200:
-            return False, {"reason": "not_enough_completed"}
-        closes = [float(c.get("close") or 0.0) for c in completed if c.get("close")]
-        highs = [float(c.get("high") or 0.0) for c in completed if c.get("high")]
-        opens = [float(c.get("open") or 0.0) for c in completed if c.get("open")]
-        vols = [float(c.get("volume") or 0.0) for c in completed if c.get("volume")]
-        if len(closes) < 200:
-            return False, {"reason": "close_short"}
-        ma200 = sum(closes[-200:]) / 200.0
-        ctx["ma200"] = ma200
-        last_close = closes[-1]
-        last_open = opens[-1] if opens else last_close
-        box_high = max(closes[-40:])
-        box_low = min(closes[-40:])
-        box_range_pct = (box_high - box_low) / box_low * 100.0 if box_low else 0.0
-        ctx["box_range_pct"] = box_range_pct
-        volume_ratio = 0.0
-        if vols and len(vols) >= 21:
-            volume_ratio = (vols[-1] / (sum(vols[-21:-1]) / 20.0)) if (sum(vols[-21:-1]) > 0) else 0.0
-        ctx["volume_ratio"] = volume_ratio
-        breakout = (
-            box_range_pct <= CORE_BOX_RANGE_PCT
-            and last_close >= ma200 * (1 + CORE_BREAKOUT_PCT / 100.0)
-            and last_close >= last_open * (1 + CORE_BREAKOUT_PCT / 100.0)
-            and volume_ratio >= CLOSE_BET_MIN_VOL_SPIKE
-        )
-        near_ma200 = abs(last_close - ma200) / ma200 * 100.0 <= CORE_BOX_RANGE_PCT
-        ctx["near_ma200"] = near_ma200
-        ctx["breakout"] = breakout
-        return breakout and near_ma200, ctx
-
-    def scan(self, kis: KisAPI, universe: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        self.candidates = []
-        for code, info in universe.items():
-            ok, ctx = self._is_core_candidate(kis, code)
-            if ok:
-                self.candidates.append({"code": code, "name": info.get("name"), "ctx": ctx})
-        if self.candidates:
-            logger.info(
-                "[CORE-SCAN] 코어 포지션 후보 %d종목 탐색 완료: %s",
-                len(self.candidates),
-                ",".join([c.get("code", "") for c in self.candidates]),
-            )
-        return self.candidates
-
-    def enter(
-        self, kis: KisAPI, capital_active: int, holding: Dict[str, Any], traded: Dict[str, Any], can_buy: bool
-    ) -> None:
-        if not self.candidates or capital_active <= 0 or not can_buy:
-            if not can_buy:
-                logger.info("[CORE-ENTRY] 예수금 부족 → 코어 포지션 신규 매수 스킵")
-            return
-        max_core_cap = int(capital_active * CORE_MAX_FRACTION)
-        per_notional = int(max_core_cap * CORE_W_MAX_ONE)
-        for cand in self.candidates:
-            code = cand.get("code")
-            if not code or code in holding or code in traded:
-                continue
-            qty = _notional_to_qty(kis, code, per_notional)
-            if qty <= 0:
-                continue
-            price = _safe_get_price(kis, code)
-            result = place_buy_with_fallback(kis, code, qty, limit_price=int(price or 0))
-            _init_position_state(
-                kis, holding, code, float(price or 0.0), int(qty), None, price, strategy="CORE"
-            )
-            traded[code] = {
-                "buy_time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                "qty": int(qty),
-                "price": float(price or 0.0),
-                "strategy": "CORE",
-            }
-            logger.info(
-                "[CORE-ENTRY] code=%s 가격=%s 비중≈%.2f%%",
-                code,
-                price,
-                CORE_W_MAX_ONE * 100,
-            )
-            log_trade(
-                {
-                    "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                    "code": code,
-                    "name": cand.get("name"),
-                    "qty": int(qty),
-                    "side": "BUY",
-                    "price": price,
-                    "amount": int(price or 0) * int(qty),
-                    "strategy": "코어 포지션",
-                    "result": result,
-                }
-            )
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
@@ -2665,8 +2264,34 @@ def main():
         cutoff=SELL_FORCE_TIME,
         market_close=MARKET_CLOSE_TIME,
     )
-    close_bet_engine = CloseBettingEngine(CLOSE_BET_TOPN, CLOSE_BET_CAP_FRACTION)
-    core_engine = CorePositionEngine()
+    close_bet_engine = CloseBettingEngine(
+        topn=CLOSE_BET_TOPN,
+        cap_fraction=CLOSE_BET_CAP_FRACTION,
+        min_ret_pct=CLOSE_BET_MIN_RET_PCT,
+        max_pullback_pct=CLOSE_BET_MAX_PULLBACK_PCT,
+        min_vol_spike=CLOSE_BET_MIN_VOL_SPIKE,
+        price_fetcher=_safe_get_price,
+        daily_ctx_fetcher=_compute_daily_entry_context,
+        intraday_ctx_fetcher=_compute_intraday_entry_context,
+        qty_calculator=_notional_to_qty,
+        buyer=place_buy_with_fallback,
+        state_initializer=_init_position_state,
+        trade_logger=log_trade,
+    )
+    core_engine = CorePositionEngine(
+        box_range_pct=CORE_BOX_RANGE_PCT,
+        breakout_pct=CORE_BREAKOUT_PCT,
+        min_vol_spike=CLOSE_BET_MIN_VOL_SPIKE,
+        max_fraction=CORE_MAX_FRACTION,
+        weight_one=CORE_W_MAX_ONE,
+        daily_candle_fetcher=_get_daily_candles_cached,
+        qty_calculator=_notional_to_qty,
+        price_fetcher=_safe_get_price,
+        buyer=place_buy_with_fallback,
+        state_initializer=_init_position_state,
+        trade_logger=log_trade,
+        tzinfo=KST,
+    )
 
     # 상태 복구
     holding, traded = load_state()
