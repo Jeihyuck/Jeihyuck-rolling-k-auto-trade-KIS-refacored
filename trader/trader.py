@@ -9,57 +9,81 @@ from zoneinfo import ZoneInfo
 import json
 from pathlib import Path
 import time
+import os
 import random
 from typing import Optional, Dict, Any, Tuple, List
 import csv
-
-from .close_betting import CloseBettingEngine
-from .core_positions import CorePositionEngine
-from .time_modes import TimeModeController, TimeModeState
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 from .report_ceo import ceo_report
 from .metrics import vwap_guard   # 🔸 VWAP 가드 함수
-# 모멘텀 체크 함수가 존재하면 활용하고, 없으면 항상 False로 처리해 매도 로직만 보수적으로 동작
-try:
-    from .metrics import is_strong_momentum
-except Exception:
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_kosdaq_top_n
 
-    def is_strong_momentum(*args, **kwargs):  # type: ignore
-        return False
-try:
-    from rolling_k_auto_trade_api.best_k_meta_strategy import (
-        get_kosdaq_top_n,
-        get_kospi_top_n,
-        get_kosdaq_kospi_top_n,
-    )
-except Exception as import_err:
-    logger.warning(
-        "[UNIVERSE-FALLBACK] 시총 TopN 통합 헬퍼 import 실패: %s → 코스닥 전용으로 폴백",
-        import_err,
-    )
+# =========================
+# [CONFIG] .env 없이도 동작
+# - 아래 값을 기본으로 사용
+# - (선택) 동일 키를 환경변수로 넘기면 override
+# =========================
+CONFIG = {
+    "SELL_FORCE_TIME": "14:40",
+    "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
+    "API_RATE_SLEEP_SEC": "0.5",
+    "FORCE_SELL_PASSES_CUTOFF": "2",
+    "FORCE_SELL_PASSES_CLOSE": "4",
+    "PARTIAL1": "0.5",
+    "PARTIAL2": "0.3",
+    "TRAIL_PCT": "0.02",
+    "FAST_STOP": "0.01",
+    "ATR_STOP": "1.5",
+    "TIME_STOP_HHMM": "13:00",
+    "DEFAULT_PROFIT_PCT": "3.0",
+    "DEFAULT_LOSS_PCT": "-5.0",
+    "DAILY_CAPITAL": "250000000",
+    "CAP_CAP": "0.8",
+    "SLIPPAGE_LIMIT_PCT": "0.25",
+    "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
+    "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
+    "W_MAX_ONE": "0.25",
+    "W_MIN_ONE": "0.03",
+    "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
+    "WEEKLY_ANCHOR_REF": "last",              # NEW: 'last'(직전 일요일) | 'next'(다음 일요일)
+    "MOMENTUM_OVERRIDES_FORCE_SELL": "true",
+    # 레짐(코스닥) 파라미터
+    "KOSDAQ_INDEX_CODE": "KOSDAQ",
+    "KOSDAQ_ETF_FALLBACK": "229200",
+    "REG_BULL_MIN_UP_PCT": "0.5",
+    "REG_BULL_MIN_MINUTES": "10",
+    "REG_BEAR_VWAP_MINUTES": "10",
+    "REG_BEAR_DROP_FROM_HIGH": "0.7",
+    "REG_BEAR_STAGE1_MINUTES": "20",
+    "REG_BEAR_STAGE2_ADD_DROP": "0.5",
+    "REG_PARTIAL_S1": "0.30",
+    "REG_PARTIAL_S2": "0.30",
+    "TRAIL_PCT_BULL": "0.025",
+    "TRAIL_PCT_BEAR": "0.012",
+    "TP_PROFIT_PCT_BULL": "3.5",
+    # 신고가 돌파 후 3일 눌림 + 반등 매수용 파라미터
+    "USE_PULLBACK_ENTRY": "true",          # true면 '신고가 → 3일 연속 하락 → 반등' 패턴 충족 시에만 눌림목 진입 허용
+    "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
+    "PULLBACK_DAYS": "3",                  # 연속 하락 일수
+    "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
+    "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
+    "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
+    # 챔피언 후보 필터
+    "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
+    "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
+    "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
+    "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
+    # 기타
+    "MARKET_DATA_WHEN_CLOSED": "false",
+    "FORCE_WEEKLY_REBALANCE": "0",
+    # NEW: 1분봉 VWAP 모멘텀 파라미터
+    "MOM_FAST": "5",        # 1분봉 fast MA 길이
+    "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+    "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+}
 
-    try:
-        from rolling_k_auto_trade_api.best_k_meta_strategy import get_kosdaq_top_n
-    except Exception:
-
-        def get_kosdaq_top_n(*args, **kwargs):  # type: ignore
-            logger.warning(
-                "[UNIVERSE-FALLBACK] get_kosdaq_top_n 미지원 → 유니버스가 비어 있을 수 있음"
-            )
-            return []
-
-    def get_kospi_top_n(*args, **kwargs):  # type: ignore
-        logger.warning("[UNIVERSE-FALLBACK] get_kospi_top_n 사용 불가 → 코스닥만 사용")
-        return []
-
-    def get_kosdaq_kospi_top_n(*args, **kwargs):  # type: ignore
-        logger.warning("[UNIVERSE-FALLBACK] 통합 유니버스 미지원 → 코스닥만 사용")
-        return []
-
-from .config import CONFIG, cfg as _cfg
+def _cfg(key: str) -> str:
+    """환경변수 > CONFIG 기본값"""
+    return os.getenv(key, CONFIG.get(key, ""))
 
 # RK-Max 유틸(가능하면 사용, 없으면 graceful fallback)
 try:
@@ -102,6 +126,9 @@ def _round_to_tick(price: float, mode: str = "nearest") -> int:
         q = int(q + 0.5)
     return int(q * tick)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"
@@ -118,25 +145,6 @@ EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
 
 KST = ZoneInfo("Asia/Seoul")
 
-
-def _parse_markets(include: str) -> List[str]:
-    allowed = {"KOSDAQ", "KOSPI"}
-    parts = [p.strip().upper() for p in (include or "").split(",") if p.strip()]
-    parsed = [p for p in parts if p in allowed]
-    if not parsed:
-        logger.warning(
-            f"[UNIVERSE-FALLBACK] 유효하지 않은 시장값 include={include!r} → KOSDAQ만 사용"
-        )
-        return ["KOSDAQ"]
-    seen = set()
-    ordered: List[str] = []
-    for p in parsed:
-        if p in seen:
-            continue
-        ordered.append(p)
-        seen.add(p)
-    return ordered
-
 # ===== 매개변수(.env 없이도 CONFIG 기본을 사용) =====
 SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
 SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "true"
@@ -150,7 +158,7 @@ FAST_STOP = float(_cfg("FAST_STOP"))
 ATR_STOP = float(_cfg("ATR_STOP"))
 TIME_STOP_HHMM = _cfg("TIME_STOP_HHMM")
 DEFAULT_PROFIT_PCT = float(_cfg("DEFAULT_PROFIT_PCT"))
-DEFAULT_LOSS_PCT = abs(float(_cfg("DEFAULT_LOSS_PCT")))  # 항상 양수(절대값)로 사용
+DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
 DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
 CAP_CAP = float(_cfg("CAP_CAP"))
 SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
@@ -166,25 +174,6 @@ MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() ==
 MOM_FAST = int(_cfg("MOM_FAST") or "5")
 MOM_SLOW = int(_cfg("MOM_SLOW") or "20")
 MOM_TH_PCT = float(_cfg("MOM_TH_PCT") or "0.5")
-# 시간 구간
-ACTIVE_START_HHMM = _cfg("ACTIVE_START_HHMM")
-FULL_ACTIVE_END_HHMM = _cfg("FULL_ACTIVE_END_HHMM")
-CLOSE_BET_PREP_START_HHMM = _cfg("CLOSE_BET_PREP_START_HHMM")
-CLOSE_BET_ENTRY_START_HHMM = _cfg("CLOSE_BET_ENTRY_START_HHMM")
-MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM")
-# 종가 베팅
-CLOSE_BET_TOPN = int(_cfg("CLOSE_BET_TOPN") or "5")
-CLOSE_BET_CAP_FRACTION = float(_cfg("CLOSE_BET_CAP_FRACTION") or "0.2")
-CLOSE_BET_MIN_RET_PCT = float(_cfg("CLOSE_BET_MIN_RET_PCT") or "3.0")
-CLOSE_BET_MAX_PULLBACK_PCT = float(_cfg("CLOSE_BET_MAX_PULLBACK_PCT") or "3.0")
-CLOSE_BET_MIN_VOL_SPIKE = float(_cfg("CLOSE_BET_MIN_VOL_SPIKE") or "2.0")
-# 코어 포지션
-ENABLE_CORE_POSITIONS = _cfg("ENABLE_CORE_POSITIONS").lower() != "false"
-CORE_MAX_FRACTION = float(_cfg("CORE_MAX_FRACTION") or "0.6")
-CORE_W_MAX_ONE = float(_cfg("CORE_W_MAX_ONE") or "0.1")
-CORE_SCAN_TOPN = int(_cfg("CORE_SCAN_TOPN") or "250")
-CORE_BOX_RANGE_PCT = float(_cfg("CORE_BOX_RANGE_PCT") or "5.0")
-CORE_BREAKOUT_PCT = float(_cfg("CORE_BREAKOUT_PCT") or "2.0")
 # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
 USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
 PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
@@ -196,10 +185,6 @@ CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
 CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
 CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
 CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
-UNIVERSE_INCLUDE_MARKETS = _cfg("UNIVERSE_INCLUDE_MARKETS").upper()
-UNIVERSE_KOSDAQ_TOPN = int(_cfg("UNIVERSE_KOSDAQ_TOPN") or "50")
-UNIVERSE_KOSPI_TOPN = int(_cfg("UNIVERSE_KOSPI_TOPN") or "50")
-UNIVERSE_MARKETS: List[str] = _parse_markets(UNIVERSE_INCLUDE_MARKETS)
 
 # 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
 CHAMPION_A_RULES = {
@@ -231,14 +216,7 @@ def _parse_hhmm(hhmm: str) -> dtime:
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
-ACTIVE_START_TIME = _parse_hhmm(ACTIVE_START_HHMM)
-FULL_ACTIVE_END_TIME = _parse_hhmm(FULL_ACTIVE_END_HHMM)
-CLOSE_BET_PREP_START_TIME = _parse_hhmm(CLOSE_BET_PREP_START_HHMM)
-CLOSE_BET_ENTRY_START_TIME = _parse_hhmm(CLOSE_BET_ENTRY_START_HHMM)
-MARKET_CLOSE_TIME = _parse_hhmm(MARKET_CLOSE_HHMM)
 ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
-
-
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
@@ -312,45 +290,13 @@ def get_rebalance_anchor_date(now: Optional[datetime] = None) -> str:
     # monthly
     return today.replace(day=1).strftime("%Y-%m-%d")
 
-def fetch_rebalancing_targets(kis: KisAPI, date: str) -> List[Dict[str, Any]]:
-    include_markets = UNIVERSE_MARKETS or ["KOSDAQ"]
-    as_of = None
-    try:
-        as_of = datetime.strptime(date, "%Y-%m-%d")
-    except Exception:
-        as_of = None
-
+def fetch_rebalancing_targets(date: str) -> List[Dict[str, Any]]:
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
-    universe_map: Dict[str, str] = {}
-    try:
-        combined_universe = get_kosdaq_kospi_top_n(
-            kis,
-            top_n_kosdaq=UNIVERSE_KOSDAQ_TOPN,
-            top_n_kospi=UNIVERSE_KOSPI_TOPN,
-            as_of=as_of,
-        )
-        universe_map = {str(ent.get("Code") or ent.get("code") or "").zfill(6): ent.get("market") for ent in combined_universe}
-    except Exception as e:
-        logger.warning(f"[UNIVERSE-MAP-FAIL] 통합 유니버스 생성 실패: {e}")
-
     response = requests.post(REBALANCE_API_URL)
     logger.info(f"[🛰️ 리밸런싱 API 전체 응답]: {response.text}")
     if response.status_code == 200:
         data = response.json()
         selected = data.get("selected") or data.get("selected_stocks") or []
-
-        if include_markets:
-            filtered: List[Dict[str, Any]] = []
-            for ent in selected:
-                code = str(ent.get("stock_code") or ent.get("code") or "").zfill(6)
-                market = (ent.get("market") or universe_map.get(code) or "").upper()
-                if market and market not in include_markets:
-                    continue
-                if market:
-                    ent["market"] = market
-                filtered.append(ent)
-            selected = filtered
-
         logger.info(f"[🎯 리밸런싱 종목]: {selected}")
         # 챔피언 & 레짐 상세 로그
         try:
@@ -359,18 +305,8 @@ def fetch_rebalancing_targets(kis: KisAPI, date: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.exception(f"[VWAP_CHAMPION_LOG_ERROR] {e}")
         return selected
-
-    logger.error(f"[REBALANCE-API-FAIL] status={response.status_code} text={response.text}")
-    if universe_map:
-        fallback: List[Dict[str, Any]] = []
-        for code, market in universe_map.items():
-            if market and market.upper() not in include_markets:
-                continue
-            fallback.append({"code": code, "name": None, "market": market})
-        if fallback:
-            logger.warning("[REBALANCE-FALLBACK] API 실패 → 시총 TopN 유니버스 반환")
-            return fallback
-    raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
+    else:
+        raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
 def log_trade(trade: dict) -> None:
     today = datetime.now(KST).strftime("%Y-%m-%d")
@@ -553,6 +489,39 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
     _BALANCE_CACHE["balances"] = list(positions)
     return positions
 
+
+def _get_effective_ord_cash(kis: KisAPI) -> int:
+    """
+    오늘 주문 가능 예수금을 가져오되,
+    - 0 이하이거나
+    - 조회 실패 / None
+    이면 DAILY_CAPITAL을 fallback으로 사용한다.
+    (모의투자에서 get_cash_available_today가 항상 0을 주는 경우 보호)
+    """
+    try:
+        cash = kis.get_cash_available_today()
+        if cash is None:
+            raise ValueError("cash is None")
+        cash = int(cash)
+        logger.info(f"[BUDGET] today cash available(raw) = {cash:,} KRW")
+    except Exception as e:
+        logger.warning(
+            f"[BUDGET] 예수금 조회 실패/무효({e}) → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
+        )
+        return DAILY_CAPITAL
+
+    if cash <= 0:
+        logger.warning(
+            f"[BUDGET] today cash <= 0 → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
+        )
+        return DAILY_CAPITAL
+
+    return cash
+
+
+# === [ANCHOR: DAILY_CANDLE_CACHE] 일봉 완전 캐싱 ===
+    
+
 # === [ANCHOR: DAILY_CANDLE_CACHE] 일봉 완전 캐싱 ===
 _DAILY_CANDLE_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -730,27 +699,6 @@ def _compute_daily_entry_context(
     if completed and str(completed[-1].get("date")) == today:
         completed = completed[:-1]
 
-    # intraday(오늘) 가격/거래량 보정
-    intraday_candles: List[Dict[str, Any]] = []
-    try:
-        intraday_candles = _get_intraday_1min(kis, code, count=240)
-    except Exception:
-        intraday_candles = []
-    if intraday_candles:
-        try:
-            last_candle = intraday_candles[-1]
-            last_px = float(
-                last_candle.get("close")
-                or last_candle.get("trade_price")
-                or last_candle.get("price")
-                or 0.0
-            )
-            if (current_price is None or current_price <= 0) and last_px > 0:
-                current_price = last_px
-                ctx["current_price"] = last_px
-        except Exception:
-            pass
-
     if not completed:
         return ctx
 
@@ -758,21 +706,12 @@ def _compute_daily_entry_context(
     highs = [float(c.get("high") or 0.0) for c in completed if c.get("high")]
     lows = [float(c.get("low") or 0.0) for c in completed if c.get("low")]
 
-    if len(closes) >= 5:
-        ma5 = sum(closes[-5:]) / 5.0
-        ctx["ma5"] = ma5
-    if len(closes) >= 10:
-        ma10 = sum(closes[-10:]) / 10.0
-        ctx["ma10"] = ma10
     if len(closes) >= 20:
         ma20 = sum(closes[-20:]) / 20.0
         ctx["ma20"] = ma20
         if current_price:
             ctx["ma20_ratio"] = current_price / ma20
             ctx["ma20_risk"] = max(0.0, current_price - ma20)
-    if len(closes) >= 200:
-        ma200 = sum(closes[-200:]) / 200.0
-        ctx["ma200"] = ma200
 
     if highs:
         window_60 = highs[-60:] if len(highs) >= 60 else highs
@@ -781,31 +720,6 @@ def _compute_daily_entry_context(
         if current_price and peak_price > 0:
             ctx["distance_to_peak"] = current_price / peak_price
             ctx["pullback_depth_pct"] = (peak_price - current_price) / peak_price * 100.0
-
-    if len(closes) >= 1:
-        prev_close = closes[-1]
-        ctx["prev_close"] = prev_close
-        last_price_ref = current_price or ctx.get("current_price")
-        if last_price_ref and prev_close:
-            ctx["ret_today_pct"] = (float(last_price_ref) - prev_close) / prev_close * 100.0
-
-    if lows and highs and len(lows) == len(highs) == len(closes):
-        vol = [float(c.get("volume") or 0.0) for c in completed if c.get("volume") is not None]
-        session_vol = 0.0
-        if intraday_candles:
-            try:
-                session_vol = sum(float(c.get("volume") or c.get("trade_volume") or 0.0) for c in intraday_candles)
-            except Exception:
-                session_vol = 0.0
-        if vol:
-            ctx["volume_avg20"] = sum(vol[-20:]) / min(20, len(vol))
-            if session_vol > 0:
-                ctx["volume_today"] = session_vol
-            elif vol:
-                ctx["volume_today"] = vol[-1]
-            base = ctx.get("volume_avg20") or 0.0
-            if base > 0:
-                ctx["volume_ratio"] = (ctx.get("volume_today") or 0.0) / base
 
     # 연속 하락 일수 체크 (신고가 이후 눌림 판단)
     down_streak = 0
@@ -873,14 +787,6 @@ def _compute_intraday_entry_context(
         if c.get("low") or c.get("close")
     ]
     vols = [float(c.get("volume") or 0.0) for c in candles]
-
-    if highs:
-        session_high = max(highs)
-        ctx["session_high"] = session_high
-        if last_close:
-            ctx["from_high_pct"] = (session_high - float(last_close)) / session_high * 100.0
-    if lows:
-        ctx["session_low"] = min(lows)
 
     if highs:
         box_high = max(highs[-20:])
@@ -1262,16 +1168,7 @@ def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
             return None
     return None
 
-def _init_position_state(
-    kis: KisAPI,
-    holding: Dict[str, Any],
-    code: str,
-    entry_price: float,
-    qty: int,
-    k_value: Any,
-    target_price: Optional[float],
-    strategy: Optional[str] = None,
-) -> None:
+def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_price: float, qty: int, k_value: Any, target_price: Optional[float]) -> None:
     try:
         _ = kis.is_market_open()
     except Exception:
@@ -1303,7 +1200,6 @@ def _init_position_state(
         'stage1_qty': int(qty),
         'stage2_qty': 0,
         'stage3_qty': 0,
-        'strategy': strategy,
     }
 
 def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code: str, avg_price: float, qty: int) -> None:
@@ -2121,26 +2017,10 @@ def _adaptive_exit(
     qty_p1 = max(1, int(qty * PARTIAL1))
     qty_p2 = max(1, int(qty * PARTIAL2))
 
-    strategy = (pos.get("strategy") or "").upper()
-
     # === 레짐 기반 TP/트레일링 설정 ===
     base_tp1 = DEFAULT_PROFIT_PCT        # 보통 3.0
     base_tp2 = DEFAULT_PROFIT_PCT * 2    # 6.0
     trail_down_frac = 0.018              # 기본: 고점대비 1.8% 되돌리면 컷
-
-    # 전략별 기본값 override
-    if strategy == "CLOSE_BET":
-        base_tp1 = 3.0
-        base_tp2 = 6.0
-        trail_down_frac = 0.02
-        hard_stop_pct = 4.0
-    elif strategy == "CORE":
-        base_tp1 = 20.0
-        base_tp2 = 35.0
-        trail_down_frac = 0.08
-        hard_stop_pct = 8.0
-    else:
-        hard_stop_pct = DEFAULT_LOSS_PCT
 
     # (선택) 모멘텀 정보를 쓰고 싶으면 여기서 strong_mom 계산
     strong_mom = False
@@ -2181,6 +2061,9 @@ def _adaptive_exit(
         tp1 = base_tp1
         tp2 = base_tp2
         trail_down_frac = 0.018
+
+    # 손절 기준
+    hard_stop_pct = DEFAULT_LOSS_PCT
 
     sell_size: int = 0
 
@@ -2256,43 +2139,6 @@ def main():
     logger.info(f"[💰 DAILY_CAPITAL] {DAILY_CAPITAL:,}원")
     logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
 
-    time_controller = TimeModeController(
-        active_start=ACTIVE_START_TIME,
-        full_active_end=FULL_ACTIVE_END_TIME,
-        close_bet_prep=CLOSE_BET_PREP_START_TIME,
-        close_bet_entry=CLOSE_BET_ENTRY_START_TIME,
-        cutoff=SELL_FORCE_TIME,
-        market_close=MARKET_CLOSE_TIME,
-    )
-    close_bet_engine = CloseBettingEngine(
-        topn=CLOSE_BET_TOPN,
-        cap_fraction=CLOSE_BET_CAP_FRACTION,
-        min_ret_pct=CLOSE_BET_MIN_RET_PCT,
-        max_pullback_pct=CLOSE_BET_MAX_PULLBACK_PCT,
-        min_vol_spike=CLOSE_BET_MIN_VOL_SPIKE,
-        price_fetcher=_safe_get_price,
-        daily_ctx_fetcher=_compute_daily_entry_context,
-        intraday_ctx_fetcher=_compute_intraday_entry_context,
-        qty_calculator=_notional_to_qty,
-        buyer=place_buy_with_fallback,
-        state_initializer=_init_position_state,
-        trade_logger=log_trade,
-    )
-    core_engine = CorePositionEngine(
-        box_range_pct=CORE_BOX_RANGE_PCT,
-        breakout_pct=CORE_BREAKOUT_PCT,
-        min_vol_spike=CLOSE_BET_MIN_VOL_SPIKE,
-        max_fraction=CORE_MAX_FRACTION,
-        weight_one=CORE_W_MAX_ONE,
-        daily_candle_fetcher=_get_daily_candles_cached,
-        qty_calculator=_notional_to_qty,
-        price_fetcher=_safe_get_price,
-        buyer=place_buy_with_fallback,
-        state_initializer=_init_position_state,
-        trade_logger=log_trade,
-        tzinfo=KST,
-    )
-
     # 상태 복구
     holding, traded = load_state()
     logger.info(f"[상태복구] holding: {list(holding.keys())}, traded: {list(traded.keys())}")
@@ -2301,7 +2147,7 @@ def main():
     targets: List[Dict[str, Any]] = []
     if REBALANCE_ANCHOR == "weekly":
         if should_weekly_rebalance_now():
-            targets = fetch_rebalancing_targets(kis, rebalance_date)
+            targets = fetch_rebalancing_targets(rebalance_date)
             # 중복 실행 방지를 위해 즉시 스탬프(필요 시 FORCE로 재실행 가능)
             stamp_weekly_done()
             logger.info(f"[REBALANCE] 이번 주 리밸런싱 실행 기록 저장({_this_iso_week_key()})")
@@ -2309,20 +2155,19 @@ def main():
             logger.info("[REBALANCE] 이번 주 이미 실행됨 → 신규 리밸런싱 생략 (보유 관리만)")
     else:
         # today/monthly 등 다른 앵커 모드는 기존 방식으로 바로 호출
-        targets = fetch_rebalancing_targets(kis, rebalance_date)
+        targets = fetch_rebalancing_targets(rebalance_date)
 
     # === [NEW] 예산 가드: 예수금이 0/부족이면 신규 매수만 스킵 ===
-    can_buy = True
-    try:
-        cash = kis.get_cash_available_today()
-        logger.info(f"[BUDGET] today cash available = {cash:,} KRW")
-        if cash <= 0:
-            can_buy = False
-            logger.warning("[BUDGET] 가용현금 0 → 신규 매수 스킵(보유 관리만 수행)")
-    except Exception as e:
-        logger.error(f"[BUDGET_FAIL] 예수금 조회 실패: {e}")
-        # 실패 시에는 일단 보수적으로 신규매수 스킵
+    effective_cash = _get_effective_ord_cash(kis)
+    if effective_cash <= 0:
         can_buy = False
+        logger.warning("[BUDGET] 유효 예산 0 → 신규 매수 스킵(보유 관리만 수행)")
+    else:
+        can_buy = True
+    logger.info(
+        f"[BUDGET] today effective cash = {effective_cash:,} KRW "
+        f"(env DAILY_CAPITAL={DAILY_CAPITAL:,})"
+    )
 
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
     processed_targets: Dict[str, Any] = {}
@@ -2475,18 +2320,18 @@ def main():
     cap_scale = REGIME_CAPITAL_SCALE.get(regime_key, REGIME_CAPITAL_SCALE.get(("neutral", 0), 0.5))
 
     # 레짐 + 예수금 기반 실제 사용 자본 계산
-    try:
-        ord_cash = kis.get_cash_available_today()
-    except Exception as e:
-        logger.error("[BUDGET_FAIL] 예수금 조회 실패(regime-capital): %s", e)
-        ord_cash = 0
+        # 레짐 + 예수금 기반 실제 사용 자본 계산 (0/실패 시 DAILY_CAPITAL fallback)
+    ord_cash = _get_effective_ord_cash(kis)
 
     capital_base = int(max(0, int(ord_cash * CAP_CAP)))
     capital_active = int(min(capital_base * cap_scale, DAILY_CAPITAL))
     logger.info(
-        f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} D1={D1 if D1 is not None else 'N/A'} "
-        f"ord_cash={ord_cash:,} base={capital_base:,} active={capital_active:,} scale={cap_scale:.2f}"
+        f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} "
+        f"D1={D1 if D1 is not None else 'N/A'} "
+        f"ord_cash(effective)={ord_cash:,} base={capital_base:,} active={capital_active:,} "
+        f"scale={cap_scale:.2f}"
     )
+
 
 
     # 레짐별 최대 보유 종목 수
@@ -2571,43 +2416,24 @@ def main():
 
     code_to_target: Dict[str, Any] = selected_targets
 
-    # 눌림목 스캔용 시총 상위 리스트 (시장별 구성)
+    # 눌림목 스캔용 코스닥 시총 상위 리스트 (챔피언과 별도로 관리)
     pullback_watch: Dict[str, Dict[str, Any]] = {}
     if USE_PULLBACK_ENTRY:
         try:
             pb_weight = max(0.0, min(PULLBACK_UNIT_WEIGHT, 1.0))
             base_notional = int(round(capital_active * pb_weight))
-            try:
-                as_of_dt = datetime.strptime(rebalance_date, "%Y-%m-%d")
-            except Exception:
-                as_of_dt = None
-
-            for market in UNIVERSE_MARKETS:
-                if market == "KOSDAQ":
-                    pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
-                else:
-                    pb_df = get_kospi_top_n(kis, top_n=PULLBACK_TOPN, as_of=as_of_dt)
-
-                if hasattr(pb_df, "iterrows"):
-                    iterator = pb_df.iterrows()
-                    entries = [(row.get("Code") or row.get("code"), row) for _, row in iterator]
-                elif isinstance(pb_df, list):
-                    entries = [(ent.get("Code") or ent.get("code"), ent) for ent in pb_df]
-                else:
-                    entries = []
-
-                for code_raw, row in entries:
-                    code = str(code_raw or "").zfill(6)
-                    if not code:
-                        continue
-                    pullback_watch[code] = {
-                        "code": code,
-                        "name": row.get("Name") or row.get("name"),
-                        "market": market,
-                        "notional": base_notional,
-                    }
+            pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
+            for _, row in pb_df.iterrows():
+                code = str(row.get("Code") or row.get("code") or "").zfill(6)
+                if not code:
+                    continue
+                pullback_watch[code] = {
+                    "code": code,
+                    "name": row.get("Name") or row.get("name"),
+                    "notional": base_notional,
+                }
             logger.info(
-                f"[PULLBACK-WATCH] 시장 {','.join(UNIVERSE_MARKETS)} Top{PULLBACK_TOPN}×각 시장 {len(pullback_watch)}종목 스캔 준비"
+                f"[PULLBACK-WATCH] 코스닥 시총 Top{PULLBACK_TOPN} {len(pullback_watch)}종목 스캔 준비"
             )
         except Exception as e:
             logger.warning(f"[PULLBACK-WATCH-FAIL] 시총 상위 로드 실패: {e}")
@@ -2629,9 +2455,6 @@ def main():
             now_dt_kst = datetime.now(KST)
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[⏰ 장상태] {'OPEN' if is_open else 'CLOSED'} / KST={now_str}")
-
-            time_state = time_controller.evaluate(now_dt_kst)
-            time_controller.log_if_changed(logger, time_state)
 
             # 잔고 동기화 & 보유분 능동관리 부트스트랩
             ord_psbl_map: Dict[str, int] = {}
@@ -2703,31 +2526,6 @@ def main():
                 save_state(holding, traded)
                 time.sleep(60.0)
                 continue
-
-            if ENABLE_CORE_POSITIONS and time_state.allow_intraday_entries:
-                try:
-                    core_engine.scan(kis, code_to_target)
-                    core_engine.enter(kis, capital_active, holding, traded, can_buy)
-                except Exception as e:
-                    logger.warning(f"[CORE-MODULE] 스캔/진입 실패: {e}")
-
-            if time_state.allow_close_bet_scan:
-                try:
-                    close_universe: Dict[str, Dict[str, Any]] = dict(code_to_target)
-                    close_universe.update(pullback_watch)
-                    close_bet_engine.scan_candidates(
-                        kis, now_dt_kst, close_universe, holding, traded
-                    )
-                except Exception as e:
-                    logger.warning(f"[CLOSE-BET-SCAN-FAIL] {e}")
-
-            if time_state.allow_close_bet_entry:
-                try:
-                    close_bet_engine.enter_close_bets(
-                        kis, now_dt_kst, capital_active, holding, traded, can_buy
-                    )
-                except Exception as e:
-                    logger.warning(f"[CLOSE-BET-ENTRY-FAIL] {e}")
 
             # ====== 매수/매도(전략) LOOP — 오늘의 타겟 ======
             for code, target in code_to_target.items():
@@ -2814,12 +2612,7 @@ def main():
                         continue
 
                     # --- 매수 --- (돌파 진입 + 슬리피지 가드 + 예산 가드)
-                    if (
-                        is_open
-                        and time_state.allow_intraday_entries
-                        and code not in holding
-                        and code not in traded
-                    ):
+                    if is_open and code not in holding and code not in traded:
                         if not can_buy:
                             logger.info(
                                 f"[BUDGET_SKIP] {code}: 예산 없음 → 신규 매수 스킵"
@@ -3137,7 +2930,7 @@ def main():
                     continue
 
             # ====== 눌림목 전용 매수 (챔피언과 독립적으로 Top-N 시총 리스트 스캔) ======
-            if USE_PULLBACK_ENTRY and is_open and time_state.allow_intraday_entries and pullback_watch:
+            if USE_PULLBACK_ENTRY and is_open and pullback_watch:
                 for code, info in pullback_watch.items():
                     if code in code_to_target:
                         continue  # 챔피언 루프와 별도로만 처리
@@ -3433,10 +3226,10 @@ def main():
                         )
                         continue
 
-            # --- 커트오프/종가 종료 ---
-            if now_dt_kst.time() >= SELL_FORCE_TIME or time_state.mode == "shutdown":
+            # --- 장중 커트오프(KST): 14:40 도달 시 "전량매도 없이" 리포트 생성 후 정상 종료 ---
+            if is_open and now_dt_kst.time() >= SELL_FORCE_TIME:
                 logger.info(
-                    f"[SHUTDOWN] SELL_FORCE_TIME({SELL_FORCE_TIME.strftime('%H:%M')}) 도달 → 리포트 작성 후 자발 종료"
+                    f"[⏰ 커트오프] {SELL_FORCE_TIME.strftime('%H:%M')} 도달: 전량 매도 없이 리포트 생성 후 종료"
                 )
 
                 save_state(holding, traded)
