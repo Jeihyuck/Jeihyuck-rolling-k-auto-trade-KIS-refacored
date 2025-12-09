@@ -7,7 +7,7 @@ on:
     branches: [ vwap ]
   schedule:
     # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~토) = 0-6
-    - cron: "57 23 * * 0-6"
+    - cron: "57 23 * * 0-6" 
   workflow_dispatch:
 
 jobs:
