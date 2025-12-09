@@ -216,7 +216,12 @@ class KisAPI:
         attempts = self._safe_attempts
         for i in range(1, attempts + 1):
             try:
-                return self.session.request(method, url, timeout=kwargs.pop("timeout", (3.0, 7.0)), **kwargs)
+                return self.session.request(
+                    method,
+                    url,
+                    timeout=kwargs.pop("timeout", (3.0, 7.0)),
+                    **kwargs,
+                )
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 self._reset_session()
@@ -245,7 +250,9 @@ class KisAPI:
                             "expires_at": cache["expires_at"],
                             "last_issued": cache.get("last_issued", 0),
                         })
-                        logger.info(f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}")
+                        logger.info(
+                            f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}"
+                        )
                         return cache["access_token"]
                 except Exception as e:
                     logger.warning(f"[토큰캐시 읽기 실패] {e}")
@@ -261,7 +268,11 @@ class KisAPI:
             self._token_cache.update({"token": token, "expires_at": expires_at, "last_issued": now})
             try:
                 with open(self._cache_path, "w", encoding="utf-8") as f:
-                    json.dump({"access_token": token, "expires_at": expires_at, "last_issued": now}, f, ensure_ascii=False)
+                    json.dump(
+                        {"access_token": token, "expires_at": expires_at, "last_issued": now},
+                        f,
+                        ensure_ascii=False,
+                    )
             except Exception as e:
                 logger.warning(f"[토큰캐시 쓰기 실패] {e}")
             logger.info("[토큰캐시] 새 토큰 발급 및 캐시")
@@ -352,7 +363,8 @@ class KisAPI:
             logger.error(f"[CASH_QUERY_FAIL] 예수금 조회 실패: {e}")
             return int(self._last_cash or 0)
 
-    def _estimate_buy_cost(self, price: float, qty: int, fee_pct: float = 0.00015, tax_pct: float = 0.0) -> int:
+    def _estimate_buy_cost(self, price: float, qty: int,
+                           fee_pct: float = 0.00015, tax_pct: float = 0.0) -> int:
         """매수 예상금액(수수료/세금 포함, 반올림)."""
         try:
             price = float(price)
@@ -544,15 +556,17 @@ class KisAPI:
         try:
             if not getattr(self, "_env_checked_daily_capital", False):
                 if os.getenv("DAILY_CAPITAL") in (None, ""):
-                    logger.warning("[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
-                                   "settings의 기본값(10,000,000)이 사용될 수 있습니다.")
+                    logger.warning(
+                        "[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
+                        "settings의 기본값(10,000,000)이 사용될 수 있습니다."
+                    )
                 self._env_checked_daily_capital = True
         except Exception:
             pass
 
         # ---- (1) 파라미터 구성 ----
         market_code = "J"                         # 시장코드: J 고정
-        iscd = code.strip().lstrip("A")           # 종목코드: 'A' 제거(6자리)
+        iscd = code.strip().lstrip("A")          # 종목코드: 'A' 제거(6자리)
 
         # 기간: 충분히 넉넉하게(휴장/결측 대비)
         kst = pytz.timezone("Asia/Seoul")
@@ -574,8 +588,7 @@ class KisAPI:
 
             params = {
                 "fid_cond_mrkt_div_code": market_code,  # 반드시 'J'
-                "fid_input_iscd": iscd,
-                # 'A' 없이 6자리
+                "fid_input_iscd": iscd,                 # 'A' 없이 6자리
                 "fid_input_date_1": from_ymd,           # 시작일(YYYYMMDD)
                 "fid_input_date_2": to_ymd,             # 종료일(YYYYMMDD)
                 "fid_org_adj_prc": "0",
@@ -585,7 +598,9 @@ class KisAPI:
             for attempt in range(1, 4):  # 가벼운 재시도
                 try:
                     # [CHG] 안전요청 사용
-                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp = self._safe_request(
+                        "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
+                    )
                     resp.raise_for_status()
                     data = resp.json()
                     logger.debug("[DAILY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
@@ -630,7 +645,7 @@ class KisAPI:
                                     "date": d,
                                     "open": float(o),
                                     "high": float(h),
-                                    "low":  float(l),
+                                    "low": float(l),
                                     "close": float(c),
                                 })
                         except Exception as e:
@@ -646,7 +661,9 @@ class KisAPI:
                     need = max(count, 21)
                     return rows[-need:][-count:]
 
-                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')} arr=None")
+                last_err = RuntimeError(
+                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')} arr=None"
+                )
                 logger.warning("[DAILY_FAIL] A%s: %s | raw=%s", iscd, last_err, data)
                 time.sleep(0.35 + random.uniform(0, 0.15))
 
@@ -662,7 +679,9 @@ class KisAPI:
                 return None
             trs: List[float] = []
             for i in range(1, len(candles)):
-                h = candles[i]["high"]; l = candles[i]["low"]; c_prev = candles[i - 1]["close"]
+                h = candles[i]["high"]
+                l = candles[i]["low"]
+                c_prev = candles[i - 1]["close"]
                 tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
                 trs.append(tr)
             if not trs:
@@ -704,7 +723,9 @@ class KisAPI:
 
             for attempt in range(1, 4):
                 try:
-                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                    resp = self._safe_request(
+                        "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
+                    )
                     resp.raise_for_status()
                     data = resp.json()
                     logger.debug("[INTRADAY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
@@ -755,7 +776,9 @@ class KisAPI:
                         raise DataEmptyError(f"A{iscd} 0 intraday candles")
                     return rows
 
-                last_err = RuntimeError(f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}")
+                last_err = RuntimeError(
+                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
+                )
                 logger.warning("[INTRADAY_BAD_RESP] %s %s", iscd, data)
                 time.sleep(0.4 + random.uniform(0, 0.2))
 
@@ -789,8 +812,6 @@ class KisAPI:
         if total_vol <= 0:
             return None
         return total_tr / total_vol
-
-
 
     def is_market_open(self) -> bool:
         kst = pytz.timezone("Asia/Seoul")
@@ -836,7 +857,8 @@ class KisAPI:
         except Exception:
             out["tp"] = None
         try:
-            ask = self.get_best_ask(code); bid = self.get_best_bid(code)
+            ask = self.get_best_ask(code)
+            bid = self.get_best_bid(code)
             out["ap"] = float(ask) if ask is not None else None
             out["bp"] = float(bid) if bid is not None else None
         except Exception:
@@ -858,7 +880,9 @@ class KisAPI:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
                         # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self._safe_request(
+                            "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
+                        )
                         data = resp.json()
                     except Exception:
                         continue
@@ -883,7 +907,9 @@ class KisAPI:
                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                     try:
                         # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                        resp = self._safe_request(
+                            "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
+                        )
                         data = resp.json()
                     except Exception:
                         continue
@@ -906,6 +932,7 @@ class KisAPI:
         2) nrcvb_buy_amt (매수가능금액)
         3) dnca_tot_amt  (예수금 총액; 결제미수 포함 가능)
         """
+
         def _to_int(x) -> int:
             try:
                 s = safe_strip(x)
@@ -969,7 +996,7 @@ class KisAPI:
         """
         fk = nk = ""
         all_rows: List[dict] = []
-        out2_last = None
+        out2_last = None  # 🔸 요약 블록(예수금 등) → '첫 페이지' 것만 유지
         empty_cnt = 0
         while True:
             try:
@@ -994,8 +1021,11 @@ class KisAPI:
                     break
             empty_cnt = 0
             all_rows.extend(rows)
-            if j.get("output2") is not None:
-                out2_last = j.get("output2")
+
+            # ✅ '처음 나온' output2만 요약으로 사용 (마지막 페이지 값으로 덮어쓰지 않음)
+            out2 = j.get("output2")
+            if out2 is not None and out2_last is None:
+                out2_last = out2
 
             fk = (j.get("ctx_area_fk100") or "").strip()
             nk = (j.get("ctx_area_nk100") or "").strip()
@@ -1096,26 +1126,37 @@ class KisAPI:
                 self._limiter.wait("orders")
 
                 # 로깅(민감 Mask)
-                log_body_masked = {k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***") for k, v in body.items()}
+                log_body_masked = {
+                    k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***")
+                    for k, v in body.items()
+                }
                 logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
 
                 # 네트워크/게이트웨이 재시도
                 for attempt in range(1, 4):
                     try:
                         # [CHG] 안전요청 사용
-                        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"))
+                        resp = self._safe_request(
+                            "POST",
+                            url,
+                            headers=headers,
+                            data=_json_dumps(body).encode("utf-8"),
+                        )
                         data = resp.json()
                     except Exception as e:
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
-                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} ex={e} → sleep {backoff:.2f}s"
+                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
+                            f"ex={e} → sleep {backoff:.2f}s"
                         )
                         time.sleep(backoff)
                         last_err = e
                         continue
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
-                        logger.info(f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}")
+                        logger.info(
+                            f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}"
+                        )
                         # 주문 성공 → fills에 기록 (추정 체결가 사용)
                         try:
                             out = data.get("output") or {}
@@ -1137,8 +1178,15 @@ class KisAPI:
                                 price_for_fill = 0.0
 
                             side = "SELL" if is_sell else "BUY"
-                            append_fill(side=side, code=pdno, name="", qty=qty, price=price_for_fill, odno=odno,
-                                        note=f"tr={tr_id},ord_dvsn={ord_dvsn}")
+                            append_fill(
+                                side=side,
+                                code=pdno,
+                                name="",
+                                qty=qty,
+                                price=price_for_fill,
+                                odno=odno,
+                                note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
+                            )
                         except Exception as e:
                             logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
                         return data
@@ -1149,7 +1197,8 @@ class KisAPI:
                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
-                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} resp={data} → sleep {backoff:.2f}s"
+                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
+                            f"resp={data} → sleep {backoff:.2f}s"
                         )
                         time.sleep(backoff)
                         last_err = data
@@ -1203,7 +1252,10 @@ class KisAPI:
         with self._recent_sells_lock:
             last = self._recent_sells.get(pdno)
             if last and (now_ts - last) < self._recent_sells_cooldown:
-                logger.warning(f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                logger.warning(
+                    f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} "
+                    f"last={last} age={now_ts-last:.1f}s"
+                )
                 return None
 
         body = {
@@ -1244,7 +1296,9 @@ class KisAPI:
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         # [CHG] 안전요청 사용
-        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        resp = self._safe_request(
+            "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+        )
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
@@ -1254,7 +1308,15 @@ class KisAPI:
                 pdno = safe_strip(body.get("PDNO", ""))
                 qty_int = int(float(body.get("ORD_QTY", "0")))
                 price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(side="BUY", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+                append_fill(
+                    side="BUY",
+                    code=pdno,
+                    name="",
+                    qty=qty_int,
+                    price=price_for_fill,
+                    odno=odno,
+                    note=f"limit,tr={tr_id}",
+                )
             except Exception as e:
                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
             return data
@@ -1274,12 +1336,15 @@ class KisAPI:
 
         base_qty = hldg if hldg > 0 else ord_psbl
         if base_qty <= 0:
-            logger.error(f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
+            logger.error(
+                f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}"
+            )
             return None
 
         if qty > base_qty:
             logger.warning(
-                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} "
+                f"(hldg={hldg}, ord_psbl={ord_psbl})"
             )
             qty = base_qty
 
@@ -1288,7 +1353,10 @@ class KisAPI:
         with self._recent_sells_lock:
             last = self._recent_sells.get(pdno)
             if last and (now_ts - last) < self._recent_sells_cooldown:
-                logger.warning(f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} last={last} age={now_ts-last:.1f}s")
+                logger.warning(
+                    f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} "
+                    f"last={last} age={now_ts-last:.1f}s"
+                )
                 return None
 
         body = {
@@ -1309,7 +1377,9 @@ class KisAPI:
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         # [CHG] 안전요청 사용
-        resp = self._safe_request("POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+        resp = self._safe_request(
+            "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+        )
         data = resp.json()
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
@@ -1319,7 +1389,15 @@ class KisAPI:
                 pdno = safe_strip(body.get("PDNO", ""))
                 qty_int = int(float(body.get("ORD_QTY", "0")))
                 price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(side="SELL", code=pdno, name="", qty=qty_int, price=price_for_fill, odno=odno, note=f"limit,tr={tr_id}")
+                append_fill(
+                    side="SELL",
+                    code=pdno,
+                    name="",
+                    qty=qty_int,
+                    price=price_for_fill,
+                    odno=odno,
+                    note=f"limit,tr={tr_id}",
+                )
             except Exception as e:
                 logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
             with self._recent_sells_lock:
@@ -1334,7 +1412,16 @@ class KisAPI:
     def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, **kwargs):
         """
         지정가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
+        ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
         """
+        # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
+        if self.env == "practice":
+            logger.info(
+                f"[BUY_GUARD] practice env → guard 생략, 직접 지정가 주문 "
+                f"(code={code}, qty={qty}, limit={limit_price})"
+            )
+            return self.buy_stock_limit(code, qty, limit_price)
+
         try:
             limit_price = int(limit_price)
         except Exception:
@@ -1364,7 +1451,16 @@ class KisAPI:
     def buy_stock_market_guarded(self, code: str, qty: int, **kwargs):
         """
         시장가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
+        ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
         """
+        # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
+        if self.env == "practice":
+            logger.info(
+                f"[BUY_GUARD] practice env → guard 생략, 직접 시장가 주문 "
+                f"(code={code}, qty={qty})"
+            )
+            return self.buy_stock_market(code, qty)
+
         try:
             cur = self.get_last_price(code)
             ref_px = float(cur) if cur is not None else 0.0
@@ -1377,11 +1473,15 @@ class KisAPI:
 
         adj_qty = self.affordable_qty(code, ref_px, qty)
         if adj_qty <= 0:
-            logger.warning(f"[BUY_GUARD] {code} 예수금 부족 → 매수 스킵 (req={qty}, px≈{ref_px})")
+            logger.warning(
+                f"[BUY_GUARD] {code} 예수금 부족 → 매수 스킵 (req={qty}, px≈{ref_px})"
+            )
             return {"rt_cd": "1", "msg1": "INSUFFICIENT_CASH", "output": {}}
 
         if adj_qty < qty:
-            logger.info(f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px≈{ref_px})")
+            logger.info(
+                f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px≈{ref_px})"
+            )
 
         return self.buy_stock_market(code, adj_qty)
 
