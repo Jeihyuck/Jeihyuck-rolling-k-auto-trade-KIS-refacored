@@ -489,6 +489,39 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
     _BALANCE_CACHE["balances"] = list(positions)
     return positions
 
+
+def _get_effective_ord_cash(kis: KisAPI) -> int:
+    """
+    오늘 주문 가능 예수금을 가져오되,
+    - 0 이하이거나
+    - 조회 실패 / None
+    이면 DAILY_CAPITAL을 fallback으로 사용한다.
+    (모의투자에서 get_cash_available_today가 항상 0을 주는 경우 보호)
+    """
+    try:
+        cash = kis.get_cash_available_today()
+        if cash is None:
+            raise ValueError("cash is None")
+        cash = int(cash)
+        logger.info(f"[BUDGET] today cash available(raw) = {cash:,} KRW")
+    except Exception as e:
+        logger.warning(
+            f"[BUDGET] 예수금 조회 실패/무효({e}) → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
+        )
+        return DAILY_CAPITAL
+
+    if cash <= 0:
+        logger.warning(
+            f"[BUDGET] today cash <= 0 → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
+        )
+        return DAILY_CAPITAL
+
+    return cash
+
+
+# === [ANCHOR: DAILY_CANDLE_CACHE] 일봉 완전 캐싱 ===
+    
+
 # === [ANCHOR: DAILY_CANDLE_CACHE] 일봉 완전 캐싱 ===
 _DAILY_CANDLE_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -2125,17 +2158,16 @@ def main():
         targets = fetch_rebalancing_targets(rebalance_date)
 
     # === [NEW] 예산 가드: 예수금이 0/부족이면 신규 매수만 스킵 ===
-    can_buy = True
-    try:
-        cash = kis.get_cash_available_today()
-        logger.info(f"[BUDGET] today cash available = {cash:,} KRW")
-        if cash <= 0:
-            can_buy = False
-            logger.warning("[BUDGET] 가용현금 0 → 신규 매수 스킵(보유 관리만 수행)")
-    except Exception as e:
-        logger.error(f"[BUDGET_FAIL] 예수금 조회 실패: {e}")
-        # 실패 시에는 일단 보수적으로 신규매수 스킵
+    effective_cash = _get_effective_ord_cash(kis)
+    if effective_cash <= 0:
         can_buy = False
+        logger.warning("[BUDGET] 유효 예산 0 → 신규 매수 스킵(보유 관리만 수행)")
+    else:
+        can_buy = True
+    logger.info(
+        f"[BUDGET] today effective cash = {effective_cash:,} KRW "
+        f"(env DAILY_CAPITAL={DAILY_CAPITAL:,})"
+    )
 
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
     processed_targets: Dict[str, Any] = {}
@@ -2288,18 +2320,18 @@ def main():
     cap_scale = REGIME_CAPITAL_SCALE.get(regime_key, REGIME_CAPITAL_SCALE.get(("neutral", 0), 0.5))
 
     # 레짐 + 예수금 기반 실제 사용 자본 계산
-    try:
-        ord_cash = kis.get_cash_available_today()
-    except Exception as e:
-        logger.error("[BUDGET_FAIL] 예수금 조회 실패(regime-capital): %s", e)
-        ord_cash = 0
+        # 레짐 + 예수금 기반 실제 사용 자본 계산 (0/실패 시 DAILY_CAPITAL fallback)
+    ord_cash = _get_effective_ord_cash(kis)
 
     capital_base = int(max(0, int(ord_cash * CAP_CAP)))
     capital_active = int(min(capital_base * cap_scale, DAILY_CAPITAL))
     logger.info(
-        f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} D1={D1 if D1 is not None else 'N/A'} "
-        f"ord_cash={ord_cash:,} base={capital_base:,} active={capital_active:,} scale={cap_scale:.2f}"
+        f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} "
+        f"D1={D1 if D1 is not None else 'N/A'} "
+        f"ord_cash(effective)={ord_cash:,} base={capital_base:,} active={capital_active:,} "
+        f"scale={cap_scale:.2f}"
     )
+
 
 
     # 레짐별 최대 보유 종목 수
