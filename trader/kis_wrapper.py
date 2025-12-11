@@ -167,6 +167,16 @@ class KisAPI:
     _cache_path = "kis_token_cache.json"
     _token_lock = threading.Lock()
 
+    def should_cooldown(self, now_kst: datetime | None = None) -> bool:
+        """
+        VWAP / 롤링K 메인 루프에서 '잠깐 쉬어야 하는 구간'을 체크하는 헬퍼.
+
+        지금은 최소 구현 버전:
+        - 항상 False를 리턴해서 쿨다운을 사용하지 않는다.
+        - 나중에 점심시간 / 장 마감 직전 / 과열 구간 등 세부 로직을 여기로 옮기면 된다.
+        """
+        return False
+
     def __init__(self):
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
