@@ -365,21 +365,41 @@ def decide_position_limit(candidates: Iterable[Dict[str, Any]]) -> int:
         return 1
 
 
-def select_champions(candidates: Iterable[Dict[str, Any]], position_limit: int) -> list[Dict[str, Any]]:
+from typing import Iterable, Dict, Any, Iterable
+
+def select_champions(
+    candidates: Iterable[Dict[str, Any]],
+    position_limit: int,
+    allowed_grades: tuple[str, ...] = ("A", "B"),
+) -> list[Dict[str, Any]]:
     """후보군 중에서 챔피언 종목만 선별.
 
     - compute_champion_score() 기준으로 내림차순 정렬
+    - allowed_grades 에 포함된 champion_grade 만 사용 (기본: A/B)
     - 상위 position_limit개 반환
     - 각 종목에 champ_score / champ_rank 필드 부여
     """
     if position_limit <= 0:
         return []
 
-    arr = list(candidates or [])
+    # 🔵 등급 필터 적용 (기본: A/B급 모두 허용)
+    raw = list(candidates or [])
+    if not raw:
+        return []
+
+    if allowed_grades:
+        arr = [
+            c for c in raw
+            if c.get("champion_grade") in allowed_grades
+        ]
+    else:
+        # allowed_grades=None 또는 () 면 필터 없이 전체 사용
+        arr = raw
+
     if not arr:
         return []
 
-    scored = []
+    scored: list[tuple[float, Dict[str, Any]]] = []
     for c in arr:
         s = compute_champion_score(c)
         scored.append((s, c))

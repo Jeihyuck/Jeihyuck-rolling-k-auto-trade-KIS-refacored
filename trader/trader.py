@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, time as dtime, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+
 
 from .config import (
     DAILY_CAPITAL,
@@ -24,6 +25,30 @@ from .config import (
     logger,
 )
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
+
+if TYPE_CHECKING:
+    # core 쪽에 구현돼 있는 헬퍼들을 타입체커에게만 명시적으로 알려준다.
+    from .core import (
+        _this_iso_week_key,
+        _get_effective_ord_cash,
+        _to_float,
+        _to_int,
+        _weight_to_qty,
+        _classify_champion_grade,
+        _update_market_regime,
+        _notional_to_qty,
+        _fetch_balances,
+        _init_position_state_from_balance,
+        _sell_once,
+        _adaptive_exit,
+        _compute_daily_entry_context,
+        _compute_intraday_entry_context,
+        _safe_get_price,
+        _round_to_tick,
+        _init_position_state,
+        _detect_pullback_reversal,
+        _has_bullish_trend_structure,
+    )
 
 
 def main():
@@ -147,7 +172,7 @@ def main():
         grade_counts[grade] = grade_counts.get(grade, 0) + 1
 
     logger.info(
-        "[CHAMPION-GRADE] A:%d / B:%d / C:%d (A급만 실제 매수)",
+        "[CHAMPION-GRADE] A:%d / B:%d / C:%d (A/B급 실제 매수)",
         grade_counts.get("A", 0),
         grade_counts.get("B", 0),
         grade_counts.get("C", 0),
