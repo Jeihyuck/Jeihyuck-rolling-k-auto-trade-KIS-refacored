@@ -219,21 +219,16 @@ def _detect_pullback_reversal(
     lookback: int = PULLBACK_LOOKBACK,
     pullback_days: int = PULLBACK_DAYS,
     buffer_pct: float = PULLBACK_REVERSAL_BUFFER_PCT,
+    reversal_buffer_pct: Optional[float] = None,  # ← 추가
 ) -> Dict[str, Any]:
     """
     신고가 달성 이후 3일 연속 하락 후 반등 여부를 판정한다.
-
-    반환 예시
-    {
-        "setup": True/False,        # 신고가 이후 3일 연속 하락 패턴 충족 여부
-        "reversing": True/False,    # 현재가가 되돌림 확인선 위로 돌아섰는지
-        "reversal_price": float,    # 되돌림 확인선(직전 하락일 고가 × (1+buffer))
-        "peak_price": float,        # 신고가(lookback 내 최고가)
-        "peak_date": "YYYYMMDD",  # 신고가 발생일
-        "last_down_date": "YYYYMMDD",  # 3번째 하락일
-        "reason": str               # setup=False일 때 스킵 사유
-    }
+    ...
     """
+    # reversal_buffer_pct를 키워드로 받았으면 그 값을 우선 사용
+    if reversal_buffer_pct is not None:
+        buffer_pct = reversal_buffer_pct
+
     try:
         candles = _get_daily_candles_cached(
             kis, code, count=max(lookback, pullback_days + 5)
