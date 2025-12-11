@@ -328,7 +328,7 @@ def main():
 
             # 장 상태
             now_dt_kst = datetime.now(KST)
-            is_open = kis.is_market_open(now_dt_kst)
+            is_open = kis.is_market_open()
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
 
             if not is_open:
