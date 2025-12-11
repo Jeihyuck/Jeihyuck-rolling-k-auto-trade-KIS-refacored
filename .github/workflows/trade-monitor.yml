@@ -1,12 +1,11 @@
-name: Trade Monitor (VWAP branch)
+name: Trade Monitor (trader_refactor branch)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, trader_refactor ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, trader_refactor ]
   schedule:
-    # 한국시간(KST) 매일 08:57 실행 → UTC 전일 23:57 (일~토) = 0-6
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
 
@@ -14,7 +13,7 @@ on:
 jobs:
   monitor-trade:
     # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
-    if: github.ref == 'refs/heads/main'
+    # if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     env:
