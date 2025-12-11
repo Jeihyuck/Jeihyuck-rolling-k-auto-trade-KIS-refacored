@@ -178,8 +178,12 @@ def main():
         grade_counts.get("C", 0),
     )
 
-    processed_targets = {k: v for k, v in graded_targets.items() if v.get("champion_grade") == "A"}
-
+    # 🔽 여기 필터를 A → A/B 로
+    processed_targets = {
+        k: v
+        for k, v in graded_targets.items()
+        if v.get("champion_grade") in ("A", "B")
+    }
     # === [챔피언 & 레짐 상세 로그] ===
     try:
         if len(processed_targets) > 0:
