@@ -503,33 +503,68 @@ def _compute_intraday_entry_context(
 
     return ctx
 
-
 def is_bad_entry(
     code: str,
     daily_ctx: Dict[str, Any],
     intraday_ctx: Dict[str, Any],
     regime_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    ma20_ratio = daily_ctx.get("ma20_ratio")
-    if ma20_ratio and ma20_ratio > BAD_ENTRY_MAX_MA20_DIST:
-        return True
+    reasons = []
 
-    pullback = daily_ctx.get("pullback_depth_pct")
-    if pullback and pullback > BAD_ENTRY_MAX_PULLBACK:
-        return True
-
-    if regime_state:
+    # 1) MA20 거리
+    mr = daily_ctx.get("ma20_ratio")
+    if mr is not None:
         try:
-            kosdaq_drop = _to_float(regime_state.get("pct_change"), None)
-            if kosdaq_drop is not None and kosdaq_drop <= -2.5:
-                return True
-        except Exception:
-            pass
+            mr_val = float(mr)
+            if abs(mr_val) > BAD_ENTRY_MAX_MA20_DIST:
+                reasons.append(f"MA20DIST {mr_val:.3f}")
+        except:
+            reasons.append("MA20DIST invalid")
 
-    below_vwap_ratio = intraday_ctx.get("below_vwap_ratio")
-    if below_vwap_ratio is not None and below_vwap_ratio >= BAD_ENTRY_MAX_BELOW_VWAP_RATIO:
+    # 2) Pullback depth
+    pb = daily_ctx.get("pullback_depth_pct")
+    if pb is not None:
+        try:
+            pb_val = float(pb)
+            if pb_val > BAD_ENTRY_MAX_PULLBACK:
+                reasons.append(f"PULLBACK {pb_val:.2f}")
+        except:
+            reasons.append("PULLBACK invalid")
+
+    # 3) Regime drop
+    if regime_state:
+        drop = _to_float(regime_state.get("pct_change"), None)
+        if drop is not None and drop <= -2.5:
+            reasons.append(f"REGIME_DROP {drop:.2f}")
+
+    # 4) VWAP ratio
+    bvr = intraday_ctx.get("below_vwap_ratio")
+    if bvr is not None:
+        try:
+            bvr_val = float(bvr)
+            if bvr_val >= BAD_ENTRY_MAX_BELOW_VWAP_RATIO:
+                reasons.append(f"VWAP_RATIO {bvr_val:.2f}")
+        except:
+            reasons.append("VWAP_RATIO invalid")
+
+    if reasons:
+        logger.info(
+            "[ENTRY-BAD] %s | 이유: %s | daily=%s intra=%s regime=%s",
+            code,
+            " / ".join(reasons),
+            daily_ctx,
+            intraday_ctx,
+            regime_state,
+        )
         return True
 
+    logger.info(
+        "[ENTRY-OK] %s | daily=%s intra=%s regime=%s",
+        code,
+        daily_ctx,
+        intraday_ctx,
+        regime_state,
+    )
     return False
 
 

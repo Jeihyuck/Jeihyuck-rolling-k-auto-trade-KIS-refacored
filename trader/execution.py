@@ -1,6 +1,8 @@
 """포지션 초기화, 체결, 레짐 관련 기능."""
 from __future__ import annotations
 
+import logging
+
 import csv
 import json
 import os

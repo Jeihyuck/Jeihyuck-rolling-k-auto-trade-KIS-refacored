@@ -664,13 +664,30 @@ def main():
                         continue
 
                     try:
-                        pullback_ok, trigger_price = _detect_pullback_reversal(
+                        resp = _detect_pullback_reversal(
                             kis,
                             code,
                             lookback=PULLBACK_LOOKBACK,
                             pullback_days=PULLBACK_DAYS,
                             reversal_buffer_pct=PULLBACK_REVERSAL_BUFFER_PCT,
                         )
+
+                        # 기본값
+                        pullback_ok = False
+                        trigger_price = None
+
+                        # 반환값이 tuple 이면 (ok, trigger, [ctx, ...]) 형태까지 모두 허용
+                        if isinstance(resp, tuple):
+                            if len(resp) >= 1:
+                               pullback_ok = bool(resp[0])
+                            if len(resp) >= 2:
+                                trigger_price = resp[1]
+                            # len(resp) >= 3 인 경우 ctx 등은 필요하면 여기서 더 받으면 됨
+                            # ctx = resp[2] if len(resp) >= 3 and isinstance(resp[2], dict) else None
+                        else:
+                            # bool 하나만 리턴하는 형태도 방어
+                            pullback_ok = bool(resp)
+
                     except Exception as e:
                         logger.warning(f"[PULLBACK-FAIL] {code}: 스캔 실패 {e}")
                         continue
