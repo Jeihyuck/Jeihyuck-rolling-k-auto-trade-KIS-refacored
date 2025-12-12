@@ -421,15 +421,40 @@ def _compute_daily_entry_context(
 
 
 def _compute_intraday_entry_context(
-    kis: KisAPI, code: str, prev_high: Optional[float] = None
+    kis: KisAPI,
+    code: str,
+    prev_high: Optional[float] = None,
+    *,
+    fast: Optional[int] = None,
+    slow: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """
+    진입 시점용 1분봉 VWAP / 박스 / 거래량 스파이크 컨텍스트 계산.
+
+    prev_high는 이전 일자 고가(전일 high) 등 외부에서 넣어줄 수 있고,
+    fast/slow는 모멘텀용 파라미터지만, 여기서는 주로 조회 길이 튜닝에 사용한다.
+    """
     ctx: Dict[str, Any] = {}
-    candles = _get_intraday_1min(kis, code, count=120)
+
+    # intraday 1분봉 조회 길이 결정
+    # - 기본은 120개
+    # - slow가 들어오면 slow * 3 정도로 늘리되 최소 60개는 확보
+    lookback = 120
+    if slow is not None:
+        try:
+            slow_n = int(slow)
+            lookback = max(slow_n * 3, 60)
+        except (TypeError, ValueError):
+            # 잘못 들어온 값이면 그냥 기본값 120 유지
+            pass
+
+    candles = _get_intraday_1min(kis, code, count=lookback)
     if not candles:
         return ctx
 
     vwap_val = _compute_vwap_from_1min(candles)
     ctx["vwap"] = vwap_val
+
     last = candles[-1]
     last_close = _to_float(last.get("close"), None)
     last_high = _to_float(last.get("high") or last.get("close"), None)
@@ -468,7 +493,9 @@ def _compute_intraday_entry_context(
             ctx["volume_spike"] = recent_vol >= base_vol * 1.5
 
     if vwap_val:
-        below = sum(1 for c in candles if _to_float(c.get("close"), 0.0) < vwap_val)
+        below = sum(
+            1 for c in candles if _to_float(c.get("close"), 0.0) < vwap_val
+        )
         ctx["below_vwap_ratio"] = below / len(candles)
 
     if prev_high and last_high:
