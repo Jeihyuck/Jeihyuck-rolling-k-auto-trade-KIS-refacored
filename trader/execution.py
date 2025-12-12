@@ -762,23 +762,27 @@ def _update_market_regime(kis: KisAPI) -> Dict[str, Any]:
     REGIME_STATE["bear_stage"] = stage if mode == "bear" else 0
 
     return REGIME_STATE
+
 def log_champion_and_regime(
     logger: logging.Logger,
     champion,
     regime_state: Dict[str, Any],
-    context: str,
+    context: Any,   # ✅ str -> Any 로 변경
 ) -> None:
-    """VWAP 챔피언 종목 및 현재 레짐 상태를 상세하게 남기는 공용 로그 함수.
-
-    - champion: 리밸런싱 API나 내부 스코어링에서 1순위로 선택된 종목(없으면 None)
-    - regime_state: REGIME_STATE 전역값을 그대로 전달
-    - context: 'rebalance_api', 'intra_day' 등 호출 위치 태그
-    """
     try:
         now_kst = datetime.now(KST)
         now_str = now_kst.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ✅ dict로 들어오면 JSON 문자열로 변환해서 로그에 보기 좋게 찍기
+    if isinstance(context, dict):
+        try:
+            context_label = json.dumps(context, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            context_label = str(context)
+    else:
+        context_label = str(context)
 
     # 1) 챔피언 종목 선정 사유(최소한 코드/이름/스코어 등 기본 정보 위주)
     if champion is None:

@@ -332,8 +332,27 @@ def main():
     }
     # === [챔피언 & 레짐 상세 로그] ===
     try:
-        if len(processed_targets) > 0:
-            log_champion_and_regime("rebalance_api", processed_targets)
+        if isinstance(processed_targets, dict) and len(processed_targets) > 0:
+            # 1) 챔피언 1개(1순위)만 뽑아서 로그 (processed_targets가 dict일 때)
+            first_code = next(iter(processed_targets.keys()))
+            champion_one = processed_targets.get(first_code)
+
+            # champion dict 안에 code가 없으면 보강
+            if isinstance(champion_one, dict) and "code" not in champion_one:
+                champion_one = {**champion_one, "code": first_code}
+
+            # 2) regime_state는 이미 만든 regime(또는 _update_market_regime(kis) 결과)를 넣어야 함
+            #    이 블록 직전에 regime = _update_market_regime(kis) 가 있어야 함
+            #    없으면 여기서 한 번 구해도 됨:
+            try:
+                regime_state = regime  # regime 변수가 위에서 만들어져 있으면 이걸 사용
+            except NameError:
+                regime_state = _update_market_regime(kis)
+
+            # 3) context는 문자열로(혹은 execution.py를 Any로 바꿨다면 dict도 가능)
+            context = "rebalance_api"
+
+            log_champion_and_regime(logger, champion_one, regime_state, context)
     except Exception as e:
         logger.warning(f"[CHAMPION_LOG] 챔피언/레짐 로그 생성 실패: {e}")
 
