@@ -178,9 +178,41 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
         logger.error(f"[BAL_STD_FAIL] 지원하지 않는 반환 타입: {type(res)}")
         positions = []
 
+    normalized: List[Dict[str, Any]] = []
+    for row in positions:
+        try:
+            code = str(row.get("code") or row.get("pdno") or "").strip()
+            if not code:
+                continue
+            qty = _to_int(row.get("qty") if "qty" in row else row.get("hldg_qty"))
+            sell_psbl_qty = _to_int(
+                row.get("sell_psbl_qty") if "sell_psbl_qty" in row else row.get("ord_psbl_qty")
+            )
+            if qty <= 0 and sell_psbl_qty > 0:
+                qty = sell_psbl_qty
+            avg_price = _to_float(
+                row.get("avg_price") if "avg_price" in row else row.get("pchs_avg_pric")
+            )
+
+            normalized.append(
+                {
+                    "code": code.zfill(6),
+                    "name": row.get("name") or row.get("prdt_name"),
+                    "qty": qty,
+                    "sell_psbl_qty": sell_psbl_qty,
+                    "avg_price": avg_price,
+                    "current_price": _to_float(row.get("prpr") or row.get("price")),
+                    "eval_amount": _to_int(row.get("evlu_amt")),
+                    "raw": row,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[BAL_STD_FAIL] 잔고 행 파싱 실패: {e}")
+            continue
+
     _BALANCE_CACHE["ts"] = now
-    _BALANCE_CACHE["balances"] = list(positions)
-    return positions
+    _BALANCE_CACHE["balances"] = list(normalized)
+    return normalized
 
 
 def _get_effective_ord_cash(kis: KisAPI) -> int:

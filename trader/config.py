@@ -63,6 +63,7 @@ CONFIG = {
     "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
+    "PULLBACK_MAX_BUYS_PER_DAY": "5",      # 눌림목 하루 최대 신규 매수 건수
     # 챔피언 후보 필터
     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
@@ -135,6 +136,7 @@ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
 PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
 PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
 PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")
 CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
 CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
 CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")

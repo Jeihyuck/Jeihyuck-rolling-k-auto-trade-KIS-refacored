@@ -21,6 +21,7 @@ from .config import (
     SELL_FORCE_TIME,
     SLIPPAGE_ENTER_GUARD_PCT,
     USE_PULLBACK_ENTRY,
+    PULLBACK_MAX_BUYS_PER_DAY,
     _cfg,
     logger,
 )
@@ -64,8 +65,153 @@ def main():
     logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
 
     # 상태 복구
+    state_loaded_at = datetime.now(KST)
+    state_loaded_date = state_loaded_at.strftime("%Y-%m-%d")
+    state_loaded_str = state_loaded_at.strftime("%Y-%m-%d %H:%M:%S")
+    state_loaded_midnight = f"{state_loaded_date} 00:00:00"
+
     holding, traded = load_state()
-    logger.info(f"[상태복구] holding: {list(holding.keys())}, traded: {list(traded.keys())}")
+
+    if isinstance(traded, (set, list, tuple)):
+        logger.warning(
+            f"[STATE-MIGRATE] traded 타입 {type(traded)} → dict로 마이그레이션(중복 진입 가드 유지)"
+        )
+        traded = {
+            code: {"buy_time": state_loaded_midnight, "qty": 0, "price": 0.0}
+            for code in traded
+        }
+    elif not isinstance(traded, dict):
+        logger.warning(
+            f"[STATE-FORMAT] traded 타입 {type(traded)} 지원 안 함 → 빈 dict로 재설정"
+        )
+        traded = {}
+
+    def _traded_codes(traded_state: Any) -> List[str]:
+        if isinstance(traded_state, dict):
+            return list(traded_state.keys())
+        return []
+
+    def _traded_today(traded_state: Any, today_prefix: str) -> set:
+        if not isinstance(traded_state, dict):
+            return set()
+
+        today_codes = set()
+        for code, payload in traded_state.items():
+            payload = payload or {}
+            buy_time = payload.get("buy_time")
+            status = payload.get("status")
+            # pending/other 상태는 재시도 허용, filled/기존(None)만 중복 방지
+            if status not in (None, "filled"):
+                continue
+            if isinstance(buy_time, str) and buy_time.startswith(today_prefix):
+                today_codes.add(code)
+        return today_codes
+
+    def _record_trade(traded_state: Any, code: str, payload: Dict[str, Any]) -> None:
+        try:
+            traded_state[code] = payload
+        except Exception:
+            logger.warning(f"[TRADED-STATE] traded에 코드 추가 실패: type={type(traded_state)}")
+
+    def _cleanup_expired_pending(traded_state: dict, now_dt: datetime, ttl_sec: int = 300) -> None:
+        if not isinstance(traded_state, dict):
+            return
+
+        for code, payload in list(traded_state.items()):
+            payload = payload or {}
+            if payload.get("status") != "pending":
+                continue
+
+            ts = payload.get("pending_since") or payload.get("buy_time")
+            if not isinstance(ts, str):
+                continue
+
+            try:
+                pending_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=now_dt.tzinfo)
+                if (now_dt - pending_dt).total_seconds() > ttl_sec:
+                    logger.warning(f"[PENDING-EXPIRE] {code}: {ttl_sec}s 초과 → pending 제거")
+                    traded_state.pop(code, None)
+            except Exception:
+                continue
+
+    def _pending_block(traded_state: dict, code: str, now_dt: datetime, block_sec: int = 45) -> bool:
+        if not isinstance(traded_state, dict):
+            return False
+        payload = traded_state.get(code) or {}
+        if payload.get("status") != "pending":
+            return False
+
+        ts = payload.get("pending_since") or payload.get("buy_time")
+        if not isinstance(ts, str):
+            return True
+
+        try:
+            pending_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=now_dt.tzinfo)
+            return (now_dt - pending_dt).total_seconds() <= block_sec
+        except Exception:
+            return True
+
+    def _is_balance_reflected(code: str, prev_qty: int = 0, delay_sec: float = 1.0) -> bool:
+        try:
+            time.sleep(delay_sec)
+            balances = _fetch_balances(kis, ttl_sec=0)
+        except Exception as e:
+            logger.warning(f"[BAL-REFRESH-FAIL] {code}: 잔고 확인 실패 {e}")
+            return False
+
+        for row in balances:
+            try:
+                if str(row.get("code")).zfill(6) != str(code).zfill(6):
+                    continue
+                qty_here = _to_int(row.get("qty") or 0)
+                sellable_here = _to_int((row.get("sell_psbl_qty") or row.get("ord_psbl_qty")) or 0)
+                baseline_qty = max(0, int(prev_qty))
+                if qty_here > baseline_qty or sellable_here > baseline_qty:
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    def _is_order_success(res: Any) -> bool:
+        if not isinstance(res, dict):
+            return False
+        rt_cd = str(res.get("rt_cd") or res.get("rtCode") or "").strip()
+        return rt_cd in ("0", "0000", "OK")
+
+    def _extract_fill_price(res: Any, fallback_price: float) -> float:
+        if isinstance(res, dict):
+            output = res.get("output") or {}
+            for payload in (output, res):
+                for key in (
+                    # 체결가/평균가 후보
+                    "ccld_prc",
+                    "ccld_unpr",
+                    "tot_ccld_unpr",
+                    "tot_ccld_prc",
+                    "avg_price",
+                    "avg_prvs",
+                    "fill_price",
+                    # 주문가(후순위)
+                    "prdt_price",
+                    "ord_unpr",
+                    "ord_prc",
+                    "order_price",
+                ):
+                    val = None
+                    if isinstance(payload, dict):
+                        val = payload.get(key)
+                    if val not in (None, ""):
+                        try:
+                            return float(val)
+                        except Exception:
+                            continue
+        return float(fallback_price)
+
+    logger.info(f"[상태복구] holding: {list(holding.keys())}, traded: {_traded_codes(traded)}")
+
+    pullback_buys_today = 0
+    pullback_buy_date = datetime.now(KST).date()
 
     # === [NEW] 주간 리밸런싱 강제/중복 방지 ===
     targets: List[Dict[str, Any]] = []
@@ -313,14 +459,6 @@ def main():
         f"{capital_active:,}",
     )
 
-    # 2) 👉 여기서 regime_state를 한 번만 만든다
-    regime_state = {
-        "mode": None,          # 로그에 찍는 mode 그대로
-        "stage": None,        # stage 그대로
-        "pct_change": None,     # 코스닥 당일 등락률(예: -0.28 같은 값)
-    }
-
-
     logger.info(
         "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
         mode,
@@ -360,6 +498,7 @@ def main():
         while True:
             # === 코스닥 레짐 업데이트 ===
             regime = _update_market_regime(kis)
+            regime_state = regime
             pct_txt = f"{regime.get('pct_change'):.2f}%" if regime.get("pct_change") is not None else "N/A"
             logger.info(f"[REGIME] mode={regime['mode']} stage={regime['bear_stage']} pct={pct_txt}")
 
@@ -367,6 +506,13 @@ def main():
             now_dt_kst = datetime.now(KST)
             is_open = kis.is_market_open()
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
+            today_prefix = now_dt_kst.strftime("%Y-%m-%d")
+            _cleanup_expired_pending(traded, now_dt_kst, ttl_sec=300)
+            traded_today = _traded_today(traded, today_prefix)
+
+            if now_dt_kst.date() != pullback_buy_date:
+                pullback_buy_date = now_dt_kst.date()
+                pullback_buys_today = 0
 
             if not is_open:
                 if not ALLOW_WHEN_CLOSED:
@@ -381,6 +527,7 @@ def main():
                 time.sleep(2)
 
             # 잔고 가져오기
+            prev_holding = holding if isinstance(holding, dict) else {}
             balances = _fetch_balances(kis)
             holding = {}
             for bal in balances:
@@ -400,8 +547,43 @@ def main():
             # 잔고 기준으로 보유종목 매도 가능 수량 맵 생성
             ord_psbl_map = {bal.get("code"): int(bal.get("sell_psbl_qty", 0)) for bal in balances}
 
+            if isinstance(traded, dict):
+                for code, payload in list(traded.items()):
+                    if (payload or {}).get("status") == "pending" and code in holding:
+                        traded[code]["status"] = "filled"
+
+            for code, info in list(holding.items()):
+                prev_qty = int((prev_holding.get(code) or {}).get("qty", info.get("qty", 0)))
+                balance_qty = int(info.get("qty", 0))
+                # 잔고가 일시적으로 줄어든 케이스만 보호하고, 정상적인 수량 증가는 유지한다.
+                if prev_qty > 0 and 0 < balance_qty < prev_qty:
+                    holding[code]["qty"] = prev_qty
+                    logger.info(
+                        f"[HOLDING-QTY-CLAMP] {code}: balance_qty={balance_qty} prev_qty={prev_qty} → {prev_qty}"
+                    )
+
+            recent_keep_minutes = 5
+            for code, info in prev_holding.items():
+                if code in holding:
+                    continue
+                buy_time_str = None
+                if isinstance(traded, dict):
+                    buy_time_str = (traded.get(code) or {}).get("buy_time")
+                if buy_time_str:
+                    try:
+                        buy_dt = datetime.strptime(buy_time_str, "%Y-%m-%d %H:%M:%S")
+                        buy_dt = buy_dt.replace(tzinfo=now_dt_kst.tzinfo)
+                        if now_dt_kst - buy_dt <= timedelta(minutes=recent_keep_minutes):
+                            holding[code] = info
+                            ord_psbl_map.setdefault(code, int(info.get("qty", 0)))
+                            logger.info(
+                                f"[HOLDING-MERGE] {code} 최근 매수({buy_time_str}) 반영 → 잔고 미반영 보호"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[HOLDING-MERGE-FAIL] {code}: {e}")
+
             logger.info(
-                f"[STATUS] holdings={holding} traded_today={list(traded.keys())} ord_psbl={ord_psbl_map}"
+                f"[STATUS] holdings={holding} traded_today={sorted(traded_today)} ord_psbl={ord_psbl_map}"
             )
 
             # 커트오프 타임 도달 시 강제매도 루틴
@@ -536,7 +718,7 @@ def main():
                 if not can_buy:
                     continue
 
-                if code in traded:
+                if code in traded_today:
                     continue
 
                 if code in holding:
@@ -558,8 +740,12 @@ def main():
                 )
 
                 # [중복 진입 방지] 이미 주문된 종목인지 확인
-                if code in traded:
+                if code in traded_today:
                     logger.info(f"[SKIP] {code}: 이미 금일 거래됨")
+                    continue
+
+                if _pending_block(traded, code, now_dt_kst, block_sec=45):
+                    logger.info(f"[SKIP-PENDING] {code}: pending 쿨다운 중 → 재주문 방지")
                     continue
 
                 # === GOOD/BAD 타점 평가 ===
@@ -621,18 +807,48 @@ def main():
                     f"[BUY-TRY] {code}: qty={qty} limit={limit_px} mo={mo_px} target={target_price} k={k_value}"
                 )
 
+                prev_qty = int((holding.get(code) or {}).get("qty", 0))
                 result = place_buy_with_fallback(kis, code, qty, limit_px or _round_to_tick(current_price))
-                traded[code] = {
-                    "buy_time": now_str,
-                    "qty": int(qty),
-                    "price": float(current_price),
-                }
+                if not _is_order_success(result):
+                    logger.warning(f"[BUY-FAIL] {code}: result={result}")
+                    continue
+
+                exec_price = _extract_fill_price(result, current_price)
+                _record_trade(
+                    traded,
+                    code,
+                    {
+                        "buy_time": now_str,
+                        "qty": int(qty),
+                        "price": float(exec_price),
+                        "status": "pending",
+                        "pending_since": now_str,
+                    },
+                )
+                save_state(holding, traded)
+                if not _is_balance_reflected(code, prev_qty=prev_qty):
+                    logger.warning(
+                        f"[BUY-PENDING] {code}: 잔고에 반영되지 않아 상태 기록 보류(result={result})"
+                    )
+                    continue
+                traded[code]["status"] = "filled"
+                _record_trade(
+                    traded,
+                    code,
+                    {
+                        "buy_time": now_str,
+                        "qty": int(qty),
+                        "price": float(exec_price),
+                        "status": "filled",
+                        "pending_since": None,
+                    },
+                )
 
                 _init_position_state(
                     kis,
                     holding,
                     code,
-                    float(current_price),
+                    float(exec_price),
                     int(qty),
                     k_value,
                     target_price,
@@ -641,122 +857,190 @@ def main():
                 log_trade(
                     {
                         **trade_ctx,
-                        "price": float(current_price),
-                        "amount": int(float(current_price) * int(qty)),
+                        "price": float(exec_price),
+                        "amount": int(float(exec_price) * int(qty)),
                         "result": result,
                     }
                 )
+                effective_cash = _get_effective_ord_cash(kis)
+                if effective_cash <= 0:
+                    can_buy = False
                 save_state(holding, traded)
                 time.sleep(RATE_SLEEP_SEC)
 
             # ====== 눌림목 전용 매수 (챔피언과 독립적으로 Top-N 시총 리스트 스캔) ======
             if USE_PULLBACK_ENTRY and is_open:
-                if pullback_watch:
-                    logger.info(f"[PULLBACK-SCAN] {len(pullback_watch)}종목 검사")
+                if not can_buy:
+                    logger.info("[PULLBACK-SKIP] can_buy=False → 신규 매수 스킵")
+                else:
+                    if pullback_watch:
+                        logger.info(f"[PULLBACK-SCAN] {len(pullback_watch)}종목 검사")
 
-                for code, info in list(pullback_watch.items()):
-                    if code in traded or code in holding:
-                        continue  # 챔피언 루프와 별도로만 처리
+                    for code, info in list(pullback_watch.items()):
+                        if pullback_buys_today >= PULLBACK_MAX_BUYS_PER_DAY:
+                            logger.info(
+                                f"[PULLBACK-LIMIT] 하루 최대 {PULLBACK_MAX_BUYS_PER_DAY}건 도달 → 스캔 중단"
+                            )
+                            break
 
-                    base_notional = int(info.get("notional") or 0)
-                    if base_notional <= 0:
-                        logger.info(f"[PULLBACK-SKIP] {code}: 예산 0")
-                        continue
+                        if code in traded_today or code in holding:
+                            continue  # 챔피언 루프와 별도로만 처리
 
-                    try:
-                        resp = _detect_pullback_reversal(
+                        if _pending_block(traded, code, now_dt_kst, block_sec=45):
+                            logger.info(f"[PULLBACK-SKIP-PENDING] {code}: pending 쿨다운 중")
+                            continue
+
+                        base_notional = int(info.get("notional") or 0)
+                        if base_notional <= 0:
+                            logger.info(f"[PULLBACK-SKIP] {code}: 예산 0")
+                            continue
+
+                        try:
+                            resp = _detect_pullback_reversal(
+                                kis,
+                                code,
+                                lookback=PULLBACK_LOOKBACK,
+                                pullback_days=PULLBACK_DAYS,
+                                reversal_buffer_pct=PULLBACK_REVERSAL_BUFFER_PCT,
+                            )
+
+                            pullback_ok = False
+                            trigger_price = None
+
+                            if isinstance(resp, dict):
+                                pullback_ok = bool(resp.get("setup")) and bool(
+                                    resp.get("reversing")
+                                )
+                                trigger_price = resp.get("reversal_price")
+                                if not pullback_ok:
+                                    reason = resp.get("reason")
+                                    if reason:
+                                        logger.info(
+                                            f"[PULLBACK-SKIP] {code}: 패턴 미충족(reason={reason})"
+                                        )
+                            elif isinstance(resp, tuple):
+                                if len(resp) >= 1:
+                                    pullback_ok = bool(resp[0])
+                                if len(resp) >= 2:
+                                    trigger_price = resp[1]
+                            else:
+                                pullback_ok = bool(resp)
+
+                        except Exception as e:
+                            logger.warning(f"[PULLBACK-FAIL] {code}: 스캔 실패 {e}")
+                            continue
+
+                        if not pullback_ok:
+                            continue
+
+                        if trigger_price is None:
+                            logger.info(f"[PULLBACK-SKIP] {code}: trigger_price None")
+                            continue
+
+                        qty = _notional_to_qty(kis, code, base_notional)
+                        if qty <= 0:
+                            logger.info(f"[PULLBACK-SKIP] {code}: 수량 산출 0")
+                            continue
+
+                        current_price = _safe_get_price(kis, code)
+                        if not current_price:
+                            logger.warning(f"[PULLBACK-PRICE] {code}: 현재가 조회 실패")
+                            continue
+
+                        if trigger_price and current_price < trigger_price * 0.98:
+                            logger.info(
+                                f"[PULLBACK-DELAY] {code}: 가격이 트리거 대비 2% 이상 하락 → 대기 (cur={current_price}, trigger={trigger_price})"
+                            )
+                            continue
+
+                        prev_qty = int((holding.get(code) or {}).get("qty", 0))
+                        result = place_buy_with_fallback(
                             kis,
                             code,
-                            lookback=PULLBACK_LOOKBACK,
-                            pullback_days=PULLBACK_DAYS,
-                            reversal_buffer_pct=PULLBACK_REVERSAL_BUFFER_PCT,
-                        )
-
-                        # 기본값
-                        pullback_ok = False
-                        trigger_price = None
-
-                        # 반환값이 tuple 이면 (ok, trigger, [ctx, ...]) 형태까지 모두 허용
-                        if isinstance(resp, tuple):
-                            if len(resp) >= 1:
-                               pullback_ok = bool(resp[0])
-                            if len(resp) >= 2:
-                                trigger_price = resp[1]
-                            # len(resp) >= 3 인 경우 ctx 등은 필요하면 여기서 더 받으면 됨
-                            # ctx = resp[2] if len(resp) >= 3 and isinstance(resp[2], dict) else None
-                        else:
-                            # bool 하나만 리턴하는 형태도 방어
-                            pullback_ok = bool(resp)
-
-                    except Exception as e:
-                        logger.warning(f"[PULLBACK-FAIL] {code}: 스캔 실패 {e}")
-                        continue
-
-                    if not pullback_ok:
-                        continue
-
-                    qty = _notional_to_qty(kis, code, base_notional)
-                    if qty <= 0:
-                        logger.info(f"[PULLBACK-SKIP] {code}: 수량 산출 0")
-                        continue
-
-                    current_price = _safe_get_price(kis, code)
-                    if not current_price:
-                        logger.warning(f"[PULLBACK-PRICE] {code}: 현재가 조회 실패")
-                        continue
-
-                    if trigger_price and current_price < trigger_price * 0.98:
-                        logger.info(
-                            f"[PULLBACK-DELAY] {code}: 가격이 트리거 대비 2% 이상 하락 → 대기 (cur={current_price}, trigger={trigger_price})"
-                        )
-                        continue
-
-                    result = place_buy_with_fallback(
-                        kis,
-                        code,
-                        int(qty),
-                        _round_to_tick(trigger_price or current_price),
-                    )
-
-                    try:
-                        _init_position_state(
-                            kis,
-                            holding,
-                            code,
-                            float(current_price),
                             int(qty),
-                            None,
-                            trigger_price,
+                            _round_to_tick(trigger_price or current_price),
                         )
-                    except Exception as e:
-                        logger.warning(f"[PULLBACK-INIT-FAIL] {code}: {e}")
 
-                    traded[code] = {
-                        "buy_time": now_str,
-                        "qty": int(qty),
-                        "price": float(current_price),
-                    }
-                    logger.info(
-                        f"[✅ 눌림목 매수] {code}, qty={qty}, price={current_price}, trigger={trigger_price}, result={result}"
-                    )
+                        if not _is_order_success(result):
+                            logger.warning(f"[PULLBACK-BUY-FAIL] {code}: result={result}")
+                            continue
 
-                    log_trade(
-                        {
-                            "datetime": now_str,
-                            "code": code,
-                            "name": info.get("name"),
+                        exec_price = _extract_fill_price(result, trigger_price or current_price)
+                        _record_trade(
+                            traded,
+                            code,
+                            {
+                                "buy_time": now_str,
+                                "qty": int(qty),
+                                "price": float(exec_price),
+                                "status": "pending",
+                                "pending_since": now_str,
+                            },
+                        )
+                        save_state(holding, traded)
+                        if not _is_balance_reflected(code, prev_qty=prev_qty):
+                            logger.warning(
+                                f"[PULLBACK-PENDING] {code}: 잔고에 반영되지 않아 상태 기록 보류(result={result})"
+                            )
+                            continue
+
+                        traded[code]["status"] = "filled"
+                        holding[code] = {
                             "qty": int(qty),
-                            "K": None,
-                            "target_price": trigger_price,
-                            "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
-                            "side": "BUY",
-                            "price": float(current_price),
-                            "amount": int(float(current_price) * int(qty)),
-                            "result": result,
+                            "buy_price": float(exec_price),
+                            "bear_s1_done": False,
+                            "bear_s2_done": False,
                         }
-                    )
-                    save_state(holding, traded)
-                    time.sleep(RATE_SLEEP_SEC)
+                        _record_trade(
+                            traded,
+                            code,
+                            {
+                                "buy_time": now_str,
+                                "qty": int(qty),
+                                "price": float(exec_price),
+                                "status": "filled",
+                                "pending_since": None,
+                            },
+                        )
+                        pullback_buys_today += 1
+
+                        try:
+                            _init_position_state(
+                                kis,
+                                holding,
+                                code,
+                                float(exec_price),
+                                int(qty),
+                                None,
+                                trigger_price,
+                            )
+                        except Exception as e:
+                            logger.warning(f"[PULLBACK-INIT-FAIL] {code}: {e}")
+
+                        logger.info(
+                            f"[✅ 눌림목 매수] {code}, qty={qty}, price={exec_price}, trigger={trigger_price}, result={result}"
+                        )
+
+                        log_trade(
+                            {
+                                "datetime": now_str,
+                                "code": code,
+                                "name": info.get("name"),
+                                "qty": int(qty),
+                                "K": None,
+                                "target_price": trigger_price,
+                                "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                "side": "BUY",
+                                "price": float(exec_price),
+                                "amount": int(float(exec_price) * int(qty)),
+                                "result": result,
+                            }
+                        )
+                        effective_cash = _get_effective_ord_cash(kis)
+                        if effective_cash <= 0:
+                            can_buy = False
+                        save_state(holding, traded)
+                        time.sleep(RATE_SLEEP_SEC)
 
             # ====== (A) 비타겟 보유분도 장중 능동관리 ======
             if is_open:
