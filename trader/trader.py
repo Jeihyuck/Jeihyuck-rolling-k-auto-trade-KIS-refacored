@@ -313,6 +313,14 @@ def main():
         f"{capital_active:,}",
     )
 
+    # 2) 👉 여기서 regime_state를 한 번만 만든다
+    regime_state = {
+        "mode": None,          # 로그에 찍는 mode 그대로
+        "stage": None,        # stage 그대로
+        "pct_change": None,     # 코스닥 당일 등락률(예: -0.28 같은 값)
+    }
+
+
     logger.info(
         "[REBALANCE] 레짐=%s pct=%.2f%%, 후보 %d개 중 상위 %d종목만 선택: %s",
         mode,
@@ -558,7 +566,7 @@ def main():
                 daily_ctx = _compute_daily_entry_context(kis, code, PULLBACK_LOOKBACK)
                 intra_ctx = _compute_intraday_entry_context(kis, code, fast=MOM_FAST, slow=MOM_SLOW)
 
-                if is_bad_entry(daily_ctx, intra_ctx):
+                if is_bad_entry(daily_ctx, intra_ctx, regime_state=None):
                     logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
                     continue
 
