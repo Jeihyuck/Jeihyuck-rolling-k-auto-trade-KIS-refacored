@@ -79,33 +79,47 @@ def _find_column(df: pd.DataFrame, keyword: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# 1) 시가총액 기준 KOSDAQ Top-N
+# 1) 시가총액 기준 Top-N (KOSDAQ/KOSPI)
 # -----------------------------
-def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
-    """시가총액 상위 n개 KOSDAQ 종목 반환 (Code, Name, Marcap)."""
+def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
+    """주어진 시장 리스트에 대한 종목명 DF 합친 후 Code 포맷을 정규화한다."""
+    frames: List[pd.DataFrame] = []
+    for m in markets:
+        try:
+            df = fdr.StockListing(m).rename(columns={"Symbol": "Code", "Name": "Name"})
+            df["Code"] = df["Code"].astype(str).str.zfill(6)
+            frames.append(df[["Code", "Name"]])
+        except Exception:
+            logger.exception("❌  StockListing(%s) 실패", m)
+    if not frames:
+        return pd.DataFrame(columns=["Code", "Name"])
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Code"], keep="first")
+    return merged
+
+def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.DataFrame:
+    """주어진 시장의 시가총액 상위 n개 종목 반환."""
     try:
         target_dt = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
         from_date = get_nearest_business_day_in_a_week(target_dt.strftime("%Y%m%d"))
-        logger.info(f"📅 pykrx 시총 조회일 → {from_date}")
+        logger.info(f"📅 pykrx 시총 조회일({market}) → {from_date}")
 
-        mktcap_df = get_market_cap_by_ticker(from_date, market="KOSDAQ")
+        mktcap_df = get_market_cap_by_ticker(from_date, market=market)
         if mktcap_df is None or len(mktcap_df) == 0:
-            logger.warning("⚠️  pykrx 시총 DF가 비었습니다 → 빈 DF 반환")
+            logger.warning("⚠️  pykrx 시총 DF(%s)가 비었습니다 → 빈 DF 반환", market)
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         mktcap_df = mktcap_df.reset_index()
         capcol = _find_column(mktcap_df, "시가총액")
         ticcol = _find_column(mktcap_df, "티커") or _find_column(mktcap_df, "코드")
         if capcol is None or ticcol is None:
-            logger.error("❌  시총/티커 컬럼 탐색 실패 → 빈 DF 반환")
+            logger.error("❌  %s 시총/티커 컬럼 탐색 실패 → 빈 DF 반환", market)
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
 
-        fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
-        fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
-
+        fdr_df = _get_listing_df([market])
         merged = pd.merge(
             fdr_df[["Code", "Name"]],
             mktcap_df[["Code", "Marcap"]],
@@ -118,19 +132,25 @@ def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataF
                     merged = merged.rename(columns={cand: "Marcap"})
                     break
         if "Marcap" not in merged.columns:
-            logger.error("❌  병합 후에도 'Marcap' 없음 → 빈 DF 반환")
+            logger.error("❌  병합 후에도 'Marcap' 없음(%s) → 빈 DF 반환", market)
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         topn = merged.dropna(subset=["Marcap"])
         # 6자리 숫자 코드만 사용 (우선주/ETN 등 특수코드, 0009K0 같은 것 제거)
         topn = topn[topn["Code"].astype(str).str.match(r"^\d{6}$")]
         topn = topn.sort_values("Marcap", ascending=False).head(n)
-        logger.info(f"✅  시총 Top{n} 추출 완료 → {len(topn)} 종목")
+        logger.info(f"✅  {market} 시총 Top{n} 추출 완료 → {len(topn)} 종목")
         return topn[["Code", "Name", "Marcap"]]
 
     except Exception:
-        logger.exception("❌  get_kosdaq_top_n 예외:")
+        logger.exception("❌  get_top_n_for_market(%s) 예외:", market)
         return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+
+def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
+    return _get_top_n_for_market(date_str, n, market="KOSDAQ")
+
+def get_kospi_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
+    return _get_top_n_for_market(date_str, n, market="KOSPI")
 
 # -----------------------------
 # ATR 계산(월 데이터 레코드에서)
@@ -266,8 +286,7 @@ def _parse_force_include_codes(env_codes: Iterable[str]) -> List[str]:
 def _inject_forced_codes(universe_df: pd.DataFrame, forced_codes: List[str]) -> pd.DataFrame:
     if not forced_codes:
         return universe_df
-    fdr_df = fdr.StockListing("KOSDAQ").rename(columns={"Symbol": "Code", "Name": "Name"})
-    fdr_df["Code"] = fdr_df["Code"].astype(str).str.zfill(6)
+    fdr_df = _get_listing_df(["KOSDAQ", "KOSPI"])
     force_df = fdr_df[fdr_df["Code"].isin(forced_codes)][["Code", "Name"]].copy()
     missing = [c for c in forced_codes if c not in set(force_df["Code"])]
     if missing:
@@ -284,16 +303,20 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict[str, Any]]:
     """
     리밸런싱 대상 리스트 작성:
     - code/name/best_k/weight(+qty=None) + prev_* + 목표가(close 포함)까지 채움
+    - KOSDAQ TopN + KOSPI TopN을 모두 포함
     """
     rebalance_date = datetime.strptime(rebalance_date_str, "%Y-%m-%d").date()
 
-    top_df = get_kosdaq_top_n(rebalance_date_str, n=TOP_N)
+    kosdaq_df = get_kosdaq_top_n(rebalance_date_str, n=TOP_N)
+    kospi_df = get_kospi_top_n(rebalance_date_str, n=TOP_N)
+    top_df = pd.concat([kosdaq_df, kospi_df], ignore_index=True)
+    top_df = top_df.drop_duplicates(subset=["Code"], keep="first")
     forced_codes = _parse_force_include_codes(ALWAYS_INCLUDE_CODES)
     if forced_codes:
         top_df = _inject_forced_codes(top_df, forced_codes)
 
     if top_df.empty:
-        logger.warning("[WARN] get_kosdaq_top_n 결과 없음 → 빈 리스트 반환")
+        logger.warning("[WARN] KOSDAQ/KOSPI TopN 결과 없음 → 빈 리스트 반환")
         return []
 
     results: Dict[str, Dict[str, Any]] = {}
