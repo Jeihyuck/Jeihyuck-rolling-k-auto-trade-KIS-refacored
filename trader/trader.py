@@ -566,7 +566,7 @@ def main():
                 daily_ctx = _compute_daily_entry_context(kis, code, PULLBACK_LOOKBACK)
                 intra_ctx = _compute_intraday_entry_context(kis, code, fast=MOM_FAST, slow=MOM_SLOW)
 
-                if is_bad_entry(daily_ctx, intra_ctx, regime_state=None):
+                if is_bad_entry(code, daily_ctx, intra_ctx, regime_state):
                     logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
                     continue
 
