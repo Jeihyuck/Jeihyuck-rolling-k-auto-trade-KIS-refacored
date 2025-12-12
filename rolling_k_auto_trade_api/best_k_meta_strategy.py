@@ -121,9 +121,13 @@ def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataF
             logger.error("❌  병합 후에도 'Marcap' 없음 → 빈 DF 반환")
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
-        topn = merged.dropna(subset=["Marcap"]).sort_values("Marcap", ascending=False).head(n)
+        topn = merged.dropna(subset=["Marcap"])
+        # 6자리 숫자 코드만 사용 (우선주/ETN 등 특수코드, 0009K0 같은 것 제거)
+        topn = topn[topn["Code"].astype(str).str.match(r"^\d{6}$")]
+        topn = topn.sort_values("Marcap", ascending=False).head(n)
         logger.info(f"✅  시총 Top{n} 추출 완료 → {len(topn)} 종목")
         return topn[["Code", "Name", "Marcap"]]
+
     except Exception:
         logger.exception("❌  get_kosdaq_top_n 예외:")
         return pd.DataFrame(columns=["Code", "Name", "Marcap"])
