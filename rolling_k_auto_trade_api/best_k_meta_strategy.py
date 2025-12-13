@@ -2,7 +2,7 @@
 # best_k_meta_strategy.py (실전 rolling_k, 최적화 전체본)
 """
 실전형 rolling_k 변동성돌파 + 월초/rolling/TopN/보유분/동적K/가중치 최적화 전략
-- KOSDAQ/KOSPI TopN(pykrx+fdr) 유니버스/시총 동적
+- KOSDAQ TopN(pykrx+fdr) 유니버스/시총 동적
 - 월/분기/연간 K-grid(고정/ATR동적)
 - 목표가: 전일 변동폭*K + 틱보정
 - best_k/Sharpe/승률/수익률/MDD/거래수 필터 + assign_weights
@@ -80,7 +80,7 @@ def _find_column(df: pd.DataFrame, keyword: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# 1) 시가총액 기준 Top-N (KOSDAQ/KOSPI)
+# 1) 시가총액 기준 Top-N (KOSDAQ only for rolling-k universe)
 # -----------------------------
 @lru_cache(maxsize=None)
 def _get_listing_df_cached(markets: tuple[str, ...]) -> pd.DataFrame:
@@ -293,7 +293,7 @@ def _parse_force_include_codes(env_codes: Iterable[str]) -> List[str]:
 def _inject_forced_codes(universe_df: pd.DataFrame, forced_codes: List[str]) -> pd.DataFrame:
     if not forced_codes:
         return universe_df
-    fdr_df = _get_listing_df(["KOSDAQ", "KOSPI"])
+    fdr_df = _get_listing_df(["KOSDAQ"])
     force_df = fdr_df[fdr_df["Code"].isin(forced_codes)][["Code", "Name"]].copy()
     missing = [c for c in forced_codes if c not in set(force_df["Code"])]
     if missing:
@@ -310,30 +310,22 @@ def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
     """
     리밸런싱 대상 리스트 작성:
     - code/name/best_k/weight(+qty=None) + prev_* + 목표가(close 포함)까지 채움
-    - KOSDAQ TopN + KOSPI TopN을 모두 포함
+    - KOSDAQ TopN만 포함 (KOSPI는 별도 코어 엔진에서 처리)
     """
     rebalance_date = datetime.strptime(rebalance_date_str, "%Y-%m-%d").date()
 
     kosdaq_df = get_kosdaq_top_n(rebalance_date_str, n=TOP_N)
-    kospi_df = get_kospi_top_n(rebalance_date_str, n=TOP_N)
-    logger.info(
-        "📈 유니버스 수집: KOSDAQ=%d, KOSPI=%d (Top%d/Top%d)",
-        len(kosdaq_df), len(kospi_df), TOP_N, TOP_N,
-    )
-    top_df = pd.concat([kosdaq_df, kospi_df], ignore_index=True)
-    top_df = top_df.drop_duplicates(subset=["Code"], keep="first")
+    logger.info("📈 유니버스 수집: KOSDAQ=%d (Top%d)", len(kosdaq_df), TOP_N)
+    top_df = kosdaq_df.copy()
     forced_codes = _parse_force_include_codes(ALWAYS_INCLUDE_CODES)
     if forced_codes:
         top_df = _inject_forced_codes(top_df, forced_codes)
 
     if top_df.empty:
-        logger.warning("[WARN] KOSDAQ/KOSPI TopN 결과 없음 → 빈 리스트 반환")
+        logger.warning("[WARN] KOSDAQ TopN 결과 없음 → 빈 리스트 반환")
         return []
 
-    logger.info(
-        "📊 시총 TopN 유니버스 수량: %d개 (고유)",
-        len(top_df),
-    )
+    logger.info("📊 KOSDAQ 시총 TopN 유니버스 수량: %d개 (고유)", len(top_df))
 
     results: Dict[str, Dict[str, Any]] = {}
 
