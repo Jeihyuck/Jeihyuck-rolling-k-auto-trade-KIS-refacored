@@ -30,3 +30,7 @@ trader/
 python -m trader.trader
 ```
 This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors. The KOSDAQ loop is blocking, so the entrypoint runs a single orchestrated cycle via `run_once()` rather than a repeating scheduler.
+
+## CI and live-trading safeguards
+- CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
+- The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.

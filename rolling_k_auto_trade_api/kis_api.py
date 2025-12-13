@@ -27,6 +27,25 @@ from urllib3.util.retry import Retry
 logger = logging.getLogger(__name__)
 
 # =============================
+# 실행 보호 플래그 (CI 등에서 실거래 방지)
+# =============================
+
+
+class LiveTradingDisabledError(RuntimeError):
+    """Raised when live KIS API calls are disabled via environment flag."""
+
+
+LIVE_TRADING_DISABLED = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _guard_live_trading(action: str) -> None:
+    if LIVE_TRADING_DISABLED:
+        logger.warning(
+            f"[KIS_DISABLED] {action} skipped because DISABLE_LIVE_TRADING is set"
+        )
+        raise LiveTradingDisabledError("DISABLE_LIVE_TRADING is enabled; KIS API calls are blocked.")
+
+# =============================
 # 설정 로딩 (settings 우선, 없으면 ENV)
 # =============================
 try:  # settings.py가 있으면 해당 값을 우선 사용
@@ -79,6 +98,7 @@ session.mount("http://", adapter)
 def get_price_quote(stock_code: str) -> Dict[str, Any]:
     """실시간/당일 시세 조회."""
 
+    _guard_live_trading("quote")
     code = str(stock_code).zfill(6)
     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
@@ -108,6 +128,7 @@ _TOKEN_FILE = os.getenv("KIS_TOKEN_CACHE", "kis_token_cache.json")
 
 
 def _issue_token() -> Dict[str, Any]:
+    _guard_live_trading("token")
     path = "/oauth2/tokenP" if KIS_ENV == "practice" else "/oauth2/token"
     url = f"{API_BASE_URL}{path}"
     hdr = {"content-type": "application/json"}
@@ -124,6 +145,7 @@ def _issue_token() -> Dict[str, Any]:
 
 
 def _get_token() -> str:
+    _guard_live_trading("token")
     now = time.time()
     if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"] - 300:
         return _TOKEN_CACHE["token"]
@@ -177,6 +199,7 @@ def _json_dumps(body: Dict[str, Any]) -> str:
 
 
 def _create_hashkey(body: Dict[str, Any]) -> str:
+    _guard_live_trading("hashkey")
     url = f"{API_BASE_URL}/uapi/hashkey"
     hdr = {"content-type": "application/json; charset=utf-8", "appkey": APP_KEY, "appsecret": APP_SECRET}
     body_str = _json_dumps(body)
@@ -198,6 +221,7 @@ def _create_hashkey(body: Dict[str, Any]) -> str:
 # =============================
 
 def _order_cash(body: Dict[str, Any], *, is_sell: bool) -> Dict[str, Any]:
+    _guard_live_trading("order")
     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
     tr_id = ("VTTC0011U" if KIS_ENV == "practice" else "TTTC0011U") if is_sell else ("VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U")
 
@@ -266,6 +290,7 @@ def send_order(code: str, qty: int, price: Optional[int] = None, side: str = "bu
     price: None이면 시장가 체인, 지정가면 지정가 고정(00)
     반환: KIS 응답(dict). 비정상 응답 시에도 원문/상태 일부 포함
     """
+    _guard_live_trading("order")
     code = str(code).strip()
     is_sell = (side.lower() == "sell")
 
@@ -313,6 +338,7 @@ def send_order(code: str, qty: int, price: Optional[int] = None, side: str = "bu
 # =============================
 
 def inquire_cash_balance() -> int:
+    _guard_live_trading("cash_balance")
     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
     tr_id = "VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R"
     hdr = _headers(tr_id)
@@ -348,6 +374,7 @@ def inquire_cash_balance() -> int:
 
 
 def inquire_balance(code: Optional[str] = None) -> List[Dict[str, Any]]:
+    _guard_live_trading("positions")
     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
     tr_id = "VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R"
     hdr = _headers(tr_id)
@@ -384,6 +411,7 @@ def inquire_filled_order(ord_no: str) -> Dict[str, Any]:
     주의: KIS의 체결 조회 API는 계좌/일자/주문번호 등 다양한 TR이 있으므로
     실제 배포 환경에 맞추어 상세 TR을 교체해야 합니다. 여기서는 요청/응답 로깅에 중점.
     """
+    _guard_live_trading("filled_order")
     # 데모용: 주문번호만 로깅/에코
     logger.info(f"[INQ_FILL] ord_no={ord_no}")
     return {"ord_no": ord_no, "status": "dummy", "note": "Fill inquiry TR 연결 필요"}

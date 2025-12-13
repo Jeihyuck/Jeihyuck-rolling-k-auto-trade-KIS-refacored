@@ -1,0 +1,27 @@
+name: CI (no live trading)
+
+on:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DISABLE_LIVE_TRADING: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Static compile check
+        run: |
+          python -m compileall portfolio strategy trader rolling_k_auto_trade_api
