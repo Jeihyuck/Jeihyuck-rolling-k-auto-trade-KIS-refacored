@@ -284,15 +284,30 @@ def _order_cash(body: Dict[str, Any], *, is_sell: bool) -> Dict[str, Any]:
     raise RuntimeError(f"ORDER_FAIL: {last_err}")
 
 
-def send_order(code: str, qty: int, price: Optional[int] = None, side: str = "buy") -> Dict[str, Any]:
+def send_order(
+    code: str,
+    qty: int,
+    price: Optional[int] = None,
+    side: str = "buy",
+    order_type: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     """공용 주문 API
     side: 'buy' or 'sell'
     price: None이면 시장가 체인, 지정가면 지정가 고정(00)
+    order_type: 과거 호출부 호환용(예: "market"); 인식 가능한 값은 price를 무시하고 시장가로 처리
     반환: KIS 응답(dict). 비정상 응답 시에도 원문/상태 일부 포함
     """
     _guard_live_trading("order")
     code = str(code).strip()
     is_sell = (side.lower() == "sell")
+
+    # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
+    ord_type_norm = str(order_type).lower() if order_type is not None else ""
+    if ord_type_norm in {"market", "mkt"}:
+        price = None
+    if kwargs:
+        logger.debug(f"[ORDER_KWARGS_IGNORED] extra_keys={list(kwargs.keys())}")
 
     if price is None:
         # 시장가 체인
