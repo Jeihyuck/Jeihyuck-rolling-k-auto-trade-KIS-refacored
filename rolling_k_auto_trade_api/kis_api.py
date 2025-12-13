@@ -72,6 +72,35 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # =============================
+# 시세 조회 (실시간/당일)
+# =============================
+
+
+def get_price_quote(stock_code: str) -> Dict[str, Any]:
+    """실시간/당일 시세 조회."""
+
+    code = str(stock_code).zfill(6)
+    url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+    tr_id = "FHKST01010100"
+
+    r = session.get(url, headers=_headers(tr_id), params=params, timeout=(3.0, 7.0))
+    try:
+        j = r.json()
+    except Exception:
+        logger.error(f"[QUOTE_RAW] status={r.status_code} text={r.text[:400]}")
+        raise
+
+    if r.status_code != 200:
+        logger.error(f"[QUOTE_FAIL] code={code} status={r.status_code} resp={j}")
+        raise RuntimeError(f"quote fail: {j}")
+
+    output = j.get("output") or {}
+    if not output:
+        logger.error(f"[QUOTE_EMPTY] code={code} resp={j}")
+    return output
+
+# =============================
 # 토큰 캐시
 # =============================
 _TOKEN_CACHE = {"token": None, "expires_at": 0.0, "last_issued": 0.0}
