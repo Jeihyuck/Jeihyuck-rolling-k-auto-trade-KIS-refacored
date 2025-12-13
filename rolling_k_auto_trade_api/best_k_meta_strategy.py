@@ -463,6 +463,13 @@ def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
     if selected and HELD_MIN_WEIGHT > 0:
         selected = _enforce_min_weight_for_forced(selected, forced_codes, min_weight=HELD_MIN_WEIGHT)
 
+    # 사후 정규화로 weight 합계를 1.0으로 유지
+    if selected:
+        total_weight = sum(float(it.get("weight") or 0) for it in selected)
+        if total_weight > 0:
+            for it in selected:
+                it["weight"] = float(it.get("weight") or 0) / total_weight
+
     return selected
 
 # -----------------------------

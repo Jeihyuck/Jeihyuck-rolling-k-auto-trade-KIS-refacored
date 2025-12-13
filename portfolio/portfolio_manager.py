@@ -46,7 +46,9 @@ class PortfolioManager:
             logger.exception("[PORTFOLIO] KOSDAQ engine failure: %s", e)
             kosdaq = {"status": "error", "message": str(e)}
         perf = self.performance.snapshot(
-            self.total_capital,
-            {"kospi_core": self.kospi_ratio, "kosdaq_alpha": self.kosdaq_ratio},
+            {
+                "kospi_core": self.kospi_engine.capital,
+                "kosdaq_alpha": self.kosdaq_engine.capital,
+            }
         )
         return {"kospi": kospi, "kosdaq": kosdaq, "performance": perf}

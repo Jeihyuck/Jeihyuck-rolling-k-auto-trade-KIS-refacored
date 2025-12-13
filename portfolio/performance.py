@@ -52,20 +52,45 @@ class PerformanceTracker:
             )
         return positions
 
-    def snapshot(self, total_capital: float, allocations: Dict[str, float]) -> Dict[str, Any]:
-        """Return a portfolio-wide PnL snapshot.
+    def snapshot(self, engine_capitals: Dict[str, float]) -> Dict[str, Any]:
+        """Return per-engine and portfolio PnL snapshots.
 
-        total_capital: configured base capital (used for pct math)
-        allocations: engine name -> capital ratio (for reporting only)
+        engine_capitals: engine name -> allocated capital (absolute, not ratio)
         """
 
         cash = float(inquire_cash_balance())
         positions = self._mark_positions()
         equity_value = sum(p.market_value for p in positions)
         unrealized = sum(p.unrealized_pnl for p in positions)
+        total_allocated = sum(engine_capitals.values())
         total_value = cash + equity_value
-        pnl = total_value - float(total_capital)
-        pnl_pct = (pnl / float(total_capital) * 100) if total_capital else 0.0
+        pnl = total_value - float(total_allocated)
+        pnl_pct = (pnl / float(total_allocated) * 100) if total_allocated else 0.0
+
+        engines: Dict[str, Dict[str, Any]] = {}
+        for name, cap in engine_capitals.items():
+            ratio = cap / total_allocated if total_allocated else 0.0
+            engine_cash = cash * ratio
+            engine_equity = equity_value * ratio
+            engine_value = engine_cash + engine_equity
+            engine_pnl = engine_value - cap
+            engine_pct = (engine_pnl / cap * 100) if cap else 0.0
+            engines[name] = {
+                "allocated_capital": cap,
+                "cash": engine_cash,
+                "equity_value": engine_equity,
+                "total_value": engine_value,
+                "pnl": engine_pnl,
+                "pnl_pct": engine_pct,
+            }
+            logger.info(
+                "[%s][PERF] alloc=%.0f value=%.0f pnl=%.0f (%.2f%%)",
+                name.upper(),
+                cap,
+                engine_value,
+                engine_pnl,
+                engine_pct,
+            )
 
         logger.info(
             "[PORTFOLIO][PERF] total=%.0f cash=%.0f equity=%.0f pnl=%.0f (%.2f%%)",
@@ -77,12 +102,14 @@ class PerformanceTracker:
         )
 
         return {
-            "cash": cash,
-            "equity_value": equity_value,
-            "total_value": total_value,
-            "unrealized": unrealized,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
+            "portfolio": {
+                "cash": cash,
+                "equity_value": equity_value,
+                "total_value": total_value,
+                "unrealized": unrealized,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+            },
+            "engines": engines,
             "positions": [p.__dict__ for p in positions],
-            "allocations": allocations,
         }
