@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     mgr = PortfolioManager()
-    result = mgr.run_cycle()
+    result = mgr.run_once()
     logger.info("[TRADER] cycle complete %s", result)
 
 

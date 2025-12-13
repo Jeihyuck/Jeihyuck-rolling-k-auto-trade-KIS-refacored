@@ -65,6 +65,7 @@ def execute_rebalance(
         delta_snapshot,
     )
 
+    orders: List[Dict[str, float]] = []
     for code in sorted(all_codes):
         current = positions.get(code, {})
         current_qty = int(current.get("qty") or 0)
@@ -90,31 +91,56 @@ def execute_rebalance(
             continue
         side = "buy" if delta_qty > 0 else "sell"
         qty = abs(delta_qty)
-        if side == "buy":
-            if not allow_buys:
-                logger.info("%s skip buy %s (buys disabled)", tag, code)
-                continue
-            if not _buy_window_open():
-                logger.info("%s skip buy %s (pre-open window)", tag, code)
-                continue
-            if mkt_price <= 0:
-                logger.info("%s skip buy %s (no price)", tag, code)
-                continue
-            affordable = int(available_cash // mkt_price)
-            if affordable <= 0:
-                logger.info("%s skip buy %s (insufficient cash)", tag, code)
-                continue
-            qty = min(qty, affordable)
+        orders.append(
+            {
+                "code": code,
+                "side": side,
+                "qty": qty,
+                "mkt_price": mkt_price,
+                "allow_weight": weight,
+            }
+        )
+
+    # Execute sells first to release cash before any new buys.
+    for order in [o for o in orders if o["side"] == "sell"]:
+        code, qty, mkt_price = order["code"], order["qty"], order["mkt_price"]
         try:
-            res = send_order(code, qty=qty, price=None, side=side, order_type="market")
-            fills.append({"code": code, "side": side, "qty": qty, "resp": str(res)})
-            if side == "buy":
-                buys += 1
-            else:
-                sells += 1
-            logger.info("%s %s %s qty=%s price=%s", tag, side.upper(), code, qty, mkt_price)
-            if side == "buy":
-                available_cash = max(0.0, available_cash - qty * mkt_price)
+            res = send_order(code, qty=qty, price=None, side="sell", order_type="market")
+            fills.append({"code": code, "side": "sell", "qty": qty, "resp": str(res)})
+            sells += 1
+            logger.info("%s SELL %s qty=%s price=%s", tag, code, qty, mkt_price)
+            if mkt_price > 0:
+                available_cash += qty * mkt_price
+        except Exception:
+            logger.exception("%s order fail %s qty=%s", tag, code, qty)
+
+    for order in [o for o in orders if o["side"] == "buy"]:
+        code, qty, mkt_price, weight = (
+            order["code"],
+            order["qty"],
+            order["mkt_price"],
+            order["allow_weight"],
+        )
+        if not allow_buys:
+            logger.info("%s skip buy %s (buys disabled)", tag, code)
+            continue
+        if not _buy_window_open():
+            logger.info("%s skip buy %s (pre-open window)", tag, code)
+            continue
+        if mkt_price <= 0:
+            logger.info("%s skip buy %s (no price)", tag, code)
+            continue
+        affordable = int(available_cash // mkt_price)
+        if affordable <= 0:
+            logger.info("%s skip buy %s (insufficient cash)", tag, code)
+            continue
+        qty = min(qty, affordable)
+        try:
+            res = send_order(code, qty=qty, price=None, side="buy", order_type="market")
+            fills.append({"code": code, "side": "buy", "qty": qty, "resp": str(res)})
+            buys += 1
+            logger.info("%s BUY %s qty=%s price=%s", tag, code, qty, mkt_price)
+            available_cash = max(0.0, available_cash - qty * mkt_price)
         except Exception:
             logger.exception("%s order fail %s qty=%s", tag, code, qty)
     invested = sum(float(t.get("target_value") or 0) for t in targets)

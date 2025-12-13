@@ -29,4 +29,4 @@ trader/
 ```
 python -m trader.trader
 ```
-This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors.
+This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors. The KOSDAQ loop is blocking, so the entrypoint runs a single orchestrated cycle via `run_once()` rather than a repeating scheduler.

@@ -79,8 +79,8 @@ class PerformanceTracker:
             self._peak_value = total_value
         drawdown_pct = 0.0
         if self._peak_value:
-            drawdown_pct = (total_value / self._peak_value - 1.0) * 100
-            self._max_drawdown_pct = min(self._max_drawdown_pct, drawdown_pct)
+            drawdown_pct = max((self._peak_value - total_value) / self._peak_value * 100, 0.0)
+            self._max_drawdown_pct = max(self._max_drawdown_pct, drawdown_pct)
 
         engines: Dict[str, Dict[str, Any]] = {}
         for name, cap in engine_capitals.items():

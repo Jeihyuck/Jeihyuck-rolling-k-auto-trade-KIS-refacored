@@ -34,7 +34,7 @@ class PortfolioManager:
             self.kosdaq_ratio * 100,
         )
 
-    def run_cycle(self) -> Dict[str, Any]:
+    def run_once(self) -> Dict[str, Any]:
         try:
             kospi = self.kospi_engine.rebalance_if_needed()
         except Exception as e:
