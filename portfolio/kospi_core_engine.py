@@ -17,7 +17,18 @@ class KospiCoreEngine(BaseEngine):
         super().__init__("kospi_core", capital)
         self.top_n = top_n
         self.rebalance_days = rebalance_days
-        self._last_rebalance: datetime | None = None
+        self._last_rebalance: datetime | None = self._load_last_rebalance()
+
+    def _load_last_rebalance(self) -> datetime | None:
+        _, _, meta = state_manager.load_state(self.name, include_meta=True)
+        ts = meta.get("last_rebalance") if isinstance(meta, dict) else None
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts)
+        except Exception:
+            logger.warning("[KOSPI_CORE] invalid last_rebalance in state: %s", ts)
+            return None
 
     def _should_rebalance(self) -> bool:
         if self._last_rebalance is None:
@@ -38,8 +49,13 @@ class KospiCoreEngine(BaseEngine):
 
         fills = execute_rebalance(targets, self.capital, self.tag, allow_buys=allow_buys)
         self._last_rebalance = datetime.now()
-        holding, traded = state_manager.load_state(self.name)
-        state_manager.save_state(self.name, holding, traded)
+        holding, traded, _ = state_manager.load_state(self.name, include_meta=True)
+        state_manager.save_state(
+            self.name,
+            holding,
+            traded,
+            meta={"last_rebalance": self._last_rebalance.isoformat()},
+        )
         self._log(f"[KOSPI_CORE][PORTFOLIO] targets={len(targets)} fills={len(fills)}")
         return {"targets": targets, "fills": fills, "regime": regime}
 

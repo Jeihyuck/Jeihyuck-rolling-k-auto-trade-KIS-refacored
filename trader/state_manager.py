@@ -21,24 +21,41 @@ def _engine_state_file(engine_name: str) -> Path:
     return _ENGINE_STATE_DIR / f"{name or 'engine'}.json"
 
 
-def load_state(engine_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def load_state(
+    engine_name: str, *, include_meta: bool = False
+) -> Tuple[Dict[str, Any], Dict[str, Any]] | Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     state_path = _engine_state_file(engine_name)
     if state_path.exists():
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            return state.get("holding", {}) or {}, state.get("traded", {}) or {}
+            holding = state.get("holding", {}) or {}
+            traded = state.get("traded", {}) or {}
+            meta = state.get("meta", {}) or {}
+            if include_meta:
+                return holding, traded, meta
+            return holding, traded
         except Exception:
             logger.exception("[STATE][%s] load failed", engine_name)
+    if include_meta:
+        return {}, {}, {}
     return {}, {}
 
 
-def save_state(engine_name: str, holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
+def save_state(
+    engine_name: str,
+    holding: Dict[str, Any],
+    traded: Dict[str, Any],
+    meta: Dict[str, Any] | None = None,
+) -> None:
     state_path = _engine_state_file(engine_name)
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"holding": holding, "traded": traded}
+        if meta:
+            payload["meta"] = meta
         with open(state_path, "w", encoding="utf-8") as f:
-            json.dump({"holding": holding, "traded": traded}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         logger.exception("[STATE][%s] save failed", engine_name)
 
