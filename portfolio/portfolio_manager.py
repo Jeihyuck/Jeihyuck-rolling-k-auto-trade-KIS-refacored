@@ -6,6 +6,7 @@ from typing import Any, Dict
 from trader.config import DAILY_CAPITAL
 from .kospi_core_engine import KospiCoreEngine
 from .kosdaq_alpha_engine import KosdaqAlphaEngine
+from .performance import PerformanceTracker
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class PortfolioManager:
         self.kosdaq_ratio = kosdaq_ratio / norm
         self.kospi_engine = KospiCoreEngine(capital=self.total_capital * self.kospi_ratio)
         self.kosdaq_engine = KosdaqAlphaEngine(capital=self.total_capital * self.kosdaq_ratio)
+        self.performance = PerformanceTracker()
         logger.info(
             "[PORTFOLIO] capital=%s kospi=%.0f%% kosdaq=%.0f%%",
             int(self.total_capital),
@@ -43,4 +45,8 @@ class PortfolioManager:
         except Exception as e:
             logger.exception("[PORTFOLIO] KOSDAQ engine failure: %s", e)
             kosdaq = {"status": "error", "message": str(e)}
-        return {"kospi": kospi, "kosdaq": kosdaq}
+        perf = self.performance.snapshot(
+            self.total_capital,
+            {"kospi_core": self.kospi_ratio, "kosdaq_alpha": self.kosdaq_ratio},
+        )
+        return {"kospi": kospi, "kosdaq": kosdaq, "performance": perf}

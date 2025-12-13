@@ -22,6 +22,7 @@ trader/
 - **KOSPI core engine**: KOSPI market-cap Top-N universe, equal-weight targets, periodic rebalance with market orders and KIS quotes.
 - **KOSDAQ alpha engine**: delegates to the legacy rolling-K/VWAP/pullback loop unchanged, using its original state file for backward compatibility.
 - **Capital split**: `PortfolioManager` divides `DAILY_CAPITAL` (or supplied total) into KOSPI and KOSDAQ ratios (default 60/40) and runs each engine independently.
+- **Performance**: portfolio-level PnL snapshots combine KIS cash/positions with engine allocation ratios for unified reporting without coupling the two engines.
 
 ## How to run
 ```

@@ -5,7 +5,12 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List
 
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
-from rolling_k_auto_trade_api.kis_api import inquire_balance, send_order, get_price_quote
+from rolling_k_auto_trade_api.kis_api import (
+    inquire_balance,
+    inquire_cash_balance,
+    send_order,
+    get_price_quote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,7 @@ def execute_rebalance(
     target_map = {str(t.get("code") or "").zfill(6): t for t in targets}
     all_codes = set(positions.keys()) | set(target_map.keys())
     buys = sells = 0
+    available_cash = min(float(cash), float(inquire_cash_balance() or 0))
 
     for code in sorted(all_codes):
         current = positions.get(code, {})
@@ -72,6 +78,14 @@ def execute_rebalance(
             if not _buy_window_open():
                 logger.info("%s skip buy %s (pre-open window)", tag, code)
                 continue
+            if mkt_price <= 0:
+                logger.info("%s skip buy %s (no price)", tag, code)
+                continue
+            affordable = int(available_cash // mkt_price)
+            if affordable <= 0:
+                logger.info("%s skip buy %s (insufficient cash)", tag, code)
+                continue
+            qty = min(qty, affordable)
         try:
             res = send_order(code, qty=qty, price=None, side=side, order_type="market")
             fills.append({"code": code, "side": side, "qty": qty, "resp": str(res)})
@@ -80,10 +94,12 @@ def execute_rebalance(
             else:
                 sells += 1
             logger.info("%s %s %s qty=%s price=%s", tag, side.upper(), code, qty, mkt_price)
+            if side == "buy":
+                available_cash = max(0.0, available_cash - qty * mkt_price)
         except Exception:
             logger.exception("%s order fail %s qty=%s", tag, code, qty)
     invested = sum(float(t.get("target_value") or 0) for t in targets)
-    cash_left = max(float(cash) - invested, 0.0)
+    cash_left = max(float(available_cash), 0.0)
     logger.info("%s[KOSPI_CORE][REBALANCE] BUY=%s SELL=%s", tag + " " if tag else "", buys, sells)
     logger.info("%s[KOSPI_CORE][PORTFOLIO] invested=%.0f cash=%.0f", tag + " " if tag else "", invested, cash_left)
     return fills
