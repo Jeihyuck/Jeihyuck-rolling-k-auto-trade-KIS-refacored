@@ -101,7 +101,8 @@ def _get_listing_df_cached(markets: tuple[str, ...]) -> pd.DataFrame:
 
 def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
     """주어진 시장 리스트에 대한 종목명 DF 합친 후 Code 포맷을 정규화한다."""
-    return _get_listing_df_cached(tuple(markets))
+    normalized_markets = tuple(dict.fromkeys(markets))
+    return _get_listing_df_cached(normalized_markets).copy()
 
 def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.DataFrame:
     """주어진 시장의 시가총액 상위 n개 종목 반환."""
@@ -468,7 +469,7 @@ def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
 
     # 보유분 최소 비중 하한 보정 (합계 1 유지)
     if selected and HELD_MIN_WEIGHT > 0:
-        selected = _enforce_min_weight_for_forced(selected, [], min_weight=HELD_MIN_WEIGHT)
+        selected = _enforce_min_weight_for_forced(selected, forced_codes, min_weight=HELD_MIN_WEIGHT)
 
     return selected
 

@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from FinanceDataReader import StockListing, DataReader
 
-from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_krx_topn
 from rolling_k_auto_trade_api.logging_config import configure_logging
 
 configure_logging()
@@ -70,7 +70,7 @@ async def run_rebalance(date: str):
     logger.info(f"[RUN] run_rebalance 호출: date={date}")
 
     try:
-        raw_results = get_best_k_for_kosdaq_50(date)
+        raw_results = get_best_k_for_krx_topn(date)
     except Exception as e:
         logger.exception(f"[ERROR] Best K 계산 실패: {e}")
         raise HTTPException(status_code=500, detail="Best K 계산 실패")
