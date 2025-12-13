@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List
 
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 from rolling_k_auto_trade_api.kis_api import inquire_balance, send_order, get_price_quote
 
 logger = logging.getLogger(__name__)
+
+KST = timezone(timedelta(hours=9))
 
 
 def _current_positions() -> Dict[str, Dict[str, float]]:
@@ -19,36 +22,68 @@ def _current_positions() -> Dict[str, Dict[str, float]]:
     return pos
 
 
-def execute_rebalance(targets: List[Dict[str, float]], cash: float, tag: str) -> List[Dict[str, str]]:
+def _buy_window_open() -> bool:
+    now = datetime.now(tz=KST).time()
+    return now >= time(9, 30)
+
+
+def execute_rebalance(
+    targets: List[Dict[str, float]],
+    cash: float,
+    tag: str,
+    *,
+    allow_buys: bool = True,
+) -> List[Dict[str, str]]:
     fills: List[Dict[str, str]] = []
     positions = _current_positions()
-    for target in targets:
-        code = str(target.get("code") or "").zfill(6)
-        weight = float(target.get("weight") or 0)
-        last_price = float(target.get("last_price") or 0)
-        if not code or last_price <= 0 or weight <= 0:
-            logger.warning("%s skip target %s", tag, target)
-            continue
-        target_value = float(target.get("target_value") or 0)
+    target_map = {str(t.get("code") or "").zfill(6): t for t in targets}
+    all_codes = set(positions.keys()) | set(target_map.keys())
+    buys = sells = 0
+
+    for code in sorted(all_codes):
         current = positions.get(code, {})
         current_qty = int(current.get("qty") or 0)
+        target = target_map.get(code)
+        target_qty = int(target.get("target_qty") or 0) if target else 0
+        weight = float(target.get("weight") or 0) if target else 0.0
+        if not target:
+            weight = 0.0
         try:
             quote = get_price_quote(code)
-            mkt_price = float(quote.get("askp1") or quote.get("stck_prpr") or last_price)
+            mkt_price = float(quote.get("askp1") or quote.get("stck_prpr") or target.get("last_price") if target else 0)
         except Exception:
             logger.exception("%s quote fail for %s", tag, code)
-            mkt_price = last_price
-        mkt_price = adjust_price_to_tick(mkt_price)
-        target_qty = int(target_value // mkt_price) if mkt_price > 0 else 0
-        delta_qty = target_qty - current_qty
+            mkt_price = float(target.get("last_price") or 0 if target else 0)
+        mkt_price = adjust_price_to_tick(mkt_price) if mkt_price else 0.0
+
+        if weight <= 0 or target_qty <= 0:
+            delta_qty = -current_qty
+        else:
+            delta_qty = target_qty - current_qty
+
         if delta_qty == 0:
             continue
         side = "buy" if delta_qty > 0 else "sell"
         qty = abs(delta_qty)
+        if side == "buy":
+            if not allow_buys:
+                logger.info("%s skip buy %s (buys disabled)", tag, code)
+                continue
+            if not _buy_window_open():
+                logger.info("%s skip buy %s (pre-open window)", tag, code)
+                continue
         try:
             res = send_order(code, qty=qty, price=None, side=side, order_type="market")
             fills.append({"code": code, "side": side, "qty": qty, "resp": str(res)})
+            if side == "buy":
+                buys += 1
+            else:
+                sells += 1
             logger.info("%s %s %s qty=%s price=%s", tag, side.upper(), code, qty, mkt_price)
         except Exception:
             logger.exception("%s order fail %s qty=%s", tag, code, qty)
+    invested = sum(float(t.get("target_value") or 0) for t in targets)
+    cash_left = max(float(cash) - invested, 0.0)
+    logger.info("%s[KOSPI_CORE][REBALANCE] BUY=%s SELL=%s", tag + " " if tag else "", buys, sells)
+    logger.info("%s[KOSPI_CORE][PORTFOLIO] invested=%.0f cash=%.0f", tag + " " if tag else "", invested, cash_left)
     return fills
