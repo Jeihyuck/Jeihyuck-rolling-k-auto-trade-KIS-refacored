@@ -52,7 +52,8 @@ if TYPE_CHECKING:
     )
 
 
-def main():
+def main(capital_override: float | None = None):
+    effective_capital = int(capital_override) if capital_override is not None else DAILY_CAPITAL
     kis = KisAPI()
 
     rebalance_date = get_rebalance_anchor_date()
@@ -61,7 +62,7 @@ def main():
         f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
         f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}"
     )
-    logger.info(f"[💰 DAILY_CAPITAL] {DAILY_CAPITAL:,}원")
+    logger.info(f"[💰 CAPITAL] {effective_capital:,}원 (configured DAILY_CAPITAL={DAILY_CAPITAL:,})")
     logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
 
     # 상태 복구
@@ -235,11 +236,10 @@ def main():
     else:
         can_buy = True
     logger.info(
-        f"[BUDGET] today effective cash = {effective_cash:,} KRW "
-        f"(env DAILY_CAPITAL={DAILY_CAPITAL:,})"
+        f"[BUDGET] today effective cash = {effective_cash:,} KRW (capital base={effective_capital:,})"
     )
 
-    # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 DAILY_CAPITAL로 수량 계산
+    # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 배정 자본으로 수량 계산
     processed_targets: Dict[str, Any] = {}
     for t in targets:
         code = t.get("stock_code") or t.get("code")
@@ -261,7 +261,7 @@ def main():
         if qty <= 0 and weight is not None:
             ref_px = _to_float(t.get("close")) or _to_float(t.get("prev_close"))
             try:
-                qty = _weight_to_qty(kis, code, float(weight), DAILY_CAPITAL, ref_price=ref_px)
+                qty = _weight_to_qty(kis, code, float(weight), effective_capital, ref_price=ref_px)
             except Exception as e:
                 logger.warning("[REBALANCE] weight→qty 변환 실패 %s: %s", code, e)
                 qty = 0
@@ -398,8 +398,8 @@ def main():
 
     cap_scale = REGIME_CAP_TABLE.get(regime.get("key"), 0.8)
     ord_cash = _get_effective_ord_cash(kis)
-    capital_base = min(ord_cash, int(CAP_CAP * DAILY_CAPITAL))
-    capital_active = int(min(capital_base * cap_scale, DAILY_CAPITAL))
+    capital_base = min(ord_cash, int(CAP_CAP * effective_capital))
+    capital_active = int(min(capital_base * cap_scale, effective_capital))
     logger.info(
         f"[REGIME-CAP] mode={mode} stage={stage} R20={R20 if R20 is not None else 'N/A'} "
         f"D1={D1 if D1 is not None else 'N/A'} "
