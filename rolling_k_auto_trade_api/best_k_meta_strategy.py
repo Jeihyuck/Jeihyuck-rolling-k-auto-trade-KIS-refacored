@@ -2,7 +2,7 @@
 # best_k_meta_strategy.py (실전 rolling_k, 최적화 전체본)
 """
 실전형 rolling_k 변동성돌파 + 월초/rolling/TopN/보유분/동적K/가중치 최적화 전략
-- KOSDAQ TopN(pykrx+fdr) 유니버스/시총 동적
+- KOSDAQ/KOSPI TopN(pykrx+fdr) 유니버스/시총 동적
 - 월/분기/연간 K-grid(고정/ATR동적)
 - 목표가: 전일 변동폭*K + 틱보정
 - best_k/Sharpe/승률/수익률/MDD/거래수 필터 + assign_weights
@@ -16,7 +16,8 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta, date
-from typing import Any, Dict, List, Optional, Iterable
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -81,8 +82,8 @@ def _find_column(df: pd.DataFrame, keyword: str) -> Optional[str]:
 # -----------------------------
 # 1) 시가총액 기준 Top-N (KOSDAQ/KOSPI)
 # -----------------------------
-def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
-    """주어진 시장 리스트에 대한 종목명 DF 합친 후 Code 포맷을 정규화한다."""
+@lru_cache(maxsize=None)
+def _get_listing_df_cached(markets: tuple[str, ...]) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     for m in markets:
         try:
@@ -96,6 +97,11 @@ def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
     merged = pd.concat(frames, ignore_index=True)
     merged = merged.drop_duplicates(subset=["Code"], keep="first")
     return merged
+
+
+def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
+    """주어진 시장 리스트에 대한 종목명 DF 합친 후 Code 포맷을 정규화한다."""
+    return _get_listing_df_cached(tuple(markets))
 
 def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.DataFrame:
     """주어진 시장의 시가총액 상위 n개 종목 반환."""
@@ -299,7 +305,7 @@ def _inject_forced_codes(universe_df: pd.DataFrame, forced_codes: List[str]) -> 
     uni = uni.drop_duplicates(subset=["Code"], keep="first")
     return uni
 
-def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict[str, Any]]:
+def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
     """
     리밸런싱 대상 리스트 작성:
     - code/name/best_k/weight(+qty=None) + prev_* + 목표가(close 포함)까지 채움
@@ -309,6 +315,10 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict[str, Any]]:
 
     kosdaq_df = get_kosdaq_top_n(rebalance_date_str, n=TOP_N)
     kospi_df = get_kospi_top_n(rebalance_date_str, n=TOP_N)
+    logger.info(
+        "📈 유니버스 수집: KOSDAQ=%d, KOSPI=%d (Top%d/Top%d)",
+        len(kosdaq_df), len(kospi_df), TOP_N, TOP_N,
+    )
     top_df = pd.concat([kosdaq_df, kospi_df], ignore_index=True)
     top_df = top_df.drop_duplicates(subset=["Code"], keep="first")
     forced_codes = _parse_force_include_codes(ALWAYS_INCLUDE_CODES)
@@ -318,6 +328,11 @@ def get_best_k_for_kosdaq_50(rebalance_date_str: str) -> List[Dict[str, Any]]:
     if top_df.empty:
         logger.warning("[WARN] KOSDAQ/KOSPI TopN 결과 없음 → 빈 리스트 반환")
         return []
+
+    logger.info(
+        "📊 시총 TopN 유니버스 수량: %d개 (고유)",
+        len(top_df),
+    )
 
     results: Dict[str, Dict[str, Any]] = {}
 
@@ -472,7 +487,7 @@ def run_rebalance(date: str, force_order: bool = False) -> Dict[str, Any]:
         }
     """
     try:
-        selected = get_best_k_for_kosdaq_50(date)
+        selected = get_best_k_for_krx_topn(date)
         # force_order가 True라고 해서 여기서 실주문을 내지 않음.
         # (주문은 trader.py가 관리) — 필요 시 'strategy'에 플래그만 남김.
         for it in selected:
