@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict
 
 from trader import state_manager
 from .base_engine import BaseEngine
-from strategy.kospi.rebalance import build_target_allocations, evaluate_regime
+from strategy.kospi.rebalance import INDEX_CODE, build_target_allocations, evaluate_regime
 from strategy.kospi.signals import execute_rebalance
 
 logger = logging.getLogger(__name__)
+KST = timezone(timedelta(hours=9))
+INTRADAY_DROP_LIMIT = -2.0
 
 
 class KospiCoreEngine(BaseEngine):
@@ -35,11 +37,50 @@ class KospiCoreEngine(BaseEngine):
             return True
         return datetime.now() - self._last_rebalance >= timedelta(days=self.rebalance_days)
 
+    def _current_index_change_pct(self) -> float | None:
+        try:
+            from rolling_k_auto_trade_api.kis_api import get_price_quote
+
+            quote = get_price_quote(INDEX_CODE)
+            current = float(quote.get("stck_prpr") or quote.get("prpr") or 0)
+            prev_close = float(quote.get("prdy_clpr") or 0)
+            if current and prev_close:
+                return (current / prev_close - 1) * 100
+        except Exception:
+            logger.exception("[KOSPI_CORE] failed to fetch live index quote")
+        return None
+
+    def _buys_permitted(self, regime: Dict[str, Any]) -> bool:
+        if not regime.get("regime_on"):
+            self._log("[KOSPI_CORE][BUYS] blocked (regime OFF)")
+            return False
+
+        now = datetime.now(tz=KST).time()
+        if now < time(9, 30):
+            self._log("[KOSPI_CORE][BUYS] blocked (pre-open window)")
+            return False
+
+        daily_change = float(regime.get("daily_change_pct") or 0)
+        if daily_change <= INTRADAY_DROP_LIMIT:
+            self._log(
+                f"[KOSPI_CORE][BUYS] blocked (prev change {daily_change:.2f}% <= {INTRADAY_DROP_LIMIT}%)"
+            )
+            return False
+
+        live_change = self._current_index_change_pct()
+        if live_change is not None and live_change <= INTRADAY_DROP_LIMIT:
+            self._log(
+                f"[KOSPI_CORE][BUYS] blocked (live change {live_change:.2f}% <= {INTRADAY_DROP_LIMIT}%)"
+            )
+            return False
+
+        return True
+
     def rebalance_if_needed(self) -> Dict[str, Any]:
         if not self._should_rebalance():
             return {"status": "skip"}
         regime = evaluate_regime()
-        allow_buys = bool(regime.get("regime_on")) and float(regime.get("daily_change_pct", 0)) > -2.0
+        allow_buys = self._buys_permitted(regime)
         if not regime.get("regime_on"):
             targets: list[dict[str, float]] = []
             self._log("[KOSPI_CORE][REGIME] OFF → liquidate positions")

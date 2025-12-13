@@ -306,7 +306,7 @@ def _inject_forced_codes(universe_df: pd.DataFrame, forced_codes: List[str]) -> 
     uni = uni.drop_duplicates(subset=["Code"], keep="first")
     return uni
 
-def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
+def get_best_k_for_kosdaq_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
     """
     리밸런싱 대상 리스트 작성:
     - code/name/best_k/weight(+qty=None) + prev_* + 목표가(close 포함)까지 채움
@@ -472,6 +472,10 @@ def get_best_k_for_krx_topn(rebalance_date_str: str) -> List[Dict[str, Any]]:
 
     return selected
 
+
+# Backward compatibility alias for earlier naming that implied KRX scope
+get_best_k_for_krx_topn = get_best_k_for_kosdaq_topn
+
 # -----------------------------
 # 5) API 진입점: /rebalance/run/{date} 에서 호출
 # -----------------------------
@@ -487,7 +491,7 @@ def run_rebalance(date: str, force_order: bool = False) -> Dict[str, Any]:
         }
     """
     try:
-        selected = get_best_k_for_krx_topn(date)
+        selected = get_best_k_for_kosdaq_topn(date)
         # force_order가 True라고 해서 여기서 실주문을 내지 않음.
         # (주문은 trader.py가 관리) — 필요 시 'strategy'에 플래그만 남김.
         for it in selected:

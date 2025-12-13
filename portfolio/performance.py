@@ -20,7 +20,11 @@ class PositionSnapshot:
 
 
 class PerformanceTracker:
-    """Aggregate realized/unrealized marks for portfolio-level observability."""
+    """Aggregate realized/unrealized marks for portfolio-level observability.
+
+    Engine-level PnL is an attribution estimate using allocation ratios because
+    KIS positions are pooled at the account level.
+    """
 
     def __init__(self) -> None:
         self._peak_value: float | None = None

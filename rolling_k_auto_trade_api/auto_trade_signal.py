@@ -7,7 +7,7 @@ from typing import List, Dict
 import pytz
 
 from rolling_k_auto_trade_api.kis_api import send_order, get_price_quote
-from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_krx_topn, get_price_data_segments
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_topn, get_price_data_segments
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 
 logger = logging.getLogger(__name__)
@@ -69,13 +69,13 @@ def rolling_k_auto_trade_loop(
 ):
     """
     실시간 자동매매 시그널 loop (실전/모의)
-    - 투자 대상 종목군/Best-K: get_best_k_for_krx_topn(rebalance_date) 결과 활용
+    - 투자 대상 종목군/Best-K: get_best_k_for_kosdaq_topn(rebalance_date) 결과 활용
     - 실시간 목표가 계산/매수/매도
     - dryrun=True: 주문 실행X 로그만
     - order_test=True: 강제 매수
     """
     logger.info(f"[실시간 AUTO LOOP] {rebalance_date} 시작 (test={order_test}, dryrun={dryrun})")
-    target_stocks: List[Dict] = get_best_k_for_krx_topn(rebalance_date)
+    target_stocks: List[Dict] = get_best_k_for_kosdaq_topn(rebalance_date)
     logger.info(f"[AUTO] 투자 대상 = {len(target_stocks)}종목")
 
     for s in target_stocks:
