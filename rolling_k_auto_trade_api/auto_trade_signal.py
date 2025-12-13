@@ -4,11 +4,14 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict
 
+import pytz
+
 from rolling_k_auto_trade_api.kis_api import send_order, get_price_quote
 from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_krx_topn, get_price_data_segments
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 
 logger = logging.getLogger(__name__)
+KST = pytz.timezone("Asia/Seoul")
 
 
 def _safe_float(v, default: float = 0.0) -> float:
@@ -39,15 +42,16 @@ def _get_price_context(stock_code: str, rebalance_date: datetime.date) -> Dict[s
     if context["prev_high"] and context["prev_low"] and context["today_open"]:
         return context
 
-    # 보완: 최근 확정 일봉에서 전일 고가/저가를 채움
+    # 보완: 오늘보다 이전 날짜의 확정 일봉에서 전일 고가/저가를 채움
     segments = get_price_data_segments(stock_code, rebalance_date)
     month_records = sorted(segments.get("month", []), key=lambda x: x.get("date"))
-    today = datetime.now().date()
-    prev_rec = None
-    for rec in month_records:
-        rec_date = rec.get("date")
-        if rec_date and rec_date < today:
-            prev_rec = rec
+    today = datetime.now(tz=KST).date()
+    prev_rec = max(
+        (rec for rec in month_records if rec.get("date") and rec.get("date") < today),
+        key=lambda r: r.get("date"),
+        default=None,
+    )
+
     if prev_rec:
         if not context["prev_high"]:
             context["prev_high"] = _safe_float(prev_rec.get("high"), 0.0)
@@ -93,11 +97,14 @@ def rolling_k_auto_trade_loop(
         if current_price <= 0:
             logger.warning(f"[SKIP] {code} 현재가 없음")
             continue
+        if weight <= 0:
+            logger.warning(f"[SKIP] {code} weight<=0 (weight={weight})")
+            continue
 
         logger.info(f"[RT] {code} 목표가={target_price}, 현재가={current_price}")
         # 매수 시그널
         if order_test or (current_price >= target_price):
-            allocated = invest_amount * weight if weight > 0 else invest_amount / max(len(target_stocks), 1)
+            allocated = invest_amount * weight
             unit_price = best_ask if best_ask > 0 else current_price
             if unit_price <= 0:
                 logger.warning(f"[SKIP] {code} 호가/현재가 없음")
