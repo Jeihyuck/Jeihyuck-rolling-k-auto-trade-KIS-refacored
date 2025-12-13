@@ -215,13 +215,14 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _get_effective_ord_cash(kis: KisAPI) -> int:
+def _get_effective_ord_cash(kis: KisAPI, soft_cap: int | float | None = None) -> int:
     """
     오늘 주문 가능 예수금을 가져오되,
     - 0 이하이거나
     - 조회 실패 / None
     이면 DAILY_CAPITAL을 fallback으로 사용한다.
     (모의투자에서 get_cash_available_today가 항상 0을 주는 경우 보호)
+    soft_cap이 주어지면 조회된 값과 비교해 더 작은 값을 사용한다.
     """
     try:
         cash = kis.get_cash_available_today()
@@ -233,13 +234,28 @@ def _get_effective_ord_cash(kis: KisAPI) -> int:
         logger.warning(
             f"[BUDGET] 예수금 조회 실패/무효({e}) → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
         )
-        return DAILY_CAPITAL
+        cash = DAILY_CAPITAL
 
     if cash <= 0:
         logger.warning(
             f"[BUDGET] today cash <= 0 → DAILY_CAPITAL {DAILY_CAPITAL:,}원 사용"
         )
-        return DAILY_CAPITAL
+        cash = DAILY_CAPITAL
+
+    if soft_cap is not None:
+        try:
+            cap_int = int(float(soft_cap))
+            if cap_int > 0:
+                if cash > cap_int:
+                    logger.info(
+                        "[BUDGET] applying soft cap %s → cash clipped from %s to %s",
+                        f"{cap_int:,}",
+                        f"{cash:,}",
+                        f"{cap_int:,}",
+                    )
+                cash = min(cash, cap_int)
+        except Exception:
+            logger.warning("[BUDGET] invalid soft_cap provided: %s", soft_cap)
 
     return cash
 

@@ -1,31 +1,64 @@
 # auto_trade_signal.py
-import os
 import time
 import logging
-import requests
-import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict
 
-from rolling_k_auto_trade_api.kis_api import send_order
-from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50, get_price_data_segments
+import pytz
+
+from rolling_k_auto_trade_api.kis_api import send_order, get_price_quote
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_topn, get_price_data_segments
+from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 
 logger = logging.getLogger(__name__)
+KST = pytz.timezone("Asia/Seoul")
 
 
-def get_latest_price(stock_code: str) -> float:
-    """실시간 가격 데이터: 한국투자 OpenAPI가 없으면 FDR로 임시 구현"""
-    # TODO: 실전에서는 websocket/REST 실시간 연동 필요
-    import FinanceDataReader as fdr
+def _safe_float(v, default: float = 0.0) -> float:
     try:
-        df = fdr.DataReader(stock_code, datetime.now()-timedelta(days=5), datetime.now())
-        if not df.empty:
-            price = float(df.iloc[-1]["Close"])
-            logger.debug(f"[RT] {stock_code} FDR 최신가: {price}")
-            return price
+        return float(v)
+    except Exception:
+        return default
+
+
+def _get_price_context(stock_code: str, rebalance_date: datetime.date) -> Dict[str, float]:
+    """KIS 시세를 우선 사용해 목표가 계산에 필요한 값들을 반환."""
+
+    try:
+        quote = get_price_quote(stock_code)
     except Exception as e:
-        logger.warning(f"[RT] FDR 가격조회 실패: {e}")
-    return 0.0
+        logger.warning(f"[QUOTE_FAIL] {stock_code} 시세 조회 실패: {e}")
+        quote = {}
+
+    context: Dict[str, float] = {
+        "current_price": _safe_float(quote.get("stck_prpr"), 0.0),
+        "today_open": _safe_float(quote.get("stck_oprc"), 0.0),
+        "prev_high": _safe_float(quote.get("prdy_hgpr"), 0.0),
+        "prev_low": _safe_float(quote.get("prdy_lwpr"), 0.0),
+        "ask_price": _safe_float(quote.get("askp1") or quote.get("askp"), 0.0),
+        "bid_price": _safe_float(quote.get("bidp1") or quote.get("bidp"), 0.0),
+    }
+
+    if context["prev_high"] and context["prev_low"] and context["today_open"]:
+        return context
+
+    # 보완: 오늘보다 이전 날짜의 확정 일봉에서 전일 고가/저가를 채움
+    segments = get_price_data_segments(stock_code, rebalance_date)
+    month_records = sorted(segments.get("month", []), key=lambda x: x.get("date"))
+    today = datetime.now(tz=KST).date()
+    prev_rec = max(
+        (rec for rec in month_records if rec.get("date") and rec.get("date") < today),
+        key=lambda r: r.get("date"),
+        default=None,
+    )
+
+    if prev_rec:
+        if not context["prev_high"]:
+            context["prev_high"] = _safe_float(prev_rec.get("high"), 0.0)
+        if not context["prev_low"]:
+            context["prev_low"] = _safe_float(prev_rec.get("low"), 0.0)
+
+    return context
 
 
 def rolling_k_auto_trade_loop(
@@ -36,46 +69,55 @@ def rolling_k_auto_trade_loop(
 ):
     """
     실시간 자동매매 시그널 loop (실전/모의)
-    - 투자 대상 종목군/Best-K: get_best_k_for_kosdaq_50(rebalance_date) 결과 활용
+    - 투자 대상 종목군/Best-K: get_best_k_for_kosdaq_topn(rebalance_date) 결과 활용
     - 실시간 목표가 계산/매수/매도
     - dryrun=True: 주문 실행X 로그만
     - order_test=True: 강제 매수
     """
     logger.info(f"[실시간 AUTO LOOP] {rebalance_date} 시작 (test={order_test}, dryrun={dryrun})")
-    target_stocks: List[Dict] = get_best_k_for_kosdaq_50(rebalance_date)
+    target_stocks: List[Dict] = get_best_k_for_kosdaq_topn(rebalance_date)
     logger.info(f"[AUTO] 투자 대상 = {len(target_stocks)}종목")
-    each_invest = invest_amount // max(len(target_stocks), 1)
 
     for s in target_stocks:
         code, name, best_k = s["code"], s["name"], s["best_k"]
+        weight = _safe_float(s.get("weight"), 0.0)
         logger.info(f"[LOOP] {name}({code}) - K={best_k}")
         # 실시간 가격 데이터/목표가 산출
-        price_segments = get_price_data_segments(code, datetime.strptime(rebalance_date, "%Y-%m-%d").date())
-        # 돌파목표가: 오늘 시가 + (전일고가-전일저가)*best_k
-        today = datetime.today().date()
-        today_prices = [p for p in price_segments["month"] if p["date"] == today]
-        if not today_prices:
-            logger.warning(f"[SKIP] {code} 오늘 시가 없음")
+        price_ctx = _get_price_context(code, datetime.strptime(rebalance_date, "%Y-%m-%d").date())
+        if not price_ctx["today_open"] or not price_ctx["prev_high"] or not price_ctx["prev_low"]:
+            logger.warning(f"[SKIP] {code} 목표가 계산에 필요한 시세 없음")
             continue
-        today_open = today_prices[0]["open"]
-        yesterday_prices = [p for p in price_segments["month"] if p["date"] == today - timedelta(days=1)]
-        if not yesterday_prices:
-            logger.warning(f"[SKIP] {code} 전일 데이터 없음")
-            continue
-        prev_high = yesterday_prices[0]["high"]
-        prev_low  = yesterday_prices[0]["low"]
-        target_price = round(today_open + (prev_high - prev_low) * best_k, 2)
 
-        current_price = get_latest_price(code)
+        target_price = adjust_price_to_tick(
+            round(price_ctx["today_open"] + (price_ctx["prev_high"] - price_ctx["prev_low"]) * best_k, 2)
+        )
+
+        current_price = price_ctx["current_price"]
+        best_ask = price_ctx.get("ask_price", 0.0)
+        if current_price <= 0:
+            logger.warning(f"[SKIP] {code} 현재가 없음")
+            continue
+        if weight <= 0:
+            logger.warning(f"[SKIP] {code} weight<=0 (weight={weight})")
+            continue
+
         logger.info(f"[RT] {code} 목표가={target_price}, 현재가={current_price}")
         # 매수 시그널
-        if order_test or (current_price > 0 and current_price >= target_price):
-            qty = max(each_invest // int(current_price), 1)
+        if order_test or (current_price >= target_price):
+            allocated = invest_amount * weight
+            unit_price = best_ask if best_ask > 0 else current_price
+            if unit_price <= 0:
+                logger.warning(f"[SKIP] {code} 호가/현재가 없음")
+                continue
+            qty = int(allocated // unit_price)
+            if qty <= 0:
+                logger.warning(f"[SKIP] {code} 배분금액 부족 allocated={allocated} unit_price={unit_price}")
+                continue
             if dryrun:
-                logger.info(f"[DRYRUN] {code} {name}: 매수신호 qty={qty} 목표가={target_price} 현재가={current_price}")
+                logger.info(f"[DRYRUN] {code} {name}: 매수신호 qty={qty} 목표가={target_price} 기준가격={unit_price} 현재가={current_price}")
             else:
                 try:
-                    resp = send_order(code, qty=qty, price=target_price, side="buy")
+                    resp = send_order(code, qty=qty, price=None, side="buy")
                     logger.info(f"[ORDER] {code} {name}: {resp}")
                     time.sleep(3)
                 except Exception as e:

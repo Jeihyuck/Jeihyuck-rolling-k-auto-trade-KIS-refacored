@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
 
-from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_50
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_topn
 from rolling_k_auto_trade_api.logging_config import configure_logging
 
 configure_logging()
@@ -43,7 +43,7 @@ async def run_rolling_rebalance(
 
     # 2) 전체 후보군 + score(수익률, 승률, 모멘텀 등) 재산출
     try:
-        new_candidates = get_best_k_for_kosdaq_50(date)
+        new_candidates = get_best_k_for_kosdaq_topn(date)
     except Exception as e:
         logger.exception(f"[ERROR] Rolling BestK 계산 실패: {e}")
         raise HTTPException(status_code=500, detail="Rolling Best K 계산 실패")
