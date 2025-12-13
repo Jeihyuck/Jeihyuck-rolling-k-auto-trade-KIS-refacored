@@ -32,6 +32,8 @@ def _get_price_context(stock_code: str, rebalance_date: datetime.date) -> Dict[s
         "today_open": _safe_float(quote.get("stck_oprc"), 0.0),
         "prev_high": _safe_float(quote.get("prdy_hgpr"), 0.0),
         "prev_low": _safe_float(quote.get("prdy_lwpr"), 0.0),
+        "ask_price": _safe_float(quote.get("askp1") or quote.get("askp"), 0.0),
+        "bid_price": _safe_float(quote.get("bidp1") or quote.get("bidp"), 0.0),
     }
 
     if context["prev_high"] and context["prev_low"] and context["today_open"]:
@@ -40,14 +42,17 @@ def _get_price_context(stock_code: str, rebalance_date: datetime.date) -> Dict[s
     # 보완: 최근 확정 일봉에서 전일 고가/저가를 채움
     segments = get_price_data_segments(stock_code, rebalance_date)
     month_records = sorted(segments.get("month", []), key=lambda x: x.get("date"))
-    if month_records:
-        last = month_records[-1]
+    today = datetime.now().date()
+    prev_rec = None
+    for rec in month_records:
+        rec_date = rec.get("date")
+        if rec_date and rec_date < today:
+            prev_rec = rec
+    if prev_rec:
         if not context["prev_high"]:
-            context["prev_high"] = _safe_float(last.get("high"), 0.0)
+            context["prev_high"] = _safe_float(prev_rec.get("high"), 0.0)
         if not context["prev_low"]:
-            context["prev_low"] = _safe_float(last.get("low"), 0.0)
-        if not context["today_open"]:
-            context["today_open"] = _safe_float(last.get("close"), 0.0)
+            context["prev_low"] = _safe_float(prev_rec.get("low"), 0.0)
 
     return context
 
@@ -84,16 +89,28 @@ def rolling_k_auto_trade_loop(
         )
 
         current_price = price_ctx["current_price"]
+        best_ask = price_ctx.get("ask_price", 0.0)
+        if current_price <= 0:
+            logger.warning(f"[SKIP] {code} 현재가 없음")
+            continue
+
         logger.info(f"[RT] {code} 목표가={target_price}, 현재가={current_price}")
         # 매수 시그널
-        if order_test or (current_price > 0 and current_price >= target_price):
+        if order_test or (current_price >= target_price):
             allocated = invest_amount * weight if weight > 0 else invest_amount / max(len(target_stocks), 1)
-            qty = max(int(allocated // int(current_price)), 1)
+            unit_price = best_ask if best_ask > 0 else current_price
+            if unit_price <= 0:
+                logger.warning(f"[SKIP] {code} 호가/현재가 없음")
+                continue
+            qty = int(allocated // unit_price)
+            if qty <= 0:
+                logger.warning(f"[SKIP] {code} 배분금액 부족 allocated={allocated} unit_price={unit_price}")
+                continue
             if dryrun:
-                logger.info(f"[DRYRUN] {code} {name}: 매수신호 qty={qty} 목표가={target_price} 현재가={current_price}")
+                logger.info(f"[DRYRUN] {code} {name}: 매수신호 qty={qty} 목표가={target_price} 기준가격={unit_price} 현재가={current_price}")
             else:
                 try:
-                    resp = send_order(code, qty=qty, price=target_price, side="buy")
+                    resp = send_order(code, qty=qty, price=None, side="buy")
                     logger.info(f"[ORDER] {code} {name}: {resp}")
                     time.sleep(3)
                 except Exception as e:
