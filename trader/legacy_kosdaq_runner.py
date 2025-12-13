@@ -229,7 +229,7 @@ def main(capital_override: float | None = None):
         targets = fetch_rebalancing_targets(rebalance_date)
 
     # === [NEW] 예산 가드: 예수금이 0/부족이면 신규 매수만 스킵 ===
-    effective_cash = _get_effective_ord_cash(kis)
+    effective_cash = _get_effective_ord_cash(kis, soft_cap=effective_capital)
     if effective_cash <= 0:
         can_buy = False
         logger.warning("[BUDGET] 유효 예산 0 → 신규 매수 스킵(보유 관리만 수행)")
@@ -397,7 +397,7 @@ def main(capital_override: float | None = None):
     TP_PROFIT_PCT_BULL = float(_cfg("TP_PROFIT_PCT_BULL") or "3.5")
 
     cap_scale = REGIME_CAP_TABLE.get(regime.get("key"), 0.8)
-    ord_cash = _get_effective_ord_cash(kis)
+    ord_cash = _get_effective_ord_cash(kis, soft_cap=effective_capital)
     capital_base = min(ord_cash, int(CAP_CAP * effective_capital))
     capital_active = int(min(capital_base * cap_scale, effective_capital))
     logger.info(
@@ -881,7 +881,7 @@ def main(capital_override: float | None = None):
                         "result": result,
                     }
                 )
-                effective_cash = _get_effective_ord_cash(kis)
+                effective_cash = _get_effective_ord_cash(kis, soft_cap=effective_capital)
                 if effective_cash <= 0:
                     can_buy = False
                 save_state(holding, traded)
@@ -1055,7 +1055,7 @@ def main(capital_override: float | None = None):
                                 "result": result,
                             }
                         )
-                        effective_cash = _get_effective_ord_cash(kis)
+                        effective_cash = _get_effective_ord_cash(kis, soft_cap=effective_capital)
                         if effective_cash <= 0:
                             can_buy = False
                         save_state(holding, traded)

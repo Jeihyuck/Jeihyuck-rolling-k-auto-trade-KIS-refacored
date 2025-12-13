@@ -46,6 +46,25 @@ def execute_rebalance(
     buys = sells = 0
     available_cash = min(float(cash), float(inquire_cash_balance() or 0))
 
+    before_snapshot = {code: data.get("qty", 0) for code, data in positions.items() if data.get("qty")}
+    target_snapshot = {
+        code: int(float(payload.get("target_qty") or 0))
+        for code, payload in target_map.items()
+        if float(payload.get("target_qty") or 0) > 0
+    }
+    delta_snapshot = {
+        code: target_snapshot.get(code, 0) - before_snapshot.get(code, 0)
+        for code in sorted(all_codes)
+        if before_snapshot.get(code, 0) != target_snapshot.get(code, 0)
+    }
+    logger.info(
+        "%s[KOSPI_CORE][DIFF] before=%s targets=%s delta=%s",
+        tag + " " if tag else "",
+        before_snapshot,
+        target_snapshot,
+        delta_snapshot,
+    )
+
     for code in sorted(all_codes):
         current = positions.get(code, {})
         current_qty = int(current.get("qty") or 0)

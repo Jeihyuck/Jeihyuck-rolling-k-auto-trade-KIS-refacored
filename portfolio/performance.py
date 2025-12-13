@@ -22,6 +22,10 @@ class PositionSnapshot:
 class PerformanceTracker:
     """Aggregate realized/unrealized marks for portfolio-level observability."""
 
+    def __init__(self) -> None:
+        self._peak_value: float | None = None
+        self._max_drawdown_pct: float = 0.0
+
     def _mark_positions(self) -> List[PositionSnapshot]:
         positions: List[PositionSnapshot] = []
         for row in inquire_balance():
@@ -67,6 +71,13 @@ class PerformanceTracker:
         pnl = total_value - float(total_allocated)
         pnl_pct = (pnl / float(total_allocated) * 100) if total_allocated else 0.0
 
+        if self._peak_value is None or total_value > self._peak_value:
+            self._peak_value = total_value
+        drawdown_pct = 0.0
+        if self._peak_value:
+            drawdown_pct = (total_value / self._peak_value - 1.0) * 100
+            self._max_drawdown_pct = min(self._max_drawdown_pct, drawdown_pct)
+
         engines: Dict[str, Dict[str, Any]] = {}
         for name, cap in engine_capitals.items():
             ratio = cap / total_allocated if total_allocated else 0.0
@@ -101,6 +112,12 @@ class PerformanceTracker:
             pnl_pct,
         )
 
+        logger.info(
+            "[PORTFOLIO][DRAWDOWN] current=%.2f%% max=%.2f%%",
+            drawdown_pct,
+            self._max_drawdown_pct,
+        )
+
         return {
             "portfolio": {
                 "cash": cash,
@@ -109,6 +126,8 @@ class PerformanceTracker:
                 "unrealized": unrealized,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
+                "drawdown_pct": drawdown_pct,
+                "max_drawdown_pct": self._max_drawdown_pct,
             },
             "engines": engines,
             "positions": [p.__dict__ for p in positions],
