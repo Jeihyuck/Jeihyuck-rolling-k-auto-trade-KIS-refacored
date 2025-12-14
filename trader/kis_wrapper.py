@@ -26,8 +26,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+from trader.time_utils import is_trading_day, is_trading_window, now_kst
 
 logger = logging.getLogger(__name__)
+_ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
 
 
 class NetTemporaryError(Exception):
@@ -112,6 +114,48 @@ def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: s
         logger.info(f"[APPEND_FILL] {side} {code} qty={qty} price={price} odno={odno}")
     except Exception as e:
         logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
+
+
+def _order_block_reason(now: datetime | None = None) -> Optional[str]:
+    now = now or now_kst()
+    state_date = _ORDER_BLOCK_STATE.get("date")
+    state_reason = _ORDER_BLOCK_STATE.get("reason")
+    if state_date and state_date != now.date():
+        _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
+        state_date, state_reason = None, None
+    if state_date == now.date() and state_reason:
+        return str(state_reason)
+    if not is_trading_day(now):
+        _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
+        return "NON_TRADING_DAY"
+    if not is_trading_window(now):
+        return "OUTSIDE_TRADING_WINDOW"
+    return None
+
+
+def _mark_order_blocked(reason: str, now: datetime | None = None) -> None:
+    now = now or now_kst()
+    _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
+
+
+def _is_order_disallowed(resp: Any) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    msg1 = str(resp.get("msg1") or "")
+    msg_cd = str(resp.get("msg_cd") or "")
+    msg = f"{msg1} {msg_cd}".strip()
+    primary_phrases = ("영업일이 아닙니다", "주문 가능 시간이 아닙니다", "주문가능시간이 아닙니다")
+    if any(p in msg1 for p in primary_phrases):
+        return msg or "ORDER_NOT_ALLOWED"
+
+    low = msg.lower()
+    keywords = ("휴장", "가능시간", "closed")
+    if any(k in low for k in keywords):
+        return msg or "ORDER_NOT_ALLOWED"
+    status = resp.get("_status")
+    if isinstance(status, int) and status in (401, 403):
+        return f"HTTP_{status}"
+    return None
 
 
 class _RateLimiter:
@@ -1110,6 +1154,12 @@ class KisAPI:
         # TR 후보 순차 시도
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
 
+        now = now_kst()
+        block_reason = _order_block_reason(now)
+        if block_reason:
+            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, body.get("PDNO"), body.get("ORD_QTY"))
+            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+
         # Fallback: 시장가 → IOC시장가 → 최유리
         ord_dvsn_chain = ["01", "13", "03"]
         last_err = None
@@ -1215,6 +1265,9 @@ class KisAPI:
                         continue
 
                     logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
+                    blocked = _is_order_disallowed(data)
+                    if blocked:
+                        _mark_order_blocked(blocked, now)
                     return None
 
                 logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
@@ -1289,6 +1342,12 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        now = now_kst()
+        block_reason = _order_block_reason(now)
+        if block_reason:
+            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
+            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -1331,9 +1390,18 @@ class KisAPI:
                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
+        blocked = _is_order_disallowed(data)
+        if blocked:
+            _mark_order_blocked(blocked, now)
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        now = now_kst()
+        block_reason = _order_block_reason(now)
+        if block_reason:
+            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
+            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+
         # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
@@ -1414,6 +1482,9 @@ class KisAPI:
                 self._recent_sells[pdno] = time.time()
             return data
         logger.error(f"[SELL_LIMIT_FAIL] {data}")
+        blocked = _is_order_disallowed(data)
+        if blocked:
+            _mark_order_blocked(blocked, now)
         return None
 
     # -------------------------------

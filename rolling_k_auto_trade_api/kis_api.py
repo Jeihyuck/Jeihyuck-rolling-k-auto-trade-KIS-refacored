@@ -18,6 +18,7 @@ import json
 import time
 import random
 import logging
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
 import requests
@@ -25,6 +26,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+KST = timezone(timedelta(hours=9))
+MARKET_OPEN = dtime(9, 0)
+MARKET_CLOSE = dtime(15, 20)
+
+_ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
 
 # =============================
 # 실행 보호 플래그 (CI 등에서 실거래 방지)
@@ -44,6 +50,58 @@ def _guard_live_trading(action: str) -> None:
             f"[KIS_DISABLED] {action} skipped because DISABLE_LIVE_TRADING is set"
         )
         raise LiveTradingDisabledError("DISABLE_LIVE_TRADING is enabled; KIS API calls are blocked.")
+
+
+def _is_trading_day(ts: Optional[datetime] = None) -> bool:
+    ts = ts or datetime.now(tz=KST)
+    return ts.weekday() < 5
+
+
+def _is_trading_window(ts: Optional[datetime] = None) -> bool:
+    ts = ts or datetime.now(tz=KST)
+    return _is_trading_day(ts) and MARKET_OPEN <= ts.time() <= MARKET_CLOSE
+
+
+def _order_block_reason(now: Optional[datetime] = None) -> Optional[str]:
+    now = now or datetime.now(tz=KST)
+    state_date = _ORDER_BLOCK_STATE.get("date")
+    state_reason = _ORDER_BLOCK_STATE.get("reason")
+    if state_date and state_date != now.date():
+        _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
+        state_date, state_reason = None, None
+    if state_date == now.date() and state_reason:
+        return str(state_reason)
+    if not _is_trading_day(now):
+        _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
+        return "NON_TRADING_DAY"
+    if not _is_trading_window(now):
+        return "OUTSIDE_TRADING_WINDOW"
+    return None
+
+
+def _mark_order_blocked(reason: str, now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(tz=KST)
+    _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
+
+
+def _is_order_disallowed(resp: Any) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    msg1 = str(resp.get("msg1") or "")
+    msg_cd = str(resp.get("msg_cd") or "")
+    msg = f"{msg1} {msg_cd}".strip()
+    primary_phrases = ("영업일이 아닙니다", "주문 가능 시간이 아닙니다", "주문가능시간이 아닙니다")
+    if any(p in msg1 for p in primary_phrases):
+        return msg or "ORDER_NOT_ALLOWED"
+
+    low = msg.lower()
+    keywords = ("휴장", "가능시간", "closed")
+    if any(k in low for k in keywords):
+        return msg or "ORDER_NOT_ALLOWED"
+    status = resp.get("_status")
+    if isinstance(status, int) and status in (401, 403):
+        return f"HTTP_{status}"
+    return None
 
 # =============================
 # 설정 로딩 (settings 우선, 없으면 ENV)
@@ -301,6 +359,19 @@ def send_order(
     _guard_live_trading("order")
     code = str(code).strip()
     is_sell = (side.lower() == "sell")
+    now = datetime.now(tz=KST)
+
+    block_reason = _order_block_reason(now)
+    if block_reason:
+        logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, code, qty)
+        return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+
+    # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
+    ord_type_norm = str(order_type).lower() if order_type is not None else ""
+    if ord_type_norm in {"market", "mkt"}:
+        price = None
+    if kwargs:
+        logger.debug(f"[ORDER_KWARGS_IGNORED] extra_keys={list(kwargs.keys())}")
 
     # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
     ord_type_norm = str(order_type).lower() if order_type is not None else ""
@@ -317,7 +388,11 @@ def send_order(
             "PDNO": code,
             "ORD_QTY": str(int(qty)),
         }
-        return _order_cash(body, is_sell=is_sell)
+        resp = _order_cash(body, is_sell=is_sell)
+        blocked = _is_order_disallowed(resp)
+        if blocked:
+            _mark_order_blocked(blocked, now)
+        return resp
     else:
         # 지정가(고정, 00)
         body = {
@@ -345,6 +420,9 @@ def send_order(
         except Exception:
             j = {"_non_json": True}
         logger.info(f"[ORDER_RESP_LIMIT] status={r.status_code} json={j} raw_head={raw[:300]}")
+        blocked = _is_order_disallowed(j)
+        if blocked:
+            _mark_order_blocked(blocked, now)
         return j if isinstance(j, dict) else {"_status": r.status_code, "raw": raw[:500]}
 
 

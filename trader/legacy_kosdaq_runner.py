@@ -11,20 +11,42 @@ from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 
-from .config import (
-    DAILY_CAPITAL,
-    FORCE_SELL_PASSES_CLOSE,
-    FORCE_SELL_PASSES_CUTOFF,
-    KST,
-    RATE_SLEEP_SEC,
-    SELL_ALL_BALANCES_AT_CUTOFF,
-    SELL_FORCE_TIME,
-    SLIPPAGE_ENTER_GUARD_PCT,
-    USE_PULLBACK_ENTRY,
-    PULLBACK_MAX_BUYS_PER_DAY,
-    _cfg,
-    logger,
-)
+try:
+    from .config import (
+        DAILY_CAPITAL,
+        FORCE_SELL_PASSES_CLOSE,
+        FORCE_SELL_PASSES_CUTOFF,
+        ALLOW_WHEN_CLOSED,
+        KST,
+        RATE_SLEEP_SEC,
+        SELL_ALL_BALANCES_AT_CUTOFF,
+        SELL_FORCE_TIME,
+        SLIPPAGE_ENTER_GUARD_PCT,
+        USE_PULLBACK_ENTRY,
+        PULLBACK_MAX_BUYS_PER_DAY,
+        _cfg,
+        logger,
+    )
+except ImportError:
+    # ALLOW_WHEN_CLOSED가 누락돼도 러너가 즉시 중단되지 않도록 안전한 기본값을 제공한다.
+    from .config import (
+        DAILY_CAPITAL,
+        FORCE_SELL_PASSES_CLOSE,
+        FORCE_SELL_PASSES_CUTOFF,
+        KST,
+        RATE_SLEEP_SEC,
+        SELL_ALL_BALANCES_AT_CUTOFF,
+        SELL_FORCE_TIME,
+        SLIPPAGE_ENTER_GUARD_PCT,
+        USE_PULLBACK_ENTRY,
+        PULLBACK_MAX_BUYS_PER_DAY,
+        _cfg,
+        logger,
+    )
+
+    ALLOW_WHEN_CLOSED = False
+    logger.warning("[CONFIG] ALLOW_WHEN_CLOSED missing; defaulting to False")
+from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
 
 if TYPE_CHECKING:
@@ -512,6 +534,8 @@ def main(capital_override: float | None = None):
             logger.warning(f"[PULLBACK-WATCH-FAIL] 시총 상위 로드 실패: {e}")
 
     loop_sleep_sec = 2.5  # 메인 루프 대기 시간(초)
+    max_closed_checks = 3
+    closed_checks = 0
 
     try:
         while True:
@@ -534,12 +558,42 @@ def main(capital_override: float | None = None):
                 pullback_buys_today = 0
 
             if not is_open:
+                if not is_trading_day(now_dt_kst):
+                    logger.error("[CLOSED] 비거래일 감지 → 루프 종료")
+                    break
+
+                if now_dt_kst.time() < MARKET_OPEN:
+                    seconds_to_open = int(
+                        (datetime.combine(now_dt_kst.date(), MARKET_OPEN, tzinfo=KST) - now_dt_kst).total_seconds()
+                    )
+                    sleep_for = max(1, min(seconds_to_open, 300))
+                    logger.info(
+                        "[PREOPEN] 장 시작까지 %ss 남음 → %ss 대기 후 재확인", seconds_to_open, sleep_for
+                    )
+                    time.sleep(sleep_for)
+                    closed_checks = 0
+                    continue
+
+                if now_dt_kst.time() >= MARKET_CLOSE:
+                    logger.error("[CLOSED] 장 마감 이후 → 루프 종료")
+                    break
+
+                closed_checks += 1
                 if not ALLOW_WHEN_CLOSED:
-                    logger.info("[CLOSED] 장 종료 → 10초 대기 후 재확인")
+                    if closed_checks > max_closed_checks:
+                        logger.error("[CLOSED] 장 종료 반복 %s회 초과 → 루프 종료", max_closed_checks)
+                        break
+                    logger.info(
+                        "[CLOSED] 장중인데 API가 닫힘 응답 → 10초 대기 후 재확인 (%s/%s)",
+                        closed_checks,
+                        max_closed_checks,
+                    )
                     time.sleep(10)
                     continue
                 else:
                     logger.warning("[CLOSED-DATA] 장 종료지만 환경설정 허용 → 시세 조회 후 진행")
+            else:
+                closed_checks = 0
 
             if kis.should_cooldown(now_dt_kst):
                 logger.warning("[COOLDOWN] 2초간 대기 (API 제한 보호)")

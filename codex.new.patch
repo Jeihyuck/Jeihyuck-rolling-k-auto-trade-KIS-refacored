@@ -1,0 +1,961 @@
+diff --git a/rolling_k_auto_trade_api/kis_api.py b/rolling_k_auto_trade_api/kis_api.py
+index c03d36908d57a81a0d158f779e0f86ed477d42e2..ee2af13179a392ad182608d91941442ef1e129e3 100644
+--- a/rolling_k_auto_trade_api/kis_api.py
++++ b/rolling_k_auto_trade_api/kis_api.py
+@@ -1,72 +1,130 @@
+ from __future__ import annotations
+ """
+ rolling_k_auto_trade_api.kis_api — 최신 응답로깅 + 파라미터 최신화 (전체 파일)
+ 
+ 핵심 개선
+ - send_order: KIS 응답 원문(raw text) 및 JSON 모두 상세 로깅(민감정보 마스킹) + 실패 사유/코드 함께 기록
+ - HashKey 및 주문 파라미터 최신화: /uapi/hashkey, /uapi/domestic-stock/v1/trading/order-cash
+ - TR_ID 자동 전환: (모의) VTTC0012U/VTTC0011U, (실전) TTTC0012U/TTTC0011U
+ - 주문 방식 체인: 시장가→IOC시장가→최유리(매수/매도 공통)로 폴백
+ - 견고한 재시도: 게이트웨이/5xx/네트워크 오류에 백오프 재시도
+ - inquire_balance(단일/전체), inquire_cash_balance, inquire_filled_order(응답 로깅 포함)
+ 
+ 주의: settings 모듈이 있으면 우선 사용하고, 없으면 환경변수에서 읽습니다.
+ """
+ 
+ import os
+ import json
+ import time
+ import random
+ import logging
++from datetime import datetime, time as dtime, timedelta, timezone
+ from typing import Any, Dict, Optional, List
+ 
+ import requests
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
+ logger = logging.getLogger(__name__)
++KST = timezone(timedelta(hours=9))
++MARKET_OPEN = dtime(9, 0)
++MARKET_CLOSE = dtime(15, 20)
++
++_ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+ 
+ # =============================
+ # 실행 보호 플래그 (CI 등에서 실거래 방지)
+ # =============================
+ 
+ 
+ class LiveTradingDisabledError(RuntimeError):
+     """Raised when live KIS API calls are disabled via environment flag."""
+ 
+ 
+ LIVE_TRADING_DISABLED = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ def _guard_live_trading(action: str) -> None:
+     if LIVE_TRADING_DISABLED:
+         logger.warning(
+             f"[KIS_DISABLED] {action} skipped because DISABLE_LIVE_TRADING is set"
+         )
+         raise LiveTradingDisabledError("DISABLE_LIVE_TRADING is enabled; KIS API calls are blocked.")
+ 
++
++def _is_trading_day(ts: Optional[datetime] = None) -> bool:
++    ts = ts or datetime.now(tz=KST)
++    return ts.weekday() < 5
++
++
++def _is_trading_window(ts: Optional[datetime] = None) -> bool:
++    ts = ts or datetime.now(tz=KST)
++    return _is_trading_day(ts) and MARKET_OPEN <= ts.time() <= MARKET_CLOSE
++
++
++def _order_block_reason(now: Optional[datetime] = None) -> Optional[str]:
++    now = now or datetime.now(tz=KST)
++    state_date = _ORDER_BLOCK_STATE.get("date")
++    state_reason = _ORDER_BLOCK_STATE.get("reason")
++    if state_date and state_date != now.date():
++        _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
++        state_date, state_reason = None, None
++    if state_date == now.date() and state_reason:
++        return str(state_reason)
++    if not _is_trading_day(now):
++        _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
++        return "NON_TRADING_DAY"
++    if not _is_trading_window(now):
++        return "OUTSIDE_TRADING_WINDOW"
++    return None
++
++
++def _mark_order_blocked(reason: str, now: Optional[datetime] = None) -> None:
++    now = now or datetime.now(tz=KST)
++    _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
++
++
++def _is_order_disallowed(resp: Any) -> Optional[str]:
++    if not isinstance(resp, dict):
++        return None
++    msg1 = str(resp.get("msg1") or "")
++    msg_cd = str(resp.get("msg_cd") or "")
++    msg = f"{msg1} {msg_cd}".strip()
++    primary_phrases = ("영업일이 아닙니다", "주문 가능 시간이 아닙니다", "주문가능시간이 아닙니다")
++    if any(p in msg1 for p in primary_phrases):
++        return msg or "ORDER_NOT_ALLOWED"
++
++    low = msg.lower()
++    keywords = ("휴장", "가능시간", "closed")
++    if any(k in low for k in keywords):
++        return msg or "ORDER_NOT_ALLOWED"
++    status = resp.get("_status")
++    if isinstance(status, int) and status in (401, 403):
++        return f"HTTP_{status}"
++    return None
++
+ # =============================
+ # 설정 로딩 (settings 우선, 없으면 ENV)
+ # =============================
+ try:  # settings.py가 있으면 해당 값을 우선 사용
+     from settings import APP_KEY as _APP_KEY
+     from settings import APP_SECRET as _APP_SECRET
+     from settings import API_BASE_URL as _API_BASE_URL
+     from settings import CANO as _CANO
+     from settings import ACNT_PRDT_CD as _ACNT_PRDT_CD
+     from settings import KIS_ENV as _KIS_ENV
+     APP_KEY = _APP_KEY
+     APP_SECRET = _APP_SECRET
+     API_BASE_URL = _API_BASE_URL
+     CANO = _CANO
+     ACNT_PRDT_CD = _ACNT_PRDT_CD
+     KIS_ENV = _KIS_ENV
+ except Exception:
+     APP_KEY = os.getenv("APP_KEY") or os.getenv("KIS_APP_KEY", "")
+     APP_SECRET = os.getenv("APP_SECRET") or os.getenv("KIS_APP_SECRET", "")
+     API_BASE_URL = os.getenv("API_BASE_URL", "https://openapi.koreainvestment.com:9443")
+     CANO = os.getenv("CANO", "")
+     ACNT_PRDT_CD = os.getenv("ACNT_PRDT_CD", "01")
+     KIS_ENV = (os.getenv("KIS_ENV", "practice") or "practice").lower()
+ 
+ # 필수값 체크 로그
+@@ -262,96 +320,124 @@ def _order_cash(body: Dict[str, Any], *, is_sell: bool) -> Dict[str, Any]:
+ 
+             # 정상 처리
+             if r.status_code == 200 and isinstance(j, dict) and j.get("rt_cd") == "0":
+                 logger.info(f"[ORDER_OK] ord_dvsn={ord_dvsn} output={j.get('output')}")
+                 return j
+ 
+             # 게이트웨이/과다/5xx 재시도
+             msg_cd = (j or {}).get("msg_cd", "") if isinstance(j, dict) else ""
+             msg1 = (j or {}).get("msg1", "") if isinstance(j, dict) else ""
+             if r.status_code >= 500 or msg_cd == "IGW00008" or (isinstance(msg1, str) and ("MCA" in msg1 or "초당" in msg1)):
+                 back = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.3)
+                 logger.warning(f"[ORDER_GATEWAY_RETRY] ord_dvsn={ord_dvsn} attempt={attempt} resp={j} → sleep {back:.2f}s")
+                 time.sleep(back)
+                 last_err = j
+                 continue
+ 
+             # 비즈니스 실패는 그대로 반환(상위에서 판단)
+             logger.error(f"[ORDER_FAIL_BIZ] ord_dvsn={ord_dvsn} resp={j} raw_head={raw[:300]}")
+             return j if isinstance(j, dict) else {"_status": r.status_code, "raw": raw[:500]}
+ 
+         logger.warning(f"[ORDER_FALLBACK] ord_dvsn={ord_dvsn} 실패 → 다음 방식")
+ 
+     raise RuntimeError(f"ORDER_FAIL: {last_err}")
+ 
+ 
+-def send_order(code: str, qty: int, price: Optional[int] = None, side: str = "buy") -> Dict[str, Any]:
++def send_order(
++    code: str,
++    qty: int,
++    price: Optional[int] = None,
++    side: str = "buy",
++    order_type: Optional[str] = None,
++    **kwargs: Any,
++) -> Dict[str, Any]:
+     """공용 주문 API
+     side: 'buy' or 'sell'
+     price: None이면 시장가 체인, 지정가면 지정가 고정(00)
++    order_type: 과거 호출부 호환용(예: "market"); 인식 가능한 값은 price를 무시하고 시장가로 처리
+     반환: KIS 응답(dict). 비정상 응답 시에도 원문/상태 일부 포함
+     """
+     _guard_live_trading("order")
+     code = str(code).strip()
+     is_sell = (side.lower() == "sell")
++    now = datetime.now(tz=KST)
++
++    block_reason = _order_block_reason(now)
++    if block_reason:
++        logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, code, qty)
++        return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
++
++    # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
++    ord_type_norm = str(order_type).lower() if order_type is not None else ""
++    if ord_type_norm in {"market", "mkt"}:
++        price = None
++    if kwargs:
++        logger.debug(f"[ORDER_KWARGS_IGNORED] extra_keys={list(kwargs.keys())}")
+ 
+     if price is None:
+         # 시장가 체인
+         body = {
+             "CANO": CANO,
+             "ACNT_PRDT_CD": ACNT_PRDT_CD,
+             "PDNO": code,
+             "ORD_QTY": str(int(qty)),
+         }
+-        return _order_cash(body, is_sell=is_sell)
++        resp = _order_cash(body, is_sell=is_sell)
++        blocked = _is_order_disallowed(resp)
++        if blocked:
++            _mark_order_blocked(blocked, now)
++        return resp
+     else:
+         # 지정가(고정, 00)
+         body = {
+             "CANO": CANO,
+             "ACNT_PRDT_CD": ACNT_PRDT_CD,
+             "PDNO": code,
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "00",
+             "ORD_UNPR": str(int(price)),
+             "EXCG_ID_DVSN_CD": "KRX",
+         }
+         if is_sell:
+             body["SLL_TYPE"] = "01"
+         hk = _create_hashkey(body)
+         tr_id = ("VTTC0011U" if KIS_ENV == "practice" else "TTTC0011U") if is_sell else ("VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U")
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+         hdr = _headers(tr_id, hashkey=hk)
+ 
+         log_body = {k: ("***" if k in ("CANO", "ACNT_PRDT_CD") else v) for k, v in body.items()}
+         logger.info(f"[ORDER_REQ_LIMIT] tr_id={tr_id} body={log_body}")
+         r = session.post(url, headers=hdr, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+         raw = r.text
+         try:
+             j = r.json()
+         except Exception:
+             j = {"_non_json": True}
+         logger.info(f"[ORDER_RESP_LIMIT] status={r.status_code} json={j} raw_head={raw[:300]}")
++        blocked = _is_order_disallowed(j)
++        if blocked:
++            _mark_order_blocked(blocked, now)
+         return j if isinstance(j, dict) else {"_status": r.status_code, "raw": raw[:500]}
+ 
+ 
+ # =============================
+ # 잔고/예수금/체결 조회
+ # =============================
+ 
+ def inquire_cash_balance() -> int:
+     _guard_live_trading("cash_balance")
+     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+     tr_id = "VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R"
+     hdr = _headers(tr_id)
+     params = {
+         "CANO": CANO,
+         "ACNT_PRDT_CD": ACNT_PRDT_CD,
+         "AFHR_FLPR_YN": "N",
+         "UNPR_YN": "N",
+         "UNPR_DVSN": "01",
+         "FUND_STTL_ICLD_YN": "N",
+         "FNCG_AMT_AUTO_RDPT_YN": "N",
+         "PRCS_DVSN": "01",
+         "OFL_YN": "N",
+         "INQR_DVSN": "02",
+         "CTX_AREA_FK100": "",
+         "CTX_AREA_NK100": "",
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 4c39f3597e36875092e849d5abe9b03f4d7804ff..10e0da1e91b96a1a1651c13cc8ef47fe6144491a 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -4,52 +4,54 @@
+ # - 토큰 캐시
+ # - 시세/일봉/ATR
+ # - 잔고/주문
+ # - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
+ # - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
+ # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
+ # - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
+ # - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+ 
+ import os
+ import json
+ import time
+ import random
+ import logging
+ import threading
+ import csv
+ from datetime import datetime, timedelta
+ from typing import Dict, List, Optional, Tuple, Any
+ 
+ import requests
+ import pytz
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
+ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
++from trader.time_utils import is_trading_day, is_trading_window, now_kst
+ 
+ logger = logging.getLogger(__name__)
++_ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+ 
+ 
+ class NetTemporaryError(Exception):
+     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+     pass
+ 
+ 
+ class DataEmptyError(Exception):
+     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
+     pass
+ 
+ 
+ class DataShortError(Exception):
+     """정상응답이나 캔들이 need_n 미만."""
+     pass
+ 
+ 
+ def _build_session():
+     s = requests.Session()
+     retry = Retry(
+         total=6, connect=5, read=5, status=3,
+         backoff_factor=0.6,
+         status_forcelist=[429, 500, 502, 503, 504],
+         allowed_methods=["GET", "POST"]
+     )
+@@ -92,50 +94,92 @@ def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: s
+     try:
+         os.makedirs("fills", exist_ok=True)
+         path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
+         header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note"]
+         row = [
+             datetime.now().isoformat(),
+             side,
+             code,
+             name or "",
+             int(qty),
+             float(price) if price is not None else 0.0,
+             str(odno) if odno is not None else "",
+             note or "",
+         ]
+         new = not os.path.exists(path)
+         with open(path, "a", newline="", encoding="utf-8") as f:
+             w = csv.writer(f)
+             if new:
+                 w.writerow(header)
+             w.writerow(row)
+         logger.info(f"[APPEND_FILL] {side} {code} qty={qty} price={price} odno={odno}")
+     except Exception as e:
+         logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
+ 
+ 
++def _order_block_reason(now: datetime | None = None) -> Optional[str]:
++    now = now or now_kst()
++    state_date = _ORDER_BLOCK_STATE.get("date")
++    state_reason = _ORDER_BLOCK_STATE.get("reason")
++    if state_date and state_date != now.date():
++        _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
++        state_date, state_reason = None, None
++    if state_date == now.date() and state_reason:
++        return str(state_reason)
++    if not is_trading_day(now):
++        _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
++        return "NON_TRADING_DAY"
++    if not is_trading_window(now):
++        return "OUTSIDE_TRADING_WINDOW"
++    return None
++
++
++def _mark_order_blocked(reason: str, now: datetime | None = None) -> None:
++    now = now or now_kst()
++    _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
++
++
++def _is_order_disallowed(resp: Any) -> Optional[str]:
++    if not isinstance(resp, dict):
++        return None
++    msg1 = str(resp.get("msg1") or "")
++    msg_cd = str(resp.get("msg_cd") or "")
++    msg = f"{msg1} {msg_cd}".strip()
++    primary_phrases = ("영업일이 아닙니다", "주문 가능 시간이 아닙니다", "주문가능시간이 아닙니다")
++    if any(p in msg1 for p in primary_phrases):
++        return msg or "ORDER_NOT_ALLOWED"
++
++    low = msg.lower()
++    keywords = ("휴장", "가능시간", "closed")
++    if any(k in low for k in keywords):
++        return msg or "ORDER_NOT_ALLOWED"
++    status = resp.get("_status")
++    if isinstance(status, int) and status in (401, 403):
++        return f"HTTP_{status}"
++    return None
++
++
+ class _RateLimiter:
+     def __init__(self, min_interval_sec: float = 0.20):
+         self.min_interval = float(min_interval_sec)
+         self.last_at: Dict[str, float] = {}
+         self._lock = threading.Lock()
+ 
+     def wait(self, key: str):
+         with self._lock:
+             now = time.time()
+             last = self.last_at.get(key, 0.0)
+             delta = now - last
+             if delta < self.min_interval:
+                 time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
+             self.last_at[key] = time.time()
+ 
+ 
+ TR_MAP = {
+     "practice": {
+         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY", "VTTC0012U"), "VTTC0802U"],
+         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL", "VTTC0011U"), "VTTC0801U"],
+         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE", "VTTC8434R")],
+         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
+         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
+         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
+@@ -1088,50 +1132,56 @@ class KisAPI:
+                 qty = hldg if hldg > 0 else ord_psbl
+                 if pdno and qty > 0:
+                     mp[pdno] = qty
+             except Exception:
+                 continue
+         logger.info(f"[보유수량맵] {len(mp)}종목")
+         return mp
+ 
+     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+     def get_balance(self) -> Dict[str, object]:
+         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
+ 
+     def get_balance_all(self) -> Dict[str, object]:
+         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
+         return self.get_balance()
+ 
+     # -------------------------------
+     # 주문 공통, 시장가/지정가, 매수/매도
+     # -------------------------------
+     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+ 
+         # TR 후보 순차 시도
+         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
+ 
++        now = now_kst()
++        block_reason = _order_block_reason(now)
++        if block_reason:
++            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, body.get("PDNO"), body.get("ORD_QTY"))
++            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
++
+         # Fallback: 시장가 → IOC시장가 → 최유리
+         ord_dvsn_chain = ["01", "13", "03"]
+         last_err = None
+ 
+         for tr_id in tr_list:
+             for ord_dvsn in ord_dvsn_chain:
+                 body["ORD_DVSN"] = ord_dvsn
+                 body["ORD_UNPR"] = "0"
+                 if is_sell and not body.get("SLL_TYPE"):
+                     body["SLL_TYPE"] = "01"
+                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+ 
+                 # HashKey
+                 try:
+                     hk = self._create_hashkey(body)
+                 except Exception as e:
+                     logger.error(f"[ORDER_HASH_FAIL] body={body} ex={e}")
+                     last_err = e
+                     continue
+ 
+                 headers = self._headers(tr_id, hk)
+ 
+                 # 레이트리밋(주문은 별 키)
+                 self._limiter.wait("orders")
+ 
+@@ -1193,50 +1243,53 @@ class KisAPI:
+                                 code=pdno,
+                                 name="",
+                                 qty=qty,
+                                 price=price_for_fill,
+                                 odno=odno,
+                                 note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
+                             )
+                         except Exception as e:
+                             logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                         return data
+ 
+                     msg_cd = data.get("msg_cd", "")
+                     msg1 = data.get("msg1", "")
+                     # 게이트웨이/서버 에러류는 재시도
+                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
+                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                         logger.error(
+                             f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
+                             f"resp={data} → sleep {backoff:.2f}s"
+                         )
+                         time.sleep(backoff)
+                         last_err = data
+                         continue
+ 
+                     logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
++                    blocked = _is_order_disallowed(data)
++                    if blocked:
++                        _mark_order_blocked(blocked, now)
+                     return None
+ 
+                 logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
+ 
+         raise Exception(f"주문 실패: {last_err}")
+ 
+     # -------------------------------
+     # 매수/매도 (기본)
+     # -------------------------------
+     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "01",  # 시장가
+             "ORD_UNPR": "0",
+         }
+         return self._order_cash(body, is_sell=False)
+ 
+     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+         # --- 강화된 사전점검: 보유수량 우선 ---
+         pos = self.get_positions() or []
+         hldg = 0
+         ord_psbl = 0
+@@ -1267,95 +1320,110 @@ class KisAPI:
+                     f"last={last} age={now_ts-last:.1f}s"
+                 )
+                 return None
+ 
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "SLL_TYPE": "01",  # 일반매도
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "01",
+             "ORD_UNPR": "0",
+             "EXCG_ID_DVSN_CD": "KRX",
+         }
+         resp = self._order_cash(body, is_sell=True)
+         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+             with self._recent_sells_lock:
+                 self._recent_sells[pdno] = time.time()
+                 cutoff = time.time() - (self._recent_sells_cooldown * 5)
+                 keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
+                 for k in keys_to_del:
+                     del self._recent_sells[k]
+         return resp
+ 
+     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
++        now = now_kst()
++        block_reason = _order_block_reason(now)
++        if block_reason:
++            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
++            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
++
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "00",  # 지정가
+             "ORD_UNPR": str(int(price)),
+             "EXCG_ID_DVSN_CD": "KRX",
+         }
+         hk = self._create_hashkey(body)
+         tr_list = _pick_tr(self.env, "ORDER_BUY")
+         if not tr_list:
+             raise Exception("ORDER_BUY TR 미구성")
+         tr_id = tr_list[0]
+         headers = self._headers(tr_id, hk)
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+         # [CHG] 안전요청 사용
+         resp = self._safe_request(
+             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+         )
+         data = resp.json()
+         if resp.status_code == 200 and data.get("rt_cd") == "0":
+             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+             try:
+                 out = data.get("output") or {}
+                 odno = out.get("ODNO") or out.get("ord_no") or ""
+                 pdno = safe_strip(body.get("PDNO", ""))
+                 qty_int = int(float(body.get("ORD_QTY", "0")))
+                 price_for_fill = float(body.get("ORD_UNPR", 0))
+                 append_fill(
+                     side="BUY",
+                     code=pdno,
+                     name="",
+                     qty=qty_int,
+                     price=price_for_fill,
+                     odno=odno,
+                     note=f"limit,tr={tr_id}",
+                 )
+             except Exception as e:
+                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
+             return data
+         logger.error(f"[BUY_LIMIT_FAIL] {data}")
++        blocked = _is_order_disallowed(data)
++        if blocked:
++            _mark_order_blocked(blocked, now)
+         return None
+ 
+     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
++        now = now_kst()
++        block_reason = _order_block_reason(now)
++        if block_reason:
++            logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
++            return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
++
+         # --- 강화된 사전점검: 보유수량 우선 ---
+         pos = self.get_positions() or []
+         hldg = 0
+         ord_psbl = 0
+         for r in pos:
+             if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                 hldg = int(float(r.get("hldg_qty", "0")))
+                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                 break
+ 
+         base_qty = hldg if hldg > 0 else ord_psbl
+         if base_qty <= 0:
+             logger.error(
+                 f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}"
+             )
+             return None
+ 
+         if qty > base_qty:
+             logger.warning(
+                 f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} "
+                 f"(hldg={hldg}, ord_psbl={ord_psbl})"
+             )
+             qty = base_qty
+ 
+         # 중복 매도 방지(메모리 기반)
+@@ -1392,50 +1460,53 @@ class KisAPI:
+         )
+         data = resp.json()
+         if resp.status_code == 200 and data.get("rt_cd") == "0":
+             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+             try:
+                 out = data.get("output") or {}
+                 odno = out.get("ODNO") or out.get("ord_no") or ""
+                 pdno = safe_strip(body.get("PDNO", ""))
+                 qty_int = int(float(body.get("ORD_QTY", "0")))
+                 price_for_fill = float(body.get("ORD_UNPR", 0))
+                 append_fill(
+                     side="SELL",
+                     code=pdno,
+                     name="",
+                     qty=qty_int,
+                     price=price_for_fill,
+                     odno=odno,
+                     note=f"limit,tr={tr_id}",
+                 )
+             except Exception as e:
+                 logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+             with self._recent_sells_lock:
+                 self._recent_sells[pdno] = time.time()
+             return data
+         logger.error(f"[SELL_LIMIT_FAIL] {data}")
++        blocked = _is_order_disallowed(data)
++        if blocked:
++            _mark_order_blocked(blocked, now)
+         return None
+ 
+     # -------------------------------
+     # 매수/매도 (신규 가드 사용 버전)
+     # -------------------------------
+     def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, **kwargs):
+         """
+         지정가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
+         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
+         """
+         # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
+         if self.env == "practice":
+             logger.info(
+                 f"[BUY_GUARD] practice env → guard 생략, 직접 지정가 주문 "
+                 f"(code={code}, qty={qty}, limit={limit_price})"
+             )
+             return self.buy_stock_limit(code, qty, limit_price)
+ 
+         try:
+             limit_price = int(limit_price)
+         except Exception:
+             limit_price = 0
+         if limit_price <= 0 or int(qty) <= 0:
+             raise ValueError("invalid limit buy params")
+ 
+diff --git a/trader/legacy_kosdaq_runner.py b/trader/legacy_kosdaq_runner.py
+index bb43aca8a424795b6b996333ba3c4ee240edb2ca..bd9f8177b8b8fe0b635557b3b6fe1208950e2cb6 100644
+--- a/trader/legacy_kosdaq_runner.py
++++ b/trader/legacy_kosdaq_runner.py
+@@ -1,52 +1,74 @@
+ # -*- coding: utf-8 -*-
+ """거래 메인 루프.
+ 
+ 기존 trader.py의 설정/유틸을 분리하고, 메인 진입점만 남겨 전략 추가가
+ 쉬운 구조로 변경했다.
+ """
+ from __future__ import annotations
+ 
+ import time
+ from datetime import datetime, time as dtime, timedelta
+ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+ 
+ 
+-from .config import (
+-    DAILY_CAPITAL,
+-    FORCE_SELL_PASSES_CLOSE,
+-    FORCE_SELL_PASSES_CUTOFF,
+-    KST,
+-    RATE_SLEEP_SEC,
+-    SELL_ALL_BALANCES_AT_CUTOFF,
+-    SELL_FORCE_TIME,
+-    SLIPPAGE_ENTER_GUARD_PCT,
+-    USE_PULLBACK_ENTRY,
+-    PULLBACK_MAX_BUYS_PER_DAY,
+-    _cfg,
+-    logger,
+-)
++try:
++    from .config import (
++        DAILY_CAPITAL,
++        FORCE_SELL_PASSES_CLOSE,
++        FORCE_SELL_PASSES_CUTOFF,
++        ALLOW_WHEN_CLOSED,
++        KST,
++        RATE_SLEEP_SEC,
++        SELL_ALL_BALANCES_AT_CUTOFF,
++        SELL_FORCE_TIME,
++        SLIPPAGE_ENTER_GUARD_PCT,
++        USE_PULLBACK_ENTRY,
++        PULLBACK_MAX_BUYS_PER_DAY,
++        _cfg,
++        logger,
++    )
++except ImportError:
++    # ALLOW_WHEN_CLOSED가 누락돼도 러너가 즉시 중단되지 않도록 안전한 기본값을 제공한다.
++    from .config import (
++        DAILY_CAPITAL,
++        FORCE_SELL_PASSES_CLOSE,
++        FORCE_SELL_PASSES_CUTOFF,
++        KST,
++        RATE_SLEEP_SEC,
++        SELL_ALL_BALANCES_AT_CUTOFF,
++        SELL_FORCE_TIME,
++        SLIPPAGE_ENTER_GUARD_PCT,
++        USE_PULLBACK_ENTRY,
++        PULLBACK_MAX_BUYS_PER_DAY,
++        _cfg,
++        logger,
++    )
++
++    ALLOW_WHEN_CLOSED = False
++    logger.warning("[CONFIG] ALLOW_WHEN_CLOSED missing; defaulting to False")
++from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
+ from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
+ 
+ if TYPE_CHECKING:
+     # core 쪽에 구현돼 있는 헬퍼들을 타입체커에게만 명시적으로 알려준다.
+     from .core import (
+         _this_iso_week_key,
+         _get_effective_ord_cash,
+         _to_float,
+         _to_int,
+         _weight_to_qty,
+         _classify_champion_grade,
+         _update_market_regime,
+         _notional_to_qty,
+         _fetch_balances,
+         _init_position_state_from_balance,
+         _sell_once,
+         _adaptive_exit,
+         _compute_daily_entry_context,
+         _compute_intraday_entry_context,
+         _safe_get_price,
+         _round_to_tick,
+         _init_position_state,
+         _detect_pullback_reversal,
+         _has_bullish_trend_structure,
+     )
+@@ -490,78 +512,110 @@ def main(capital_override: float | None = None):
+     code_to_target: Dict[str, Any] = selected_targets
+ 
+     # 눌림목 스캔용 코스닥 시총 상위 리스트 (챔피언과 별도로 관리)
+     pullback_watch: Dict[str, Dict[str, Any]] = {}
+     if USE_PULLBACK_ENTRY:
+         try:
+             pb_weight = max(0.0, min(PULLBACK_UNIT_WEIGHT, 1.0))
+             base_notional = int(round(capital_active * pb_weight))
+             pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
+             for _, row in pb_df.iterrows():
+                 code = str(row.get("Code") or row.get("code") or "").zfill(6)
+                 if not code:
+                     continue
+                 pullback_watch[code] = {
+                     "code": code,
+                     "name": row.get("Name") or row.get("name"),
+                     "notional": base_notional,
+                 }
+             logger.info(
+                 f"[PULLBACK-WATCH] 코스닥 시총 Top{PULLBACK_TOPN} {len(pullback_watch)}종목 스캔 준비"
+             )
+         except Exception as e:
+             logger.warning(f"[PULLBACK-WATCH-FAIL] 시총 상위 로드 실패: {e}")
+ 
+     loop_sleep_sec = 2.5  # 메인 루프 대기 시간(초)
++    max_closed_checks = 3
++    closed_checks = 0
+ 
+     try:
+         while True:
+             # === 코스닥 레짐 업데이트 ===
+             regime = _update_market_regime(kis)
+             regime_state = regime
+             pct_txt = f"{regime.get('pct_change'):.2f}%" if regime.get("pct_change") is not None else "N/A"
+             logger.info(f"[REGIME] mode={regime['mode']} stage={regime['bear_stage']} pct={pct_txt}")
+ 
+             # 장 상태
+             now_dt_kst = datetime.now(KST)
+             is_open = kis.is_market_open()
+             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
+             today_prefix = now_dt_kst.strftime("%Y-%m-%d")
+             _cleanup_expired_pending(traded, now_dt_kst, ttl_sec=300)
+             traded_today = _traded_today(traded, today_prefix)
+ 
+             if now_dt_kst.date() != pullback_buy_date:
+                 pullback_buy_date = now_dt_kst.date()
+                 pullback_buys_today = 0
+ 
+             if not is_open:
++                if not is_trading_day(now_dt_kst):
++                    logger.error("[CLOSED] 비거래일 감지 → 루프 종료")
++                    break
++
++                if now_dt_kst.time() < MARKET_OPEN:
++                    seconds_to_open = int(
++                        (datetime.combine(now_dt_kst.date(), MARKET_OPEN, tzinfo=KST) - now_dt_kst).total_seconds()
++                    )
++                    sleep_for = max(1, min(seconds_to_open, 300))
++                    logger.info(
++                        "[PREOPEN] 장 시작까지 %ss 남음 → %ss 대기 후 재확인", seconds_to_open, sleep_for
++                    )
++                    time.sleep(sleep_for)
++                    closed_checks = 0
++                    continue
++
++                if now_dt_kst.time() >= MARKET_CLOSE:
++                    logger.error("[CLOSED] 장 마감 이후 → 루프 종료")
++                    break
++
++                closed_checks += 1
+                 if not ALLOW_WHEN_CLOSED:
+-                    logger.info("[CLOSED] 장 종료 → 10초 대기 후 재확인")
++                    if closed_checks > max_closed_checks:
++                        logger.error("[CLOSED] 장 종료 반복 %s회 초과 → 루프 종료", max_closed_checks)
++                        break
++                    logger.info(
++                        "[CLOSED] 장중인데 API가 닫힘 응답 → 10초 대기 후 재확인 (%s/%s)",
++                        closed_checks,
++                        max_closed_checks,
++                    )
+                     time.sleep(10)
+                     continue
+                 else:
+                     logger.warning("[CLOSED-DATA] 장 종료지만 환경설정 허용 → 시세 조회 후 진행")
++            else:
++                closed_checks = 0
+ 
+             if kis.should_cooldown(now_dt_kst):
+                 logger.warning("[COOLDOWN] 2초간 대기 (API 제한 보호)")
+                 time.sleep(2)
+ 
+             # 잔고 가져오기
+             prev_holding = holding if isinstance(holding, dict) else {}
+             balances = _fetch_balances(kis)
+             holding = {}
+             for bal in balances:
+                 code = bal.get("code")
+                 qty = int(bal.get("qty", 0))
+                 if qty <= 0:
+                     continue
+                 price = float(bal.get("avg_price", 0.0))
+                 holding[code] = {
+                     "qty": qty,
+                     "buy_price": price,
+                     "bear_s1_done": False,
+                     "bear_s2_done": False,
+                 }
+                 _init_position_state_from_balance(kis, holding, code, price, qty)
+ 
+             # 잔고 기준으로 보유종목 매도 가능 수량 맵 생성
+             ord_psbl_map = {bal.get("code"): int(bal.get("sell_psbl_qty", 0)) for bal in balances}
+diff --git a/trader/time_utils.py b/trader/time_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf7615cacd95e434da76c648d740dbac5c5a5126
+--- /dev/null
++++ b/trader/time_utils.py
+@@ -0,0 +1,30 @@
++"""거래일/거래 가능 시간 헬퍼."""
++
++from __future__ import annotations
++
++from datetime import datetime, time, timedelta, timezone
++
++KST = timezone(timedelta(hours=9))
++MARKET_OPEN = time(9, 0)
++MARKET_CLOSE = time(15, 20)
++
++
++def now_kst() -> datetime:
++    """현재 KST 시각을 반환."""
++
++    return datetime.now(tz=KST)
++
++
++def is_trading_day(ts: datetime | None = None) -> bool:
++    """주말을 제외한 기본 거래일 여부를 판정."""
++
++    ts = ts or now_kst()
++    return ts.weekday() < 5
++
++
++def is_trading_window(ts: datetime | None = None) -> bool:
++    """당일 장중(09:00~15:20) 여부."""
++
++    ts = ts or now_kst()
++    return is_trading_day(ts) and MARKET_OPEN <= ts.time() <= MARKET_CLOSE
++
+diff --git a/trader/trader.py b/trader/trader.py
+index 16de2145910bc107321f2375bafa6906df654a73..15dae007b8e876fe99556ad9726a40a6d05128a8 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,19 +1,25 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ 
+ from portfolio.portfolio_manager import PortfolioManager
++from trader.time_utils import is_trading_day, now_kst
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> None:
++    now = now_kst()
++    if not is_trading_day(now):
++        logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
++        return
++
+     mgr = PortfolioManager()
+     result = mgr.run_once()
+     logger.info("[TRADER] cycle complete %s", result)
+ 
+ 
+ if __name__ == "__main__":
+     main()
