@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
-      ALLOW_NON_TRADING_ORDER: "1"
+      #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
+      #ALLOW_NON_TRADING_ORDER: "1"
       # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
       KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
