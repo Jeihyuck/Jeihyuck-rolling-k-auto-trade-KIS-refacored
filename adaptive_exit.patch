@@ -1,0 +1,90 @@
+diff --git a/trader/legacy_kosdaq_runner.py b/trader/legacy_kosdaq_runner.py
+index bd9f8177b8b8fe0b635557b3b6fe1208950e2cb6..fc263b18d92d4dabadf153f2d1e85627e7f9d9c8 100644
+--- a/trader/legacy_kosdaq_runner.py
++++ b/trader/legacy_kosdaq_runner.py
+@@ -742,71 +742,64 @@ def main(capital_override: float | None = None):
+                             f"[REGIME-REDUCE-S2] {code} 약세2단계 {REG_PARTIAL_S2 * 100:.0f}% 축소 → {cut_qty}"
+                         )
+                         exec_px, result = _sell_once(kis, code, cut_qty, prefer_market=True)
+                         holding[code]["qty"] -= int(cut_qty)
+                         holding[code]["bear_s2_done"] = True
+                         log_trade(
+                             {
+                                 "datetime": now_str,
+                                 "code": code,
+                                 "name": None,
+                                 "qty": int(cut_qty),
+                                 "K": holding[code].get("k_value"),
+                                 "target_price": holding[code].get("target_price_src"),
+                                 "strategy": "레짐축소",
+                                 "side": "SELL",
+                                 "price": exec_px,
+                                 "amount": int((exec_px or 0)) * int(cut_qty),
+                                 "result": result,
+                                 "reason": "시장약세 2단계 축소",
+                             }
+                         )
+                         save_state(holding, traded)
+                         time.sleep(RATE_SLEEP_SEC)
+ 
+                 # --- 1b) TP/SL/트레일링, VWAP 가드 ---
+-                _adaptive_exit(
+-                    kis,
+-                    holding,
+-                    traded,
+-                    code,
+-                    ord_psbl_map,
+-                    regime,
+-                    now_dt_kst,
+-                    now_str,
+-                    R20,
+-                    can_buy,
+-                    PARTIAL1,
+-                    PARTIAL2,
+-                    TRAIL_PCT_BULL,
+-                    TRAIL_PCT_BEAR,
+-                    TP_PROFIT_PCT_BULL,
+-                    DEFAULT_PROFIT_PCT,
+-                    DEFAULT_LOSS_PCT,
+-                    ATR_STOP,
+-                    FAST_STOP,
+-                )
++                try:
++                    exit_reason, exec_px, exit_result, sold_qty = _adaptive_exit(
++                        kis,
++                        code,
++                        holding[code],
++                        regime_mode=mode or "neutral",
++                    )
++                except Exception as e:
++                    logger.error(f"[_adaptive_exit 실패] {code}: {e}")
++                    exit_reason = exec_px = exit_result = sold_qty = None
++
++                if sold_qty:
++                    save_state(holding, traded)
++                    time.sleep(RATE_SLEEP_SEC)
+ 
+             # === (2) 신규 진입 로직 (챔피언) ===
+             for code, info in code_to_target.items():
+                 if not can_buy:
+                     continue
+ 
+                 if code in traded_today:
+                     continue
+ 
+                 if code in holding:
+                     continue
+ 
+                 target_qty = int(info.get("qty", 0))
+                 if target_qty <= 0:
+                     logger.info(f"[REBALANCE] {code}: target_qty=0 → 스킵")
+                     continue
+ 
+                 target_price = info.get("target_price")
+                 k_value = info.get("best_k")
+                 strategy = info.get("strategy")
+                 weight = _to_float(info.get("weight") or 0.0)
+ 
+                 planned_notional = int(_to_float(info.get("target_notional") or 0.0) or 0)
+                 logger.info(
+                     f"[TARGET] {code} qty={target_qty} tgt_px={target_price} notional={planned_notional} K={k_value}"

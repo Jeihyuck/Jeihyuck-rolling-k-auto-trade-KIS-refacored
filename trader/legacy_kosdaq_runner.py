@@ -764,27 +764,20 @@ def main(capital_override: float | None = None):
                         time.sleep(RATE_SLEEP_SEC)
 
                 # --- 1b) TP/SL/트레일링, VWAP 가드 ---
-                _adaptive_exit(
-                    kis,
-                    holding,
-                    traded,
-                    code,
-                    ord_psbl_map,
-                    regime,
-                    now_dt_kst,
-                    now_str,
-                    R20,
-                    can_buy,
-                    PARTIAL1,
-                    PARTIAL2,
-                    TRAIL_PCT_BULL,
-                    TRAIL_PCT_BEAR,
-                    TP_PROFIT_PCT_BULL,
-                    DEFAULT_PROFIT_PCT,
-                    DEFAULT_LOSS_PCT,
-                    ATR_STOP,
-                    FAST_STOP,
-                )
+                try:
+                    exit_reason, exec_px, exit_result, sold_qty = _adaptive_exit(
+                        kis,
+                        code,
+                        holding[code],
+                        regime_mode=mode or "neutral",
+                    )
+                except Exception as e:
+                    logger.error(f"[_adaptive_exit 실패] {code}: {e}")
+                    exit_reason = exec_px = exit_result = sold_qty = None
+
+                if sold_qty:
+                    save_state(holding, traded)
+                    time.sleep(RATE_SLEEP_SEC)
 
             # === (2) 신규 진입 로직 (챔피언) ===
             for code, info in code_to_target.items():
