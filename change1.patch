@@ -1,0 +1,972 @@
+diff --git a/trader/config.py b/trader/config.py
+index fd164461d55ba9a26d5ff76dd1cbd8417222f9e9..00ebc400c72ac870268f06119fcdf2cdf42fe65d 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -47,50 +47,51 @@ CONFIG = {
+     "KOSDAQ_ETF_FALLBACK": "229200",
+     "REG_BULL_MIN_UP_PCT": "0.5",
+     "REG_BULL_MIN_MINUTES": "10",
+     "REG_BEAR_VWAP_MINUTES": "10",
+     "REG_BEAR_DROP_FROM_HIGH": "0.7",
+     "REG_BEAR_STAGE1_MINUTES": "20",
+     "REG_BEAR_STAGE2_ADD_DROP": "0.5",
+     "REG_PARTIAL_S1": "0.30",
+     "REG_PARTIAL_S2": "0.30",
+     "TRAIL_PCT_BULL": "0.025",
+     "TRAIL_PCT_BEAR": "0.012",
+     "TP_PROFIT_PCT_BULL": "3.5",
+     # 신고가 돌파 후 3일 눌림 + 반등 매수용 파라미터
+     "USE_PULLBACK_ENTRY": "true",          # true면 '신고가 → 3일 연속 하락 → 반등' 패턴 충족 시에만 눌림목 진입 허용
+     "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
+     "PULLBACK_DAYS": "3",                  # 연속 하락 일수
+     "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
+     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
+     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
+     "PULLBACK_MAX_BUYS_PER_DAY": "5",      # 눌림목 하루 최대 신규 매수 건수
+     # 챔피언 후보 필터
+     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
+     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
+     "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
+     "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
++    "NEUTRAL_ENTRY_SCALE": "0.6",          # 중립 레짐 신규/재진입 스케일링 비율
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+ }
+ 
+ 
+ def _cfg(key: str) -> str:
+     """환경변수 > CONFIG 기본값"""
+     return os.getenv(key, CONFIG.get(key, ""))
+ 
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ LOG_DIR = Path(__file__).parent / "logs"
+ LOG_DIR.mkdir(exist_ok=True)
+ STATE_FILE = Path(__file__).parent / "trade_state.json"
+ 
+ # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
+ MARKET_MAP: Dict[str, str] = {
+     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
+@@ -139,47 +140,48 @@ PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+ PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")
+ CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
+ CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
+ CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
+ CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
+ 
+ # 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
+ CHAMPION_A_RULES = {
+     "min_trades": 30,
+     "min_cumret_pct": 40.0,
+     "max_mdd_pct": 25.0,
+     "min_win_pct": 50.0,
+     "min_sharpe": 1.2,
+     "min_turnover": 3_000_000_000,  # 30억
+ }
+ 
+ GOOD_ENTRY_PULLBACK_RANGE = (5.0, 15.0)  # 신고가 대비 눌림폭(%): 최소~최대
+ GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
+ GOOD_ENTRY_MAX_FROM_PEAK = 0.97  # 현재가/최근고점 최대치(≤0.97)
+ GOOD_ENTRY_MIN_RR = 2.0  # 기대수익/리스크 최소 비율
+ GOOD_ENTRY_MIN_INTRADAY_SIG = 2  # GOOD 타점으로 인정하기 위한 최소 intraday 시그널 개수
+ 
+ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+ BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
++NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
+ 
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
+ 
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+ 
+ def _this_iso_week_key(now=None):
+     now = now or datetime.now(KST)
+     return f"{now.year}-W{now.isocalendar().week:02d}"
+ 
+diff --git a/trader/core_constants.py b/trader/core_constants.py
+index 9baf2a9bcffc4491885ba13cc59f6c97e18951b2..8585a18a3ac767679ebf85837128b0d9e33baee7 100644
+--- a/trader/core_constants.py
++++ b/trader/core_constants.py
+@@ -39,50 +39,51 @@ W_MIN_ONE = config.W_MIN_ONE
+ REBALANCE_ANCHOR = config.REBALANCE_ANCHOR
+ WEEKLY_ANCHOR_REF = config.WEEKLY_ANCHOR_REF
+ MOMENTUM_OVERRIDES_FORCE_SELL = config.MOMENTUM_OVERRIDES_FORCE_SELL
+ MOM_FAST = config.MOM_FAST
+ MOM_SLOW = config.MOM_SLOW
+ MOM_TH_PCT = config.MOM_TH_PCT
+ USE_PULLBACK_ENTRY = config.USE_PULLBACK_ENTRY
+ PULLBACK_LOOKBACK = config.PULLBACK_LOOKBACK
+ PULLBACK_DAYS = config.PULLBACK_DAYS
+ PULLBACK_REVERSAL_BUFFER_PCT = config.PULLBACK_REVERSAL_BUFFER_PCT
+ PULLBACK_TOPN = config.PULLBACK_TOPN
+ PULLBACK_UNIT_WEIGHT = config.PULLBACK_UNIT_WEIGHT
+ CHAMPION_MIN_TRADES = config.CHAMPION_MIN_TRADES
+ CHAMPION_MIN_WINRATE = config.CHAMPION_MIN_WINRATE
+ CHAMPION_MAX_MDD = config.CHAMPION_MAX_MDD
+ CHAMPION_MIN_SHARPE = config.CHAMPION_MIN_SHARPE
+ CHAMPION_A_RULES = config.CHAMPION_A_RULES
+ GOOD_ENTRY_PULLBACK_RANGE = config.GOOD_ENTRY_PULLBACK_RANGE
+ GOOD_ENTRY_MA20_RANGE = config.GOOD_ENTRY_MA20_RANGE
+ GOOD_ENTRY_MAX_FROM_PEAK = config.GOOD_ENTRY_MAX_FROM_PEAK
+ GOOD_ENTRY_MIN_RR = config.GOOD_ENTRY_MIN_RR
+ GOOD_ENTRY_MIN_INTRADAY_SIG = config.GOOD_ENTRY_MIN_INTRADAY_SIG
+ BAD_ENTRY_MAX_MA20_DIST = config.BAD_ENTRY_MAX_MA20_DIST
+ BAD_ENTRY_MAX_PULLBACK = config.BAD_ENTRY_MAX_PULLBACK
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = config.BAD_ENTRY_MAX_BELOW_VWAP_RATIO
++NEUTRAL_ENTRY_SCALE = config.NEUTRAL_ENTRY_SCALE
+ ALLOW_WHEN_CLOSED = config.ALLOW_WHEN_CLOSED
+ STATE_WEEKLY_PATH = config.STATE_WEEKLY_PATH
+ _this_iso_week_key = config._this_iso_week_key
+ 
+ __all__ = [
+     "logger",
+     "_cfg",
+     "LOG_DIR",
+     "STATE_FILE",
+     "MARKET_MAP",
+     "EXCLUDE_STATE",
+     "KST",
+     "SELL_FORCE_TIME_STR",
+     "SELL_FORCE_TIME",
+     "SELL_ALL_BALANCES_AT_CUTOFF",
+     "RATE_SLEEP_SEC",
+     "FORCE_SELL_PASSES_CUTOFF",
+     "FORCE_SELL_PASSES_CLOSE",
+     "PARTIAL1",
+     "PARTIAL2",
+     "TRAIL_PCT",
+     "FAST_STOP",
+     "ATR_STOP",
+     "TIME_STOP_TIME",
+     "DEFAULT_PROFIT_PCT",
+@@ -97,30 +98,31 @@ __all__ = [
+     "REBALANCE_ANCHOR",
+     "WEEKLY_ANCHOR_REF",
+     "MOMENTUM_OVERRIDES_FORCE_SELL",
+     "MOM_FAST",
+     "MOM_SLOW",
+     "MOM_TH_PCT",
+     "USE_PULLBACK_ENTRY",
+     "PULLBACK_LOOKBACK",
+     "PULLBACK_DAYS",
+     "PULLBACK_REVERSAL_BUFFER_PCT",
+     "PULLBACK_TOPN",
+     "PULLBACK_UNIT_WEIGHT",
+     "CHAMPION_MIN_TRADES",
+     "CHAMPION_MIN_WINRATE",
+     "CHAMPION_MAX_MDD",
+     "CHAMPION_MIN_SHARPE",
+     "CHAMPION_A_RULES",
+     "GOOD_ENTRY_PULLBACK_RANGE",
+     "GOOD_ENTRY_MA20_RANGE",
+     "GOOD_ENTRY_MAX_FROM_PEAK",
+     "GOOD_ENTRY_MIN_RR",
+     "GOOD_ENTRY_MIN_INTRADAY_SIG",
+     "BAD_ENTRY_MAX_MA20_DIST",
+     "BAD_ENTRY_MAX_PULLBACK",
+     "BAD_ENTRY_MAX_BELOW_VWAP_RATIO",
++    "NEUTRAL_ENTRY_SCALE",
+     "ALLOW_WHEN_CLOSED",
+     "STATE_WEEKLY_PATH",
+     "_this_iso_week_key",
+ ]
+ 
+diff --git a/trader/legacy_kosdaq_runner.py b/trader/legacy_kosdaq_runner.py
+index fc263b18d92d4dabadf153f2d1e85627e7f9d9c8..5d7395a243096c8682701a7321e29354ced57d15 100644
+--- a/trader/legacy_kosdaq_runner.py
++++ b/trader/legacy_kosdaq_runner.py
+@@ -2,66 +2,68 @@
+ """거래 메인 루프.
+ 
+ 기존 trader.py의 설정/유틸을 분리하고, 메인 진입점만 남겨 전략 추가가
+ 쉬운 구조로 변경했다.
+ """
+ from __future__ import annotations
+ 
+ import time
+ from datetime import datetime, time as dtime, timedelta
+ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+ 
+ 
+ try:
+     from .config import (
+         DAILY_CAPITAL,
+         FORCE_SELL_PASSES_CLOSE,
+         FORCE_SELL_PASSES_CUTOFF,
+         ALLOW_WHEN_CLOSED,
+         KST,
+         RATE_SLEEP_SEC,
+         SELL_ALL_BALANCES_AT_CUTOFF,
+         SELL_FORCE_TIME,
+         SLIPPAGE_ENTER_GUARD_PCT,
+         USE_PULLBACK_ENTRY,
+         PULLBACK_MAX_BUYS_PER_DAY,
++        NEUTRAL_ENTRY_SCALE,
+         _cfg,
+         logger,
+     )
+ except ImportError:
+     # ALLOW_WHEN_CLOSED가 누락돼도 러너가 즉시 중단되지 않도록 안전한 기본값을 제공한다.
+     from .config import (
+         DAILY_CAPITAL,
+         FORCE_SELL_PASSES_CLOSE,
+         FORCE_SELL_PASSES_CUTOFF,
+         KST,
+         RATE_SLEEP_SEC,
+         SELL_ALL_BALANCES_AT_CUTOFF,
+         SELL_FORCE_TIME,
+         SLIPPAGE_ENTER_GUARD_PCT,
+         USE_PULLBACK_ENTRY,
+         PULLBACK_MAX_BUYS_PER_DAY,
++        NEUTRAL_ENTRY_SCALE,
+         _cfg,
+         logger,
+     )
+ 
+     ALLOW_WHEN_CLOSED = False
+     logger.warning("[CONFIG] ALLOW_WHEN_CLOSED missing; defaulting to False")
+ from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
+ from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
+ 
+ if TYPE_CHECKING:
+     # core 쪽에 구현돼 있는 헬퍼들을 타입체커에게만 명시적으로 알려준다.
+     from .core import (
+         _this_iso_week_key,
+         _get_effective_ord_cash,
+         _to_float,
+         _to_int,
+         _weight_to_qty,
+         _classify_champion_grade,
+         _update_market_regime,
+         _notional_to_qty,
+         _fetch_balances,
+         _init_position_state_from_balance,
+         _sell_once,
+         _adaptive_exit,
+         _compute_daily_entry_context,
+@@ -792,83 +794,109 @@ def main(capital_override: float | None = None):
+ 
+                 target_qty = int(info.get("qty", 0))
+                 if target_qty <= 0:
+                     logger.info(f"[REBALANCE] {code}: target_qty=0 → 스킵")
+                     continue
+ 
+                 target_price = info.get("target_price")
+                 k_value = info.get("best_k")
+                 strategy = info.get("strategy")
+                 weight = _to_float(info.get("weight") or 0.0)
+ 
+                 planned_notional = int(_to_float(info.get("target_notional") or 0.0) or 0)
+                 logger.info(
+                     f"[TARGET] {code} qty={target_qty} tgt_px={target_price} notional={planned_notional} K={k_value}"
+                 )
+ 
+                 # [중복 진입 방지] 이미 주문된 종목인지 확인
+                 if code in traded_today:
+                     logger.info(f"[SKIP] {code}: 이미 금일 거래됨")
+                     continue
+ 
+                 if _pending_block(traded, code, now_dt_kst, block_sec=45):
+                     logger.info(f"[SKIP-PENDING] {code}: pending 쿨다운 중 → 재주문 방지")
+                     continue
+ 
++                price_res = _safe_get_price(kis, code, with_source=True)
++                if isinstance(price_res, tuple):
++                    current_price, price_source = price_res
++                else:
++                    current_price, price_source = price_res, None
++
++                if not current_price or current_price <= 0:
++                    logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
++                    continue
++
+                 # === GOOD/BAD 타점 평가 ===
+-                daily_ctx = _compute_daily_entry_context(kis, code, PULLBACK_LOOKBACK)
++                daily_ctx = _compute_daily_entry_context(kis, code, current_price, price_source)
+                 intra_ctx = _compute_intraday_entry_context(kis, code, fast=MOM_FAST, slow=MOM_SLOW)
+ 
++                momentum_confirmed = bool(
++                    daily_ctx.get("strong_trend")
++                    or intra_ctx.get("vwap_reclaim")
++                    or intra_ctx.get("range_break")
++                )
++
++                if mode == "neutral" and not (
++                    info.get("champion_grade") in ("A", "B") or momentum_confirmed
++                ):
++                    logger.info(
++                        f"[ENTRY-SKIP] {code}: neutral 레짐에서 비챔피언/모멘텀 미확인 → 신규 진입 보류"
++                    )
++                    continue
++
+                 if is_bad_entry(code, daily_ctx, intra_ctx, regime_state):
+                     logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
+                     continue
+ 
+                 if not is_good_entry(daily_ctx, intra_ctx):
+                     logger.info(
+                         f"[ENTRY-SKIP] {code}: GOOD 타점 미충족 → 다음 루프에서 재확인"
+                     )
+                     continue
+ 
+                 logger.info(f"[ENTRY-GOOD] {code}: GOOD 타점 확인 → 매수 시도")
+ 
+                 # === VWAP 가드(슬리피지 방어) ===
+                 try:
+                     guard_passed = vwap_guard(kis, code, SLIPPAGE_ENTER_GUARD_PCT)
+                 except Exception as e:
+                     logger.warning(f"[VWAP_GUARD_FAIL] {code}: VWAP 가드 오류 → 진입 보류 ({e})")
+                     continue
+ 
+                 if not guard_passed:
+                     logger.info(f"[VWAP_GUARD] {code}: 슬리피지 위험 → 매수 스킵")
+                     continue
+ 
+-                current_price = _safe_get_price(kis, code)
+-                if not current_price or current_price <= 0:
+-                    logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
+-                    continue
+-
+                 qty = target_qty
++                if mode == "neutral":
++                    scaled_qty = max(1, int(qty * NEUTRAL_ENTRY_SCALE))
++                    if scaled_qty < qty:
++                        logger.info(
++                            f"[ENTRY-SIZE] {code}: neutral 레짐 감축 {qty}→{scaled_qty} (스케일={NEUTRAL_ENTRY_SCALE})"
++                        )
++                    qty = scaled_qty
+                 trade_ctx = {
+                     "datetime": now_str,
+                     "code": code,
+                     "name": info.get("name"),
+                     "qty": int(qty),
+                     "K": k_value,
+                     "target_price": target_price,
+                     "strategy": strategy,
+                     "side": "BUY",
+                 }
+ 
+                 limit_px, mo_px = compute_entry_target(kis, info)
+                 if limit_px is None and mo_px is None:
+                     logger.warning(f"[TARGET-PRICE] {code}: limit/mo 가격 산출 실패 → 스킵")
+                     continue
+ 
+                 if limit_px and abs(limit_px - current_price) / current_price * 100 > SLIPPAGE_LIMIT_PCT:
+                     logger.info(
+                         f"[SLIPPAGE_LIMIT] {code}: 호가乖離 {abs(limit_px - current_price) / current_price * 100:.2f}% → 스킵"
+                     )
+                     continue
+ 
+                 logger.info(
+                     f"[BUY-TRY] {code}: qty={qty} limit={limit_px} mo={mo_px} target={target_price} k={k_value}"
+                 )
+diff --git a/trader/signals.py b/trader/signals.py
+index 4810abcc946840a3ab5b814dc228f6039e265cba..fa50eac90b4e38a45a4367493b21fa7d29189a5d 100644
+--- a/trader/signals.py
++++ b/trader/signals.py
+@@ -1,28 +1,29 @@
+ """시그널 계산 및 시세/밸런스 조회 보조 함수."""
+ from __future__ import annotations
+ 
++import logging
+ from datetime import datetime
+ import time
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from .core_constants import (
+     ALLOW_WHEN_CLOSED,
+     BAD_ENTRY_MAX_BELOW_VWAP_RATIO,
+     BAD_ENTRY_MAX_MA20_DIST,
+     BAD_ENTRY_MAX_PULLBACK,
+     CHAMPION_A_RULES,
+     CHAMPION_MAX_MDD,
+     CHAMPION_MIN_SHARPE,
+     CHAMPION_MIN_TRADES,
+     CHAMPION_MIN_WINRATE,
+     GOOD_ENTRY_MA20_RANGE,
+     GOOD_ENTRY_MAX_FROM_PEAK,
+     GOOD_ENTRY_MIN_INTRADAY_SIG,
+     GOOD_ENTRY_MIN_RR,
+     GOOD_ENTRY_PULLBACK_RANGE,
+     KST,
+     MOMENTUM_OVERRIDES_FORCE_SELL,
+     MOM_FAST,
+     MOM_SLOW,
+     MOM_TH_PCT,
+     PULLBACK_DAYS,
+@@ -43,133 +44,188 @@ from .metrics import vwap_guard
+ __all__ = [
+     "_safe_get_price",
+     "_fetch_balances",
+     "_get_effective_ord_cash",
+     "_get_daily_candles_cached",
+     "_detect_pullback_reversal",
+     "_classify_champion_grade",
+     "_compute_daily_entry_context",
+     "_compute_intraday_entry_context",
+     "is_bad_entry",
+     "is_good_entry",
+     "_get_intraday_1min",
+     "_compute_vwap_from_1min",
+     "_compute_intraday_momentum",
+     "is_strong_momentum_vwap",
+     "get_20d_return_pct",
+     "is_strong_momentum",
+     "_percentile_rank",
+     "_has_bullish_trend_structure",
+     "_weight_to_qty",
+     "_notional_to_qty",
+     "_get_atr",
+ ]
+ 
+ # === [ANCHOR: PRICE_CACHE] 현재가 캐시 & 서킷브레이커 ===
+-_LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts": epoch}
++_LAST_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # code -> {"px": float, "ts": epoch}
+ _PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
+ 
+ # === [ANCHOR: BALANCE_CACHE] 잔고 캐싱 (루프 15초 단일 호출) ===
+ _BALANCE_CACHE: Dict[str, Any] = {"ts": 0.0, "balances": []}
+ 
+-def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
++def _safe_get_price(
++    kis: KisAPI,
++    code: str,
++    ttl_sec: int = 5,
++    stale_ok_sec: int = 30,
++    *,
++    with_source: bool = False,
++) -> Optional[float | Tuple[float, str]]:
+     import time as _t
+     now = _t.time()
+ 
++    def _store_and_return(val: float, source: str, log_level: Optional[int] = None):
++        _LAST_PRICE_CACHE[code] = {"px": float(val), "ts": now, "source": source}
++        if log_level:
++            logger.log(log_level, f"[PRICE_SRC] {code} ← {source} ({float(val):.2f})")
++        return (float(val), source) if with_source else float(val)
++
+     # 0) 서킷브레이커: 최근 실패 누적이면 잠시 건너뛴다
+     cb = _PRICE_CB.get(code, {"fail": 0, "until": 0})
+     primary_allowed = now >= cb.get("until", 0)
+ 
+     # 장마감이면 캐시/종가로 대체
+     try:
+         if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
+             ent = _LAST_PRICE_CACHE.get(code)
+             if ent:
+-                return float(ent["px"])
++                src = ent.get("source") or "cache_close"
++                return (float(ent["px"]), src) if with_source else float(ent["px"])
+             if hasattr(kis, "get_close_price"):
+                 try:
+                     close_px = kis.get_close_price(code)
+                     if close_px and float(close_px) > 0:
+                         val = float(close_px)
+-                        _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
+-                        return val
++                        return _store_and_return(val, "close_after")
+                 except Exception:
+                     pass
+             return None
+     except Exception:
+         pass
+ 
+     # 1) 캐시 최신이면 반환
+     ent = _LAST_PRICE_CACHE.get(code)
+     if ent and (now - ent["ts"] <= ttl_sec):
+-        return float(ent["px"])
++        src = ent.get("source") or "cache_recent"
++        return (float(ent["px"]), src) if with_source else float(ent["px"])
+ 
+     # 2) 1차 소스
+     if primary_allowed:
+         try:
+             px = _with_retry(kis.get_current_price, code)
+             if px is not None and float(px) > 0:
+                 val = float(px)
+-                _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
+                 _PRICE_CB[code] = {"fail": 0, "until": 0}
+-                return val
++                return _store_and_return(val, "realtime")
+             else:
+                 logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({px})")
+         except Exception as e:
+             fail = int(cb.get("fail", 0)) + 1
+             cool = min(60, 3 * fail)
+             _PRICE_CB[code] = {"fail": fail, "until": now + cool}
+             logger.error(f"[NET/API 장애] {code} 현재가 1차조회 실패({e}) → cool {cool}s")
+ 
+     # 3) 보조 소스
+     try:
+         if hasattr(kis, "get_quote_snapshot"):
+             q = kis.get_quote_snapshot(code)
+             cand = None
+             if isinstance(q, dict):
+                 for k in ("tp", "trade_price", "prpr", "close", "price"):
+                     v = q.get(k)
+                     if v and float(v) > 0:
+                         cand = float(v); break
+             if cand and cand > 0:
+-                _LAST_PRICE_CACHE[code] = {"px": cand, "ts": now}
+-                return cand
++                return _store_and_return(cand, "snapshot")
+ 
+         if hasattr(kis, "get_best_ask") and hasattr(kis, "get_best_bid"):
+             ask = kis.get_best_ask(code)
+             bid = kis.get_best_bid(code)
+             if ask and bid and float(ask) > 0 and float(bid) > 0:
+                 mid = (float(ask) + float(bid)) / 2.0
+-                _LAST_PRICE_CACHE[code] = {"px": mid, "ts": now}
+-                return mid
++                return _store_and_return(mid, "mid_quote")
+     except Exception as e:
+         logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 보조소스 실패: {e}")
+ 
+-    # 4) 최후: 캐시가 있으면 stale_ok_sec 내 제공  (BUGFIX: px 반환)
++    def _historical_fallback() -> Optional[Tuple[Optional[float], Optional[str]]]:
++        """
++        실시간 조회 실패 시 가격 대체값 계산.
++
++        우선순위
++        1) 전일 종가
++        2) 1분봉 VWAP
++        3) 1분봉 최근 체결가
++        """
++
++        # 1) 전일 종가
++        try:
++            if hasattr(kis, "get_close_price"):
++                close_px = _to_float(kis.get_close_price(code), None)
++                if close_px and close_px > 0:
++                    return float(close_px), "close"
++        except Exception:
++            pass
++
++        # 2) 1분봉 데이터 기반 (VWAP → 최근 체결가)
++        try:
++            candles = _get_intraday_1min(kis, code, count=40)
++            if candles:
++                vwap_val = _compute_vwap_from_1min(candles)
++                if vwap_val and vwap_val > 0:
++                    return float(vwap_val), "vwap"
++
++                last_close = _to_float(candles[-1].get("close"), None)
++                if last_close and last_close > 0:
++                    return float(last_close), "last_trade"
++        except Exception as e:
++            logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 과거가 기반 대체값 실패: {e}")
++
++        return None
++
++    # 4) 히스토리 기반 대체값 시도
++    fallback_px = _historical_fallback()
++    if fallback_px:
++        px_val, px_src = fallback_px
++        if px_val and px_val > 0:
++            return _store_and_return(float(px_val), px_src or "fallback", log_level=logging.INFO)
++
++    # 5) 최후: 캐시가 있으면 stale_ok_sec 내 제공  (BUGFIX: px 반환)
+     ent = _LAST_PRICE_CACHE.get(code)
+     if ent and (now - ent["ts"] <= stale_ok_sec):
+-        return float(ent["px"])
++        src = ent.get("source") or "stale_cache"
++        logger.info(f"[PRICE_SRC] {code} ← {src}({float(ent['px']):.2f}) (stale ok)")
++        return (float(ent["px"]), src) if with_source else float(ent["px"])
+     return None
+ 
+ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
+     """
+     get_balance / get_balance_all 호출을 15초 캐시.
+     초당 루프를 돌려도 실제 API는 15초에 1번만 두드리도록 한다.
+     """
+     now = time.time()
+     try:
+         if _BALANCE_CACHE["balances"] and (now - float(_BALANCE_CACHE["ts"])) <= ttl_sec:
+             return list(_BALANCE_CACHE["balances"])
+     except Exception:
+         pass
+ 
+     if hasattr(kis, "get_balance_all"):
+         res = _with_retry(kis.get_balance_all)
+     else:
+         res = _with_retry(kis.get_balance)
+ 
+     if isinstance(res, dict):
+         positions = res.get("positions") or res.get("output1") or []
+         if not isinstance(positions, list):
+             logger.error(f"[BAL_STD_FAIL] positions 타입 이상: {type(positions)}")
+             positions = []
+     elif isinstance(res, list):
+@@ -302,51 +358,64 @@ def _detect_pullback_reversal(
+     peak_price = max(highs)
+     try:
+         peak_idx = max(
+             i for i, c in enumerate(window) if float(c.get("high") or 0.0) == peak_price
+         )
+     except Exception:
+         return {"setup": False, "reason": "peak_index_error"}
+ 
+     # 직전 일자까지 연속 하락 구간 길이를 계산(어제까지 n일 연속 하락인지)
+     down_streak_len = 0
+     last_idx = len(window) - 1
+     while last_idx > peak_idx:
+         try:
+             cur_close = float(window[last_idx].get("close") or 0.0)
+             prev_close = float(window[last_idx - 1].get("close") or 0.0)
+         except Exception:
+             break
+         if cur_close <= 0 or prev_close <= 0:
+             break
+         if cur_close < prev_close:
+             down_streak_len += 1
+             last_idx -= 1
+             continue
+         break
+ 
+-    if down_streak_len < pullback_days:
++    # [RELAX] 2일 연속 하락이면 완화 진입 허용, 또는 VWAP 회복 시 예외 허용
++    vwap_reclaim = False
++    if current_price:
++        try:
++            intra = _compute_intraday_entry_context(kis, code, slow=MOM_SLOW)
++            vwap_val = intra.get("vwap")
++            last_close = intra.get("last_close") or current_price
++            if vwap_val and last_close:
++                vwap_reclaim = float(last_close) >= float(vwap_val) * (1 - VWAP_TOL)
++        except Exception:
++            vwap_reclaim = False
++
++    relaxed_streak_ok = down_streak_len >= pullback_days or down_streak_len >= 2
++    if not relaxed_streak_ok and not vwap_reclaim:
+         return {
+             "setup": False,
+             "peak_price": peak_price,
+             "reason": "not_enough_consecutive_down",
+         }
+ 
+     if last_idx < peak_idx:
+         return {
+             "setup": False,
+             "peak_price": peak_price,
+             "reason": "down_streak_not_after_peak",
+         }
+ 
+     last_down = window[len(window) - 1]
+     try:
+         reversal_line = max(
+             float(last_down.get("high") or 0.0), float(last_down.get("close") or 0.0)
+         )
+     except Exception:
+         reversal_line = 0.0
+ 
+     reversal_price = reversal_line * (1.0 + buffer_pct / 100.0)
+     reversing = (
+         current_price is not None
+         and reversal_price > 0
+@@ -377,116 +446,152 @@ def _classify_champion_grade(info: Dict[str, Any]) -> str:
+     )
+ 
+     turnover_ok = turnover <= 0 or turnover >= CHAMPION_A_RULES["min_turnover"]
+     if (
+         trades >= CHAMPION_A_RULES["min_trades"]
+         and cumret >= CHAMPION_A_RULES["min_cumret_pct"]
+         and mdd <= CHAMPION_A_RULES["max_mdd_pct"]
+         and win >= CHAMPION_A_RULES["min_win_pct"]
+         and sharpe >= CHAMPION_A_RULES["min_sharpe"]
+         and turnover_ok
+     ):
+         return "A"
+ 
+     if (
+         trades >= CHAMPION_MIN_TRADES
+         and win >= CHAMPION_MIN_WINRATE
+         and mdd <= CHAMPION_MAX_MDD
+         and sharpe >= CHAMPION_MIN_SHARPE
+     ):
+         return "B"
+ 
+     return "C"
+ 
+ 
+ def _compute_daily_entry_context(
+-    kis: KisAPI, code: str, current_price: Optional[float]
++    kis: KisAPI, code: str, current_price: Optional[float], price_source: Optional[str] = None
+ ) -> Dict[str, Any]:
+-    ctx: Dict[str, Any] = {"current_price": current_price}
++    ctx: Dict[str, Any] = {"current_price": current_price, "price_source": price_source}
+     try:
+         candles = _get_daily_candles_cached(kis, code, count=max(PULLBACK_LOOKBACK, 60))
+     except Exception:
+         return ctx
+ 
+     today = datetime.now(KST).strftime("%Y%m%d")
+     completed = list(candles)
+     if completed and str(completed[-1].get("date")) == today:
+         completed = completed[:-1]
+ 
+     if not completed:
+         return ctx
+ 
+     closes = [float(c.get("close") or 0.0) for c in completed if c.get("close")]
+     highs = [float(c.get("high") or 0.0) for c in completed if c.get("high")]
+     lows = [float(c.get("low") or 0.0) for c in completed if c.get("low")]
+ 
+     if len(closes) >= 20:
+         ma20 = sum(closes[-20:]) / 20.0
+         ctx["ma20"] = ma20
+         if current_price:
+             ctx["ma20_ratio"] = current_price / ma20
+             ctx["ma20_risk"] = max(0.0, current_price - ma20)
+ 
++        # 단기/중기 추세 정배열 및 상승 여부
++        if len(closes) >= 21:
++            ma5 = sum(closes[-5:]) / 5.0
++            ma10 = sum(closes[-10:]) / 10.0
++            prev_ma20 = sum(closes[-21:-1]) / 20.0
++
++            ctx["ma5"] = ma5
++            ctx["ma10"] = ma10
++            ctx["ma20_prev"] = prev_ma20
++
++            bullish_stack = (
++                ma5 > ma10 > ma20
++                and ma20 > prev_ma20
++                and float(closes[-1]) > ma20
++            )
++            ctx["strong_trend"] = bullish_stack
++
++    strong_trend = bool(ctx.get("strong_trend"))
++    effective_max_pullback = BAD_ENTRY_MAX_PULLBACK
++    if strong_trend:
++        effective_max_pullback = max(effective_max_pullback, 60.0)
++    ctx["max_pullback_pct"] = effective_max_pullback
++
+     if highs:
+         window_60 = highs[-60:] if len(highs) >= 60 else highs
+         peak_price = max(window_60)
+         ctx["peak_price"] = peak_price
+         if current_price and peak_price > 0:
+             ctx["distance_to_peak"] = current_price / peak_price
+             ctx["pullback_depth_pct"] = (peak_price - current_price) / peak_price * 100.0
+ 
+     # 연속 하락 일수 체크 (신고가 이후 눌림 판단)
+     down_streak = 0
+     for idx in range(len(completed) - 1, 0, -1):
+         cur = float(completed[idx].get("close") or 0.0)
+         prev = float(completed[idx - 1].get("close") or 0.0)
+         if cur <= 0 or prev <= 0:
+             break
+         if cur < prev:
+             down_streak += 1
+         else:
+             break
+     ctx["down_streak"] = down_streak
+ 
+     try:
+         atr = _get_atr(kis, code)
+         if atr:
+             ctx["atr"] = float(atr)
+     except Exception:
+         pass
+ 
+     if closes and highs:
+         recent_high = max(highs[-20:])
+         ctx["recent_high_20"] = recent_high
+-        ctx["setup_ok"] = bool(
++
++        base_setup = bool(
+             down_streak >= 2
+             and ctx.get("pullback_depth_pct") is not None
+             and ctx.get("pullback_depth_pct") >= GOOD_ENTRY_PULLBACK_RANGE[0]
+             and (ctx.get("ma20_ratio") or 0) >= GOOD_ENTRY_MA20_RANGE[0]
+             and recent_high >= max(highs[-60:]) * 0.95
+         )
+ 
++        relaxed_pullback_ok = (
++            ctx.get("strong_trend")
++            and ctx.get("pullback_depth_pct") is not None
++            and ctx.get("pullback_depth_pct") >= GOOD_ENTRY_PULLBACK_RANGE[0]
++            and ctx.get("pullback_depth_pct") <= float(ctx.get("max_pullback_pct") or 60.0)
++            and (ctx.get("ma20_ratio") or 0) >= GOOD_ENTRY_MA20_RANGE[0]
++        )
++
++        ctx["setup_ok"] = bool(base_setup or relaxed_pullback_ok)
++        if relaxed_pullback_ok and not base_setup:
++            ctx["setup_reason"] = "strong_trend_relaxed"
++
+     return ctx
+ 
+ 
+ def _compute_intraday_entry_context(
+     kis: KisAPI,
+     code: str,
+     prev_high: Optional[float] = None,
+     *,
+     fast: Optional[int] = None,
+     slow: Optional[int] = None,
+ ) -> Dict[str, Any]:
+     """
+     진입 시점용 1분봉 VWAP / 박스 / 거래량 스파이크 컨텍스트 계산.
+ 
+     prev_high는 이전 일자 고가(전일 high) 등 외부에서 넣어줄 수 있고,
+     fast/slow는 모멘텀용 파라미터지만, 여기서는 주로 조회 길이 튜닝에 사용한다.
+     """
+     ctx: Dict[str, Any] = {}
+ 
+     # intraday 1분봉 조회 길이 결정
+     # - 기본은 120개
+     # - slow가 들어오면 slow * 3 정도로 늘리되 최소 60개는 확보
+     lookback = 120
+     if slow is not None:
+         try:
+@@ -536,120 +641,127 @@ def _compute_intraday_entry_context(
+ 
+     if vols and len(vols) >= 10:
+         recent_vol = sum(vols[-5:]) / 5.0
+         base_vol = sum(vols[:-5]) / max(1, len(vols) - 5)
+         if base_vol > 0:
+             ctx["volume_spike"] = recent_vol >= base_vol * 1.5
+ 
+     if vwap_val:
+         below = sum(
+             1 for c in candles if _to_float(c.get("close"), 0.0) < vwap_val
+         )
+         ctx["below_vwap_ratio"] = below / len(candles)
+ 
+     if prev_high and last_high:
+         ctx["prev_high_retest"] = last_high >= float(prev_high) * 0.999
+ 
+     return ctx
+ 
+ def is_bad_entry(
+     code: str,
+     daily_ctx: Dict[str, Any],
+     intraday_ctx: Dict[str, Any],
+     regime_state: Optional[Dict[str, Any]] = None,
+ ) -> bool:
+     reasons = []
++    strong_trend = bool(daily_ctx.get("strong_trend"))
+ 
+     # 1) MA20 거리
+     mr = daily_ctx.get("ma20_ratio")
+     if mr is not None:
+         try:
+             mr_val = float(mr)
+             if abs(mr_val) > BAD_ENTRY_MAX_MA20_DIST:
+                 reasons.append(f"MA20DIST {mr_val:.3f}")
+         except:
+             reasons.append("MA20DIST invalid")
+ 
+     # 2) Pullback depth
+     pb = daily_ctx.get("pullback_depth_pct")
+     if pb is not None:
+         try:
+             pb_val = float(pb)
+-            if pb_val > BAD_ENTRY_MAX_PULLBACK:
++            max_pb = float(daily_ctx.get("max_pullback_pct") or BAD_ENTRY_MAX_PULLBACK)
++            if pb_val > max_pb:
+                 reasons.append(f"PULLBACK {pb_val:.2f}")
+         except:
+             reasons.append("PULLBACK invalid")
+ 
+     # 3) Regime drop
+     if regime_state:
+         drop = _to_float(regime_state.get("pct_change"), None)
+-        if drop is not None and drop <= -2.5:
++        mode = regime_state.get("mode")
++        if drop is not None and drop <= -2.5 and not (strong_trend and mode == "neutral"):
+             reasons.append(f"REGIME_DROP {drop:.2f}")
+ 
+     # 4) VWAP ratio
+     bvr = intraday_ctx.get("below_vwap_ratio")
+     if bvr is not None:
+         try:
+             bvr_val = float(bvr)
+             if bvr_val >= BAD_ENTRY_MAX_BELOW_VWAP_RATIO:
+                 reasons.append(f"VWAP_RATIO {bvr_val:.2f}")
+         except:
+             reasons.append("VWAP_RATIO invalid")
+ 
+     if reasons:
+         logger.info(
+             "[ENTRY-BAD] %s | 이유: %s | daily=%s intra=%s regime=%s",
+             code,
+             " / ".join(reasons),
+             daily_ctx,
+             intraday_ctx,
+             regime_state,
+         )
+         return True
+ 
+     logger.info(
+         "[ENTRY-OK] %s | daily=%s intra=%s regime=%s",
+         code,
+         daily_ctx,
+         intraday_ctx,
+         regime_state,
+     )
+     return False
+ 
+ 
+ def is_good_entry(
+     code: str,
+     daily_ctx: Dict[str, Any],
+     intraday_ctx: Dict[str, Any],
+     prev_high: Optional[float] = None,
+ ) -> bool:
+     if not daily_ctx.get("setup_ok"):
+         return False
+ 
+     pullback = daily_ctx.get("pullback_depth_pct")
++    strong_trend = bool(daily_ctx.get("strong_trend"))
++    max_pb = float(daily_ctx.get("max_pullback_pct") or GOOD_ENTRY_PULLBACK_RANGE[1])
++    if not strong_trend:
++        max_pb = min(max_pb, GOOD_ENTRY_PULLBACK_RANGE[1])
+     if pullback is None or not (
+-        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= GOOD_ENTRY_PULLBACK_RANGE[1]
++        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= max_pb
+     ):
+         return False
+ 
+     ma20_ratio = daily_ctx.get("ma20_ratio")
+     if ma20_ratio is None or not (
+         GOOD_ENTRY_MA20_RANGE[0] <= ma20_ratio <= GOOD_ENTRY_MA20_RANGE[1]
+     ):
+         return False
+ 
+     dist_peak = daily_ctx.get("distance_to_peak")
+     if dist_peak is None or dist_peak > GOOD_ENTRY_MAX_FROM_PEAK:
+         return False
+ 
+     cur_px = daily_ctx.get("current_price")
+     atr = daily_ctx.get("atr") or 0.0
+     ma_risk = daily_ctx.get("ma20_risk") or 0.0
+     risk = max(atr, ma_risk, (cur_px or 0) * 0.03)
+     reward = max(0.0, (daily_ctx.get("peak_price") or 0) - (cur_px or 0)) + atr
+     if risk <= 0 or reward / risk < GOOD_ENTRY_MIN_RR:
+         return False
+ 
+     signals = []
+     if intraday_ctx.get("vwap_reclaim"):
+         signals.append("vwap")
+     if intraday_ctx.get("range_break"):

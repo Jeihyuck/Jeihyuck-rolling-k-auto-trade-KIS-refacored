@@ -1,6 +1,7 @@
 """시그널 계산 및 시세/밸런스 조회 보조 함수."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,15 +66,28 @@ __all__ = [
 ]
 
 # === [ANCHOR: PRICE_CACHE] 현재가 캐시 & 서킷브레이커 ===
-_LAST_PRICE_CACHE: Dict[str, Dict[str, float]] = {}  # code -> {"px": float, "ts": epoch}
+_LAST_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # code -> {"px": float, "ts": epoch}
 _PRICE_CB: Dict[str, Dict[str, float]] = {}          # code -> {"fail": int, "until": epoch}
 
 # === [ANCHOR: BALANCE_CACHE] 잔고 캐싱 (루프 15초 단일 호출) ===
 _BALANCE_CACHE: Dict[str, Any] = {"ts": 0.0, "balances": []}
 
-def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int = 30) -> Optional[float]:
+def _safe_get_price(
+    kis: KisAPI,
+    code: str,
+    ttl_sec: int = 5,
+    stale_ok_sec: int = 30,
+    *,
+    with_source: bool = False,
+) -> Optional[float | Tuple[float, str]]:
     import time as _t
     now = _t.time()
+
+    def _store_and_return(val: float, source: str, log_level: Optional[int] = None):
+        _LAST_PRICE_CACHE[code] = {"px": float(val), "ts": now, "source": source}
+        if log_level:
+            logger.log(log_level, f"[PRICE_SRC] {code} ← {source} ({float(val):.2f})")
+        return (float(val), source) if with_source else float(val)
 
     # 0) 서킷브레이커: 최근 실패 누적이면 잠시 건너뛴다
     cb = _PRICE_CB.get(code, {"fail": 0, "until": 0})
@@ -84,14 +98,14 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
         if not kis.is_market_open() and not ALLOW_WHEN_CLOSED:
             ent = _LAST_PRICE_CACHE.get(code)
             if ent:
-                return float(ent["px"])
+                src = ent.get("source") or "cache_close"
+                return (float(ent["px"]), src) if with_source else float(ent["px"])
             if hasattr(kis, "get_close_price"):
                 try:
                     close_px = kis.get_close_price(code)
                     if close_px and float(close_px) > 0:
                         val = float(close_px)
-                        _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
-                        return val
+                        return _store_and_return(val, "close_after")
                 except Exception:
                     pass
             return None
@@ -101,7 +115,8 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
     # 1) 캐시 최신이면 반환
     ent = _LAST_PRICE_CACHE.get(code)
     if ent and (now - ent["ts"] <= ttl_sec):
-        return float(ent["px"])
+        src = ent.get("source") or "cache_recent"
+        return (float(ent["px"]), src) if with_source else float(ent["px"])
 
     # 2) 1차 소스
     if primary_allowed:
@@ -109,9 +124,8 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
             px = _with_retry(kis.get_current_price, code)
             if px is not None and float(px) > 0:
                 val = float(px)
-                _LAST_PRICE_CACHE[code] = {"px": val, "ts": now}
                 _PRICE_CB[code] = {"fail": 0, "until": 0}
-                return val
+                return _store_and_return(val, "realtime")
             else:
                 logger.warning(f"[PRICE_GUARD] {code} 현재가 무효값({px})")
         except Exception as e:
@@ -131,23 +145,65 @@ def _safe_get_price(kis: KisAPI, code: str, ttl_sec: int = 5, stale_ok_sec: int 
                     if v and float(v) > 0:
                         cand = float(v); break
             if cand and cand > 0:
-                _LAST_PRICE_CACHE[code] = {"px": cand, "ts": now}
-                return cand
+                return _store_and_return(cand, "snapshot")
 
         if hasattr(kis, "get_best_ask") and hasattr(kis, "get_best_bid"):
             ask = kis.get_best_ask(code)
             bid = kis.get_best_bid(code)
             if ask and bid and float(ask) > 0 and float(bid) > 0:
                 mid = (float(ask) + float(bid)) / 2.0
-                _LAST_PRICE_CACHE[code] = {"px": mid, "ts": now}
-                return mid
+                return _store_and_return(mid, "mid_quote")
     except Exception as e:
         logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 보조소스 실패: {e}")
 
-    # 4) 최후: 캐시가 있으면 stale_ok_sec 내 제공  (BUGFIX: px 반환)
+    def _historical_fallback() -> Optional[Tuple[Optional[float], Optional[str]]]:
+        """
+        실시간 조회 실패 시 가격 대체값 계산.
+
+        우선순위
+        1) 전일 종가
+        2) 1분봉 VWAP
+        3) 1분봉 최근 체결가
+        """
+
+        # 1) 전일 종가
+        try:
+            if hasattr(kis, "get_close_price"):
+                close_px = _to_float(kis.get_close_price(code), None)
+                if close_px and close_px > 0:
+                    return float(close_px), "close"
+        except Exception:
+            pass
+
+        # 2) 1분봉 데이터 기반 (VWAP → 최근 체결가)
+        try:
+            candles = _get_intraday_1min(kis, code, count=40)
+            if candles:
+                vwap_val = _compute_vwap_from_1min(candles)
+                if vwap_val and vwap_val > 0:
+                    return float(vwap_val), "vwap"
+
+                last_close = _to_float(candles[-1].get("close"), None)
+                if last_close and last_close > 0:
+                    return float(last_close), "last_trade"
+        except Exception as e:
+            logger.warning(f"[PRICE_FALLBACK_FAIL] {code} 과거가 기반 대체값 실패: {e}")
+
+        return None
+
+    # 4) 히스토리 기반 대체값 시도
+    fallback_px = _historical_fallback()
+    if fallback_px:
+        px_val, px_src = fallback_px
+        if px_val and px_val > 0:
+            return _store_and_return(float(px_val), px_src or "fallback", log_level=logging.INFO)
+
+    # 5) 최후: 캐시가 있으면 stale_ok_sec 내 제공  (BUGFIX: px 반환)
     ent = _LAST_PRICE_CACHE.get(code)
     if ent and (now - ent["ts"] <= stale_ok_sec):
-        return float(ent["px"])
+        src = ent.get("source") or "stale_cache"
+        logger.info(f"[PRICE_SRC] {code} ← {src}({float(ent['px']):.2f}) (stale ok)")
+        return (float(ent["px"]), src) if with_source else float(ent["px"])
     return None
 
 def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
@@ -324,7 +380,20 @@ def _detect_pullback_reversal(
             continue
         break
 
-    if down_streak_len < pullback_days:
+    # [RELAX] 2일 연속 하락이면 완화 진입 허용, 또는 VWAP 회복 시 예외 허용
+    vwap_reclaim = False
+    if current_price:
+        try:
+            intra = _compute_intraday_entry_context(kis, code, slow=MOM_SLOW)
+            vwap_val = intra.get("vwap")
+            last_close = intra.get("last_close") or current_price
+            if vwap_val and last_close:
+                vwap_reclaim = float(last_close) >= float(vwap_val) * (1 - VWAP_TOL)
+        except Exception:
+            vwap_reclaim = False
+
+    relaxed_streak_ok = down_streak_len >= pullback_days or down_streak_len >= 2
+    if not relaxed_streak_ok and not vwap_reclaim:
         return {
             "setup": False,
             "peak_price": peak_price,
@@ -399,9 +468,9 @@ def _classify_champion_grade(info: Dict[str, Any]) -> str:
 
 
 def _compute_daily_entry_context(
-    kis: KisAPI, code: str, current_price: Optional[float]
+    kis: KisAPI, code: str, current_price: Optional[float], price_source: Optional[str] = None
 ) -> Dict[str, Any]:
-    ctx: Dict[str, Any] = {"current_price": current_price}
+    ctx: Dict[str, Any] = {"current_price": current_price, "price_source": price_source}
     try:
         candles = _get_daily_candles_cached(kis, code, count=max(PULLBACK_LOOKBACK, 60))
     except Exception:
@@ -425,6 +494,29 @@ def _compute_daily_entry_context(
         if current_price:
             ctx["ma20_ratio"] = current_price / ma20
             ctx["ma20_risk"] = max(0.0, current_price - ma20)
+
+        # 단기/중기 추세 정배열 및 상승 여부
+        if len(closes) >= 21:
+            ma5 = sum(closes[-5:]) / 5.0
+            ma10 = sum(closes[-10:]) / 10.0
+            prev_ma20 = sum(closes[-21:-1]) / 20.0
+
+            ctx["ma5"] = ma5
+            ctx["ma10"] = ma10
+            ctx["ma20_prev"] = prev_ma20
+
+            bullish_stack = (
+                ma5 > ma10 > ma20
+                and ma20 > prev_ma20
+                and float(closes[-1]) > ma20
+            )
+            ctx["strong_trend"] = bullish_stack
+
+    strong_trend = bool(ctx.get("strong_trend"))
+    effective_max_pullback = BAD_ENTRY_MAX_PULLBACK
+    if strong_trend:
+        effective_max_pullback = max(effective_max_pullback, 60.0)
+    ctx["max_pullback_pct"] = effective_max_pullback
 
     if highs:
         window_60 = highs[-60:] if len(highs) >= 60 else highs
@@ -457,13 +549,26 @@ def _compute_daily_entry_context(
     if closes and highs:
         recent_high = max(highs[-20:])
         ctx["recent_high_20"] = recent_high
-        ctx["setup_ok"] = bool(
+
+        base_setup = bool(
             down_streak >= 2
             and ctx.get("pullback_depth_pct") is not None
             and ctx.get("pullback_depth_pct") >= GOOD_ENTRY_PULLBACK_RANGE[0]
             and (ctx.get("ma20_ratio") or 0) >= GOOD_ENTRY_MA20_RANGE[0]
             and recent_high >= max(highs[-60:]) * 0.95
         )
+
+        relaxed_pullback_ok = (
+            ctx.get("strong_trend")
+            and ctx.get("pullback_depth_pct") is not None
+            and ctx.get("pullback_depth_pct") >= GOOD_ENTRY_PULLBACK_RANGE[0]
+            and ctx.get("pullback_depth_pct") <= float(ctx.get("max_pullback_pct") or 60.0)
+            and (ctx.get("ma20_ratio") or 0) >= GOOD_ENTRY_MA20_RANGE[0]
+        )
+
+        ctx["setup_ok"] = bool(base_setup or relaxed_pullback_ok)
+        if relaxed_pullback_ok and not base_setup:
+            ctx["setup_reason"] = "strong_trend_relaxed"
 
     return ctx
 
@@ -558,6 +663,7 @@ def is_bad_entry(
     regime_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
     reasons = []
+    strong_trend = bool(daily_ctx.get("strong_trend"))
 
     # 1) MA20 거리
     mr = daily_ctx.get("ma20_ratio")
@@ -574,7 +680,8 @@ def is_bad_entry(
     if pb is not None:
         try:
             pb_val = float(pb)
-            if pb_val > BAD_ENTRY_MAX_PULLBACK:
+            max_pb = float(daily_ctx.get("max_pullback_pct") or BAD_ENTRY_MAX_PULLBACK)
+            if pb_val > max_pb:
                 reasons.append(f"PULLBACK {pb_val:.2f}")
         except:
             reasons.append("PULLBACK invalid")
@@ -582,7 +689,8 @@ def is_bad_entry(
     # 3) Regime drop
     if regime_state:
         drop = _to_float(regime_state.get("pct_change"), None)
-        if drop is not None and drop <= -2.5:
+        mode = regime_state.get("mode")
+        if drop is not None and drop <= -2.5 and not (strong_trend and mode == "neutral"):
             reasons.append(f"REGIME_DROP {drop:.2f}")
 
     # 4) VWAP ratio
@@ -626,8 +734,12 @@ def is_good_entry(
         return False
 
     pullback = daily_ctx.get("pullback_depth_pct")
+    strong_trend = bool(daily_ctx.get("strong_trend"))
+    max_pb = float(daily_ctx.get("max_pullback_pct") or GOOD_ENTRY_PULLBACK_RANGE[1])
+    if not strong_trend:
+        max_pb = min(max_pb, GOOD_ENTRY_PULLBACK_RANGE[1])
     if pullback is None or not (
-        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= GOOD_ENTRY_PULLBACK_RANGE[1]
+        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= max_pb
     ):
         return False
 

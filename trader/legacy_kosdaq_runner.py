@@ -24,6 +24,7 @@ try:
         SLIPPAGE_ENTER_GUARD_PCT,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
+        NEUTRAL_ENTRY_SCALE,
         _cfg,
         logger,
     )
@@ -40,6 +41,7 @@ except ImportError:
         SLIPPAGE_ENTER_GUARD_PCT,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
+        NEUTRAL_ENTRY_SCALE,
         _cfg,
         logger,
     )
@@ -814,9 +816,33 @@ def main(capital_override: float | None = None):
                     logger.info(f"[SKIP-PENDING] {code}: pending 쿨다운 중 → 재주문 방지")
                     continue
 
+                price_res = _safe_get_price(kis, code, with_source=True)
+                if isinstance(price_res, tuple):
+                    current_price, price_source = price_res
+                else:
+                    current_price, price_source = price_res, None
+
+                if not current_price or current_price <= 0:
+                    logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
+                    continue
+
                 # === GOOD/BAD 타점 평가 ===
-                daily_ctx = _compute_daily_entry_context(kis, code, PULLBACK_LOOKBACK)
+                daily_ctx = _compute_daily_entry_context(kis, code, current_price, price_source)
                 intra_ctx = _compute_intraday_entry_context(kis, code, fast=MOM_FAST, slow=MOM_SLOW)
+
+                momentum_confirmed = bool(
+                    daily_ctx.get("strong_trend")
+                    or intra_ctx.get("vwap_reclaim")
+                    or intra_ctx.get("range_break")
+                )
+
+                if mode == "neutral" and not (
+                    info.get("champion_grade") in ("A", "B") or momentum_confirmed
+                ):
+                    logger.info(
+                        f"[ENTRY-SKIP] {code}: neutral 레짐에서 비챔피언/모멘텀 미확인 → 신규 진입 보류"
+                    )
+                    continue
 
                 if is_bad_entry(code, daily_ctx, intra_ctx, regime_state):
                     logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
@@ -841,12 +867,14 @@ def main(capital_override: float | None = None):
                     logger.info(f"[VWAP_GUARD] {code}: 슬리피지 위험 → 매수 스킵")
                     continue
 
-                current_price = _safe_get_price(kis, code)
-                if not current_price or current_price <= 0:
-                    logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
-                    continue
-
                 qty = target_qty
+                if mode == "neutral":
+                    scaled_qty = max(1, int(qty * NEUTRAL_ENTRY_SCALE))
+                    if scaled_qty < qty:
+                        logger.info(
+                            f"[ENTRY-SIZE] {code}: neutral 레짐 감축 {qty}→{scaled_qty} (스케일={NEUTRAL_ENTRY_SCALE})"
+                        )
+                    qty = scaled_qty
                 trade_ctx = {
                     "datetime": now_str,
                     "code": code,

@@ -69,6 +69,7 @@ CONFIG = {
     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
     "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
     "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
+    "NEUTRAL_ENTRY_SCALE": "0.6",          # 중립 레짐 신규/재진입 스케일링 비율
     # 기타
     "MARKET_DATA_WHEN_CLOSED": "false",
     "FORCE_WEEKLY_REBALANCE": "0",
@@ -161,6 +162,7 @@ GOOD_ENTRY_MIN_INTRADAY_SIG = 2  # GOOD 타점으로 인정하기 위한 최소 
 BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
 BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
 BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
 
 
 def _parse_hhmm(hhmm: str) -> dtime:
