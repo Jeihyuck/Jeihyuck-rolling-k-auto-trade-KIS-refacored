@@ -848,7 +848,9 @@ def main(capital_override: float | None = None):
                     logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
                     continue
 
-                if not is_good_entry(daily_ctx, intra_ctx):
+                if not is_good_entry(
+                    code=code, daily_ctx=daily_ctx, intraday_ctx=intra_ctx
+                ):
                     logger.info(
                         f"[ENTRY-SKIP] {code}: GOOD 타점 미충족 → 다음 루프에서 재확인"
                     )
