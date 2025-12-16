@@ -52,6 +52,8 @@ __all__ = [
     "_compute_intraday_entry_context",
     "is_bad_entry",
     "is_good_entry",
+    "evaluate_setup_gate",
+    "evaluate_trigger_gate",
     "_get_intraday_1min",
     "_compute_vwap_from_1min",
     "_compute_intraday_momentum",
@@ -380,6 +382,11 @@ def _detect_pullback_reversal(
             continue
         break
 
+    recent_closes = [float(c.get("close") or 0.0) for c in window[max(0, len(window) - (pullback_days + 4)) :]]
+    logger.debug(
+        f"[PULLBACK-STREAK] {code} closes={recent_closes} streak={down_streak_len} peak_idx={peak_idx}"
+    )
+
     # [RELAX] 2일 연속 하락이면 완화 진입 허용, 또는 VWAP 회복 시 예외 허용
     vwap_reclaim = False
     if current_price:
@@ -656,13 +663,12 @@ def _compute_intraday_entry_context(
 
     return ctx
 
-def is_bad_entry(
-    code: str,
+def _collect_bad_entry_reasons(
     daily_ctx: Dict[str, Any],
     intraday_ctx: Dict[str, Any],
     regime_state: Optional[Dict[str, Any]] = None,
-) -> bool:
-    reasons = []
+) -> List[str]:
+    reasons: List[str] = []
     strong_trend = bool(daily_ctx.get("strong_trend"))
 
     # 1) MA20 거리
@@ -672,7 +678,7 @@ def is_bad_entry(
             mr_val = float(mr)
             if abs(mr_val) > BAD_ENTRY_MAX_MA20_DIST:
                 reasons.append(f"MA20DIST {mr_val:.3f}")
-        except:
+        except Exception:
             reasons.append("MA20DIST invalid")
 
     # 2) Pullback depth
@@ -683,7 +689,7 @@ def is_bad_entry(
             max_pb = float(daily_ctx.get("max_pullback_pct") or BAD_ENTRY_MAX_PULLBACK)
             if pb_val > max_pb:
                 reasons.append(f"PULLBACK {pb_val:.2f}")
-        except:
+        except Exception:
             reasons.append("PULLBACK invalid")
 
     # 3) Regime drop
@@ -700,8 +706,19 @@ def is_bad_entry(
             bvr_val = float(bvr)
             if bvr_val >= BAD_ENTRY_MAX_BELOW_VWAP_RATIO:
                 reasons.append(f"VWAP_RATIO {bvr_val:.2f}")
-        except:
+        except Exception:
             reasons.append("VWAP_RATIO invalid")
+
+    return reasons
+
+
+def is_bad_entry(
+    code: str,
+    daily_ctx: Dict[str, Any],
+    intraday_ctx: Dict[str, Any],
+    regime_state: Optional[Dict[str, Any]] = None,
+) -> bool:
+    reasons = _collect_bad_entry_reasons(daily_ctx, intraday_ctx, regime_state)
 
     if reasons:
         logger.info(
@@ -724,44 +741,44 @@ def is_bad_entry(
     return False
 
 
-def is_good_entry(
-    code: str,
+def evaluate_setup_gate(
     daily_ctx: Dict[str, Any],
     intraday_ctx: Dict[str, Any],
-    prev_high: Optional[float] = None,
-) -> bool:
+    regime_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    missing_conditions: List[str] = []
+    reasons = _collect_bad_entry_reasons(daily_ctx, intraday_ctx, regime_state)
+
     if not daily_ctx.get("setup_ok"):
-        return False
+        missing_conditions.append("setup_flag")
 
-    pullback = daily_ctx.get("pullback_depth_pct")
-    strong_trend = bool(daily_ctx.get("strong_trend"))
-    max_pb = float(daily_ctx.get("max_pullback_pct") or GOOD_ENTRY_PULLBACK_RANGE[1])
-    if not strong_trend:
-        max_pb = min(max_pb, GOOD_ENTRY_PULLBACK_RANGE[1])
-    if pullback is None or not (
-        GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= max_pb
-    ):
-        return False
+    ok = not missing_conditions and not reasons
+    return {
+        "ok": ok,
+        "missing_conditions": missing_conditions,
+        "reasons": reasons,
+    }
 
-    ma20_ratio = daily_ctx.get("ma20_ratio")
-    if ma20_ratio is None or not (
-        GOOD_ENTRY_MA20_RANGE[0] <= ma20_ratio <= GOOD_ENTRY_MA20_RANGE[1]
-    ):
-        return False
 
-    dist_peak = daily_ctx.get("distance_to_peak")
-    if dist_peak is None or dist_peak > GOOD_ENTRY_MAX_FROM_PEAK:
-        return False
+def evaluate_trigger_gate(
+    daily_ctx: Dict[str, Any],
+    intraday_ctx: Dict[str, Any],
+    *,
+    prev_high: Optional[float] = None,
+    prev_price: Optional[float] = None,
+    target_price: Optional[float] = None,
+    trigger_name: str = "breakout_cross",
+) -> Dict[str, Any]:
+    missing_conditions: List[str] = []
+    signals: List[str] = []
 
-    cur_px = daily_ctx.get("current_price")
-    atr = daily_ctx.get("atr") or 0.0
-    ma_risk = daily_ctx.get("ma20_risk") or 0.0
+    cur_px = _to_float(daily_ctx.get("current_price"), None)
+    atr = _to_float(daily_ctx.get("atr"), 0.0)
+    ma_risk = _to_float(daily_ctx.get("ma20_risk"), 0.0)
     risk = max(atr, ma_risk, (cur_px or 0) * 0.03)
     reward = max(0.0, (daily_ctx.get("peak_price") or 0) - (cur_px or 0)) + atr
-    if risk <= 0 or reward / risk < GOOD_ENTRY_MIN_RR:
-        return False
+    risk_reward = reward / risk if risk else None
 
-    signals = []
     if intraday_ctx.get("vwap_reclaim"):
         signals.append("vwap")
     if intraday_ctx.get("range_break"):
@@ -770,8 +787,125 @@ def is_good_entry(
         signals.append("volume")
     if prev_high and intraday_ctx.get("prev_high_retest"):
         signals.append("prev_high")
+    gap_pct = None
+    require_cross = (trigger_name == "breakout_cross") and target_price is not None
+    if cur_px and target_price:
+        try:
+            gap_pct = (float(cur_px) - float(target_price)) / float(target_price) * 100.0
+        except Exception:
+            gap_pct = None
 
-    return len(signals) >= GOOD_ENTRY_MIN_INTRADAY_SIG
+    crossed = False
+    prev_ref = prev_price
+    if prev_ref is None:
+        prev_ref = _to_float(daily_ctx.get("prev_close"), None)
+        if prev_ref is None and require_cross:
+            missing_conditions.append("no_prev_price")
+    if require_cross and target_price and cur_px is not None:
+        try:
+            if prev_ref is not None:
+                crossed = (
+                    float(prev_ref) < float(target_price)
+                    and float(cur_px) >= float(target_price)
+                )
+            else:
+                crossed = False
+        except Exception:
+            crossed = False
+        if not crossed:
+            missing_conditions.append("no_cross")
+
+    ok = False
+    if trigger_name == "pullback_rebound":
+        if not daily_ctx.get("setup_ok"):
+            missing_conditions.append("setup_flag")
+
+        pullback = _to_float(daily_ctx.get("pullback_depth_pct"), None)
+        if pullback is None:
+            missing_conditions.append("pullback_depth")
+        elif not (
+            GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= GOOD_ENTRY_PULLBACK_RANGE[1]
+        ):
+            missing_conditions.append("pullback_range")
+
+        reversal_signals = [
+            name
+            for name in ("vwap", "range", "volume", "prev_high")
+            if name in signals
+        ]
+        if not reversal_signals:
+            missing_conditions.append("reversal_signal")
+
+        ok = not missing_conditions and bool(reversal_signals)
+
+    elif trigger_name == "close_betting":
+        if not daily_ctx.get("strong_trend") and not intraday_ctx.get("vwap_reclaim"):
+            missing_conditions.append("trend_confirm")
+
+        if not signals:
+            missing_conditions.append("intraday_signal")
+
+        ok = not missing_conditions
+
+    else:
+        pullback = daily_ctx.get("pullback_depth_pct")
+        strong_trend = bool(daily_ctx.get("strong_trend"))
+        max_pb = float(daily_ctx.get("max_pullback_pct") or GOOD_ENTRY_PULLBACK_RANGE[1])
+        if not strong_trend:
+            max_pb = min(max_pb, GOOD_ENTRY_PULLBACK_RANGE[1])
+        if pullback is None or not (
+            GOOD_ENTRY_PULLBACK_RANGE[0] <= pullback <= max_pb
+        ):
+            missing_conditions.append("pullback_depth")
+
+        ma20_ratio = daily_ctx.get("ma20_ratio")
+        if ma20_ratio is None or not (
+            GOOD_ENTRY_MA20_RANGE[0] <= ma20_ratio <= GOOD_ENTRY_MA20_RANGE[1]
+        ):
+            missing_conditions.append("ma20_ratio")
+
+        dist_peak = daily_ctx.get("distance_to_peak")
+        if dist_peak is None or dist_peak > GOOD_ENTRY_MAX_FROM_PEAK:
+            missing_conditions.append("distance_to_peak")
+
+        if risk_reward is None or risk_reward < GOOD_ENTRY_MIN_RR:
+            missing_conditions.append("risk_reward")
+
+        if len(signals) < GOOD_ENTRY_MIN_INTRADAY_SIG:
+            missing_conditions.append("intraday_signals")
+
+        ok = not missing_conditions and len(signals) >= GOOD_ENTRY_MIN_INTRADAY_SIG
+
+    if require_cross and target_price is not None:
+        ok = ok and crossed
+
+    return {
+        "ok": ok,
+        "missing_conditions": missing_conditions,
+        "trigger_signals": signals,
+        "trigger_name": trigger_name,
+        "current_price": cur_px,
+        "target_price": target_price,
+        "gap_pct": gap_pct,
+        "risk_reward": risk_reward,
+    }
+
+
+def is_good_entry(
+    code: str,
+    daily_ctx: Dict[str, Any],
+    intraday_ctx: Dict[str, Any],
+    prev_high: Optional[float] = None,
+) -> bool:
+    result = evaluate_trigger_gate(
+        daily_ctx,
+        intraday_ctx,
+        prev_high=prev_high,
+        prev_price=None,
+        target_price=None,
+        trigger_name="breakout_cross",
+    )
+    return bool(result.get("ok"))
 
 # === [ANCHOR: INTRADAY_MOMENTUM] 1분봉 VWAP + 단기 모멘텀 ===
 def _get_intraday_1min(kis: KisAPI, code: str, count: int = 60) -> List[Dict[str, Any]]:

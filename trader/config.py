@@ -122,6 +122,7 @@ SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
 VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
 W_MAX_ONE = float(_cfg("W_MAX_ONE"))
 W_MIN_ONE = float(_cfg("W_MIN_ONE"))
+ALLOW_PYRAMID = (_cfg("ALLOW_PYRAMID") or "false").lower() == "true"
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
 WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
 MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"

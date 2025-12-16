@@ -17,6 +17,7 @@ try:
         FORCE_SELL_PASSES_CLOSE,
         FORCE_SELL_PASSES_CUTOFF,
         ALLOW_WHEN_CLOSED,
+        ALLOW_PYRAMID,
         KST,
         RATE_SLEEP_SEC,
         SELL_ALL_BALANCES_AT_CUTOFF,
@@ -48,6 +49,9 @@ except ImportError:
 
     ALLOW_WHEN_CLOSED = False
     logger.warning("[CONFIG] ALLOW_WHEN_CLOSED missing; defaulting to False")
+    ALLOW_PYRAMID = False
+    logger.warning("[CONFIG] ALLOW_PYRAMID missing; defaulting to False")
+from . import signals
 from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
 
@@ -96,6 +100,9 @@ def main(capital_override: float | None = None):
     state_loaded_midnight = f"{state_loaded_date} 00:00:00"
 
     holding, traded = load_state()
+    triggered_today: set[str] = set()
+    last_price_map: dict[str, float] = {}
+    last_today_prefix: str | None = None
 
     if isinstance(traded, (set, list, tuple)):
         logger.warning(
@@ -138,9 +145,12 @@ def main(capital_override: float | None = None):
         except Exception:
             logger.warning(f"[TRADED-STATE] traded에 코드 추가 실패: type={type(traded_state)}")
 
-    def _cleanup_expired_pending(traded_state: dict, now_dt: datetime, ttl_sec: int = 300) -> None:
+    def _cleanup_expired_pending(
+        traded_state: dict, now_dt: datetime, ttl_sec: int = 300
+    ) -> set:
+        expired: set[str] = set()
         if not isinstance(traded_state, dict):
-            return
+            return expired
 
         for code, payload in list(traded_state.items()):
             payload = payload or {}
@@ -156,8 +166,10 @@ def main(capital_override: float | None = None):
                 if (now_dt - pending_dt).total_seconds() > ttl_sec:
                     logger.warning(f"[PENDING-EXPIRE] {code}: {ttl_sec}s 초과 → pending 제거")
                     traded_state.pop(code, None)
+                    expired.add(code)
             except Exception:
                 continue
+        return expired
 
     def _pending_block(traded_state: dict, code: str, now_dt: datetime, block_sec: int = 45) -> bool:
         if not isinstance(traded_state, dict):
@@ -552,8 +564,13 @@ def main(capital_override: float | None = None):
             is_open = kis.is_market_open()
             now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
             today_prefix = now_dt_kst.strftime("%Y-%m-%d")
-            _cleanup_expired_pending(traded, now_dt_kst, ttl_sec=300)
-            traded_today = _traded_today(traded, today_prefix)
+            if last_today_prefix != today_prefix:
+                triggered_today.clear()
+                last_today_prefix = today_prefix
+            expired_pending = _cleanup_expired_pending(traded, now_dt_kst, ttl_sec=300)
+            if expired_pending:
+                triggered_today.difference_update(expired_pending)
+            traded_today: set[str] = set()
 
             if now_dt_kst.date() != pullback_buy_date:
                 pullback_buy_date = now_dt_kst.date()
@@ -626,6 +643,22 @@ def main(capital_override: float | None = None):
                 for code, payload in list(traded.items()):
                     if (payload or {}).get("status") == "pending" and code in holding:
                         traded[code]["status"] = "filled"
+
+            traded_today = _traded_today(traded, today_prefix)
+            for bal in balances:
+                code = bal.get("code")
+                raw = bal.get("raw") or {}
+                raw_l = {str(k).lower(): v for k, v in raw.items()}
+                thdt_buy_qty = _to_int(
+                    raw_l.get("thdt_buyqty")
+                    or raw_l.get("thdt_buy_qty")
+                    or raw_l.get("thdt_buy_q")
+                )
+                if thdt_buy_qty > 0:
+                    traded_today.add(code)
+
+            if not ALLOW_PYRAMID:
+                traded_today.update(holding.keys())
 
             for code, info in list(holding.items()):
                 prev_qty = int((prev_holding.get(code) or {}).get("qty", info.get("qty", 0)))
@@ -789,7 +822,11 @@ def main(capital_override: float | None = None):
                 if code in traded_today:
                     continue
 
-                if code in holding:
+                if code in holding and not ALLOW_PYRAMID:
+                    continue
+
+                if code in triggered_today:
+                    logger.info(f"[TRIGGER-SKIP] {code}: 금일 이미 트리거 발생")
                     continue
 
                 target_qty = int(info.get("qty", 0))
@@ -816,6 +853,16 @@ def main(capital_override: float | None = None):
                     logger.info(f"[SKIP-PENDING] {code}: pending 쿨다운 중 → 재주문 방지")
                     continue
 
+                prev_price = last_price_map.get(code)
+                if prev_price is None:
+                    try:
+                        cached = signals._LAST_PRICE_CACHE.get(code) or {}
+                        ts = cached.get("ts")
+                        if ts and (time.time() - float(ts) <= 120):
+                            prev_price = cached.get("px")
+                    except Exception:
+                        prev_price = None
+
                 price_res = _safe_get_price(kis, code, with_source=True)
                 if isinstance(price_res, tuple):
                     current_price, price_source = price_res
@@ -825,6 +872,11 @@ def main(capital_override: float | None = None):
                 if not current_price or current_price <= 0:
                     logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
                     continue
+
+                try:
+                    last_price_map[code] = float(current_price)
+                except Exception:
+                    pass
 
                 # === GOOD/BAD 타점 평가 ===
                 daily_ctx = _compute_daily_entry_context(kis, code, current_price, price_source)
@@ -844,19 +896,64 @@ def main(capital_override: float | None = None):
                     )
                     continue
 
-                if is_bad_entry(code, daily_ctx, intra_ctx, regime_state):
-                    logger.info(f"[ENTRY-SKIP] {code}: BAD 타점 감지 → 이번 루프 매수 스킵")
-                    continue
-
-                if not is_good_entry(
-                    code=code, daily_ctx=daily_ctx, intraday_ctx=intra_ctx
-                ):
+                setup_state = signals.evaluate_setup_gate(
+                    daily_ctx, intra_ctx, regime_state=regime_state
+                )
+                if not setup_state.get("ok"):
                     logger.info(
-                        f"[ENTRY-SKIP] {code}: GOOD 타점 미충족 → 다음 루프에서 재확인"
+                        "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s regime=%s",
+                        code,
+                        setup_state.get("missing_conditions"),
+                        setup_state.get("reasons"),
+                        daily_ctx,
+                        intra_ctx,
+                        regime_state,
                     )
                     continue
+                logger.info(
+                    "[SETUP-OK] %s | daily=%s intra=%s regime=%s",
+                    code,
+                    daily_ctx,
+                    intra_ctx,
+                    regime_state,
+                )
 
-                logger.info(f"[ENTRY-GOOD] {code}: GOOD 타점 확인 → 매수 시도")
+                trigger_label = "breakout_cross"
+                strategy_name = str(strategy or "").lower()
+                if "pullback" in strategy_name:
+                    trigger_label = "pullback_rebound"
+                elif "close" in strategy_name:
+                    trigger_label = "close_betting"
+
+                trigger_state = signals.evaluate_trigger_gate(
+                    daily_ctx,
+                    intra_ctx,
+                    prev_price=prev_price,
+                    target_price=target_price,
+                    trigger_name=trigger_label,
+                )
+                if not trigger_state.get("ok"):
+                    logger.info(
+                        "[TRIGGER-NO] %s | trigger=%s current=%s tgt_px=%s gap_pct=%s missing=%s signals=%s",
+                        code,
+                        trigger_state.get("trigger_name"),
+                        trigger_state.get("current_price"),
+                        trigger_state.get("target_price"),
+                        trigger_state.get("gap_pct"),
+                        trigger_state.get("missing_conditions"),
+                        trigger_state.get("trigger_signals"),
+                    )
+                    continue
+                logger.info(
+                    "[TRIGGER-OK] %s | trigger=%s current=%s tgt_px=%s gap_pct=%s signals=%s rr=%.2f",
+                    code,
+                    trigger_state.get("trigger_name"),
+                    trigger_state.get("current_price"),
+                    trigger_state.get("target_price"),
+                    trigger_state.get("gap_pct"),
+                    trigger_state.get("trigger_signals"),
+                    trigger_state.get("risk_reward") or 0.0,
+                )
 
                 # === VWAP 가드(슬리피지 방어) ===
                 try:
@@ -909,6 +1006,8 @@ def main(capital_override: float | None = None):
                     logger.warning(f"[BUY-FAIL] {code}: result={result}")
                     continue
 
+                triggered_today.add(code)
+
                 exec_price = _extract_fill_price(result, current_price)
                 _record_trade(
                     traded,
@@ -921,6 +1020,7 @@ def main(capital_override: float | None = None):
                         "pending_since": now_str,
                     },
                 )
+                traded_today.add(code)
                 save_state(holding, traded)
                 if not _is_balance_reflected(code, prev_qty=prev_qty):
                     logger.warning(
@@ -1061,6 +1161,7 @@ def main(capital_override: float | None = None):
                             logger.warning(f"[PULLBACK-BUY-FAIL] {code}: result={result}")
                             continue
 
+                        triggered_today.add(code)
                         exec_price = _extract_fill_price(result, trigger_price or current_price)
                         _record_trade(
                             traded,
@@ -1073,6 +1174,7 @@ def main(capital_override: float | None = None):
                                 "pending_since": now_str,
                             },
                         )
+                        traded_today.add(code)
                         save_state(holding, traded)
                         if not _is_balance_reflected(code, prev_qty=prev_qty):
                             logger.warning(
