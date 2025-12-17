@@ -18,11 +18,11 @@ class BaseEngine(ABC):
         return f"[{self.name.upper()}]"
 
     @abstractmethod
-    def rebalance_if_needed(self) -> Any:
+    def rebalance_if_needed(self, selected_stocks: list[dict[str, Any]] | None = None) -> Any:
         ...
 
     @abstractmethod
-    def trade_loop(self) -> Any:
+    def trade_loop(self, selected_stocks: list[dict[str, Any]] | None = None) -> Any:
         ...
 
     def _log(self, message: str) -> None:

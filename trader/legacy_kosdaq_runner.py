@@ -53,6 +53,7 @@ except ImportError:
     logger.warning("[CONFIG] ALLOW_PYRAMID missing; defaulting to False")
 from . import signals
 from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
+from trader.subject_flow import get_subject_flow_with_fallback, reset_flow_call_count
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
 
 if TYPE_CHECKING:
@@ -80,7 +81,8 @@ if TYPE_CHECKING:
     )
 
 
-def main(capital_override: float | None = None):
+def main(capital_override: float | None = None, selected_stocks: list[dict[str, Any]] | None = None):
+    reset_flow_call_count()
     effective_capital = int(capital_override) if capital_override is not None else DAILY_CAPITAL
     kis = KisAPI()
 
@@ -210,6 +212,74 @@ def main(capital_override: float | None = None):
 
         return False
 
+    def _subject_flow_gate(
+        code: str,
+        info: Dict[str, Any],
+        current_price: float,
+        target_price: float | None,
+        vwap_val: float | None,
+    ) -> tuple[bool, Dict[str, Any], float]:
+        day_turnover_krw = _to_float(
+            info.get("prev_turnover") or info.get("avg_turnover") or info.get("turnover"), 0.0
+        )
+        market = (info.get("market") or "KOSDAQ").upper()
+        flow = get_subject_flow_with_fallback(
+            kis, code, market, float(day_turnover_krw or 0.0)
+        )
+        score = flow.get("score") or {}
+
+        turnover_guard = float(CHAMPION_A_RULES.get("min_turnover") or 0.0)
+        ob_guard = 0.0
+        ob_strength_val: float = 0.0
+        try:
+            ob_strength_val = float(_to_float(kis.get_orderbook_strength(code), 0.0) or 0.0)
+        except Exception as e:
+            logger.warning(f"[OB_STRENGTH_FAIL] {code}: {e}")
+
+        if flow.get("degraded"):
+            turnover_guard *= float(flow.get("turnover_guard_mult") or 1.0)
+            ob_guard += float(flow.get("ob_strength_add") or 0.0)
+
+        ok = bool(flow.get("flow_ok"))
+        reason_tag = None
+
+        if turnover_guard > 0 and float(day_turnover_krw or 0.0) < turnover_guard:
+            ok = False
+            reason_tag = "LOW_TURNOVER"
+        if ob_guard > 0 and ob_strength_val < ob_guard:
+            ok = False
+            reason_tag = "OB_WEAK"
+
+        if not ok:
+            if reason_tag is None:
+                decision = str(flow.get("decision") or "")
+                if decision.startswith("BLOCK"):
+                    reason_tag = "SUBJECT_FLOW_FAIL_BLOCK"
+                else:
+                    reason_tag = "SUBJECT_FLOW_WEAK"
+
+            logger.info(
+                "[%s] code=%s market=%s last=%s target=%s vwap=%s turnover_krw=%.0f "
+                "spread_ticks=%s orderbook_strength=%s smart_money_krw=%s smart_money_ratio=%.6f "
+                "flow_used=%s flow_policy=%s degraded_mode=%s",
+                reason_tag,
+                code,
+                market,
+                current_price,
+                target_price,
+                vwap_val,
+                float(day_turnover_krw or 0.0),
+                None,
+                ob_strength_val,
+                score.get("smart_money_krw"),
+                float(score.get("smart_money_ratio") or 0.0),
+                flow.get("used"),
+                flow.get("policy"),
+                flow.get("degraded"),
+            )
+
+        return ok, flow, ob_strength_val
+
     def _is_order_success(res: Any) -> bool:
         if not isinstance(res, dict):
             return False
@@ -252,7 +322,12 @@ def main(capital_override: float | None = None):
 
     # === [NEW] 주간 리밸런싱 강제/중복 방지 ===
     targets: List[Dict[str, Any]] = []
-    if REBALANCE_ANCHOR == "weekly":
+    if selected_stocks is not None:
+        targets = list(selected_stocks)
+        logger.info(
+            "[REBALANCE] injected selected_stocks count=%d (skip API fetch)", len(targets)
+        )
+    elif REBALANCE_ANCHOR == "weekly":
         if should_weekly_rebalance_now():
             targets = fetch_rebalancing_targets(rebalance_date)
             # 중복 실행 방지를 위해 즉시 스탬프(필요 시 FORCE로 재실행 가능)
@@ -955,6 +1030,16 @@ def main(capital_override: float | None = None):
                     trigger_state.get("risk_reward") or 0.0,
                 )
 
+                flow_ok, flow_ctx, ob_strength = _subject_flow_gate(
+                    code,
+                    info,
+                    float(current_price),
+                    target_price,
+                    intraday_ctx.get("vwap"),
+                )
+                if not flow_ok:
+                    continue
+
                 # === VWAP 가드(슬리피지 방어) ===
                 try:
                     guard_passed = vwap_guard(kis, code, SLIPPAGE_ENTER_GUARD_PCT)
@@ -1147,6 +1232,16 @@ def main(capital_override: float | None = None):
                             logger.info(
                                 f"[PULLBACK-DELAY] {code}: 가격이 트리거 대비 2% 이상 하락 → 대기 (cur={current_price}, trigger={trigger_price})"
                             )
+                            continue
+
+                        flow_ok, flow_ctx, ob_strength = _subject_flow_gate(
+                            code,
+                            info,
+                            float(current_price),
+                            trigger_price,
+                            None,
+                        )
+                        if not flow_ok:
                             continue
 
                         prev_qty = int((holding.get(code) or {}).get("qty", 0))

@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.config import DAILY_CAPITAL
+from trader.core_utils import get_rebalance_anchor_date
+from trader.subject_flow import reset_flow_call_count
 from .kospi_core_engine import KospiCoreEngine
 from .kosdaq_alpha_engine import KosdaqAlphaEngine
 from .performance import PerformanceTracker
@@ -35,13 +38,32 @@ class PortfolioManager:
         )
 
     def run_once(self) -> Dict[str, Any]:
+        reset_flow_call_count()
+        selected_by_market: Dict[str, Any] = {}
         try:
-            kospi = self.kospi_engine.rebalance_if_needed()
+            rebalance_date = str(get_rebalance_anchor_date())
+            rebalance_payload = run_rebalance(rebalance_date, return_by_market=True)
+            selected_by_market = rebalance_payload.get("selected_by_market") or {}
+            logger.info(
+                "[PORTFOLIO][REBALANCE] date=%s kospi=%d kosdaq=%d",
+                rebalance_date,
+                len(selected_by_market.get("KOSPI", [])),
+                len(selected_by_market.get("KOSDAQ", [])),
+            )
+        except Exception as e:
+            logger.exception("[PORTFOLIO] rebalance fetch failed: %s", e)
+
+        try:
+            kospi = self.kospi_engine.rebalance_if_needed(
+                selected_stocks=selected_by_market.get("KOSPI")
+            )
         except Exception as e:
             logger.exception("[PORTFOLIO] KOSPI engine failure: %s", e)
             kospi = {"status": "error", "message": str(e)}
         try:
-            kosdaq = self.kosdaq_engine.trade_loop()
+            kosdaq = self.kosdaq_engine.trade_loop(
+                selected_stocks=selected_by_market.get("KOSDAQ")
+            )
         except Exception as e:
             logger.exception("[PORTFOLIO] KOSDAQ engine failure: %s", e)
             kosdaq = {"status": "error", "message": str(e)}

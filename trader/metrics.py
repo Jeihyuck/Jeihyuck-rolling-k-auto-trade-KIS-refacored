@@ -15,6 +15,11 @@ from __future__ import annotations
 import math
 import logging
 
+from trader.config import (
+    MIN_SMART_MONEY_RATIO_KOSPI,
+    MIN_SMART_MONEY_RATIO_KOSDAQ,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,3 +110,28 @@ def adaptive_slip(prev_turnover: float | None, price: float | None, base_pct: fl
 
     slip = (base_pct / 100.0) * factor_t * factor_p
     return slip
+
+
+def smart_money_score(inv: dict, day_turnover_krw: float) -> dict:
+    orgn = inv.get("orgn_ntby_tr_pbmn", 0) if isinstance(inv, dict) else 0
+    frgn = inv.get("frgn_ntby_tr_pbmn", 0) if isinstance(inv, dict) else 0
+    prsn = inv.get("prsn_ntby_tr_pbmn", 0) if isinstance(inv, dict) else 0
+    # pbmn(purchase balance in million KRW) 값을 원화로 환산해 비교 (단위 불일치 방지)
+    smart_money_krw = (orgn + frgn) * 1_000_000
+    turnover = float(day_turnover_krw or 0.0)
+    smart_money_ratio = smart_money_krw / turnover if turnover > 0 else 0.0
+    return {
+        "smart_money_krw": smart_money_krw,
+        "smart_money_ratio": smart_money_ratio,
+        "orgn": orgn,
+        "frgn": frgn,
+        "prsn": prsn,
+    }
+
+
+def subject_flow_gate(market: str, smart_money_ratio: float) -> bool:
+    if market == "KOSPI":
+        th = MIN_SMART_MONEY_RATIO_KOSPI
+    else:
+        th = MIN_SMART_MONEY_RATIO_KOSDAQ
+    return smart_money_ratio >= th

@@ -10,11 +10,11 @@ class KosdaqAlphaEngine(BaseEngine):
     def __init__(self, capital: float) -> None:
         super().__init__("kosdaq_alpha", capital)
 
-    def rebalance_if_needed(self) -> Dict[str, Any]:
+    def rebalance_if_needed(self, selected_stocks: list[dict[str, Any]] | None = None) -> Dict[str, Any]:
         # kosdaq engine keeps its own intraday logic; rebalance handled inside legacy loop
         return {"status": "delegated"}
 
-    def trade_loop(self) -> Any:
+    def trade_loop(self, selected_stocks: list[dict[str, Any]] | None = None) -> Any:
         self._log("starting legacy KOSDAQ loop")
-        result = run_trade_loop(capital_override=self.capital)
+        result = run_trade_loop(capital_override=self.capital, selected_stocks=selected_stocks)
         return result

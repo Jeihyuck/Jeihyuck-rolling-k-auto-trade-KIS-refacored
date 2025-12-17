@@ -27,6 +27,7 @@ from urllib3.util.retry import Retry
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
+from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
@@ -724,6 +725,64 @@ class KisAPI:
         if last_err:
             logger.warning("[DAILY_FAIL] A%s: %s", iscd, last_err)
         raise NetTemporaryError(f"DAILY A{iscd} net fail")
+
+    def inquire_investor(self, code: str, market: str = "KOSDAQ") -> dict:
+        """주체수급 조회(inquire-investor) — 실패 시에도 예외를 던지지 않는다."""
+        iscd = code.strip().lstrip("A")
+        # FID_COND_MRKT_DIV_CODE는 시장(KOSPI/KOSDAQ) 코드가 아니라 상품군 코드(J=주식/ETF/ETN, W=ELW 등)로
+        # 쓰이는 사례가 많다. 주식/ETF/ETN 기본값 "J"를 사용하고, 매핑에 W가 명시된 경우에만 W로 전송한다.
+        mapped = MARKET_MAP.get(iscd)
+        market_code = mapped if mapped in ("J", "W") else "J"
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
+        headers = self._headers("FHKST01010900")
+        params = {"FID_COND_MRKT_DIV_CODE": market_code, "FID_INPUT_ISCD": iscd}
+
+        def _safe_num(val: Any) -> int:
+            try:
+                if val is None:
+                    return 0
+                if isinstance(val, (int, float)):
+                    return int(val)
+                return int(str(val).replace(",", ""))
+            except Exception:
+                return 0
+
+        attempts = max(1, int(SUBJECT_FLOW_RETRY) + 1)
+        timeout = (SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_TIMEOUT_SEC + 0.5)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                self._limiter.wait("investor")
+                resp = self._safe_request(
+                    "get",
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=timeout,
+                )
+                data = resp.json()
+                output = data.get("output") or data.get("OutBlock_1") or data.get("outblock")
+                if isinstance(output, list):
+                    output = output[0] if output else {}
+                if not isinstance(output, dict):
+                    raise ValueError(f"unexpected output type: {type(output)}")
+                if not output:
+                    raise ValueError(f"empty output: {data}")
+
+                inv = {
+                    "prsn_ntby_tr_pbmn": _safe_num(output.get("prsn_ntby_tr_pbmn")),
+                    "frgn_ntby_tr_pbmn": _safe_num(output.get("frgn_ntby_tr_pbmn")),
+                    "orgn_ntby_tr_pbmn": _safe_num(output.get("orgn_ntby_tr_pbmn")),
+                }
+                for key in ("prsn_ntby_qty", "frgn_ntby_qty", "orgn_ntby_qty"):
+                    if key in output:
+                        inv[key] = _safe_num(output.get(key))
+                return {"ok": True, "inv": inv}
+            except Exception as e:
+                logger.info("[INVESTOR_FAIL] %s attempt=%s err=%s", code, attempt, e)
+                if attempt >= attempts:
+                    return {"ok": False, "error": str(e), "inv": None}
+                time.sleep(0.2 * (2 ** (attempt - 1)))
 
     # === ATR ===
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:

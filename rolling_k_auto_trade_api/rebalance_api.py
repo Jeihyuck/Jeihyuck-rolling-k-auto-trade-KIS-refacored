@@ -12,14 +12,14 @@ import pandas as pd
 import numpy as np
 from FinanceDataReader import StockListing, DataReader
 
-from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_kosdaq_topn
+from rolling_k_auto_trade_api.best_k_meta_strategy import get_best_k_for_krx_topn
 from rolling_k_auto_trade_api.logging_config import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 rebalance_router = APIRouter()
-latest_rebalance_result: Dict[str, Any] = {"date": None, "selected_stocks": []}
+latest_rebalance_result: Dict[str, Any] = {"date": None, "selected_stocks": [], "selected_by_market": {}}
 
 TOTAL_CAPITAL = int(os.getenv("TOTAL_CAPITAL", "10000000"))
 MIN_WINRATE = float(os.getenv("MIN_WINRATE", "50"))
@@ -70,22 +70,29 @@ async def run_rebalance(date: str):
     logger.info(f"[RUN] run_rebalance 호출: date={date}")
 
     try:
-        raw_results = get_best_k_for_kosdaq_topn(date)
+        raw_results = get_best_k_for_krx_topn(date, return_by_market=True)
     except Exception as e:
         logger.exception(f"[ERROR] Best K 계산 실패: {e}")
         raise HTTPException(status_code=500, detail="Best K 계산 실패")
 
     results_map: Dict[str, Dict[str, Any]] = {}
+    selected_flat: List[Dict[str, Any]] = []
+    selected_by_market: Dict[str, List[Dict[str, Any]]] = {}
+    weight_scope = None
     if isinstance(raw_results, dict):
-        results_map = raw_results
+        selected_flat = raw_results.get("selected") or []
+        selected_by_market = raw_results.get("selected_by_market") or {}
+        weight_scope = raw_results.get("weight_scope")
     else:
-        for s in raw_results:
-            code_key = s.get("stock_code") or s.get("code") or s.get("티커")
-            if not code_key:
-                logger.warning(f"[WARN] 코드 누락: {s}")
-                continue
-            s["stock_code"] = code_key
-            results_map[code_key] = s
+        selected_flat = raw_results or []
+
+    for s in selected_flat:
+        code_key = s.get("stock_code") or s.get("code") or s.get("티커")
+        if not code_key:
+            logger.warning(f"[WARN] 코드 누락: {s}")
+            continue
+        s["stock_code"] = code_key
+        results_map[code_key] = s
 
     logger.info(f"[FILTER] 후보 종목 수 = {len(results_map)}개")
 
@@ -150,6 +157,27 @@ async def run_rebalance(date: str):
     if not has_weight:
         selected = _assign_weights(selected)
 
+    selected_by_market_out: Dict[str, List[Dict[str, Any]]] = {}
+    for info in selected:
+        mkt = (info.get("market") or "UNKNOWN").upper()
+        selected_by_market_out.setdefault(mkt, []).append(info)
+
+    for mkt, rows in selected_by_market_out.items():
+        total_weight = sum(float(r.get("weight") or 0) for r in rows)
+        if total_weight > 0:
+            for r in rows:
+                r["weight"] = float(r.get("weight") or 0) / total_weight
+
+    # 서버 측 필터링 후에는 시장별 정규화가 적용되므로 스코프를 명시적으로 per_market로 고정한다.
+    weight_scope = {"selected": "per_market", "selected_by_market": "per_market"}
+
+    market_counts: Dict[str, int] = {}
+    for info in selected:
+        mkt = (info.get("market") or "UNKNOWN").upper()
+        market_counts[mkt] = market_counts.get(mkt, 0) + 1
+    for mkt, cnt in market_counts.items():
+        logger.info("[MARKET] %s selected_count=%d", mkt, cnt)
+
     enriched: List[Dict[str, Any]] = []
     for info in selected:
         code = info.get("stock_code") or info.get("code")
@@ -157,6 +185,7 @@ async def run_rebalance(date: str):
         row = dict(info)
         row.setdefault("code", code)
         row.setdefault("name", name)
+        row.setdefault("market", info.get("market"))
         try:
             df = DataReader(code)
             if df is not None and len(df) >= 2:
@@ -171,7 +200,12 @@ async def run_rebalance(date: str):
             logger.warning(f"[REBAL] OHLC enrich fail {code}: {e}")
         enriched.append(row)
 
-    latest_rebalance_result.update({"date": date, "selected_stocks": enriched})
+    latest_rebalance_result.update({
+        "date": date,
+        "selected_stocks": enriched,
+        "selected_by_market": selected_by_market_out,
+        "weight_scope": weight_scope,
+    })
     os.makedirs(REBALANCE_OUT_DIR, exist_ok=True)
     fp = os.path.join(REBALANCE_OUT_DIR, f"rebalance_{date}.json")
     try:
@@ -190,6 +224,8 @@ async def run_rebalance(date: str):
         "status": "saved",
         "selected_count": len(enriched),
         "selected_stocks": enriched,
+        "selected_by_market": selected_by_market_out,
+        "weight_scope": weight_scope,
         "store": REBALANCE_STORE,
         "out_file": fp,
         "total_capital_hint": TOTAL_CAPITAL,
@@ -315,16 +351,19 @@ def rebalance_backtest_monthly(
 def get_selected_stocks(date: str):
     if latest_rebalance_result.get("date") == date:
         selected = latest_rebalance_result.get("selected_stocks", [])
+        selected_by_market = latest_rebalance_result.get("selected_by_market", {})
         return {
             "status": "ready",
             "rebalance_date": date,
-            "selected": selected
+            "selected": selected,
+            "selected_by_market": selected_by_market,
         }
     else:
         return {
             "status": "not_ready",
             "rebalance_date": date,
             "selected": [],
+            "selected_by_market": {},
             "message": "먼저 /rebalance/run/{date} 엔드포인트로 리밸런싱을 실행하세요."
         }
 # TOTAL_LINES: 320

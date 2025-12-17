@@ -1,9 +1,10 @@
 # rolling_k_auto_trade_api/adjust_price_to_tick.py
 
-def adjust_price_to_tick(price: float) -> int:
+def adjust_price_to_tick(price: float, code: str | None = None) -> int:
     """
     한국 주식 시장 호가단위(틱사이즈)에 맞게 가격을 자동 보정.
     - KOSDAQ/코스피 기준 호가단위 (1원 ~ 1000원 단위까지 지원)
+    - code 인자는 호가 단위 결정에 사용하지 않으나, 호출부 호환성을 위해 허용한다.
     """
     # 2024년 기준 틱사이즈 테이블 (KOSPI/KOSDAQ 공통)
     tick_table = [

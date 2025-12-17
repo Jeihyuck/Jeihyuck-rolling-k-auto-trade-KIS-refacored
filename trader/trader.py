@@ -6,6 +6,7 @@ import logging
 
 from portfolio.portfolio_manager import PortfolioManager
 from trader.time_utils import is_trading_day, now_kst
+from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
 
 logger = logging.getLogger(__name__)
 
