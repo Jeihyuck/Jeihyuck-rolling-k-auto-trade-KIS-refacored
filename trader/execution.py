@@ -23,7 +23,8 @@ from .core_utils import (
     _with_retry,
     log_trade,
 )
-from .kis_wrapper import KisAPI, NetTemporaryError, append_fill
+from .kis_wrapper import KisAPI, NetTemporaryError
+from .fills import append_fill
 from .signals import (
     _get_atr,
     _notional_to_qty,
@@ -383,7 +384,16 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
                 writer = csv.writer(f)
                 writer.writerows(reader)
             return
-        append_fill("BUY", code, name or "", qty, price or 0.0, odno or "", note="ensure_fill_added_by_trader")
+        append_fill(
+            "BUY",
+            code,
+            name or "",
+            qty,
+            price or 0.0,
+            odno or "",
+            note="ensure_fill_added_by_trader",
+            reason="ensure_fill_name",
+        )
     except Exception as e:
         logger.warning(f"[ENSURE_FILL_FAIL] odno={odno} code={code} ex={e}")
 

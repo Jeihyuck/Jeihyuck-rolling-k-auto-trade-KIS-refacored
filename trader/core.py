@@ -7,7 +7,8 @@ from typing import Dict, Optional
 from rolling_k_auto_trade_api.best_k_meta_strategy import get_kosdaq_top_n
 
 from . import config
-from .kis_wrapper import DataEmptyError, DataShortError, KisAPI, NetTemporaryError, append_fill
+from .kis_wrapper import DataEmptyError, DataShortError, KisAPI, NetTemporaryError
+from .fills import append_fill
 from .metrics import vwap_guard
 from .report_ceo import ceo_report
 

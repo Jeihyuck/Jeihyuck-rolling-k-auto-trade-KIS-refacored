@@ -16,7 +16,6 @@ import time
 import random
 import logging
 import threading
-import csv
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -28,6 +27,7 @@ from urllib3.util.retry import Retry
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
 from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+from trader.fills import append_fill
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
@@ -89,32 +89,6 @@ def safe_strip(val):
 
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
-
-
-def append_fill(side: str, code: str, name: str, qty: int, price: float, odno: str, note: str = ""):
-    try:
-        os.makedirs("fills", exist_ok=True)
-        path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
-        header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note"]
-        row = [
-            datetime.now().isoformat(),
-            side,
-            code,
-            name or "",
-            int(qty),
-            float(price) if price is not None else 0.0,
-            str(odno) if odno is not None else "",
-            note or "",
-        ]
-        new = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(header)
-            w.writerow(row)
-        logger.info(f"[APPEND_FILL] {side} {code} qty={qty} price={price} odno={odno}")
-    except Exception as e:
-        logger.warning(f"[APPEND_FILL_FAIL] side={side} code={code} ex={e}")
 
 
 def _order_block_reason(now: datetime | None = None) -> Optional[str]:
@@ -1305,6 +1279,7 @@ class KisAPI:
                                 price=price_for_fill,
                                 odno=odno,
                                 note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
+                                reason="order_cash",
                             )
                         except Exception as e:
                             logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
@@ -1378,7 +1353,7 @@ class KisAPI:
                     f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} "
                     f"last={last} age={now_ts-last:.1f}s"
                 )
-                return None
+                return {"status": "SKIPPED", "skip_reason": "DUP_BLOCK"}
 
         body = {
             "CANO": self.CANO,
@@ -1494,7 +1469,7 @@ class KisAPI:
                     f"[SELL_DUP_BLOCK_LIMIT] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} "
                     f"last={last} age={now_ts-last:.1f}s"
                 )
-                return None
+                return {"status": "SKIPPED", "skip_reason": "DUP_BLOCK"}
 
         body = {
             "CANO": self.CANO,
@@ -1534,6 +1509,7 @@ class KisAPI:
                     price=price_for_fill,
                     odno=odno,
                     note=f"limit,tr={tr_id}",
+                    reason="sell_limit",
                 )
             except Exception as e:
                 logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")

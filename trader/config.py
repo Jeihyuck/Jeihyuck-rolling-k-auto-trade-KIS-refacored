@@ -53,6 +53,7 @@ CONFIG = {
     "REG_BEAR_STAGE2_ADD_DROP": "0.5",
     "REG_PARTIAL_S1": "0.30",
     "REG_PARTIAL_S2": "0.30",
+    "BASE_QTY_MODE": "initial",  # initial | current
     "TRAIL_PCT_BULL": "0.025",
     "TRAIL_PCT_BEAR": "0.012",
     "TP_PROFIT_PCT_BULL": "3.5",
@@ -137,6 +138,12 @@ ALLOW_PYRAMID = (_cfg("ALLOW_PYRAMID") or "false").lower() == "true"
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
 WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
 MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
+BASE_QTY_MODE = (_cfg("BASE_QTY_MODE") or "initial").lower()
+if BASE_QTY_MODE not in {"initial", "current"}:
+    logging.getLogger(__name__).warning(
+        f"[CONFIG] BASE_QTY_MODE={BASE_QTY_MODE} 지원 안 함 → initial로 대체"
+    )
+    BASE_QTY_MODE = "initial"
 
 # NEW: 1분봉 모멘텀 파라미터
 MOM_FAST = int(_cfg("MOM_FAST") or "5")

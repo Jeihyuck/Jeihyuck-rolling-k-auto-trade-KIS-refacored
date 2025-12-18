@@ -1,7 +1,7 @@
 from datetime import datetime
 import csv, os
 
-def append_fill(side, code, name, qty, price, odno, note=""):
+def append_fill(side, code, name, qty, price, odno, note="", reason=""):
     """
     체결 기록을 CSV로 저장
     side: "BUY" or "SELL"
@@ -14,7 +14,7 @@ def append_fill(side, code, name, qty, price, odno, note=""):
     """
     os.makedirs("fills", exist_ok=True)
     path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
-    header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note"]
+    header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note", "reason"]
     row = [
         datetime.now().isoformat(),
         side,
@@ -24,6 +24,7 @@ def append_fill(side, code, name, qty, price, odno, note=""):
         float(price),
         str(odno),
         note,
+        reason or "",
     ]
     new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
