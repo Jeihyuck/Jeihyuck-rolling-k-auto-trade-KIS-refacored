@@ -68,25 +68,40 @@ def apply_sell_fill_fifo(
     remaining = int(qty_filled)
     if remaining <= 0:
         return
+
     req_sid = _norm_sid(strategy_id)
-    for lot in lots:
-        if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
-            continue
-        if not allow_blocked and lot.get("meta", {}).get("sell_blocked") is True:
-            continue
-        lot_sid = _norm_sid(lot.get("strategy_id"))
-        if req_sid is not None and lot_sid != req_sid:
-            continue
-        lot_remaining = int(lot.get("remaining_qty") or 0)
-        if lot_remaining <= 0:
-            continue
-        delta = min(lot_remaining, remaining)
-        lot["remaining_qty"] = int(lot_remaining - delta)
-        if delta > 0:
-            lot["last_sell_ts"] = sell_ts
-        remaining -= delta
-        if remaining <= 0:
-            break
+
+    def _consume(remaining_qty: int, sid_filter: int | str | None) -> int:
+        for lot in lots:
+            if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+                continue
+            if not allow_blocked and lot.get("meta", {}).get("sell_blocked") is True:
+                continue
+
+            lot_sid = _norm_sid(lot.get("strategy_id"))
+            if sid_filter is not None and lot_sid != sid_filter:
+                continue
+
+            lot_remaining = int(lot.get("remaining_qty") or 0)
+            if lot_remaining <= 0:
+                continue
+
+            delta = min(lot_remaining, remaining_qty)
+            lot["remaining_qty"] = int(lot_remaining - delta)
+            if delta > 0:
+                lot["last_sell_ts"] = sell_ts
+
+            remaining_qty -= delta
+            if remaining_qty <= 0:
+                break
+        return remaining_qty
+
+    # 1) 먼저 요청 전략에서 차감
+    remaining = _consume(remaining, req_sid)
+
+    # 2) 부족하면 다른 전략 lot에서도 차감(계좌 매도 반영 spill)
+    if remaining > 0 and req_sid is not None:
+        remaining = _consume(remaining, None)
 
 
 def owned_lots_by_strategy(state: Dict[str, Any], strategy_id: int | str) -> List[Dict[str, Any]]:
