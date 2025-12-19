@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from .core_constants import *  # noqa: F401,F403
+from .config import KST, STATE_PATH
 from .core_utils import (
     _get_daily_candles_cached,
     _log_realized_pnl,
@@ -50,7 +51,166 @@ __all__ = [
     "log_champion_and_regime",
     "_adaptive_exit",
     "REGIME_STATE",
+    "record_entry_state",
+    "update_position_meta",
+    "update_position_flags",
 ]
+
+
+def _normalize_entry_meta(
+    *,
+    code: str,
+    strategy_id: Any,
+    engine: str,
+    entry_reason: str,
+    order_type: str | None,
+    best_k: Any,
+    tgt_px: Any,
+    gap_pct_at_entry: Any,
+    entry_time: str | None = None,
+) -> Dict[str, Any]:
+    return {
+        "time": entry_time or datetime.now(KST).isoformat(),
+        "strategy_id": strategy_id,
+        "engine": engine,
+        "entry_reason": entry_reason,
+        "order_type": order_type,
+        "best_k": best_k,
+        "tgt_px": tgt_px,
+        "gap_pct_at_entry": gap_pct_at_entry,
+    }
+
+
+def _normalize_meta(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    payload = payload or {}
+    return {
+        "pullback_peak_price": payload.get("pullback_peak_price"),
+        "pullback_reversal_price": payload.get("pullback_reversal_price"),
+        "pullback_reason": payload.get("pullback_reason"),
+    }
+
+
+def _normalize_flags(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    payload = payload or {}
+    return {
+        "bear_s1_done": bool(payload.get("bear_s1_done", False)),
+        "bear_s2_done": bool(payload.get("bear_s2_done", False)),
+    }
+
+
+def record_entry_state(
+    *,
+    state: Dict[str, Any],
+    code: str,
+    qty: int,
+    avg_price: float,
+    strategy_id: Any,
+    engine: str,
+    entry_reason: str,
+    order_type: str | None,
+    best_k: Any,
+    tgt_px: Any,
+    gap_pct_at_entry: Any,
+    meta: Dict[str, Any] | None = None,
+    flags: Dict[str, Any] | None = None,
+    entry_time: str | None = None,
+) -> Dict[str, Any]:
+    code_key = str(code).zfill(6)
+    sid_key = str(strategy_id)
+    pos = state.setdefault("positions", {}).setdefault(
+        code_key,
+        {
+            "entries": {},
+            "flags": {"bear_s1_done": False, "bear_s2_done": False},
+            "broker_qty": None,
+            "broker_avg_price": None,
+            "miss_count": 0,
+        },
+    )
+    entries = pos.setdefault("entries", {})
+    entries[sid_key] = {
+        "qty": int(qty),
+        "avg_price": float(avg_price),
+        "entry": _normalize_entry_meta(
+            code=str(code),
+            strategy_id=strategy_id,
+            engine=engine,
+            entry_reason=entry_reason,
+            order_type=order_type,
+            best_k=best_k,
+            tgt_px=tgt_px,
+            gap_pct_at_entry=gap_pct_at_entry,
+            entry_time=entry_time,
+        ),
+        "meta": _normalize_meta(meta),
+    }
+    if flags:
+        update_position_flags(state, code, flags)
+    logger.info(
+        "[ENTRY] code=%s strategy=%s engine=%s best_k=%s tgt_px=%s saved_state=OK",
+        code_key,
+        strategy_id,
+        engine,
+        best_k,
+        tgt_px,
+    )
+    return state
+
+
+def update_position_meta(
+    state: Dict[str, Any],
+    code: str,
+    strategy_id: Any,
+    meta_updates: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    code_key = str(code).zfill(6)
+    sid_key = str(strategy_id)
+    pos = state.get("positions", {}).get(code_key)
+    if not isinstance(pos, dict):
+        return state
+    entries = pos.get("entries", {})
+    entry = entries.get(sid_key)
+    if not isinstance(entry, dict):
+        return state
+    meta = entry.setdefault(
+        "meta",
+        {
+            "pullback_peak_price": None,
+            "pullback_reversal_price": None,
+            "pullback_reason": None,
+        },
+    )
+    if meta_updates:
+        for key in ("pullback_peak_price", "pullback_reversal_price", "pullback_reason"):
+            if key in meta_updates:
+                meta[key] = meta_updates.get(key)
+    return state
+
+
+def update_position_flags(
+    state: Dict[str, Any],
+    code: str,
+    flag_updates: Dict[str, Any],
+) -> Dict[str, Any]:
+    code_key = str(code).zfill(6)
+    pos = state.get("positions", {}).get(code_key)
+    if not isinstance(pos, dict):
+        return state
+    flags = pos.setdefault(
+        "flags",
+        {"bear_s1_done": False, "bear_s2_done": False},
+    )
+    before_flags = dict(flags)
+    for key in ("bear_s1_done", "bear_s2_done"):
+        if key in flag_updates:
+            flags[key] = bool(flag_updates.get(key))
+    logger.info(
+        "[FLAGS] code=%s flags_before=%s flags_after=%s",
+        code_key,
+        before_flags,
+        flags,
+    )
+    return state
 
 def fetch_rebalancing_targets(date: str) -> list[dict[str, Any]]:
     REBALANCE_API_URL = f"http://localhost:8000/rebalance/run/{date}?force_order=true"
@@ -146,6 +306,7 @@ def _maybe_scale_in_dips(
     target: Dict[str, Any],
     now_str: str,
     regime_mode: str,
+    position_state: Dict[str, Any] | None = None,
 ) -> None:
     """
     신고가 → 3일 연속 하락 → 반등 확인 시 단계적 추가 매수 로직.
@@ -245,6 +406,17 @@ def _maybe_scale_in_dips(
     # 참고용 상태 업데이트
     pos["pullback_peak_price"] = float(peak_price)
     pos["pullback_reversal_price"] = float(reversal_price)
+    if position_state is not None:
+        update_position_meta(
+            position_state,
+            code,
+            pos.get("strategy_id") or 1,
+            {
+                "pullback_peak_price": float(peak_price),
+                "pullback_reversal_price": float(reversal_price),
+                "pullback_reason": pullback.get("reason"),
+            },
+        )
 
     add_qty = 0
     next_stage = entry_stage
@@ -1038,5 +1210,3 @@ def _adaptive_exit(
         return None, None, None, None
 
     return reason, exec_px, result, sold_qty
-
-

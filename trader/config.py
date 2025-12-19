@@ -103,7 +103,10 @@ logger = logging.getLogger(__name__)
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-STATE_FILE = Path(__file__).parent / "trade_state.json"
+STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
+STATE_DIR = Path(__file__).parent / "state"
+STATE_PATH = STATE_DIR / "state.json"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
 MARKET_MAP: Dict[str, str] = {

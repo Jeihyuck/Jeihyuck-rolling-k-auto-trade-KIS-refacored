@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 try:
     from .config import (
         DAILY_CAPITAL,
+        FAST_STOP,
         FORCE_SELL_PASSES_CLOSE,
         FORCE_SELL_PASSES_CUTOFF,
         FORCE_SELL_BLOCKED_LOTS,
@@ -28,6 +29,7 @@ try:
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
+        STATE_PATH,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
@@ -38,6 +40,7 @@ except ImportError:
     # ALLOW_WHEN_CLOSED가 누락돼도 러너가 즉시 중단되지 않도록 안전한 기본값을 제공한다.
     from .config import (
         DAILY_CAPITAL,
+        FAST_STOP,
         FORCE_SELL_PASSES_CLOSE,
         FORCE_SELL_PASSES_CUTOFF,
         FORCE_SELL_BLOCKED_LOTS,
@@ -48,6 +51,7 @@ except ImportError:
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
+        STATE_PATH,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
@@ -62,6 +66,8 @@ except ImportError:
 from . import signals
 from trader.time_utils import MARKET_CLOSE, MARKET_OPEN, is_trading_day
 from trader.subject_flow import get_subject_flow_with_fallback, reset_flow_call_count
+from trader.execution import record_entry_state
+from trader.exit_allocation import allocate_sell_qty, apply_sell_allocation
 from trader.ledger import (
     apply_sell_fill_fifo,
     dominant_strategy_for,
@@ -69,7 +75,12 @@ from trader.ledger import (
     remaining_qty_for_strategy,
     reconcile_with_broker_holdings,
 )
-from trader.state_store import load_state as load_lot_state, save_state as save_lot_state
+from trader.lot_state_store import load_lot_state, save_lot_state
+from trader.position_state_store import (
+    load_position_state,
+    reconcile_with_broker,
+    save_position_state,
+)
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
 
 if TYPE_CHECKING:
@@ -129,9 +140,11 @@ def main(
     holding, traded = load_state()
     lot_state_path = "bot_state/state.json"
     lot_state = load_lot_state(lot_state_path)
+    position_state_path = str(STATE_PATH)
+    position_state = load_position_state(position_state_path)
+    position_state_dirty = False
     triggered_today: set[str] = set()
     s1_done_today: set[str] = set()
-    last_price_map: dict[str, float] = {}
     last_today_prefix: str | None = None
 
     if isinstance(traded, (set, list, tuple)):
@@ -195,12 +208,119 @@ def main(
         if after_signature != before_signature:
             save_lot_state(lot_state_path, lot_state)
 
+    def _ensure_position_entry(
+        code: str, strategy_id: int | str
+    ) -> Dict[str, Any]:
+        code_key = str(code).zfill(6)
+        sid_key = str(strategy_id)
+        pos = position_state.setdefault("positions", {}).setdefault(
+            code_key,
+            {
+                "entries": {},
+                "flags": {"bear_s1_done": False, "bear_s2_done": False},
+                "broker_qty": None,
+                "broker_avg_price": None,
+                "miss_count": 0,
+            },
+        )
+        entries = pos.setdefault("entries", {})
+        entry = entries.get(sid_key)
+        if isinstance(entry, dict):
+            return entry
+        now_ts = datetime.now(KST).isoformat()
+        entry = {
+            "qty": int((holding.get(code) or {}).get("qty") or 0),
+            "avg_price": float((holding.get(code) or {}).get("buy_price") or 0.0),
+            "entry": {
+                "time": now_ts,
+                "strategy_id": sid_key,
+                "engine": "unknown",
+                "entry_reason": "RECONCILE",
+                "order_type": "unknown",
+                "best_k": None,
+                "tgt_px": None,
+                "gap_pct_at_entry": None,
+            },
+            "meta": {
+                "pullback_peak_price": None,
+                "pullback_reversal_price": None,
+                "pullback_reason": None,
+            },
+        }
+        entries[sid_key] = entry
+        return entry
+
+    def _set_position_flags(code: str, **flags: bool) -> None:
+        nonlocal position_state_dirty
+        pos = position_state.setdefault("positions", {}).setdefault(
+            str(code).zfill(6),
+            {
+                "entries": {},
+                "flags": {"bear_s1_done": False, "bear_s2_done": False},
+                "broker_qty": None,
+                "broker_avg_price": None,
+                "miss_count": 0,
+            },
+        )
+        flags_before = dict(pos.get("flags") or {})
+        entry_flags = pos.setdefault(
+            "flags",
+            {"bear_s1_done": False, "bear_s2_done": False},
+        )
+        for key, value in flags.items():
+            entry_flags[key] = bool(value)
+            if code in holding:
+                holding[code][key] = bool(value)
+        logger.info(
+            "[FLAGS] code=%s flags_before=%s flags_after=%s",
+            str(code).zfill(6),
+            flags_before,
+            entry_flags,
+        )
+        position_state_dirty = True
+
+    def _update_last_price_memory(code: str, current_price: float, now_ts: str) -> None:
+        nonlocal position_state_dirty
+        memory = position_state.setdefault("memory", {})
+        memory.setdefault("last_price", {})[str(code).zfill(6)] = float(current_price)
+        memory.setdefault("last_seen", {})[str(code).zfill(6)] = now_ts
+        position_state_dirty = True
+
+    def _pullback_stop_hit(
+        code: str, current_price: float, strategy_id: int | str = 5
+    ) -> bool:
+        pos = position_state.get("positions", {}).get(str(code).zfill(6))
+        if not isinstance(pos, dict):
+            return False
+        entries = pos.get("entries", {})
+        entry = entries.get(str(strategy_id))
+        if not isinstance(entry, dict):
+            return False
+        meta = entry.get("meta", {}) or {}
+        reversal_price = meta.get("pullback_reversal_price")
+        if reversal_price is None:
+            return False
+        try:
+            return float(current_price) < float(reversal_price) * (1 - FAST_STOP)
+        except Exception:
+            return False
+
     def _remaining_qty_for(pdno: str) -> int:
         return sum(
             int(lot.get("remaining_qty") or 0)
             for lot in lot_state.get("lots", [])
             if str(lot.get("pdno")).zfill(6) == str(pdno).zfill(6)
         )
+
+    def _ledger_total_available_qty(code: str) -> int:
+        return sum(
+            int(lot.get("remaining_qty") or 0)
+            for lot in lot_state.get("lots", [])
+            if str(lot.get("pdno")).zfill(6) == str(code).zfill(6)
+        )
+
+    def _cap_sell_qty(code: str, requested_qty: int) -> int:
+        return min(int(requested_qty), int(_ledger_total_available_qty(code)))
 
     def _normalize_strategy_id(value: Any) -> int:
         try:
@@ -318,28 +438,69 @@ def main(
         requested_qty: int,
         sell_ts: str,
         result: Any,
-        strategy_id: int | None = None,
+        scope: str = "proportional",
+        trigger_strategy_id: int | None = None,
         prev_qty_before: int | None = None,
         allow_blocked: bool = False,
     ) -> None:
         if not _is_order_success(result):
             return
         prev_qty = int(prev_qty_before if prev_qty_before is not None else (holding.get(code) or {}).get("qty") or requested_qty)
-        if strategy_id is not None:
-            available_qty = remaining_qty_for_strategy(lot_state, code, strategy_id)
-            requested_qty = min(int(requested_qty), int(available_qty))
-            if requested_qty <= 0:
-                return
         sold_qty = _estimate_sold_qty(code, requested_qty, prev_qty)
         if sold_qty <= 0:
             return
+        if scope == "strategy" and trigger_strategy_id is None:
+            scope = "proportional"
         before_lot_signature = _lot_state_signature(lot_state)
-        _apply_sell_to_ledger(
+        allocations = allocate_sell_qty(
+            lot_state,
             code,
             int(sold_qty),
+            scope=scope,
+            trigger_strategy_id=trigger_strategy_id,
+        )
+        if not allocations:
+            if sold_qty > 0:
+                now_ts = datetime.now(KST).isoformat()
+                lot_state.setdefault("lots", []).append(
+                    {
+                        "lot_id": f"{str(code).zfill(6)}-ORPHAN-{now_ts}",
+                        "pdno": str(code).zfill(6),
+                        "strategy_id": "ORPHAN",
+                        "engine": "orphan",
+                        "entry_ts": now_ts,
+                        "entry_price": 0.0,
+                        "qty": int(sold_qty),
+                        "remaining_qty": int(sold_qty),
+                        "meta": {"reconciled": True},
+                    }
+                )
+                apply_sell_fill_fifo(
+                    lot_state,
+                    pdno=str(code).zfill(6),
+                    qty_filled=int(sold_qty),
+                    sell_ts=sell_ts,
+                    strategy_id="ORPHAN",
+                    allow_blocked=allow_blocked,
+                )
+                _maybe_save_lot_state(before_lot_signature)
+            return
+        broker_qty_after = max(0, int(prev_qty) - int(sold_qty))
+        logger.info(
+            "[SELL-ALLOC] code=%s requested_qty=%s scope=%s allocations=%s sold_qty=%s broker_qty_before=%s broker_qty_after=%s",
+            str(code).zfill(6),
+            int(requested_qty),
+            scope,
+            allocations,
+            int(sold_qty),
+            int(prev_qty),
+            int(broker_qty_after),
+        )
+        apply_sell_allocation(
+            lot_state,
+            code,
+            allocations,
             sell_ts,
-            result,
-            strategy_id=strategy_id,
             allow_blocked=allow_blocked,
         )
         _maybe_save_lot_state(before_lot_signature)
@@ -1170,7 +1331,11 @@ def main(
                 }
                 _init_position_state_from_balance(kis, holding, code, price, qty)
 
-            for code in holding.keys():
+            before_lot_signature = _lot_state_signature(lot_state)
+            reconcile_with_broker_holdings(lot_state, balances)
+            _maybe_save_lot_state(before_lot_signature)
+
+            for code, info in holding.items():
                 sid = dominant_strategy_for(lot_state, code)
                 if sid is not None:
                     holding[code]["strategy_id"] = sid
@@ -1180,9 +1345,29 @@ def main(
                         sid,
                     )
 
-            before_lot_signature = _lot_state_signature(lot_state)
-            reconcile_with_broker_holdings(lot_state, balances)
-            _maybe_save_lot_state(before_lot_signature)
+            position_state = reconcile_with_broker(position_state, balances)
+            position_state_dirty = True
+
+            for code, info in holding.items():
+                pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
+                if not isinstance(pos_state, dict):
+                    continue
+                entries = pos_state.get("entries", {})
+                if not entries:
+                    sid = info.get("strategy_id") or "ORPHAN"
+                    _ensure_position_entry(code, sid)
+                    position_state_dirty = True
+                    entries = pos_state.get("entries", {})
+                entry = entries.get(str(info.get("strategy_id"))) if entries else None
+                if not isinstance(entry, dict):
+                    continue
+                meta = entry.get("meta", {})
+                flags = pos_state.get("flags", {})
+                info["engine"] = entry.get("entry", {}).get("engine") or info.get("engine")
+                info["bear_s1_done"] = bool(flags.get("bear_s1_done", False))
+                info["bear_s2_done"] = bool(flags.get("bear_s2_done", False))
+                info["pullback_peak_price"] = meta.get("pullback_peak_price")
+                info["pullback_reversal_price"] = meta.get("pullback_reversal_price")
 
             # 잔고 기준으로 보유종목 매도 가능 수량 맵 생성
             ord_psbl_map = {
@@ -1258,6 +1443,9 @@ def main(
                     if qty <= 0:
                         continue
                     prev_qty_before = int((holding.get(code) or {}).get("qty") or 0)
+                    qty = _cap_sell_qty(code, qty)
+                    if qty <= 0:
+                        continue
                     exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
                     log_trade(
                         {
@@ -1280,7 +1468,8 @@ def main(
                         int(qty),
                         now_dt_kst.isoformat(),
                         result,
-                        strategy_id=None,
+                        scope="proportional",
+                        trigger_strategy_id=None,
                         prev_qty_before=prev_qty_before,
                         allow_blocked=FORCE_SELL_BLOCKED_LOTS,
                     )
@@ -1296,6 +1485,28 @@ def main(
 
             # === (1) 잔여 물량 대상 스탑/리밸런스 관리 ===
             for code in list(holding.keys()):
+                pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
+                if isinstance(pos_state, dict):
+                    entries = pos_state.get("entries", {})
+                    entry_ids = ",".join(sorted(entries.keys())) if entries else "ORPHAN"
+                    entry_sample = None
+                    if entries:
+                        entry_sample = next(iter(entries.values()))
+                    entry_meta = entry_sample.get("entry", {}) if isinstance(entry_sample, dict) else {}
+                    flags = pos_state.get("flags", {}) if isinstance(pos_state, dict) else {}
+                    logger.info(
+                        "[EXIT-CHECK] code=%s strategy=%s engine=%s flags=bear_s1_done=%s bear_s2_done=%s source=state.json",
+                        str(code).zfill(6),
+                        entry_ids,
+                        entry_meta.get("engine"),
+                        flags.get("bear_s1_done", False),
+                        flags.get("bear_s2_done", False),
+                    )
+                else:
+                    logger.info(
+                        "[EXIT-CHECK] code=%s strategy=ORPHAN engine=unknown flags=bear_s1_done=False bear_s2_done=False source=ORPHAN_POSITION",
+                        str(code).zfill(6),
+                    )
                 # 신규 진입 금지 모드
                 if code not in code_to_target:
                     continue
@@ -1333,7 +1544,7 @@ def main(
 
                             if remaining <= 0 or sellable_qty <= 0:
                                 if remaining <= 0:
-                                    holding[code]["bear_s1_done"] = True
+                                    _set_position_flags(code, bear_s1_done=True)
                                     s1_done_today.add(code)
                                 regime_s1_summary["skipped"] += 1
                                 _log_s1_action(
@@ -1351,13 +1562,8 @@ def main(
                                     ),
                                 )
                             else:
-                                sid = _resolve_sell_sid(code)
                                 sell_qty = min(remaining, sellable_qty)
-                                if sid is not None:
-                                    sell_qty = min(
-                                        sell_qty,
-                                        remaining_qty_for_strategy(lot_state, code, sid),
-                                    )
+                                sell_qty = _cap_sell_qty(code, sell_qty)
                                 if sell_qty <= 0:
                                     regime_s1_summary["skipped"] += 1
                                     _log_s1_action(
@@ -1392,7 +1598,7 @@ def main(
                                         0, holding[code]["qty"] - int(sell_qty)
                                     )
                                     if guard["sold"] >= target_qty:
-                                        holding[code]["bear_s1_done"] = True
+                                        _set_position_flags(code, bear_s1_done=True)
                                         s1_done_today.add(code)
                                     _persist_guard_state(now_dt_kst.date())
                                     regime_s1_summary["sent_qty"] += int(sell_qty)
@@ -1420,7 +1626,8 @@ def main(
                                         int(sell_qty),
                                         now_dt_kst.isoformat(),
                                         result,
-                                        strategy_id=sid,
+                                        scope="strategy",
+                                        trigger_strategy_id=_resolve_sell_sid(code),
                                         prev_qty_before=prev_qty_before,
                                     )
                                     save_state(holding, traded)
@@ -1483,7 +1690,7 @@ def main(
 
                             if remaining <= 0 or sellable_qty <= 0:
                                 if remaining <= 0:
-                                    holding[code]["bear_s2_done"] = True
+                                    _set_position_flags(code, bear_s2_done=True)
                                 _log_s2_action(
                                     code,
                                     "SKIP",
@@ -1499,13 +1706,8 @@ def main(
                                     ),
                                 )
                             else:
-                                sid = _resolve_sell_sid(code)
                                 sell_qty = min(remaining, sellable_qty)
-                                if sid is not None:
-                                    sell_qty = min(
-                                        sell_qty,
-                                        remaining_qty_for_strategy(lot_state, code, sid),
-                                    )
+                                sell_qty = _cap_sell_qty(code, sell_qty)
                                 if sell_qty <= 0:
                                     _log_s2_action(
                                         code,
@@ -1538,7 +1740,7 @@ def main(
                                         0, holding[code]["qty"] - int(sell_qty)
                                     )
                                     if guard["sold"] >= target_qty:
-                                        holding[code]["bear_s2_done"] = True
+                                        _set_position_flags(code, bear_s2_done=True)
                                     _persist_guard_state(now_dt_kst.date())
                                     log_trade(
                                         {
@@ -1564,7 +1766,8 @@ def main(
                                         int(sell_qty),
                                         now_dt_kst.isoformat(),
                                         result,
-                                        strategy_id=sid,
+                                        scope="strategy",
+                                        trigger_strategy_id=_resolve_sell_sid(code),
                                         prev_qty_before=prev_qty_before,
                                     )
                                     save_state(holding, traded)
@@ -1595,25 +1798,71 @@ def main(
                     exit_reason = exec_px = exit_result = sold_qty = None
 
                 if sold_qty:
-                    sid = _resolve_sell_sid(code)
-                    if sid is not None:
-                        sold_qty = min(
-                            int(sold_qty),
-                            remaining_qty_for_strategy(lot_state, code, sid),
-                        )
                     if sold_qty <= 0:
                         continue
                     prev_qty_before = int((holding.get(code) or {}).get("qty") or 0)
+                    sold_qty = _cap_sell_qty(code, sold_qty)
+                    if sold_qty <= 0:
+                        continue
                     _apply_sell_to_ledger_with_balance(
                         code,
                         int(sold_qty),
                         now_dt_kst.isoformat(),
                         exit_result,
-                        strategy_id=sid,
+                        scope="strategy",
+                        trigger_strategy_id=_resolve_sell_sid(code),
                         prev_qty_before=prev_qty_before,
                     )
                     save_state(holding, traded)
                     time.sleep(RATE_SLEEP_SEC)
+                else:
+                    try:
+                        current_price = _safe_get_price(kis, code)
+                    except Exception:
+                        current_price = None
+                    if current_price and _pullback_stop_hit(code, current_price):
+                        sellable_qty = ord_psbl_map.get(code, 0)
+                        pb_avail = remaining_qty_for_strategy(lot_state, code, 5)
+                        sell_qty = min(int(sellable_qty), int(pb_avail))
+                        if sell_qty > 0:
+                            prev_qty_before = int(
+                                (holding.get(code) or {}).get("qty") or 0
+                            )
+                            exec_px, result = _sell_once(
+                                kis, code, sell_qty, prefer_market=True
+                            )
+                            log_trade(
+                                {
+                                    "datetime": now_str,
+                                    "code": code,
+                                    "name": None,
+                                    "qty": int(sell_qty),
+                                    "K": holding[code].get("k_value"),
+                                    "target_price": holding[code].get("target_price_src"),
+                                    "strategy": "눌림목 손절",
+                                    "side": "SELL",
+                                    "price": exec_px,
+                                    "amount": int((exec_px or 0)) * int(sell_qty),
+                                    "result": result,
+                                    "reason": "pullback_reversal_break",
+                                }
+                            )
+                            _apply_sell_to_ledger_with_balance(
+                                code,
+                                int(sell_qty),
+                                now_dt_kst.isoformat(),
+                                result,
+                                scope="strategy",
+                                trigger_strategy_id=5,
+                                prev_qty_before=prev_qty_before,
+                            )
+                            save_state(holding, traded)
+                            time.sleep(RATE_SLEEP_SEC)
+                            logger.info(
+                                "[PULLBACK-STOP] code=%s current=%s reason=reversal_break",
+                                code,
+                                current_price,
+                            )
 
             # === (2) 신규 진입 로직 (챔피언) ===
             for code, info in code_to_target.items():
@@ -1652,7 +1901,7 @@ def main(
                     logger.info(f"[SKIP] {code}: 이미 금일 거래됨")
                     continue
 
-                strategy_id = info.get("strategy_id")
+                strategy_id = info.get("strategy_id") or _derive_strategy_id(info)
                 if strategy_id is not None and remaining_qty_for_strategy(
                     lot_state, code, strategy_id
                 ) > 0:
@@ -1669,7 +1918,11 @@ def main(
                     )
                     continue
 
-                prev_price = last_price_map.get(code)
+                prev_price = (
+                    position_state.get("memory", {})
+                    .get("last_price", {})
+                    .get(str(code).zfill(6))
+                )
                 if prev_price is None:
                     try:
                         cached = signals._LAST_PRICE_CACHE.get(code) or {}
@@ -1689,10 +1942,7 @@ def main(
                     logger.warning(f"[PRICE_FAIL] {code}: 현재가 조회 실패 → 스킵")
                     continue
 
-                try:
-                    last_price_map[code] = float(current_price)
-                except Exception:
-                    pass
+                _update_last_price_memory(code, float(current_price), now_dt_kst.isoformat())
 
                 # === GOOD/BAD 타점 평가 ===
                 daily_ctx = _compute_daily_entry_context(
@@ -1890,6 +2140,25 @@ def main(
                     k_value,
                     target_price,
                 )
+                position_state = record_entry_state(
+                    state=position_state,
+                    code=code,
+                    qty=int(qty),
+                    avg_price=float(exec_price),
+                    strategy_id=strategy_id,
+                    engine=trigger_label,
+                    entry_reason="SETUP-OK + TRIGGER-YES",
+                    order_type="marketable_limit",
+                    best_k=k_value,
+                    tgt_px=target_price,
+                    gap_pct_at_entry=trigger_state.get("gap_pct"),
+                    flags={
+                        "bear_s1_done": holding[code].get("bear_s1_done", False),
+                        "bear_s2_done": holding[code].get("bear_s2_done", False),
+                    },
+                    entry_time=now_dt_kst.isoformat(),
+                )
+                position_state_dirty = True
 
                 lot_id = _build_lot_id(
                     result,
@@ -1901,15 +2170,18 @@ def main(
                     lot_state,
                     lot_id=lot_id,
                     pdno=code,
-                    strategy_id=info.get("strategy_id") or _derive_strategy_id(info),
+                    strategy_id=strategy_id,
                     engine="legacy_kosdaq_runner",
                     entry_ts=now_dt_kst.isoformat(),
                     entry_price=float(exec_price),
                     qty=int(qty),
                     meta={
                         "strategy_name": strategy,
+                        "entry_reason": "SETUP-OK + TRIGGER-YES",
                         "k": k_value,
                         "target_price": target_price,
+                        "best_k": k_value,
+                        "tgt_px": target_price,
                         "engine": "legacy_kosdaq_runner",
                         "rebalance_date": str(rebalance_date),
                     },
@@ -1917,7 +2189,7 @@ def main(
                 logger.info(
                     "[LEDGER][BUY] code=%s sid=%s lot_id=%s qty=%s",
                     code,
-                    info.get("strategy_id") or _derive_strategy_id(info),
+                    strategy_id,
                     lot_id,
                     qty,
                 )
@@ -2113,6 +2385,34 @@ def main(
                         except Exception as e:
                             logger.warning(f"[PULLBACK-INIT-FAIL] {code}: {e}")
 
+                        pullback_meta = {}
+                        if isinstance(resp, dict):
+                            pullback_meta = {
+                                "pullback_peak_price": resp.get("peak_price"),
+                                "pullback_reversal_price": resp.get("reversal_price"),
+                                "pullback_reason": resp.get("reason"),
+                            }
+                        position_state = record_entry_state(
+                            state=position_state,
+                            code=code,
+                            qty=int(qty),
+                            avg_price=float(exec_price),
+                            strategy_id=5,
+                            engine="pullback",
+                            entry_reason="PULLBACK-SETUP + REVERSAL",
+                            order_type="marketable_limit",
+                            best_k=None,
+                            tgt_px=trigger_price,
+                            gap_pct_at_entry=None,
+                            meta=pullback_meta,
+                            flags={
+                                "bear_s1_done": holding[code].get("bear_s1_done", False),
+                                "bear_s2_done": holding[code].get("bear_s2_done", False),
+                            },
+                            entry_time=now_dt_kst.isoformat(),
+                        )
+                        position_state_dirty = True
+
                         lot_id = _build_lot_id(
                             result,
                             now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
@@ -2130,8 +2430,17 @@ def main(
                             qty=int(qty),
                             meta={
                                 "strategy_name": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                "entry_reason": "PULLBACK-SETUP + REVERSAL",
                                 "k": None,
                                 "target_price": trigger_price,
+                                "best_k": None,
+                                "tgt_px": trigger_price,
+                                "pullback_peak_price": resp.get("peak_price")
+                                if isinstance(resp, dict)
+                                else None,
+                                "pullback_reversal_price": resp.get("reversal_price")
+                                if isinstance(resp, dict)
+                                else None,
                                 "engine": "legacy_kosdaq_runner",
                                 "rebalance_date": str(rebalance_date),
                             },
@@ -2209,7 +2518,7 @@ def main(
 
                                     if remaining <= 0 or sellable_here <= 0:
                                         if remaining <= 0:
-                                            holding[code]["bear_s1_done"] = True
+                                            _set_position_flags(code, bear_s1_done=True)
                                             s1_done_today.add(code)
                                         regime_s1_summary["skipped"] += 1
                                         _log_s1_action(
@@ -2227,15 +2536,8 @@ def main(
                                             ),
                                         )
                                     else:
-                                        sid = _resolve_sell_sid(code)
                                         sell_qty = min(remaining, sellable_here)
-                                        if sid is not None:
-                                            sell_qty = min(
-                                                sell_qty,
-                                                remaining_qty_for_strategy(
-                                                    lot_state, code, sid
-                                                ),
-                                            )
+                                        sell_qty = _cap_sell_qty(code, sell_qty)
                                         if sell_qty <= 0:
                                             regime_s1_summary["skipped"] += 1
                                             _log_s1_action(
@@ -2275,7 +2577,7 @@ def main(
                                                 0, holding[code]["qty"] - int(sell_qty)
                                             )
                                             if guard["sold"] >= target_qty:
-                                                holding[code]["bear_s1_done"] = True
+                                                _set_position_flags(code, bear_s1_done=True)
                                                 s1_done_today.add(code)
                                             _persist_guard_state(now_dt_kst.date())
                                             regime_s1_summary["sent_qty"] += int(
@@ -2306,7 +2608,8 @@ def main(
                                                 int(sell_qty),
                                                 now_dt_kst.isoformat(),
                                                 result,
-                                                strategy_id=sid,
+                                                scope="strategy",
+                                                trigger_strategy_id=_resolve_sell_sid(code),
                                                 prev_qty_before=prev_qty_before,
                                             )
                                             save_state(holding, traded)
@@ -2371,7 +2674,7 @@ def main(
 
                                     if remaining <= 0 or sellable_here <= 0:
                                         if remaining <= 0:
-                                            holding[code]["bear_s2_done"] = True
+                                            _set_position_flags(code, bear_s2_done=True)
                                         _log_s2_action(
                                             code,
                                             "SKIP",
@@ -2387,15 +2690,8 @@ def main(
                                             ),
                                         )
                                     else:
-                                        sid = _resolve_sell_sid(code)
                                         sell_qty = min(remaining, sellable_here)
-                                        if sid is not None:
-                                            sell_qty = min(
-                                                sell_qty,
-                                                remaining_qty_for_strategy(
-                                                    lot_state, code, sid
-                                                ),
-                                            )
+                                        sell_qty = _cap_sell_qty(code, sell_qty)
                                         if sell_qty <= 0:
                                             _log_s2_action(
                                                 code,
@@ -2433,7 +2729,7 @@ def main(
                                                 0, holding[code]["qty"] - int(sell_qty)
                                             )
                                             if guard["sold"] >= target_qty:
-                                                holding[code]["bear_s2_done"] = True
+                                                _set_position_flags(code, bear_s2_done=True)
                                             _persist_guard_state(now_dt_kst.date())
                                             log_trade(
                                                 {
@@ -2459,7 +2755,8 @@ def main(
                                                 int(sell_qty),
                                                 now_dt_kst.isoformat(),
                                                 result,
-                                                strategy_id=sid,
+                                                scope="strategy",
+                                                trigger_strategy_id=_resolve_sell_sid(code),
                                                 prev_qty_before=prev_qty_before,
                                             )
                                             save_state(holding, traded)
@@ -2523,6 +2820,9 @@ def main(
                 )
 
                 save_state(holding, traded)
+                if position_state_dirty:
+                    save_position_state(position_state_path, position_state)
+                    position_state_dirty = False
 
                 try:
                     _report = ceo_report(datetime.now(KST), period="daily")
@@ -2536,6 +2836,9 @@ def main(
                 break
 
             save_state(holding, traded)
+            if position_state_dirty:
+                save_position_state(position_state_path, position_state)
+                position_state_dirty = False
             time.sleep(loop_sleep_sec)
 
     except KeyboardInterrupt:

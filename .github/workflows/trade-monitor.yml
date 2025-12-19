@@ -192,6 +192,9 @@ jobs:
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
           sleep 30  # 서버 기동 대기
 
+      - name: Compile modules
+        run: |
+          python -m compileall trader rolling_k_auto_trade_api
       - name: trader 자동매매 로직 실행
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -210,13 +213,21 @@ jobs:
         run: |
           ls -al trader/logs || true
 
-      - name: CEO 리포트 artifact 업로드
+      - name: Push state (plain)
+        if: github.event_name != 'pull_request'
+        run: |
+          test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+
+      - name: Save state snapshot as artifact (audit only)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ceo-report
-          path: trader/logs/*.md
-          if-no-files-found: error
+          name: trader-state-${{ github.run_id }}
+          path: |
+            trader/state/state.json
+            bot_state/state.json
+            trader/logs/CEO_Report_*.md
+            trader/logs/ledger.jsonl
           retention-days: 30
 
       - name: Rebalance JSON artifact 업로드
@@ -253,10 +264,4 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Push state (plain)
-        if: success() && github.event_name != 'pull_request'
-        run: |
-          bash scripts/state_push_plain.sh
-
-            
-          
+      
