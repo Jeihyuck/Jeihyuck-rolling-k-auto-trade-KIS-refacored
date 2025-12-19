@@ -7,3 +7,4 @@ watchlists/
 *.log
 *.json
 .env
+bot_state/state.json

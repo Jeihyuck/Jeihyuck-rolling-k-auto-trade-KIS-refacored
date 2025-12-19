@@ -24,6 +24,7 @@ CONFIG = {
     "API_RATE_SLEEP_SEC": "0.5",
     "FORCE_SELL_PASSES_CUTOFF": "2",
     "FORCE_SELL_PASSES_CLOSE": "4",
+    "FORCE_SELL_BLOCKED_LOTS": "0",
     "PARTIAL1": "0.5",
     "PARTIAL2": "0.3",
     "TRAIL_PCT": "0.02",
@@ -119,6 +120,7 @@ SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "tr
 RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
 FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
 FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
+FORCE_SELL_BLOCKED_LOTS = _cfg("FORCE_SELL_BLOCKED_LOTS").lower() in ("1", "true", "yes")
 PARTIAL1 = float(_cfg("PARTIAL1"))
 PARTIAL2 = float(_cfg("PARTIAL2"))
 TRAIL_PCT = float(_cfg("TRAIL_PCT"))
@@ -214,4 +216,3 @@ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 def _this_iso_week_key(now=None):
     now = now or datetime.now(KST)
     return f"{now.year}-W{now.isocalendar().week:02d}"
-
