@@ -1,0 +1,174 @@
+{
+  "version": 1,
+  "lots": [
+    {
+      "lot_id": "005380-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "005380",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 282428.571,
+      "qty": 49,
+      "remaining_qty": 49,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "010120-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "010120",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 464181.818,
+      "qty": 22,
+      "remaining_qty": 22,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "010130-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "010130",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 1311375.0,
+      "qty": 8,
+      "remaining_qty": 8,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "012330-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "012330",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 354792.899,
+      "qty": 39,
+      "remaining_qty": 39,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "012450-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "012450",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 865340.0,
+      "qty": 15,
+      "remaining_qty": 15,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "015760-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "015760",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 48722.478,
+      "qty": 301,
+      "remaining_qty": 301,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "018260-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "018260",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 169528.83,
+      "qty": 85,
+      "remaining_qty": 85,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "035420-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "035420",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 232214.592,
+      "qty": 61,
+      "remaining_qty": 61,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "035720-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "035720",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 57440.962,
+      "qty": 250,
+      "remaining_qty": 250,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "316140-RECON-2025-12-19T13:47:14.758854+09:00",
+      "pdno": "316140",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:14.758854+09:00",
+      "entry_price": 27447.338,
+      "qty": 542,
+      "remaining_qty": 542,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "010120-RECON-2025-12-19T13:47:58.270809+09:00",
+      "pdno": "010120",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:58.270809+09:00",
+      "entry_price": 464948.275,
+      "qty": 7,
+      "remaining_qty": 7,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "010130-RECON-2025-12-19T13:47:58.270809+09:00",
+      "pdno": "010130",
+      "strategy_id": "UNKNOWN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-19T13:47:58.270809+09:00",
+      "entry_price": 1311000.0,
+      "qty": 1,
+      "remaining_qty": 1,
+      "meta": {
+        "reconciled": true,
+        "sell_blocked": true
+      }
+    }
+  ],
+  "updated_at": "2025-12-19T13:47:58.270942+09:00"
+}
