@@ -61,6 +61,38 @@ def allocate_sell_qty(
         qty = min(requested_qty, totals.get(dominant_key, 0))
         return [{"strategy_id": dominant_key, "qty": int(qty)}] if qty > 0 else []
 
+    if scope == "global":
+        totals = _strategy_qty_map(lot_state, code)
+        if not totals:
+            return []
+        orphan_qty = int(totals.get("ORPHAN", 0))
+        allocations: List[Dict[str, Any]] = []
+        remaining_qty = min(requested_qty, sum(totals.values()))
+        if orphan_qty > 0 and remaining_qty > 0:
+            take = min(orphan_qty, remaining_qty)
+            allocations.append({"strategy_id": "ORPHAN", "qty": int(take)})
+            remaining_qty -= take
+        if remaining_qty <= 0:
+            return allocations
+        non_orphan_totals = {k: v for k, v in totals.items() if k != "ORPHAN"}
+        if not non_orphan_totals:
+            return allocations
+        total_qty = sum(non_orphan_totals.values())
+        remaining_qty = min(remaining_qty, total_qty)
+        strategy_ids = sorted(non_orphan_totals.keys())
+        for sid in strategy_ids[:-1]:
+            ratio_qty = int(remaining_qty * (non_orphan_totals[sid] / total_qty))
+            qty = min(ratio_qty, non_orphan_totals[sid], remaining_qty)
+            if qty > 0:
+                allocations.append({"strategy_id": sid, "qty": int(qty)})
+                remaining_qty -= qty
+        if remaining_qty > 0:
+            last_sid = strategy_ids[-1]
+            qty = min(remaining_qty, non_orphan_totals[last_sid])
+            if qty > 0:
+                allocations.append({"strategy_id": last_sid, "qty": int(qty)})
+        return allocations
+
     if scope != "proportional":
         return []
 

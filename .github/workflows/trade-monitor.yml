@@ -123,6 +123,24 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Restore state cache (fallback only)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
+          restore-keys: |
+            trader-state-${{ github.ref_name }}-
+      - name: Save state cache (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
+
       - name: Set git identity
         run: |
           git config user.name "trade-bot"

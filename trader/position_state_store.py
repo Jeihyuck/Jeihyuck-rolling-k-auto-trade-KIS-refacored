@@ -11,7 +11,7 @@ from .config import KST
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _empty_state() -> Dict[str, Any]:
@@ -26,7 +26,7 @@ def _empty_state() -> Dict[str, Any]:
 def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(state, dict):
         return _empty_state()
-    state.setdefault("schema_version", SCHEMA_VERSION)
+    state["schema_version"] = SCHEMA_VERSION
     state.setdefault("updated_at", None)
     positions = state.get("positions")
     if not isinstance(positions, dict):
@@ -38,20 +38,112 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
         state["memory"] = memory
     memory.setdefault("last_price", {})
     memory.setdefault("last_seen", {})
-    for code, payload in positions.items():
+    for code, payload in list(positions.items()):
         if not isinstance(payload, dict):
-            positions[code] = {
-                "entries": {},
-                "broker_qty": None,
-                "broker_avg_price": None,
-                "miss_count": 0,
-            }
+            positions[code] = {"strategies": {}}
             continue
-        payload.setdefault("entries", {})
-        payload.setdefault("flags", {"bear_s1_done": False, "bear_s2_done": False})
-        payload.setdefault("broker_qty", None)
-        payload.setdefault("broker_avg_price", None)
-        payload.setdefault("miss_count", 0)
+        if "strategies" not in payload and "entries" in payload:
+            entries = payload.get("entries") or {}
+            flags = payload.get("flags") or {}
+            strategies: Dict[str, Any] = {}
+            if isinstance(entries, dict):
+                for sid, entry in entries.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    strategies[str(sid)] = {
+                        "qty": int(entry.get("qty") or 0),
+                        "avg_price": float(entry.get("avg_price") or 0.0),
+                        "entry": entry.get("entry") or {},
+                        "meta": entry.get("meta") or {},
+                        "flags": {
+                            "bear_s1_done": bool(flags.get("bear_s1_done", False)),
+                            "bear_s2_done": bool(flags.get("bear_s2_done", False)),
+                            "sold_p1": bool(entry.get("sold_p1", False)),
+                            "sold_p2": bool(entry.get("sold_p2", False)),
+                        },
+                    }
+            positions[code] = {"strategies": strategies}
+        else:
+            payload.setdefault("strategies", {})
+        strategies = positions[code].get("strategies")
+        if not isinstance(strategies, dict):
+            positions[code]["strategies"] = {}
+            strategies = positions[code]["strategies"]
+        for sid, entry in list(strategies.items()):
+            if not isinstance(entry, dict):
+                strategies.pop(sid, None)
+                continue
+            entry.setdefault("qty", 0)
+            entry.setdefault("avg_price", 0.0)
+            entry.setdefault("entry", {})
+            entry.setdefault("meta", {})
+            meta = entry["meta"]
+            avg_price = float(entry.get("avg_price") or 0.0)
+            if not meta.get("high") or float(meta.get("high") or 0.0) <= 0:
+                meta["high"] = avg_price
+            meta["high"] = max(float(meta.get("high") or 0.0), avg_price)
+            entry.setdefault(
+                "flags",
+                {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
+            )
+    return state
+
+
+def migrate_position_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return _empty_state()
+    schema_version = int(state.get("schema_version") or 1)
+    if schema_version >= SCHEMA_VERSION:
+        return state
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        state["positions"] = {}
+        state["schema_version"] = SCHEMA_VERSION
+        return state
+    for code, payload in list(positions.items()):
+        if not isinstance(payload, dict):
+            positions[code] = {"strategies": {}}
+            continue
+        if "strategies" in payload:
+            continue
+        entries = payload.get("entries") or {}
+        legacy_flags = payload.get("flags") or {}
+        strategies: Dict[str, Any] = {}
+        if isinstance(entries, dict) and entries:
+            for sid, entry in entries.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_meta = entry.get("meta") or {}
+                avg_price = float(entry.get("avg_price") or 0.0)
+                entry_meta.setdefault("high", avg_price)
+                entry_meta["high"] = max(float(entry_meta.get("high") or 0.0), avg_price)
+                strategies[str(sid)] = {
+                    "qty": int(entry.get("qty") or 0),
+                    "avg_price": avg_price,
+                    "entry": entry.get("entry") or {},
+                    "meta": entry_meta,
+                    "flags": {
+                        "bear_s1_done": bool(legacy_flags.get("bear_s1_done", False)),
+                        "bear_s2_done": bool(legacy_flags.get("bear_s2_done", False)),
+                        "sold_p1": bool(entry.get("sold_p1", False)),
+                        "sold_p2": bool(entry.get("sold_p2", False)),
+                    },
+                }
+        else:
+            strategies["1"] = {
+                "qty": 0,
+                "avg_price": 0.0,
+                "entry": {},
+                "meta": {"high": 0.0},
+                "flags": {
+                    "bear_s1_done": bool(legacy_flags.get("bear_s1_done", False)),
+                    "bear_s2_done": bool(legacy_flags.get("bear_s2_done", False)),
+                    "sold_p1": False,
+                    "sold_p2": False,
+                },
+            }
+        positions[code] = {"strategies": strategies}
+    state["schema_version"] = SCHEMA_VERSION
     return state
 
 
@@ -72,7 +164,10 @@ def load_position_state(path: str) -> Dict[str, Any]:
     try:
         with open(path_obj, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        state = _coerce_state(payload)
+        migrated = migrate_position_state(payload)
+        state = _coerce_state(migrated)
+        if int(payload.get("schema_version") or 1) < SCHEMA_VERSION:
+            save_position_state(path, state)
         logger.info(
             "[STATE] loaded path=%s positions=%s updated_at=%s",
             path_obj,
@@ -132,8 +227,13 @@ def _orphan_entry(code: str, qty: int, avg_price: float | None) -> Dict[str, Any
 
 
 def reconcile_with_broker(
-    state: Dict[str, Any], broker_positions: Iterable[Dict[str, Any]]
+    state: Dict[str, Any],
+    broker_positions: Iterable[Dict[str, Any]],
+    *,
+    lot_state: Dict[str, Any],
 ) -> Dict[str, Any]:
+    from .ledger import remaining_qty_for_strategy
+
     state = _coerce_state(state)
     positions = state["positions"]
     memory = state["memory"]
@@ -151,33 +251,101 @@ def reconcile_with_broker(
             "avg_price": row.get("avg_price"),
         }
 
-    for code, payload in broker_map.items():
-        qty = int(payload.get("qty") or 0)
-        avg_price = payload.get("avg_price")
-        if code not in positions:
-            positions[code] = {
-                "entries": {},
-                "flags": {"bear_s1_done": False, "bear_s2_done": False},
-                "broker_qty": int(qty),
-                "broker_avg_price": float(avg_price or 0.0),
-                "miss_count": 0,
-            }
+    def _strategies_for_code(code: str) -> Dict[str, int]:
+        strategies: Dict[str, int] = {}
+        lots = lot_state.get("lots", [])
+        if not isinstance(lots, list):
+            return strategies
+        for lot in lots:
+            if _normalize_code(lot.get("pdno")) != code:
+                continue
+            remaining = int(lot.get("remaining_qty") or 0)
+            if remaining <= 0:
+                continue
+            sid = lot.get("strategy_id")
+            if sid is None:
+                continue
+            key = str(sid)
+            strategies[key] = strategies.get(key, 0) + remaining
+        return strategies
+
+    active_codes = set()
+    for code in set(list(broker_map.keys()) + list(positions.keys())):
+        code_key = _normalize_code(code)
+        strategies = _strategies_for_code(code_key)
+        if not strategies and broker_map.get(code_key):
+            orphan_qty = int(broker_map[code_key].get("qty") or 0)
+            if orphan_qty > 0:
+                strategies = {"ORPHAN": orphan_qty}
+                logger.warning(
+                    "[STATE] broker has qty but ledger empty: code=%s qty=%s -> ORPHAN",
+                    code_key,
+                    orphan_qty,
+                )
+        if not strategies:
+            positions.pop(code_key, None)
+            memory.get("last_price", {}).pop(code_key, None)
+            memory.get("last_seen", {}).pop(code_key, None)
             continue
-        pos = positions[code]
-        pos["broker_qty"] = int(qty)
-        pos["broker_avg_price"] = (
-            float(avg_price) if avg_price is not None else pos.get("broker_avg_price")
-        )
-        pos["miss_count"] = 0
+
+        pos = positions.setdefault(code_key, {"strategies": {}})
+        entries = pos.setdefault("strategies", {})
+        for sid, entry in list(entries.items()):
+            if sid not in strategies:
+                entries.pop(sid, None)
+                continue
+            if not isinstance(entry, dict):
+                entries.pop(sid, None)
+                continue
+            ledger_qty = int(remaining_qty_for_strategy(lot_state, code_key, sid))
+            if int(entry.get("qty") or 0) > ledger_qty:
+                logger.warning(
+                    "[STATE] qty exceeds ledger: code=%s sid=%s state=%s ledger=%s",
+                    code_key,
+                    sid,
+                    entry.get("qty"),
+                    ledger_qty,
+                )
+                entry["qty"] = int(ledger_qty)
+
+        for sid, qty in strategies.items():
+            entry = entries.get(sid)
+            if not isinstance(entry, dict):
+                if sid == "ORPHAN":
+                    entry = _orphan_entry(
+                        code_key, qty, broker_map.get(code_key, {}).get("avg_price")
+                    )
+                else:
+                    now_ts = datetime.now(KST).isoformat()
+                    entry = {
+                        "qty": int(qty),
+                        "avg_price": float(
+                            broker_map.get(code_key, {}).get("avg_price") or 0.0
+                        ),
+                        "entry": {
+                            "time": now_ts,
+                            "strategy_id": sid,
+                            "engine": "reconcile",
+                            "entry_reason": "RECONCILE",
+                            "order_type": "unknown",
+                            "best_k": None,
+                            "tgt_px": None,
+                            "gap_pct_at_entry": None,
+                        },
+                        "meta": {},
+                    }
+                entry["flags"] = {
+                    "bear_s1_done": False,
+                    "bear_s2_done": False,
+                    "sold_p1": False,
+                    "sold_p2": False,
+                }
+                entries[sid] = entry
+            entry["qty"] = int(qty)
+        active_codes.add(code_key)
 
     for code in list(positions.keys()):
-        if code in broker_map:
-            continue
-        pos = positions.get(code) or {}
-        miss_count = int(pos.get("miss_count") or 0) + 1
-        pos["miss_count"] = miss_count
-        positions[code] = pos
-        if miss_count >= 3:
+        if code not in active_codes:
             positions.pop(code, None)
             memory.get("last_price", {}).pop(code, None)
             memory.get("last_seen", {}).pop(code, None)
@@ -187,17 +355,22 @@ def reconcile_with_broker(
 
 def run_reconcile_self_checks() -> None:
     state = _empty_state()
-    state["positions"]["000001"] = {
-        "entries": {},
-        "flags": {"bear_s1_done": True, "bear_s2_done": False},
-        "broker_qty": 5,
-        "broker_avg_price": 100.0,
-        "miss_count": 2,
+    lot_state = {
+        "lots": [{"pdno": "000001", "strategy_id": 1, "remaining_qty": 5}]
     }
-    state = reconcile_with_broker(state, [])
-    assert state["positions"]["000001"]["miss_count"] == 3
-    state = reconcile_with_broker(state, [])
-    assert "000001" not in state["positions"]
+    state["positions"]["000001"] = {
+        "strategies": {
+            "1": {
+                "qty": 7,
+                "avg_price": 100.0,
+                "entry": {},
+                "meta": {},
+                "flags": {},
+            }
+        }
+    }
+    state = reconcile_with_broker(state, [], lot_state=lot_state)
+    assert state["positions"]["000001"]["strategies"]["1"]["qty"] == 5
 
 
 if __name__ == "__main__":

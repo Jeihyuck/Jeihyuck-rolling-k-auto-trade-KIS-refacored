@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import os
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
@@ -26,10 +27,12 @@ try:
         KST,
         LOG_DIR,
         RATE_SLEEP_SEC,
+        EMERGENCY_GLOBAL_SELL,
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
         STATE_PATH,
+        STRATEGY_REDUCTION_PRIORITY,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
@@ -48,10 +51,12 @@ except ImportError:
         LOG_DIR,
         BASE_QTY_MODE,
         RATE_SLEEP_SEC,
+        EMERGENCY_GLOBAL_SELL,
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
         STATE_PATH,
+        STRATEGY_REDUCTION_PRIORITY,
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
@@ -69,12 +74,13 @@ from trader.subject_flow import get_subject_flow_with_fallback, reset_flow_call_
 from trader.execution import record_entry_state
 from trader.exit_allocation import allocate_sell_qty, apply_sell_allocation
 from trader.ledger import (
-    apply_sell_fill_fifo,
-    dominant_strategy_for,
     record_buy_fill,
     remaining_qty_for_strategy,
     reconcile_with_broker_holdings,
+    strategy_avg_price,
 )
+from trader.ctx_schema import normalize_daily_ctx, normalize_intraday_ctx
+from trader import state_store as runtime_state_store
 from trader.lot_state_store import load_lot_state, save_lot_state
 from trader.position_state_store import (
     load_position_state,
@@ -117,6 +123,7 @@ def main(
         int(capital_override) if capital_override is not None else DAILY_CAPITAL
     )
     kis = KisAPI()
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
 
     rebalance_date = get_rebalance_anchor_date()
     logger.info(
@@ -143,8 +150,9 @@ def main(
     position_state_path = str(STATE_PATH)
     position_state = load_position_state(position_state_path)
     position_state_dirty = False
+    runtime_state = runtime_state_store.load_state()
     triggered_today: set[str] = set()
-    s1_done_today: set[str] = set()
+    s1_done_today: set[tuple[str, str]] = set()
     last_today_prefix: str | None = None
 
     if isinstance(traded, (set, list, tuple)):
@@ -190,6 +198,12 @@ def main(
                 f"[TRADED-STATE] traded에 코드 추가 실패: type={type(traded_state)}"
             )
 
+    def _save_runtime_state() -> None:
+        try:
+            runtime_state_store.save_state(runtime_state)
+        except Exception:
+            logger.exception("[RUNTIME_STATE] save failed")
+
     def _lot_state_signature(state: dict) -> tuple:
         lots = state.get("lots")
         if not isinstance(lots, list):
@@ -216,20 +230,16 @@ def main(
         pos = position_state.setdefault("positions", {}).setdefault(
             code_key,
             {
-                "entries": {},
-                "flags": {"bear_s1_done": False, "bear_s2_done": False},
-                "broker_qty": None,
-                "broker_avg_price": None,
-                "miss_count": 0,
+                "strategies": {},
             },
         )
-        entries = pos.setdefault("entries", {})
+        entries = pos.setdefault("strategies", {})
         entry = entries.get(sid_key)
         if isinstance(entry, dict):
             return entry
         now_ts = datetime.now(KST).isoformat()
         entry = {
-            "qty": int((holding.get(code) or {}).get("qty") or 0),
+            "qty": int(remaining_qty_for_strategy(lot_state, code_key, sid_key)),
             "avg_price": float((holding.get(code) or {}).get("buy_price") or 0.0),
             "entry": {
                 "time": now_ts,
@@ -246,31 +256,33 @@ def main(
                 "pullback_reversal_price": None,
                 "pullback_reason": None,
             },
+            "flags": {
+                "bear_s1_done": False,
+                "bear_s2_done": False,
+                "sold_p1": False,
+                "sold_p2": False,
+            },
         }
         entries[sid_key] = entry
         return entry
 
-    def _set_position_flags(code: str, **flags: bool) -> None:
+    def _set_position_flags(code: str, strategy_id: int | str, **flags: bool) -> None:
         nonlocal position_state_dirty
         pos = position_state.setdefault("positions", {}).setdefault(
             str(code).zfill(6),
             {
-                "entries": {},
-                "flags": {"bear_s1_done": False, "bear_s2_done": False},
-                "broker_qty": None,
-                "broker_avg_price": None,
-                "miss_count": 0,
+                "strategies": {},
             },
         )
-        flags_before = dict(pos.get("flags") or {})
-        entry_flags = pos.setdefault(
+        entries = pos.setdefault("strategies", {})
+        entry = entries.setdefault(str(strategy_id), {})
+        entry_flags = entry.setdefault(
             "flags",
-            {"bear_s1_done": False, "bear_s2_done": False},
+            {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
         )
+        flags_before = dict(entry_flags)
         for key, value in flags.items():
             entry_flags[key] = bool(value)
-            if code in holding:
-                holding[code][key] = bool(value)
         logger.info(
             "[FLAGS] code=%s flags_before=%s flags_after=%s",
             str(code).zfill(6),
@@ -292,7 +304,7 @@ def main(
         pos = position_state.get("positions", {}).get(str(code).zfill(6))
         if not isinstance(pos, dict):
             return False
-        entries = pos.get("entries", {})
+        entries = pos.get("strategies", {})
         entry = entries.get(str(strategy_id))
         if not isinstance(entry, dict):
             return False
@@ -304,6 +316,65 @@ def main(
             return float(current_price) < float(reversal_price) * (1 - FAST_STOP)
         except Exception:
             return False
+
+    def _build_exit_intents(code: str, regime_mode: str) -> list[dict[str, Any]]:
+        nonlocal position_state_dirty
+        intents: list[dict[str, Any]] = []
+        code_key = str(code).zfill(6)
+        pos_state = position_state.get("positions", {}).get(code_key)
+        if not isinstance(pos_state, dict):
+            return intents
+        strategies = pos_state.get("strategies", {})
+        if not isinstance(strategies, dict):
+            return intents
+        for sid, entry in strategies.items():
+            if not isinstance(entry, dict):
+                continue
+            available_qty = remaining_qty_for_strategy(lot_state, code_key, sid)
+            if available_qty <= 0:
+                continue
+            avg_price = strategy_avg_price(lot_state, code_key, sid)
+            if avg_price is None:
+                continue
+            flags = entry.get("flags", {}) or {}
+            meta = entry.get("meta", {}) or {}
+            high_value = float(meta.get("high") or 0.0)
+            if not high_value or high_value <= 0:
+                high_value = float(avg_price)
+            high_value = max(high_value, float(avg_price))
+            meta["high"] = high_value
+            pos_view = {
+                "qty": int(available_qty),
+                "buy_price": float(avg_price),
+                "high": high_value,
+                "sold_p1": bool(flags.get("sold_p1", False)),
+                "sold_p2": bool(flags.get("sold_p2", False)),
+                "name": entry.get("entry", {}).get("name"),
+                "k_value": entry.get("entry", {}).get("best_k"),
+                "target_price_src": entry.get("entry", {}).get("tgt_px"),
+            }
+            reason, sell_qty = _adaptive_exit(
+                kis,
+                code_key,
+                pos_view,
+                regime_mode=regime_mode,
+            )
+            if sell_qty:
+                intents.append(
+                    {
+                        "code": code_key,
+                        "strategy_id": sid,
+                        "sell_qty": int(sell_qty),
+                        "reason": reason or "adaptive_exit",
+                    }
+                )
+            meta["high"] = float(pos_view.get("high") or meta.get("high") or 0.0)
+            entry["meta"] = meta
+            flags["sold_p1"] = bool(pos_view.get("sold_p1", flags.get("sold_p1")))
+            flags["sold_p2"] = bool(pos_view.get("sold_p2", flags.get("sold_p2")))
+            entry["flags"] = flags
+            position_state_dirty = True
+        return intents
 
     def _remaining_qty_for(pdno: str) -> int:
         return sum(
@@ -392,24 +463,6 @@ def main(
             fill_seq = "0"
         return f"{kis.CANO}-{kis.ACNT_PRDT_CD}-{order_no}-{fill_seq}"
 
-    def _resolve_sell_sid(code: str) -> int | None:
-        try:
-            sid = (holding.get(code) or {}).get("strategy_id")
-        except Exception:
-            sid = None
-        if sid is not None:
-            try:
-                return int(sid)
-            except Exception:
-                sid = None
-        dominant = dominant_strategy_for(lot_state, code)
-        if dominant is None:
-            return None
-        try:
-            return int(dominant)
-        except Exception:
-            return None
-
     def _estimate_sold_qty(
         code: str, requested_qty: int, prev_qty: int, delay_sec: float = 1.0
     ) -> int:
@@ -433,25 +486,98 @@ def main(
             return min(int(requested_qty), int(sold))
         return int(requested_qty)
 
+    def _sync_position_state_qty(code: str) -> None:
+        nonlocal position_state_dirty
+        code_key = str(code).zfill(6)
+        pos = position_state.get("positions", {}).get(code_key)
+        if not isinstance(pos, dict):
+            return
+        strategies = pos.get("strategies", {})
+        if not isinstance(strategies, dict):
+            return
+        for sid in list(strategies.keys()):
+            remaining = remaining_qty_for_strategy(lot_state, code_key, sid)
+            if remaining <= 0:
+                strategies.pop(sid, None)
+                continue
+            entry = strategies.get(sid)
+            if not isinstance(entry, dict):
+                strategies.pop(sid, None)
+                continue
+            if int(entry.get("qty") or 0) > int(remaining):
+                logger.warning(
+                    "[STATE] qty exceeds ledger after sell: code=%s sid=%s state=%s ledger=%s",
+                    code_key,
+                    sid,
+                    entry.get("qty"),
+                    remaining,
+                )
+            entry["qty"] = int(remaining)
+        if not strategies:
+            position_state.get("positions", {}).pop(code_key, None)
+        position_state_dirty = True
+
     def _apply_sell_to_ledger_with_balance(
         code: str,
         requested_qty: int,
         sell_ts: str,
         result: Any,
-        scope: str = "proportional",
+        scope: str = "strategy",
         trigger_strategy_id: int | None = None,
         prev_qty_before: int | None = None,
         allow_blocked: bool = False,
     ) -> None:
         if not _is_order_success(result):
             return
-        prev_qty = int(prev_qty_before if prev_qty_before is not None else (holding.get(code) or {}).get("qty") or requested_qty)
-        sold_qty = _estimate_sold_qty(code, requested_qty, prev_qty)
+        if scope != "strategy" and not (SELL_ALL_BALANCES_AT_CUTOFF or EMERGENCY_GLOBAL_SELL):
+            raise RuntimeError(
+                f"[SELL-ALLOC] global scope used without force sell: code={code} scope={scope}"
+            )
+        prev_qty = int(
+            prev_qty_before
+            if prev_qty_before is not None
+            else (holding.get(code) or {}).get("qty") or requested_qty
+        )
+        sold_qty = 0
+        for delay_sec in (0.5, 1.0, 2.0):
+            sold_qty = _estimate_sold_qty(
+                code, requested_qty, prev_qty, delay_sec=delay_sec
+            )
+            if sold_qty > 0:
+                break
         if sold_qty <= 0:
+            logger.warning(
+                "[SELL-ALLOC] sold_qty unresolved: code=%s requested=%s prev_qty=%s",
+                str(code).zfill(6),
+                requested_qty,
+                prev_qty,
+            )
+            try:
+                balances = _fetch_balances(kis, ttl_sec=0)
+            except TypeError:
+                balances = _fetch_balances(kis)
+            reconcile_with_broker_holdings(lot_state, balances)
             return
         if scope == "strategy" and trigger_strategy_id is None:
-            scope = "proportional"
+            raise RuntimeError(
+                f"[SELL-ALLOC] strategy scope requires trigger_strategy_id: code={code}"
+            )
+        if scope == "strategy":
+            available_qty = remaining_qty_for_strategy(
+                lot_state, code, trigger_strategy_id
+            )
+            if available_qty < int(requested_qty):
+                raise RuntimeError(
+                    "[SELL-ALLOC] insufficient strategy qty: code=%s sid=%s available=%s requested=%s"
+                    % (str(code).zfill(6), trigger_strategy_id, available_qty, requested_qty)
+                )
         before_lot_signature = _lot_state_signature(lot_state)
+        before_qty_total = _ledger_total_available_qty(code)
+        before_qty_strategy = (
+            remaining_qty_for_strategy(lot_state, code, trigger_strategy_id)
+            if scope == "strategy"
+            else before_qty_total
+        )
         allocations = allocate_sell_qty(
             lot_state,
             code,
@@ -460,7 +586,7 @@ def main(
             trigger_strategy_id=trigger_strategy_id,
         )
         if not allocations:
-            if sold_qty > 0:
+            if sold_qty > 0 and scope != "strategy":
                 now_ts = datetime.now(KST).isoformat()
                 lot_state.setdefault("lots", []).append(
                     {
@@ -472,19 +598,14 @@ def main(
                         "entry_price": 0.0,
                         "qty": int(sold_qty),
                         "remaining_qty": int(sold_qty),
-                        "meta": {"reconciled": True},
+                        "meta": {"reconciled": True, "orphan": True},
                     }
                 )
-                apply_sell_fill_fifo(
-                    lot_state,
-                    pdno=str(code).zfill(6),
-                    qty_filled=int(sold_qty),
-                    sell_ts=sell_ts,
-                    strategy_id="ORPHAN",
-                    allow_blocked=allow_blocked,
+                allocations = [{"strategy_id": "ORPHAN", "qty": int(sold_qty)}]
+            else:
+                raise RuntimeError(
+                    f"[SELL-ALLOC] no allocations for strategy sell: code={code} sid={trigger_strategy_id}"
                 )
-                _maybe_save_lot_state(before_lot_signature)
-            return
         broker_qty_after = max(0, int(prev_qty) - int(sold_qty))
         logger.info(
             "[SELL-ALLOC] code=%s requested_qty=%s scope=%s allocations=%s sold_qty=%s broker_qty_before=%s broker_qty_after=%s",
@@ -496,61 +617,48 @@ def main(
             int(prev_qty),
             int(broker_qty_after),
         )
-        apply_sell_allocation(
+        sold_total = apply_sell_allocation(
             lot_state,
             code,
             allocations,
             sell_ts,
             allow_blocked=allow_blocked,
         )
+        after_qty_total = _ledger_total_available_qty(code)
+        after_qty_strategy = (
+            remaining_qty_for_strategy(lot_state, code, trigger_strategy_id)
+            if scope == "strategy"
+            else after_qty_total
+        )
+        expected_before = before_qty_strategy
+        expected_after = max(0, int(expected_before) - int(sold_total))
+        if after_qty_strategy != expected_after:
+            resolved = False
+            for delay_sec in (0.5, 1.0, 2.0):
+                time.sleep(delay_sec)
+                retry_sold = _estimate_sold_qty(code, requested_qty, prev_qty, delay_sec=0)
+                retry_expected = max(0, int(expected_before) - int(retry_sold))
+                if after_qty_strategy == retry_expected:
+                    resolved = True
+                    break
+            if not resolved:
+                logger.warning(
+                    "[SELL-ALLOC] ledger mismatch: code=%s sid=%s before=%s sold=%s after=%s"
+                    % (
+                        str(code).zfill(6),
+                        trigger_strategy_id,
+                        expected_before,
+                        sold_total,
+                        after_qty_strategy,
+                    )
+                )
+                try:
+                    balances = _fetch_balances(kis, ttl_sec=0)
+                except TypeError:
+                    balances = _fetch_balances(kis)
+                reconcile_with_broker_holdings(lot_state, balances)
         _maybe_save_lot_state(before_lot_signature)
-
-    def _apply_sell_to_ledger(
-        pdno: str,
-        qty: int,
-        sell_ts: str,
-        result: Any,
-        strategy_id: int | None = None,
-        allow_blocked: bool = False,
-    ) -> None:
-        if not _is_order_success(result):
-            return
-        before = _remaining_qty_for(pdno)
-        apply_sell_fill_fifo(
-            lot_state,
-            pdno=pdno,
-            qty_filled=qty,
-            sell_ts=sell_ts,
-            strategy_id=strategy_id,
-            allow_blocked=allow_blocked,
-        )
-        after = _remaining_qty_for(pdno)
-        logger.info(
-            "[LEDGER][SELL] code=%s sid=%s sold=%s before=%s after=%s",
-            pdno,
-            strategy_id,
-            qty,
-            before,
-            after,
-        )
-        if strategy_id is not None and after == before:
-            apply_sell_fill_fifo(
-                lot_state,
-                pdno=pdno,
-                qty_filled=qty,
-                sell_ts=sell_ts,
-                strategy_id=None,
-                allow_blocked=allow_blocked,
-            )
-            fallback_after = _remaining_qty_for(pdno)
-            logger.info(
-                "[LEDGER][SELL][FALLBACK] code=%s sid=%s sold=%s before=%s after=%s",
-                pdno,
-                strategy_id,
-                qty,
-                before,
-                fallback_after,
-            )
+        _sync_position_state_qty(code)
 
     def _cleanup_expired_pending(
         traded_state: dict, now_dt: datetime, ttl_sec: int = 300
@@ -635,13 +743,16 @@ def main(
             guard_state = _load_guard_state(day)
             guard_state_date = day
 
-    def _guard_entry(bucket: str, day: date, code: str, base_qty: int) -> dict:
+    def _guard_entry(
+        bucket: str, day: date, code: str, strategy_id: int | str, base_qty: int
+    ) -> dict:
         _ensure_guard_state(day)
         bucket_state = guard_state.setdefault(bucket, {})
-        entry = bucket_state.get(code)
+        key = f"{str(code).zfill(6)}:{strategy_id}"
+        entry = bucket_state.get(key)
         if entry is None:
             entry = {"base_qty": int(base_qty), "sold": 0}
-            bucket_state[code] = entry
+            bucket_state[key] = entry
             _persist_guard_state(day)
         elif BASE_QTY_MODE == "current":
             base_int = int(base_qty)
@@ -650,17 +761,25 @@ def main(
                 _persist_guard_state(day)
         return entry
 
-    def _s1_guard_target(today_date, code: str, base_qty: int) -> dict:
-        return _guard_entry("s1_target", today_date, code, base_qty)
+    def _s1_guard_target(
+        today_date, code: str, strategy_id: int | str, base_qty: int
+    ) -> dict:
+        return _guard_entry("s1_target", today_date, code, strategy_id, base_qty)
 
-    def _s1_guard_nontarget(today_date, code: str, base_qty: int) -> dict:
-        return _guard_entry("s1_nontarget", today_date, code, base_qty)
+    def _s1_guard_nontarget(
+        today_date, code: str, strategy_id: int | str, base_qty: int
+    ) -> dict:
+        return _guard_entry("s1_nontarget", today_date, code, strategy_id, base_qty)
 
-    def _s2_guard_target(today_date, code: str, base_qty: int) -> dict:
-        return _guard_entry("s2_target", today_date, code, base_qty)
+    def _s2_guard_target(
+        today_date, code: str, strategy_id: int | str, base_qty: int
+    ) -> dict:
+        return _guard_entry("s2_target", today_date, code, strategy_id, base_qty)
 
-    def _s2_guard_nontarget(today_date, code: str, base_qty: int) -> dict:
-        return _guard_entry("s2_nontarget", today_date, code, base_qty)
+    def _s2_guard_nontarget(
+        today_date, code: str, strategy_id: int | str, base_qty: int
+    ) -> dict:
+        return _guard_entry("s2_nontarget", today_date, code, strategy_id, base_qty)
 
     def _sell_result_status(result: Any) -> tuple[str, str | None]:
         try:
@@ -1198,6 +1317,7 @@ def main(
 
             def _log_s1_action(
                 code: str,
+                strategy_id: int | str,
                 status: str,
                 base_qty: int,
                 target_qty: int,
@@ -1206,7 +1326,8 @@ def main(
                 sell_qty: int,
                 reason_msg: str | None = None,
             ) -> None:
-                regime_s1_summary["by_stock"][code] = {
+                key = f"{str(code).zfill(6)}:{strategy_id}"
+                regime_s1_summary["by_stock"][key] = {
                     "status": status,
                     "base_qty": int(base_qty),
                     "target": int(target_qty),
@@ -1221,7 +1342,7 @@ def main(
                     else "[SELL][SKIP]" if status == "SKIP" else "[SELL][ERROR]"
                 )
                 msg = (
-                    f"{prefix} [REGIME_S1] {code} base_qty={base_qty} target={target_qty} "
+                    f"{prefix} [REGIME_S1] {code}:{strategy_id} base_qty={base_qty} target={target_qty} "
                     f"sold={sold_today} remaining={remaining} sell_qty={sell_qty}"
                 )
                 if reason_msg:
@@ -1233,6 +1354,7 @@ def main(
 
             def _log_s2_action(
                 code: str,
+                strategy_id: int | str,
                 status: str,
                 base_qty: int,
                 target_qty: int,
@@ -1247,7 +1369,7 @@ def main(
                     else "[SELL][SKIP]" if status == "SKIP" else "[SELL][ERROR]"
                 )
                 msg = (
-                    f"{prefix} [REGIME_S2] {code} base_qty={base_qty} target={target_qty} "
+                    f"{prefix} [REGIME_S2] {code}:{strategy_id} base_qty={base_qty} target={target_qty} "
                     f"sold={sold_today} remaining={remaining} sell_qty={sell_qty}"
                 )
                 if reason_msg:
@@ -1256,6 +1378,429 @@ def main(
                     logger.error(msg)
                 else:
                     logger.info(msg)
+
+            def _strategy_ids_for_code(code: str) -> list[str]:
+                code_key = str(code).zfill(6)
+                totals: dict[str, int] = {}
+                lots = lot_state.get("lots", [])
+                if isinstance(lots, list):
+                    for lot in lots:
+                        if str(lot.get("pdno")).zfill(6) != code_key:
+                            continue
+                        remaining = int(lot.get("remaining_qty") or 0)
+                        if remaining <= 0:
+                            continue
+                        sid = lot.get("strategy_id")
+                        if sid is None:
+                            continue
+                        if str(sid).isdigit():
+                            sid_int = int(sid)
+                            if 1 <= sid_int <= 5:
+                                totals[str(sid_int)] = totals.get(str(sid_int), 0) + remaining
+                ordered: list[str] = []
+                for sid in STRATEGY_REDUCTION_PRIORITY:
+                    key = str(sid)
+                    if key in totals:
+                        ordered.append(key)
+                for sid in sorted(totals.keys()):
+                    if sid not in ordered:
+                        ordered.append(sid)
+                return ordered
+
+            def _run_bear_reduction(
+                code: str,
+                *,
+                is_target: bool,
+                regime: dict[str, Any],
+            ) -> None:
+                sellable_qty = ord_psbl_map.get(code, 0)
+                if sellable_qty <= 0:
+                    return
+                for sid in _strategy_ids_for_code(code):
+                    remaining_strategy = remaining_qty_for_strategy(lot_state, code, sid)
+                    if remaining_strategy <= 0:
+                        continue
+                    entry = _ensure_position_entry(code, sid)
+                    flags = entry.setdefault(
+                        "flags",
+                        {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
+                    )
+                    if regime.get("bear_stage", 0) >= 1:
+                        if flags.get("bear_s1_done"):
+                            continue
+                        guard = (
+                            _s1_guard_target(now_dt_kst.date(), code, sid, remaining_strategy)
+                            if is_target
+                            else _s1_guard_nontarget(now_dt_kst.date(), code, sid, remaining_strategy)
+                        )
+                        base_qty = int(guard.get("base_qty") or 0)
+                        if base_qty <= 0:
+                            regime_s1_summary["skipped"] += 1
+                            _log_s1_action(
+                                code,
+                                sid,
+                                "SKIP",
+                                base_qty,
+                                0,
+                                int(guard.get("sold", 0)),
+                                0,
+                                0,
+                                "base_qty_zero",
+                            )
+                        else:
+                            target_qty = max(1, int(base_qty * REG_PARTIAL_S1))
+                            sold_today = int(guard.get("sold", 0))
+                            remaining = max(0, target_qty - sold_today)
+
+                            if remaining <= 0 or sellable_qty <= 0:
+                                if remaining <= 0:
+                                    _set_position_flags(code, sid, bear_s1_done=True)
+                                    s1_done_today.add((str(code).zfill(6), str(sid)))
+                                regime_s1_summary["skipped"] += 1
+                                _log_s1_action(
+                                    code,
+                                    sid,
+                                    "SKIP",
+                                    base_qty,
+                                    target_qty,
+                                    sold_today,
+                                    remaining,
+                                    0,
+                                    "target_met" if remaining <= 0 else "no_sellable_qty",
+                                )
+                            else:
+                                sell_qty = min(remaining, sellable_qty, remaining_strategy)
+                                sell_qty = _cap_sell_qty(code, sell_qty)
+                                if sell_qty <= 0:
+                                    regime_s1_summary["skipped"] += 1
+                                    _log_s1_action(
+                                        code,
+                                        sid,
+                                        "SKIP",
+                                        base_qty,
+                                        target_qty,
+                                        sold_today,
+                                        remaining,
+                                        0,
+                                        "strategy_qty_zero",
+                                    )
+                                    continue
+                                regime_s1_summary["total_qty"] += int(sell_qty)
+                                try:
+                                    prev_qty_before = int(
+                                        (holding.get(code) or {}).get("qty") or 0
+                                    )
+                                    if dry_run:
+                                        logger.info(
+                                            "[DRY-RUN][SELL] code=%s qty=%s strategy_id=%s reason=%s",
+                                            code,
+                                            sell_qty,
+                                            sid,
+                                            reason_msg,
+                                        )
+                                        runtime_state_store.mark_order(
+                                            runtime_state,
+                                            code,
+                                            "SELL",
+                                            sid,
+                                            int(sell_qty),
+                                            float(holding.get(code, {}).get("buy_price") or 0.0),
+                                            now_dt_kst.isoformat(),
+                                            status="submitted(dry)",
+                                        )
+                                        _save_runtime_state()
+                                        status, skip_reason = "SKIP", "DRY_RUN"
+                                        exec_px, result = None, {"status": "SKIPPED", "skip_reason": "DRY_RUN"}
+                                    else:
+                                        exec_px, result = _sell_once(
+                                            kis, code, sell_qty, prefer_market=True
+                                        )
+                                        runtime_state_store.mark_order(
+                                            runtime_state,
+                                            code,
+                                            "SELL",
+                                            sid,
+                                            int(sell_qty),
+                                            float(exec_px or 0.0),
+                                            now_dt_kst.isoformat(),
+                                            status="submitted",
+                                        )
+                                        _save_runtime_state()
+                                    status, skip_reason = _sell_result_status(result)
+                                except Exception as e:
+                                    exec_px, result = None, None
+                                    status, skip_reason = "ERROR", str(e)
+
+                                reason_msg = skip_reason or (
+                                    "시장약세 1단계 축소"
+                                    if is_target
+                                    else "시장약세 1단계 축소(비타겟)"
+                                )
+
+                                if status == "SENT":
+                                    guard["sold"] = sold_today + int(sell_qty)
+                                    holding[code]["qty"] = max(
+                                        0, holding[code]["qty"] - int(sell_qty)
+                                    )
+                                    if guard["sold"] >= target_qty:
+                                        _set_position_flags(code, sid, bear_s1_done=True)
+                                        s1_done_today.add((str(code).zfill(6), str(sid)))
+                                    _persist_guard_state(now_dt_kst.date())
+                                    regime_s1_summary["sent_qty"] += int(sell_qty)
+                                    regime_s1_summary["sent_orders"] += 1
+                                    trade_payload = {
+                                        "datetime": now_str,
+                                        "code": code,
+                                        "name": None,
+                                        "qty": int(sell_qty),
+                                        "K": holding[code].get("k_value"),
+                                        "target_price": holding[code].get("target_price_src"),
+                                        "strategy": "레짐축소" if is_target else "기존보유 능동관리",
+                                        "side": "SELL",
+                                        "price": exec_px,
+                                        "amount": int((exec_px or 0)) * int(sell_qty),
+                                        "reason": reason_msg,
+                                    }
+                                    if result is not None:
+                                        trade_payload["result"] = result
+                                    log_trade(trade_payload)
+                                    _apply_sell_to_ledger_with_balance(
+                                        code,
+                                        int(sell_qty),
+                                        now_dt_kst.isoformat(),
+                                        result,
+                                        scope="strategy",
+                                        trigger_strategy_id=int(sid) if sid.isdigit() else sid,
+                                        prev_qty_before=prev_qty_before,
+                                    )
+                                    runtime_state_store.mark_fill(
+                                        runtime_state,
+                                        code,
+                                        "SELL",
+                                        sid,
+                                        int(sell_qty),
+                                        float(exec_px or 0.0),
+                                        now_dt_kst.isoformat(),
+                                        status="filled",
+                                    )
+                                    _save_runtime_state()
+                                    save_state(holding, traded)
+                                    time.sleep(RATE_SLEEP_SEC)
+                                    sellable_qty = max(0, int(sellable_qty) - int(sell_qty))
+                                elif status == "SKIP":
+                                    regime_s1_summary["skipped"] += 1
+                                else:
+                                    regime_s1_summary["skipped"] += 1
+
+                                _log_s1_action(
+                                    code,
+                                    sid,
+                                    status,
+                                    base_qty,
+                                    target_qty,
+                                    sold_today,
+                                    remaining,
+                                    sell_qty,
+                                    reason_msg,
+                                )
+
+                    if regime.get("bear_stage", 0) >= 2:
+                        if flags.get("bear_s2_done"):
+                            continue
+                        if not flags.get("bear_s1_done"):
+                            _log_s2_action(
+                                code,
+                                sid,
+                                "SKIP",
+                                int(remaining_strategy),
+                                0,
+                                0,
+                                0,
+                                0,
+                                "s1_not_done",
+                            )
+                            continue
+                        if (str(code).zfill(6), str(sid)) in s1_done_today:
+                            logger.warning(
+                                "[REGIME_S2][SEQ] %s:%s 동일 일자 S1 완료 직후 S2 진입",
+                                str(code).zfill(6),
+                                sid,
+                            )
+                        sellable_qty = ord_psbl_map.get(code, 0)
+                        remaining_strategy_stage2 = remaining_qty_for_strategy(
+                            lot_state, code, sid
+                        )
+                        guard = (
+                            _s2_guard_target(
+                                now_dt_kst.date(), code, sid, remaining_strategy_stage2
+                            )
+                            if is_target
+                            else _s2_guard_nontarget(
+                                now_dt_kst.date(), code, sid, remaining_strategy_stage2
+                            )
+                        )
+                        base_qty = int(guard.get("base_qty") or 0)
+                        if base_qty <= 0:
+                            _log_s2_action(
+                                code,
+                                sid,
+                                "SKIP",
+                                base_qty,
+                                0,
+                                int(guard.get("sold", 0)),
+                                0,
+                                0,
+                                "base_qty_zero",
+                            )
+                        else:
+                            target_qty = max(1, int(base_qty * REG_PARTIAL_S2))
+                            sold_today = int(guard.get("sold", 0))
+                            remaining = max(0, target_qty - sold_today)
+
+                            if remaining <= 0 or sellable_qty <= 0:
+                                if remaining <= 0:
+                                    _set_position_flags(code, sid, bear_s2_done=True)
+                                _log_s2_action(
+                                    code,
+                                    sid,
+                                    "SKIP",
+                                    base_qty,
+                                    target_qty,
+                                    sold_today,
+                                    remaining,
+                                    0,
+                                    "target_met" if remaining <= 0 else "no_sellable_qty",
+                                )
+                            else:
+                                sell_qty = min(
+                                    remaining, sellable_qty, remaining_strategy_stage2
+                                )
+                                sell_qty = _cap_sell_qty(code, sell_qty)
+                                if sell_qty <= 0:
+                                    _log_s2_action(
+                                        code,
+                                        sid,
+                                        "SKIP",
+                                        base_qty,
+                                        target_qty,
+                                        sold_today,
+                                        remaining,
+                                        0,
+                                        "strategy_qty_zero",
+                                    )
+                                    continue
+                                try:
+                                    prev_qty_before = int(
+                                        (holding.get(code) or {}).get("qty") or 0
+                                    )
+                                    if dry_run:
+                                        logger.info(
+                                            "[DRY-RUN][SELL] code=%s qty=%s strategy_id=%s reason=%s",
+                                            code,
+                                            sell_qty,
+                                            sid,
+                                            reason_msg,
+                                        )
+                                        runtime_state_store.mark_order(
+                                            runtime_state,
+                                            code,
+                                            "SELL",
+                                            sid,
+                                            int(sell_qty),
+                                            float(holding.get(code, {}).get("buy_price") or 0.0),
+                                            now_dt_kst.isoformat(),
+                                            status="submitted(dry)",
+                                        )
+                                        _save_runtime_state()
+                                        status, skip_reason = "SKIP", "DRY_RUN"
+                                        exec_px, result = None, {"status": "SKIPPED", "skip_reason": "DRY_RUN"}
+                                    else:
+                                        exec_px, result = _sell_once(
+                                            kis, code, sell_qty, prefer_market=True
+                                        )
+                                        runtime_state_store.mark_order(
+                                            runtime_state,
+                                            code,
+                                            "SELL",
+                                            sid,
+                                            int(sell_qty),
+                                            float(exec_px or 0.0),
+                                            now_dt_kst.isoformat(),
+                                            status="submitted",
+                                        )
+                                        _save_runtime_state()
+                                    status, skip_reason = _sell_result_status(result)
+                                except Exception as e:
+                                    exec_px, result = None, None
+                                    status, skip_reason = "ERROR", str(e)
+
+                                reason_msg = skip_reason or (
+                                    "시장약세 2단계 축소"
+                                    if is_target
+                                    else "시장약세 2단계 축소(비타겟)"
+                                )
+
+                                if status == "SENT":
+                                    guard["sold"] = sold_today + int(sell_qty)
+                                    holding[code]["qty"] = max(
+                                        0, holding[code]["qty"] - int(sell_qty)
+                                    )
+                                    if guard["sold"] >= target_qty:
+                                        _set_position_flags(code, sid, bear_s2_done=True)
+                                    _persist_guard_state(now_dt_kst.date())
+                                    log_trade(
+                                        {
+                                            "datetime": now_str,
+                                            "code": code,
+                                            "name": None,
+                                            "qty": int(sell_qty),
+                                            "K": holding[code].get("k_value"),
+                                            "target_price": holding[code].get("target_price_src"),
+                                            "strategy": "레짐축소" if is_target else "기존보유 능동관리",
+                                            "side": "SELL",
+                                            "price": exec_px,
+                                            "amount": int((exec_px or 0)) * int(sell_qty),
+                                            "result": result,
+                                            "reason": reason_msg,
+                                        }
+                                    )
+                                    _apply_sell_to_ledger_with_balance(
+                                        code,
+                                        int(sell_qty),
+                                        now_dt_kst.isoformat(),
+                                        result,
+                                        scope="strategy",
+                                        trigger_strategy_id=int(sid) if sid.isdigit() else sid,
+                                        prev_qty_before=prev_qty_before,
+                                    )
+                                    runtime_state_store.mark_fill(
+                                        runtime_state,
+                                        code,
+                                        "SELL",
+                                        sid,
+                                        int(sell_qty),
+                                        float(exec_px or 0.0),
+                                        now_dt_kst.isoformat(),
+                                        status="filled",
+                                    )
+                                    _save_runtime_state()
+                                    save_state(holding, traded)
+                                    time.sleep(RATE_SLEEP_SEC)
+                                    sellable_qty = max(0, int(sellable_qty) - int(sell_qty))
+                                elif status == "SKIP":
+                                    pass
+
+                                _log_s2_action(
+                                    code,
+                                    sid,
+                                    status,
+                                    base_qty,
+                                    target_qty,
+                                    sold_today,
+                                    remaining,
+                                    sell_qty,
+                                    reason_msg,
+                                )
 
             if now_dt_kst.date() != pullback_buy_date:
                 pullback_buy_date = now_dt_kst.date()
@@ -1335,37 +1880,25 @@ def main(
             reconcile_with_broker_holdings(lot_state, balances)
             _maybe_save_lot_state(before_lot_signature)
 
-            for code, info in holding.items():
-                sid = dominant_strategy_for(lot_state, code)
-                if sid is not None:
-                    holding[code]["strategy_id"] = sid
-                    logger.info(
-                        "[HOLDING_STRATEGY_RESTORE] code=%s sid=%s source=ledger",
-                        code,
-                        sid,
-                    )
-
-            position_state = reconcile_with_broker(position_state, balances)
+            position_state = reconcile_with_broker(
+                position_state, balances, lot_state=lot_state
+            )
             position_state_dirty = True
 
             for code, info in holding.items():
                 pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
                 if not isinstance(pos_state, dict):
                     continue
-                entries = pos_state.get("entries", {})
-                if not entries:
-                    sid = info.get("strategy_id") or "ORPHAN"
-                    _ensure_position_entry(code, sid)
+                strategies = pos_state.get("strategies", {})
+                if not strategies:
+                    _ensure_position_entry(code, "ORPHAN")
                     position_state_dirty = True
-                    entries = pos_state.get("entries", {})
-                entry = entries.get(str(info.get("strategy_id"))) if entries else None
+                    strategies = pos_state.get("strategies", {})
+                entry = next(iter(strategies.values()), None)
                 if not isinstance(entry, dict):
                     continue
                 meta = entry.get("meta", {})
-                flags = pos_state.get("flags", {})
                 info["engine"] = entry.get("entry", {}).get("engine") or info.get("engine")
-                info["bear_s1_done"] = bool(flags.get("bear_s1_done", False))
-                info["bear_s2_done"] = bool(flags.get("bear_s2_done", False))
                 info["pullback_peak_price"] = meta.get("pullback_peak_price")
                 info["pullback_reversal_price"] = meta.get("pullback_reversal_price")
 
@@ -1434,8 +1967,12 @@ def main(
             )
 
             # 커트오프 타임 도달 시 강제매도 루틴
-            if now_dt_kst.time() >= SELL_FORCE_TIME and SELL_ALL_BALANCES_AT_CUTOFF:
-                logger.info("[⏰ 커트오프 도달: 전량매도 루틴 실행]")
+            force_global_liquidation = (
+                EMERGENCY_GLOBAL_SELL
+                or (SELL_ALL_BALANCES_AT_CUTOFF and now_dt_kst.time() >= SELL_FORCE_TIME)
+            )
+            if force_global_liquidation:
+                logger.info("[⏰ 강제 전량매도 루틴 실행] emergency=%s cutoff=%s", EMERGENCY_GLOBAL_SELL, SELL_ALL_BALANCES_AT_CUTOFF)
                 pass_count = FORCE_SELL_PASSES_CUTOFF
                 if now_dt_kst.time() >= dtime(hour=15, minute=0):
                     pass_count = FORCE_SELL_PASSES_CLOSE
@@ -1446,7 +1983,36 @@ def main(
                     qty = _cap_sell_qty(code, qty)
                     if qty <= 0:
                         continue
+                    if dry_run:
+                        logger.info(
+                            "[DRY-RUN][SELL] code=%s qty=%s strategy_id=GLOBAL reason=force_liquidation",
+                            code,
+                            qty,
+                        )
+                        runtime_state_store.mark_order(
+                            runtime_state,
+                            code,
+                            "SELL",
+                            "GLOBAL",
+                            int(qty),
+                            float(holding.get(code, {}).get("buy_price") or 0.0),
+                            now_dt_kst.isoformat(),
+                            status="submitted(dry)",
+                        )
+                        _save_runtime_state()
+                        continue
                     exec_px, result = _sell_once(kis, code, qty, prefer_market=True)
+                    runtime_state_store.mark_order(
+                        runtime_state,
+                        code,
+                        "SELL",
+                        "GLOBAL",
+                        int(qty),
+                        float(exec_px or 0.0),
+                        now_dt_kst.isoformat(),
+                        status="submitted",
+                    )
+                    _save_runtime_state()
                     log_trade(
                         {
                             "datetime": now_str,
@@ -1468,11 +2034,22 @@ def main(
                         int(qty),
                         now_dt_kst.isoformat(),
                         result,
-                        scope="proportional",
+                        scope="global",
                         trigger_strategy_id=None,
                         prev_qty_before=prev_qty_before,
                         allow_blocked=FORCE_SELL_BLOCKED_LOTS,
                     )
+                    runtime_state_store.mark_fill(
+                        runtime_state,
+                        code,
+                        "SELL",
+                        "GLOBAL",
+                        int(qty),
+                        float(exec_px or 0.0),
+                        now_dt_kst.isoformat(),
+                        status="filled",
+                    )
+                    _save_runtime_state()
                     time.sleep(RATE_SLEEP_SEC)
                 for _ in range(pass_count - 1):
                     logger.info(
@@ -1487,21 +2064,33 @@ def main(
             for code in list(holding.keys()):
                 pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
                 if isinstance(pos_state, dict):
-                    entries = pos_state.get("entries", {})
+                    entries = pos_state.get("strategies", {})
                     entry_ids = ",".join(sorted(entries.keys())) if entries else "ORPHAN"
-                    entry_sample = None
-                    if entries:
-                        entry_sample = next(iter(entries.values()))
-                    entry_meta = entry_sample.get("entry", {}) if isinstance(entry_sample, dict) else {}
-                    flags = pos_state.get("flags", {}) if isinstance(pos_state, dict) else {}
                     logger.info(
-                        "[EXIT-CHECK] code=%s strategy=%s engine=%s flags=bear_s1_done=%s bear_s2_done=%s source=state.json",
+                        "[EXIT-CHECK] code=%s strategies=%s",
                         str(code).zfill(6),
-                        entry_ids,
-                        entry_meta.get("engine"),
-                        flags.get("bear_s1_done", False),
-                        flags.get("bear_s2_done", False),
+                        len(entries),
                     )
+                    if entries:
+                        for sid, entry in entries.items():
+                            if not isinstance(entry, dict):
+                                continue
+                            avg_price = strategy_avg_price(lot_state, code, sid)
+                            entry_meta = entry.get("meta", {}) or {}
+                            high = float(entry_meta.get("high") or 0.0)
+                            if avg_price is not None:
+                                high = max(high, float(avg_price))
+                            flags = entry.get("flags", {}) or {}
+                            avg_label = f"{avg_price:.2f}" if avg_price is not None else None
+                            high_label = f"{high:.2f}" if high else None
+                            logger.info(
+                                "  - sid=%s qty=%s avg=%s high=%s flags=%s",
+                                sid,
+                                entry.get("qty"),
+                                avg_label,
+                                high_label,
+                                flags,
+                            )
                 else:
                     logger.info(
                         "[EXIT-CHECK] code=%s strategy=ORPHAN engine=unknown flags=bear_s1_done=False bear_s2_done=False source=ORPHAN_POSITION",
@@ -1519,303 +2108,100 @@ def main(
                 regime_key = regime.get("key")
                 mode = regime.get("mode")
                 if regime_key and regime_key[0] == "bear":
-                    if regime["bear_stage"] >= 1:
-                        sellable_qty = ord_psbl_map.get(code, 0)
-                        guard = _s1_guard_target(
-                            now_dt_kst.date(), code, holding[code].get("qty", 0)
-                        )
-                        base_qty = int(guard.get("base_qty") or 0)
-                        if base_qty <= 0:
-                            regime_s1_summary["skipped"] += 1
-                            _log_s1_action(
-                                code,
-                                "SKIP",
-                                base_qty,
-                                0,
-                                int(guard.get("sold", 0)),
-                                0,
-                                0,
-                                "base_qty_zero",
-                            )
-                        else:
-                            target_qty = max(1, int(base_qty * REG_PARTIAL_S1))
-                            sold_today = int(guard.get("sold", 0))
-                            remaining = max(0, target_qty - sold_today)
-
-                            if remaining <= 0 or sellable_qty <= 0:
-                                if remaining <= 0:
-                                    _set_position_flags(code, bear_s1_done=True)
-                                    s1_done_today.add(code)
-                                regime_s1_summary["skipped"] += 1
-                                _log_s1_action(
-                                    code,
-                                    "SKIP",
-                                    base_qty,
-                                    target_qty,
-                                    sold_today,
-                                    remaining,
-                                    0,
-                                    (
-                                        "target_met"
-                                        if remaining <= 0
-                                        else "no_sellable_qty"
-                                    ),
-                                )
-                            else:
-                                sell_qty = min(remaining, sellable_qty)
-                                sell_qty = _cap_sell_qty(code, sell_qty)
-                                if sell_qty <= 0:
-                                    regime_s1_summary["skipped"] += 1
-                                    _log_s1_action(
-                                        code,
-                                        "SKIP",
-                                        base_qty,
-                                        target_qty,
-                                        sold_today,
-                                        remaining,
-                                        0,
-                                        "strategy_qty_zero",
-                                    )
-                                    continue
-                                regime_s1_summary["total_qty"] += int(sell_qty)
-                                try:
-                                    prev_qty_before = int(
-                                        (holding.get(code) or {}).get("qty") or 0
-                                    )
-                                    exec_px, result = _sell_once(
-                                        kis, code, sell_qty, prefer_market=True
-                                    )
-                                    status, skip_reason = _sell_result_status(result)
-                                except Exception as e:
-                                    exec_px, result = None, None
-                                    status, skip_reason = "ERROR", str(e)
-
-                                reason_msg = skip_reason or "시장약세 1단계 축소"
-
-                                if status == "SENT":
-                                    guard["sold"] = sold_today + int(sell_qty)
-                                    holding[code]["qty"] = max(
-                                        0, holding[code]["qty"] - int(sell_qty)
-                                    )
-                                    if guard["sold"] >= target_qty:
-                                        _set_position_flags(code, bear_s1_done=True)
-                                        s1_done_today.add(code)
-                                    _persist_guard_state(now_dt_kst.date())
-                                    regime_s1_summary["sent_qty"] += int(sell_qty)
-                                    regime_s1_summary["sent_orders"] += 1
-                                    trade_payload = {
-                                        "datetime": now_str,
-                                        "code": code,
-                                        "name": None,
-                                        "qty": int(sell_qty),
-                                        "K": holding[code].get("k_value"),
-                                        "target_price": holding[code].get(
-                                            "target_price_src"
-                                        ),
-                                        "strategy": "레짐축소",  # 신규 전략 구분을 위해 strategy 필드 활용
-                                        "side": "SELL",
-                                        "price": exec_px,
-                                        "amount": int((exec_px or 0)) * int(sell_qty),
-                                        "reason": reason_msg,
-                                    }
-                                    if result is not None:
-                                        trade_payload["result"] = result
-                                    log_trade(trade_payload)
-                                    _apply_sell_to_ledger_with_balance(
-                                        code,
-                                        int(sell_qty),
-                                        now_dt_kst.isoformat(),
-                                        result,
-                                        scope="strategy",
-                                        trigger_strategy_id=_resolve_sell_sid(code),
-                                        prev_qty_before=prev_qty_before,
-                                    )
-                                    save_state(holding, traded)
-                                    time.sleep(RATE_SLEEP_SEC)
-                                elif status == "SKIP":
-                                    regime_s1_summary["skipped"] += 1
-                                else:
-                                    regime_s1_summary["skipped"] += 1
-
-                                _log_s1_action(
-                                    code,
-                                    status,
-                                    base_qty,
-                                    target_qty,
-                                    sold_today,
-                                    remaining,
-                                    sell_qty,
-                                    reason_msg,
-                                )
-
-                    if regime["bear_stage"] >= 2 and not holding[code].get(
-                        "bear_s2_done"
-                    ):
-                        if not holding[code].get("bear_s1_done"):
-                            _log_s2_action(
-                                code,
-                                "SKIP",
-                                int(holding[code].get("qty", 0)),
-                                0,
-                                0,
-                                0,
-                                0,
-                                "s1_not_done",
-                            )
-                            continue
-                        if code in s1_done_today:
-                            logger.warning(
-                                f"[REGIME_S2][SEQ] {code}: 동일 일자 S1 완료 직후 S2 진입"
-                            )
-                        sellable_qty = ord_psbl_map.get(code, 0)
-                        guard = _s2_guard_target(
-                            now_dt_kst.date(), code, holding[code].get("qty", 0)
-                        )
-                        base_qty = int(guard.get("base_qty") or 0)
-                        if base_qty <= 0:
-                            _log_s2_action(
-                                code,
-                                "SKIP",
-                                base_qty,
-                                0,
-                                int(guard.get("sold", 0)),
-                                0,
-                                0,
-                                "base_qty_zero",
-                            )
-                        else:
-                            target_qty = max(1, int(base_qty * REG_PARTIAL_S2))
-                            sold_today = int(guard.get("sold", 0))
-                            remaining = max(0, target_qty - sold_today)
-
-                            if remaining <= 0 or sellable_qty <= 0:
-                                if remaining <= 0:
-                                    _set_position_flags(code, bear_s2_done=True)
-                                _log_s2_action(
-                                    code,
-                                    "SKIP",
-                                    base_qty,
-                                    target_qty,
-                                    sold_today,
-                                    remaining,
-                                    0,
-                                    (
-                                        "target_met"
-                                        if remaining <= 0
-                                        else "no_sellable_qty"
-                                    ),
-                                )
-                            else:
-                                sell_qty = min(remaining, sellable_qty)
-                                sell_qty = _cap_sell_qty(code, sell_qty)
-                                if sell_qty <= 0:
-                                    _log_s2_action(
-                                        code,
-                                        "SKIP",
-                                        base_qty,
-                                        target_qty,
-                                        sold_today,
-                                        remaining,
-                                        0,
-                                        "strategy_qty_zero",
-                                    )
-                                    continue
-                                try:
-                                    prev_qty_before = int(
-                                        (holding.get(code) or {}).get("qty") or 0
-                                    )
-                                    exec_px, result = _sell_once(
-                                        kis, code, sell_qty, prefer_market=True
-                                    )
-                                    status, skip_reason = _sell_result_status(result)
-                                except Exception as e:
-                                    exec_px, result = None, None
-                                    status, skip_reason = "ERROR", str(e)
-
-                                reason_msg = skip_reason or "시장약세 2단계 축소"
-
-                                if status == "SENT":
-                                    guard["sold"] = sold_today + int(sell_qty)
-                                    holding[code]["qty"] = max(
-                                        0, holding[code]["qty"] - int(sell_qty)
-                                    )
-                                    if guard["sold"] >= target_qty:
-                                        _set_position_flags(code, bear_s2_done=True)
-                                    _persist_guard_state(now_dt_kst.date())
-                                    log_trade(
-                                        {
-                                            "datetime": now_str,
-                                            "code": code,
-                                            "name": None,
-                                            "qty": int(sell_qty),
-                                            "K": holding[code].get("k_value"),
-                                            "target_price": holding[code].get(
-                                                "target_price_src"
-                                            ),
-                                            "strategy": "레짐축소",
-                                            "side": "SELL",
-                                            "price": exec_px,
-                                            "amount": int((exec_px or 0))
-                                            * int(sell_qty),
-                                            "result": result,
-                                            "reason": reason_msg,
-                                        }
-                                    )
-                                    _apply_sell_to_ledger_with_balance(
-                                        code,
-                                        int(sell_qty),
-                                        now_dt_kst.isoformat(),
-                                        result,
-                                        scope="strategy",
-                                        trigger_strategy_id=_resolve_sell_sid(code),
-                                        prev_qty_before=prev_qty_before,
-                                    )
-                                    save_state(holding, traded)
-                                    time.sleep(RATE_SLEEP_SEC)
-                                elif status == "SKIP":
-                                    pass
-                                _log_s2_action(
-                                    code,
-                                    status,
-                                    base_qty,
-                                    target_qty,
-                                    sold_today,
-                                    remaining,
-                                    sell_qty,
-                                    reason_msg,
-                                )
+                    _run_bear_reduction(code, is_target=True, regime=regime)
 
                 # --- 1b) TP/SL/트레일링, VWAP 가드 ---
                 try:
-                    exit_reason, exec_px, exit_result, sold_qty = _adaptive_exit(
-                        kis,
-                        code,
-                        holding[code],
-                        regime_mode=mode or "neutral",
+                    exit_intents = _build_exit_intents(
+                        code, mode or "neutral"
                     )
                 except Exception as e:
                     logger.error(f"[_adaptive_exit 실패] {code}: {e}")
-                    exit_reason = exec_px = exit_result = sold_qty = None
+                    exit_intents = []
 
-                if sold_qty:
-                    if sold_qty <= 0:
+                for intent in exit_intents:
+                    sell_qty = int(intent.get("sell_qty") or 0)
+                    if sell_qty <= 0:
+                        continue
+                    sid = intent.get("strategy_id")
+                    sell_qty = _cap_sell_qty(code, sell_qty)
+                    if sell_qty <= 0:
+                        continue
+                    if dry_run:
+                        logger.info(
+                            "[DRY-RUN][SELL] code=%s qty=%s strategy_id=%s reason=%s",
+                            code,
+                            sell_qty,
+                            sid,
+                            intent.get("reason"),
+                        )
+                        runtime_state_store.mark_order(
+                            runtime_state,
+                            code,
+                            "SELL",
+                            sid,
+                            int(sell_qty),
+                            float(holding.get(code, {}).get("buy_price") or 0.0),
+                            now_dt_kst.isoformat(),
+                            status="submitted(dry)",
+                        )
+                        _save_runtime_state()
                         continue
                     prev_qty_before = int((holding.get(code) or {}).get("qty") or 0)
-                    sold_qty = _cap_sell_qty(code, sold_qty)
-                    if sold_qty <= 0:
-                        continue
+                    exec_px, result = _sell_once(
+                        kis, code, sell_qty, prefer_market=True
+                    )
+                    runtime_state_store.mark_order(
+                        runtime_state,
+                        code,
+                        "SELL",
+                        sid,
+                        int(sell_qty),
+                        float(exec_px or 0.0),
+                        now_dt_kst.isoformat(),
+                        status="submitted",
+                    )
+                    _save_runtime_state()
+                    log_trade(
+                        {
+                            "datetime": now_str,
+                            "code": code,
+                            "name": None,
+                            "qty": int(sell_qty),
+                            "K": None,
+                            "target_price": None,
+                            "strategy": f"adaptive_exit_{sid}",
+                            "side": "SELL",
+                            "price": exec_px,
+                            "amount": int((exec_px or 0)) * int(sell_qty),
+                            "result": result,
+                            "reason": intent.get("reason"),
+                        }
+                    )
                     _apply_sell_to_ledger_with_balance(
                         code,
-                        int(sold_qty),
+                        int(sell_qty),
                         now_dt_kst.isoformat(),
-                        exit_result,
+                        result,
                         scope="strategy",
-                        trigger_strategy_id=_resolve_sell_sid(code),
+                        trigger_strategy_id=int(sid) if sid is not None and str(sid).isdigit() else sid,
                         prev_qty_before=prev_qty_before,
                     )
+                    runtime_state_store.mark_fill(
+                        runtime_state,
+                        code,
+                        "SELL",
+                        sid,
+                        int(sell_qty),
+                        float(exec_px or 0.0),
+                        now_dt_kst.isoformat(),
+                        status="filled",
+                    )
+                    _save_runtime_state()
                     save_state(holding, traded)
                     time.sleep(RATE_SLEEP_SEC)
-                else:
+
+                if not exit_intents:
                     try:
                         current_price = _safe_get_price(kis, code)
                     except Exception:
@@ -1828,17 +2214,46 @@ def main(
                             prev_qty_before = int(
                                 (holding.get(code) or {}).get("qty") or 0
                             )
+                            if dry_run:
+                                logger.info(
+                                    "[DRY-RUN][SELL] code=%s qty=%s strategy_id=5 reason=pullback_reversal_break",
+                                    code,
+                                    sell_qty,
+                                )
+                                runtime_state_store.mark_order(
+                                    runtime_state,
+                                    code,
+                                    "SELL",
+                                    5,
+                                    int(sell_qty),
+                                    float(holding.get(code, {}).get("buy_price") or 0.0),
+                                    now_dt_kst.isoformat(),
+                                    status="submitted(dry)",
+                                )
+                                _save_runtime_state()
+                                continue
                             exec_px, result = _sell_once(
                                 kis, code, sell_qty, prefer_market=True
                             )
+                            runtime_state_store.mark_order(
+                                runtime_state,
+                                code,
+                                "SELL",
+                                5,
+                                int(sell_qty),
+                                float(exec_px or 0.0),
+                                now_dt_kst.isoformat(),
+                                status="submitted",
+                            )
+                            _save_runtime_state()
                             log_trade(
                                 {
                                     "datetime": now_str,
                                     "code": code,
                                     "name": None,
                                     "qty": int(sell_qty),
-                                    "K": holding[code].get("k_value"),
-                                    "target_price": holding[code].get("target_price_src"),
+                                    "K": None,
+                                    "target_price": None,
                                     "strategy": "눌림목 손절",
                                     "side": "SELL",
                                     "price": exec_px,
@@ -1856,6 +2271,17 @@ def main(
                                 trigger_strategy_id=5,
                                 prev_qty_before=prev_qty_before,
                             )
+                            runtime_state_store.mark_fill(
+                                runtime_state,
+                                code,
+                                "SELL",
+                                5,
+                                int(sell_qty),
+                                float(exec_px or 0.0),
+                                now_dt_kst.isoformat(),
+                                status="filled",
+                            )
+                            _save_runtime_state()
                             save_state(holding, traded)
                             time.sleep(RATE_SLEEP_SEC)
                             logger.info(
@@ -1917,6 +2343,14 @@ def main(
                         f"[SKIP-PENDING] {code}: pending 쿨다운 중 → 재주문 방지"
                     )
                     continue
+                if runtime_state_store.should_block_order(
+                    runtime_state, code, "BUY", now_dt_kst.isoformat()
+                ):
+                    logger.info(
+                        "[IDEMPOTENT-SKIP] %s BUY blocked within window",
+                        code,
+                    )
+                    continue
 
                 prev_price = (
                     position_state.get("memory", {})
@@ -1948,9 +2382,11 @@ def main(
                 daily_ctx = _compute_daily_entry_context(
                     kis, code, current_price, price_source
                 )
+                daily_ctx = normalize_daily_ctx(daily_ctx)
                 intra_ctx = _compute_intraday_entry_context(
                     kis, code, fast=MOM_FAST, slow=MOM_SLOW
                 )
+                intra_ctx = normalize_intraday_ctx(intra_ctx)
 
                 momentum_confirmed = bool(
                     daily_ctx.get("strong_trend")
@@ -1971,9 +2407,8 @@ def main(
                 )
                 if not setup_state.get("ok"):
                     logger.info(
-                        "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s regime=%s",
+                        "[SETUP-BAD] %s | reasons=%s | daily=%s intra=%s regime=%s",
                         code,
-                        setup_state.get("missing_conditions"),
                         setup_state.get("reasons"),
                         daily_ctx,
                         intra_ctx,
@@ -2090,9 +2525,40 @@ def main(
                 )
 
                 prev_qty = int((holding.get(code) or {}).get("qty", 0))
+                if dry_run:
+                    logger.info(
+                        "[DRY-RUN][BUY] code=%s qty=%s price=%s strategy_id=%s",
+                        code,
+                        int(qty),
+                        current_price,
+                        strategy_id,
+                    )
+                    runtime_state_store.mark_order(
+                        runtime_state,
+                        code,
+                        "BUY",
+                        strategy_id,
+                        int(qty),
+                        float(current_price),
+                        now_dt_kst.isoformat(),
+                        status="submitted(dry)",
+                    )
+                    _save_runtime_state()
+                    continue
                 result = place_buy_with_fallback(
                     kis, code, qty, limit_px or _round_to_tick(current_price)
                 )
+                runtime_state_store.mark_order(
+                    runtime_state,
+                    code,
+                    "BUY",
+                    strategy_id,
+                    int(qty),
+                    float(current_price),
+                    now_dt_kst.isoformat(),
+                    status="submitted",
+                )
+                _save_runtime_state()
                 if not _is_order_success(result):
                     logger.warning(f"[BUY-FAIL] {code}: result={result}")
                     continue
@@ -2130,6 +2596,17 @@ def main(
                         "pending_since": None,
                     },
                 )
+                runtime_state_store.mark_fill(
+                    runtime_state,
+                    code,
+                    "BUY",
+                    strategy_id,
+                    int(qty),
+                    float(exec_price),
+                    now_dt_kst.isoformat(),
+                    status="filled",
+                )
+                _save_runtime_state()
 
                 _init_position_state(
                     kis,
@@ -2152,10 +2629,6 @@ def main(
                     best_k=k_value,
                     tgt_px=target_price,
                     gap_pct_at_entry=trigger_state.get("gap_pct"),
-                    flags={
-                        "bear_s1_done": holding[code].get("bear_s1_done", False),
-                        "bear_s2_done": holding[code].get("bear_s2_done", False),
-                    },
                     entry_time=now_dt_kst.isoformat(),
                 )
                 position_state_dirty = True
@@ -2194,6 +2667,10 @@ def main(
                     qty,
                 )
                 _maybe_save_lot_state(before_lot_signature)
+                if _lot_state_signature(lot_state) == before_lot_signature:
+                    raise RuntimeError(
+                        f"[LEDGER][BUY] failed to persist lot: code={code} sid={strategy_id}"
+                    )
 
                 log_trade(
                     {
@@ -2239,6 +2716,14 @@ def main(
                         if _pending_block(traded, code, now_dt_kst, block_sec=45):
                             logger.info(
                                 f"[PULLBACK-SKIP-PENDING] {code}: pending 쿨다운 중"
+                            )
+                            continue
+                        if runtime_state_store.should_block_order(
+                            runtime_state, code, "BUY", now_dt_kst.isoformat()
+                        ):
+                            logger.info(
+                                "[IDEMPOTENT-SKIP] %s BUY blocked within window",
+                                code,
                             )
                             continue
 
@@ -2316,12 +2801,42 @@ def main(
                             continue
 
                         prev_qty = int((holding.get(code) or {}).get("qty", 0))
+                        if dry_run:
+                            logger.info(
+                                "[DRY-RUN][BUY] code=%s qty=%s price=%s strategy_id=5",
+                                code,
+                                int(qty),
+                                trigger_price or current_price,
+                            )
+                            runtime_state_store.mark_order(
+                                runtime_state,
+                                code,
+                                "BUY",
+                                5,
+                                int(qty),
+                                float(trigger_price or current_price),
+                                now_dt_kst.isoformat(),
+                                status="submitted(dry)",
+                            )
+                            _save_runtime_state()
+                            continue
                         result = place_buy_with_fallback(
                             kis,
                             code,
                             int(qty),
                             _round_to_tick(trigger_price or current_price),
                         )
+                        runtime_state_store.mark_order(
+                            runtime_state,
+                            code,
+                            "BUY",
+                            5,
+                            int(qty),
+                            float(trigger_price or current_price),
+                            now_dt_kst.isoformat(),
+                            status="submitted",
+                        )
+                        _save_runtime_state()
 
                         if not _is_order_success(result):
                             logger.warning(
@@ -2370,6 +2885,17 @@ def main(
                                 "pending_since": None,
                             },
                         )
+                        runtime_state_store.mark_fill(
+                            runtime_state,
+                            code,
+                            "BUY",
+                            5,
+                            int(qty),
+                            float(exec_price),
+                            now_dt_kst.isoformat(),
+                            status="filled",
+                        )
+                        _save_runtime_state()
                         pullback_buys_today += 1
 
                         try:
@@ -2405,10 +2931,6 @@ def main(
                             tgt_px=trigger_price,
                             gap_pct_at_entry=None,
                             meta=pullback_meta,
-                            flags={
-                                "bear_s1_done": holding[code].get("bear_s1_done", False),
-                                "bear_s2_done": holding[code].get("bear_s2_done", False),
-                            },
                             entry_time=now_dt_kst.isoformat(),
                         )
                         position_state_dirty = True
@@ -2453,6 +2975,10 @@ def main(
                             qty,
                         )
                         _maybe_save_lot_state(before_lot_signature)
+                        if _lot_state_signature(lot_state) == before_lot_signature:
+                            raise RuntimeError(
+                                f"[LEDGER][BUY] failed to persist lot: code={code} sid=5"
+                            )
 
                         logger.info(
                             f"[✅ 눌림목 매수] {code}, qty={qty}, price={exec_price}, trigger={trigger_price}, result={result}"
@@ -2490,290 +3016,7 @@ def main(
 
                     # 약세 단계 축소(비타겟)
                     if regime["mode"] == "bear":
-                        sellable_here = ord_psbl_map.get(code, 0)
-                        if sellable_here > 0:
-                            if regime["bear_stage"] >= 1:
-                                guard = _s1_guard_nontarget(
-                                    now_dt_kst.date(),
-                                    code,
-                                    holding[code].get("qty", 0),
-                                )
-                                base_qty = int(guard.get("base_qty") or 0)
-                                if base_qty <= 0:
-                                    regime_s1_summary["skipped"] += 1
-                                    _log_s1_action(
-                                        code,
-                                        "SKIP",
-                                        base_qty,
-                                        0,
-                                        int(guard.get("sold", 0)),
-                                        0,
-                                        0,
-                                        "base_qty_zero",
-                                    )
-                                else:
-                                    target_qty = max(1, int(base_qty * REG_PARTIAL_S1))
-                                    sold_today = int(guard.get("sold", 0))
-                                    remaining = max(0, target_qty - sold_today)
-
-                                    if remaining <= 0 or sellable_here <= 0:
-                                        if remaining <= 0:
-                                            _set_position_flags(code, bear_s1_done=True)
-                                            s1_done_today.add(code)
-                                        regime_s1_summary["skipped"] += 1
-                                        _log_s1_action(
-                                            code,
-                                            "SKIP",
-                                            base_qty,
-                                            target_qty,
-                                            sold_today,
-                                            remaining,
-                                            0,
-                                            (
-                                                "target_met"
-                                                if remaining <= 0
-                                                else "no_sellable_qty"
-                                            ),
-                                        )
-                                    else:
-                                        sell_qty = min(remaining, sellable_here)
-                                        sell_qty = _cap_sell_qty(code, sell_qty)
-                                        if sell_qty <= 0:
-                                            regime_s1_summary["skipped"] += 1
-                                            _log_s1_action(
-                                                code,
-                                                "SKIP",
-                                                base_qty,
-                                                target_qty,
-                                                sold_today,
-                                                remaining,
-                                                0,
-                                                "strategy_qty_zero",
-                                            )
-                                            continue
-                                        regime_s1_summary["total_qty"] += int(sell_qty)
-                                        try:
-                                            prev_qty_before = int(
-                                                (holding.get(code) or {}).get("qty")
-                                                or 0
-                                            )
-                                            exec_px, result = _sell_once(
-                                                kis, code, sell_qty, prefer_market=True
-                                            )
-                                            status, skip_reason = _sell_result_status(
-                                                result
-                                            )
-                                        except Exception as e:
-                                            exec_px, result = None, None
-                                            status, skip_reason = "ERROR", str(e)
-
-                                        reason_msg = (
-                                            skip_reason or "시장약세 1단계 축소(비타겟)"
-                                        )
-
-                                        if status == "SENT":
-                                            guard["sold"] = sold_today + int(sell_qty)
-                                            holding[code]["qty"] = max(
-                                                0, holding[code]["qty"] - int(sell_qty)
-                                            )
-                                            if guard["sold"] >= target_qty:
-                                                _set_position_flags(code, bear_s1_done=True)
-                                                s1_done_today.add(code)
-                                            _persist_guard_state(now_dt_kst.date())
-                                            regime_s1_summary["sent_qty"] += int(
-                                                sell_qty
-                                            )
-                                            regime_s1_summary["sent_orders"] += 1
-                                            trade_payload = {
-                                                "datetime": now_str,
-                                                "code": code,
-                                                "name": None,
-                                                "qty": int(sell_qty),
-                                                "K": holding[code].get("k_value"),
-                                                "target_price": holding[code].get(
-                                                    "target_price_src"
-                                                ),
-                                                "strategy": "기존보유 능동관리",
-                                                "side": "SELL",
-                                                "price": exec_px,
-                                                "amount": int((exec_px or 0))
-                                                * int(sell_qty),
-                                                "reason": reason_msg,
-                                            }
-                                            if result is not None:
-                                                trade_payload["result"] = result
-                                            log_trade(trade_payload)
-                                            _apply_sell_to_ledger_with_balance(
-                                                code,
-                                                int(sell_qty),
-                                                now_dt_kst.isoformat(),
-                                                result,
-                                                scope="strategy",
-                                                trigger_strategy_id=_resolve_sell_sid(code),
-                                                prev_qty_before=prev_qty_before,
-                                            )
-                                            save_state(holding, traded)
-                                            time.sleep(RATE_SLEEP_SEC)
-                                        elif status == "SKIP":
-                                            regime_s1_summary["skipped"] += 1
-                                        else:
-                                            regime_s1_summary["skipped"] += 1
-
-                                        _log_s1_action(
-                                            code,
-                                            status,
-                                            base_qty,
-                                            target_qty,
-                                            sold_today,
-                                            remaining,
-                                            sell_qty,
-                                            reason_msg,
-                                        )
-
-                            if regime["bear_stage"] >= 2 and not holding[code].get(
-                                "bear_s2_done"
-                            ):
-                                if not holding[code].get("bear_s1_done"):
-                                    _log_s2_action(
-                                        code,
-                                        "SKIP",
-                                        int(holding[code].get("qty", 0)),
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        "s1_not_done",
-                                    )
-                                    continue
-                                if code in s1_done_today:
-                                    logger.warning(
-                                        f"[REGIME_S2][SEQ] {code}: 동일 일자 S1 완료 직후 S2 진입"
-                                    )
-                                sellable_here = ord_psbl_map.get(code, 0)
-                                guard = _s2_guard_nontarget(
-                                    now_dt_kst.date(),
-                                    code,
-                                    holding[code].get("qty", 0),
-                                )
-                                base_qty = int(guard.get("base_qty") or 0)
-                                if base_qty <= 0:
-                                    _log_s2_action(
-                                        code,
-                                        "SKIP",
-                                        base_qty,
-                                        0,
-                                        int(guard.get("sold", 0)),
-                                        0,
-                                        0,
-                                        "base_qty_zero",
-                                    )
-                                else:
-                                    target_qty = max(1, int(base_qty * REG_PARTIAL_S2))
-                                    sold_today = int(guard.get("sold", 0))
-                                    remaining = max(0, target_qty - sold_today)
-
-                                    if remaining <= 0 or sellable_here <= 0:
-                                        if remaining <= 0:
-                                            _set_position_flags(code, bear_s2_done=True)
-                                        _log_s2_action(
-                                            code,
-                                            "SKIP",
-                                            base_qty,
-                                            target_qty,
-                                            sold_today,
-                                            remaining,
-                                            0,
-                                            (
-                                                "target_met"
-                                                if remaining <= 0
-                                                else "no_sellable_qty"
-                                            ),
-                                        )
-                                    else:
-                                        sell_qty = min(remaining, sellable_here)
-                                        sell_qty = _cap_sell_qty(code, sell_qty)
-                                        if sell_qty <= 0:
-                                            _log_s2_action(
-                                                code,
-                                                "SKIP",
-                                                base_qty,
-                                                target_qty,
-                                                sold_today,
-                                                remaining,
-                                                0,
-                                                "strategy_qty_zero",
-                                            )
-                                            continue
-                                        try:
-                                            prev_qty_before = int(
-                                                (holding.get(code) or {}).get("qty")
-                                                or 0
-                                            )
-                                            exec_px, result = _sell_once(
-                                                kis, code, sell_qty, prefer_market=True
-                                            )
-                                            status, skip_reason = _sell_result_status(
-                                                result
-                                            )
-                                        except Exception as e:
-                                            exec_px, result = None, None
-                                            status, skip_reason = "ERROR", str(e)
-
-                                        reason_msg = (
-                                            skip_reason or "시장약세 2단계 축소(비타겟)"
-                                        )
-
-                                        if status == "SENT":
-                                            guard["sold"] = sold_today + int(sell_qty)
-                                            holding[code]["qty"] = max(
-                                                0, holding[code]["qty"] - int(sell_qty)
-                                            )
-                                            if guard["sold"] >= target_qty:
-                                                _set_position_flags(code, bear_s2_done=True)
-                                            _persist_guard_state(now_dt_kst.date())
-                                            log_trade(
-                                                {
-                                                    "datetime": now_str,
-                                                    "code": code,
-                                                    "name": None,
-                                                    "qty": int(sell_qty),
-                                                    "K": holding[code].get("k_value"),
-                                                    "target_price": holding[code].get(
-                                                        "target_price_src"
-                                                    ),
-                                                    "strategy": "기존보유 능동관리",
-                                                    "side": "SELL",
-                                                    "price": exec_px,
-                                                    "amount": int((exec_px or 0))
-                                                    * int(sell_qty),
-                                                    "result": result,
-                                                    "reason": reason_msg,
-                                                }
-                                            )
-                                            _apply_sell_to_ledger_with_balance(
-                                                code,
-                                                int(sell_qty),
-                                                now_dt_kst.isoformat(),
-                                                result,
-                                                scope="strategy",
-                                                trigger_strategy_id=_resolve_sell_sid(code),
-                                                prev_qty_before=prev_qty_before,
-                                            )
-                                            save_state(holding, traded)
-                                            time.sleep(RATE_SLEEP_SEC)
-                                        elif status == "SKIP":
-                                            pass
-
-                                        _log_s2_action(
-                                            code,
-                                            status,
-                                            base_qty,
-                                            target_qty,
-                                            sold_today,
-                                            remaining,
-                                            sell_qty,
-                                            reason_msg,
-                                        )
+                        _run_bear_reduction(code, is_target=False, regime=regime)
 
                     try:
                         momentum_intact, trend_ctx = _has_bullish_trend_structure(

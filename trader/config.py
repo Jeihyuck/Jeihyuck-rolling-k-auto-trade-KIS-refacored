@@ -90,6 +90,8 @@ CONFIG = {
     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+    "EMERGENCY_GLOBAL_SELL": "false",
+    "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
 }
 
 
@@ -120,6 +122,7 @@ KST = ZoneInfo("Asia/Seoul")
 
 SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
 SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "true"
+EMERGENCY_GLOBAL_SELL = _cfg("EMERGENCY_GLOBAL_SELL").lower() in ("1", "true", "yes")
 RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
 FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
 FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
@@ -165,6 +168,25 @@ SUBJECT_FLOW_EMPTY_POLICY = (_cfg("SUBJECT_FLOW_EMPTY_POLICY") or "TREAT_AS_FAIL
 SUBJECT_FLOW_DEGRADED_TURNOVER_MULT = float(_cfg("SUBJECT_FLOW_DEGRADED_TURNOVER_MULT") or "1.5")
 SUBJECT_FLOW_DEGRADED_OB_ADD = float(_cfg("SUBJECT_FLOW_DEGRADED_OB_ADD") or "10")
 SUBJECT_FLOW_MAX_CALLS_PER_RUN = int(_cfg("SUBJECT_FLOW_MAX_CALLS_PER_RUN") or "200")
+# 전략별 레짐 축소 우선순위
+def _parse_strategy_priority(raw: str) -> list[int]:
+    priorities: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if 1 <= value <= 5 and value not in priorities:
+            priorities.append(value)
+    return priorities or [5, 4, 3, 2, 1]
+
+
+STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+    _cfg("STRATEGY_REDUCTION_PRIORITY")
+)
 # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
 USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
 PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")

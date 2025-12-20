@@ -120,32 +120,75 @@ def record_entry_state(
     pos = state.setdefault("positions", {}).setdefault(
         code_key,
         {
-            "entries": {},
-            "flags": {"bear_s1_done": False, "bear_s2_done": False},
-            "broker_qty": None,
-            "broker_avg_price": None,
-            "miss_count": 0,
+            "strategies": {},
         },
     )
-    entries = pos.setdefault("entries", {})
-    entries[sid_key] = {
-        "qty": int(qty),
-        "avg_price": float(avg_price),
-        "entry": _normalize_entry_meta(
-            code=str(code),
-            strategy_id=strategy_id,
-            engine=engine,
-            entry_reason=entry_reason,
-            order_type=order_type,
-            best_k=best_k,
-            tgt_px=tgt_px,
-            gap_pct_at_entry=gap_pct_at_entry,
-            entry_time=entry_time,
-        ),
-        "meta": _normalize_meta(meta),
-    }
-    if flags:
-        update_position_flags(state, code, flags)
+    strategies = pos.setdefault("strategies", {})
+    existing = strategies.get(sid_key)
+    if not isinstance(existing, dict):
+        entry_flags = {
+            "bear_s1_done": False,
+            "bear_s2_done": False,
+            "sold_p1": False,
+            "sold_p2": False,
+        }
+        if flags:
+            entry_flags.update(
+                {k: bool(flags.get(k)) for k in entry_flags.keys() if k in flags}
+            )
+        entry_meta = _normalize_meta(meta)
+        entry_meta.setdefault("high", float(avg_price))
+        entry_meta["high"] = max(float(entry_meta.get("high") or 0.0), float(avg_price))
+        strategies[sid_key] = {
+            "qty": int(qty),
+            "avg_price": float(avg_price),
+            "entry": _normalize_entry_meta(
+                code=str(code),
+                strategy_id=strategy_id,
+                engine=engine,
+                entry_reason=entry_reason,
+                order_type=order_type,
+                best_k=best_k,
+                tgt_px=tgt_px,
+                gap_pct_at_entry=gap_pct_at_entry,
+                entry_time=entry_time,
+            ),
+            "meta": entry_meta,
+            "flags": entry_flags,
+        }
+    else:
+        prev_qty = int(existing.get("qty") or 0)
+        add_qty = int(qty)
+        total_qty = prev_qty + add_qty
+        prev_avg = float(existing.get("avg_price") or 0.0)
+        new_avg = (
+            (prev_avg * prev_qty + float(avg_price) * add_qty) / total_qty
+            if total_qty > 0
+            else 0.0
+        )
+        existing["qty"] = int(total_qty)
+        existing["avg_price"] = float(new_avg)
+        entry = existing.setdefault("entry", {})
+        entry_time_value = entry_time or datetime.now(KST).isoformat()
+        entry["last_entry_time"] = entry_time_value
+        entry["strategy_id"] = entry.get("strategy_id") or str(strategy_id)
+        entry_meta = existing.setdefault("meta", {})
+        if not entry_meta.get("high") or float(entry_meta.get("high") or 0.0) <= 0:
+            entry_meta["high"] = float(new_avg)
+        entry_meta["high"] = max(float(entry_meta.get("high") or 0.0), float(new_avg))
+        entry_flags = existing.setdefault(
+            "flags",
+            {
+                "bear_s1_done": False,
+                "bear_s2_done": False,
+                "sold_p1": False,
+                "sold_p2": False,
+            },
+        )
+        if flags:
+            for key, value in flags.items():
+                if key in entry_flags:
+                    entry_flags[key] = bool(value)
     logger.info(
         "[ENTRY] code=%s strategy=%s engine=%s best_k=%s tgt_px=%s saved_state=OK",
         code_key,
@@ -168,8 +211,8 @@ def update_position_meta(
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
         return state
-    entries = pos.get("entries", {})
-    entry = entries.get(sid_key)
+    strategies = pos.get("strategies", {})
+    entry = strategies.get(sid_key)
     if not isinstance(entry, dict):
         return state
     meta = entry.setdefault(
@@ -190,18 +233,24 @@ def update_position_meta(
 def update_position_flags(
     state: Dict[str, Any],
     code: str,
+    strategy_id: Any,
     flag_updates: Dict[str, Any],
 ) -> Dict[str, Any]:
+    assert strategy_id is not None, "strategy_id required for update_position_flags"
     code_key = str(code).zfill(6)
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
         return state
-    flags = pos.setdefault(
+    strategies = pos.setdefault("strategies", {})
+    entry = strategies.get(str(strategy_id))
+    if not isinstance(entry, dict):
+        return state
+    flags = entry.setdefault(
         "flags",
-        {"bear_s1_done": False, "bear_s2_done": False},
+        {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
     )
     before_flags = dict(flags)
-    for key in ("bear_s1_done", "bear_s2_done"):
+    for key in ("bear_s1_done", "bear_s2_done", "sold_p1", "sold_p2"):
         if key in flag_updates:
             flags[key] = bool(flag_updates.get(key))
     logger.info(
@@ -1056,7 +1105,7 @@ def _adaptive_exit(
     code: str,
     pos: Dict[str, Any],
     regime_mode: str = "neutral",
-) -> Tuple[Optional[str], Optional[float], Optional[Any], Optional[int]]:
+) -> Tuple[Optional[str], Optional[int]]:
     """
     레짐(강세/약세/중립) + 1분봉 모멘텀 기반
     - 부분 익절(1차/2차)
@@ -1073,21 +1122,21 @@ def _adaptive_exit(
         cur = _safe_get_price(kis, code)
         if cur is None or cur <= 0:
             logger.warning(f"[EXIT-FAIL] {code} 현재가 조회 실패")
-            return None, None, None, None
+            return None, None
     except Exception as e:
         logger.error(f"[EXIT-FAIL] {code} 현재가 조회 예외: {e}")
-        return None, None, None, None
+        return None, None
 
     # === 상태/기초 값 ===
     qty = _to_int(pos.get("qty"), 0)
     if qty <= 0:
         logger.warning(f"[EXIT-FAIL] {code} qty<=0")
-        return None, None, None, None
+        return None, None
 
     buy_price = float(pos.get("buy_price", 0.0)) or 0.0
     if buy_price <= 0:
         logger.warning(f"[EXIT-FAIL] {code} buy_price<=0")
-        return None, None, None, None
+        return None, None
 
     # 최고가(high) 갱신
     pos["high"] = max(float(pos.get("high", cur)), float(cur))
@@ -1176,37 +1225,6 @@ def _adaptive_exit(
             sell_size = qty
         else:
             # 청산 조건 없음 → 보유 유지
-            return None, None, None, None
+            return None, None
 
-    # === 실제 매도 실행 ===
-    try:
-        exec_px, result = _sell_once(kis, code, sell_size, prefer_market=True)
-        sold_qty = sell_size
-
-        # 보유 수량 감소
-        pos["qty"] = max(0, qty - sell_size)
-
-        # 실현손익 로그
-        try:
-            log_trade(
-                {
-                    "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "code": code,
-                    "name": pos.get("name"),
-                    "side": "SELL",
-                    "qty": int(sold_qty),
-                    "price": float(exec_px) if exec_px is not None else float(cur),
-                    "amount": int(sold_qty) * int(exec_px or cur),
-                    "reason": reason,
-                    "regime_mode": regime_mode,
-                }
-            )
-        except Exception as e:
-            logger.warning(f"[EXIT-LOG-FAIL] {code}: {e}")
-
-    except Exception as e:
-        logger.error(f"[SELL-FAIL] {code} qty={sell_size} err={e}")
-        # 매도 실패 시에는 상태 원복하지 않고, 다음 루프에서 다시 판단
-        return None, None, None, None
-
-    return reason, exec_px, result, sold_qty
+    return reason, sell_size

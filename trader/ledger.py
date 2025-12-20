@@ -96,12 +96,7 @@ def apply_sell_fill_fifo(
                 break
         return remaining_qty
 
-    # 1) 먼저 요청 전략에서 차감
-    remaining = _consume(remaining, req_sid)
-
-    # 2) 부족하면 다른 전략 lot에서도 차감(계좌 매도 반영 spill)
-    if remaining > 0 and req_sid is not None:
-        remaining = _consume(remaining, None)
+    _consume(remaining, req_sid)
 
 
 def owned_lots_by_strategy(state: Dict[str, Any], strategy_id: int | str) -> List[Dict[str, Any]]:
@@ -145,6 +140,28 @@ def dominant_strategy_for(state: Dict[str, Any], pdno: str) -> int | None:
     return max(totals.items(), key=lambda item: item[1])[0]
 
 
+def strategy_avg_price(
+    state: Dict[str, Any], pdno: str, strategy_id: int | str
+) -> float | None:
+    lots = _ensure_state(state)
+    total_qty = 0
+    total_cost = 0.0
+    for lot in lots:
+        if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+            continue
+        if _norm_sid(lot.get("strategy_id")) != _norm_sid(strategy_id):
+            continue
+        remaining = int(lot.get("remaining_qty") or 0)
+        if remaining <= 0:
+            continue
+        entry_price = float(lot.get("entry_price") or 0.0)
+        total_qty += remaining
+        total_cost += entry_price * remaining
+    if total_qty <= 0:
+        return None
+    return total_cost / total_qty
+
+
 def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[str, Any]]) -> None:
     lots = _ensure_state(state)
     holdings_map: Dict[str, Dict[str, Any]] = {}
@@ -185,13 +202,13 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
                 {
                     "lot_id": f"{pdno}-RECON-{now_ts}",
                     "pdno": pdno,
-                    "strategy_id": "UNKNOWN",
+                    "strategy_id": "ORPHAN",
                     "engine": "reconcile",
                     "entry_ts": now_ts,
                     "entry_price": float(payload.get("avg_price") or 0.0),
                     "qty": int(diff),
                     "remaining_qty": int(diff),
-                    "meta": {"reconciled": True, "sell_blocked": True},
+                    "meta": {"reconciled": True, "orphan": True},
                 }
             )
         elif total_remaining > hold_qty:

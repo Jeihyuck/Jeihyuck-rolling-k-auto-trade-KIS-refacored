@@ -749,10 +749,7 @@ def evaluate_setup_gate(
     missing_conditions: List[str] = []
     reasons = _collect_bad_entry_reasons(daily_ctx, intraday_ctx, regime_state)
 
-    if not daily_ctx.get("setup_ok"):
-        missing_conditions.append("setup_flag")
-
-    ok = not missing_conditions and not reasons
+    ok = bool(daily_ctx.get("setup_ok")) and not reasons
     return {
         "ok": ok,
         "missing_conditions": missing_conditions,
@@ -817,9 +814,6 @@ def evaluate_trigger_gate(
 
     ok = False
     if trigger_name == "pullback_rebound":
-        if not daily_ctx.get("setup_ok"):
-            missing_conditions.append("setup_flag")
-
         pullback = _to_float(daily_ctx.get("pullback_depth_pct"), None)
         if pullback is None:
             missing_conditions.append("pullback_depth")
@@ -1186,4 +1180,3 @@ def _get_atr(kis: KisAPI, code: str, window: int = 14) -> Optional[float]:
             logger.warning(f"[ATR_FAIL] {code}: {e}")
             return None
     return None
-
