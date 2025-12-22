@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +41,7 @@ from .core_constants import (
 from .core_utils import _get_daily_candles_cached, _to_float, _to_int, _with_retry
 from .kis_wrapper import KisAPI, NetTemporaryError, DataEmptyError, DataShortError
 from .metrics import vwap_guard
+from .code_utils import normalize_code
 
 __all__ = [
     "_safe_get_price",
@@ -83,6 +85,9 @@ def _safe_get_price(
     with_source: bool = False,
 ) -> Optional[float | Tuple[float, str]]:
     import time as _t
+    code = normalize_code(code)
+    if not code:
+        return None
     now = _t.time()
 
     def _store_and_return(val: float, source: str, log_level: Optional[int] = None):
@@ -239,7 +244,7 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for row in positions:
         try:
-            code = str(row.get("code") or row.get("pdno") or "").strip()
+            code = normalize_code(row.get("code") or row.get("pdno") or "")
             if not code:
                 continue
             qty = _to_int(row.get("qty") if "qty" in row else row.get("hldg_qty"))
@@ -254,7 +259,7 @@ def _fetch_balances(kis: KisAPI, ttl_sec: int = 15) -> List[Dict[str, Any]]:
 
             normalized.append(
                 {
-                    "code": code.zfill(6),
+                    "code": code,
                     "name": row.get("name") or row.get("prdt_name"),
                     "qty": qty,
                     "sell_psbl_qty": sell_psbl_qty,
@@ -477,9 +482,25 @@ def _classify_champion_grade(info: Dict[str, Any]) -> str:
 def _compute_daily_entry_context(
     kis: KisAPI, code: str, current_price: Optional[float], price_source: Optional[str] = None
 ) -> Dict[str, Any]:
-    ctx: Dict[str, Any] = {"current_price": current_price, "price_source": price_source}
+    code = normalize_code(code)
+    ctx: Dict[str, Any] = {
+        "current_price": current_price,
+        "price_source": price_source,
+        "daily_count": 0,
+        "data_insufficient": False,
+    }
     try:
         candles = _get_daily_candles_cached(kis, code, count=max(PULLBACK_LOOKBACK, 60))
+    except DataShortError as e:
+        ctx["data_insufficient"] = True
+        match = re.search(r"(\d+)\s+candles", str(e))
+        if match:
+            ctx["daily_count"] = int(match.group(1))
+        return ctx
+    except DataEmptyError:
+        ctx["data_insufficient"] = True
+        ctx["daily_count"] = 0
+        return ctx
     except Exception:
         return ctx
 
@@ -489,11 +510,26 @@ def _compute_daily_entry_context(
         completed = completed[:-1]
 
     if not completed:
+        ctx["data_insufficient"] = True
+        ctx["daily_count"] = 0
+        ctx["setup_ok"] = False
         return ctx
+
+    ctx["daily_count"] = len(completed)
 
     closes = [float(c.get("close") or 0.0) for c in completed if c.get("close")]
     highs = [float(c.get("high") or 0.0) for c in completed if c.get("high")]
     lows = [float(c.get("low") or 0.0) for c in completed if c.get("low")]
+
+    if len(closes) >= 2:
+        ctx["prev_close"] = float(closes[-2])
+    else:
+        ctx["prev_close"] = None
+
+    if len(closes) < 21:
+        ctx["data_insufficient"] = True
+        ctx["setup_ok"] = False
+        return ctx
 
     if len(closes) >= 20:
         ma20 = sum(closes[-20:]) / 20.0
@@ -594,7 +630,8 @@ def _compute_intraday_entry_context(
     prev_high는 이전 일자 고가(전일 high) 등 외부에서 넣어줄 수 있고,
     fast/slow는 모멘텀용 파라미터지만, 여기서는 주로 조회 길이 튜닝에 사용한다.
     """
-    ctx: Dict[str, Any] = {}
+    code = normalize_code(code)
+    ctx: Dict[str, Any] = {"intraday_available": False, "vwap_enabled": False}
 
     # intraday 1분봉 조회 길이 결정
     # - 기본은 120개
@@ -611,9 +648,12 @@ def _compute_intraday_entry_context(
     candles = _get_intraday_1min(kis, code, count=lookback)
     if not candles:
         return ctx
+    ctx["intraday_available"] = True
 
     vwap_val = _compute_vwap_from_1min(candles)
     ctx["vwap"] = vwap_val
+    if vwap_val and vwap_val > 0:
+        ctx["vwap_enabled"] = True
 
     last = candles[-1]
     last_close = _to_float(last.get("close"), None)
@@ -749,7 +789,51 @@ def evaluate_setup_gate(
     missing_conditions: List[str] = []
     reasons = _collect_bad_entry_reasons(daily_ctx, intraday_ctx, regime_state)
 
+    if daily_ctx.get("data_insufficient"):
+        daily_count = daily_ctx.get("daily_count")
+        if daily_count is not None and int(daily_count) < 21:
+            reasons.append("data_insufficient_daily_<21")
+        elif daily_count is not None:
+            reasons.append(f"data_insufficient_daily_{daily_count}")
+        else:
+            reasons.append("data_insufficient_daily_unknown")
+
+    if daily_ctx.get("prev_close") in (None, 0):
+        reasons.append("prev_close_missing")
+
+    if not intraday_ctx or not intraday_ctx.get("intraday_available"):
+        reasons.append("intraday_unavailable")
+    elif not intraday_ctx.get("vwap_enabled"):
+        reasons.append("intraday_unavailable")
+
+    down_streak = daily_ctx.get("down_streak")
+    if down_streak is not None and int(down_streak) < 2:
+        reasons.append("down_streak_insufficient")
+
+    pullback = daily_ctx.get("pullback_depth_pct")
+    if pullback is not None:
+        try:
+            pullback_val = float(pullback)
+            max_pb = float(daily_ctx.get("max_pullback_pct") or BAD_ENTRY_MAX_PULLBACK)
+            if pullback_val > max_pb:
+                reasons.append("pullback_depth_too_high")
+        except Exception:
+            reasons.append("pullback_depth_invalid")
+
+    ma20_ratio = daily_ctx.get("ma20_ratio")
+    if ma20_ratio is not None:
+        try:
+            if float(ma20_ratio) < GOOD_ENTRY_MA20_RANGE[0]:
+                reasons.append("ma20_below")
+        except Exception:
+            reasons.append("ma20_invalid")
+
+    if not daily_ctx.get("strong_trend"):
+        reasons.append("not_strong_trend")
+
     ok = bool(daily_ctx.get("setup_ok")) and not reasons
+    if not ok and not reasons:
+        reasons = ["setup_flag_false"]
     return {
         "ok": ok,
         "missing_conditions": missing_conditions,
@@ -907,6 +991,9 @@ def _get_intraday_1min(kis: KisAPI, code: str, count: int = 60) -> List[Dict[str
     KisAPI에 1분봉 메서드가 있으면 사용하고, 없으면 호환 메서드로 fallback.
     반환은 최소한 'close'와 'volume' 정보를 가진 dict 리스트라고 가정한다.
     """
+    code = normalize_code(code)
+    if not code:
+        return []
     try:
         if hasattr(kis, "get_intraday_1min"):
             return kis.get_intraday_1min(code, count=count)

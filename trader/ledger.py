@@ -4,10 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from .config import KST
-
-
-def _normalize_code(pdno: str) -> str:
-    return str(pdno).zfill(6)
+from .code_utils import normalize_code
 
 
 def _ensure_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -43,7 +40,7 @@ def record_buy_fill(
     lots.append(
         {
             "lot_id": lot_id,
-            "pdno": _normalize_code(pdno),
+            "pdno": normalize_code(pdno),
             "strategy_id": strategy_id,
             "engine": engine,
             "entry_ts": entry_ts,
@@ -73,7 +70,7 @@ def apply_sell_fill_fifo(
 
     def _consume(remaining_qty: int, sid_filter: int | str | None) -> int:
         for lot in lots:
-            if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+            if normalize_code(lot.get("pdno")) != normalize_code(pdno):
                 continue
             if not allow_blocked and lot.get("meta", {}).get("sell_blocked") is True:
                 continue
@@ -113,7 +110,7 @@ def remaining_qty_for_strategy(state: Dict[str, Any], pdno: str, strategy_id: in
     lots = _ensure_state(state)
     total = 0
     for lot in lots:
-        if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
             continue
         if int(lot.get("remaining_qty") or 0) <= 0:
             continue
@@ -127,7 +124,7 @@ def dominant_strategy_for(state: Dict[str, Any], pdno: str) -> int | None:
     lots = _ensure_state(state)
     totals: Dict[int, int] = {}
     for lot in lots:
-        if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
             continue
         remaining = int(lot.get("remaining_qty") or 0)
         if remaining <= 0:
@@ -147,7 +144,7 @@ def strategy_avg_price(
     total_qty = 0
     total_cost = 0.0
     for lot in lots:
-        if _normalize_code(lot.get("pdno")) != _normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
             continue
         if _norm_sid(lot.get("strategy_id")) != _norm_sid(strategy_id):
             continue
@@ -166,7 +163,7 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
     lots = _ensure_state(state)
     holdings_map: Dict[str, Dict[str, Any]] = {}
     for row in holdings:
-        code = _normalize_code(row.get("code") or row.get("pdno") or "")
+        code = normalize_code(row.get("code") or row.get("pdno") or "")
         if not code:
             continue
         qty = int(row.get("qty") or 0)
@@ -182,7 +179,11 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
     now_ts = datetime.now(KST).isoformat()
 
     for lot in lots:
-        pdno = _normalize_code(lot.get("pdno"))
+        if str(lot.get("strategy_id")) in {"ORPHAN", "UNKNOWN"}:
+            lot["strategy_id"] = "MANUAL"
+
+    for lot in lots:
+        pdno = normalize_code(lot.get("pdno"))
         if pdno not in holdings_map or holdings_map[pdno]["qty"] <= 0:
             if int(lot.get("remaining_qty") or 0) > 0:
                 lot["remaining_qty"] = 0
@@ -194,7 +195,7 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
         total_remaining = sum(
             int(lot.get("remaining_qty") or 0)
             for lot in lots
-            if _normalize_code(lot.get("pdno")) == pdno
+            if normalize_code(lot.get("pdno")) == pdno
         )
         if total_remaining < hold_qty:
             diff = hold_qty - total_remaining
@@ -202,19 +203,19 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
                 {
                     "lot_id": f"{pdno}-RECON-{now_ts}",
                     "pdno": pdno,
-                    "strategy_id": "ORPHAN",
+                    "strategy_id": "MANUAL",
                     "engine": "reconcile",
                     "entry_ts": now_ts,
                     "entry_price": float(payload.get("avg_price") or 0.0),
                     "qty": int(diff),
                     "remaining_qty": int(diff),
-                    "meta": {"reconciled": True, "orphan": True},
+                    "meta": {"reconciled": True, "manual": True},
                 }
             )
         elif total_remaining > hold_qty:
             extra = total_remaining - hold_qty
             for lot in reversed(lots):
-                if _normalize_code(lot.get("pdno")) != pdno:
+                if normalize_code(lot.get("pdno")) != pdno:
                     continue
                 lot_remaining = int(lot.get("remaining_qty") or 0)
                 if lot_remaining <= 0:

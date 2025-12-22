@@ -36,3 +36,27 @@ Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 
 ## CI and live-trading safeguards
 - CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
 - The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.
+
+## How ORPHAN recovery works
+The KOSDAQ loop reconciles broker holdings into the position state each cycle. If a holding is missing from the state, the bot:
+1. Searches the recent trade logs for the latest BUY fill of the same code to recover the strategy ID and engine.
+2. Falls back to a rebalance bucket (`REB_YYYYMMDD`) if the code is in today’s targets.
+3. Otherwise assigns the holding to `MANUAL`.
+
+This avoids ORPHAN/UNKNOWN mappings and ensures every holding has an explicit sid bucket.
+
+## State schema
+Position state is stored in `trader/state/state.json` and normalized on load. Each strategy entry is guaranteed to include:
+```
+{
+  "code": "<6-digit code>",
+  "sid": "<strategy or bucket id>",
+  "engine": "<entry engine>",
+  "qty": <int>,
+  "avg_price": <float>,
+  "entry_ts": "<ISO timestamp>",
+  "high_watermark": <float>,
+  "flags": { ... },
+  "last_update_ts": "<ISO timestamp>"
+}
+```

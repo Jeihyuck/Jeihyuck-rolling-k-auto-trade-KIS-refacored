@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from datetime import datetime, timedelta
@@ -20,6 +21,7 @@ from .core_constants import (
     logger,
 )
 from .kis_wrapper import KisAPI
+from .code_utils import normalize_code
 
 __all__ = [
     "_krx_tick",
@@ -32,6 +34,7 @@ __all__ = [
     "get_rebalance_anchor_date",
     "log_trade",
     "save_state",
+    "save_state_atomic",
     "load_state",
     "_with_retry",
     "_to_int",
@@ -91,13 +94,16 @@ def _get_daily_candles_cached(kis: KisAPI, code: str, count: int) -> List[Dict[s
     """
 
     today = datetime.now(KST).date()
-    entry = _DAILY_CANDLE_CACHE.get(code)
+    code_key = normalize_code(code)
+    if not code_key:
+        return []
+    entry = _DAILY_CANDLE_CACHE.get(code_key)
     if entry and entry.get("date") == today and len(entry.get("candles") or []) >= count:
         return entry["candles"]
 
-    candles = kis.get_daily_candles(code, count=count)
+    candles = kis.get_daily_candles(code_key, count=count)
     if candles:
-        _DAILY_CANDLE_CACHE[code] = {"date": today, "candles": candles}
+        _DAILY_CANDLE_CACHE[code_key] = {"date": today, "candles": candles}
     return candles or []
 
 
@@ -174,12 +180,23 @@ def log_trade(trade: dict) -> None:
     today = datetime.now(KST).strftime("%Y-%m-%d")
     logfile = LOG_DIR / f"trades_{today}.json"
     with open(logfile, "a", encoding="utf-8") as f:
-        f.write(json.dumps(trade, ensure_ascii=False) + "\n")
+        payload = dict(trade)
+        if "code" in payload:
+            payload["code"] = normalize_code(payload.get("code"))
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def save_state_atomic(holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"holding": holding, "traded": traded}
+    tmp_path = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, STATE_FILE)
 
 
 def save_state(holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"holding": holding, "traded": traded}, f, ensure_ascii=False, indent=2)
+    save_state_atomic(holding, traded)
 
 
 def load_state() -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -240,4 +257,3 @@ def _log_realized_pnl(
         logger.info(msg)
     except Exception as e:
         logger.warning(f"[P&L_LOG_FAIL] {code} err={e}")
-

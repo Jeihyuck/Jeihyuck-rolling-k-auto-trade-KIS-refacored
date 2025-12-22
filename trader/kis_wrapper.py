@@ -28,6 +28,7 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
 from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
+from trader.code_utils import normalize_code
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
@@ -553,7 +554,9 @@ class KisAPI:
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
             markets = ["J", "U"]
-            c = code.strip()
+            c = normalize_code(code)
+            if not c:
+                return None
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
                 for code_fmt in codes:
@@ -595,7 +598,9 @@ class KisAPI:
 
         # ---- (1) 파라미터 구성 ----
         market_code = "J"                         # 시장코드: J 고정
-        iscd = code.strip().lstrip("A")          # 종목코드: 'A' 제거(6자리)
+        iscd = normalize_code(code)              # 종목코드: 'A' 제거(6자리)
+        if not iscd:
+            raise ValueError("invalid code for daily candles")
 
         # 기간: 충분히 넉넉하게(휴장/결측 대비)
         kst = pytz.timezone("Asia/Seoul")
@@ -702,7 +707,7 @@ class KisAPI:
 
     def inquire_investor(self, code: str, market: str = "KOSDAQ") -> dict:
         """주체수급 조회(inquire-investor) — 실패 시에도 예외를 던지지 않는다."""
-        iscd = code.strip().lstrip("A")
+        iscd = normalize_code(code)
         # FID_COND_MRKT_DIV_CODE는 시장(KOSPI/KOSDAQ) 코드가 아니라 상품군 코드(J=주식/ETF/ETN, W=ELW 등)로
         # 쓰이는 사례가 많다. 주식/ETF/ETN 기본값 "J"를 사용하고, 매핑에 W가 명시된 경우에만 W로 전송한다.
         mapped = MARKET_MAP.get(iscd)
@@ -787,7 +792,9 @@ class KisAPI:
         - FID_ETC_CLS_CODE: ''
         """
         market_code = "J"
-        iscd = code.strip().lstrip("A")
+        iscd = normalize_code(code)
+        if not iscd:
+            return []
 
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
         self._limiter.wait("intraday")
@@ -1312,6 +1319,7 @@ class KisAPI:
     # 매수/매도 (기본)
     # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        pdno = normalize_code(pdno)
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -1323,12 +1331,13 @@ class KisAPI:
         return self._order_cash(body, is_sell=False)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        pdno = normalize_code(pdno)
         # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
         ord_psbl = 0
         for r in pos:
-            if safe_strip(r.get("pdno")) == safe_strip(pdno):
+            if normalize_code(r.get("pdno")) == pdno:
                 hldg = int(float(r.get("hldg_qty", "0")))
                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
                 break
@@ -1376,6 +1385,7 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        pdno = normalize_code(pdno)
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
@@ -1430,6 +1440,7 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        pdno = normalize_code(pdno)
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
@@ -1530,6 +1541,7 @@ class KisAPI:
         지정가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
         """
+        code = normalize_code(code)
         # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
         if self.env == "practice":
             logger.info(
@@ -1569,6 +1581,7 @@ class KisAPI:
         시장가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
         """
+        code = normalize_code(code)
         # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
         if self.env == "practice":
             logger.info(
@@ -1604,12 +1617,14 @@ class KisAPI:
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
         """기존 코드 호환용."""
+        code = normalize_code(code)
         if price is None:
             return self.buy_stock_market(code, qty)
         return self.buy_stock_limit(code, qty, price)
 
     def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
         """기존 코드 호환용."""
+        code = normalize_code(code)
         if price is None:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)

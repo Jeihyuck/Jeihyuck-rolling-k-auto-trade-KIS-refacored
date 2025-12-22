@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .config import KST
+from .code_utils import normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +65,12 @@ def get_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any] | None:
     positions = state.get("positions", {})
     if not isinstance(positions, dict):
         return None
-    return positions.get(str(symbol).zfill(6))
+    return positions.get(normalize_code(symbol))
 
 
 def upsert_position(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) -> None:
     positions = state.setdefault("positions", {})
-    key = str(symbol).zfill(6)
+    key = normalize_code(symbol)
     pos = positions.setdefault(key, {})
     for field, value in fields.items():
         pos[field] = value
@@ -77,7 +78,7 @@ def upsert_position(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) 
 
 def _order_bucket(state: Dict[str, Any], symbol: str, side: str) -> Dict[str, Any]:
     orders = state.setdefault("orders", {})
-    symbol_key = str(symbol).zfill(6)
+    symbol_key = normalize_code(symbol)
     symbol_bucket = orders.setdefault(symbol_key, {})
     return symbol_bucket.setdefault(side.upper(), {})
 
@@ -181,7 +182,7 @@ def reconcile_with_kis_balance(
         return state
     seen = set()
     for row in balance_positions:
-        symbol = str(row.get("code") or row.get("pdno") or "").zfill(6)
+        symbol = normalize_code(row.get("code") or row.get("pdno") or "")
         if not symbol:
             continue
         qty = int(row.get("qty") or 0)
@@ -189,7 +190,7 @@ def reconcile_with_kis_balance(
             continue
         seen.add(symbol)
         pos = positions.setdefault(symbol, {})
-        strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "UNKNOWN"
+        strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "MANUAL"
         pos.update(
             {
                 "strategy_id": strategy_id,

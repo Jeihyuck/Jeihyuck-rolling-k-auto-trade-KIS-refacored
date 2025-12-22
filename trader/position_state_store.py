@@ -5,9 +5,11 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable
 
 from .config import KST
+from .code_utils import normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +41,15 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
     memory.setdefault("last_price", {})
     memory.setdefault("last_seen", {})
     for code, payload in list(positions.items()):
+        code_key = normalize_code(code)
+        if code_key and code_key != code:
+            positions.pop(code, None)
+            positions[code_key] = payload
+        elif not code_key:
+            positions.pop(code, None)
+            continue
         if not isinstance(payload, dict):
-            positions[code] = {"strategies": {}}
+            positions[code_key] = {"strategies": {}}
             continue
         if "strategies" not in payload and "entries" in payload:
             entries = payload.get("entries") or {}
@@ -62,17 +71,21 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
                             "sold_p2": bool(entry.get("sold_p2", False)),
                         },
                     }
-            positions[code] = {"strategies": strategies}
+            positions[code_key] = {"strategies": strategies}
         else:
             payload.setdefault("strategies", {})
-        strategies = positions[code].get("strategies")
+        strategies = positions[code_key].get("strategies")
         if not isinstance(strategies, dict):
-            positions[code]["strategies"] = {}
-            strategies = positions[code]["strategies"]
+            positions[code_key]["strategies"] = {}
+            strategies = positions[code_key]["strategies"]
         for sid, entry in list(strategies.items()):
             if not isinstance(entry, dict):
                 strategies.pop(sid, None)
                 continue
+            if sid in {"ORPHAN", "UNKNOWN"}:
+                strategies.pop(sid, None)
+                sid = "MANUAL"
+                strategies.setdefault(sid, entry)
             entry.setdefault("qty", 0)
             entry.setdefault("avg_price", 0.0)
             entry.setdefault("entry", {})
@@ -82,6 +95,17 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
             if not meta.get("high") or float(meta.get("high") or 0.0) <= 0:
                 meta["high"] = avg_price
             meta["high"] = max(float(meta.get("high") or 0.0), avg_price)
+            entry.setdefault("code", code_key)
+            entry.setdefault("sid", str(sid))
+            entry.setdefault("engine", entry.get("entry", {}).get("engine"))
+            entry.setdefault("entry_ts", entry.get("entry", {}).get("time"))
+            entry.setdefault("high_watermark", float(meta.get("high") or avg_price))
+            entry["high_watermark"] = max(
+                float(entry.get("high_watermark") or 0.0),
+                float(meta.get("high") or 0.0),
+                avg_price,
+            )
+            entry.setdefault("last_update_ts", entry.get("entry", {}).get("time"))
             entry.setdefault(
                 "flags",
                 {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
@@ -198,11 +222,6 @@ def save_position_state(path: str, state: Dict[str, Any]) -> None:
         logger.exception("[STATE] failed to save %s", path_obj)
 
 
-def _normalize_code(value: Any) -> str:
-    text = str(value or "").strip()
-    return text.zfill(6) if text else ""
-
-
 def _orphan_entry(code: str, qty: int, avg_price: float | None) -> Dict[str, Any]:
     now_ts = datetime.now(KST).isoformat()
     return {
@@ -210,7 +229,7 @@ def _orphan_entry(code: str, qty: int, avg_price: float | None) -> Dict[str, Any
         "avg_price": float(avg_price or 0.0),
         "entry": {
             "time": now_ts,
-            "strategy_id": "ORPHAN",
+            "strategy_id": "MANUAL",
             "engine": "unknown",
             "entry_reason": "RECONCILE",
             "order_type": "unknown",
@@ -223,6 +242,12 @@ def _orphan_entry(code: str, qty: int, avg_price: float | None) -> Dict[str, Any
             "pullback_reversal_price": None,
             "pullback_reason": None,
         },
+        "code": code,
+        "sid": "MANUAL",
+        "engine": "unknown",
+        "entry_ts": now_ts,
+        "high_watermark": float(avg_price or 0.0),
+        "last_update_ts": now_ts,
     }
 
 
@@ -240,7 +265,7 @@ def reconcile_with_broker(
 
     broker_map: Dict[str, Dict[str, Any]] = {}
     for row in broker_positions:
-        code = _normalize_code(row.get("code") or row.get("pdno") or "")
+        code = normalize_code(row.get("code") or row.get("pdno") or "")
         if not code:
             continue
         qty = int(row.get("qty") or 0)
@@ -257,7 +282,7 @@ def reconcile_with_broker(
         if not isinstance(lots, list):
             return strategies
         for lot in lots:
-            if _normalize_code(lot.get("pdno")) != code:
+            if normalize_code(lot.get("pdno")) != code:
                 continue
             remaining = int(lot.get("remaining_qty") or 0)
             if remaining <= 0:
@@ -271,14 +296,14 @@ def reconcile_with_broker(
 
     active_codes = set()
     for code in set(list(broker_map.keys()) + list(positions.keys())):
-        code_key = _normalize_code(code)
+        code_key = normalize_code(code)
         strategies = _strategies_for_code(code_key)
         if not strategies and broker_map.get(code_key):
             orphan_qty = int(broker_map[code_key].get("qty") or 0)
             if orphan_qty > 0:
-                strategies = {"ORPHAN": orphan_qty}
+                strategies = {"MANUAL": orphan_qty}
                 logger.warning(
-                    "[STATE] broker has qty but ledger empty: code=%s qty=%s -> ORPHAN",
+                    "[STATE] broker has qty but ledger empty: code=%s qty=%s -> MANUAL",
                     code_key,
                     orphan_qty,
                 )
@@ -311,7 +336,7 @@ def reconcile_with_broker(
         for sid, qty in strategies.items():
             entry = entries.get(sid)
             if not isinstance(entry, dict):
-                if sid == "ORPHAN":
+                if sid == "MANUAL":
                     entry = _orphan_entry(
                         code_key, qty, broker_map.get(code_key, {}).get("avg_price")
                     )
@@ -333,6 +358,14 @@ def reconcile_with_broker(
                             "gap_pct_at_entry": None,
                         },
                         "meta": {},
+                        "code": code_key,
+                        "sid": str(sid),
+                        "engine": "reconcile",
+                        "entry_ts": now_ts,
+                        "high_watermark": float(
+                            broker_map.get(code_key, {}).get("avg_price") or 0.0
+                        ),
+                        "last_update_ts": now_ts,
                     }
                 entry["flags"] = {
                     "bear_s1_done": False,
@@ -342,6 +375,12 @@ def reconcile_with_broker(
                 }
                 entries[sid] = entry
             entry["qty"] = int(qty)
+            entry.setdefault("code", code_key)
+            entry.setdefault("sid", str(sid))
+            entry.setdefault("engine", entry.get("entry", {}).get("engine"))
+            entry.setdefault("entry_ts", entry.get("entry", {}).get("time"))
+            entry.setdefault("high_watermark", float(entry.get("avg_price") or 0.0))
+            entry["last_update_ts"] = datetime.now(KST).isoformat()
         active_codes.add(code_key)
 
     for code in list(positions.keys()):
@@ -349,6 +388,177 @@ def reconcile_with_broker(
             positions.pop(code, None)
             memory.get("last_price", {}).pop(code, None)
             memory.get("last_seen", {}).pop(code, None)
+
+    return state
+
+
+def _normalize_strategy_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        num = int(value)
+    except Exception:
+        num = None
+    if num is not None and 1 <= num <= 5:
+        return str(num)
+    text = str(value).strip()
+    if text.upper().startswith("STRAT_"):
+        text = text.split("_", 1)[-1]
+    match = re.search(r"([1-5])", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _latest_trade_sid(
+    trade_log: Iterable[Dict[str, Any]], code: str
+) -> tuple[str | None, str | None]:
+    code_key = normalize_code(code)
+    for entry in reversed(list(trade_log)):
+        if normalize_code(entry.get("code")) != code_key:
+            continue
+        if str(entry.get("side") or "").upper() != "BUY":
+            continue
+        status = str(entry.get("status") or "").lower()
+        result = entry.get("result") or {}
+        if status not in ("", "filled") and not (
+            isinstance(result, dict) and result.get("rt_cd") == "0"
+        ):
+            continue
+        sid = _normalize_strategy_id(entry.get("strategy_id"))
+        engine = entry.get("engine") or "trade_log"
+        return sid, str(engine)
+    return None, None
+
+
+def reconcile_positions(
+    kis_holdings: Iterable[Dict[str, Any]],
+    state: Dict[str, Any],
+    trade_log: Iterable[Dict[str, Any]],
+    todays_targets: Iterable[str],
+) -> Dict[str, Any]:
+    state = _coerce_state(state)
+    positions = state["positions"]
+    today_tag = datetime.now(KST).strftime("%Y%m%d")
+    targets = {normalize_code(code) for code in todays_targets if normalize_code(code)}
+
+    for row in kis_holdings:
+        code_key = normalize_code(row.get("code") or row.get("pdno") or "")
+        if not code_key:
+            continue
+        qty = int(row.get("qty") or row.get("hldg_qty") or 0)
+        if qty <= 0:
+            continue
+        avg_price = float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0)
+        pos = positions.setdefault(code_key, {"strategies": {}})
+        strategies = pos.setdefault("strategies", {})
+
+        def _fallback_sid() -> tuple[str, str]:
+            sid, engine = _latest_trade_sid(trade_log, code_key)
+            if sid:
+                return sid, engine or "trade_log"
+            if code_key in targets:
+                return f"REB_{today_tag}", "reconcile"
+            return "MANUAL", "reconcile"
+
+        if not strategies:
+            sid_key, engine = _fallback_sid()
+            now_ts = datetime.now(KST).isoformat()
+            strategies[sid_key] = {
+                "qty": int(qty),
+                "avg_price": float(avg_price),
+                "entry": {
+                    "time": now_ts,
+                    "strategy_id": sid_key,
+                    "engine": engine,
+                    "entry_reason": "RECONCILE",
+                    "order_type": "unknown",
+                    "best_k": None,
+                    "tgt_px": None,
+                    "gap_pct_at_entry": None,
+                },
+                "meta": {},
+                "flags": {
+                    "bear_s1_done": False,
+                    "bear_s2_done": False,
+                    "sold_p1": False,
+                    "sold_p2": False,
+                },
+                "code": code_key,
+                "sid": sid_key,
+                "engine": engine,
+                "entry_ts": now_ts,
+                "high_watermark": float(avg_price),
+                "last_update_ts": now_ts,
+            }
+
+        for sid in list(strategies.keys()):
+            if sid in {"ORPHAN", "UNKNOWN"}:
+                strategies.pop(sid, None)
+                sid_key, engine = _fallback_sid()
+                now_ts = datetime.now(KST).isoformat()
+                strategies[sid_key] = {
+                    "qty": int(qty),
+                    "avg_price": float(avg_price),
+                    "entry": {
+                        "time": now_ts,
+                        "strategy_id": sid_key,
+                        "engine": engine,
+                        "entry_reason": "RECONCILE",
+                        "order_type": "unknown",
+                        "best_k": None,
+                        "tgt_px": None,
+                        "gap_pct_at_entry": None,
+                    },
+                    "meta": {},
+                    "flags": {
+                        "bear_s1_done": False,
+                        "bear_s2_done": False,
+                        "sold_p1": False,
+                        "sold_p2": False,
+                    },
+                    "code": code_key,
+                    "sid": sid_key,
+                    "engine": engine,
+                    "entry_ts": now_ts,
+                    "high_watermark": float(avg_price),
+                    "last_update_ts": now_ts,
+                }
+
+        total_qty = sum(int(entry.get("qty") or 0) for entry in strategies.values())
+        if total_qty != qty:
+            if len(strategies) == 1:
+                only_entry = next(iter(strategies.values()))
+                only_entry["qty"] = int(qty)
+                only_entry["avg_price"] = float(avg_price)
+            else:
+                base_total = total_qty or len(strategies)
+                adjusted_total = 0
+                entries = list(strategies.values())
+                for entry in entries:
+                    portion = (int(entry.get("qty") or 0) / base_total) if base_total else 0
+                    new_qty = int(round(qty * portion))
+                    entry["qty"] = int(new_qty)
+                    entry["avg_price"] = float(avg_price) if avg_price else entry.get("avg_price")
+                    adjusted_total += new_qty
+                diff = int(qty) - adjusted_total
+                if diff and entries:
+                    entries[0]["qty"] = int(entries[0].get("qty") or 0) + diff
+
+        for sid_key, entry in strategies.items():
+            entry.setdefault("code", code_key)
+            entry.setdefault("sid", str(sid_key))
+            entry.setdefault("engine", entry.get("entry", {}).get("engine") or "reconcile")
+            entry.setdefault("entry_ts", entry.get("entry", {}).get("time"))
+            entry.setdefault(
+                "high_watermark",
+                max(float(entry.get("high_watermark") or 0.0), float(avg_price or 0.0)),
+            )
+            entry["last_update_ts"] = datetime.now(KST).isoformat()
+            entry.setdefault(
+                "flags",
+                {"bear_s1_done": False, "bear_s2_done": False, "sold_p1": False, "sold_p2": False},
+            )
 
     return state
 

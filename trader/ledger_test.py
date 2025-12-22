@@ -6,6 +6,7 @@ from trader.execution import record_entry_state
 from trader.ledger import apply_sell_fill_fifo, record_buy_fill, remaining_qty_for_strategy
 from trader.position_state_store import migrate_position_state
 from trader import state_store as runtime_state_store
+from trader.code_utils import normalize_code
 
 
 def _sample_state() -> dict:
@@ -154,7 +155,7 @@ def test_migrate_position_state_v1() -> None:
 def test_global_liquidation_orphan_priority() -> None:
     lot_state = {
         "lots": [
-            {"pdno": "000001", "strategy_id": "ORPHAN", "remaining_qty": 2, "entry_price": 90.0},
+            {"pdno": "000001", "strategy_id": "MANUAL", "remaining_qty": 2, "entry_price": 90.0},
             {"pdno": "000001", "strategy_id": 1, "remaining_qty": 4, "entry_price": 100.0},
             {"pdno": "000001", "strategy_id": 2, "remaining_qty": 3, "entry_price": 105.0},
         ]
@@ -166,7 +167,7 @@ def test_global_liquidation_orphan_priority() -> None:
         scope="global",
         trigger_strategy_id=None,
     )
-    assert allocations[0]["strategy_id"] == "ORPHAN"
+    assert allocations[0]["strategy_id"] == "MANUAL"
     sold_total = apply_sell_allocation(
         lot_state,
         "000001",
@@ -174,7 +175,7 @@ def test_global_liquidation_orphan_priority() -> None:
         sell_ts="2025-01-01T10:00:00+09:00",
     )
     assert sold_total == 9
-    assert remaining_qty_for_strategy(lot_state, "000001", "ORPHAN") == 0
+    assert remaining_qty_for_strategy(lot_state, "000001", "MANUAL") == 0
     assert remaining_qty_for_strategy(lot_state, "000001", 1) == 0
     assert remaining_qty_for_strategy(lot_state, "000001", 2) == 0
 
@@ -183,6 +184,12 @@ def test_normalize_ctx_missing_setup_flag() -> None:
     ctx = normalize_daily_ctx({"strong_trend": True})
     assert ctx.get("setup_flag") is False
     assert ctx.get("setup_ok") is False
+
+
+def test_normalize_code() -> None:
+    assert normalize_code("A476830") == "476830"
+    assert normalize_code("123") == "000123"
+    assert normalize_code("00123456") == "123456"
 
 
 def test_idempotent_order_block() -> None:

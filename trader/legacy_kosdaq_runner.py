@@ -36,6 +36,9 @@ try:
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
+        MANUAL_HARD_STOP_LOSS_PCT,
+        MANUAL_TRAILING_STOP_PCT,
+        MANUAL_MAX_HOLDING_DAYS,
         _cfg,
         logger,
     )
@@ -60,6 +63,9 @@ except ImportError:
         USE_PULLBACK_ENTRY,
         PULLBACK_MAX_BUYS_PER_DAY,
         NEUTRAL_ENTRY_SCALE,
+        MANUAL_HARD_STOP_LOSS_PCT,
+        MANUAL_TRAILING_STOP_PCT,
+        MANUAL_MAX_HOLDING_DAYS,
         _cfg,
         logger,
     )
@@ -74,6 +80,7 @@ from trader.subject_flow import get_subject_flow_with_fallback, reset_flow_call_
 from trader.execution import record_entry_state
 from trader.strategy_rules import strategy_entry_gate, strategy_trigger_label
 from trader.exit_allocation import allocate_sell_qty, apply_sell_allocation
+from trader.code_utils import normalize_code
 from trader.ledger import (
     record_buy_fill,
     remaining_qty_for_strategy,
@@ -86,6 +93,7 @@ from trader.lot_state_store import load_lot_state, save_lot_state
 from trader.position_state_store import (
     load_position_state,
     reconcile_with_broker,
+    reconcile_positions,
     save_position_state,
 )
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
@@ -169,6 +177,10 @@ def main(
             f"[STATE-FORMAT] traded 타입 {type(traded)} 지원 안 함 → 빈 dict로 재설정"
         )
         traded = {}
+    if isinstance(traded, dict):
+        traded = {normalize_code(k): v for k, v in traded.items() if normalize_code(k)}
+    if isinstance(holding, dict):
+        holding = {normalize_code(k): v for k, v in holding.items() if normalize_code(k)}
 
     def _traded_codes(traded_state: Any) -> List[str]:
         if isinstance(traded_state, dict):
@@ -193,17 +205,45 @@ def main(
 
     def _record_trade(traded_state: Any, code: str, payload: Dict[str, Any]) -> None:
         try:
-            traded_state[code] = payload
+            traded_state[normalize_code(code)] = payload
         except Exception:
             logger.warning(
                 f"[TRADED-STATE] traded에 코드 추가 실패: type={type(traded_state)}"
             )
+
+    def _load_trade_log(days: int = 7) -> List[Dict[str, Any]]:
+        logs: List[Dict[str, Any]] = []
+        today = datetime.now(KST).date()
+        for offset in range(days):
+            day = today - timedelta(days=offset)
+            path = LOG_DIR / f"trades_{day.strftime('%Y-%m-%d')}.json"
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            logs.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                logger.exception("[TRADE_LOG] failed to read %s", path)
+        return logs
 
     def _save_runtime_state() -> None:
         try:
             runtime_state_store.save_state(runtime_state)
         except Exception:
             logger.exception("[RUNTIME_STATE] save failed")
+
+    def _save_position_state_now() -> None:
+        nonlocal position_state_dirty
+        if position_state_dirty:
+            save_position_state(position_state_path, position_state)
+            position_state_dirty = False
 
     def _lot_state_signature(state: dict) -> tuple:
         lots = state.get("lots")
@@ -226,7 +266,7 @@ def main(
     def _ensure_position_entry(
         code: str, strategy_id: int | str
     ) -> Dict[str, Any]:
-        code_key = str(code).zfill(6)
+        code_key = normalize_code(code)
         sid_key = str(strategy_id)
         pos = position_state.setdefault("positions", {}).setdefault(
             code_key,
@@ -270,7 +310,7 @@ def main(
     def _set_position_flags(code: str, strategy_id: int | str, **flags: bool) -> None:
         nonlocal position_state_dirty
         pos = position_state.setdefault("positions", {}).setdefault(
-            str(code).zfill(6),
+            normalize_code(code),
             {
                 "strategies": {},
             },
@@ -286,7 +326,7 @@ def main(
             entry_flags[key] = bool(value)
         logger.info(
             "[FLAGS] code=%s flags_before=%s flags_after=%s",
-            str(code).zfill(6),
+            normalize_code(code),
             flags_before,
             entry_flags,
         )
@@ -295,14 +335,15 @@ def main(
     def _update_last_price_memory(code: str, current_price: float, now_ts: str) -> None:
         nonlocal position_state_dirty
         memory = position_state.setdefault("memory", {})
-        memory.setdefault("last_price", {})[str(code).zfill(6)] = float(current_price)
-        memory.setdefault("last_seen", {})[str(code).zfill(6)] = now_ts
+        code_key = normalize_code(code)
+        memory.setdefault("last_price", {})[code_key] = float(current_price)
+        memory.setdefault("last_seen", {})[code_key] = now_ts
         position_state_dirty = True
 
     def _pullback_stop_hit(
         code: str, current_price: float, strategy_id: int | str = 5
     ) -> bool:
-        pos = position_state.get("positions", {}).get(str(code).zfill(6))
+        pos = position_state.get("positions", {}).get(normalize_code(code))
         if not isinstance(pos, dict):
             return False
         entries = pos.get("strategies", {})
@@ -318,10 +359,53 @@ def main(
         except Exception:
             return False
 
+    def _manual_exit_intent(
+        code_key: str,
+        entry: Dict[str, Any],
+        available_qty: int,
+        avg_price: float,
+        now_dt: datetime,
+        rebalance_anchor: str,
+    ) -> Tuple[str | None, int]:
+        cur_price = _safe_get_price(kis, code_key)
+        if cur_price is None or cur_price <= 0:
+            return None, 0
+        high_val = float(entry.get("high_watermark") or entry.get("meta", {}).get("high") or avg_price)
+        high_val = max(high_val, float(cur_price))
+        entry["high_watermark"] = high_val
+        entry.setdefault("meta", {})["high"] = high_val
+        entry["last_update_ts"] = now_dt.isoformat()
+
+        pnl_pct = (float(cur_price) - float(avg_price)) / float(avg_price) * 100.0
+        if MANUAL_HARD_STOP_LOSS_PCT and pnl_pct <= -abs(MANUAL_HARD_STOP_LOSS_PCT):
+            return "manual_hard_stop", int(available_qty)
+
+        trail_pct = abs(MANUAL_TRAILING_STOP_PCT or 0.0)
+        if trail_pct and float(cur_price) <= high_val * (1 - trail_pct / 100.0):
+            return "manual_trailing_stop", int(available_qty)
+
+        if MANUAL_MAX_HOLDING_DAYS:
+            try:
+                entry_ts = entry.get("entry_ts") or entry.get("entry", {}).get("time")
+                entry_dt = datetime.fromisoformat(entry_ts) if entry_ts else None
+            except Exception:
+                entry_dt = None
+            if entry_dt:
+                if (now_dt.date() - entry_dt.date()).days >= MANUAL_MAX_HOLDING_DAYS:
+                    return "manual_time_cut", int(available_qty)
+                try:
+                    rebalance_dt = date.fromisoformat(rebalance_anchor)
+                    if entry_dt.date() < rebalance_dt:
+                        return "manual_rebalance_cut", int(available_qty)
+                except Exception:
+                    pass
+
+        return None, 0
+
     def _build_exit_intents(code: str, regime_mode: str) -> list[dict[str, Any]]:
         nonlocal position_state_dirty
         intents: list[dict[str, Any]] = []
-        code_key = str(code).zfill(6)
+        code_key = normalize_code(code)
         pos_state = position_state.get("positions", {}).get(code_key)
         if not isinstance(pos_state, dict):
             return intents
@@ -344,6 +428,8 @@ def main(
                 high_value = float(avg_price)
             high_value = max(high_value, float(avg_price))
             meta["high"] = high_value
+            entry["high_watermark"] = max(float(entry.get("high_watermark") or 0.0), high_value)
+            entry["last_update_ts"] = datetime.now(KST).isoformat()
             pos_view = {
                 "qty": int(available_qty),
                 "buy_price": float(avg_price),
@@ -354,12 +440,22 @@ def main(
                 "k_value": entry.get("entry", {}).get("best_k"),
                 "target_price_src": entry.get("entry", {}).get("tgt_px"),
             }
-            reason, sell_qty = _adaptive_exit(
-                kis,
-                code_key,
-                pos_view,
-                regime_mode=regime_mode,
-            )
+            if str(sid) in {"MANUAL", "LEGACY"}:
+                reason, sell_qty = _manual_exit_intent(
+                    code_key,
+                    entry,
+                    int(available_qty),
+                    float(avg_price),
+                    datetime.now(KST),
+                    str(rebalance_date),
+                )
+            else:
+                reason, sell_qty = _adaptive_exit(
+                    kis,
+                    code_key,
+                    pos_view,
+                    regime_mode=regime_mode,
+                )
             if sell_qty:
                 intents.append(
                     {
@@ -370,6 +466,9 @@ def main(
                     }
                 )
             meta["high"] = float(pos_view.get("high") or meta.get("high") or 0.0)
+            entry["high_watermark"] = max(
+                float(entry.get("high_watermark") or 0.0), float(meta.get("high") or 0.0)
+            )
             entry["meta"] = meta
             flags["sold_p1"] = bool(pos_view.get("sold_p1", flags.get("sold_p1")))
             flags["sold_p2"] = bool(pos_view.get("sold_p2", flags.get("sold_p2")))
@@ -381,14 +480,14 @@ def main(
         return sum(
             int(lot.get("remaining_qty") or 0)
             for lot in lot_state.get("lots", [])
-            if str(lot.get("pdno")).zfill(6) == str(pdno).zfill(6)
+            if normalize_code(lot.get("pdno")) == normalize_code(pdno)
         )
 
     def _ledger_total_available_qty(code: str) -> int:
         return sum(
             int(lot.get("remaining_qty") or 0)
             for lot in lot_state.get("lots", [])
-            if str(lot.get("pdno")).zfill(6) == str(code).zfill(6)
+            if normalize_code(lot.get("pdno")) == normalize_code(code)
         )
 
     def _cap_sell_qty(code: str, requested_qty: int) -> int:
@@ -459,7 +558,7 @@ def main(
                 or ""
             )
         if not order_no:
-            order_no = f"NOORDER-{str(pdno).zfill(6)}-{fallback_ts}"
+            order_no = f"NOORDER-{normalize_code(pdno)}-{fallback_ts}"
         if not fill_seq:
             fill_seq = "0"
         return f"{kis.CANO}-{kis.ACNT_PRDT_CD}-{order_no}-{fill_seq}"
@@ -478,7 +577,7 @@ def main(
         except Exception:
             return int(requested_qty)
         for row in balances:
-            if str(row.get("code")).zfill(6) != str(code).zfill(6):
+            if normalize_code(row.get("code")) != normalize_code(code):
                 continue
             new_qty = int(row.get("qty") or 0)
             sold = max(0, int(prev_qty) - int(new_qty))
@@ -489,7 +588,7 @@ def main(
 
     def _sync_position_state_qty(code: str) -> None:
         nonlocal position_state_dirty
-        code_key = str(code).zfill(6)
+        code_key = normalize_code(code)
         pos = position_state.get("positions", {}).get(code_key)
         if not isinstance(pos, dict):
             return
@@ -549,7 +648,7 @@ def main(
         if sold_qty <= 0:
             logger.warning(
                 "[SELL-ALLOC] sold_qty unresolved: code=%s requested=%s prev_qty=%s",
-                str(code).zfill(6),
+                normalize_code(code),
                 requested_qty,
                 prev_qty,
             )
@@ -570,7 +669,7 @@ def main(
             if available_qty < int(requested_qty):
                 raise RuntimeError(
                     "[SELL-ALLOC] insufficient strategy qty: code=%s sid=%s available=%s requested=%s"
-                    % (str(code).zfill(6), trigger_strategy_id, available_qty, requested_qty)
+                    % (normalize_code(code), trigger_strategy_id, available_qty, requested_qty)
                 )
         before_lot_signature = _lot_state_signature(lot_state)
         before_qty_total = _ledger_total_available_qty(code)
@@ -591,18 +690,18 @@ def main(
                 now_ts = datetime.now(KST).isoformat()
                 lot_state.setdefault("lots", []).append(
                     {
-                        "lot_id": f"{str(code).zfill(6)}-ORPHAN-{now_ts}",
-                        "pdno": str(code).zfill(6),
-                        "strategy_id": "ORPHAN",
-                        "engine": "orphan",
+                        "lot_id": f"{normalize_code(code)}-MANUAL-{now_ts}",
+                        "pdno": normalize_code(code),
+                        "strategy_id": "MANUAL",
+                        "engine": "reconcile",
                         "entry_ts": now_ts,
                         "entry_price": 0.0,
                         "qty": int(sold_qty),
                         "remaining_qty": int(sold_qty),
-                        "meta": {"reconciled": True, "orphan": True},
+                        "meta": {"reconciled": True, "manual": True},
                     }
                 )
-                allocations = [{"strategy_id": "ORPHAN", "qty": int(sold_qty)}]
+                allocations = [{"strategy_id": "MANUAL", "qty": int(sold_qty)}]
             else:
                 raise RuntimeError(
                     f"[SELL-ALLOC] no allocations for strategy sell: code={code} sid={trigger_strategy_id}"
@@ -610,7 +709,7 @@ def main(
         broker_qty_after = max(0, int(prev_qty) - int(sold_qty))
         logger.info(
             "[SELL-ALLOC] code=%s requested_qty=%s scope=%s allocations=%s sold_qty=%s broker_qty_before=%s broker_qty_after=%s",
-            str(code).zfill(6),
+            normalize_code(code),
             int(requested_qty),
             scope,
             allocations,
@@ -646,7 +745,7 @@ def main(
                 logger.warning(
                     "[SELL-ALLOC] ledger mismatch: code=%s sid=%s before=%s sold=%s after=%s"
                     % (
-                        str(code).zfill(6),
+                        normalize_code(code),
                         trigger_strategy_id,
                         expected_before,
                         sold_total,
@@ -660,6 +759,7 @@ def main(
                 reconcile_with_broker_holdings(lot_state, balances)
         _maybe_save_lot_state(before_lot_signature)
         _sync_position_state_qty(code)
+        _save_position_state_now()
 
     def _cleanup_expired_pending(
         traded_state: dict, now_dt: datetime, ttl_sec: int = 300
@@ -749,7 +849,7 @@ def main(
     ) -> dict:
         _ensure_guard_state(day)
         bucket_state = guard_state.setdefault(bucket, {})
-        key = f"{str(code).zfill(6)}:{strategy_id}"
+        key = f"{normalize_code(code)}:{strategy_id}"
         entry = bucket_state.get(key)
         if entry is None:
             entry = {"base_qty": int(base_qty), "sold": 0}
@@ -826,7 +926,7 @@ def main(
 
         for row in balances:
             try:
-                if str(row.get("code")).zfill(6) != str(code).zfill(6):
+                if normalize_code(row.get("code")) != normalize_code(code):
                     continue
                 qty_here = _to_int(row.get("qty") or 0)
                 sellable_here = _to_int(
@@ -993,7 +1093,7 @@ def main(
     # 리밸런싱 대상 후처리: qty 없고 weight만 있으면 배정 자본으로 수량 계산
     processed_targets: Dict[str, Any] = {}
     for t in targets:
-        code = t.get("stock_code") or t.get("code")
+        code = normalize_code(t.get("stock_code") or t.get("code"))
         if not code:
             continue
         name = t.get("name") or t.get("종목명")
@@ -1281,7 +1381,7 @@ def main(
                 base_notional = int(round(capital_active * pb_weight))
                 pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
                 for _, row in pb_df.iterrows():
-                    code = str(row.get("Code") or row.get("code") or "").zfill(6)
+                    code = normalize_code(row.get("Code") or row.get("code") or "")
                     if not code:
                         continue
                     pullback_watch[code] = {
@@ -1346,7 +1446,7 @@ def main(
                     sell_qty: int,
                     reason_msg: str | None = None,
                 ) -> None:
-                    key = f"{str(code).zfill(6)}:{strategy_id}"
+                    key = f"{normalize_code(code)}:{strategy_id}"
                     regime_s1_summary["by_stock"][key] = {
                         "status": status,
                         "base_qty": int(base_qty),
@@ -1400,12 +1500,12 @@ def main(
                         logger.info(msg)
 
                 def _strategy_ids_for_code(code: str) -> list[str]:
-                    code_key = str(code).zfill(6)
+                    code_key = normalize_code(code)
                     totals: dict[str, int] = {}
                     lots = lot_state.get("lots", [])
                     if isinstance(lots, list):
                         for lot in lots:
-                            if str(lot.get("pdno")).zfill(6) != code_key:
+                            if normalize_code(lot.get("pdno")) != code_key:
                                 continue
                             remaining = int(lot.get("remaining_qty") or 0)
                             if remaining <= 0:
@@ -1475,7 +1575,7 @@ def main(
                                 if remaining <= 0 or sellable_qty <= 0:
                                     if remaining <= 0:
                                         _set_position_flags(code, sid, bear_s1_done=True)
-                                        s1_done_today.add((str(code).zfill(6), str(sid)))
+                                        s1_done_today.add((normalize_code(code), str(sid)))
                                     regime_s1_summary["skipped"] += 1
                                     _log_s1_action(
                                         code,
@@ -1564,7 +1664,7 @@ def main(
                                         )
                                         if guard["sold"] >= target_qty:
                                             _set_position_flags(code, sid, bear_s1_done=True)
-                                            s1_done_today.add((str(code).zfill(6), str(sid)))
+                                            s1_done_today.add((normalize_code(code), str(sid)))
                                         _persist_guard_state(now_dt_kst.date())
                                         regime_s1_summary["sent_qty"] += int(sell_qty)
                                         regime_s1_summary["sent_orders"] += 1
@@ -1640,10 +1740,10 @@ def main(
                                     "s1_not_done",
                                 )
                                 continue
-                            if (str(code).zfill(6), str(sid)) in s1_done_today:
+                            if (normalize_code(code), str(sid)) in s1_done_today:
                                 logger.warning(
                                     "[REGIME_S2][SEQ] %s:%s 동일 일자 S1 완료 직후 S2 진입",
-                                    str(code).zfill(6),
+                                    normalize_code(code),
                                     sid,
                                 )
                             sellable_qty = ord_psbl_map.get(code, 0)
@@ -1883,7 +1983,7 @@ def main(
                 balances = _fetch_balances(kis)
                 holding = {}
                 for bal in balances:
-                    code = bal.get("code")
+                    code = normalize_code(bal.get("code") or bal.get("pdno"))
                     qty = int(bal.get("qty", 0))
                     if qty <= 0:
                         continue
@@ -1903,15 +2003,18 @@ def main(
                 position_state = reconcile_with_broker(
                     position_state, balances, lot_state=lot_state
                 )
+                position_state = reconcile_positions(
+                    balances, position_state, _load_trade_log(), processed_targets.keys()
+                )
                 position_state_dirty = True
 
                 for code, info in holding.items():
-                    pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
+                    pos_state = position_state.get("positions", {}).get(normalize_code(code))
                     if not isinstance(pos_state, dict):
                         continue
                     strategies = pos_state.get("strategies", {})
                     if not strategies:
-                        _ensure_position_entry(code, "ORPHAN")
+                        _ensure_position_entry(code, "MANUAL")
                         position_state_dirty = True
                         strategies = pos_state.get("strategies", {})
                     entry = next(iter(strategies.values()), None)
@@ -1924,7 +2027,10 @@ def main(
 
                 # 잔고 기준으로 보유종목 매도 가능 수량 맵 생성
                 ord_psbl_map = {
-                    bal.get("code"): int(bal.get("sell_psbl_qty", 0)) for bal in balances
+                    normalize_code(bal.get("code") or bal.get("pdno")): int(
+                        bal.get("sell_psbl_qty", 0)
+                    )
+                    for bal in balances
                 }
 
                 if isinstance(traded, dict):
@@ -1934,7 +2040,7 @@ def main(
 
                 traded_today = _traded_today(traded, today_prefix)
                 for bal in balances:
-                    code = bal.get("code")
+                    code = normalize_code(bal.get("code") or bal.get("pdno"))
                     raw = bal.get("raw") or {}
                     raw_l = {str(k).lower(): v for k, v in raw.items()}
                     thdt_buy_qty = _to_int(
@@ -2082,39 +2188,39 @@ def main(
 
                 # === (1) 잔여 물량 대상 스탑/리밸런스 관리 ===
                 for code in list(holding.keys()):
-                    pos_state = position_state.get("positions", {}).get(str(code).zfill(6))
-                    if isinstance(pos_state, dict):
-                        entries = pos_state.get("strategies", {})
-                        entry_ids = ",".join(sorted(entries.keys())) if entries else "ORPHAN"
+                    code_key = normalize_code(code)
+                    pos_state = position_state.get("positions", {}).get(code_key)
+                    entries = pos_state.get("strategies", {}) if isinstance(pos_state, dict) else {}
+                    logger.info(
+                        "[EXIT-CHECK] code=%s positions=%s",
+                        code_key,
+                        len(entries),
+                    )
+                    cur_price = _safe_get_price(kis, code_key)
+                    for sid, entry in entries.items():
+                        if not isinstance(entry, dict):
+                            continue
+                        avg_price = strategy_avg_price(lot_state, code_key, sid)
+                        entry_meta = entry.get("meta", {}) or {}
+                        high = float(entry.get("high_watermark") or entry_meta.get("high") or 0.0)
+                        if avg_price is not None:
+                            high = max(high, float(avg_price))
+                        flags = entry.get("flags", {}) or {}
+                        avg_label = f"{avg_price:.2f}" if avg_price is not None else None
+                        high_label = f"{high:.2f}" if high else None
+                        pnl_pct = None
+                        if cur_price and avg_price:
+                            pnl_pct = (float(cur_price) - float(avg_price)) / float(avg_price) * 100.0
+                        pnl_label = f"{pnl_pct:.2f}" if pnl_pct is not None else None
                         logger.info(
-                            "[EXIT-CHECK] code=%s strategies=%s",
-                            str(code).zfill(6),
-                            len(entries),
-                        )
-                        if entries:
-                            for sid, entry in entries.items():
-                                if not isinstance(entry, dict):
-                                    continue
-                                avg_price = strategy_avg_price(lot_state, code, sid)
-                                entry_meta = entry.get("meta", {}) or {}
-                                high = float(entry_meta.get("high") or 0.0)
-                                if avg_price is not None:
-                                    high = max(high, float(avg_price))
-                                flags = entry.get("flags", {}) or {}
-                                avg_label = f"{avg_price:.2f}" if avg_price is not None else None
-                                high_label = f"{high:.2f}" if high else None
-                                logger.info(
-                                    "  - sid=%s qty=%s avg=%s high=%s flags=%s",
-                                    sid,
-                                    entry.get("qty"),
-                                    avg_label,
-                                    high_label,
-                                    flags,
-                                )
-                    else:
-                        logger.info(
-                            "[EXIT-CHECK] code=%s strategy=ORPHAN engine=unknown flags=bear_s1_done=False bear_s2_done=False source=ORPHAN_POSITION",
-                            str(code).zfill(6),
+                            "  - sid=%s qty=%s avg=%s high=%s pnl%%=%s flags=%s engine=%s",
+                            sid,
+                            entry.get("qty"),
+                            avg_label,
+                            high_label,
+                            pnl_label,
+                            flags,
+                            entry.get("engine") or entry.get("entry", {}).get("engine"),
                         )
                     # 신규 진입 금지 모드
                     if code not in code_to_target:
@@ -2375,7 +2481,7 @@ def main(
                     prev_price = (
                         position_state.get("memory", {})
                         .get("last_price", {})
-                        .get(str(code).zfill(6))
+                        .get(normalize_code(code))
                     )
                     if prev_price is None:
                         try:
@@ -2685,6 +2791,7 @@ def main(
                         entry_time=now_dt_kst.isoformat(),
                     )
                     position_state_dirty = True
+                    _save_position_state_now()
 
                     lot_id = _build_lot_id(
                         result,
@@ -2988,6 +3095,7 @@ def main(
                                 entry_time=now_dt_kst.isoformat(),
                             )
                             position_state_dirty = True
+                            _save_position_state_now()
 
                             lot_id = _build_lot_id(
                                 result,

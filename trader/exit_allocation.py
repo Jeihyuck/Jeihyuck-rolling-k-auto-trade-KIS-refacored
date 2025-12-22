@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from trader.code_utils import normalize_code
 from trader.ledger import apply_sell_fill_fifo, dominant_strategy_for
 
 def _strategy_qty_map(lot_state: Dict[str, Any], code: str) -> Dict[str, int]:
     lots = lot_state.get("lots", [])
-    code_key = str(code).zfill(6)
+    code_key = normalize_code(code)
     totals: Dict[str, int] = {}
     if not isinstance(lots, list):
         return totals
     for lot in lots:
-        if str(lot.get("pdno") or "").zfill(6) != code_key:
+        if normalize_code(lot.get("pdno")) != code_key:
             continue
         remaining = int(lot.get("remaining_qty") or 0)
         if remaining <= 0:
@@ -32,7 +33,7 @@ def allocate_sell_qty(
     scope: str,
     trigger_strategy_id: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    code = str(code).zfill(6)
+    code = normalize_code(code)
     requested_qty = int(requested_qty)
     if requested_qty <= 0:
         return []
@@ -65,16 +66,16 @@ def allocate_sell_qty(
         totals = _strategy_qty_map(lot_state, code)
         if not totals:
             return []
-        orphan_qty = int(totals.get("ORPHAN", 0))
+        orphan_qty = int(totals.get("MANUAL", 0))
         allocations: List[Dict[str, Any]] = []
         remaining_qty = min(requested_qty, sum(totals.values()))
         if orphan_qty > 0 and remaining_qty > 0:
             take = min(orphan_qty, remaining_qty)
-            allocations.append({"strategy_id": "ORPHAN", "qty": int(take)})
+            allocations.append({"strategy_id": "MANUAL", "qty": int(take)})
             remaining_qty -= take
         if remaining_qty <= 0:
             return allocations
-        non_orphan_totals = {k: v for k, v in totals.items() if k != "ORPHAN"}
+        non_orphan_totals = {k: v for k, v in totals.items() if k != "MANUAL"}
         if not non_orphan_totals:
             return allocations
         total_qty = sum(non_orphan_totals.values())
@@ -133,7 +134,7 @@ def apply_sell_allocation(
             continue
         apply_sell_fill_fifo(
             lot_state,
-            pdno=str(code).zfill(6),
+            pdno=normalize_code(code),
             qty_filled=qty,
             sell_ts=sell_ts,
             strategy_id=sid,
@@ -148,7 +149,7 @@ def run_allocation_self_checks() -> None:
         "lots": [
             {"pdno": "000001", "strategy_id": 1, "remaining_qty": 7},
             {"pdno": "000001", "strategy_id": 5, "remaining_qty": 3},
-            {"pdno": "000001", "strategy_id": "ORPHAN", "remaining_qty": 5},
+            {"pdno": "000001", "strategy_id": "MANUAL", "remaining_qty": 5},
         ]
     }
     allocations = allocate_sell_qty(
@@ -163,7 +164,7 @@ def run_allocation_self_checks() -> None:
         lot_state, "000001", 10, scope="proportional", trigger_strategy_id=None
     )
     allocated_strategies = {a["strategy_id"] for a in allocations}
-    assert "ORPHAN" in allocated_strategies
+    assert "MANUAL" in allocated_strategies
 
 
 if __name__ == "__main__":

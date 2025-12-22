@@ -15,6 +15,7 @@ import requests
 
 from .core_constants import *  # noqa: F401,F403
 from .config import KST, STATE_PATH
+from .code_utils import normalize_code
 from .core_utils import (
     _get_daily_candles_cached,
     _log_realized_pnl,
@@ -115,7 +116,7 @@ def record_entry_state(
     flags: Dict[str, Any] | None = None,
     entry_time: str | None = None,
 ) -> Dict[str, Any]:
-    code_key = str(code).zfill(6)
+    code_key = normalize_code(code)
     sid_key = str(strategy_id)
     pos = state.setdefault("positions", {}).setdefault(
         code_key,
@@ -139,6 +140,7 @@ def record_entry_state(
         entry_meta = _normalize_meta(meta)
         entry_meta.setdefault("high", float(avg_price))
         entry_meta["high"] = max(float(entry_meta.get("high") or 0.0), float(avg_price))
+        now_ts = entry_time or datetime.now(KST).isoformat()
         strategies[sid_key] = {
             "qty": int(qty),
             "avg_price": float(avg_price),
@@ -151,10 +153,16 @@ def record_entry_state(
                 best_k=best_k,
                 tgt_px=tgt_px,
                 gap_pct_at_entry=gap_pct_at_entry,
-                entry_time=entry_time,
+                entry_time=now_ts,
             ),
             "meta": entry_meta,
             "flags": entry_flags,
+            "code": code_key,
+            "sid": str(strategy_id),
+            "engine": engine,
+            "entry_ts": now_ts,
+            "high_watermark": float(entry_meta.get("high") or avg_price),
+            "last_update_ts": now_ts,
         }
     else:
         prev_qty = int(existing.get("qty") or 0)
@@ -176,6 +184,16 @@ def record_entry_state(
         if not entry_meta.get("high") or float(entry_meta.get("high") or 0.0) <= 0:
             entry_meta["high"] = float(new_avg)
         entry_meta["high"] = max(float(entry_meta.get("high") or 0.0), float(new_avg))
+        existing["code"] = code_key
+        existing["sid"] = str(strategy_id)
+        existing["engine"] = engine
+        existing["entry_ts"] = entry.get("time") or entry_time_value
+        existing["high_watermark"] = max(
+            float(existing.get("high_watermark") or 0.0),
+            float(entry_meta.get("high") or 0.0),
+            float(new_avg),
+        )
+        existing["last_update_ts"] = entry_time_value
         entry_flags = existing.setdefault(
             "flags",
             {
@@ -206,7 +224,7 @@ def update_position_meta(
     strategy_id: Any,
     meta_updates: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    code_key = str(code).zfill(6)
+    code_key = normalize_code(code)
     sid_key = str(strategy_id)
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
@@ -227,6 +245,7 @@ def update_position_meta(
         for key in ("pullback_peak_price", "pullback_reversal_price", "pullback_reason"):
             if key in meta_updates:
                 meta[key] = meta_updates.get(key)
+    entry["last_update_ts"] = datetime.now(KST).isoformat()
     return state
 
 
@@ -237,7 +256,7 @@ def update_position_flags(
     flag_updates: Dict[str, Any],
 ) -> Dict[str, Any]:
     assert strategy_id is not None, "strategy_id required for update_position_flags"
-    code_key = str(code).zfill(6)
+    code_key = normalize_code(code)
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
         return state
@@ -259,6 +278,7 @@ def update_position_flags(
         before_flags,
         flags,
     )
+    entry["last_update_ts"] = datetime.now(KST).isoformat()
     return state
 
 def fetch_rebalancing_targets(date: str) -> list[dict[str, Any]]:
@@ -278,6 +298,7 @@ def fetch_rebalancing_targets(date: str) -> list[dict[str, Any]]:
     raise Exception(f"리밸런싱 API 호출 실패: {response.text}")
 
 def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_price: float, qty: int, k_value: Any, target_price: Optional[float]) -> None:
+    code = normalize_code(code)
     try:
         _ = kis.is_market_open()
     except Exception:
@@ -312,6 +333,7 @@ def _init_position_state(kis: KisAPI, holding: Dict[str, Any], code: str, entry_
     }
 
 def _init_position_state_from_balance(kis: KisAPI, holding: Dict[str, Any], code: str, avg_price: float, qty: int) -> None:
+    code = normalize_code(code)
     if qty <= 0 or code in holding:
         return
     try:
@@ -362,7 +384,10 @@ def _maybe_scale_in_dips(
     - entry_stage: 1 → 2차 진입 후보(반등 확인선 돌파), 2 → 3차 진입 후보(신고가 회복)
     - bull / neutral 모드에서만 동작, bear 모드에서는 추가 진입 금지
     """
-    pos = holding.get(code)
+    code_key = normalize_code(code)
+    if not code_key:
+        return
+    pos = holding.get(code_key)
     if not pos:
         return
 
@@ -376,7 +401,7 @@ def _maybe_scale_in_dips(
 
     # 현재가 조회
     try:
-        cur_price = _safe_get_price(kis, code)
+        cur_price = _safe_get_price(kis, code_key)
     except Exception:
         cur_price = None
     if cur_price is None or cur_price <= 0:
@@ -387,7 +412,7 @@ def _maybe_scale_in_dips(
         stop_abs = pos.get("stop_abs")
         if stop_abs is not None and cur_price <= float(stop_abs):
             logger.info(
-                f"[SCALE-IN-GUARD] {code}: 현재가({cur_price}) <= stop_abs({stop_abs}) → 추가 진입 금지"
+                f"[SCALE-IN-GUARD] {code_key}: 현재가({cur_price}) <= stop_abs({stop_abs}) → 추가 진입 금지"
             )
             return
     except Exception:
@@ -395,15 +420,15 @@ def _maybe_scale_in_dips(
 
     # VWAP 가드: 과도한 추세 붕괴 구간에서는 추가 진입하지 않음
     try:
-        vwap_val = kis.get_vwap_today(code)
+        vwap_val = kis.get_vwap_today(code_key)
     except Exception:
         vwap_val = None
     if vwap_val is None or vwap_val <= 0:
-        logger.debug(f"[SCALE-IN-VWAP-SKIP] {code}: VWAP 데이터 없음 → VWAP 가드 생략")
+        logger.debug(f"[SCALE-IN-VWAP-SKIP] {code_key}: VWAP 데이터 없음 → VWAP 가드 생략")
     else:
         if not vwap_guard(float(cur_price), float(vwap_val), VWAP_TOL):
             logger.info(
-                f"[SCALE-IN-VWAP-GUARD] {code}: 현재가({cur_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
+                f"[SCALE-IN-VWAP-GUARD] {code_key}: 현재가({cur_price}) < VWAP*(1 - {VWAP_TOL:.4f}) "
                 f"→ 눌림목 추가 진입 스킵 (VWAP={vwap_val:.2f})"
             )
             return
@@ -433,19 +458,19 @@ def _maybe_scale_in_dips(
     # 신고가 → 3일 눌림 → 반등 여부 확인
     pullback = _detect_pullback_reversal(
         kis=kis,
-        code=code,
+        code=code_key,
         current_price=float(cur_price),
     )
     if USE_PULLBACK_ENTRY and not pullback.get("setup"):
         logger.info(
-            f"[PULLBACK-SKIP] {code}: 신고가 눌림 패턴 미충족 → reason={pullback.get('reason')}"
+            f"[PULLBACK-SKIP] {code_key}: 신고가 눌림 패턴 미충족 → reason={pullback.get('reason')}"
         )
         return
 
     if USE_PULLBACK_ENTRY and not pullback.get("reversing"):
         rev_px = pullback.get("reversal_price")
         logger.info(
-            f"[PULLBACK-WAIT] {code}: 현재가({cur_price}) < 반등확인선({rev_px}) → 대기"
+            f"[PULLBACK-WAIT] {code_key}: 현재가({cur_price}) < 반등확인선({rev_px}) → 대기"
         )
         return
 
@@ -458,7 +483,7 @@ def _maybe_scale_in_dips(
     if position_state is not None:
         update_position_meta(
             position_state,
-            code,
+            code_key,
             pos.get("strategy_id") or 1,
             {
                 "pullback_peak_price": float(peak_price),
@@ -549,6 +574,7 @@ def _maybe_scale_in_dips(
 
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
+    code = normalize_code(code)
     cur_price = _safe_get_price(kis, code)
     try:
         if prefer_market and hasattr(kis, "sell_stock_market"):
@@ -570,6 +596,7 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Op
     return cur_price, result
 
 def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: float = 0.0) -> None:
+    code = normalize_code(code)
     try:
         fills_dir = Path("fills")
         fills_dir.mkdir(exist_ok=True)
@@ -620,7 +647,7 @@ def ensure_fill_has_name(odno: str, code: str, name: str, qty: int = 0, price: f
 
 # === 앵커: 목표가 계산 함수 ===
 def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    code = str(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
+    code = normalize_code(stk.get("code") or stk.get("stock_code") or stk.get("pdno") or "")
     if not code:
         return None, None
 
@@ -686,6 +713,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     """
     매수 주문(지정가 우선, 실패시 시장가 Fallback) + 체결가/슬리피지/네트워크 장애/실패 상세 로깅
     """
+    code = normalize_code(code)
     result_limit: Optional[Dict[str, Any]] = None
     order_price = _round_to_tick(limit_price, mode="up") if (limit_price and limit_price > 0) else 0
     fill_price = None
