@@ -66,6 +66,13 @@ CONFIG = {
     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
     "PULLBACK_MAX_BUYS_PER_DAY": "5",      # 눌림목 하루 최대 신규 매수 건수
+
+# 전략4(종가베팅) & 전략별 필터 옵션
+"CLOSE_BETTING_START": "14:30",        # 전략4 진입 시작 시간(HH:MM)
+"CLOSE_BETTING_END": "15:10",          # 전략4 진입 종료 시간(HH:MM)
+"CLOSE_BETTING_QTY_SCALE": "0.5",      # 전략4 진입 수량 스케일(0.1~1.0)
+"CLOSE_BETTING_REQUIRE_GRADE": "AB",   # 전략4 챔피언 등급 요구: A 또는 AB
+"STRICT_CHAMPION_STRATEGY_IDS": "4",   # CHAMPION_* 필터를 엄격 적용할 전략 ID들(쉼표구분)
     # 챔피언 후보 필터
     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
