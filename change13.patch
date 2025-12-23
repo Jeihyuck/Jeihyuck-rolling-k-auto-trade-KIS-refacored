@@ -1,0 +1,129 @@
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 3a5e03bf2be672a4234d989ea4ab3ae726d6c601..0f43279df60bd308c0dec927dcc7232d7c060f69 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -840,87 +840,87 @@ class KisAPI:
+                     except requests.exceptions.SSLError as e:
+                         last_err = e
+                         logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.4 * attempt)
+                         continue
+                     except requests.exceptions.RequestException as e:
+                         last_err = e
+                         logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.4 * attempt)
+                         continue
+                     except ValueError as e:
+                         last_err = e
+                         logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.35 + random.uniform(0, 0.15))
+                         continue
+                 except Exception as e:
+                     last_err = e
+                     logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                     time.sleep(0.4 * attempt)
+                     continue
+ 
+                 if "초당 거래건수" in str(data.get("msg1") or ""):
+                     time.sleep(0.35 + random.uniform(0, 0.15))
+                     continue
+ 
+-                    arr = data.get("output2") or []
+-                    if resp.status_code == 200 and arr:
+-                        rows: List[Dict[str, Any]] = []
+-                        for r in arr:
+-                            try:
+-                                hhmmss = r.get("stck_cntg_hour")
+-                                price = r.get("stck_prpr")
+-                                vol = r.get("cntg_vol")
+-                                if hhmmss and price is not None and vol is not None:
+-                                    rows.append({
+-                                        "time": str(hhmmss),
+-                                        "price": float(price),
+-                                        "volume": float(vol),
+-                                    })
+-                            except Exception as e:
+-                                logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+-
+-                        rows.sort(key=lambda x: x["time"])
+-                        if len(rows) == 0:
+-                            raise DataEmptyError(f"A{iscd} 0 intraday candles")
+-                        return rows
+-
+-                    msg = f"{data.get('msg_cd') or ''}:{data.get('msg1') or ''}".strip(":")
+-                    logger.warning(
+-                        "[INTRADAY-FETCH-FAIL] code=%s http=%s rt_cd=%s msg=%s output2_len=%s retry=%s count=%s",
+-                        iscd,
+-                        resp.status_code,
+-                        data.get("rt_cd"),
+-                        msg,
+-                        len(arr),
+-                        attempt + (start_idx * 3),
+-                        req_count,
+-                    )
+-                    last_err = RuntimeError(
+-                        f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
+-                    )
+-                    time.sleep(0.4 + random.uniform(0, 0.2))
++                arr = data.get("output2") or []
++                if resp.status_code == 200 and arr:
++                    rows: List[Dict[str, Any]] = []
++                    for r in arr:
++                        try:
++                            hhmmss = r.get("stck_cntg_hour")
++                            price = r.get("stck_prpr")
++                            vol = r.get("cntg_vol")
++                            if hhmmss and price is not None and vol is not None:
++                                rows.append({
++                                    "time": str(hhmmss),
++                                    "price": float(price),
++                                    "volume": float(vol),
++                                })
++                        except Exception as e:
++                            logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
++
++                    rows.sort(key=lambda x: x["time"])
++                    if len(rows) == 0:
++                        raise DataEmptyError(f"A{iscd} 0 intraday candles")
++                    return rows
++
++                msg = f"{data.get('msg_cd') or ''}:{data.get('msg1') or ''}".strip(":")
++                logger.warning(
++                    "[INTRADAY-FETCH-FAIL] code=%s http=%s rt_cd=%s msg=%s output2_len=%s retry=%s count=%s",
++                    iscd,
++                    resp.status_code,
++                    data.get("rt_cd"),
++                    msg,
++                    len(arr),
++                    attempt + (start_idx * 3),
++                    req_count,
++                )
++                last_err = RuntimeError(
++                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
++                )
++                time.sleep(0.4 + random.uniform(0, 0.2))
+ 
+         if last_err:
+             raise last_err
+         raise RuntimeError(f"INTRADAY_FAIL A{iscd}")
+ 
+     def get_vwap_today(self, code: str, start_hhmm: str = "090000") -> float | None:
+         """당일 분봉 기준 체결 가격/거래량으로 단순 VWAP 계산."""
+         try:
+             candles = self.get_intraday_candles_today(code, start_hhmm=start_hhmm)
+         except DataEmptyError:
+             return None
+         except Exception as e:
+             logger.warning("[VWAP_FAIL] %s %s", code, e)
+             return None
+ 
+         total_vol = 0.0
+         total_tr = 0.0
+         for c in candles:
+             try:
+                 v = float(c.get("volume") or 0.0)
+                 p = float(c.get("price") or 0.0)
+             except Exception:
+                 continue
+             if v <= 0 or p <= 0:
+                 continue

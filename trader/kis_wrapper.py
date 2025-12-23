@@ -862,43 +862,43 @@ class KisAPI:
                     time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
-                    arr = data.get("output2") or []
-                    if resp.status_code == 200 and arr:
-                        rows: List[Dict[str, Any]] = []
-                        for r in arr:
-                            try:
-                                hhmmss = r.get("stck_cntg_hour")
-                                price = r.get("stck_prpr")
-                                vol = r.get("cntg_vol")
-                                if hhmmss and price is not None and vol is not None:
-                                    rows.append({
-                                        "time": str(hhmmss),
-                                        "price": float(price),
-                                        "volume": float(vol),
-                                    })
-                            except Exception as e:
-                                logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+                arr = data.get("output2") or []
+                if resp.status_code == 200 and arr:
+                    rows: List[Dict[str, Any]] = []
+                    for r in arr:
+                        try:
+                            hhmmss = r.get("stck_cntg_hour")
+                            price = r.get("stck_prpr")
+                            vol = r.get("cntg_vol")
+                            if hhmmss and price is not None and vol is not None:
+                                rows.append({
+                                    "time": str(hhmmss),
+                                    "price": float(price),
+                                    "volume": float(vol),
+                                })
+                        except Exception as e:
+                            logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
 
-                        rows.sort(key=lambda x: x["time"])
-                        if len(rows) == 0:
-                            raise DataEmptyError(f"A{iscd} 0 intraday candles")
-                        return rows
+                    rows.sort(key=lambda x: x["time"])
+                    if len(rows) == 0:
+                        raise DataEmptyError(f"A{iscd} 0 intraday candles")
+                    return rows
 
-                    msg = f"{data.get('msg_cd') or ''}:{data.get('msg1') or ''}".strip(":")
-                    logger.warning(
-                        "[INTRADAY-FETCH-FAIL] code=%s http=%s rt_cd=%s msg=%s output2_len=%s retry=%s count=%s",
-                        iscd,
-                        resp.status_code,
-                        data.get("rt_cd"),
-                        msg,
-                        len(arr),
-                        attempt + (start_idx * 3),
-                        req_count,
-                    )
-                    last_err = RuntimeError(
-                        f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
-                    )
-                    time.sleep(0.4 + random.uniform(0, 0.2))
+                msg = f"{data.get('msg_cd') or ''}:{data.get('msg1') or ''}".strip(":")
+                logger.warning(
+                    "[INTRADAY-FETCH-FAIL] code=%s http=%s rt_cd=%s msg=%s output2_len=%s retry=%s count=%s",
+                    iscd,
+                    resp.status_code,
+                    data.get("rt_cd"),
+                    msg,
+                    len(arr),
+                    attempt + (start_idx * 3),
+                    req_count,
+                )
+                last_err = RuntimeError(
+                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
+                )
+                time.sleep(0.4 + random.uniform(0, 0.2))
 
         if last_err:
             raise last_err
