@@ -852,11 +852,13 @@ class KisAPI:
                         logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
                         time.sleep(0.35 + random.uniform(0, 0.15))
                         continue
-                except Exception as e:
-                    last_err = e
-                    logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(
+                            "[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e
+                        )
+                        time.sleep(0.4 * attempt)
+                        continue
 
                 if "초당 거래건수" in str(data.get("msg1") or ""):
                     time.sleep(0.35 + random.uniform(0, 0.15))

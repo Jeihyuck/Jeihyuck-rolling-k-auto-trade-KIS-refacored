@@ -1,0 +1,67 @@
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 0f43279df60bd308c0dec927dcc7232d7c060f69..4552d52532ad889c963122a7c15a14f17cdee651 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -830,55 +830,57 @@ class KisAPI:
+                         resp.raise_for_status()
+                         data = resp.json()
+                         logger.debug(
+                             "[INTRADAY_RAW_JSON] %s TR=%s attempt=%d start=%s → %s",
+                             iscd,
+                             tr,
+                             attempt,
+                             start,
+                             data,
+                         )
+                     except requests.exceptions.SSLError as e:
+                         last_err = e
+                         logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.4 * attempt)
+                         continue
+                     except requests.exceptions.RequestException as e:
+                         last_err = e
+                         logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.4 * attempt)
+                         continue
+                     except ValueError as e:
+                         last_err = e
+                         logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                         time.sleep(0.35 + random.uniform(0, 0.15))
+                         continue
+-                except Exception as e:
+-                    last_err = e
+-                    logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+-                    time.sleep(0.4 * attempt)
+-                    continue
++                    except Exception as e:
++                        last_err = e
++                        logger.warning(
++                            "[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e
++                        )
++                        time.sleep(0.4 * attempt)
++                        continue
+ 
+                 if "초당 거래건수" in str(data.get("msg1") or ""):
+                     time.sleep(0.35 + random.uniform(0, 0.15))
+                     continue
+ 
+                 arr = data.get("output2") or []
+                 if resp.status_code == 200 and arr:
+                     rows: List[Dict[str, Any]] = []
+                     for r in arr:
+                         try:
+                             hhmmss = r.get("stck_cntg_hour")
+                             price = r.get("stck_prpr")
+                             vol = r.get("cntg_vol")
+                             if hhmmss and price is not None and vol is not None:
+                                 rows.append({
+                                     "time": str(hhmmss),
+                                     "price": float(price),
+                                     "volume": float(vol),
+                                 })
+                         except Exception as e:
+                             logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+ 
+                     rows.sort(key=lambda x: x["time"])
+                     if len(rows) == 0:
+                         raise DataEmptyError(f"A{iscd} 0 intraday candles")
