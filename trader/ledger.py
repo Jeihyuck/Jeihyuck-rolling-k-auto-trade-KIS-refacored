@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 from .config import KST
 from .code_utils import normalize_code
+from .strategy_ids import STRATEGY_INT_IDS
 
 
 def _ensure_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -142,7 +143,7 @@ def dominant_strategy_for(state: Dict[str, Any], pdno: str) -> int | None:
         if remaining <= 0:
             continue
         sid = _norm_sid(lot.get("strategy_id"))
-        if isinstance(sid, int) and 1 <= sid <= 5:
+        if isinstance(sid, int) and sid in STRATEGY_INT_IDS:
             totals[sid] = totals.get(sid, 0) + remaining
     if not totals:
         return None

@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Any, Dict, List, Optional
 
+from .strategy_ids import (
+    INTRADAY_BREAKOUT_IDS,
+    SID_BREAKOUT,
+    SID_LASTHOUR,
+    SID_PULLBACK,
+    SID_SWING,
+)
+
 
 def _parse_hhmm(val: str, default: time) -> time:
     try:
@@ -17,14 +25,29 @@ def _parse_hhmm(val: str, default: time) -> time:
         return default
 
 
+def is_close_betting_strategy(strategy_id: int | None) -> bool:
+    sid = int(strategy_id or SID_BREAKOUT)
+    return sid == SID_LASTHOUR
+
+
+def use_pullback_engine(strategy_id: int | None) -> bool:
+    sid = int(strategy_id or SID_BREAKOUT)
+    return sid == SID_PULLBACK
+
+
+def is_breakout_strategy(strategy_id: int | None) -> bool:
+    sid = int(strategy_id or SID_BREAKOUT)
+    return sid in INTRADAY_BREAKOUT_IDS
+
+
 def strategy_trigger_label(strategy_id: int | None, strategy_name: Any = None) -> str:
     """전략 ID 기반 trigger label.
     - signals.evaluate_trigger_gate()가 이해하는 trigger_name을 반환한다.
     """
-    sid = int(strategy_id or 1)
-    if sid == 5:
+    sid = int(strategy_id or SID_BREAKOUT)
+    if sid == SID_PULLBACK:
         return "pullback_rebound"
-    if sid == 4:
+    if sid == SID_LASTHOUR:
         return "close_betting"
     return "breakout_cross"
 
@@ -47,17 +70,17 @@ def strategy_entry_gate(
       qty_scale: float
       entry_reason: str
     """
-    sid = int(strategy_id or 1)
+    sid = int(strategy_id or SID_BREAKOUT)
     reasons: List[str] = []
 
-    # 전략5는 legacy_kosdaq_runner에서 별도 pullback 엔진으로 처리.
-    if sid == 5:
+    # 전략2는 legacy_kosdaq_runner에서 별도 pullback 엔진으로 처리.
+    if sid == SID_PULLBACK:
         return {
             "ok": False,
             "reasons": ["use_pullback_engine"],
             "trigger_label": "pullback_rebound",
             "qty_scale": 0.0,
-            "entry_reason": "S5_PULLBACK_ENGINE",
+            "entry_reason": "S2_PULLBACK_ENGINE",
         }
 
     trigger_label = strategy_trigger_label(sid, info.get("strategy"))
@@ -73,23 +96,17 @@ def strategy_entry_gate(
     volume_spike = bool(intraday_ctx.get("volume_spike"))
 
     # === 전략별 규칙 ===
-    if sid == 1:
+    if sid == SID_BREAKOUT:
         # 기본 돌파: setup_gate + trigger_gate 통과가 핵심 (추가 제약 없음)
         entry_reason = "S1_BREAKOUT"
 
-    elif sid == 2:
+    elif sid == SID_PULLBACK:
         # 강한 돌파(범위/전고점 재돌파 중 하나는 필수)
         if not (range_break or prev_high_retest):
             reasons.append("need_range_or_prevhigh_retest")
         entry_reason = "S2_RANGE_BREAK"
 
-    elif sid == 3:
-        # VWAP 리클레임(상승 전환) 필수
-        if not vwap_reclaim:
-            reasons.append("need_vwap_reclaim")
-        entry_reason = "S3_VWAP_RECLAIM"
-
-    elif sid == 4:
+    elif sid == SID_LASTHOUR:
         # 종가베팅: 시간 조건 + 최소 모멘텀 + (기본) 챔피언 등급
         start = _parse_hhmm(os.getenv("CLOSE_BETTING_START", "14:30"), time(14, 30))
         end = _parse_hhmm(os.getenv("CLOSE_BETTING_END", "15:10"), time(15, 10))
@@ -116,7 +133,10 @@ def strategy_entry_gate(
         except Exception:
             qty_scale = 0.5
         qty_scale = max(0.1, min(qty_scale, 1.0))
-        entry_reason = "S4_CLOSE_BETTING"
+        entry_reason = "S3_LAST_HOUR"
+
+    elif sid == SID_SWING:
+        entry_reason = "S5_SWING"
 
     else:
         # 알 수 없는 ID는 전략1로 안전 처리

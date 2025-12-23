@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable
 
 from .config import KST, STATE_PATH
 from .code_utils import normalize_code
+from .strategy_ids import SID_BREAKOUT, STRATEGY_INT_IDS
 from .state_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -407,7 +408,7 @@ def _normalize_strategy_id(value: Any) -> str | None:
         num = int(value)
     except Exception:
         num = None
-    if num is not None and 1 <= num <= 5:
+    if num is not None and num in STRATEGY_INT_IDS:
         return str(num)
     text = str(value).strip()
     if text.upper().startswith("STRAT_"):
@@ -575,11 +576,11 @@ def reconcile_positions(
 def run_reconcile_self_checks() -> None:
     state = _empty_state()
     lot_state = {
-        "lots": [{"pdno": "000001", "strategy_id": 1, "remaining_qty": 5}]
+        "lots": [{"pdno": "000001", "strategy_id": SID_BREAKOUT, "remaining_qty": 5}]
     }
     state["positions"]["000001"] = {
         "strategies": {
-            "1": {
+            str(SID_BREAKOUT): {
                 "qty": 7,
                 "avg_price": 100.0,
                 "entry": {},
@@ -589,7 +590,7 @@ def run_reconcile_self_checks() -> None:
         }
     }
     state = reconcile_with_broker(state, [], lot_state=lot_state)
-    assert state["positions"]["000001"]["strategies"]["1"]["qty"] == 5
+    assert state["positions"]["000001"]["strategies"][str(SID_BREAKOUT)]["qty"] == 5
 
 
 if __name__ == "__main__":

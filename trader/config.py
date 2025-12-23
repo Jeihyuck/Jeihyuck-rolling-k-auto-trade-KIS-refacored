@@ -36,10 +36,19 @@ CONFIG = {
     "MANUAL_HARD_STOP_LOSS_PCT": "5.0",
     "MANUAL_TRAILING_STOP_PCT": "2.0",
     "MANUAL_MAX_HOLDING_DAYS": "5",
+    "MANUAL_STOP_LOSS_PCT": "-3.0",
+    "MANUAL_TAKE_PROFIT1_PCT": "5.0",
+    "MANUAL_TAKE_PROFIT2_PCT": "8.0",
+    "MANUAL_TP1_SELL_FRAC": "0.5",
+    "MANUAL_TRAIL_START_PCT": "4.0",
+    "MANUAL_TRAIL_STOP_PCT": "2.0",
+    "MANUAL_MAX_HOLD_DAYS": "20",
+    "MANUAL_TIME_CUT_PNL_MAX": "1.0",
     "DAILY_CAPITAL": "250000000",
     "CAP_CAP": "0.8",
     "SLIPPAGE_LIMIT_PCT": "0.25",
     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
+    "MAX_CHASE_PCT": "2.0",
     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
     "W_MAX_ONE": "0.25",
     "W_MIN_ONE": "0.03",
@@ -75,7 +84,7 @@ CONFIG = {
 "CLOSE_BETTING_END": "15:10",          # 전략4 진입 종료 시간(HH:MM)
 "CLOSE_BETTING_QTY_SCALE": "0.5",      # 전략4 진입 수량 스케일(0.1~1.0)
 "CLOSE_BETTING_REQUIRE_GRADE": "AB",   # 전략4 챔피언 등급 요구: A 또는 AB
-"STRICT_CHAMPION_STRATEGY_IDS": "4",   # CHAMPION_* 필터를 엄격 적용할 전략 ID들(쉼표구분)
+"STRICT_CHAMPION_STRATEGY_IDS": "5",   # CHAMPION_* 필터를 엄격 적용할 전략 ID들(쉼표구분)
     # 챔피언 후보 필터
     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
@@ -148,10 +157,19 @@ DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
 MANUAL_HARD_STOP_LOSS_PCT = float(_cfg("MANUAL_HARD_STOP_LOSS_PCT"))
 MANUAL_TRAILING_STOP_PCT = float(_cfg("MANUAL_TRAILING_STOP_PCT"))
 MANUAL_MAX_HOLDING_DAYS = int(_cfg("MANUAL_MAX_HOLDING_DAYS") or "5")
+MANUAL_STOP_LOSS_PCT = float(_cfg("MANUAL_STOP_LOSS_PCT") or "-3.0")
+MANUAL_TAKE_PROFIT1_PCT = float(_cfg("MANUAL_TAKE_PROFIT1_PCT") or "5.0")
+MANUAL_TAKE_PROFIT2_PCT = float(_cfg("MANUAL_TAKE_PROFIT2_PCT") or "8.0")
+MANUAL_TP1_SELL_FRAC = float(_cfg("MANUAL_TP1_SELL_FRAC") or "0.5")
+MANUAL_TRAIL_START_PCT = float(_cfg("MANUAL_TRAIL_START_PCT") or "4.0")
+MANUAL_TRAIL_STOP_PCT = float(_cfg("MANUAL_TRAIL_STOP_PCT") or "2.0")
+MANUAL_MAX_HOLD_DAYS = int(_cfg("MANUAL_MAX_HOLD_DAYS") or "20")
+MANUAL_TIME_CUT_PNL_MAX = float(_cfg("MANUAL_TIME_CUT_PNL_MAX") or "1.0")
 DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
 CAP_CAP = float(_cfg("CAP_CAP"))
 SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
 SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
+MAX_CHASE_PCT = float(_cfg("MAX_CHASE_PCT") or "2.0")
 VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
 W_MAX_ONE = float(_cfg("W_MAX_ONE"))
 W_MIN_ONE = float(_cfg("W_MIN_ONE"))

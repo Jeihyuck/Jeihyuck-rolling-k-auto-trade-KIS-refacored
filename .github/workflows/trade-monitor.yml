@@ -123,6 +123,18 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Restore bot_state from bot-state branch
+        if: github.event_name != 'pull_request'
+        run: |
+          git fetch origin bot-state:bot-state || true
+          if git show-ref --verify --quiet refs/heads/bot-state; then
+            git checkout bot-state -- bot_state || true
+          fi
+          mkdir -p trader/state
+          if [ -d bot_state/trader_state ]; then
+            cp -a bot_state/trader_state/. trader/state/ || true
+          fi
+
       - name: Restore state cache (fallback only)
         uses: actions/cache/restore@v4
         with:
@@ -235,6 +247,35 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+
+      - name: Persist trader state to bot-state branch
+        if: github.event_name != 'pull_request'
+        run: |
+          set -e
+          TMP_DIR="$(mktemp -d)"
+          mkdir -p "$TMP_DIR/state" "$TMP_DIR/fills"
+          if [ -d trader/state ]; then
+            cp -a trader/state/. "$TMP_DIR/state/" || true
+          fi
+          if [ -d trader/fills ]; then
+            cp -a trader/fills/. "$TMP_DIR/fills/" || true
+          fi
+          git fetch origin bot-state:bot-state || true
+          if git show-ref --verify --quiet refs/heads/bot-state; then
+            git checkout bot-state
+          else
+            git checkout -b bot-state
+          fi
+          mkdir -p bot_state/trader_state
+          cp -a "$TMP_DIR/state/." bot_state/trader_state/ || true
+          cp -a "$TMP_DIR/fills/." bot_state/trader_state/ || true
+          git add -f bot_state/trader_state/*
+          if git diff --cached --quiet; then
+            echo "No bot_state changes to commit."
+            exit 0
+          fi
+          git commit -m "Update trader state"
+          git push origin bot-state
 
       - name: Save state snapshot as artifact (audit only)
         if: always()

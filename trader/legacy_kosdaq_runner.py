@@ -31,6 +31,8 @@ try:
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
+        MAX_CHASE_PCT,
+        VWAP_TOL,
         STATE_PATH,
         STRATEGY_REDUCTION_PRIORITY,
         USE_PULLBACK_ENTRY,
@@ -39,6 +41,14 @@ try:
         MANUAL_HARD_STOP_LOSS_PCT,
         MANUAL_TRAILING_STOP_PCT,
         MANUAL_MAX_HOLDING_DAYS,
+        MANUAL_STOP_LOSS_PCT,
+        MANUAL_TAKE_PROFIT1_PCT,
+        MANUAL_TAKE_PROFIT2_PCT,
+        MANUAL_TP1_SELL_FRAC,
+        MANUAL_TRAIL_START_PCT,
+        MANUAL_TRAIL_STOP_PCT,
+        MANUAL_MAX_HOLD_DAYS,
+        MANUAL_TIME_CUT_PNL_MAX,
         _cfg,
         logger,
     )
@@ -58,6 +68,8 @@ except ImportError:
         SELL_ALL_BALANCES_AT_CUTOFF,
         SELL_FORCE_TIME,
         SLIPPAGE_ENTER_GUARD_PCT,
+        MAX_CHASE_PCT,
+        VWAP_TOL,
         STATE_PATH,
         STRATEGY_REDUCTION_PRIORITY,
         USE_PULLBACK_ENTRY,
@@ -66,6 +78,14 @@ except ImportError:
         MANUAL_HARD_STOP_LOSS_PCT,
         MANUAL_TRAILING_STOP_PCT,
         MANUAL_MAX_HOLDING_DAYS,
+        MANUAL_STOP_LOSS_PCT,
+        MANUAL_TAKE_PROFIT1_PCT,
+        MANUAL_TAKE_PROFIT2_PCT,
+        MANUAL_TP1_SELL_FRAC,
+        MANUAL_TRAIL_START_PCT,
+        MANUAL_TRAIL_STOP_PCT,
+        MANUAL_MAX_HOLD_DAYS,
+        MANUAL_TIME_CUT_PNL_MAX,
         _cfg,
         logger,
     )
@@ -96,6 +116,15 @@ from trader.position_state_store import (
     reconcile_positions,
     save_position_state,
 )
+from trader.strategy_ids import (
+    INTRADAY_EXIT_IDS,
+    SID_BREAKOUT,
+    SID_LASTHOUR,
+    SID_PULLBACK,
+    SID_SWING,
+    STRATEGY_INT_IDS,
+)
+from trader import guards
 from .core import *  # noqa: F401,F403 - 전략 유틸 전체 노출로 확장성 확보
 
 if TYPE_CHECKING:
@@ -162,9 +191,13 @@ def main(
     sell_reconcile_needed = False
     pending_buy_orders: list[dict[str, Any]] = []
     runtime_state = runtime_state_store.load_state()
+    breakout_watch = runtime_state_store.load_breakout_watch()
+    breakout_watch_dirty = False
     triggered_today: set[str] = set()
     s1_done_today: set[tuple[str, str]] = set()
     last_today_prefix: str | None = None
+    gate_retry_after: dict[str, float] = {}
+    reentry_state: dict[str, datetime] = {}
 
     if isinstance(traded, (set, list, tuple)):
         logger.warning(
@@ -240,6 +273,16 @@ def main(
             runtime_state_store.save_state(runtime_state)
         except Exception:
             logger.exception("[RUNTIME_STATE] save failed")
+
+    def _save_breakout_watch() -> None:
+        nonlocal breakout_watch_dirty
+        if not breakout_watch_dirty:
+            return
+        try:
+            runtime_state_store.save_breakout_watch(breakout_watch)
+            breakout_watch_dirty = False
+        except Exception:
+            logger.exception("[BREAKOUT_WATCH] save failed")
 
     def _save_position_state_now() -> None:
         nonlocal position_state_dirty
@@ -370,6 +413,11 @@ def main(
                 entry_time=now_ts,
             )
             position_state_dirty = True
+            code_key = normalize_code(code)
+            if code_key in breakout_watch:
+                breakout_watch.pop(code_key, None)
+                breakout_watch_dirty = True
+                _save_breakout_watch()
 
             lot_id = _build_lot_id(
                 result,
@@ -497,8 +545,32 @@ def main(
         memory.setdefault("last_seen", {})[code_key] = now_ts
         position_state_dirty = True
 
+    def _record_breakout_watch(
+        code: str,
+        *,
+        target_price: float | None,
+        reason: str,
+        now_ts: str,
+        eligible: bool = True,
+    ) -> None:
+        nonlocal breakout_watch_dirty
+        code_key = normalize_code(code)
+        if not code_key:
+            return
+        entry = breakout_watch.get(code_key) or {}
+        entry_date = now_ts.split("T")[0] if "T" in now_ts else now_ts.split(" ")[0]
+        entry.setdefault("first_seen_ts", now_ts)
+        entry["date"] = entry_date
+        entry["target_price"] = target_price
+        entry["breakout_seen"] = True
+        entry["reason"] = reason
+        entry["eligible"] = bool(eligible)
+        breakout_watch[code_key] = entry
+        breakout_watch_dirty = True
+        _save_breakout_watch()
+
     def _pullback_stop_hit(
-        code: str, current_price: float, strategy_id: int | str = 5
+        code: str, current_price: float, strategy_id: int | str = SID_PULLBACK
     ) -> bool:
         pos = position_state.get("positions", {}).get(normalize_code(code))
         if not isinstance(pos, dict):
@@ -527,6 +599,7 @@ def main(
         cur_price = _safe_get_price(kis, code_key)
         if cur_price is None or cur_price <= 0:
             return None, 0
+        flags = entry.setdefault("flags", {})
         high_val = float(entry.get("high_watermark") or entry.get("meta", {}).get("high") or avg_price)
         high_val = max(high_val, float(cur_price))
         entry["high_watermark"] = high_val
@@ -534,28 +607,46 @@ def main(
         entry["last_update_ts"] = now_dt.isoformat()
 
         pnl_pct = (float(cur_price) - float(avg_price)) / float(avg_price) * 100.0
-        if MANUAL_HARD_STOP_LOSS_PCT and pnl_pct <= -abs(MANUAL_HARD_STOP_LOSS_PCT):
-            return "manual_hard_stop", int(available_qty)
+        if MANUAL_STOP_LOSS_PCT and pnl_pct <= float(MANUAL_STOP_LOSS_PCT):
+            logger.info("[MANUAL-SL] code=%s pnl=%.2f%% sell=100%%", code_key, pnl_pct)
+            return "manual_sl", int(available_qty)
 
-        trail_pct = abs(MANUAL_TRAILING_STOP_PCT or 0.0)
-        if trail_pct and float(cur_price) <= high_val * (1 - trail_pct / 100.0):
-            return "manual_trailing_stop", int(available_qty)
+        tp1_pct = float(MANUAL_TAKE_PROFIT1_PCT or 0.0)
+        tp2_pct = float(MANUAL_TAKE_PROFIT2_PCT or 0.0)
+        tp1_frac = float(MANUAL_TP1_SELL_FRAC or 0.0)
+        if tp2_pct and pnl_pct >= tp2_pct and not flags.get("sold_p2"):
+            logger.info("[MANUAL-TP2] code=%s pnl=%.2f%% sell=100%%", code_key, pnl_pct)
+            return "manual_tp2", int(available_qty)
+        if tp1_pct and pnl_pct >= tp1_pct and not flags.get("sold_p1") and tp1_frac > 0:
+            sell_qty = max(1, int(round(float(available_qty) * tp1_frac)))
+            sell_qty = min(int(available_qty), int(sell_qty))
+            logger.info("[MANUAL-TP1] code=%s pnl=%.2f%% sell=%.0f%%", code_key, pnl_pct, tp1_frac * 100)
+            return "manual_tp1", int(sell_qty)
 
-        if MANUAL_MAX_HOLDING_DAYS:
+        trail_start = float(MANUAL_TRAIL_START_PCT or 0.0)
+        trail_stop = float(MANUAL_TRAIL_STOP_PCT or 0.0)
+        peak_pnl_pct = (float(high_val) - float(avg_price)) / float(avg_price) * 100.0
+        if trail_start and trail_stop and peak_pnl_pct >= trail_start:
+            drawdown_pct = (float(high_val) - float(cur_price)) / float(high_val) * 100.0
+            if drawdown_pct >= trail_stop:
+                logger.info(
+                    "[MANUAL-TRAIL] code=%s peak=%.2f%% drawdown=%.2f%% sell=100%%",
+                    code_key,
+                    peak_pnl_pct,
+                    drawdown_pct,
+                )
+                return "manual_trail", int(available_qty)
+
+        if MANUAL_MAX_HOLD_DAYS:
             try:
                 entry_ts = entry.get("entry_ts") or entry.get("entry", {}).get("time")
                 entry_dt = datetime.fromisoformat(entry_ts) if entry_ts else None
             except Exception:
                 entry_dt = None
             if entry_dt:
-                if (now_dt.date() - entry_dt.date()).days >= MANUAL_MAX_HOLDING_DAYS:
-                    return "manual_time_cut", int(available_qty)
-                try:
-                    rebalance_dt = date.fromisoformat(rebalance_anchor)
-                    if entry_dt.date() < rebalance_dt:
-                        return "manual_rebalance_cut", int(available_qty)
-                except Exception:
-                    pass
+                if (now_dt.date() - entry_dt.date()).days >= MANUAL_MAX_HOLD_DAYS:
+                    if pnl_pct < float(MANUAL_TIME_CUT_PNL_MAX or 0.0):
+                        return "manual_time_cut", int(available_qty)
 
         return None, 0
 
@@ -569,11 +660,23 @@ def main(
         strategies = pos_state.get("strategies", {})
         if not isinstance(strategies, dict):
             return intents
+        now_dt = datetime.now(KST)
         for sid, entry in strategies.items():
             if not isinstance(entry, dict):
                 continue
             available_qty = remaining_qty_for_strategy(lot_state, code_key, sid)
             if available_qty <= 0:
+                continue
+            sid_int = int(sid) if str(sid).isdigit() else None
+            if sid_int in INTRADAY_EXIT_IDS and now_dt.time() >= SELL_FORCE_TIME:
+                intents.append(
+                    {
+                        "code": code_key,
+                        "strategy_id": sid,
+                        "sell_qty": int(available_qty),
+                        "reason": "force_exit_time",
+                    }
+                )
                 continue
             avg_price = strategy_avg_price(lot_state, code_key, sid)
             if avg_price is None:
@@ -586,7 +689,7 @@ def main(
             high_value = max(high_value, float(avg_price))
             meta["high"] = high_value
             entry["high_watermark"] = max(float(entry.get("high_watermark") or 0.0), high_value)
-            entry["last_update_ts"] = datetime.now(KST).isoformat()
+            entry["last_update_ts"] = now_dt.isoformat()
             pos_view = {
                 "qty": int(available_qty),
                 "buy_price": float(avg_price),
@@ -654,10 +757,10 @@ def main(
         try:
             strategy_num = int(value)
         except Exception:
-            return 1
-        if 1 <= strategy_num <= 5:
+            return SID_BREAKOUT
+        if strategy_num in STRATEGY_INT_IDS:
             return strategy_num
-        return 1
+        return SID_BREAKOUT
 
     def _derive_strategy_id(payload: Dict[str, Any]) -> int:
         raw = (
@@ -687,10 +790,10 @@ def main(
             )
             return strategy_id
         if "pullback" in name_lower or "눌림목" in name:
-            logger.info("[STRATEGY_ID_DERIVE] source=pullback -> 5")
-            return 5
-        logger.info("[STRATEGY_ID_DERIVE] source=default -> 1")
-        return 1
+            logger.info("[STRATEGY_ID_DERIVE] source=pullback -> %s", SID_PULLBACK)
+            return SID_PULLBACK
+        logger.info("[STRATEGY_ID_DERIVE] source=default -> %s", SID_BREAKOUT)
+        return SID_BREAKOUT
 
     def _build_lot_id(result: Any, fallback_ts: str, pdno: str) -> str:
         order_no = ""
@@ -1228,11 +1331,11 @@ def main(
     # === 전략별 필터링 (전략 1~5 분리) ===
     # NOTE:
     # - 기존 코드가 모든 종목에 '챔피언 필터'를 강제 적용하면서 전략 1~3 진입이 사실상 막히는 문제가 있었음.
-    # - 기본값은 전략 4(챔피언)에만 CHAMPION_* 필터를 적용하고, 나머지(1~3)는 메타 지표를 참고만 하도록 한다.
-    strict_sid_env = _cfg("STRICT_CHAMPION_STRATEGY_IDS") or "4"
+    # - 기본값은 전략 5(챔피언/스윙)에만 CHAMPION_* 필터를 적용하고, 나머지(1~3)는 메타 지표를 참고만 하도록 한다.
+    strict_sid_env = _cfg("STRICT_CHAMPION_STRATEGY_IDS") or "5"
     strict_sids = {
         int(x.strip()) for x in str(strict_sid_env).split(",") if x.strip().isdigit()
-    } or {4}
+    } or {SID_SWING}
 
     filtered_targets: Dict[str, Any] = {}
     for code, info in processed_targets.items():
@@ -1243,7 +1346,7 @@ def main(
         mdd = abs(_to_float(info.get("mdd_pct"), 0.0) or 0.0)
         sharpe = _to_float(info.get("sharpe_m"), 0.0)
 
-        # 전략4(챔피언) 등 '엄격 필터' 대상만 CHAMPION_* 기준으로 컷
+        # 전략5(챔피언/스윙) 등 '엄격 필터' 대상만 CHAMPION_* 기준으로 컷
         if sid in strict_sids:
             if (
                 trades < CHAMPION_MIN_TRADES
@@ -1449,27 +1552,6 @@ def main(
 
         code_to_target: Dict[str, Any] = selected_targets
 
-        # 눌림목 스캔용 코스닥 시총 상위 리스트 (챔피언과 별도로 관리)
-        pullback_watch: Dict[str, Dict[str, Any]] = {}
-        if USE_PULLBACK_ENTRY:
-            try:
-                pb_weight = max(0.0, min(PULLBACK_UNIT_WEIGHT, 1.0))
-                base_notional = int(round(capital_active * pb_weight))
-                pb_df = get_kosdaq_top_n(date_str=rebalance_date, n=PULLBACK_TOPN)
-                for _, row in pb_df.iterrows():
-                    code = normalize_code(row.get("Code") or row.get("code") or "")
-                    if not code:
-                        continue
-                    pullback_watch[code] = {
-                        "code": code,
-                        "name": row.get("Name") or row.get("name"),
-                        "notional": base_notional,
-                    }
-                logger.info(
-                    f"[PULLBACK-WATCH] 코스닥 시총 Top{PULLBACK_TOPN} {len(pullback_watch)}종목 스캔 준비"
-                )
-            except Exception as e:
-                logger.warning(f"[PULLBACK-WATCH-FAIL] 시총 상위 로드 실패: {e}")
 
         loop_sleep_sec = 2.5  # 메인 루프 대기 시간(초)
         max_closed_checks = 3
@@ -1492,6 +1574,7 @@ def main(
                 # 장 상태
                 now_dt_kst = datetime.now(KST)
                 is_open = kis.is_market_open()
+                open_ts = datetime.combine(now_dt_kst.date(), MARKET_OPEN, tzinfo=KST)
                 now_str = now_dt_kst.strftime("%Y-%m-%d %H:%M:%S")
                 today_prefix = now_dt_kst.strftime("%Y-%m-%d")
                 _ensure_guard_state(now_dt_kst.date())
@@ -1499,6 +1582,11 @@ def main(
                     triggered_today.clear()
                     s1_done_today.clear()
                     last_today_prefix = today_prefix
+                    for code in list(breakout_watch.keys()):
+                        if breakout_watch.get(code, {}).get("date") != today_prefix:
+                            breakout_watch.pop(code, None)
+                            breakout_watch_dirty = True
+                    _save_breakout_watch()
                 expired_pending = _cleanup_expired_pending(traded, now_dt_kst, ttl_sec=300)
                 if expired_pending:
                     triggered_today.difference_update(expired_pending)
@@ -1591,7 +1679,7 @@ def main(
                                 continue
                             if str(sid).isdigit():
                                 sid_int = int(sid)
-                                if 1 <= sid_int <= 5:
+                                if sid_int in STRATEGY_INT_IDS:
                                     totals[str(sid_int)] = totals.get(str(sid_int), 0) + remaining
                     ordered: list[str] = []
                     for sid in STRATEGY_REDUCTION_PRIORITY:
@@ -2396,6 +2484,10 @@ def main(
                             trigger_strategy_id=int(sid) if sid is not None and str(sid).isdigit() else sid,
                             prev_qty_before=prev_qty_before,
                         )
+                        if intent.get("reason") == "manual_tp1":
+                            _set_position_flags(code, sid, sold_p1=True)
+                        elif intent.get("reason") == "manual_tp2":
+                            _set_position_flags(code, sid, sold_p1=True, sold_p2=True)
                         runtime_state_store.mark_fill(
                             runtime_state,
                             code,
@@ -2407,6 +2499,7 @@ def main(
                             status="filled",
                         )
                         _save_runtime_state()
+                        reentry_state[normalize_code(code)] = now_dt_kst
                         save_state(holding, traded)
                         time.sleep(RATE_SLEEP_SEC)
 
@@ -2417,7 +2510,7 @@ def main(
                             current_price = None
                         if current_price and _pullback_stop_hit(code, current_price):
                             sellable_qty = ord_psbl_map.get(code, 0)
-                            pb_avail = remaining_qty_for_strategy(lot_state, code, 5)
+                            pb_avail = remaining_qty_for_strategy(lot_state, code, SID_PULLBACK)
                             sell_qty = min(int(sellable_qty), int(pb_avail))
                             if sell_qty > 0:
                                 prev_qty_before = int(
@@ -2425,15 +2518,16 @@ def main(
                                 )
                                 if dry_run:
                                     logger.info(
-                                        "[DRY-RUN][SELL] code=%s qty=%s strategy_id=5 reason=pullback_reversal_break",
+                                        "[DRY-RUN][SELL] code=%s qty=%s strategy_id=%s reason=pullback_reversal_break",
                                         code,
                                         sell_qty,
+                                        SID_PULLBACK,
                                     )
                                     runtime_state_store.mark_order(
                                         runtime_state,
                                         code,
                                         "SELL",
-                                        5,
+                                        SID_PULLBACK,
                                         int(sell_qty),
                                         float(holding.get(code, {}).get("buy_price") or 0.0),
                                         now_dt_kst.isoformat(),
@@ -2448,7 +2542,7 @@ def main(
                                     runtime_state,
                                     code,
                                     "SELL",
-                                    5,
+                                    SID_PULLBACK,
                                     int(sell_qty),
                                     float(exec_px or 0.0),
                                     now_dt_kst.isoformat(),
@@ -2477,20 +2571,21 @@ def main(
                                     now_dt_kst.isoformat(),
                                     result,
                                     scope="strategy",
-                                    trigger_strategy_id=5,
+                                    trigger_strategy_id=SID_PULLBACK,
                                     prev_qty_before=prev_qty_before,
                                 )
                                 runtime_state_store.mark_fill(
                                     runtime_state,
                                     code,
                                     "SELL",
-                                    5,
+                                    SID_PULLBACK,
                                     int(sell_qty),
                                     float(exec_px or 0.0),
                                     now_dt_kst.isoformat(),
                                     status="filled",
                                 )
                                 _save_runtime_state()
+                                reentry_state[normalize_code(code)] = now_dt_kst
                                 save_state(holding, traded)
                                 time.sleep(RATE_SLEEP_SEC)
                                 logger.info(
@@ -2545,6 +2640,12 @@ def main(
                     if code in triggered_today:
                         logger.info(f"[TRIGGER-SKIP] {code}: 금일 이미 트리거 발생")
                         continue
+
+                    next_retry_ts = gate_retry_after.get(code)
+                    if next_retry_ts and time.time() < next_retry_ts:
+                        continue
+                    if next_retry_ts:
+                        gate_retry_after.pop(code, None)
 
                     target_qty = int(info.get("qty", 0))
                     if target_qty <= 0:
@@ -2647,12 +2748,21 @@ def main(
                         daily_ctx, intra_ctx, regime_state=regime_state
                     )
                     if not setup_state.get("ok"):
-                        if not setup_state.get("reasons"):
-                            setup_state["reasons"] = ["setup_flag_false"]
+                        reasons = setup_state.get("reasons") or []
+                        if not reasons:
+                            reasons = ["setup_flag_false"]
+                        if setup_state.get("retryable") and "intraday_unavailable" in reasons:
+                            gate_retry_after[code] = time.time() + 90
+                            logger.info(
+                                "[GATE-RETRY] code=%s intraday_available=%s -> retry scheduled",
+                                code,
+                                intra_ctx.get("intraday_available"),
+                            )
+                            continue
                         logger.info(
                             "[SETUP-BAD] %s | reasons=%s | daily=%s intra=%s regime=%s",
                             code,
-                            setup_state.get("reasons"),
+                            reasons,
                             daily_ctx,
                             intra_ctx,
                             regime_state,
@@ -2718,6 +2828,26 @@ def main(
                         trigger_state.get("risk_reward") or 0.0,
                     )
 
+                    if guards.should_no_trade(open_ts, now_dt_kst):
+                        logger.info("[GOVERNOR-BLOCK] code=%s reason=no_trade_window", code)
+                        continue
+                    code_key = normalize_code(code)
+                    if code_key in reentry_state and not guards.can_reenter(
+                        {"last_exit": {code_key: {"time": reentry_state[code_key]}}},
+                        code_key,
+                        now_dt_kst,
+                    ):
+                        logger.info("[GOVERNOR-BLOCK] code=%s reason=reenter_cooldown", code)
+                        continue
+                    daily_loss_pct = float(runtime_state.get("daily_loss_pct") or 0.0)
+                    if daily_loss_pct <= -abs(guards.MAX_DRAWDOWN_DAY_PCT):
+                        logger.info(
+                            "[GOVERNOR-BLOCK] code=%s reason=daily_loss_cut loss=%.2f%%",
+                            code,
+                            daily_loss_pct,
+                        )
+                        continue
+
                     flow_ok, flow_ctx, ob_strength = _subject_flow_gate(
                         code,
                         info,
@@ -2778,8 +2908,28 @@ def main(
                         "strategy_id": info.get("strategy_id"),
                         "side": "BUY",
                     }
-
-                    limit_px, mo_px = compute_entry_target(kis, info)
+                    limit_px = None
+                    mo_px = None
+                    if strategy_id == SID_BREAKOUT and target_price:
+                        chase_limit = float(target_price) * (1 + MAX_CHASE_PCT / 100.0)
+                        if current_price > chase_limit:
+                            _record_breakout_watch(
+                                code,
+                                target_price=float(target_price),
+                                reason="chase_exceeded",
+                                now_ts=now_dt_kst.isoformat(),
+                                eligible=True,
+                            )
+                            logger.info(
+                                "[GOVERNOR-BLOCK] code=%s reason=chase_exceeded last=%.2f limit=%.2f",
+                                code,
+                                float(current_price),
+                                chase_limit,
+                            )
+                            continue
+                        limit_px = min(float(current_price), chase_limit)
+                    else:
+                        limit_px, mo_px = compute_entry_target(kis, info)
                     if limit_px is None and mo_px is None:
                         logger.warning(
                             f"[TARGET-PRICE] {code}: limit/mo 가격 산출 실패 → 스킵"
@@ -2890,31 +3040,25 @@ def main(
                     balances_after_buy = _refresh_balances_snapshot("buy_batch")
                     _finalize_pending_buys(pending_buy_orders, balances_after_buy)
 
-                # ====== 눌림목 전용 매수 (챔피언과 독립적으로 Top-N 시총 리스트 스캔) ======
-                if USE_PULLBACK_ENTRY and is_open:
+                # ====== 전략2: 돌파 후 눌림 재진입 (breakout_watch 기반) ======
+                if USE_PULLBACK_ENTRY and is_open and breakout_watch:
                     if not can_buy:
                         logger.info("[PULLBACK-SKIP] can_buy=False → 신규 매수 스킵")
                     else:
-                        if pullback_watch:
-                            logger.info(f"[PULLBACK-SCAN] {len(pullback_watch)}종목 검사")
-
-                        for code, info in list(pullback_watch.items()):
+                        for code, watch in list(breakout_watch.items()):
                             if pullback_buys_today >= PULLBACK_MAX_BUYS_PER_DAY:
                                 logger.info(
                                     f"[PULLBACK-LIMIT] 하루 최대 {PULLBACK_MAX_BUYS_PER_DAY}건 도달 → 스캔 중단"
                                 )
                                 break
-
-                            if code in traded_today or code in holding:
-                                continue  # 챔피언 루프와 별도로만 처리
-
-                            if remaining_qty_for_strategy(lot_state, code, 5) > 0:
-                                logger.info(
-                                    "[ENTRY-SKIP] already owned in ledger: code=%s sid=5",
-                                    code,
-                                )
+                            if watch.get("date") != today_prefix:
                                 continue
-
+                            if not watch.get("eligible", True):
+                                continue
+                            if code in traded_today or code in holding:
+                                continue
+                            if remaining_qty_for_strategy(lot_state, code, SID_PULLBACK) > 0:
+                                continue
                             if _pending_block(traded, code, now_dt_kst, block_sec=45):
                                 logger.info(
                                     f"[PULLBACK-SKIP-PENDING] {code}: pending 쿨다운 중"
@@ -2929,94 +3073,143 @@ def main(
                                 )
                                 continue
 
-                            base_notional = int(info.get("notional") or 0)
+                            info = code_to_target.get(code) or {}
+                            base_notional = int(info.get("target_notional") or 0)
                             if base_notional <= 0:
-                                logger.info(f"[PULLBACK-SKIP] {code}: 예산 0")
                                 continue
 
-                            try:
-                                resp = _detect_pullback_reversal(
-                                    kis,
-                                    code,
-                                    lookback=PULLBACK_LOOKBACK,
-                                    pullback_days=PULLBACK_DAYS,
-                                    reversal_buffer_pct=PULLBACK_REVERSAL_BUFFER_PCT,
-                                )
-
-                                pullback_ok = False
-                                trigger_price = None
-
-                                if isinstance(resp, dict):
-                                    pullback_ok = bool(resp.get("setup")) and bool(
-                                        resp.get("reversing")
-                                    )
-                                    trigger_price = resp.get("reversal_price")
-                                    if not pullback_ok:
-                                        reason = resp.get("reason")
-                                        if reason:
-                                            logger.info(
-                                                f"[PULLBACK-SKIP] {code}: 패턴 미충족(reason={reason})"
-                                            )
-                                elif isinstance(resp, tuple):
-                                    if len(resp) >= 1:
-                                        pullback_ok = bool(resp[0])
-                                    if len(resp) >= 2:
-                                        trigger_price = resp[1]
-                                else:
-                                    pullback_ok = bool(resp)
-
-                            except Exception as e:
-                                logger.warning(f"[PULLBACK-FAIL] {code}: 스캔 실패 {e}")
-                                continue
-
-                            if not pullback_ok:
-                                continue
-
-                            if trigger_price is None:
-                                logger.info(f"[PULLBACK-SKIP] {code}: trigger_price None")
-                                continue
-
-                            qty = _notional_to_qty(kis, code, base_notional)
-                            if qty <= 0:
-                                logger.info(f"[PULLBACK-SKIP] {code}: 수량 산출 0")
-                                continue
-
-                            current_price = _safe_get_price(kis, code)
+                            price_res = _safe_get_price(kis, code, with_source=True)
+                            if isinstance(price_res, tuple):
+                                current_price, price_source = price_res
+                            else:
+                                current_price, price_source = price_res, None
                             if not current_price:
                                 logger.warning(f"[PULLBACK-PRICE] {code}: 현재가 조회 실패")
                                 continue
 
-                            if trigger_price and current_price < trigger_price * 0.98:
+                            candles = signals._get_intraday_1min(
+                                kis, code, count=max(120, MOM_SLOW * 3)
+                            )
+                            if not candles:
+                                gate_retry_after[code] = time.time() + 90
                                 logger.info(
-                                    f"[PULLBACK-DELAY] {code}: 가격이 트리거 대비 2% 이상 하락 → 대기 (cur={current_price}, trigger={trigger_price})"
+                                    "[GATE-RETRY] code=%s intraday_available=False -> retry scheduled",
+                                    code,
                                 )
                                 continue
 
+                            vwap_val = signals._compute_vwap_from_1min(candles)
+                            last_candle = candles[-1]
+                            last_close = _to_float(last_candle.get("close") or last_candle.get("price"), None)
+                            if not vwap_val or not last_close:
+                                continue
+
+                            since_candles = candles
+                            first_seen_ts = watch.get("first_seen_ts")
+                            if isinstance(first_seen_ts, str):
+                                try:
+                                    ts = datetime.fromisoformat(first_seen_ts)
+                                    cutoff = ts.strftime("%H%M%S")
+                                    filtered = [
+                                        c for c in candles
+                                        if str(c.get("time") or "") >= cutoff
+                                    ]
+                                    if filtered:
+                                        since_candles = filtered
+                                except Exception:
+                                    pass
+
+                            lows = [
+                                _to_float(c.get("low") or c.get("close") or c.get("price"), None)
+                                for c in since_candles
+                            ]
+                            lows = [v for v in lows if v is not None]
+                            cond_a = (
+                                bool(lows)
+                                and min(lows) <= float(vwap_val) * (1 - VWAP_TOL)
+                                and float(last_close) >= float(vwap_val)
+                            )
+
+                            cond_b = False
+                            candles_5m = signals.aggregate_1m_to_5m(since_candles)
+                            if len(candles_5m) >= 2:
+                                prev = candles_5m[-2]
+                                prev_high = _to_float(prev.get("high"), None)
+                                lows_5m = [
+                                    _to_float(c.get("low"), None) for c in candles_5m[:-1]
+                                ]
+                                lows_5m = [v for v in lows_5m if v is not None]
+                                if prev_high and lows_5m:
+                                    cond_b = float(last_close) >= float(prev_high) and min(lows_5m) < float(prev_high)
+
+                            if not (cond_a or cond_b):
+                                continue
+
+                            daily_ctx = normalize_daily_ctx(
+                                _compute_daily_entry_context(
+                                    kis, code, current_price, price_source
+                                )
+                            )
+                            intra_ctx = normalize_intraday_ctx(
+                                _compute_intraday_entry_context(
+                                    kis, code, fast=MOM_FAST, slow=MOM_SLOW
+                                )
+                            )
+                            trigger_state = signals.evaluate_trigger_gate(
+                                daily_ctx,
+                                intra_ctx,
+                                prev_price=None,
+                                target_price=None,
+                                trigger_name="breakout_cross",
+                            )
+                            if len(trigger_state.get("trigger_signals") or []) < 2:
+                                continue
+
+                            target_price = watch.get("target_price")
+                            if not target_price:
+                                continue
+                            chase_limit = float(target_price) * (1 + MAX_CHASE_PCT / 100.0)
+                            if current_price > chase_limit:
+                                logger.info(
+                                    "[GOVERNOR-BLOCK] code=%s reason=chase_exceeded last=%.2f limit=%.2f",
+                                    code,
+                                    float(current_price),
+                                    chase_limit,
+                                )
+                                continue
+
+                            qty = _notional_to_qty(kis, code, base_notional)
+                            if qty <= 0:
+                                continue
+
+                            limit_px = min(float(current_price), chase_limit)
                             flow_ok, flow_ctx, ob_strength = _subject_flow_gate(
                                 code,
                                 info,
                                 float(current_price),
-                                trigger_price,
-                                None,
+                                target_price,
+                                vwap_val,
                             )
                             if not flow_ok:
                                 continue
 
+                            pullback_reason = "vwap_reclaim" if cond_a else "five_min_reclaim"
                             prev_qty = int((holding.get(code) or {}).get("qty", 0))
                             if dry_run:
                                 logger.info(
-                                    "[DRY-RUN][BUY] code=%s qty=%s price=%s strategy_id=5",
+                                    "[DRY-RUN][BUY] code=%s qty=%s price=%s strategy_id=%s",
                                     code,
                                     int(qty),
-                                    trigger_price or current_price,
+                                    limit_px,
+                                    SID_PULLBACK,
                                 )
                                 runtime_state_store.mark_order(
                                     runtime_state,
                                     code,
                                     "BUY",
-                                    5,
+                                    SID_PULLBACK,
                                     int(qty),
-                                    float(trigger_price or current_price),
+                                    float(limit_px),
                                     now_dt_kst.isoformat(),
                                     status="submitted(dry)",
                                 )
@@ -3026,20 +3219,19 @@ def main(
                                 kis,
                                 code,
                                 int(qty),
-                                _round_to_tick(trigger_price or current_price),
+                                _round_to_tick(limit_px),
                             )
                             runtime_state_store.mark_order(
                                 runtime_state,
                                 code,
                                 "BUY",
-                                5,
+                                SID_PULLBACK,
                                 int(qty),
-                                float(trigger_price or current_price),
+                                float(limit_px),
                                 now_dt_kst.isoformat(),
                                 status="submitted",
                             )
                             _save_runtime_state()
-
                             if not _is_order_success(result):
                                 logger.warning(
                                     f"[PULLBACK-BUY-FAIL] {code}: result={result}"
@@ -3047,9 +3239,7 @@ def main(
                                 continue
 
                             triggered_today.add(code)
-                            exec_price = _extract_fill_price(
-                                result, trigger_price or current_price
-                            )
+                            exec_price = _extract_fill_price(result, limit_px)
                             _record_trade(
                                 traded,
                                 code,
@@ -3063,45 +3253,41 @@ def main(
                             )
                             traded_today.add(code)
                             save_state(holding, traded)
-                            pullback_meta = {}
-                            if isinstance(resp, dict):
-                                pullback_meta = {
-                                    "pullback_peak_price": resp.get("peak_price"),
-                                    "pullback_reversal_price": resp.get("reversal_price"),
-                                    "pullback_reason": resp.get("reason"),
-                                }
                             pending_buy_orders.append(
                                 {
                                     "code": code,
                                     "qty": int(qty),
                                     "exec_price": float(exec_price),
-                                    "strategy_id": 5,
-                                    "trigger_label": "pullback",
-                                    "k_value": None,
-                                    "target_price": trigger_price,
+                                    "strategy_id": SID_PULLBACK,
+                                    "trigger_label": "pullback_reentry",
+                                    "k_value": info.get("best_k"),
+                                    "target_price": target_price,
                                     "gate": {},
-                                    "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                    "strategy": "전략2: 눌림 재진입",
                                     "trade_ctx": {
                                         "datetime": now_str,
                                         "code": code,
                                         "name": info.get("name"),
                                         "qty": int(qty),
-                                        "K": None,
-                                        "target_price": trigger_price,
-                                        "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
-                                        "strategy_id": 5,
+                                        "K": info.get("best_k"),
+                                        "target_price": target_price,
+                                        "strategy": "전략2: 눌림 재진입",
+                                        "strategy_id": SID_PULLBACK,
                                         "side": "BUY",
                                     },
                                     "result": result,
                                     "now_ts": now_dt_kst.isoformat(),
                                     "pending_since": now_str,
                                     "prev_qty": prev_qty,
-                                    "entry_reason": "PULLBACK-SETUP + REVERSAL",
+                                    "entry_reason": "PULLBACK-INTRADAY",
                                     "order_type": "marketable_limit",
                                     "gap_pct_at_entry": None,
                                     "rebalance_date": str(rebalance_date),
                                     "lot_ts": now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
-                                    "meta": pullback_meta,
+                                    "meta": {
+                                        "pullback_reversal_price": vwap_val,
+                                        "pullback_reason": pullback_reason,
+                                    },
                                 }
                             )
                             pullback_buys_today += 1
@@ -3116,6 +3302,189 @@ def main(
                 if pending_buy_orders:
                     balances_after_pullback = _refresh_balances_snapshot("pullback_buy_batch")
                     _finalize_pending_buys(pending_buy_orders, balances_after_pullback)
+
+                # ====== 전략3: 라스트아워 베팅 (14:10~14:35) ======
+                last_hour_start = dtime(14, 10)
+                last_hour_end = dtime(14, 35)
+                if is_open and last_hour_start <= now_dt_kst.time() <= last_hour_end:
+                    last_hour_codes = set(code_to_target.keys()) | set(breakout_watch.keys())
+                    for code in sorted(last_hour_codes):
+                        if code in holding or code in traded_today or code in triggered_today:
+                            continue
+                        if remaining_qty_for_strategy(lot_state, code, SID_LASTHOUR) > 0:
+                            continue
+                        info = code_to_target.get(code) or {"code": code}
+                        base_notional = int(info.get("target_notional") or 0)
+                        if base_notional <= 0:
+                            continue
+                        price_res = _safe_get_price(kis, code, with_source=True)
+                        if isinstance(price_res, tuple):
+                            current_price, price_source = price_res
+                        else:
+                            current_price, price_source = price_res, None
+                        if not current_price:
+                            continue
+                        candles = signals._get_intraday_1min(
+                            kis, code, count=max(120, MOM_SLOW * 3)
+                        )
+                        if not candles:
+                            continue
+                        vwap_val = signals._compute_vwap_from_1min(candles)
+                        if not vwap_val or float(current_price) < float(vwap_val):
+                            continue
+                        highs = [
+                            _to_float(c.get("high") or c.get("close") or c.get("price"), None)
+                            for c in candles
+                        ]
+                        lows = [
+                            _to_float(c.get("low") or c.get("close") or c.get("price"), None)
+                            for c in candles
+                        ]
+                        highs = [v for v in highs if v is not None]
+                        lows = [v for v in lows if v is not None]
+                        if not highs or not lows:
+                            continue
+                        day_high = max(highs)
+                        day_low = min(lows)
+                        if day_high <= day_low:
+                            continue
+                        range_pos = (float(current_price) - day_low) / (day_high - day_low)
+                        if range_pos < 0.7:
+                            continue
+
+                        daily_ctx = normalize_daily_ctx(
+                            _compute_daily_entry_context(
+                                kis, code, current_price, price_source
+                            )
+                        )
+                        intra_ctx = normalize_intraday_ctx(
+                            _compute_intraday_entry_context(
+                                kis, code, fast=MOM_FAST, slow=MOM_SLOW
+                            )
+                        )
+                        trigger_state = signals.evaluate_trigger_gate(
+                            daily_ctx,
+                            intra_ctx,
+                            prev_price=None,
+                            target_price=None,
+                            trigger_name="close_betting",
+                        )
+                        if len(trigger_state.get("trigger_signals") or []) < 2:
+                            continue
+
+                        flow_ok, flow_ctx, ob_strength = _subject_flow_gate(
+                            code,
+                            info,
+                            float(current_price),
+                            None,
+                            vwap_val,
+                        )
+                        if not flow_ok:
+                            continue
+
+                        qty = _notional_to_qty(kis, code, int(base_notional * 0.4))
+                        if qty <= 0:
+                            continue
+
+                        if guards.should_no_trade(open_ts, now_dt_kst):
+                            logger.info("[GOVERNOR-BLOCK] code=%s reason=no_trade_window", code)
+                            continue
+                        code_key = normalize_code(code)
+                        if code_key in reentry_state and not guards.can_reenter(
+                            {"last_exit": {code_key: {"time": reentry_state[code_key]}}},
+                            code_key,
+                            now_dt_kst,
+                        ):
+                            logger.info("[GOVERNOR-BLOCK] code=%s reason=reenter_cooldown", code)
+                            continue
+
+                        limit_px = _round_to_tick(float(current_price))
+                        if dry_run:
+                            logger.info(
+                                "[DRY-RUN][BUY] code=%s qty=%s price=%s strategy_id=%s",
+                                code,
+                                int(qty),
+                                limit_px,
+                                SID_LASTHOUR,
+                            )
+                            runtime_state_store.mark_order(
+                                runtime_state,
+                                code,
+                                "BUY",
+                                SID_LASTHOUR,
+                                int(qty),
+                                float(limit_px),
+                                now_dt_kst.isoformat(),
+                                status="submitted(dry)",
+                            )
+                            _save_runtime_state()
+                            continue
+                        result = place_buy_with_fallback(
+                            kis, code, int(qty), limit_px
+                        )
+                        runtime_state_store.mark_order(
+                            runtime_state,
+                            code,
+                            "BUY",
+                            SID_LASTHOUR,
+                            int(qty),
+                            float(limit_px),
+                            now_dt_kst.isoformat(),
+                            status="submitted",
+                        )
+                        _save_runtime_state()
+                        if not _is_order_success(result):
+                            continue
+
+                        triggered_today.add(code)
+                        exec_price = _extract_fill_price(result, limit_px)
+                        _record_trade(
+                            traded,
+                            code,
+                            {
+                                "buy_time": now_str,
+                                "qty": int(qty),
+                                "price": float(exec_price),
+                                "status": "pending",
+                                "pending_since": now_str,
+                            },
+                        )
+                        traded_today.add(code)
+                        pending_buy_orders.append(
+                            {
+                                "code": code,
+                                "qty": int(qty),
+                                "exec_price": float(exec_price),
+                                "strategy_id": SID_LASTHOUR,
+                                "trigger_label": "close_betting",
+                                "k_value": info.get("best_k"),
+                                "target_price": None,
+                                "gate": {},
+                                "strategy": "전략3: 라스트아워",
+                                "trade_ctx": {
+                                    "datetime": now_str,
+                                    "code": code,
+                                    "name": info.get("name"),
+                                    "qty": int(qty),
+                                    "K": info.get("best_k"),
+                                    "target_price": None,
+                                    "strategy": "전략3: 라스트아워",
+                                    "strategy_id": SID_LASTHOUR,
+                                    "side": "BUY",
+                                },
+                                "result": result,
+                                "now_ts": now_dt_kst.isoformat(),
+                                "pending_since": now_str,
+                                "prev_qty": int((holding.get(code) or {}).get("qty", 0)),
+                                "entry_reason": "LAST-HOUR",
+                                "order_type": "marketable_limit",
+                                "gap_pct_at_entry": None,
+                                "rebalance_date": str(rebalance_date),
+                                "lot_ts": now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
+                            }
+                        )
+                        save_state(holding, traded)
+                        time.sleep(RATE_SLEEP_SEC)
 
                 # ====== (A) 비타겟 보유분도 장중 능동관리 ======
                 if is_open:

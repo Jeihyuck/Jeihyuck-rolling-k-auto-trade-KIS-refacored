@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 RUNTIME_STATE_DIR = Path(".runtime")
 RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
+BREAKOUT_WATCH_PATH = Path(__file__).parent / "state" / "breakout_watch.json"
 
 
 def _default_runtime_state() -> Dict[str, Any]:
@@ -241,3 +243,23 @@ def save_lot_state(path_json: str, state: Dict[str, Any]) -> None:
         os.replace(tmp_path, path)
     except Exception:
         logger.exception("[STATE_STORE] failed to save %s", path_json)
+
+
+def load_breakout_watch() -> Dict[str, Any]:
+    if not BREAKOUT_WATCH_PATH.exists():
+        return {}
+    try:
+        with open(BREAKOUT_WATCH_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        logger.exception("[BREAKOUT_WATCH] failed to load %s", BREAKOUT_WATCH_PATH)
+        return {}
+
+
+def save_breakout_watch(state: Dict[str, Any]) -> None:
+    try:
+        BREAKOUT_WATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(BREAKOUT_WATCH_PATH, state or {})
+    except Exception:
+        logger.exception("[BREAKOUT_WATCH] failed to save %s", BREAKOUT_WATCH_PATH)

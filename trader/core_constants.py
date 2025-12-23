@@ -33,6 +33,7 @@ DAILY_CAPITAL = config.DAILY_CAPITAL
 CAP_CAP = config.CAP_CAP
 SLIPPAGE_LIMIT_PCT = config.SLIPPAGE_LIMIT_PCT
 SLIPPAGE_ENTER_GUARD_PCT = config.SLIPPAGE_ENTER_GUARD_PCT
+MAX_CHASE_PCT = config.MAX_CHASE_PCT
 VWAP_TOL = config.VWAP_TOL
 W_MAX_ONE = config.W_MAX_ONE
 W_MIN_ONE = config.W_MIN_ONE
@@ -93,6 +94,7 @@ __all__ = [
     "CAP_CAP",
     "SLIPPAGE_LIMIT_PCT",
     "SLIPPAGE_ENTER_GUARD_PCT",
+    "MAX_CHASE_PCT",
     "VWAP_TOL",
     "W_MAX_ONE",
     "W_MIN_ONE",
@@ -127,4 +129,3 @@ __all__ = [
     "STATE_WEEKLY_PATH",
     "_this_iso_week_key",
 ]
-

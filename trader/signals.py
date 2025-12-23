@@ -56,6 +56,7 @@ __all__ = [
     "is_good_entry",
     "evaluate_setup_gate",
     "evaluate_trigger_gate",
+    "aggregate_1m_to_5m",
     "_get_intraday_1min",
     "_compute_vwap_from_1min",
     "_compute_intraday_momentum",
@@ -788,6 +789,7 @@ def evaluate_setup_gate(
 ) -> Dict[str, Any]:
     missing_conditions: List[str] = []
     reasons = _collect_bad_entry_reasons(daily_ctx, intraday_ctx, regime_state)
+    retryable = False
 
     if daily_ctx.get("data_insufficient"):
         daily_count = daily_ctx.get("daily_count")
@@ -803,8 +805,10 @@ def evaluate_setup_gate(
 
     if not intraday_ctx or not intraday_ctx.get("intraday_available"):
         reasons.append("intraday_unavailable")
+        retryable = True
     elif not intraday_ctx.get("vwap_enabled"):
         reasons.append("intraday_unavailable")
+        retryable = True
 
     down_streak = daily_ctx.get("down_streak")
     if down_streak is not None and int(down_streak) < 2:
@@ -838,6 +842,7 @@ def evaluate_setup_gate(
         "ok": ok,
         "missing_conditions": missing_conditions,
         "reasons": reasons,
+        "retryable": retryable,
     }
 
 
@@ -1040,6 +1045,52 @@ def _compute_intraday_momentum(candles: List[Dict[str, Any]], fast: int = MOM_FA
     if slow_ma <= 0:
         return 0.0
     return (fast_ma - slow_ma) / slow_ma * 100.0
+
+
+def aggregate_1m_to_5m(candles_1m: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not candles_1m:
+        return []
+    candles = list(candles_1m)
+    if candles and "time" in candles[0]:
+        candles = sorted(candles, key=lambda c: str(c.get("time") or ""))
+    aggregated: List[Dict[str, Any]] = []
+    bucket: List[Dict[str, Any]] = []
+    for candle in candles:
+        bucket.append(candle)
+        if len(bucket) < 5:
+            continue
+        open_px = _to_float(
+            bucket[0].get("open") or bucket[0].get("close") or bucket[0].get("price"),
+            None,
+        )
+        close_px = _to_float(
+            bucket[-1].get("close") or bucket[-1].get("price"),
+            None,
+        )
+        highs = [
+            _to_float(c.get("high") or c.get("close") or c.get("price"), 0.0)
+            for c in bucket
+        ]
+        lows = [
+            _to_float(c.get("low") or c.get("close") or c.get("price"), 0.0)
+            for c in bucket
+        ]
+        volumes = [
+            _to_float(c.get("volume") or c.get("trade_volume") or 0.0, 0.0)
+            for c in bucket
+        ]
+        aggregated.append(
+            {
+                "time": bucket[-1].get("time"),
+                "open": open_px,
+                "high": max(highs) if highs else None,
+                "low": min(lows) if lows else None,
+                "close": close_px,
+                "volume": sum(volumes),
+            }
+        )
+        bucket = []
+    return aggregated
 
 def is_strong_momentum_vwap(kis: KisAPI, code: str) -> bool:
     """

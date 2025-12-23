@@ -801,43 +801,57 @@ class KisAPI:
 
         last_err = None
 
+        start_candidates = [start_hhmm, "091000", "092000"]
+        start_candidates = [
+            s for i, s in enumerate(start_candidates) if s and s not in start_candidates[:i]
+        ]
+        retry_counts = [120, 80, 40]
+
         for tr in _pick_tr(self.env, "INTRADAY_CHART"):
             headers = self._headers(tr)
             headers.setdefault("accept", "*/*")
             headers.setdefault("tr_cont", "N")
             headers.setdefault("Connection", "keep-alive")
 
-            params = {
-                "fid_cond_mrkt_div_code": market_code,
-                "fid_input_iscd": iscd,
-                "fid_input_hour_1": start_hhmm,
-                "fid_pw_data_incu_yn": "Y",
-                "fid_etc_cls_code": "",
-            }
-
-            for attempt in range(1, 4):
-                try:
-                    resp = self._safe_request(
-                        "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    logger.debug("[INTRADAY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
-                except requests.exceptions.SSLError as e:
-                    last_err = e
-                    logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except requests.exceptions.RequestException as e:
-                    last_err = e
-                    logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except ValueError as e:
-                    last_err = e
-                    logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.35 + random.uniform(0, 0.15))
-                    continue
+            for start_idx, start in enumerate(start_candidates):
+                for attempt in range(1, 4):
+                    req_count = retry_counts[min(attempt - 1, len(retry_counts) - 1)]
+                    params = {
+                        "fid_cond_mrkt_div_code": market_code,
+                        "fid_input_iscd": iscd,
+                        "fid_input_hour_1": start,
+                        "fid_pw_data_incu_yn": "Y",
+                        "fid_etc_cls_code": "",
+                    }
+                    try:
+                        resp = self._safe_request(
+                            "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        logger.debug(
+                            "[INTRADAY_RAW_JSON] %s TR=%s attempt=%d start=%s → %s",
+                            iscd,
+                            tr,
+                            attempt,
+                            start,
+                            data,
+                        )
+                    except requests.exceptions.SSLError as e:
+                        last_err = e
+                        logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                        time.sleep(0.4 * attempt)
+                        continue
+                    except requests.exceptions.RequestException as e:
+                        last_err = e
+                        logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                        time.sleep(0.4 * attempt)
+                        continue
+                    except ValueError as e:
+                        last_err = e
+                        logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
+                        time.sleep(0.35 + random.uniform(0, 0.15))
+                        continue
                 except Exception as e:
                     last_err = e
                     logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
@@ -848,33 +862,43 @@ class KisAPI:
                     time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
-                arr = data.get("output2") or []
-                if resp.status_code == 200 and arr:
-                    rows: List[Dict[str, Any]] = []
-                    for r in arr:
-                        try:
-                            hhmmss = r.get("stck_cntg_hour")
-                            price = r.get("stck_prpr")
-                            vol = r.get("cntg_vol")
-                            if hhmmss and price is not None and vol is not None:
-                                rows.append({
-                                    "time": str(hhmmss),
-                                    "price": float(price),
-                                    "volume": float(vol),
-                                })
-                        except Exception as e:
-                            logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+                    arr = data.get("output2") or []
+                    if resp.status_code == 200 and arr:
+                        rows: List[Dict[str, Any]] = []
+                        for r in arr:
+                            try:
+                                hhmmss = r.get("stck_cntg_hour")
+                                price = r.get("stck_prpr")
+                                vol = r.get("cntg_vol")
+                                if hhmmss and price is not None and vol is not None:
+                                    rows.append({
+                                        "time": str(hhmmss),
+                                        "price": float(price),
+                                        "volume": float(vol),
+                                    })
+                            except Exception as e:
+                                logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
 
-                    rows.sort(key=lambda x: x["time"])
-                    if len(rows) == 0:
-                        raise DataEmptyError(f"A{iscd} 0 intraday candles")
-                    return rows
+                        rows.sort(key=lambda x: x["time"])
+                        if len(rows) == 0:
+                            raise DataEmptyError(f"A{iscd} 0 intraday candles")
+                        return rows
 
-                last_err = RuntimeError(
-                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
-                )
-                logger.warning("[INTRADAY_BAD_RESP] %s %s", iscd, data)
-                time.sleep(0.4 + random.uniform(0, 0.2))
+                    msg = f"{data.get('msg_cd') or ''}:{data.get('msg1') or ''}".strip(":")
+                    logger.warning(
+                        "[INTRADAY-FETCH-FAIL] code=%s http=%s rt_cd=%s msg=%s output2_len=%s retry=%s count=%s",
+                        iscd,
+                        resp.status_code,
+                        data.get("rt_cd"),
+                        msg,
+                        len(arr),
+                        attempt + (start_idx * 3),
+                        req_count,
+                    )
+                    last_err = RuntimeError(
+                        f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
+                    )
+                    time.sleep(0.4 + random.uniform(0, 0.2))
 
         if last_err:
             raise last_err

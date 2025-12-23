@@ -28,6 +28,7 @@ from pykrx.stock import (
 )
 
 from trader.rkmax_utils import get_best_k_meta, assign_weights, _enforce_min_weight_for_forced
+from trader.strategy_ids import SID_BREAKOUT, SID_SWING
 from .simulate_with_k_and_get_metrics import simulate_with_k_and_get_metrics
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 
@@ -41,12 +42,11 @@ def _infer_strategy_from_metrics(
     sharpe_m: float,
     forced: bool = False,
 ) -> tuple[int, str]:
-    """Infer strategy_id(1~4) from backtest/meta metrics.
+    """Infer strategy_id from backtest/meta metrics.
 
     목적:
-    - trader/legacy_kosdaq_runner.py가 전략별 트리거 게이트(1~4)를 실제로 분기할 수 있도록
-      리밸런싱 결과에 strategy_id/strategy 라벨을 주입한다.
-    - 전략5(눌림목)는 USE_PULLBACK_ENTRY 경로로 별도 실행되므로 여기서는 1~4만 할당한다.
+    - 리밸런싱 결과에 strategy_id/strategy 라벨을 주입한다.
+    - 전략2/3은 상황 트리거에서만 사용하므로 여기서 할당하지 않는다.
 
     NOTE: 이 로직은 '전략을 실제로 돌릴 수 있게 만드는 라우팅'이 목적이며,
           최종 수익 최적화는 별도의 튜닝(임계값/가중치)로 개선 가능하다.
@@ -58,25 +58,17 @@ def _infer_strategy_from_metrics(
         sharpe_m = float(sharpe_m or 0.0)
         trades = int(trades or 0)
     except Exception:
-        return 1, "전략1: 돌파(기본)"
+        return SID_BREAKOUT, "전략1: 돌파(기본)"
 
     # 강제 포함(보유 유지 등)인 경우: 과한 필터를 피하기 위해 기본전략으로 둔다
     if forced:
-        return 1, "전략1: 돌파(기본)"
+        return SID_BREAKOUT, "전략1: 돌파(기본)"
 
     # Champion/Close-betting 성격: 리스크가 낮고(낮은 MDD), 성과/샤프가 높은 종목
     if sharpe_m >= 2.0 and avg_return > 0.0 and mdd <= 8.0 and trades >= 4:
-        return 4, "전략4: Champion/종가베팅"
+        return SID_SWING, "전략5: 스윙(챔피언)"
 
-    # VWAP reclaim 성격: 승률이 높고 거래가 적당히 발생
-    if win_rate >= 60.0 and trades >= 6:
-        return 3, "전략3: VWAP 리클레임"
-
-    # Range/Box breakout 성격: 거래 빈도가 높은 편
-    if trades >= 12:
-        return 2, "전략2: 박스/전고점 돌파"
-
-    return 1, "전략1: 돌파(기본)"
+    return SID_BREAKOUT, "전략1: 돌파(기본)"
 
 # -----------------------------
 # 환경 파라미터 (튜닝 가능)
@@ -371,7 +363,7 @@ def _calc_best_k_for_universe(
                 logger.debug(f"[SKIP] {name}({code}) 전월 데이터 없음")
                 if code in forced_codes and KEEP_HELD_BYPASS_FILTERS:
                     results[code] = {
-                        "code": code, "name": name, "market": market, "best_k": 0.5, "strategy_id": 1, "strategy": "전략1: 돌파(기본)",
+                        "code": code, "name": name, "market": market, "best_k": 0.5, "strategy_id": SID_BREAKOUT, "strategy": "전략1: 돌파(기본)",
                         "avg_return_pct": 0.0, "win_rate_pct": 0.0,
                         "mdd_pct": 0.0, "trades": 0, "cumulative_return_pct": 0.0,
                         "avg_holding_days": 0.0, "sharpe_m": 0.0,
@@ -402,7 +394,7 @@ def _calc_best_k_for_universe(
                 logger.debug(f"[SKIP] {name}({code}) trades<{MIN_TRADES}")
                 if code in forced_codes and KEEP_HELD_BYPASS_FILTERS:
                     results[code] = {
-                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": 1, "strategy": "전략1: 돌파(기본)",
+                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": SID_BREAKOUT, "strategy": "전략1: 돌파(기본)",
                         "avg_return_pct": avg_return, "win_rate_pct": win_rate,
                         "mdd_pct": mdd, "trades": trades, "cumulative_return_pct": cumret,
                         "avg_holding_days": avg_hold, "sharpe_m": sharpe_m,
@@ -417,7 +409,7 @@ def _calc_best_k_for_universe(
                 logger.debug(f"[SKIP] {name}({code}) mdd>{MAX_MDD_PCT}")
                 if code in forced_codes and KEEP_HELD_BYPASS_FILTERS:
                     results[code] = {
-                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": 1, "strategy": "전략1: 돌파(기본)",
+                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": SID_BREAKOUT, "strategy": "전략1: 돌파(기본)",
                         "avg_return_pct": avg_return, "win_rate_pct": win_rate,
                         "mdd_pct": mdd, "trades": trades, "cumulative_return_pct": cumret,
                         "avg_holding_days": avg_hold, "sharpe_m": sharpe_m,
@@ -432,7 +424,7 @@ def _calc_best_k_for_universe(
                 logger.debug(f"[SKIP] {name}({code}) avg_return<=0")
                 if code in forced_codes and KEEP_HELD_BYPASS_FILTERS:
                     results[code] = {
-                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": 1, "strategy": "전략1: 돌파(기본)",
+                        "code": code, "name": name, "market": market, "best_k": best_k, "strategy_id": SID_BREAKOUT, "strategy": "전략1: 돌파(기본)",
                         "avg_return_pct": avg_return, "win_rate_pct": win_rate,
                         "mdd_pct": mdd, "trades": trades, "cumulative_return_pct": cumret,
                         "avg_holding_days": avg_hold, "sharpe_m": sharpe_m,
