@@ -8,8 +8,9 @@ from pathlib import Path
 import re
 from typing import Any, Dict, Iterable
 
-from .config import KST
+from .config import KST, STATE_PATH
 from .code_utils import normalize_code
+from .state_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
                 strategies.pop(sid, None)
                 continue
             if sid in {"ORPHAN", "UNKNOWN"}:
+                # legacy migration only: map deprecated sid to MANUAL
                 strategies.pop(sid, None)
                 sid = "MANUAL"
                 strategies.setdefault(sid, entry)
@@ -97,7 +99,7 @@ def _coerce_state(state: Dict[str, Any]) -> Dict[str, Any]:
             meta["high"] = max(float(meta.get("high") or 0.0), avg_price)
             entry.setdefault("code", code_key)
             entry.setdefault("sid", str(sid))
-            entry.setdefault("engine", entry.get("entry", {}).get("engine"))
+            entry.setdefault("engine", entry.get("entry", {}).get("engine") or "reconcile")
             entry.setdefault("entry_ts", entry.get("entry", {}).get("time"))
             entry.setdefault("high_watermark", float(meta.get("high") or avg_price))
             entry["high_watermark"] = max(
@@ -211,15 +213,21 @@ def load_position_state(path: str) -> Dict[str, Any]:
 def save_position_state(path: str, state: Dict[str, Any]) -> None:
     path_obj = Path(path)
     try:
-        path_obj.parent.mkdir(parents=True, exist_ok=True)
         payload = _coerce_state(dict(state))
         payload["updated_at"] = datetime.now(KST).isoformat()
-        tmp_path = path_obj.with_name(f"{path_obj.name}.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path_obj)
+        atomic_write_json(path_obj, payload)
     except Exception:
         logger.exception("[STATE] failed to save %s", path_obj)
+
+
+def load_state(path: str | None = None) -> Dict[str, Any]:
+    path_value = path or str(STATE_PATH)
+    return load_position_state(path_value)
+
+
+def save_state_atomic(state: Dict[str, Any], path: str | None = None) -> None:
+    path_value = path or str(STATE_PATH)
+    save_position_state(path_value, state)
 
 
 def _orphan_entry(code: str, qty: int, avg_price: float | None) -> Dict[str, Any]:
@@ -494,6 +502,7 @@ def reconcile_positions(
 
         for sid in list(strategies.keys()):
             if sid in {"ORPHAN", "UNKNOWN"}:
+                # legacy migration only: map deprecated sid to MANUAL
                 strategies.pop(sid, None)
                 sid_key, engine = _fallback_sid()
                 now_ts = datetime.now(KST).isoformat()

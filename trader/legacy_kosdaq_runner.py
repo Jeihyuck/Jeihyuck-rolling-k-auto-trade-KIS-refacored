@@ -159,6 +159,8 @@ def main(
     position_state_path = str(STATE_PATH)
     position_state = load_position_state(position_state_path)
     position_state_dirty = False
+    sell_reconcile_needed = False
+    pending_buy_orders: list[dict[str, Any]] = []
     runtime_state = runtime_state_store.load_state()
     triggered_today: set[str] = set()
     s1_done_today: set[tuple[str, str]] = set()
@@ -262,6 +264,161 @@ def main(
         after_signature = _lot_state_signature(lot_state)
         if after_signature != before_signature:
             save_lot_state(lot_state_path, lot_state)
+
+    def _refresh_balances_snapshot(reason: str) -> List[Dict[str, Any]]:
+        try:
+            balances = _fetch_balances(kis, ttl_sec=0)
+        except TypeError:
+            balances = _fetch_balances(kis)
+        logger.info("[BALANCE-REFRESH] reason=%s count=%s", reason, len(balances))
+        return balances
+
+    def _balance_qty(balances: List[Dict[str, Any]], code: str) -> int:
+        code_key = normalize_code(code)
+        if not code_key:
+            return 0
+        for row in balances:
+            if normalize_code(row.get("code") or row.get("pdno")) != code_key:
+                continue
+            return int(row.get("qty") or 0)
+        return 0
+
+    def _finalize_pending_buys(
+        pending_orders: List[Dict[str, Any]],
+        balances: List[Dict[str, Any]],
+    ) -> None:
+        nonlocal position_state, position_state_dirty
+        if not pending_orders:
+            return
+        for pending in list(pending_orders):
+            code = pending.get("code")
+            if not code:
+                pending_orders.remove(pending)
+                continue
+            prev_qty = int(pending.get("prev_qty") or 0)
+            new_qty = _balance_qty(balances, code)
+            delta_qty = max(0, int(new_qty) - int(prev_qty))
+            if delta_qty <= 0:
+                logger.warning(
+                    "[BUY-PENDING] %s: balance not updated yet (prev=%s new=%s)",
+                    normalize_code(code),
+                    prev_qty,
+                    new_qty,
+                )
+                continue
+
+            fill_qty = min(int(pending.get("qty") or 0), delta_qty)
+            exec_price = float(pending.get("exec_price") or 0.0)
+            strategy_id = pending.get("strategy_id")
+            trigger_label = pending.get("trigger_label")
+            k_value = pending.get("k_value")
+            target_price = pending.get("target_price")
+            gate = pending.get("gate") or {}
+            meta = pending.get("meta") or {}
+            trade_ctx = pending.get("trade_ctx") or {}
+            now_ts = pending.get("now_ts")
+            result = pending.get("result") or {}
+
+            traded[normalize_code(code)] = {
+                "buy_time": pending.get("pending_since") or now_ts,
+                "qty": int(fill_qty),
+                "price": float(exec_price),
+                "status": "filled",
+                "pending_since": None,
+            }
+            runtime_state_store.mark_fill(
+                runtime_state,
+                code,
+                "BUY",
+                strategy_id,
+                int(fill_qty),
+                float(exec_price),
+                now_ts or datetime.now(KST).isoformat(),
+                status="filled",
+            )
+            _save_runtime_state()
+
+            holding[normalize_code(code)] = {
+                "qty": int(new_qty),
+                "buy_price": float(exec_price),
+                "bear_s1_done": False,
+                "bear_s2_done": False,
+            }
+
+            _init_position_state(
+                kis,
+                holding,
+                code,
+                float(exec_price),
+                int(fill_qty),
+                k_value,
+                target_price,
+            )
+            position_state = record_entry_state(
+                state=position_state,
+                code=code,
+                qty=int(fill_qty),
+                avg_price=float(exec_price),
+                strategy_id=strategy_id,
+                engine=trigger_label,
+                entry_reason=pending.get("entry_reason") or "SETUP-OK + TRIGGER-YES",
+                order_type=pending.get("order_type") or "marketable_limit",
+                best_k=k_value,
+                tgt_px=target_price,
+                gap_pct_at_entry=pending.get("gap_pct_at_entry"),
+                meta=meta,
+                entry_time=now_ts,
+            )
+            position_state_dirty = True
+
+            lot_id = _build_lot_id(
+                result,
+                pending.get("lot_ts") or datetime.now(KST).strftime("%Y%m%d%H%M%S%f"),
+                code,
+            )
+            before_lot_signature = _lot_state_signature(lot_state)
+            record_buy_fill(
+                lot_state,
+                lot_id=lot_id,
+                pdno=code,
+                strategy_id=strategy_id,
+                engine=f"legacy_kosdaq_runner:sid{strategy_id}",
+                entry_ts=now_ts or datetime.now(KST).isoformat(),
+                entry_price=float(exec_price),
+                qty=int(fill_qty),
+                meta={
+                    "strategy_name": pending.get("strategy"),
+                    "entry_reason": pending.get("entry_reason") or "SETUP-OK + TRIGGER-YES",
+                    "strategy_gate": gate,
+                    "pullback_meta": meta,
+                    "k": k_value,
+                    "target_price": target_price,
+                    "best_k": k_value,
+                    "tgt_px": target_price,
+                    "engine": "legacy_kosdaq_runner",
+                    "rebalance_date": pending.get("rebalance_date"),
+                },
+            )
+            logger.info(
+                "[LEDGER][BUY] code=%s sid=%s lot_id=%s qty=%s",
+                normalize_code(code),
+                strategy_id,
+                lot_id,
+                fill_qty,
+            )
+            _maybe_save_lot_state(before_lot_signature)
+
+            log_trade(
+                {
+                    **trade_ctx,
+                    "price": float(exec_price),
+                    "amount": int(float(exec_price) * int(fill_qty)),
+                    "result": result,
+                }
+            )
+            pending_orders.remove(pending)
+        save_state(holding, traded)
+        _save_position_state_now()
 
     def _ensure_position_entry(
         code: str, strategy_id: int | str
@@ -563,29 +720,6 @@ def main(
             fill_seq = "0"
         return f"{kis.CANO}-{kis.ACNT_PRDT_CD}-{order_no}-{fill_seq}"
 
-    def _estimate_sold_qty(
-        code: str, requested_qty: int, prev_qty: int, delay_sec: float = 1.0
-    ) -> int:
-        if requested_qty <= 0:
-            return 0
-        try:
-            time.sleep(delay_sec)
-            try:
-                balances = _fetch_balances(kis, ttl_sec=0)
-            except TypeError:
-                balances = _fetch_balances(kis)
-        except Exception:
-            return int(requested_qty)
-        for row in balances:
-            if normalize_code(row.get("code")) != normalize_code(code):
-                continue
-            new_qty = int(row.get("qty") or 0)
-            sold = max(0, int(prev_qty) - int(new_qty))
-            if sold <= 0:
-                return 0
-            return min(int(requested_qty), int(sold))
-        return int(requested_qty)
-
     def _sync_position_state_qty(code: str) -> None:
         nonlocal position_state_dirty
         code_key = normalize_code(code)
@@ -627,6 +761,7 @@ def main(
         prev_qty_before: int | None = None,
         allow_blocked: bool = False,
     ) -> None:
+        nonlocal sell_reconcile_needed
         if not _is_order_success(result):
             return
         if scope != "strategy" and not (SELL_ALL_BALANCES_AT_CUTOFF or EMERGENCY_GLOBAL_SELL):
@@ -638,26 +773,7 @@ def main(
             if prev_qty_before is not None
             else (holding.get(code) or {}).get("qty") or requested_qty
         )
-        sold_qty = 0
-        for delay_sec in (0.5, 1.0, 2.0):
-            sold_qty = _estimate_sold_qty(
-                code, requested_qty, prev_qty, delay_sec=delay_sec
-            )
-            if sold_qty > 0:
-                break
-        if sold_qty <= 0:
-            logger.warning(
-                "[SELL-ALLOC] sold_qty unresolved: code=%s requested=%s prev_qty=%s",
-                normalize_code(code),
-                requested_qty,
-                prev_qty,
-            )
-            try:
-                balances = _fetch_balances(kis, ttl_sec=0)
-            except TypeError:
-                balances = _fetch_balances(kis)
-            reconcile_with_broker_holdings(lot_state, balances)
-            return
+        sold_qty = min(int(requested_qty), int(prev_qty)) if prev_qty > 0 else int(requested_qty)
         if scope == "strategy" and trigger_strategy_id is None:
             raise RuntimeError(
                 f"[SELL-ALLOC] strategy scope requires trigger_strategy_id: code={code}"
@@ -733,33 +849,19 @@ def main(
         expected_before = before_qty_strategy
         expected_after = max(0, int(expected_before) - int(sold_total))
         if after_qty_strategy != expected_after:
-            resolved = False
-            for delay_sec in (0.5, 1.0, 2.0):
-                time.sleep(delay_sec)
-                retry_sold = _estimate_sold_qty(code, requested_qty, prev_qty, delay_sec=0)
-                retry_expected = max(0, int(expected_before) - int(retry_sold))
-                if after_qty_strategy == retry_expected:
-                    resolved = True
-                    break
-            if not resolved:
-                logger.warning(
-                    "[SELL-ALLOC] ledger mismatch: code=%s sid=%s before=%s sold=%s after=%s"
-                    % (
-                        normalize_code(code),
-                        trigger_strategy_id,
-                        expected_before,
-                        sold_total,
-                        after_qty_strategy,
-                    )
-                )
-                try:
-                    balances = _fetch_balances(kis, ttl_sec=0)
-                except TypeError:
-                    balances = _fetch_balances(kis)
-                reconcile_with_broker_holdings(lot_state, balances)
+            logger.warning(
+                "[SELL-ALLOC] ledger mismatch: code=%s sid=%s before=%s sold=%s after=%s",
+                normalize_code(code),
+                trigger_strategy_id,
+                expected_before,
+                sold_total,
+                after_qty_strategy,
+            )
+            sell_reconcile_needed = True
         _maybe_save_lot_state(before_lot_signature)
         _sync_position_state_qty(code)
         _save_position_state_now()
+        sell_reconcile_needed = True
 
     def _cleanup_expired_pending(
         traded_state: dict, now_dt: datetime, ttl_sec: int = 300
@@ -913,32 +1015,6 @@ def main(
             return (now_dt - pending_dt).total_seconds() <= block_sec
         except Exception:
             return True
-
-    def _is_balance_reflected(
-        code: str, prev_qty: int = 0, delay_sec: float = 1.0
-    ) -> bool:
-        try:
-            time.sleep(delay_sec)
-            balances = _fetch_balances(kis, ttl_sec=0)
-        except Exception as e:
-            logger.warning(f"[BAL-REFRESH-FAIL] {code}: 잔고 확인 실패 {e}")
-            return False
-
-        for row in balances:
-            try:
-                if normalize_code(row.get("code")) != normalize_code(code):
-                    continue
-                qty_here = _to_int(row.get("qty") or 0)
-                sellable_here = _to_int(
-                    (row.get("sell_psbl_qty") or row.get("ord_psbl_qty")) or 0
-                )
-                baseline_qty = max(0, int(prev_qty))
-                if qty_here > baseline_qty or sellable_here > baseline_qty:
-                    return True
-            except Exception:
-                continue
-
-        return False
 
     def _subject_flow_gate(
         code: str,
@@ -2205,6 +2281,13 @@ def main(
                         high = float(entry.get("high_watermark") or entry_meta.get("high") or 0.0)
                         if avg_price is not None:
                             high = max(high, float(avg_price))
+                        if cur_price:
+                            high = max(high, float(cur_price))
+                            entry["high_watermark"] = high
+                            entry_meta["high"] = high
+                            entry["meta"] = entry_meta
+                            entry["last_update_ts"] = now_dt_kst.isoformat()
+                            position_state_dirty = True
                         flags = entry.get("flags", {}) or {}
                         avg_label = f"{avg_price:.2f}" if avg_price is not None else None
                         high_label = f"{high:.2f}" if high else None
@@ -2416,6 +2499,38 @@ def main(
                                     current_price,
                                 )
 
+                if sell_reconcile_needed:
+                    balances_after_sell = _refresh_balances_snapshot("sell_batch")
+                    holding = {}
+                    for bal in balances_after_sell:
+                        code = normalize_code(bal.get("code") or bal.get("pdno"))
+                        qty = int(bal.get("qty", 0))
+                        if qty <= 0:
+                            continue
+                        price = float(bal.get("avg_price", 0.0))
+                        holding[code] = {
+                            "qty": qty,
+                            "buy_price": price,
+                            "bear_s1_done": False,
+                            "bear_s2_done": False,
+                        }
+                        _init_position_state_from_balance(kis, holding, code, price, qty)
+                    reconcile_with_broker_holdings(lot_state, balances_after_sell)
+                    position_state = reconcile_with_broker(
+                        position_state, balances_after_sell, lot_state=lot_state
+                    )
+                    position_state = reconcile_positions(
+                        balances_after_sell,
+                        position_state,
+                        _load_trade_log(),
+                        processed_targets.keys(),
+                    )
+                    position_state_dirty = True
+                    sell_reconcile_needed = False
+                    _save_position_state_now()
+
+                _save_position_state_now()
+
                 # === (2) 신규 진입 로직 (챔피언) ===
                 for code, info in code_to_target.items():
                     if not can_buy:
@@ -2532,6 +2647,8 @@ def main(
                         daily_ctx, intra_ctx, regime_state=regime_state
                     )
                     if not setup_state.get("ok"):
+                        if not setup_state.get("reasons"):
+                            setup_state["reasons"] = ["setup_flag_false"]
                         logger.info(
                             "[SETUP-BAD] %s | reasons=%s | daily=%s intra=%s regime=%s",
                             code,
@@ -2737,110 +2854,30 @@ def main(
                         },
                     )
                     traded_today.add(code)
-                    save_state(holding, traded)
-                    if not _is_balance_reflected(code, prev_qty=prev_qty):
-                        logger.warning(
-                            f"[BUY-PENDING] {code}: 잔고에 반영되지 않아 상태 기록 보류(result={result})"
-                        )
-                        continue
-                    traded[code]["status"] = "filled"
-                    _record_trade(
-                        traded,
-                        code,
+                    pending_buy_orders.append(
                         {
-                            "buy_time": now_str,
+                            "code": code,
                             "qty": int(qty),
-                            "price": float(exec_price),
-                            "status": "filled",
-                            "pending_since": None,
-                        },
-                    )
-                    runtime_state_store.mark_fill(
-                        runtime_state,
-                        code,
-                        "BUY",
-                        strategy_id,
-                        int(qty),
-                        float(exec_price),
-                        now_dt_kst.isoformat(),
-                        status="filled",
-                    )
-                    _save_runtime_state()
-
-                    _init_position_state(
-                        kis,
-                        holding,
-                        code,
-                        float(exec_price),
-                        int(qty),
-                        k_value,
-                        target_price,
-                    )
-                    position_state = record_entry_state(
-                        state=position_state,
-                        code=code,
-                        qty=int(qty),
-                        avg_price=float(exec_price),
-                        strategy_id=strategy_id,
-                        engine=trigger_label,
-                        entry_reason="SETUP-OK + TRIGGER-YES",
-                        order_type="marketable_limit",
-                        best_k=k_value,
-                        tgt_px=target_price,
-                        gap_pct_at_entry=trigger_state.get("gap_pct"),
-                        entry_time=now_dt_kst.isoformat(),
-                    )
-                    position_state_dirty = True
-                    _save_position_state_now()
-
-                    lot_id = _build_lot_id(
-                        result,
-                        now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
-                        code,
-                    )
-                    before_lot_signature = _lot_state_signature(lot_state)
-                    record_buy_fill(
-                        lot_state,
-                        lot_id=lot_id,
-                        pdno=code,
-                        strategy_id=strategy_id,
-                        engine=f"legacy_kosdaq_runner:sid{strategy_id}",
-                        entry_ts=now_dt_kst.isoformat(),
-                        entry_price=float(exec_price),
-                        qty=int(qty),
-                        meta={
-                            "strategy_name": strategy,
-                            "entry_reason": str(gate.get("entry_reason") or "SETUP-OK") + " + TRIGGER-YES",
-                            "strategy_gate": gate,
-                            "k": k_value,
+                            "exec_price": float(exec_price),
+                            "strategy_id": strategy_id,
+                            "trigger_label": trigger_label,
+                            "k_value": k_value,
                             "target_price": target_price,
-                            "best_k": k_value,
-                            "tgt_px": target_price,
-                            "engine": "legacy_kosdaq_runner",
-                            "rebalance_date": str(rebalance_date),
-                        },
-                    )
-                    logger.info(
-                        "[LEDGER][BUY] code=%s sid=%s lot_id=%s qty=%s",
-                        code,
-                        strategy_id,
-                        lot_id,
-                        qty,
-                    )
-                    _maybe_save_lot_state(before_lot_signature)
-                    if _lot_state_signature(lot_state) == before_lot_signature:
-                        raise RuntimeError(
-                            f"[LEDGER][BUY] failed to persist lot: code={code} sid={strategy_id}"
-                        )
-
-                    log_trade(
-                        {
-                            **trade_ctx,
-                            "price": float(exec_price),
-                            "amount": int(float(exec_price) * int(qty)),
+                            "gate": gate,
+                            "strategy": strategy,
+                            "trade_ctx": trade_ctx,
                             "result": result,
+                            "now_ts": now_dt_kst.isoformat(),
+                            "pending_since": now_str,
+                            "prev_qty": prev_qty,
+                            "entry_reason": "SETUP-OK + TRIGGER-YES",
+                            "order_type": "marketable_limit",
+                            "gap_pct_at_entry": trigger_state.get("gap_pct"),
+                            "rebalance_date": str(rebalance_date),
+                            "lot_ts": now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
                         }
                     )
+                    save_state(holding, traded)
                     effective_cash = _get_effective_ord_cash(
                         kis, soft_cap=effective_capital
                     )
@@ -2848,6 +2885,10 @@ def main(
                         can_buy = False
                     save_state(holding, traded)
                     time.sleep(RATE_SLEEP_SEC)
+
+                if pending_buy_orders:
+                    balances_after_buy = _refresh_balances_snapshot("buy_batch")
+                    _finalize_pending_buys(pending_buy_orders, balances_after_buy)
 
                 # ====== 눌림목 전용 매수 (챔피언과 독립적으로 Top-N 시총 리스트 스캔) ======
                 if USE_PULLBACK_ENTRY and is_open:
@@ -3022,56 +3063,6 @@ def main(
                             )
                             traded_today.add(code)
                             save_state(holding, traded)
-                            if not _is_balance_reflected(code, prev_qty=prev_qty):
-                                logger.warning(
-                                    f"[PULLBACK-PENDING] {code}: 잔고에 반영되지 않아 상태 기록 보류(result={result})"
-                                )
-                                continue
-
-                            traded[code]["status"] = "filled"
-                            holding[code] = {
-                                "qty": int(qty),
-                                "buy_price": float(exec_price),
-                                "bear_s1_done": False,
-                                "bear_s2_done": False,
-                            }
-                            _record_trade(
-                                traded,
-                                code,
-                                {
-                                    "buy_time": now_str,
-                                    "qty": int(qty),
-                                    "price": float(exec_price),
-                                    "status": "filled",
-                                    "pending_since": None,
-                                },
-                            )
-                            runtime_state_store.mark_fill(
-                                runtime_state,
-                                code,
-                                "BUY",
-                                5,
-                                int(qty),
-                                float(exec_price),
-                                now_dt_kst.isoformat(),
-                                status="filled",
-                            )
-                            _save_runtime_state()
-                            pullback_buys_today += 1
-
-                            try:
-                                _init_position_state(
-                                    kis,
-                                    holding,
-                                    code,
-                                    float(exec_price),
-                                    int(qty),
-                                    None,
-                                    trigger_price,
-                                )
-                            except Exception as e:
-                                logger.warning(f"[PULLBACK-INIT-FAIL] {code}: {e}")
-
                             pullback_meta = {}
                             if isinstance(resp, dict):
                                 pullback_meta = {
@@ -3079,89 +3070,41 @@ def main(
                                     "pullback_reversal_price": resp.get("reversal_price"),
                                     "pullback_reason": resp.get("reason"),
                                 }
-                            position_state = record_entry_state(
-                                state=position_state,
-                                code=code,
-                                qty=int(qty),
-                                avg_price=float(exec_price),
-                                strategy_id=5,
-                                engine="pullback",
-                                entry_reason="PULLBACK-SETUP + REVERSAL",
-                                order_type="marketable_limit",
-                                best_k=None,
-                                tgt_px=trigger_price,
-                                gap_pct_at_entry=None,
-                                meta=pullback_meta,
-                                entry_time=now_dt_kst.isoformat(),
-                            )
-                            position_state_dirty = True
-                            _save_position_state_now()
-
-                            lot_id = _build_lot_id(
-                                result,
-                                now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
-                                code,
-                            )
-                            before_lot_signature = _lot_state_signature(lot_state)
-                            record_buy_fill(
-                                lot_state,
-                                lot_id=lot_id,
-                                pdno=code,
-                                strategy_id=5,
-                                engine=f"legacy_kosdaq_runner:sid{strategy_id}",
-                                entry_ts=now_dt_kst.isoformat(),
-                                entry_price=float(exec_price),
-                                qty=int(qty),
-                                meta={
-                                    "strategy_name": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
-                                    "entry_reason": "PULLBACK-SETUP + REVERSAL",
-                                    "k": None,
-                                    "target_price": trigger_price,
-                                    "best_k": None,
-                                    "tgt_px": trigger_price,
-                                    "pullback_peak_price": resp.get("peak_price")
-                                    if isinstance(resp, dict)
-                                    else None,
-                                    "pullback_reversal_price": resp.get("reversal_price")
-                                    if isinstance(resp, dict)
-                                    else None,
-                                    "engine": "legacy_kosdaq_runner",
-                                    "rebalance_date": str(rebalance_date),
-                                },
-                            )
-                            logger.info(
-                                "[LEDGER][BUY] code=%s sid=%s lot_id=%s qty=%s",
-                                code,
-                                5,
-                                lot_id,
-                                qty,
-                            )
-                            _maybe_save_lot_state(before_lot_signature)
-                            if _lot_state_signature(lot_state) == before_lot_signature:
-                                raise RuntimeError(
-                                    f"[LEDGER][BUY] failed to persist lot: code={code} sid=5"
-                                )
-
-                            logger.info(
-                                f"[✅ 눌림목 매수] {code}, qty={qty}, price={exec_price}, trigger={trigger_price}, result={result}"
-                            )
-
-                            log_trade(
+                            pending_buy_orders.append(
                                 {
-                                    "datetime": now_str,
                                     "code": code,
-                                    "name": info.get("name"),
                                     "qty": int(qty),
-                                    "K": None,
-                                    "target_price": trigger_price,
-                                    "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                    "exec_price": float(exec_price),
                                     "strategy_id": 5,
-                                    "side": "BUY",
-                                    "price": float(exec_price),
-                                    "amount": int(float(exec_price) * int(qty)),
+                                    "trigger_label": "pullback",
+                                    "k_value": None,
+                                    "target_price": trigger_price,
+                                    "gate": {},
+                                    "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                    "trade_ctx": {
+                                        "datetime": now_str,
+                                        "code": code,
+                                        "name": info.get("name"),
+                                        "qty": int(qty),
+                                        "K": None,
+                                        "target_price": trigger_price,
+                                        "strategy": f"코스닥 Top{PULLBACK_TOPN} 눌림목",
+                                        "strategy_id": 5,
+                                        "side": "BUY",
+                                    },
                                     "result": result,
+                                    "now_ts": now_dt_kst.isoformat(),
+                                    "pending_since": now_str,
+                                    "prev_qty": prev_qty,
+                                    "entry_reason": "PULLBACK-SETUP + REVERSAL",
+                                    "order_type": "marketable_limit",
+                                    "gap_pct_at_entry": None,
+                                    "rebalance_date": str(rebalance_date),
+                                    "lot_ts": now_dt_kst.strftime("%Y%m%d%H%M%S%f"),
+                                    "meta": pullback_meta,
                                 }
                             )
+                            pullback_buys_today += 1
                             effective_cash = _get_effective_ord_cash(
                                 kis, soft_cap=effective_capital
                             )
@@ -3169,6 +3112,10 @@ def main(
                                 can_buy = False
                             save_state(holding, traded)
                             time.sleep(RATE_SLEEP_SEC)
+
+                if pending_buy_orders:
+                    balances_after_pullback = _refresh_balances_snapshot("pullback_buy_batch")
+                    _finalize_pending_buys(pending_buy_orders, balances_after_pullback)
 
                 # ====== (A) 비타겟 보유분도 장중 능동관리 ======
                 if is_open:

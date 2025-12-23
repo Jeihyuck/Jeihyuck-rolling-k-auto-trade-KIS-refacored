@@ -549,7 +549,7 @@ def _normalize_weights_by_market(
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in selected_all:
-        market = (row.get("market") or "UNKNOWN").upper()
+        market = (row.get("market") or "UNCLASSIFIED").upper()
         grouped.setdefault(market, []).append(row)
 
     for market, rows in grouped.items():
@@ -631,7 +631,7 @@ def get_best_k_for_krx_topn(
 
     counts: Dict[str, int] = {}
     for row in merged_per_market:
-        mkt = row.get("market") or "UNKNOWN"
+        mkt = row.get("market") or "UNCLASSIFIED"
         counts[mkt] = counts.get(mkt, 0) + 1
     for mkt, cnt in counts.items():
         logger.info("[COUNT] %s selected_count=%d", mkt, cnt)

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
 from .config import KST
 from .code_utils import normalize_code
+from .state_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +47,12 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
-        RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = dict(state)
         payload.setdefault("schema_version", SCHEMA_VERSION)
         payload.setdefault("positions", {})
         payload.setdefault("orders", {})
         payload["updated_at"] = datetime.now(KST).isoformat()
-        tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, RUNTIME_STATE_PATH)
+        atomic_write_json(RUNTIME_STATE_PATH, payload)
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
 

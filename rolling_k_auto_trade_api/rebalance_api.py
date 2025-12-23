@@ -159,7 +159,7 @@ async def run_rebalance(date: str):
 
     selected_by_market_out: Dict[str, List[Dict[str, Any]]] = {}
     for info in selected:
-        mkt = (info.get("market") or "UNKNOWN").upper()
+        mkt = (info.get("market") or "UNCLASSIFIED").upper()
         selected_by_market_out.setdefault(mkt, []).append(info)
 
     for mkt, rows in selected_by_market_out.items():
@@ -173,7 +173,7 @@ async def run_rebalance(date: str):
 
     market_counts: Dict[str, int] = {}
     for info in selected:
-        mkt = (info.get("market") or "UNKNOWN").upper()
+        mkt = (info.get("market") or "UNCLASSIFIED").upper()
         market_counts[mkt] = market_counts.get(mkt, 0) + 1
     for mkt, cnt in market_counts.items():
         logger.info("[MARKET] %s selected_count=%d", mkt, cnt)

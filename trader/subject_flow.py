@@ -119,7 +119,7 @@ def get_subject_flow_with_fallback(
     inv: Dict[str, Any] | None = None
     error: str | None = None
     flow_ok = False
-    decision = "UNKNOWN"
+    decision = "UNCLASSIFIED"
     turnover_guard_mult = 1.0
     ob_strength_add = 0.0
 
@@ -183,7 +183,7 @@ def get_subject_flow_with_fallback(
                     decision = "LIVE_OK"
                     _cache_set(key, {"ok": True, "inv": inv, "score": score})
             else:
-                error = str(resp.get("error") or "UNKNOWN_ERROR")
+                error = str(resp.get("error") or "UNCLASSIFIED_ERROR")
 
         if score and used == "live":
             _log_flow(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
 from rolling_k_auto_trade_api.kis_api import (
@@ -11,25 +11,53 @@ from rolling_k_auto_trade_api.kis_api import (
     send_order,
     get_price_quote,
 )
+from trader.code_utils import normalize_code
 
 logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
 
-def _current_positions() -> Dict[str, Dict[str, float]]:
-    pos: Dict[str, Dict[str, float]] = {}
+def _current_positions() -> Dict[str, Dict[str, float | str | None]]:
+    pos: Dict[str, Dict[str, float | str | None]] = {}
     for row in inquire_balance():
-        code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+        code = normalize_code(row.get("pdno") or row.get("code") or "")
+        if not code:
+            continue
         qty = int(float(row.get("hldg_qty") or row.get("qty") or 0))
         price = float(row.get("pchs_avg_pric") or row.get("avg_price") or 0)
-        pos[code] = {"qty": qty, "avg_price": price}
+        market = row.get("market") or row.get("mkt") or row.get("market_div")
+        pos[code] = {"qty": qty, "avg_price": price, "market": market}
     return pos
 
 
 def _buy_window_open() -> bool:
     now = datetime.now(tz=KST).time()
     return now >= time(9, 30)
+
+
+def _split_positions_for_kospi(
+    positions: Dict[str, Dict[str, float | str | None]],
+    target_map: Dict[str, Dict[str, float]],
+) -> Tuple[Dict[str, Dict[str, float | str | None]], List[str]]:
+    kospi_positions: Dict[str, Dict[str, float | str | None]] = {}
+    excluded: List[str] = []
+    for code, payload in positions.items():
+        code_key = normalize_code(code)
+        if not code_key:
+            continue
+        market = str(payload.get("market") or "").upper()
+        if market in {"KOSPI", "KSE"}:
+            kospi_positions[code_key] = payload
+            continue
+        if market in {"KOSDAQ", "KSQ"}:
+            excluded.append(code_key)
+            continue
+        if code_key in target_map:
+            kospi_positions[code_key] = payload
+            continue
+        excluded.append(code_key)
+    return kospi_positions, excluded
 
 
 def execute_rebalance(
@@ -41,12 +69,19 @@ def execute_rebalance(
 ) -> List[Dict[str, str]]:
     fills: List[Dict[str, str]] = []
     positions = _current_positions()
-    target_map = {str(t.get("code") or "").zfill(6): t for t in targets}
-    all_codes = set(positions.keys()) | set(target_map.keys())
+    target_map = {normalize_code(t.get("code") or ""): t for t in targets if normalize_code(t.get("code") or "")}
+    kospi_positions, excluded_positions = _split_positions_for_kospi(
+        positions, target_map
+    )
+    all_codes = set(kospi_positions.keys()) | set(target_map.keys())
     buys = sells = 0
     available_cash = min(float(cash), float(inquire_cash_balance() or 0))
 
-    before_snapshot = {code: data.get("qty", 0) for code, data in positions.items() if data.get("qty")}
+    before_snapshot = {
+        code: data.get("qty", 0)
+        for code, data in kospi_positions.items()
+        if data.get("qty")
+    }
     target_snapshot = {
         code: int(float(payload.get("target_qty") or 0))
         for code, payload in target_map.items()
@@ -57,6 +92,13 @@ def execute_rebalance(
         for code in sorted(all_codes)
         if before_snapshot.get(code, 0) != target_snapshot.get(code, 0)
     }
+    if excluded_positions:
+        logger.warning(
+            "%s[KOSPI_CORE][UNKNOWN_HOLDINGS] excluded=%s (targets_fallback=%s)",
+            tag + " " if tag else "",
+            sorted(excluded_positions),
+            sorted(set(excluded_positions) & set(target_map.keys())),
+        )
     logger.info(
         "%s[KOSPI_CORE][DIFF] before=%s targets=%s delta=%s",
         tag + " " if tag else "",
@@ -67,7 +109,7 @@ def execute_rebalance(
 
     orders: List[Dict[str, float]] = []
     for code in sorted(all_codes):
-        current = positions.get(code, {})
+        current = kospi_positions.get(code, {})
         current_qty = int(current.get("qty") or 0)
         target = target_map.get(code)
         target_qty = int(target.get("target_qty") or 0) if target else 0

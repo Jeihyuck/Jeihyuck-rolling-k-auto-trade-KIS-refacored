@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import random
 import time
 from datetime import datetime, timedelta
@@ -22,6 +21,7 @@ from .core_constants import (
 )
 from .kis_wrapper import KisAPI
 from .code_utils import normalize_code
+from .state_io import atomic_write_json
 
 __all__ = [
     "_krx_tick",
@@ -187,12 +187,8 @@ def log_trade(trade: dict) -> None:
 
 
 def save_state_atomic(holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {"holding": holding, "traded": traded}
-    tmp_path = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, STATE_FILE)
+    atomic_write_json(STATE_FILE, payload)
 
 
 def save_state(holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
@@ -201,9 +197,12 @@ def save_state(holding: Dict[str, Any], traded: Dict[str, Any]) -> None:
 
 def load_state() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        return state.get("holding", {}), state.get("traded", {})
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return state.get("holding", {}), state.get("traded", {})
+        except Exception as e:
+            logger.warning("[STATE] failed to load %s: %s", STATE_FILE, e)
     return {}, {}
 
 

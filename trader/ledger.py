@@ -35,12 +35,15 @@ def record_buy_fill(
     meta: Dict[str, Any] | None,
 ) -> None:
     lots = _ensure_state(state)
+    code_key = normalize_code(pdno)
+    if not code_key:
+        return
     if any(lot.get("lot_id") == lot_id for lot in lots):
         return
     lots.append(
         {
             "lot_id": lot_id,
-            "pdno": normalize_code(pdno),
+            "pdno": code_key,
             "strategy_id": strategy_id,
             "engine": engine,
             "entry_ts": entry_ts,
@@ -65,12 +68,15 @@ def apply_sell_fill_fifo(
     remaining = int(qty_filled)
     if remaining <= 0:
         return
+    pdno_key = normalize_code(pdno)
+    if not pdno_key:
+        return
 
     req_sid = _norm_sid(strategy_id)
 
     def _consume(remaining_qty: int, sid_filter: int | str | None) -> int:
         for lot in lots:
-            if normalize_code(lot.get("pdno")) != normalize_code(pdno):
+            if normalize_code(lot.get("pdno")) != pdno_key:
                 continue
             if not allow_blocked and lot.get("meta", {}).get("sell_blocked") is True:
                 continue
@@ -108,9 +114,12 @@ def owned_lots_by_strategy(state: Dict[str, Any], strategy_id: int | str) -> Lis
 
 def remaining_qty_for_strategy(state: Dict[str, Any], pdno: str, strategy_id: int | str) -> int:
     lots = _ensure_state(state)
+    pdno_key = normalize_code(pdno)
+    if not pdno_key:
+        return 0
     total = 0
     for lot in lots:
-        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != pdno_key:
             continue
         if int(lot.get("remaining_qty") or 0) <= 0:
             continue
@@ -122,9 +131,12 @@ def remaining_qty_for_strategy(state: Dict[str, Any], pdno: str, strategy_id: in
 
 def dominant_strategy_for(state: Dict[str, Any], pdno: str) -> int | None:
     lots = _ensure_state(state)
+    pdno_key = normalize_code(pdno)
+    if not pdno_key:
+        return None
     totals: Dict[int, int] = {}
     for lot in lots:
-        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != pdno_key:
             continue
         remaining = int(lot.get("remaining_qty") or 0)
         if remaining <= 0:
@@ -141,10 +153,13 @@ def strategy_avg_price(
     state: Dict[str, Any], pdno: str, strategy_id: int | str
 ) -> float | None:
     lots = _ensure_state(state)
+    pdno_key = normalize_code(pdno)
+    if not pdno_key:
+        return None
     total_qty = 0
     total_cost = 0.0
     for lot in lots:
-        if normalize_code(lot.get("pdno")) != normalize_code(pdno):
+        if normalize_code(lot.get("pdno")) != pdno_key:
             continue
         if _norm_sid(lot.get("strategy_id")) != _norm_sid(strategy_id):
             continue
@@ -180,6 +195,7 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
 
     for lot in lots:
         if str(lot.get("strategy_id")) in {"ORPHAN", "UNKNOWN"}:
+            # legacy migration only: map deprecated sid to MANUAL
             lot["strategy_id"] = "MANUAL"
 
     for lot in lots:

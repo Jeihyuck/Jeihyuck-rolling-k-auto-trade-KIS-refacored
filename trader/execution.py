@@ -117,6 +117,8 @@ def record_entry_state(
     entry_time: str | None = None,
 ) -> Dict[str, Any]:
     code_key = normalize_code(code)
+    if not code_key:
+        return state
     sid_key = str(strategy_id)
     pos = state.setdefault("positions", {}).setdefault(
         code_key,
@@ -225,6 +227,8 @@ def update_position_meta(
     meta_updates: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     code_key = normalize_code(code)
+    if not code_key:
+        return state
     sid_key = str(strategy_id)
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
@@ -257,6 +261,8 @@ def update_position_flags(
 ) -> Dict[str, Any]:
     assert strategy_id is not None, "strategy_id required for update_position_flags"
     code_key = normalize_code(code)
+    if not code_key:
+        return state
     pos = state.get("positions", {}).get(code_key)
     if not isinstance(pos, dict):
         return state
