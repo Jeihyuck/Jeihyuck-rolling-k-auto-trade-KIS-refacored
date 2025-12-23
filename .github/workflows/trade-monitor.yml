@@ -18,7 +18,6 @@ on:
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
 
-
 jobs:
   monitor-trade:
     # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
@@ -144,6 +143,7 @@ jobs:
           key: trader-state-${{ github.ref_name }}
           restore-keys: |
             trader-state-${{ github.ref_name }}-
+
       - name: Save state cache (dispatch only)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/cache/save@v4
@@ -162,11 +162,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Ensure state scripts executable
-        if: github.event_name != 'pull_request'
-        run: |
-          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
-
+      # NOTE: chmod 단계 제거 (bash로 실행하면 실행권한 불필요)
       - name: Pull state (plain)
         if: github.event_name != 'pull_request'
         run: |
@@ -225,6 +221,7 @@ jobs:
       - name: Compile modules
         run: |
           python -m compileall trader rolling_k_auto_trade_api
+
       - name: trader 자동매매 로직 실행
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -248,10 +245,12 @@ jobs:
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
-      - name: Persist trader state to bot-state branch
+      # ✅ FIX: bot-state 브랜치를 checkout 하지 않고 worktree로 별도 작업공간에서 커밋/푸시
+      - name: Persist trader state to bot-state branch (worktree)
         if: github.event_name != 'pull_request'
         run: |
-          set -e
+          set -euo pipefail
+
           TMP_DIR="$(mktemp -d)"
           mkdir -p "$TMP_DIR/state" "$TMP_DIR/fills"
           if [ -d trader/state ]; then
@@ -260,22 +259,31 @@ jobs:
           if [ -d trader/fills ]; then
             cp -a trader/fills/. "$TMP_DIR/fills/" || true
           fi
+
+          # bot-state 브랜치 준비
           git fetch origin bot-state:bot-state || true
-          if git show-ref --verify --quiet refs/heads/bot-state; then
-            git checkout bot-state
-          else
-            git checkout -b bot-state
+          if ! git show-ref --verify --quiet refs/heads/bot-state; then
+            git branch bot-state || true
           fi
-          mkdir -p bot_state/trader_state
-          cp -a "$TMP_DIR/state/." bot_state/trader_state/ || true
-          cp -a "$TMP_DIR/fills/." bot_state/trader_state/ || true
-          git add -f bot_state/trader_state/*
+
+          WT_DIR="$(mktemp -d)"
+          git worktree add "$WT_DIR" bot-state
+
+          mkdir -p "$WT_DIR/bot_state/trader_state"
+          cp -a "$TMP_DIR/state/." "$WT_DIR/bot_state/trader_state/" || true
+          cp -a "$TMP_DIR/fills/." "$WT_DIR/bot_state/trader_state/" || true
+
+          pushd "$WT_DIR" >/dev/null
+          git add -f bot_state/trader_state || true
           if git diff --cached --quiet; then
             echo "No bot_state changes to commit."
-            exit 0
+          else
+            git commit -m "Update trader state"
+            git push origin bot-state
           fi
-          git commit -m "Update trader state"
-          git push origin bot-state
+          popd >/dev/null
+
+          git worktree remove "$WT_DIR" --force
 
       - name: Save state snapshot as artifact (audit only)
         if: always()
@@ -322,5 +330,3 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
-
-      
