@@ -24,15 +24,18 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # === KIS 인증키(두 이름 모두 대응) ===
+      # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
       KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
       APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
       APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
 
       CANO:           ${{ secrets.CANO }}
       ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV:        ${{ secrets.KIS_ENV }}
+      KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+
+      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
       API_BASE_URL:   ${{ secrets.API_BASE_URL }}
 
       # === trader.py 운영 파라미터 ===
@@ -54,6 +57,7 @@ jobs:
       SLIPPAGE_LIMIT_PCT: "0.25"
       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
 
+      # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
       VWAP_TOL: "0.003"
 
       W_MAX_ONE: "0.25"
@@ -63,6 +67,7 @@ jobs:
       FORCE_WEEKLY_REBALANCE: "0"
       MOMENTUM_OVERRIDES_FORCE_SELL: "true"
 
+      # 레짐/지수
       KOSDAQ_INDEX_CODE: "KOSDAQ"
       KOSDAQ_ETF_FALLBACK: "229200"
 
@@ -82,12 +87,16 @@ jobs:
 
       MARKET_DATA_WHEN_CLOSED: "false"
 
+      # 배분/속도
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
+      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
+      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
       KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
       KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
 
+      # === FastAPI 리밸런싱 서버(선정 필터) ===
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -113,7 +122,7 @@ jobs:
           set -euo pipefail
           mkdir -p trader/state trader/fills trader/logs rebalance_results bot_state
 
-      # ✅ bot-state에서 상태를 "파일만" 안전하게 복원 (로컬 bot-state 브랜치 직접 갱신/체크아웃 금지)
+      # ✅ bot-state에서 상태를 "파일만" 안전하게 복원 (로컬 bot-state 브랜치에 fetch/checkout 금지)
       - name: Restore bot_state from origin/bot-state
         if: github.event_name != 'pull_request'
         run: |
@@ -158,7 +167,10 @@ jobs:
         run: |
           python - << 'PY'
           import os
-          keys = ['KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET','CANO','ACNT_PRDT_CD','KIS_ENV']
+          keys = [
+            'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
+            'CANO','ACNT_PRDT_CD','KIS_ENV'
+          ]
           for k in keys:
               v = os.getenv(k) or ''
               print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
@@ -167,7 +179,7 @@ jobs:
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30
+          sleep 30  # 서버 기동 대기
 
       - name: Compile modules
         run: |
@@ -186,7 +198,18 @@ jobs:
         run: |
           python -m trader.report_ceo || true
 
-      # ✅ 여기서 "실제로 파일이 만들어졌는지" 확인 (문제 재현/진단 핵심)
+      # ✅ FIX 1) 코드가 루트에 state.json을 만들면 trader/state로 복사해서 "표준 경로"로 정규화
+      - name: Normalize state paths (copy root state.json -> trader/state)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p trader/state
+          if [ -f state.json ]; then
+            cp -a state.json trader/state/state.json
+            echo "[NORMALIZE] copied ./state.json -> trader/state/state.json"
+          fi
+
+      # ✅ (디버그) 실제 파일 생성 여부를 런에서 바로 확인
       - name: (DEBUG) list outputs before bundling
         if: always()
         run: |
@@ -199,9 +222,9 @@ jobs:
           echo "== rebalance_results =="; ls -al rebalance_results || true
           echo "== bot_state =="; ls -al bot_state || true
           echo "== find ledger/state ==";
-          find . -maxdepth 5 -type f \( -name "ledger.jsonl" -o -name "state.json" -o -name "CEO_Report_*.md" \) -print || true
+          find . -maxdepth 6 -type f \( -name "ledger.jsonl" -o -name "state.json" -o -name "CEO_Report_*.md" \) -print || true
 
-      # ✅ 핵심 FIX: "항상 아티팩트에 trader/가 생기게" 번들 폴더로 강제 수집
+      # ✅ FIX 2) 업로드 경로가 흔들려도 항상 모이도록 번들 폴더에 수집
       - name: Collect artifact bundle (force-create trader/)
         if: always()
         run: |
@@ -209,7 +232,8 @@ jobs:
 
           BUNDLE="artifact_bundle"
           rm -rf "$BUNDLE" || true
-          mkdir -p "$BUNDLE/trader/state" "$BUNDLE/trader/fills" "$BUNDLE/trader/logs" "$BUNDLE/rebalance_results" "$BUNDLE/bot_state"
+          mkdir -p "$BUNDLE/trader/state" "$BUNDLE/trader/fills" "$BUNDLE/trader/logs" \
+                   "$BUNDLE/rebalance_results" "$BUNDLE/bot_state"
 
           # 1) 표준 위치 복사(있으면)
           if [ -d trader/state ]; then cp -a trader/state/. "$BUNDLE/trader/state/" || true; fi
@@ -219,30 +243,24 @@ jobs:
           if [ -d bot_state ]; then cp -a bot_state/. "$BUNDLE/bot_state/" || true; fi
 
           # 2) 혹시 다른 위치에 생성된 파일이 있으면 찾아서 추가(경로 흔들림 대응)
-          #    - ledger.jsonl
           for f in $(find . -maxdepth 6 -type f -name "ledger.jsonl" 2>/dev/null || true); do
             echo "[BUNDLE] found ledger: $f"
             cp -a "$f" "$BUNDLE/trader/logs/" || true
           done
-          #    - state.json (bot_state/state.json 외에 trader/state/state.json 등이 다른 위치에 생긴 경우)
-          for f in $(find . -maxdepth 6 -type f -name "state.json" 2>/dev/null || true); do
-            echo "[BUNDLE] found state: $f"
-            cp -a "$f" "$BUNDLE/" || true
-          done
-          #    - CEO report
+
           for f in $(find . -maxdepth 6 -type f -name "CEO_Report_*.md" 2>/dev/null || true); do
             echo "[BUNDLE] found report: $f"
             cp -a "$f" "$BUNDLE/trader/logs/" || true
           done
 
-          # 3) 최소 placeholder 생성: 업로드 경고/누락 방지 + "폴더 생성 확인" 목적
+          # 3) 최소 placeholder 생성: 업로드 경고/누락 방지
           date -Iseconds > "$BUNDLE/_bundle_created_at.txt"
           echo "ok" > "$BUNDLE/trader/_trader_dir_exists.txt"
 
           echo "== Bundle tree =="
           find "$BUNDLE" -maxdepth 4 -print
 
-      # ✅ bot-state 브랜치는 worktree로만 푸시 (plain push 금지)
+      # ✅ FIX 3) bot-state 브랜치에 상태를 worktree로만 커밋/푸시 (충돌 방지)
       - name: Persist trader state to bot-state branch (worktree)
         if: github.event_name != 'pull_request'
         run: |
@@ -285,7 +303,7 @@ jobs:
           fi
           popd >/dev/null
 
-      # ✅ 이제는 번들 폴더만 올리면 "trader/가 없다" 문제가 구조적으로 사라짐
+      # ✅ FIX 4) 아티팩트는 번들 폴더만 업로드 (trader/ 누락 문제 구조적으로 제거)
       - name: Upload trader-state artifact (bundle)
         if: always()
         uses: actions/upload-artifact@v4
@@ -318,4 +336,5 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
 
