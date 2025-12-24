@@ -6,26 +6,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .config import KST
 from .code_utils import normalize_code
+from .config import KST
+from .paths import LOG_DIR
 from .strategy_ids import STRATEGY_INT_IDS
-from .strategy_recovery import recover_sid_for_holding
 from .strategy_registry import normalize_sid
 
-LEDGER_DIR = Path("fills")
-LEDGER_PATH = LEDGER_DIR / "ledger.jsonl"
+LEDGER_PATH = LOG_DIR / "ledger.jsonl"
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         f.flush()
         try:
             os.fsync(f.fileno())
         except Exception:
-            # 일부 플랫폼에서는 fsync 미지원
             pass
+
+
+def append_ledger_event(event_type: str, payload: Dict[str, Any]) -> None:
+    entry = {"event": event_type, **payload}
+    _append_jsonl(LEDGER_PATH, entry)
 
 
 def record_trade_ledger(
@@ -39,7 +42,6 @@ def record_trade_ledger(
     meta: Dict[str, Any] | None = None,
     path: Path | None = None,
 ) -> Dict[str, Any]:
-    """체결 내역을 JSONL 원장에 추가하고 즉시 flush."""
     entry = {
         "timestamp": timestamp,
         "code": normalize_code(code),
@@ -49,7 +51,7 @@ def record_trade_ledger(
         "price": float(price),
         "meta": meta or {},
     }
-    _append_jsonl(path or LEDGER_PATH, entry)
+    append_ledger_event("trade", entry if path is None else {**entry, "path_override": str(path)})
     return entry
 
 
@@ -74,7 +76,6 @@ def load_ledger_entries(path: Path | None = None) -> List[Dict[str, Any]]:
 
 
 def strategy_map_from_ledger(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """최근 매수 체결 기준 종목→전략 맵을 생성."""
     mapping: Dict[str, Any] = {}
     for entry in entries:
         code = normalize_code(entry.get("code") or entry.get("pdno") or "")
@@ -85,7 +86,6 @@ def strategy_map_from_ledger(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         if side == "BUY" and sid is not None:
             mapping[code] = sid
         elif code not in mapping and sid is not None:
-            # 매도/정리 체결만 있어도 최근 전략을 남겨 재구성
             mapping[code] = sid
     return mapping
 
@@ -128,6 +128,7 @@ def record_buy_fill(
             "lot_id": lot_id,
             "pdno": code_key,
             "strategy_id": strategy_id,
+            "sid": normalize_sid(strategy_id),
             "engine": engine,
             "entry_ts": entry_ts,
             "entry_price": float(entry_price),
@@ -306,27 +307,39 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
             continue
         if total_remaining < hold_qty:
             diff = hold_qty - total_remaining
-            sid, conf, reasons = recover_sid_for_holding(pdno, diff, avg_price, now_ts, evidence_dirs)
-            meta = {"reconciled": True}
-            if sid == "MANUAL":
-                meta["sell_blocked"] = True
-                meta["reasons"] = reasons
-                manual_created += 1
-            else:
-                recovered += 1
-            lots.append(
-                {
-                    "lot_id": f"{pdno}-RECON-{now_ts.isoformat()}",
-                    "pdno": pdno,
-                    "strategy_id": sid,
-                    "engine": "reconcile",
-                    "entry_ts": now_ts.isoformat(),
-                    "entry_price": avg_price,
-                    "qty": int(diff),
-                    "remaining_qty": int(diff),
-                    "meta": meta,
-                }
-            )
+            from .strategy_recovery import StrategyRecovery
+
+            recovered_lots = StrategyRecovery(now_ts=now_ts).recover(pdno, diff, avg_price, evidence_dirs)
+            if not recovered_lots:
+                recovered_lots = [
+                    {
+                        "sid": "MANUAL",
+                        "qty": diff,
+                        "entry_price": avg_price,
+                        "meta": {"confidence": 0.1, "sources": ["fallback"], "sell_blocked": False},
+                    }
+                ]
+            for lot_info in recovered_lots:
+                sid = lot_info.get("sid") or "MANUAL"
+                meta = {"reconciled": True, **(lot_info.get("meta") or {})}
+                if sid == "MANUAL":
+                    manual_created += 1
+                else:
+                    recovered += 1
+                lots.append(
+                    {
+                        "lot_id": f"{pdno}-RECON-{now_ts.isoformat()}",
+                        "pdno": pdno,
+                        "strategy_id": sid,
+                        "sid": sid,
+                        "engine": "reconcile",
+                        "entry_ts": now_ts.isoformat(),
+                        "entry_price": avg_price,
+                        "qty": int(lot_info.get("qty") or diff),
+                        "remaining_qty": int(lot_info.get("qty") or diff),
+                        "meta": meta,
+                    }
+                )
         elif total_remaining > hold_qty:
             extra = total_remaining - hold_qty
             for lot in sorted(

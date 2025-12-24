@@ -53,7 +53,7 @@ def main() -> None:
         preferred_strategy = strategy_map_from_ledger(ledger_entries) or {}
         balance = kis.get_balance()
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
-            runtime_state, balance, preferred_strategy=preferred_strategy
+            balance, preferred_strategy=preferred_strategy, state=runtime_state
         )
         runtime_state_store.save_state(runtime_state)
         logger.info("[TRADER] runtime state reconciled (positions=%d)", len(runtime_state.get("positions", {})))
@@ -78,7 +78,7 @@ def main() -> None:
             try:
                 balance = kis.get_balance()
                 runtime_state = runtime_state_store.reconcile_with_kis_balance(
-                    runtime_state, balance, preferred_strategy=preferred_strategy
+                    balance, preferred_strategy=preferred_strategy, state=runtime_state
                 )
             except Exception:
                 logger.exception("[TRADER] balance fetch/reconcile failed")

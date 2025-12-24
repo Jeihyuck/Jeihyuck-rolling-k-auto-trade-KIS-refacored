@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from .code_utils import normalize_code
 from .fill_store import load_fills_index
 from .order_map_store import ORDERS_MAP_PATH, load_order_map_index
 from .paths import LOG_DIR, REPO_ROOT
@@ -13,21 +15,15 @@ from .strategy_registry import normalize_sid
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOOKBACK_DAYS = 30
+RECOVERY_SCHEMA_VERSION = 1
 
 
-def _parse_ts(value: Any, default: datetime) -> datetime:
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(value))
-        except Exception:
-            return default
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except Exception:
-            return default
-    return default
+@dataclass
+class RecoveredLot:
+    sid: str
+    qty: int
+    entry_price: float
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def _load_json_lines(path: Path) -> List[Dict[str, Any]]:
@@ -49,200 +45,232 @@ def _load_json_lines(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _rebalance_candidates(rebalance_dir: Path, pdno: str, asof: datetime) -> Tuple[str | None, float, List[str]]:
-    files = sorted(rebalance_dir.glob("*.json"))
-    chosen = None
-    chosen_conf = 0.0
-    reason: List[str] = []
-    latest_ts = None
-    for fp in files:
-        try:
-            tag = fp.stem
-            ts = datetime.fromisoformat(tag) if len(tag) >= 8 else None
-        except Exception:
-            ts = None
-        if ts and ts > asof:
-            continue
-        try:
-            payload = json.loads(fp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        strategy_hits: Dict[str, int] = {}
-        for key, val in payload.items():
-            if not isinstance(val, list):
+class StrategyRecovery:
+    """Multi-source recovery of strategy id (sid) for UNKNOWN/MANUAL holdings."""
+
+    def __init__(self, now_ts: Optional[datetime] = None, *, preferred_strategy: Optional[Dict[str, Any]] = None) -> None:
+        self.now_ts = now_ts or datetime.now()
+        self.preferred_strategy = preferred_strategy or {}
+        self.stats: Dict[str, int] = {rule: 0 for rule in ["A", "B", "C", "D", "E", "F"]}
+        self.orders_map = load_order_map_index(ORDERS_MAP_PATH)
+        self.ledger_rows = _load_json_lines(LOG_DIR / "ledger.jsonl")
+        self.engine_events = _load_json_lines(LOG_DIR / "engine_events.jsonl")
+        self.rebalance_dir = REPO_ROOT / "rebalance_results"
+        self.fills_rows = load_fills_index()
+
+    def _candidate_from_fills(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        latest_ts: Optional[datetime] = None
+        qty_by_sid: Dict[str, int] = {}
+        evidence: Dict[str, Any] = {}
+        for row in self.fills_rows:
+            code = normalize_code(row.get("pdno") or row.get("code") or "")
+            if code != pdno_key:
                 continue
-            for row in val:
-                code = str(row.get("code") or row.get("pdno") or "").strip()
-                if code != pdno:
-                    continue
-                strategy_hits[key] = strategy_hits.get(key, 0) + 1
-        if not strategy_hits:
-            continue
-        if len(strategy_hits) == 1:
-            sid_raw = list(strategy_hits.keys())[0]
-            sid = normalize_sid(sid_raw if sid_raw.upper().startswith("S") else 1)
-            conf = 0.75
-        else:
-            sid = None
-            conf = 0.55
-        if latest_ts is None or (ts and ts > latest_ts):
-            latest_ts = ts
-            chosen = sid
-            chosen_conf = conf
-            reason = [f"rebalance:{fp.name}"]
-    return chosen, chosen_conf, reason
-
-
-def _scan_logs_for_sid(log_dir: Path, pdno: str, asof: datetime) -> Tuple[str | None, float, List[str]]:
-    candidates: Dict[str, int] = {}
-    reasons: List[str] = []
-    for fp in log_dir.glob("*.log"):
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                for line in f:
-                    if pdno not in line:
-                        continue
-                    line_upper = line.upper()
-                    if "SID=" in line_upper:
-                        token = line_upper.split("SID=")[1].split()[0].strip(",;]")
-                        sid = normalize_sid(token)
-                        candidates[sid] = candidates.get(sid, 0) + 1
-                    elif "STRATEGY_ID" in line_upper:
-                        token = line_upper.split("STRATEGY_ID")[1].split("=")[1].split()[0].strip(",;]")
-                        sid = normalize_sid(token)
-                        candidates[sid] = candidates.get(sid, 0) + 1
-        except Exception:
-            continue
-    if not candidates:
-        return None, 0.0, reasons
-    if len(candidates) == 1:
-        sid = list(candidates.keys())[0]
-        return sid, 0.85, [f"log:{next(iter(log_dir.glob('*.log')), None)}"]
-    sorted_hits = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
-    sid, _ = sorted_hits[0]
-    reasons.append(f"log_ambiguous:{candidates}")
-    return sid, 0.7, reasons
-
-
-def recover_sid_for_holding(
-    pdno: str,
-    qty: int,
-    avg_price: float | None,
-    asof_ts: datetime | None = None,
-    evidence_dirs: Dict[str, Any] | None = None,
-) -> Tuple[str, float, List[str]]:
-    asof = asof_ts or datetime.now()
-    evidence_dirs = evidence_dirs or {}
-    reasons: List[str] = []
-    candidates: List[Tuple[str, float, List[str]]] = []
-
-    # Current state lots (for remainder allocation)
-    state_lots: List[Dict[str, Any]] = evidence_dirs.get("state_lots") or []
-    for lot in state_lots:
-        lot_pdno = str(lot.get("pdno") or "").strip()
-        if lot_pdno != pdno:
-            continue
-        sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
-        if sid in {"UNKNOWN", "MANUAL"}:
-            continue
-        rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
-        if rem > 0:
-            candidates.append((sid, 0.95, ["existing_open_lot"]))
-            break
-
-    # E1 orders_map recent buy
-    orders_path = evidence_dirs.get("orders_map") or ORDERS_MAP_PATH
-    om_index = load_order_map_index(orders_path) if isinstance(orders_path, Path) or orders_path else load_order_map_index()
-    lookback = timedelta(days=DEFAULT_LOOKBACK_DAYS)
-    now_dt = asof
-    for payload in om_index.values():
-        if str(payload.get("pdno") or "").strip() != pdno:
-            continue
-        if str(payload.get("side") or "").upper() != "BUY":
-            continue
-        ts = _parse_ts(payload.get("ts"), now_dt)
-        if now_dt - ts > lookback:
-            continue
-        sid = normalize_sid(payload.get("sid"))
-        recency = max(0.0, 1.0 - (now_dt - ts).total_seconds() / lookback.total_seconds())
-        conf = 0.90 + (0.09 * recency)
-        candidates.append((sid, conf, ["orders_map_recent_buy"]))
-
-    # E2 fills/ledger
-    fills_dir = evidence_dirs.get("fills_dir")
-    fills_rows = load_fills_index() if fills_dir is None else load_fills_index(Path(fills_dir))  # type: ignore[arg-type]
-    latest_fill = None
-    for row in fills_rows:
-        if str(row.get("pdno") or "").strip() != pdno:
-            continue
-        if str(row.get("side") or "").upper() != "BUY":
-            continue
-        ts = _parse_ts(row.get("ts"), now_dt)
-        if latest_fill is None or ts > latest_fill[0]:
-            latest_fill = (ts, row)
-    if latest_fill:
-        ts, row = latest_fill
-        if now_dt - ts <= timedelta(days=DEFAULT_LOOKBACK_DAYS):
-            sid = normalize_sid(row.get("sid"))
-            candidates.append((sid, 0.95, ["fills_recent_buy"]))
-    ledger_path = Path(evidence_dirs.get("ledger_path") or LOG_DIR / "ledger.jsonl")
-    ledger_rows = _load_json_lines(ledger_path)
-    for row in ledger_rows:
-        code = str(row.get("code") or row.get("pdno") or "").strip()
-        if code != pdno:
-            continue
-        sid = normalize_sid(row.get("strategy_id"))
-        side = str(row.get("side") or "").upper()
-        if sid not in {"UNKNOWN", "MANUAL"} and side in {"BUY", "SELL"}:
-            candidates.append((sid, 0.9, [f"ledger:{ledger_path.name}"]))
-            break
-
-    # E3 logs
-    log_dir = Path(evidence_dirs.get("log_dir") or LOG_DIR)
-    sid_from_logs, log_conf, log_reason = _scan_logs_for_sid(log_dir, pdno, asof)
-    if sid_from_logs:
-        candidates.append((sid_from_logs, log_conf, log_reason or ["logs"]))
-
-    # E4 rebalance json
-    rebalance_dir = Path(evidence_dirs.get("rebalance_dir") or REPO_ROOT / "rebalance_results")
-    reb_sid, reb_conf, reb_reason = _rebalance_candidates(rebalance_dir, pdno, asof)
-    if reb_sid:
-        candidates.append((reb_sid, reb_conf, reb_reason))
-
-    # E5 proportional allocation (weak)
-    if not candidates and state_lots:
-        allocations: Dict[str, int] = {}
-        for lot in state_lots:
-            if str(lot.get("pdno") or "").strip() != pdno:
+            if str(row.get("side") or "").upper() != "BUY":
                 continue
-            sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
-            rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
-            allocations[sid] = allocations.get(sid, 0) + rem
-        if allocations:
-            sid = max(allocations.items(), key=lambda x: x[1])[0]
-            candidates.append((sid, 0.7, ["allocation_heuristic"]))
+            ts_val = row.get("ts") or row.get("timestamp")
+            try:
+                ts = datetime.fromisoformat(str(ts_val))
+            except Exception:
+                ts = None
+            sid = normalize_sid(row.get("sid") or row.get("strategy_id"))
+            if sid == "UNKNOWN":
+                oid = row.get("order_id") or row.get("client_order_id")
+                if oid and oid in self.orders_map:
+                    sid = normalize_sid(self.orders_map[oid].get("sid"))
+                elif isinstance(oid, str) and oid.startswith("client-") and "-" in oid:
+                    sid = normalize_sid(oid.split("-")[1])
+            qty_by_sid[sid] = qty_by_sid.get(sid, 0) + int(row.get("qty") or 0)
+            if ts and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
+        if not qty_by_sid:
+            return None, 0.0, evidence
+        best_sid = max(qty_by_sid.items(), key=lambda kv: kv[1])[0]
+        confidence = 0.95
+        evidence = {"qty_by_sid": qty_by_sid, "source": "fills"}
+        return best_sid, confidence, evidence
 
-    if not candidates:
-        return "MANUAL", 0.4, ["no_evidence"]
+    def _candidate_from_orders(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        lookback = self.now_ts - timedelta(days=30)
+        qty_by_sid: Dict[str, int] = {}
+        for payload in self.orders_map.values():
+            code = normalize_code(payload.get("pdno") or "")
+            if code != pdno_key:
+                continue
+            if str(payload.get("side") or "").upper() != "BUY":
+                continue
+            try:
+                ts_val = payload.get("ts") or payload.get("timestamp")
+                ts = datetime.fromisoformat(str(ts_val))
+            except Exception:
+                ts = None
+            if ts and ts < lookback:
+                continue
+            sid = normalize_sid(payload.get("sid"))
+            qty_by_sid[sid] = qty_by_sid.get(sid, 0) + int(payload.get("qty") or 0)
+        if not qty_by_sid:
+            return None, 0.0, {}
+        best_sid = max(qty_by_sid.items(), key=lambda kv: kv[1])[0]
+        return best_sid, 0.80, {"qty_by_sid": qty_by_sid, "source": "orders_map"}
 
-    # Aggregate per sid choose best confidence
-    merged: Dict[str, Tuple[float, List[str]]] = {}
-    for sid, conf, rs in candidates:
-        best_conf, best_reasons = merged.get(sid, (0.0, []))
-        if conf > best_conf:
-            merged[sid] = (conf, rs)
-        elif conf == best_conf:
-            merged[sid] = (conf, best_reasons + rs)
+    def _candidate_from_ledger(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        latest_ts: Optional[datetime] = None
+        chosen_sid: Optional[str] = None
+        for row in self.ledger_rows:
+            code = normalize_code(row.get("code") or row.get("pdno") or "")
+            if code != pdno_key:
+                continue
+            side = str(row.get("side") or "").upper()
+            if side != "BUY":
+                continue
+            sid = normalize_sid(row.get("strategy_id") or row.get("sid"))
+            try:
+                ts_val = row.get("timestamp") or row.get("ts")
+                ts = datetime.fromisoformat(str(ts_val))
+            except Exception:
+                ts = None
+            if latest_ts is None or (ts and ts > latest_ts):
+                latest_ts = ts
+                chosen_sid = sid
+        if not chosen_sid:
+            return None, 0.0, {}
+        return chosen_sid, 0.82, {"source": "ledger"}
 
-    sorted_candidates = sorted(merged.items(), key=lambda x: x[1][0], reverse=True)
-    best_sid, (best_conf, best_reasons) = sorted_candidates[0]
-    if len(sorted_candidates) > 1:
-        second_conf = sorted_candidates[1][1][0]
-        if best_conf - second_conf < 0.15:
-            conflict_reasons = [f"conflict:{[(sid, conf) for sid, (conf, _) in sorted_candidates[:3]]}"]
-            return "MANUAL", 0.5, best_reasons + conflict_reasons
+    def _candidate_from_rebalance(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        files = sorted(self.rebalance_dir.glob("*.json"))
+        if not files:
+            return None, 0.0, {}
+        latest = files[-1]
+        try:
+            payload = json.loads(latest.read_text(encoding="utf-8"))
+        except Exception:
+            return None, 0.0, {}
+        for sid_raw, rows in payload.items():
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                code = normalize_code(row.get("code") or row.get("pdno") or "")
+                if code == pdno_key:
+                    sid = normalize_sid(sid_raw if str(sid_raw).upper().startswith("S") else f"S{sid_raw}")
+                    return sid, 0.65, {"file": latest.name, "source": "rebalance_results"}
+        return None, 0.0, {}
 
-    final_sid = best_sid if best_conf >= 0.80 else "MANUAL"
-    if final_sid == "MANUAL" and "confidence_low" not in best_reasons:
-        best_reasons.append("confidence_low")
-    return final_sid, best_conf, best_reasons
+    def _candidate_from_engine_events(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        for row in reversed(self.engine_events):
+            code = normalize_code(row.get("pdno") or row.get("code") or "")
+            if code != pdno_key:
+                continue
+            if str(row.get("side") or "").upper() != "BUY":
+                continue
+            sid = normalize_sid(row.get("sid") or row.get("strategy_id"))
+            return sid, 0.60, {"source": "engine_events"}
+        return None, 0.0, {}
+
+    def _candidate_from_preference(self, pdno: str) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        sid_pref = self.preferred_strategy.get(pdno_key)
+        if sid_pref:
+            return normalize_sid(sid_pref), 0.82, {"source": "preferred_strategy"}
+        return None, 0.0, {}
+
+    def recover(self, pdno: str, hldg_qty: int, pchs_avg_pric: float, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        pdno_key = normalize_code(pdno)
+        candidates: List[Tuple[str, float, Dict[str, Any]]] = []
+
+        for getter in (
+            self._candidate_from_fills,
+            self._candidate_from_orders,
+            self._candidate_from_ledger,
+            self._candidate_from_rebalance,
+            self._candidate_from_engine_events,
+            self._candidate_from_preference,
+        ):
+            sid, conf, evidence = getter(pdno_key)
+            if sid:
+                candidates.append((sid, conf, evidence))
+
+        if not candidates:
+            self.stats["F"] += 1
+            return [
+                {
+                    "sid": "MANUAL",
+                    "qty": int(hldg_qty),
+                    "entry_price": float(pchs_avg_pric or 0.0),
+                    "meta": {
+                        "confidence": 0.10,
+                        "sources": [],
+                        "evidence": context,
+                        "reconciled": True,
+                        "sell_blocked": False,
+                        "rule": "F",
+                    },
+                }
+            ]
+
+        merged: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        for sid, conf, evidence in candidates:
+            best_conf, evidences = merged.get(sid, (0.0, []))
+            if conf > best_conf:
+                merged[sid] = (conf, [evidence])
+            elif conf == best_conf:
+                evidences.append(evidence)
+                merged[sid] = (conf, evidences)
+
+        sorted_candidates = sorted(merged.items(), key=lambda kv: kv[1][0], reverse=True)
+        best_sid, (best_conf, best_evidences) = sorted_candidates[0]
+        if len(sorted_candidates) > 1:
+            second_conf = sorted_candidates[1][1][0]
+            if (best_conf - second_conf) <= 0.10:
+                self.stats["E"] += 1
+                first_qty = int(round(hldg_qty * 0.6))
+                second_qty = hldg_qty - first_qty
+                lots: List[Dict[str, Any]] = []
+                for sid, qty in ((best_sid, first_qty), (sorted_candidates[1][0], second_qty)):
+                    lots.append(
+                        {
+                            "sid": sid,
+                            "qty": int(qty),
+                            "entry_price": float(pchs_avg_pric or 0.0),
+                            "meta": {
+                                "confidence": 0.45,
+                                "sources": ["ambiguous_split"],
+                                "evidence": {"candidates": sorted_candidates, **context},
+                                "reconciled": True,
+                                "sell_blocked": False,
+                                "rule": "E",
+                                "ambiguous": True,
+                            },
+                        }
+                    )
+                return lots
+
+        rule_key = "A"
+        if best_conf >= 0.95:
+            rule_key = "A"
+        elif best_conf >= 0.80:
+            rule_key = "B"
+        elif best_conf >= 0.65:
+            rule_key = "C"
+        elif best_conf >= 0.60:
+            rule_key = "D"
+        self.stats[rule_key] += 1
+        return [
+            {
+                "sid": best_sid,
+                "qty": int(hldg_qty),
+                "entry_price": float(pchs_avg_pric or 0.0),
+                "meta": {
+                    "confidence": best_conf,
+                    "sources": [ev.get("source", "unknown") for ev in best_evidences if ev],
+                    "evidence": {**context, "details": best_evidences},
+                    "reconciled": True,
+                    "sell_blocked": False,
+                    "rule": rule_key,
+                },
+            }
+        ]

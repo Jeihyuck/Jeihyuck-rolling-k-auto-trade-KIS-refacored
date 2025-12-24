@@ -1,36 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_DIR="bot_state"
-JSON_PATH="${STATE_DIR}/state.json"
-REMOTE_PATH="${STATE_DIR}/state.json"
-DEFAULT_STATE='{"version": 1, "lots": [], "updated_at": null}'
-POS_STATE_DIR="trader/state"
-POS_JSON_PATH="${POS_STATE_DIR}/state.json"
-POS_REMOTE_PATH="${POS_STATE_DIR}/state.json"
-DEFAULT_POS_STATE='{"schema_version": 2, "updated_at": null, "positions": {}, "memory": {"last_price": {}, "last_seen": {}}}'
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
 
-mkdir -p "${STATE_DIR}"
-mkdir -p "${POS_STATE_DIR}"
+TARGET_STATE_DIR="trader/state"
+TARGET_LOG_DIR="trader/logs"
+TARGET_FILLS_DIR="trader/fills"
+TARGET_REBAL_DIR="rebalance_results"
 
-if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
-  git fetch --no-tags origin bot-state:refs/remotes/origin/bot-state >/dev/null 2>&1 || true
-  if git cat-file -e "origin/bot-state:${REMOTE_PATH}" 2>/dev/null; then
-    git show "origin/bot-state:${REMOTE_PATH}" > "${JSON_PATH}"
-    echo "[STATE] Pulled ${REMOTE_PATH} from bot-state branch."
-  else
-    echo "[STATE] WARN: state.json not found in bot-state branch. Initializing."
-    echo "${DEFAULT_STATE}" > "${JSON_PATH}"
-  fi
-  if git cat-file -e "origin/bot-state:${POS_REMOTE_PATH}" 2>/dev/null; then
-    git show "origin/bot-state:${POS_REMOTE_PATH}" > "${POS_JSON_PATH}"
-    echo "[STATE] Pulled ${POS_REMOTE_PATH} from bot-state branch."
-  else
-    echo "[STATE] WARN: position state not found in bot-state branch. Initializing."
-    echo "${DEFAULT_POS_STATE}" > "${POS_JSON_PATH}"
-  fi
-else
-  echo "[STATE] WARN: bot-state branch not found. Initializing."
-  echo "${DEFAULT_STATE}" > "${JSON_PATH}"
-  echo "${DEFAULT_POS_STATE}" > "${POS_JSON_PATH}"
+mkdir -p "$TARGET_STATE_DIR" "$TARGET_LOG_DIR" "$TARGET_FILLS_DIR" "$TARGET_REBAL_DIR"
+
+if ! git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+  echo "[STATE_PULL] bot-state branch missing. Nothing to pull."
+  exit 0
 fi
+
+git fetch --no-tags origin bot-state:refs/remotes/origin/bot-state >/dev/null 2>&1 || true
+
+copy_path() {
+  local remote_path="$1"
+  local dest="$2"
+  if git cat-file -e "origin/bot-state:${remote_path}" 2>/dev/null; then
+    mkdir -p "$(dirname "$dest")"
+    git show "origin/bot-state:${remote_path}" > "$dest"
+    echo "[STATE_PULL] restored ${remote_path} -> ${dest}"
+  fi
+}
+
+copy_tree() {
+  local remote_dir="$1"
+  local dest_dir="$2"
+  mkdir -p "$dest_dir"
+  git ls-tree -r "origin/bot-state" "$remote_dir" --name-only 2>/dev/null | while read -r file; do
+    dest_path="$dest_dir/${file#${remote_dir}/}"
+    copy_path "$file" "$dest_path"
+  done
+}
+
+copy_path "bot_state/trader_state/state/state.json" "$TARGET_STATE_DIR/state.json"
+copy_path "bot_state/trader_state/state/orders_map.jsonl" "$TARGET_STATE_DIR/orders_map.jsonl"
+copy_tree "bot_state/trader_state/logs" "$TARGET_LOG_DIR"
+copy_tree "bot_state/trader_state/fills" "$TARGET_FILLS_DIR"
+copy_tree "bot_state/trader_state/rebalance_results" "$TARGET_REBAL_DIR"
+
+touch "$TARGET_STATE_DIR/state.json" "$TARGET_STATE_DIR/orders_map.jsonl" "$TARGET_LOG_DIR/ledger.jsonl"
+echo "[STATE_PULL] done."

@@ -28,7 +28,7 @@ def append_order_map(
 ) -> Dict[str, Any]:
     ensure_dirs()
     normalized_sid = normalize_sid(sid)
-    oid = order_id or f"client-{uuid.uuid4().hex}"
+    oid = order_id or f"client-{normalized_sid}-{uuid.uuid4().hex}"
     record = {
         "order_id": oid,
         "pdno": pdno,
