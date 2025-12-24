@@ -17,6 +17,7 @@ import random
 import logging
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import requests
@@ -172,6 +173,61 @@ TR_MAP = {
         "TOKEN": "/oauth2/token",
     },
 }
+
+
+def _load_tr_override_from_excel(path: str | None) -> Dict[str, Dict[str, List[str]]]:
+    """환경변수로 전달된 최신 엑셀 정의에서 TR ID를 읽어온다."""
+    if not path:
+        return {}
+    excel_path = Path(path)
+    if not excel_path.exists():
+        logger.info("[KIS_TR] excel not found: %s", excel_path)
+        return {}
+    try:
+        import openpyxl
+    except ImportError:
+        logger.warning("[KIS_TR] openpyxl not installed → skip excel parsing")
+        return {}
+
+    overrides: Dict[str, Dict[str, List[str]]] = {}
+    try:
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        sheet_name = os.getenv("KIS_PARAM_SHEET") or wb.sheetnames[0]
+        ws = wb[sheet_name]
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        header_index = {str(val).strip().lower(): idx for idx, val in enumerate(header) if val}
+        key_idx = header_index.get("key") or header_index.get("api") or header_index.get("구분")
+        practice_idx = header_index.get("practice") or header_index.get("모의투자") or header_index.get("sandbox")
+        real_idx = header_index.get("real") or header_index.get("실전") or header_index.get("production")
+        if key_idx is None or (practice_idx is None and real_idx is None):
+            logger.info("[KIS_TR] excel missing required columns → skip")
+            return {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            key = str(row[key_idx]).strip().upper() if row[key_idx] else ""
+            if not key:
+                continue
+            practice_val = row[practice_idx] if practice_idx is not None else None
+            real_val = row[real_idx] if real_idx is not None else None
+            overrides[key] = {
+                "practice": [str(practice_val).strip()] if practice_val else [],
+                "real": [str(real_val).strip()] if real_val else [],
+            }
+    except Exception as e:
+        logger.warning("[KIS_TR] excel parse failed: %s", e)
+    return overrides
+
+
+_TR_OVERRIDE = _load_tr_override_from_excel(
+    os.getenv("KIS_PARAM_EXCEL_PATH", "한국투자증권_오픈API_전체문서_20250717_030000.xlsx")
+)
+if _TR_OVERRIDE:
+    for env in ("practice", "real"):
+        env_map = TR_MAP.get(env, {})
+        for key, payload in _TR_OVERRIDE.items():
+            if env in payload and payload[env]:
+                env_map[key] = payload[env]
+        TR_MAP[env] = env_map
+        logger.info("[KIS_TR] %s overrides applied: %d", env, len(env_map))
 
 
 def _pick_tr(env: str, key: str) -> List[str]:

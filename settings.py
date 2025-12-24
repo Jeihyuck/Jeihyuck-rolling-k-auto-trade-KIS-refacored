@@ -78,3 +78,49 @@ logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 logger.info(f"[환경변수 체크] 기타 옵션들 정상 적용됨")
+
+
+def _float_env(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, default))
+    except Exception:
+        return float(default)
+
+
+def _alloc_env(key: str, default: float) -> float:
+    value = _float_env(key, default)
+    return value / 100.0 if value > 1 else value
+
+
+STRATEGY_SETTINGS = {
+    "breakout": {
+        "strategy_id": 1,
+        "profit_target_pct": _float_env("BREAKOUT_PROFIT_TARGET_PCT", 3.0),
+        "stop_loss_pct": _float_env("BREAKOUT_STOP_LOSS_PCT", 5.0),
+        "entry_allocation_pct": _alloc_env("BREAKOUT_ENTRY_PCT", 20.0),
+    },
+    "pullback": {
+        "strategy_id": 2,
+        "profit_target_pct": _float_env("PULLBACK_PROFIT_TARGET_PCT", 3.5),
+        "stop_loss_pct": _float_env("PULLBACK_STOP_LOSS_PCT", 4.0),
+        "entry_allocation_pct": _alloc_env("PULLBACK_ENTRY_PCT", 20.0),
+    },
+    "momentum": {
+        "strategy_id": 3,
+        "profit_target_pct": _float_env("MOMENTUM_PROFIT_TARGET_PCT", 2.5),
+        "stop_loss_pct": _float_env("MOMENTUM_STOP_LOSS_PCT", 3.0),
+        "entry_allocation_pct": _alloc_env("MOMENTUM_ENTRY_PCT", 20.0),
+    },
+    "mean_reversion": {
+        "strategy_id": 4,
+        "profit_target_pct": _float_env("MEANREV_PROFIT_TARGET_PCT", 2.0),
+        "stop_loss_pct": _float_env("MEANREV_STOP_LOSS_PCT", 2.5),
+        "entry_allocation_pct": _alloc_env("MEANREV_ENTRY_PCT", 20.0),
+    },
+    "volatility": {
+        "strategy_id": 5,
+        "profit_target_pct": _float_env("VOLATILITY_PROFIT_TARGET_PCT", 3.0),
+        "stop_loss_pct": _float_env("VOLATILITY_STOP_LOSS_PCT", 4.0),
+        "entry_allocation_pct": _alloc_env("VOLATILITY_ENTRY_PCT", 20.0),
+    },
+}

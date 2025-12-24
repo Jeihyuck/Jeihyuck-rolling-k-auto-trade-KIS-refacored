@@ -200,9 +200,7 @@ def reconcile_with_kis_balance(
         positions[symbol] = pos
     for symbol, pos in list(positions.items()):
         if symbol not in seen:
-            pos["qty"] = 0
-            pos["last_action"] = "RECONCILE"
-            positions[symbol] = pos
+            positions.pop(symbol, None)
     return state
 
 

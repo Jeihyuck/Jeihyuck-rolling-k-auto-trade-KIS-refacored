@@ -1,11 +1,91 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
 from .config import KST
 from .code_utils import normalize_code
 from .strategy_ids import STRATEGY_INT_IDS
+
+LEDGER_DIR = Path("fills")
+LEDGER_PATH = LEDGER_DIR / "ledger.jsonl"
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            # 일부 플랫폼에서는 fsync 미지원
+            pass
+
+
+def record_trade_ledger(
+    *,
+    timestamp: str,
+    code: str,
+    strategy_id: int | str | None,
+    side: str,
+    qty: int,
+    price: float,
+    meta: Dict[str, Any] | None = None,
+    path: Path | None = None,
+) -> Dict[str, Any]:
+    """체결 내역을 JSONL 원장에 추가하고 즉시 flush."""
+    entry = {
+        "timestamp": timestamp,
+        "code": normalize_code(code),
+        "strategy_id": strategy_id,
+        "side": str(side).upper(),
+        "qty": int(qty),
+        "price": float(price),
+        "meta": meta or {},
+    }
+    _append_jsonl(path or LEDGER_PATH, entry)
+    return entry
+
+
+def load_ledger_entries(path: Path | None = None) -> List[Dict[str, Any]]:
+    path = path or LEDGER_PATH
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return rows
+    return rows
+
+
+def strategy_map_from_ledger(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """최근 매수 체결 기준 종목→전략 맵을 생성."""
+    mapping: Dict[str, Any] = {}
+    for entry in entries:
+        code = normalize_code(entry.get("code") or entry.get("pdno") or "")
+        if not code:
+            continue
+        side = str(entry.get("side") or "").upper()
+        sid = entry.get("strategy_id")
+        if side == "BUY" and sid is not None:
+            mapping[code] = sid
+        elif code not in mapping and sid is not None:
+            # 매도/정리 체결만 있어도 최근 전략을 남겨 재구성
+            mapping[code] = sid
+    return mapping
 
 
 def _ensure_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:

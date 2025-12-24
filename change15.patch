@@ -1,0 +1,1398 @@
+diff --git a/README.md b/README.md
+index 155c6e1d80c7e3f5ba1325c2874ebee405d22e27..3b3c0038bb8931ad6699e0374f7aa433f81273fb 100644
+--- a/README.md
++++ b/README.md
+@@ -1,60 +1,76 @@
+ # Jeihyuck-rolling-k-auto-trade-KIS-refacored
+ 
+ ## Portfolio split architecture
+ This refactor promotes KOSPI and KOSDAQ trading into parallel engines under a shared portfolio manager while preserving the existing KOSDAQ intraday behavior.
+ 
+ ```
+ portfolio/
+   base_engine.py
+   kospi_core_engine.py
+   kosdaq_alpha_engine.py
+   portfolio_manager.py
+ strategy/
+   kospi/{universe.py, rebalance.py, signals.py}
+   kosdaq/{universe.py, rolling_entry.py, pullback.py}
+ trader/
+   trader.py (entrypoint)
+   state_manager.py
+   legacy_kosdaq_runner.py (previous KOSDAQ loop kept intact)
++  strategy_manager.py (multi-strategy orchestrator)
++  strategies/ (strategy interface & concrete implementations)
+ ```
+ 
+ ## Engine responsibilities
+ - **KOSPI core engine**: KOSPI market-cap Top-N universe, equal-weight targets, periodic rebalance with market orders and KIS quotes.
+ - **KOSDAQ alpha engine**: delegates to the legacy rolling-K/VWAP/pullback loop unchanged, using its original state file for backward compatibility.
+ - **Capital split**: `PortfolioManager` divides `DAILY_CAPITAL` (or supplied total) into KOSPI and KOSDAQ ratios (default 60/40) and runs each engine independently.
+ - **Performance**: portfolio-level PnL snapshots combine KIS cash/positions with engine allocation ratios for unified reporting without coupling the two engines.
+   - Engine-level PnL is an attribution estimate based on capital split ratios because positions are pooled at the account level.
+ 
+ ## How to run
+ ```
+ python -m trader.trader
+ ```
+-This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors. The KOSDAQ loop is blocking, so the entrypoint runs a single orchestrated cycle via `run_once()` rather than a repeating scheduler.
++This now initializes the strategy-aware engine, reconciles state with the KIS balance + ledger, and runs a single StrategyManager cycle (entries/exits) for all enabled strategies in parallel. The legacy KOSDAQ loop remains available via the portfolio engines but the default entrypoint focuses on the multi-strategy Rolling-K pipeline.
+ 
+ Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 상태를 유지합니다.
+ 
++## Multi-strategy Rolling-K
++- `trader/strategies/`: BaseStrategy plus breakout, pullback, momentum, mean-reversion, and volatility variants, each exposing common enter/exit hooks.
++- `trader/strategy_manager.py`: evaluates all enabled strategies, allocates capital by configurable weights, and routes buy/sell decisions through `KisAPI` while tagging fills with `strategy_id`.
++- Configuration: per-strategy risk knobs are sourced from environment variables (see `trader/config.py` or `settings.py`). Key variables include `BREAKOUT_PROFIT_TARGET_PCT`, `BREAKOUT_STOP_LOSS_PCT`, `PULLBACK_REVERSAL_BUFFER`, `MOMENTUM_MIN_MOMENTUM_PCT`, `MEANREV_BAND_WIDTH_PCT`, `VOLATILITY_THRESHOLD_PCT`, `STRATEGY_WEIGHTS`, and `STRATEGY_WATCHLIST`.
++- Logging: entry/exit, stop-loss/take-profit decisions, and reconciliation steps emit INFO logs with code/strategy context for traceability.
++
++## Ledger and reconciliation
++- Every confirmed order is appended to `fills/ledger.jsonl` with `{timestamp, code, strategy_id, side, qty, price, meta}` and flushed to disk.
++- On startup, the ledger is parsed to recover preferred `strategy_id` mappings for existing holdings before reconciling with the broker’s balance. Holdings absent from the latest balance snapshot are removed from local runtime state.
++- Existing CSV fills under `fills/` are preserved; the JSONL ledger is additive and used for state recovery.
++
++## KIS parameter updates
++- `trader/kis_wrapper.py` will optionally load TR ID overrides from the latest KIS Excel spec via `KIS_PARAM_EXCEL_PATH` (defaulting to `한국투자증권_오픈API_전체문서_20250717_030000.xlsx` when present). Missing files fall back to the environment variables baked into `TR_MAP`.
++
+ ## CI and live-trading safeguards
+ - CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
+ - The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.
+ 
+ ## How legacy recovery works
+ The KOSDAQ loop reconciles broker holdings into the position state each cycle. If a holding is missing from the state, the bot:
+ 1. Searches the recent trade logs for the latest BUY fill of the same code to recover the strategy ID and engine.
+ 2. Falls back to a rebalance bucket (`REB_YYYYMMDD`) if the code is in today’s targets.
+ 3. Otherwise assigns the holding to `MANUAL`.
+ 
+ This avoids legacy sid placeholders and ensures every holding has an explicit sid bucket.
+ 
+ ## State schema
+ Position state is stored in `trader/state/state.json` and normalized on load. Each strategy entry is guaranteed to include:
+ ```
+ {
+   "code": "<6-digit code>",
+   "sid": "<strategy or bucket id>",
+   "engine": "<entry engine>",
+   "qty": <int>,
+   "avg_price": <float>,
+   "entry_ts": "<ISO timestamp>",
+   "high_watermark": <float>,
+   "flags": { ... },
+   "last_update_ts": "<ISO timestamp>"
+diff --git a/settings.py b/settings.py
+index c318c0f3422e433a2c4b1f367befc45f8edc5067..33b304fa5c81c774652c258dc703dd07dfe20b09 100644
+--- a/settings.py
++++ b/settings.py
+@@ -56,25 +56,71 @@ K_STEP                = float(os.getenv("K_STEP", "0.1"))
+ K_GRID_MODE           = os.getenv("K_GRID_MODE", "fixed").lower()
+ K_STEP_FINE           = float(os.getenv("K_STEP_FINE", "0.05"))
+ K_DYNAMIC_STEP_MIN    = float(os.getenv("K_DYNAMIC_STEP_MIN", "0.03"))
+ K_DYNAMIC_STEP_MAX    = float(os.getenv("K_DYNAMIC_STEP_MAX", "0.10"))
+ K_DYNAMIC_STEP_MULT   = float(os.getenv("K_DYNAMIC_STEP_MULT", "1.5"))
+ MIN_TRADES            = int(os.getenv("MIN_TRADES", "5"))
+ MAX_MDD_PCT           = float(os.getenv("MAX_MDD_PCT", "30"))
+ REQUIRE_POS_RET       = os.getenv("REQUIRE_POS_RET", "true").lower() == "true"
+ TOP_N                 = int(os.getenv("TOP_N", "50"))
+ ALWAYS_INCLUDE_CODES  = {c.strip() for c in os.getenv("ALWAYS_INCLUDE_CODES", "").replace(" ", "").split(",") if c.strip()}
+ KEEP_HELD_BYPASS_FILTERS = os.getenv("KEEP_HELD_BYPASS_FILTERS", "true").lower() == "true"
+ HELD_MIN_WEIGHT       = float(os.getenv("HELD_MIN_WEIGHT", "0.01"))
+ 
+ # === 로깅 설정 ===
+ LOG_DIR = os.getenv("LOG_DIR", "logs")
+ os.makedirs(LOG_DIR, exist_ok=True)
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
+ logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
+ logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
+ logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
+ logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
+ logger.info(f"[환경변수 체크] 기타 옵션들 정상 적용됨")
++
++
++def _float_env(key: str, default: float) -> float:
++    try:
++        return float(os.getenv(key, default))
++    except Exception:
++        return float(default)
++
++
++def _alloc_env(key: str, default: float) -> float:
++    value = _float_env(key, default)
++    return value / 100.0 if value > 1 else value
++
++
++STRATEGY_SETTINGS = {
++    "breakout": {
++        "strategy_id": 1,
++        "profit_target_pct": _float_env("BREAKOUT_PROFIT_TARGET_PCT", 3.0),
++        "stop_loss_pct": _float_env("BREAKOUT_STOP_LOSS_PCT", 5.0),
++        "entry_allocation_pct": _alloc_env("BREAKOUT_ENTRY_PCT", 20.0),
++    },
++    "pullback": {
++        "strategy_id": 2,
++        "profit_target_pct": _float_env("PULLBACK_PROFIT_TARGET_PCT", 3.5),
++        "stop_loss_pct": _float_env("PULLBACK_STOP_LOSS_PCT", 4.0),
++        "entry_allocation_pct": _alloc_env("PULLBACK_ENTRY_PCT", 20.0),
++    },
++    "momentum": {
++        "strategy_id": 3,
++        "profit_target_pct": _float_env("MOMENTUM_PROFIT_TARGET_PCT", 2.5),
++        "stop_loss_pct": _float_env("MOMENTUM_STOP_LOSS_PCT", 3.0),
++        "entry_allocation_pct": _alloc_env("MOMENTUM_ENTRY_PCT", 20.0),
++    },
++    "mean_reversion": {
++        "strategy_id": 4,
++        "profit_target_pct": _float_env("MEANREV_PROFIT_TARGET_PCT", 2.0),
++        "stop_loss_pct": _float_env("MEANREV_STOP_LOSS_PCT", 2.5),
++        "entry_allocation_pct": _alloc_env("MEANREV_ENTRY_PCT", 20.0),
++    },
++    "volatility": {
++        "strategy_id": 5,
++        "profit_target_pct": _float_env("VOLATILITY_PROFIT_TARGET_PCT", 3.0),
++        "stop_loss_pct": _float_env("VOLATILITY_STOP_LOSS_PCT", 4.0),
++        "entry_allocation_pct": _alloc_env("VOLATILITY_ENTRY_PCT", 20.0),
++    },
++}
+diff --git a/trader/config.py b/trader/config.py
+index f2a876becf33582d9a1666095d0c22e792502dff..adf7e7118eab11db1531adb7666583d9ccb180b6 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -89,50 +89,73 @@ CONFIG = {
+     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
+     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
+     "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
+     "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
+     "NEUTRAL_ENTRY_SCALE": "0.6",          # 중립 레짐 신규/재진입 스케일링 비율
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
++    # 멀티 전략 설정
++    "STRATEGY_WEIGHTS": "1:0.2,2:0.2,3:0.2,4:0.2,5:0.2",
++    "STRATEGY_WATCHLIST": "",
++    "BREAKOUT_PROFIT_TARGET_PCT": "3.0",
++    "BREAKOUT_STOP_LOSS_PCT": "5.0",
++    "BREAKOUT_ENTRY_PCT": "20.0",
++    "BREAKOUT_K_FACTOR": "0.5",
++    "PULLBACK_PROFIT_TARGET_PCT": "3.5",
++    "PULLBACK_STOP_LOSS_PCT": "4.0",
++    "PULLBACK_ENTRY_PCT": "20.0",
++    "PULLBACK_REVERSAL_BUFFER": "0.2",
++    "MOMENTUM_PROFIT_TARGET_PCT": "2.5",
++    "MOMENTUM_STOP_LOSS_PCT": "3.0",
++    "MOMENTUM_ENTRY_PCT": "20.0",
++    "MOMENTUM_MIN_MOMENTUM_PCT": "0.5",
++    "MEANREV_PROFIT_TARGET_PCT": "2.0",
++    "MEANREV_STOP_LOSS_PCT": "2.5",
++    "MEANREV_ENTRY_PCT": "20.0",
++    "MEANREV_BAND_WIDTH_PCT": "2.0",
++    "VOLATILITY_PROFIT_TARGET_PCT": "3.0",
++    "VOLATILITY_STOP_LOSS_PCT": "4.0",
++    "VOLATILITY_ENTRY_PCT": "20.0",
++    "VOLATILITY_THRESHOLD_PCT": "1.5",
+ }
+ 
+ 
+ def _cfg(key: str) -> str:
+     """환경변수 > CONFIG 기본값"""
+     return os.getenv(key, CONFIG.get(key, ""))
+ 
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ LOG_DIR = Path(__file__).parent / "logs"
+ LOG_DIR.mkdir(exist_ok=True)
+ STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
+ STATE_DIR = Path(__file__).parent / "state"
+ STATE_PATH = STATE_DIR / "state.json"
+ STATE_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
+ MARKET_MAP: Dict[str, str] = {
+     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
+ }
+ 
+ # 데이터 없음 1차 감지 상태 저장(연속 DATA_EMPTY 확인용)
+ EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
+@@ -196,50 +219,134 @@ SUBJECT_FLOW_RETRY = int(_cfg("SUBJECT_FLOW_RETRY") or "1")
+ SUBJECT_FLOW_CACHE_TTL_SEC = float(_cfg("SUBJECT_FLOW_CACHE_TTL_SEC") or "60")
+ SUBJECT_FLOW_FAIL_POLICY = (_cfg("SUBJECT_FLOW_FAIL_POLICY") or "CACHE").upper()
+ SUBJECT_FLOW_EMPTY_POLICY = (_cfg("SUBJECT_FLOW_EMPTY_POLICY") or "TREAT_AS_FAIL").upper()
+ SUBJECT_FLOW_DEGRADED_TURNOVER_MULT = float(_cfg("SUBJECT_FLOW_DEGRADED_TURNOVER_MULT") or "1.5")
+ SUBJECT_FLOW_DEGRADED_OB_ADD = float(_cfg("SUBJECT_FLOW_DEGRADED_OB_ADD") or "10")
+ SUBJECT_FLOW_MAX_CALLS_PER_RUN = int(_cfg("SUBJECT_FLOW_MAX_CALLS_PER_RUN") or "200")
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             value = int(item)
+         except ValueError:
+             continue
+         if 1 <= value <= 5 and value not in priorities:
+             priorities.append(value)
+     return priorities or [5, 4, 3, 2, 1]
+ 
+ 
+ STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+     _cfg("STRATEGY_REDUCTION_PRIORITY")
+ )
++
++
++def _parse_strategy_weights(raw: str) -> Dict[int, float]:
++    weights: Dict[int, float] = {}
++    for item in raw.split(","):
++        if ":" not in item:
++            continue
++        sid_txt, weight_txt = item.split(":", 1)
++        try:
++            sid = int(sid_txt.strip())
++            weight = float(weight_txt.strip())
++        except Exception:
++            continue
++        if sid < 1 or sid > 5:
++            continue
++        weights[sid] = max(0.0, weight)
++    if not weights:
++        weights = {i: 1.0 for i in range(1, 6)}
++    total = sum(weights.values()) or 1.0
++    return {sid: w / total for sid, w in weights.items()}
++
++
++def _parse_watchlist(raw: str) -> list[str]:
++    codes: list[str] = []
++    for code in raw.split(","):
++        code = code.strip()
++        if code:
++            codes.append(code)
++    return codes
++
++
++STRATEGY_WEIGHTS = _parse_strategy_weights(_cfg("STRATEGY_WEIGHTS"))
++STRATEGY_WATCHLIST = _parse_watchlist(_cfg("STRATEGY_WATCHLIST"))
++
++
++def _pct_value(value: str, default: float) -> float:
++    try:
++        return float(value)
++    except Exception:
++        return float(default)
++
++
++def _alloc_pct(value: str, default: float) -> float:
++    pct = _pct_value(value, default)
++    return pct / 100.0 if pct > 1 else pct
++
++
++STRATEGY_CONFIG = {
++    "breakout": {
++        "strategy_id": 1,
++        "profit_target_pct": _pct_value(_cfg("BREAKOUT_PROFIT_TARGET_PCT"), 3.0),
++        "stop_loss_pct": _pct_value(_cfg("BREAKOUT_STOP_LOSS_PCT"), 5.0),
++        "entry_allocation_pct": _alloc_pct(_cfg("BREAKOUT_ENTRY_PCT"), 20.0),
++        "k_factor": _pct_value(_cfg("BREAKOUT_K_FACTOR"), 0.5),
++    },
++    "pullback": {
++        "strategy_id": 2,
++        "profit_target_pct": _pct_value(_cfg("PULLBACK_PROFIT_TARGET_PCT"), 3.5),
++        "stop_loss_pct": _pct_value(_cfg("PULLBACK_STOP_LOSS_PCT"), 4.0),
++        "entry_allocation_pct": _alloc_pct(_cfg("PULLBACK_ENTRY_PCT"), 20.0),
++        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.2),
++    },
++    "momentum": {
++        "strategy_id": 3,
++        "profit_target_pct": _pct_value(_cfg("MOMENTUM_PROFIT_TARGET_PCT"), 2.5),
++        "stop_loss_pct": _pct_value(_cfg("MOMENTUM_STOP_LOSS_PCT"), 3.0),
++        "entry_allocation_pct": _alloc_pct(_cfg("MOMENTUM_ENTRY_PCT"), 20.0),
++        "min_momentum_pct": _pct_value(_cfg("MOMENTUM_MIN_MOMENTUM_PCT"), 0.5),
++    },
++    "mean_reversion": {
++        "strategy_id": 4,
++        "profit_target_pct": _pct_value(_cfg("MEANREV_PROFIT_TARGET_PCT"), 2.0),
++        "stop_loss_pct": _pct_value(_cfg("MEANREV_STOP_LOSS_PCT"), 2.5),
++        "entry_allocation_pct": _alloc_pct(_cfg("MEANREV_ENTRY_PCT"), 20.0),
++        "band_width_pct": _pct_value(_cfg("MEANREV_BAND_WIDTH_PCT"), 2.0),
++    },
++    "volatility": {
++        "strategy_id": 5,
++        "profit_target_pct": _pct_value(_cfg("VOLATILITY_PROFIT_TARGET_PCT"), 3.0),
++        "stop_loss_pct": _pct_value(_cfg("VOLATILITY_STOP_LOSS_PCT"), 4.0),
++        "entry_allocation_pct": _alloc_pct(_cfg("VOLATILITY_ENTRY_PCT"), 20.0),
++        "volatility_threshold_pct": _pct_value(_cfg("VOLATILITY_THRESHOLD_PCT"), 1.5),
++    },
++}
+ # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
+ USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
+ PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
+ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+ PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
+ PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
+ PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+ PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")
+ CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
+ CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
+ CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
+ CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
+ 
+ # 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
+ CHAMPION_A_RULES = {
+     "min_trades": 30,
+     "min_cumret_pct": 40.0,
+     "max_mdd_pct": 25.0,
+     "min_win_pct": 50.0,
+     "min_sharpe": 1.2,
+     "min_turnover": 3_000_000_000,  # 30억
+ }
+ 
+ GOOD_ENTRY_PULLBACK_RANGE = (5.0, 15.0)  # 신고가 대비 눌림폭(%): 최소~최대
+ GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 4552d52532ad889c963122a7c15a14f17cdee651..9ea6981be08c9c2f3a3f65b6f22667b6ffbdc529 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -1,44 +1,45 @@
+ # -*- coding: utf-8 -*-
+ # kis_wrapper.py — KIS OpenAPI wrapper (practice/real 공용)
+ # - 세션/리트라이/레이트리밋
+ # - 토큰 캐시
+ # - 시세/일봉/ATR
+ # - 잔고/주문
+ # - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
+ # - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
+ # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
+ # - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
+ # - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+ 
+ import os
+ import json
+ import time
+ import random
+ import logging
+ import threading
+ from datetime import datetime, timedelta
++from pathlib import Path
+ from typing import Dict, List, Optional, Tuple, Any
+ 
+ import requests
+ import pytz
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
+ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+ from trader.time_utils import is_trading_day, is_trading_window, now_kst
+ from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+ from trader.fills import append_fill
+ from trader.code_utils import normalize_code
+ 
+ logger = logging.getLogger(__name__)
+ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+ 
+ 
+ class NetTemporaryError(Exception):
+     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+     pass
+ 
+ 
+ class DataEmptyError(Exception):
+     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
+     pass
+@@ -152,50 +153,105 @@ class _RateLimiter:
+ 
+ TR_MAP = {
+     "practice": {
+         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY", "VTTC0012U"), "VTTC0802U"],
+         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL", "VTTC0011U"), "VTTC0801U"],
+         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE", "VTTC8434R")],
+         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
+         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
+         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
+         "TOKEN": "/oauth2/tokenP",
+     },
+     "real": {
+         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY_REAL", "TTTC0012U")],
+         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL_REAL", "TTTC0011U")],
+         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE_REAL", "TTTC8434R")],
+         "PRICE": [os.getenv("KIS_TR_ID_PRICE_REAL", "FHKST01010100")],
+         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
+         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
+         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART_REAL", "FHKST03010200")],
+         "TOKEN": "/oauth2/token",
+     },
+ }
+ 
+ 
++def _load_tr_override_from_excel(path: str | None) -> Dict[str, Dict[str, List[str]]]:
++    """환경변수로 전달된 최신 엑셀 정의에서 TR ID를 읽어온다."""
++    if not path:
++        return {}
++    excel_path = Path(path)
++    if not excel_path.exists():
++        logger.info("[KIS_TR] excel not found: %s", excel_path)
++        return {}
++    try:
++        import openpyxl
++    except ImportError:
++        logger.warning("[KIS_TR] openpyxl not installed → skip excel parsing")
++        return {}
++
++    overrides: Dict[str, Dict[str, List[str]]] = {}
++    try:
++        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
++        sheet_name = os.getenv("KIS_PARAM_SHEET") or wb.sheetnames[0]
++        ws = wb[sheet_name]
++        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
++        header_index = {str(val).strip().lower(): idx for idx, val in enumerate(header) if val}
++        key_idx = header_index.get("key") or header_index.get("api") or header_index.get("구분")
++        practice_idx = header_index.get("practice") or header_index.get("모의투자") or header_index.get("sandbox")
++        real_idx = header_index.get("real") or header_index.get("실전") or header_index.get("production")
++        if key_idx is None or (practice_idx is None and real_idx is None):
++            logger.info("[KIS_TR] excel missing required columns → skip")
++            return {}
++        for row in ws.iter_rows(min_row=2, values_only=True):
++            key = str(row[key_idx]).strip().upper() if row[key_idx] else ""
++            if not key:
++                continue
++            practice_val = row[practice_idx] if practice_idx is not None else None
++            real_val = row[real_idx] if real_idx is not None else None
++            overrides[key] = {
++                "practice": [str(practice_val).strip()] if practice_val else [],
++                "real": [str(real_val).strip()] if real_val else [],
++            }
++    except Exception as e:
++        logger.warning("[KIS_TR] excel parse failed: %s", e)
++    return overrides
++
++
++_TR_OVERRIDE = _load_tr_override_from_excel(
++    os.getenv("KIS_PARAM_EXCEL_PATH", "한국투자증권_오픈API_전체문서_20250717_030000.xlsx")
++)
++if _TR_OVERRIDE:
++    for env in ("practice", "real"):
++        env_map = TR_MAP.get(env, {})
++        for key, payload in _TR_OVERRIDE.items():
++            if env in payload and payload[env]:
++                env_map[key] = payload[env]
++        TR_MAP[env] = env_map
++        logger.info("[KIS_TR] %s overrides applied: %d", env, len(env_map))
++
++
+ def _pick_tr(env: str, key: str) -> List[str]:
+     try:
+         return TR_MAP[env][key]
+     except Exception:
+         return []
+ 
+ 
+ # --- KisAPI 이하 실전 전체 로직 ---
+ class KisAPI:
+     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
+     _cache_path = "kis_token_cache.json"
+     _token_lock = threading.Lock()
+ 
+     def should_cooldown(self, now_kst: datetime | None = None) -> bool:
+         """
+         VWAP / 롤링K 메인 루프에서 '잠깐 쉬어야 하는 구간'을 체크하는 헬퍼.
+ 
+         지금은 최소 구현 버전:
+         - 항상 False를 리턴해서 쿨다운을 사용하지 않는다.
+         - 나중에 점심시간 / 장 마감 직전 / 과열 구간 등 세부 로직을 여기로 옮기면 된다.
+         """
+         return False
+ 
+     def __init__(self):
+         self.CANO = safe_strip(CANO)
+diff --git a/trader/ledger.py b/trader/ledger.py
+index 7335374515dbc7fbbca0e0787ee1e7e7c7b85bb2..55de8580e8875c11548c770e5039627214fa33e0 100644
+--- a/trader/ledger.py
++++ b/trader/ledger.py
+@@ -1,34 +1,114 @@
+ from __future__ import annotations
+ 
++import json
++import os
+ from datetime import datetime
++from pathlib import Path
+ from typing import Any, Dict, List
+ 
+ from .config import KST
+ from .code_utils import normalize_code
+ from .strategy_ids import STRATEGY_INT_IDS
+ 
++LEDGER_DIR = Path("fills")
++LEDGER_PATH = LEDGER_DIR / "ledger.jsonl"
++
++
++def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
++    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
++        f.flush()
++        try:
++            os.fsync(f.fileno())
++        except Exception:
++            # 일부 플랫폼에서는 fsync 미지원
++            pass
++
++
++def record_trade_ledger(
++    *,
++    timestamp: str,
++    code: str,
++    strategy_id: int | str | None,
++    side: str,
++    qty: int,
++    price: float,
++    meta: Dict[str, Any] | None = None,
++    path: Path | None = None,
++) -> Dict[str, Any]:
++    """체결 내역을 JSONL 원장에 추가하고 즉시 flush."""
++    entry = {
++        "timestamp": timestamp,
++        "code": normalize_code(code),
++        "strategy_id": strategy_id,
++        "side": str(side).upper(),
++        "qty": int(qty),
++        "price": float(price),
++        "meta": meta or {},
++    }
++    _append_jsonl(path or LEDGER_PATH, entry)
++    return entry
++
++
++def load_ledger_entries(path: Path | None = None) -> List[Dict[str, Any]]:
++    path = path or LEDGER_PATH
++    if not path.exists():
++        return []
++    rows: List[Dict[str, Any]] = []
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    rows.append(json.loads(line))
++                except json.JSONDecodeError:
++                    continue
++    except Exception:
++        return rows
++    return rows
++
++
++def strategy_map_from_ledger(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
++    """최근 매수 체결 기준 종목→전략 맵을 생성."""
++    mapping: Dict[str, Any] = {}
++    for entry in entries:
++        code = normalize_code(entry.get("code") or entry.get("pdno") or "")
++        if not code:
++            continue
++        side = str(entry.get("side") or "").upper()
++        sid = entry.get("strategy_id")
++        if side == "BUY" and sid is not None:
++            mapping[code] = sid
++        elif code not in mapping and sid is not None:
++            # 매도/정리 체결만 있어도 최근 전략을 남겨 재구성
++            mapping[code] = sid
++    return mapping
++
+ 
+ def _ensure_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+     lots = state.get("lots")
+     if not isinstance(lots, list):
+         lots = []
+         state["lots"] = lots
+     return lots
+ 
+ 
+ def _norm_sid(value: int | str | None) -> int | str | None:
+     if value is None:
+         return None
+     text = str(value)
+     return int(text) if text.isdigit() else text
+ 
+ 
+ def record_buy_fill(
+     state: Dict[str, Any],
+     *,
+     lot_id: str,
+     pdno: str,
+     strategy_id: int | str,
+     engine: str,
+     entry_ts: str,
+     entry_price: float,
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 8a36b7be668709915f7fc164bfcbac5ca2515868..659750826a488b3e9532c67007bccb207e8b715f 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -178,53 +178,51 @@ def reconcile_with_kis_balance(
+     balance_positions = balance.get("positions") if isinstance(balance, dict) else None
+     if not isinstance(balance_positions, list):
+         return state
+     seen = set()
+     for row in balance_positions:
+         symbol = normalize_code(row.get("code") or row.get("pdno") or "")
+         if not symbol:
+             continue
+         qty = int(row.get("qty") or 0)
+         if qty <= 0:
+             continue
+         seen.add(symbol)
+         pos = positions.setdefault(symbol, {})
+         strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "MANUAL"
+         pos.update(
+             {
+                 "strategy_id": strategy_id,
+                 "qty": qty,
+                 "avg_price": float(row.get("avg_price") or 0.0),
+                 "last_action": "RECONCILE",
+             }
+         )
+         positions[symbol] = pos
+     for symbol, pos in list(positions.items()):
+         if symbol not in seen:
+-            pos["qty"] = 0
+-            pos["last_action"] = "RECONCILE"
+-            positions[symbol] = pos
++            positions.pop(symbol, None)
+     return state
+ 
+ 
+ def _default_lot_state() -> Dict[str, Any]:
+     return {"version": SCHEMA_VERSION, "lots": [], "updated_at": None}
+ 
+ 
+ def load_lot_state(path_json: str) -> Dict[str, Any]:
+     path = Path(path_json)
+     if not path.exists():
+         return _default_lot_state()
+     try:
+         with open(path, "r", encoding="utf-8") as f:
+             state = json.load(f)
+         if not isinstance(state, dict):
+             logger.warning("[STATE_STORE] invalid state format: %s", type(state))
+             return _default_lot_state()
+         state.setdefault("version", SCHEMA_VERSION)
+         state.setdefault("lots", [])
+         state.setdefault("updated_at", None)
+         return state
+     except Exception:
+         logger.exception("[STATE_STORE] failed to load %s", path_json)
+         return _default_lot_state()
+ 
+diff --git a/trader/strategies/__init__.py b/trader/strategies/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5e46c56a7894badeacbf5c60c49d980df248b35
+--- /dev/null
++++ b/trader/strategies/__init__.py
+@@ -0,0 +1,16 @@
++"""Strategy package exposing a common interface for multi-strategy trading."""
++from .base import BaseStrategy
++from .strategy_breakout import BreakoutStrategy
++from .strategy_pullback import PullbackStrategy
++from .strategy_momentum import MomentumStrategy
++from .strategy_mean_reversion import MeanReversionStrategy
++from .strategy_volatility import VolatilityStrategy
++
++__all__ = [
++    "BaseStrategy",
++    "BreakoutStrategy",
++    "PullbackStrategy",
++    "MomentumStrategy",
++    "MeanReversionStrategy",
++    "VolatilityStrategy",
++]
+diff --git a/trader/strategies/base.py b/trader/strategies/base.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc06a78f2af5e1f9c71a9608578536a4098b904e
+--- /dev/null
++++ b/trader/strategies/base.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++
++class BaseStrategy:
++    """Common strategy interface used by the StrategyManager."""
++
++    name: str = "base"
++
++    def __init__(self, config: Dict[str, Any] | None = None):
++        self.config = config or {}
++        self.strategy_id = self.config.get("strategy_id")
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        raise NotImplementedError
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        raise NotImplementedError
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        raise NotImplementedError
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        raise NotImplementedError
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        raise NotImplementedError
++
++    def _pct_value(self, key: str, default: float) -> float:
++        try:
++            return float(self.config.get(key, default))
++        except Exception:
++            return float(default)
++
++    def _stop_loss_price(self, avg_price: float, pct: float) -> float:
++        pct = abs(pct)
++        return max(0.0, avg_price * (1 - pct / 100.0))
++
++    def _take_profit_price(self, avg_price: float, pct: float) -> float:
++        return avg_price * (1 + pct / 100.0)
+diff --git a/trader/strategies/strategy_breakout.py b/trader/strategies/strategy_breakout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc30de098a87c976b6e7cac927ba3a09bfda76ef
+--- /dev/null
++++ b/trader/strategies/strategy_breakout.py
+@@ -0,0 +1,43 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .base import BaseStrategy
++
++
++class BreakoutStrategy(BaseStrategy):
++    """신고가 돌파 전략."""
++
++    name = "breakout"
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
++        if price <= 0 or recent_high <= 0:
++            return False
++        k_factor = self._pct_value("k_factor", 0.5)
++        breakout_level = recent_high * (1 + k_factor / 100.0)
++        return price >= breakout_level
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        price = float(market_data.get("price") or 0.0)
++        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
++        k_factor = self._pct_value("k_factor", 0.5)
++        target = recent_high * (1 + k_factor / 100.0) if recent_high > 0 else price
++        return float(target or price)
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 5.0))
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.0))
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        if price <= 0:
++            return False
++        stop = self.compute_stop_loss(position_state, market_data)
++        target = self.compute_take_profit(position_state, market_data)
++        return price <= stop or price >= target
+diff --git a/trader/strategies/strategy_mean_reversion.py b/trader/strategies/strategy_mean_reversion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..13d21f22187e6065a2f746421ff3050e6145106e
+--- /dev/null
++++ b/trader/strategies/strategy_mean_reversion.py
+@@ -0,0 +1,42 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .base import BaseStrategy
++
++
++class MeanReversionStrategy(BaseStrategy):
++    """밴드 하단 진입 / 평균 회귀 전략."""
++
++    name = "mean_reversion"
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        mean = float(market_data.get("mean_price") or market_data.get("ma_slow") or 0.0)
++        band_width_pct = self._pct_value("band_width_pct", 2.0)
++        if price <= 0 or mean <= 0:
++            return False
++        lower_band = mean * (1 - band_width_pct / 100.0)
++        return price <= lower_band
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        return float(market_data.get("price") or 0.0)
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 2.5))
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        mean = float(market_data.get("mean_price") or market_data.get("ma_slow") or 0.0)
++        if mean > 0:
++            return mean
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 2.0))
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        if price <= 0:
++            return False
++        stop = self.compute_stop_loss(position_state, market_data)
++        target = self.compute_take_profit(position_state, market_data)
++        return price <= stop or price >= target
+diff --git a/trader/strategies/strategy_momentum.py b/trader/strategies/strategy_momentum.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2342ee63d2b825f87648321d785c2b30e5889564
+--- /dev/null
++++ b/trader/strategies/strategy_momentum.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .base import BaseStrategy
++
++
++class MomentumStrategy(BaseStrategy):
++    """단기 모멘텀 교차 기반 전략."""
++
++    name = "momentum"
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        vwap = float(market_data.get("vwap") or 0.0)
++        fast = float(market_data.get("ma_fast") or 0.0)
++        slow = float(market_data.get("ma_slow") or 0.0)
++        prev_close = float(market_data.get("prev_close") or 0.0)
++        min_mom = self._pct_value("min_momentum_pct", 0.5)
++        if price <= 0 or fast <= 0 or slow <= 0 or prev_close <= 0:
++            return False
++        momentum_pct = (price - prev_close) / prev_close * 100
++        return fast > slow and price >= vwap and momentum_pct >= min_mom
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        return float(market_data.get("price") or 0.0)
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 3.0))
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 2.5))
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        if price <= 0:
++            return False
++        stop = self.compute_stop_loss(position_state, market_data)
++        target = self.compute_take_profit(position_state, market_data)
++        vwap = float(market_data.get("vwap") or 0.0)
++        lost_momentum = vwap > 0 and price < vwap
++        return price <= stop or price >= target or lost_momentum
+diff --git a/trader/strategies/strategy_pullback.py b/trader/strategies/strategy_pullback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f672474a01e36555142189eb5a809cec22a1bd94
+--- /dev/null
++++ b/trader/strategies/strategy_pullback.py
+@@ -0,0 +1,47 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .base import BaseStrategy
++
++
++class PullbackStrategy(BaseStrategy):
++    """신고가 이후 눌림목 + 반등 전략."""
++
++    name = "pullback"
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
++        recent_low = float(market_data.get("recent_low") or market_data.get("low") or 0.0)
++        reversal_price = float(market_data.get("reversal_price") or 0.0)
++        if price <= 0 or high <= 0 or recent_low <= 0:
++            return False
++        drop_pct = (high - price) / high * 100 if high else 0.0
++        reversal_buffer = self._pct_value("reversal_buffer_pct", 0.2)
++        has_reversal = price >= max(recent_low, reversal_price) * (1 - reversal_buffer / 100.0)
++        return drop_pct >= 3.0 and has_reversal
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        reversal_price = float(market_data.get("reversal_price") or 0.0)
++        price = float(market_data.get("price") or 0.0)
++        return reversal_price or price
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 4.0))
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.5))
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        if price <= 0:
++            return False
++        stop = self.compute_stop_loss(position_state, market_data)
++        target = self.compute_take_profit(position_state, market_data)
++        # 추가: 반등 실패 시 직전 저점 하회 체크
++        recent_low = float(market_data.get("recent_low") or market_data.get("low") or 0.0)
++        failed_rebound = recent_low > 0 and price < recent_low
++        return price <= stop or price >= target or failed_rebound
+diff --git a/trader/strategies/strategy_volatility.py b/trader/strategies/strategy_volatility.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..521c0c98fac0c360ed3623182c76c3c5645f6eb2
+--- /dev/null
++++ b/trader/strategies/strategy_volatility.py
+@@ -0,0 +1,39 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .base import BaseStrategy
++
++
++class VolatilityStrategy(BaseStrategy):
++    """변동성 돌파 및 확장 전략."""
++
++    name = "volatility"
++
++    def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
++        volatility = float(market_data.get("volatility") or 0.0)
++        threshold = self._pct_value("volatility_threshold_pct", 1.5)
++        if price <= 0 or recent_high <= 0:
++            return False
++        return volatility >= threshold and price >= recent_high
++
++    def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
++        return float(market_data.get("price") or 0.0)
++
++    def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 4.0))
++
++    def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
++        avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
++        return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.0))
++
++    def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
++        price = float(market_data.get("price") or 0.0)
++        if price <= 0:
++            return False
++        stop = self.compute_stop_loss(position_state, market_data)
++        target = self.compute_take_profit(position_state, market_data)
++        return price <= stop or price >= target
+diff --git a/trader/strategy_manager.py b/trader/strategy_manager.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f80e405358c1c80bad1c1b38c652eb6a3581020
+--- /dev/null
++++ b/trader/strategy_manager.py
+@@ -0,0 +1,289 @@
++from __future__ import annotations
++
++import logging
++from datetime import datetime
++from typing import Any, Dict, Iterable, List, Optional
++
++from .code_utils import normalize_code
++from .config import (
++    DAILY_CAPITAL,
++    STRATEGY_CONFIG,
++    STRATEGY_WATCHLIST,
++    STRATEGY_WEIGHTS,
++)
++from .ledger import record_trade_ledger
++from .state_store import mark_fill, mark_order
++from .time_utils import now_kst
++from .kis_wrapper import KisAPI
++from .strategies import (
++    BaseStrategy,
++    BreakoutStrategy,
++    MeanReversionStrategy,
++    MomentumStrategy,
++    PullbackStrategy,
++    VolatilityStrategy,
++)
++
++logger = logging.getLogger(__name__)
++
++
++STRATEGY_CLASS_MAP = {
++    "breakout": BreakoutStrategy,
++    "pullback": PullbackStrategy,
++    "momentum": MomentumStrategy,
++    "mean_reversion": MeanReversionStrategy,
++    "volatility": VolatilityStrategy,
++}
++
++
++class StrategyManager:
++    """Instantiate and orchestrate enabled strategies."""
++
++    def __init__(
++        self,
++        *,
++        kis: KisAPI,
++        strategy_configs: Dict[str, Dict[str, Any]] | None = None,
++        strategy_weights: Dict[int, float] | None = None,
++        watchlist: Iterable[str] | None = None,
++    ) -> None:
++        self.kis = kis
++        self.strategy_configs = strategy_configs or STRATEGY_CONFIG
++        self.strategy_weights = strategy_weights or STRATEGY_WEIGHTS
++        self.watchlist = [normalize_code(code) for code in (watchlist or STRATEGY_WATCHLIST) if normalize_code(code)]
++        self.strategies = self._init_strategies()
++
++    def _init_strategies(self) -> Dict[int, BaseStrategy]:
++        strategies: Dict[int, BaseStrategy] = {}
++        for name, cfg in self.strategy_configs.items():
++            cls = STRATEGY_CLASS_MAP.get(name)
++            if not cls:
++                continue
++            try:
++                strat: BaseStrategy = cls(cfg)
++                sid = int(cfg.get("strategy_id"))
++            except Exception:
++                continue
++            strategies[sid] = strat
++        return strategies
++
++    def _strategy_for_id(self, strategy_id: Any) -> Optional[BaseStrategy]:
++        try:
++            sid = int(strategy_id)
++        except Exception:
++            return None
++        return self.strategies.get(sid)
++
++    def _capital_by_strategy(self, total_cash: float) -> Dict[int, float]:
++        allocations: Dict[int, float] = {}
++        for sid, weight in self.strategy_weights.items():
++            allocations[int(sid)] = float(total_cash) * float(weight)
++        if not allocations and total_cash > 0:
++            per = float(total_cash) / max(len(self.strategies), 1)
++            for sid in self.strategies:
++                allocations[sid] = per
++        return allocations
++
++    def _candidate_symbols(self, positions: Dict[str, Any], extra: Iterable[str] | None) -> List[str]:
++        universe = set(self.watchlist)
++        universe.update(positions.keys())
++        if extra:
++            universe.update(normalize_code(code) for code in extra if normalize_code(code))
++        return [code for code in universe if code]
++
++    def fetch_market_data(self, symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
++        market_data: Dict[str, Dict[str, Any]] = {}
++        for code in symbols:
++            code_key = normalize_code(code)
++            if not code_key:
++                continue
++            snap: Dict[str, Any] = {}
++            try:
++                snap = self.kis.get_quote_snapshot(code_key)
++            except Exception as e:
++                logger.warning("[STRAT] snapshot fail %s: %s", code_key, e)
++            price = float(snap.get("tp") or 0.0)
++            prev_close = None
++            try:
++                prev_close = float(self.kis.get_prev_close(code_key) or 0.0)
++            except Exception:
++                prev_close = None
++            try:
++                candles = self.kis.get_daily_candles(code_key, count=30)
++            except Exception:
++                candles = []
++            recent_high, recent_low = 0.0, 0.0
++            ma_fast, ma_slow = 0.0, 0.0
++            volatility = 0.0
++            closes: List[float] = []
++            highs: List[float] = []
++            lows: List[float] = []
++            for candle in candles or []:
++                try:
++                    closes.append(float(candle.get("close") or 0.0))
++                    highs.append(float(candle.get("high") or 0.0))
++                    lows.append(float(candle.get("low") or 0.0))
++                except Exception:
++                    continue
++            if highs:
++                recent_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
++            if lows:
++                recent_low = min(lows[-10:]) if len(lows) >= 10 else min(lows)
++            if closes:
++                window = min(len(closes), 20)
++                ma_fast = sum(closes[-5:]) / min(len(closes), 5)
++                ma_slow = sum(closes[-window:]) / window
++                if recent_high and recent_low and prev_close:
++                    volatility = (recent_high - recent_low) / prev_close * 100
++            market_data[code_key] = {
++                "price": price,
++                "ask": snap.get("ap"),
++                "bid": snap.get("bp"),
++                "prev_close": prev_close,
++                "recent_high": recent_high,
++                "recent_low": recent_low,
++                "ma_fast": ma_fast,
++                "ma_slow": ma_slow,
++                "mean_price": ma_slow,
++                "volatility": volatility,
++                "vwap": snap.get("tp"),  # fallback: 실시간 VWAP 불가 시 현재가 사용
++            }
++        return market_data
++
++    def run_cycle(
++        self,
++        state: Dict[str, Any],
++        balance: Dict[str, Any],
++        candidates: Iterable[str] | None = None,
++    ) -> Dict[str, Any]:
++        positions = state.get("positions", {})
++        symbols = self._candidate_symbols(positions, candidates)
++        if not symbols:
++            logger.info("[STRAT] no symbols to evaluate")
++            return {"entries": 0, "exits": 0}
++        market_data = self.fetch_market_data(symbols)
++        exits = self._evaluate_exits(state, market_data)
++        entries = self._evaluate_entries(state, market_data, balance)
++        return {"entries": entries, "exits": exits}
++
++    def _evaluate_entries(
++        self,
++        state: Dict[str, Any],
++        market_data: Dict[str, Dict[str, Any]],
++        balance: Dict[str, Any],
++    ) -> int:
++        total_cash = float(balance.get("cash") or 0.0) if isinstance(balance, dict) else 0.0
++        if total_cash <= 0:
++            total_cash = float(DAILY_CAPITAL)
++        allocations = self._capital_by_strategy(total_cash)
++        positions = state.get("positions", {})
++        entries = 0
++        for sid, strategy in self.strategies.items():
++            alloc = allocations.get(sid, total_cash / max(len(self.strategies), 1))
++            cfg = self.strategy_configs.get(strategy.name, {})
++            entry_pct = cfg.get("entry_allocation_pct") or 0.2
++            if entry_pct > 1:
++                entry_pct = entry_pct / 100.0
++            budget = alloc * float(entry_pct)
++            for code, data in market_data.items():
++                if normalize_code(code) in positions:
++                    continue
++                if not strategy.should_enter(code, data):
++                    continue
++                entry_price = strategy.compute_entry_price(code, data)
++                qty = self._qty_for_budget(budget, entry_price)
++                if qty <= 0:
++                    logger.debug(
++                        "[STRAT][ENTRY_SKIP] %s sid=%s budget=%.0f px=%.2f qty<=0",
++                        code,
++                        sid,
++                        budget,
++                        entry_price,
++                    )
++                    continue
++                ts = now_kst().isoformat()
++                mark_order(state, code, "BUY", sid, qty, entry_price, ts)
++                try:
++                    resp = (
++                        self.kis.buy_stock_limit_guarded(code, qty, int(entry_price))
++                        if entry_price > 0
++                        else self.kis.buy_stock_market_guarded(code, qty)
++                    )
++                except Exception as e:
++                    logger.error("[STRAT][BUY_FAIL] %s sid=%s ex=%s", code, sid, e)
++                    continue
++                if self.kis.check_filled(resp):
++                    mark_fill(state, code, "BUY", sid, qty, entry_price, ts, status="filled")
++                    record_trade_ledger(
++                        timestamp=ts,
++                        code=code,
++                        strategy_id=sid,
++                        side="BUY",
++                        qty=qty,
++                        price=entry_price,
++                        meta={"engine": "strategy_manager", "resp": resp},
++                    )
++                    entries += 1
++                    logger.info(
++                        "[STRAT][ENTRY] code=%s sid=%s qty=%s price=%.2f budget=%.0f",
++                        code,
++                        sid,
++                        qty,
++                        entry_price,
++                        budget,
++                    )
++        return entries
++
++    def _evaluate_exits(self, state: Dict[str, Any], market_data: Dict[str, Dict[str, Any]]) -> int:
++        positions = state.get("positions", {})
++        exits = 0
++        for code, pos in list(positions.items()):
++            code_key = normalize_code(code)
++            strategy_id = pos.get("strategy_id")
++            strategy = self._strategy_for_id(strategy_id)
++            if not strategy:
++                continue
++            data = market_data.get(code_key) or {}
++            if not strategy.should_exit(pos, data):
++                continue
++            qty = int(pos.get("qty") or 0)
++            if qty <= 0:
++                continue
++            ts = now_kst().isoformat()
++            mark_order(state, code_key, "SELL", strategy_id, qty, data.get("price") or 0.0, ts)
++            try:
++                resp = self.kis.sell_stock_market_guarded(code_key, qty)
++            except Exception as e:
++                logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, strategy_id, e)
++                continue
++            if self.kis.check_filled(resp):
++                price = float(data.get("price") or 0.0)
++                mark_fill(state, code_key, "SELL", strategy_id, qty, price, ts, status="filled")
++                record_trade_ledger(
++                    timestamp=ts,
++                    code=code_key,
++                    strategy_id=strategy_id,
++                    side="SELL",
++                    qty=qty,
++                    price=price,
++                    meta={"engine": "strategy_manager", "resp": resp},
++                )
++                positions.pop(code_key, None)
++                exits += 1
++                logger.info(
++                    "[STRAT][EXIT] code=%s sid=%s qty=%s price=%.2f reason=signal",
++                    code_key,
++                    strategy_id,
++                    qty,
++                    price,
++                )
++        return exits
++
++    @staticmethod
++    def _qty_for_budget(budget: float, price: float) -> int:
++        try:
++            if budget <= 0 or price <= 0:
++                return 0
++            return int(budget // price)
++        except Exception:
++            return 0
+diff --git a/trader/trader.py b/trader/trader.py
+index 72c94072f0348462ce6ad0d8f551bad922a307da..c1c28a80eb91011050f55364773fc79ea8d638fc 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,39 +1,72 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ 
+-from portfolio.portfolio_manager import PortfolioManager
++from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.kis_wrapper import KisAPI
+ from trader import state_store as runtime_state_store
++from trader.strategy_manager import StrategyManager
++from trader.ledger import load_ledger_entries, strategy_map_from_ledger
+ from trader.time_utils import is_trading_day, now_kst
++from trader.core_utils import get_rebalance_anchor_date
++from trader.code_utils import normalize_code
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _collect_rebalance_candidates() -> set[str]:
++    candidates: set[str] = set()
++    try:
++        rebalance_date = str(get_rebalance_anchor_date())
++        payload = run_rebalance(rebalance_date, return_by_market=True)
++        selected_by_market = payload.get("selected_by_market") or {}
++        for items in selected_by_market.values():
++            for row in items or []:
++                code = normalize_code(row.get("code") or row.get("pdno") or row.get("symbol") or "")
++                if code:
++                    candidates.add(code)
++        logger.info("[TRADER] rebalance candidates=%d (date=%s)", len(candidates), rebalance_date)
++    except Exception:
++        logger.exception("[TRADER] rebalance candidate fetch failed")
++    return candidates
++
++
+ def main() -> None:
+     now = now_kst()
+     if not is_trading_day(now):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
+         return
++    runtime_state = runtime_state_store.load_state()
++    kis: KisAPI | None = None
++    balance: dict[str, object] = {}
+     try:
+-        runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
++        ledger_entries = load_ledger_entries()
++        preferred_strategy = strategy_map_from_ledger(ledger_entries)
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+-            runtime_state, balance
++            runtime_state, balance, preferred_strategy=preferred_strategy
+         )
+         runtime_state_store.save_state(runtime_state)
+-        logger.info("[TRADER] runtime state reconciled")
++        logger.info("[TRADER] runtime state reconciled (positions=%d)", len(runtime_state.get("positions", {})))
+     except Exception:
+         logger.exception("[TRADER] runtime state reconcile failed")
+ 
+-    mgr = PortfolioManager()
+-    result = mgr.run_once()
+-    logger.info("[TRADER] cycle complete %s", result)
++    try:
++        kis = kis or KisAPI()
++        manager = StrategyManager(kis=kis)
++        candidates = _collect_rebalance_candidates()
++        # open positions도 관찰 대상에 포함
++        candidates.update(runtime_state.get("positions", {}).keys())
++        result = manager.run_cycle(runtime_state, balance, candidates)
++        runtime_state_store.save_state(runtime_state)
++        logger.info("[TRADER] strategy cycle complete %s", result)
++    except Exception:
++        logger.exception("[TRADER] strategy cycle failed")
+ 
+ 
+ if __name__ == "__main__":
+     main()

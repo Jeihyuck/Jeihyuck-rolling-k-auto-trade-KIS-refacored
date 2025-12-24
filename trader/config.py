@@ -111,6 +111,29 @@ CONFIG = {
     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
     "EMERGENCY_GLOBAL_SELL": "false",
     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+    # 멀티 전략 설정
+    "STRATEGY_WEIGHTS": "1:0.2,2:0.2,3:0.2,4:0.2,5:0.2",
+    "STRATEGY_WATCHLIST": "",
+    "BREAKOUT_PROFIT_TARGET_PCT": "3.0",
+    "BREAKOUT_STOP_LOSS_PCT": "5.0",
+    "BREAKOUT_ENTRY_PCT": "20.0",
+    "BREAKOUT_K_FACTOR": "0.5",
+    "PULLBACK_PROFIT_TARGET_PCT": "3.5",
+    "PULLBACK_STOP_LOSS_PCT": "4.0",
+    "PULLBACK_ENTRY_PCT": "20.0",
+    "PULLBACK_REVERSAL_BUFFER": "0.2",
+    "MOMENTUM_PROFIT_TARGET_PCT": "2.5",
+    "MOMENTUM_STOP_LOSS_PCT": "3.0",
+    "MOMENTUM_ENTRY_PCT": "20.0",
+    "MOMENTUM_MIN_MOMENTUM_PCT": "0.5",
+    "MEANREV_PROFIT_TARGET_PCT": "2.0",
+    "MEANREV_STOP_LOSS_PCT": "2.5",
+    "MEANREV_ENTRY_PCT": "20.0",
+    "MEANREV_BAND_WIDTH_PCT": "2.0",
+    "VOLATILITY_PROFIT_TARGET_PCT": "3.0",
+    "VOLATILITY_STOP_LOSS_PCT": "4.0",
+    "VOLATILITY_ENTRY_PCT": "20.0",
+    "VOLATILITY_THRESHOLD_PCT": "1.5",
 }
 
 
@@ -218,6 +241,90 @@ def _parse_strategy_priority(raw: str) -> list[int]:
 STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
     _cfg("STRATEGY_REDUCTION_PRIORITY")
 )
+
+
+def _parse_strategy_weights(raw: str) -> Dict[int, float]:
+    weights: Dict[int, float] = {}
+    for item in raw.split(","):
+        if ":" not in item:
+            continue
+        sid_txt, weight_txt = item.split(":", 1)
+        try:
+            sid = int(sid_txt.strip())
+            weight = float(weight_txt.strip())
+        except Exception:
+            continue
+        if sid < 1 or sid > 5:
+            continue
+        weights[sid] = max(0.0, weight)
+    if not weights:
+        weights = {i: 1.0 for i in range(1, 6)}
+    total = sum(weights.values()) or 1.0
+    return {sid: w / total for sid, w in weights.items()}
+
+
+def _parse_watchlist(raw: str) -> list[str]:
+    codes: list[str] = []
+    for code in raw.split(","):
+        code = code.strip()
+        if code:
+            codes.append(code)
+    return codes
+
+
+STRATEGY_WEIGHTS = _parse_strategy_weights(_cfg("STRATEGY_WEIGHTS"))
+STRATEGY_WATCHLIST = _parse_watchlist(_cfg("STRATEGY_WATCHLIST"))
+
+
+def _pct_value(value: str, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _alloc_pct(value: str, default: float) -> float:
+    pct = _pct_value(value, default)
+    return pct / 100.0 if pct > 1 else pct
+
+
+STRATEGY_CONFIG = {
+    "breakout": {
+        "strategy_id": 1,
+        "profit_target_pct": _pct_value(_cfg("BREAKOUT_PROFIT_TARGET_PCT"), 3.0),
+        "stop_loss_pct": _pct_value(_cfg("BREAKOUT_STOP_LOSS_PCT"), 5.0),
+        "entry_allocation_pct": _alloc_pct(_cfg("BREAKOUT_ENTRY_PCT"), 20.0),
+        "k_factor": _pct_value(_cfg("BREAKOUT_K_FACTOR"), 0.5),
+    },
+    "pullback": {
+        "strategy_id": 2,
+        "profit_target_pct": _pct_value(_cfg("PULLBACK_PROFIT_TARGET_PCT"), 3.5),
+        "stop_loss_pct": _pct_value(_cfg("PULLBACK_STOP_LOSS_PCT"), 4.0),
+        "entry_allocation_pct": _alloc_pct(_cfg("PULLBACK_ENTRY_PCT"), 20.0),
+        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.2),
+    },
+    "momentum": {
+        "strategy_id": 3,
+        "profit_target_pct": _pct_value(_cfg("MOMENTUM_PROFIT_TARGET_PCT"), 2.5),
+        "stop_loss_pct": _pct_value(_cfg("MOMENTUM_STOP_LOSS_PCT"), 3.0),
+        "entry_allocation_pct": _alloc_pct(_cfg("MOMENTUM_ENTRY_PCT"), 20.0),
+        "min_momentum_pct": _pct_value(_cfg("MOMENTUM_MIN_MOMENTUM_PCT"), 0.5),
+    },
+    "mean_reversion": {
+        "strategy_id": 4,
+        "profit_target_pct": _pct_value(_cfg("MEANREV_PROFIT_TARGET_PCT"), 2.0),
+        "stop_loss_pct": _pct_value(_cfg("MEANREV_STOP_LOSS_PCT"), 2.5),
+        "entry_allocation_pct": _alloc_pct(_cfg("MEANREV_ENTRY_PCT"), 20.0),
+        "band_width_pct": _pct_value(_cfg("MEANREV_BAND_WIDTH_PCT"), 2.0),
+    },
+    "volatility": {
+        "strategy_id": 5,
+        "profit_target_pct": _pct_value(_cfg("VOLATILITY_PROFIT_TARGET_PCT"), 3.0),
+        "stop_loss_pct": _pct_value(_cfg("VOLATILITY_STOP_LOSS_PCT"), 4.0),
+        "entry_allocation_pct": _alloc_pct(_cfg("VOLATILITY_ENTRY_PCT"), 20.0),
+        "volatility_threshold_pct": _pct_value(_cfg("VOLATILITY_THRESHOLD_PCT"), 1.5),
+    },
+}
 # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
 USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
 PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")

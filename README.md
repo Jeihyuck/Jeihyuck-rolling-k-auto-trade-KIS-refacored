@@ -16,6 +16,8 @@ trader/
   trader.py (entrypoint)
   state_manager.py
   legacy_kosdaq_runner.py (previous KOSDAQ loop kept intact)
+  strategy_manager.py (multi-strategy orchestrator)
+  strategies/ (strategy interface & concrete implementations)
 ```
 
 ## Engine responsibilities
@@ -29,9 +31,23 @@ trader/
 ```
 python -m trader.trader
 ```
-This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors. The KOSDAQ loop is blocking, so the entrypoint runs a single orchestrated cycle via `run_once()` rather than a repeating scheduler.
+This now initializes the strategy-aware engine, reconciles state with the KIS balance + ledger, and runs a single StrategyManager cycle (entries/exits) for all enabled strategies in parallel. The legacy KOSDAQ loop remains available via the portfolio engines but the default entrypoint focuses on the multi-strategy Rolling-K pipeline.
 
 Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 상태를 유지합니다.
+
+## Multi-strategy Rolling-K
+- `trader/strategies/`: BaseStrategy plus breakout, pullback, momentum, mean-reversion, and volatility variants, each exposing common enter/exit hooks.
+- `trader/strategy_manager.py`: evaluates all enabled strategies, allocates capital by configurable weights, and routes buy/sell decisions through `KisAPI` while tagging fills with `strategy_id`.
+- Configuration: per-strategy risk knobs are sourced from environment variables (see `trader/config.py` or `settings.py`). Key variables include `BREAKOUT_PROFIT_TARGET_PCT`, `BREAKOUT_STOP_LOSS_PCT`, `PULLBACK_REVERSAL_BUFFER`, `MOMENTUM_MIN_MOMENTUM_PCT`, `MEANREV_BAND_WIDTH_PCT`, `VOLATILITY_THRESHOLD_PCT`, `STRATEGY_WEIGHTS`, and `STRATEGY_WATCHLIST`.
+- Logging: entry/exit, stop-loss/take-profit decisions, and reconciliation steps emit INFO logs with code/strategy context for traceability.
+
+## Ledger and reconciliation
+- Every confirmed order is appended to `fills/ledger.jsonl` with `{timestamp, code, strategy_id, side, qty, price, meta}` and flushed to disk.
+- On startup, the ledger is parsed to recover preferred `strategy_id` mappings for existing holdings before reconciling with the broker’s balance. Holdings absent from the latest balance snapshot are removed from local runtime state.
+- Existing CSV fills under `fills/` are preserved; the JSONL ledger is additive and used for state recovery.
+
+## KIS parameter updates
+- `trader/kis_wrapper.py` will optionally load TR ID overrides from the latest KIS Excel spec via `KIS_PARAM_EXCEL_PATH` (defaulting to `한국투자증권_오픈API_전체문서_20250717_030000.xlsx` when present). Missing files fall back to the environment variables baked into `TR_MAP`.
 
 ## CI and live-trading safeguards
 - CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
