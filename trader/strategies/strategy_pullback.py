@@ -12,15 +12,24 @@ class PullbackStrategy(BaseStrategy):
 
     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
         price = float(market_data.get("price") or 0.0)
-        high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
-        recent_low = float(market_data.get("recent_low") or market_data.get("low") or 0.0)
+        recent_high = float(market_data.get("recent_high") or 0.0)
+        recent_low = float(market_data.get("recent_low") or 0.0)
         reversal_price = float(market_data.get("reversal_price") or 0.0)
-        if price <= 0 or high <= 0 or recent_low <= 0:
+        vwap = float(market_data.get("vwap") or 0.0)
+        if price <= 0 or recent_high <= 0 or recent_low <= 0 or vwap <= 0:
             return False
-        drop_pct = (high - price) / high * 100 if high else 0.0
-        reversal_buffer = self._pct_value("reversal_buffer_pct", 0.2)
-        has_reversal = price >= max(recent_low, reversal_price) * (1 - reversal_buffer / 100.0)
-        return drop_pct >= 3.0 and has_reversal
+        drop_pct = (recent_high - price) / recent_high * 100.0
+        min_drop = self._pct_value("drop_threshold_pct", 3.0)
+        max_drop = self._pct_value("max_drop_pct", 15.0)
+        if drop_pct < min_drop or drop_pct > max_drop:
+            return False
+        reversal_buffer = self._pct_value("reversal_buffer_pct", 0.5)
+        min_reversal = max(recent_low, reversal_price) * (1 + reversal_buffer / 100.0)
+        if price < min_reversal:
+            return False
+        if price < vwap:
+            return False
+        return True
 
     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
         reversal_price = float(market_data.get("reversal_price") or 0.0)

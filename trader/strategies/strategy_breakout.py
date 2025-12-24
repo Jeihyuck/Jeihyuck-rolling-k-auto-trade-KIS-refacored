@@ -12,12 +12,21 @@ class BreakoutStrategy(BaseStrategy):
 
     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
         price = float(market_data.get("price") or 0.0)
-        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
-        if price <= 0 or recent_high <= 0:
+        recent_high = float(market_data.get("recent_high") or 0.0)
+        vwap = float(market_data.get("vwap") or 0.0)
+        ma_fast = float(market_data.get("ma_fast") or 0.0)
+        if price <= 0 or recent_high <= 0 or ma_fast <= 0 or vwap <= 0:
             return False
         k_factor = self._pct_value("k_factor", 0.5)
         breakout_level = recent_high * (1 + k_factor / 100.0)
-        return price >= breakout_level
+        if price < breakout_level:
+            return False
+        if price < vwap or price < ma_fast:
+            return False
+        max_dist = self._pct_value("max_ma_dist_pct", 10.0)
+        if ma_fast > 0 and ((price - ma_fast) / ma_fast * 100.0) > max_dist:
+            return False
+        return True
 
     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
         price = float(market_data.get("price") or 0.0)

@@ -1,0 +1,641 @@
+diff --git a/trader/config.py b/trader/config.py
+index adf7e7118eab11db1531adb7666583d9ccb180b6..e0c87b7652b3845dd488e6e08a5928a7468bf162 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -52,102 +52,106 @@ CONFIG = {
+     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
+     "W_MAX_ONE": "0.25",
+     "W_MIN_ONE": "0.03",
+     "REBALANCE_ANCHOR": "weekly",             # weekly | today | monthly
+     "WEEKLY_ANCHOR_REF": "last",              # NEW: 'last'(직전 일요일) | 'next'(다음 일요일)
+     "MOMENTUM_OVERRIDES_FORCE_SELL": "true",
+     # 레짐(코스닥) 파라미터
+     "KOSDAQ_INDEX_CODE": "KOSDAQ",
+     "KOSDAQ_ETF_FALLBACK": "229200",
+     "REG_BULL_MIN_UP_PCT": "0.5",
+     "REG_BULL_MIN_MINUTES": "10",
+     "REG_BEAR_VWAP_MINUTES": "10",
+     "REG_BEAR_DROP_FROM_HIGH": "0.7",
+     "REG_BEAR_STAGE1_MINUTES": "20",
+     "REG_BEAR_STAGE2_ADD_DROP": "0.5",
+     "REG_PARTIAL_S1": "0.30",
+     "REG_PARTIAL_S2": "0.30",
+     "BASE_QTY_MODE": "initial",  # initial | current
+     "TRAIL_PCT_BULL": "0.025",
+     "TRAIL_PCT_BEAR": "0.012",
+     "TP_PROFIT_PCT_BULL": "3.5",
+     # 신고가 돌파 후 3일 눌림 + 반등 매수용 파라미터
+     "USE_PULLBACK_ENTRY": "true",          # true면 '신고가 → 3일 연속 하락 → 반등' 패턴 충족 시에만 눌림목 진입 허용
+     "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
+     "PULLBACK_DAYS": "3",                  # 연속 하락 일수
+-    "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
++    "PULLBACK_REVERSAL_BUFFER_PCT": "0.5", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
+     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
+     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
+     "PULLBACK_MAX_BUYS_PER_DAY": "5",      # 눌림목 하루 최대 신규 매수 건수
+ 
+ # 전략4(종가베팅) & 전략별 필터 옵션
+ "CLOSE_BETTING_START": "14:30",        # 전략4 진입 시작 시간(HH:MM)
+ "CLOSE_BETTING_END": "15:10",          # 전략4 진입 종료 시간(HH:MM)
+ "CLOSE_BETTING_QTY_SCALE": "0.5",      # 전략4 진입 수량 스케일(0.1~1.0)
+ "CLOSE_BETTING_REQUIRE_GRADE": "AB",   # 전략4 챔피언 등급 요구: A 또는 AB
+ "STRICT_CHAMPION_STRATEGY_IDS": "5",   # CHAMPION_* 필터를 엄격 적용할 전략 ID들(쉼표구분)
+     # 챔피언 후보 필터
+     "CHAMPION_MIN_TRADES": "5",            # 최소 거래수
+     "CHAMPION_MIN_WINRATE": "45.0",        # 최소 승률(%)
+     "CHAMPION_MAX_MDD": "30.0",            # 최대 허용 MDD(%)
+     "CHAMPION_MIN_SHARPE": "0.0",          # 최소 샤프 비율
+     "NEUTRAL_ENTRY_SCALE": "0.6",          # 중립 레짐 신규/재진입 스케일링 비율
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+     # 멀티 전략 설정
+     "STRATEGY_WEIGHTS": "1:0.2,2:0.2,3:0.2,4:0.2,5:0.2",
+     "STRATEGY_WATCHLIST": "",
+     "BREAKOUT_PROFIT_TARGET_PCT": "3.0",
+     "BREAKOUT_STOP_LOSS_PCT": "5.0",
+     "BREAKOUT_ENTRY_PCT": "20.0",
+     "BREAKOUT_K_FACTOR": "0.5",
++    "BREAKOUT_MAX_MA_DIST_PCT": "10.0",
+     "PULLBACK_PROFIT_TARGET_PCT": "3.5",
+     "PULLBACK_STOP_LOSS_PCT": "4.0",
+     "PULLBACK_ENTRY_PCT": "20.0",
+-    "PULLBACK_REVERSAL_BUFFER": "0.2",
++    "PULLBACK_REVERSAL_BUFFER": "0.5",
++    "PULLBACK_DROP_THRESHOLD_PCT": "3.0",
++    "PULLBACK_MAX_DROP_PCT": "15.0",
+     "MOMENTUM_PROFIT_TARGET_PCT": "2.5",
+     "MOMENTUM_STOP_LOSS_PCT": "3.0",
+     "MOMENTUM_ENTRY_PCT": "20.0",
+     "MOMENTUM_MIN_MOMENTUM_PCT": "0.5",
++    "MOMENTUM_MAX_MA_DIST_PCT": "10.0",
+     "MEANREV_PROFIT_TARGET_PCT": "2.0",
+     "MEANREV_STOP_LOSS_PCT": "2.5",
+     "MEANREV_ENTRY_PCT": "20.0",
+     "MEANREV_BAND_WIDTH_PCT": "2.0",
+     "VOLATILITY_PROFIT_TARGET_PCT": "3.0",
+     "VOLATILITY_STOP_LOSS_PCT": "4.0",
+     "VOLATILITY_ENTRY_PCT": "20.0",
+     "VOLATILITY_THRESHOLD_PCT": "1.5",
+ }
+ 
+ 
+ def _cfg(key: str) -> str:
+     """환경변수 > CONFIG 기본값"""
+     return os.getenv(key, CONFIG.get(key, ""))
+ 
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ LOG_DIR = Path(__file__).parent / "logs"
+ LOG_DIR.mkdir(exist_ok=True)
+ STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
+ STATE_DIR = Path(__file__).parent / "state"
+ STATE_PATH = STATE_DIR / "state.json"
+ STATE_DIR.mkdir(parents=True, exist_ok=True)
+@@ -273,85 +277,89 @@ def _parse_watchlist(raw: str) -> list[str]:
+ 
+ 
+ STRATEGY_WEIGHTS = _parse_strategy_weights(_cfg("STRATEGY_WEIGHTS"))
+ STRATEGY_WATCHLIST = _parse_watchlist(_cfg("STRATEGY_WATCHLIST"))
+ 
+ 
+ def _pct_value(value: str, default: float) -> float:
+     try:
+         return float(value)
+     except Exception:
+         return float(default)
+ 
+ 
+ def _alloc_pct(value: str, default: float) -> float:
+     pct = _pct_value(value, default)
+     return pct / 100.0 if pct > 1 else pct
+ 
+ 
+ STRATEGY_CONFIG = {
+     "breakout": {
+         "strategy_id": 1,
+         "profit_target_pct": _pct_value(_cfg("BREAKOUT_PROFIT_TARGET_PCT"), 3.0),
+         "stop_loss_pct": _pct_value(_cfg("BREAKOUT_STOP_LOSS_PCT"), 5.0),
+         "entry_allocation_pct": _alloc_pct(_cfg("BREAKOUT_ENTRY_PCT"), 20.0),
+         "k_factor": _pct_value(_cfg("BREAKOUT_K_FACTOR"), 0.5),
++        "max_ma_dist_pct": _pct_value(_cfg("BREAKOUT_MAX_MA_DIST_PCT"), 10.0),
+     },
+     "pullback": {
+         "strategy_id": 2,
+         "profit_target_pct": _pct_value(_cfg("PULLBACK_PROFIT_TARGET_PCT"), 3.5),
+         "stop_loss_pct": _pct_value(_cfg("PULLBACK_STOP_LOSS_PCT"), 4.0),
+         "entry_allocation_pct": _alloc_pct(_cfg("PULLBACK_ENTRY_PCT"), 20.0),
+-        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.2),
++        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.5),
++        "drop_threshold_pct": _pct_value(_cfg("PULLBACK_DROP_THRESHOLD_PCT"), 3.0),
++        "max_drop_pct": _pct_value(_cfg("PULLBACK_MAX_DROP_PCT"), 15.0),
+     },
+     "momentum": {
+         "strategy_id": 3,
+         "profit_target_pct": _pct_value(_cfg("MOMENTUM_PROFIT_TARGET_PCT"), 2.5),
+         "stop_loss_pct": _pct_value(_cfg("MOMENTUM_STOP_LOSS_PCT"), 3.0),
+         "entry_allocation_pct": _alloc_pct(_cfg("MOMENTUM_ENTRY_PCT"), 20.0),
+         "min_momentum_pct": _pct_value(_cfg("MOMENTUM_MIN_MOMENTUM_PCT"), 0.5),
++        "max_ma_dist_pct": _pct_value(_cfg("MOMENTUM_MAX_MA_DIST_PCT"), 10.0),
+     },
+     "mean_reversion": {
+         "strategy_id": 4,
+         "profit_target_pct": _pct_value(_cfg("MEANREV_PROFIT_TARGET_PCT"), 2.0),
+         "stop_loss_pct": _pct_value(_cfg("MEANREV_STOP_LOSS_PCT"), 2.5),
+         "entry_allocation_pct": _alloc_pct(_cfg("MEANREV_ENTRY_PCT"), 20.0),
+         "band_width_pct": _pct_value(_cfg("MEANREV_BAND_WIDTH_PCT"), 2.0),
+     },
+     "volatility": {
+         "strategy_id": 5,
+         "profit_target_pct": _pct_value(_cfg("VOLATILITY_PROFIT_TARGET_PCT"), 3.0),
+         "stop_loss_pct": _pct_value(_cfg("VOLATILITY_STOP_LOSS_PCT"), 4.0),
+         "entry_allocation_pct": _alloc_pct(_cfg("VOLATILITY_ENTRY_PCT"), 20.0),
+         "volatility_threshold_pct": _pct_value(_cfg("VOLATILITY_THRESHOLD_PCT"), 1.5),
+     },
+ }
+ # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
+ USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
+ PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
+ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+-PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
++PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.5")
+ PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
+ PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+ PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")
+ CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
+ CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
+ CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
+ CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
+ 
+ # 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
+ CHAMPION_A_RULES = {
+     "min_trades": 30,
+     "min_cumret_pct": 40.0,
+     "max_mdd_pct": 25.0,
+     "min_win_pct": 50.0,
+     "min_sharpe": 1.2,
+     "min_turnover": 3_000_000_000,  # 30억
+ }
+ 
+ GOOD_ENTRY_PULLBACK_RANGE = (5.0, 15.0)  # 신고가 대비 눌림폭(%): 최소~최대
+ GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
+ GOOD_ENTRY_MAX_FROM_PEAK = 0.97  # 현재가/최근고점 최대치(≤0.97)
+ GOOD_ENTRY_MIN_RR = 2.0  # 기대수익/리스크 최소 비율
+ GOOD_ENTRY_MIN_INTRADAY_SIG = 2  # GOOD 타점으로 인정하기 위한 최소 intraday 시그널 개수
+ 
+ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+diff --git a/trader/strategies/strategy_breakout.py b/trader/strategies/strategy_breakout.py
+index cc30de098a87c976b6e7cac927ba3a09bfda76ef..9b5e155ad2ab0e7d38ffd0e8708dc85c84171bd9 100644
+--- a/trader/strategies/strategy_breakout.py
++++ b/trader/strategies/strategy_breakout.py
+@@ -1,43 +1,52 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict
+ 
+ from .base import BaseStrategy
+ 
+ 
+ class BreakoutStrategy(BaseStrategy):
+     """신고가 돌파 전략."""
+ 
+     name = "breakout"
+ 
+     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+-        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
+-        if price <= 0 or recent_high <= 0:
++        recent_high = float(market_data.get("recent_high") or 0.0)
++        vwap = float(market_data.get("vwap") or 0.0)
++        ma_fast = float(market_data.get("ma_fast") or 0.0)
++        if price <= 0 or recent_high <= 0 or ma_fast <= 0 or vwap <= 0:
+             return False
+         k_factor = self._pct_value("k_factor", 0.5)
+         breakout_level = recent_high * (1 + k_factor / 100.0)
+-        return price >= breakout_level
++        if price < breakout_level:
++            return False
++        if price < vwap or price < ma_fast:
++            return False
++        max_dist = self._pct_value("max_ma_dist_pct", 10.0)
++        if ma_fast > 0 and ((price - ma_fast) / ma_fast * 100.0) > max_dist:
++            return False
++        return True
+ 
+     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
+         price = float(market_data.get("price") or 0.0)
+         recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
+         k_factor = self._pct_value("k_factor", 0.5)
+         target = recent_high * (1 + k_factor / 100.0) if recent_high > 0 else price
+         return float(target or price)
+ 
+     def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 5.0))
+ 
+     def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.0))
+ 
+     def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         if price <= 0:
+             return False
+         stop = self.compute_stop_loss(position_state, market_data)
+         target = self.compute_take_profit(position_state, market_data)
+         return price <= stop or price >= target
+diff --git a/trader/strategies/strategy_mean_reversion.py b/trader/strategies/strategy_mean_reversion.py
+index 13d21f22187e6065a2f746421ff3050e6145106e..08f6d4132d90ffc1e245f3216c44a20bd7b6ea52 100644
+--- a/trader/strategies/strategy_mean_reversion.py
++++ b/trader/strategies/strategy_mean_reversion.py
+@@ -1,42 +1,45 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict
+ 
+ from .base import BaseStrategy
+ 
+ 
+ class MeanReversionStrategy(BaseStrategy):
+     """밴드 하단 진입 / 평균 회귀 전략."""
+ 
+     name = "mean_reversion"
+ 
+     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         mean = float(market_data.get("mean_price") or market_data.get("ma_slow") or 0.0)
++        fast = float(market_data.get("ma_fast") or 0.0)
+         band_width_pct = self._pct_value("band_width_pct", 2.0)
+-        if price <= 0 or mean <= 0:
++        if price <= 0 or mean <= 0 or fast <= 0:
+             return False
+         lower_band = mean * (1 - band_width_pct / 100.0)
+-        return price <= lower_band
++        if not (price <= lower_band and fast < mean):
++            return False
++        return True
+ 
+     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
+         return float(market_data.get("price") or 0.0)
+ 
+     def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 2.5))
+ 
+     def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         mean = float(market_data.get("mean_price") or market_data.get("ma_slow") or 0.0)
+         if mean > 0:
+             return mean
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 2.0))
+ 
+     def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         if price <= 0:
+             return False
+         stop = self.compute_stop_loss(position_state, market_data)
+         target = self.compute_take_profit(position_state, market_data)
+         return price <= stop or price >= target
+diff --git a/trader/strategies/strategy_momentum.py b/trader/strategies/strategy_momentum.py
+index 2342ee63d2b825f87648321d785c2b30e5889564..d17e5716cea662087fbe9c0076e9798a4eccc7ca 100644
+--- a/trader/strategies/strategy_momentum.py
++++ b/trader/strategies/strategy_momentum.py
+@@ -1,44 +1,49 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict
+ 
+ from .base import BaseStrategy
+ 
+ 
+ class MomentumStrategy(BaseStrategy):
+     """단기 모멘텀 교차 기반 전략."""
+ 
+     name = "momentum"
+ 
+     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         vwap = float(market_data.get("vwap") or 0.0)
+         fast = float(market_data.get("ma_fast") or 0.0)
+         slow = float(market_data.get("ma_slow") or 0.0)
+         prev_close = float(market_data.get("prev_close") or 0.0)
+         min_mom = self._pct_value("min_momentum_pct", 0.5)
+-        if price <= 0 or fast <= 0 or slow <= 0 or prev_close <= 0:
++        if price <= 0 or fast <= 0 or slow <= 0 or prev_close <= 0 or vwap <= 0:
+             return False
+-        momentum_pct = (price - prev_close) / prev_close * 100
+-        return fast > slow and price >= vwap and momentum_pct >= min_mom
++        momentum_pct = (price - prev_close) / prev_close * 100.0
++        if not (fast > slow and price >= vwap and momentum_pct >= min_mom):
++            return False
++        max_dist = self._pct_value("max_ma_dist_pct", 10.0)
++        if fast > 0 and ((price - fast) / fast * 100.0) > max_dist:
++            return False
++        return True
+ 
+     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
+         return float(market_data.get("price") or 0.0)
+ 
+     def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 3.0))
+ 
+     def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 2.5))
+ 
+     def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         if price <= 0:
+             return False
+         stop = self.compute_stop_loss(position_state, market_data)
+         target = self.compute_take_profit(position_state, market_data)
+         vwap = float(market_data.get("vwap") or 0.0)
+         lost_momentum = vwap > 0 and price < vwap
+         return price <= stop or price >= target or lost_momentum
+diff --git a/trader/strategies/strategy_pullback.py b/trader/strategies/strategy_pullback.py
+index f672474a01e36555142189eb5a809cec22a1bd94..315d16be4a76851d931f162d8b0c9a4d086cfeba 100644
+--- a/trader/strategies/strategy_pullback.py
++++ b/trader/strategies/strategy_pullback.py
+@@ -1,47 +1,56 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict
+ 
+ from .base import BaseStrategy
+ 
+ 
+ class PullbackStrategy(BaseStrategy):
+     """신고가 이후 눌림목 + 반등 전략."""
+ 
+     name = "pullback"
+ 
+     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+-        high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
+-        recent_low = float(market_data.get("recent_low") or market_data.get("low") or 0.0)
++        recent_high = float(market_data.get("recent_high") or 0.0)
++        recent_low = float(market_data.get("recent_low") or 0.0)
+         reversal_price = float(market_data.get("reversal_price") or 0.0)
+-        if price <= 0 or high <= 0 or recent_low <= 0:
++        vwap = float(market_data.get("vwap") or 0.0)
++        if price <= 0 or recent_high <= 0 or recent_low <= 0 or vwap <= 0:
++            return False
++        drop_pct = (recent_high - price) / recent_high * 100.0
++        min_drop = self._pct_value("drop_threshold_pct", 3.0)
++        max_drop = self._pct_value("max_drop_pct", 15.0)
++        if drop_pct < min_drop or drop_pct > max_drop:
++            return False
++        reversal_buffer = self._pct_value("reversal_buffer_pct", 0.5)
++        min_reversal = max(recent_low, reversal_price) * (1 + reversal_buffer / 100.0)
++        if price < min_reversal:
++            return False
++        if price < vwap:
+             return False
+-        drop_pct = (high - price) / high * 100 if high else 0.0
+-        reversal_buffer = self._pct_value("reversal_buffer_pct", 0.2)
+-        has_reversal = price >= max(recent_low, reversal_price) * (1 - reversal_buffer / 100.0)
+-        return drop_pct >= 3.0 and has_reversal
++        return True
+ 
+     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
+         reversal_price = float(market_data.get("reversal_price") or 0.0)
+         price = float(market_data.get("price") or 0.0)
+         return reversal_price or price
+ 
+     def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 4.0))
+ 
+     def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.5))
+ 
+     def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         if price <= 0:
+             return False
+         stop = self.compute_stop_loss(position_state, market_data)
+         target = self.compute_take_profit(position_state, market_data)
+         # 추가: 반등 실패 시 직전 저점 하회 체크
+         recent_low = float(market_data.get("recent_low") or market_data.get("low") or 0.0)
+         failed_rebound = recent_low > 0 and price < recent_low
+         return price <= stop or price >= target or failed_rebound
+diff --git a/trader/strategies/strategy_volatility.py b/trader/strategies/strategy_volatility.py
+index 521c0c98fac0c360ed3623182c76c3c5645f6eb2..47b283a44ae6972649a33268d3d62ca4df9e6285 100644
+--- a/trader/strategies/strategy_volatility.py
++++ b/trader/strategies/strategy_volatility.py
+@@ -1,39 +1,44 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict
+ 
+ from .base import BaseStrategy
+ 
+ 
+ class VolatilityStrategy(BaseStrategy):
+     """변동성 돌파 및 확장 전략."""
+ 
+     name = "volatility"
+ 
+     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+-        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
++        recent_high = float(market_data.get("recent_high") or 0.0)
++        fast = float(market_data.get("ma_fast") or 0.0)
+         volatility = float(market_data.get("volatility") or 0.0)
+         threshold = self._pct_value("volatility_threshold_pct", 1.5)
+-        if price <= 0 or recent_high <= 0:
++        if price <= 0 or recent_high <= 0 or fast <= 0:
+             return False
+-        return volatility >= threshold and price >= recent_high
++        if not (volatility >= threshold and price >= recent_high):
++            return False
++        if price < fast:
++            return False
++        return True
+ 
+     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
+         return float(market_data.get("price") or 0.0)
+ 
+     def compute_stop_loss(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._stop_loss_price(avg_price, self._pct_value("stop_loss_pct", 4.0))
+ 
+     def compute_take_profit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+         avg_price = float(position_state.get("avg_price") or market_data.get("price") or 0.0)
+         return self._take_profit_price(avg_price, self._pct_value("profit_target_pct", 3.0))
+ 
+     def should_exit(self, position_state: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+         price = float(market_data.get("price") or 0.0)
+         if price <= 0:
+             return False
+         stop = self.compute_stop_loss(position_state, market_data)
+         target = self.compute_take_profit(position_state, market_data)
+         return price <= stop or price >= target
+diff --git a/trader/strategy_manager.py b/trader/strategy_manager.py
+index 6f80e405358c1c80bad1c1b38c652eb6a3581020..6cfd6592882b548a7ac89689ecd696d5b69311b8 100644
+--- a/trader/strategy_manager.py
++++ b/trader/strategy_manager.py
+@@ -82,132 +82,140 @@ class StrategyManager:
+             per = float(total_cash) / max(len(self.strategies), 1)
+             for sid in self.strategies:
+                 allocations[sid] = per
+         return allocations
+ 
+     def _candidate_symbols(self, positions: Dict[str, Any], extra: Iterable[str] | None) -> List[str]:
+         universe = set(self.watchlist)
+         universe.update(positions.keys())
+         if extra:
+             universe.update(normalize_code(code) for code in extra if normalize_code(code))
+         return [code for code in universe if code]
+ 
+     def fetch_market_data(self, symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+         market_data: Dict[str, Dict[str, Any]] = {}
+         for code in symbols:
+             code_key = normalize_code(code)
+             if not code_key:
+                 continue
+             snap: Dict[str, Any] = {}
+             try:
+                 snap = self.kis.get_quote_snapshot(code_key)
+             except Exception as e:
+                 logger.warning("[STRAT] snapshot fail %s: %s", code_key, e)
+             price = float(snap.get("tp") or 0.0)
+             prev_close = None
++            reversal_price = price
+             try:
+                 prev_close = float(self.kis.get_prev_close(code_key) or 0.0)
+             except Exception:
+                 prev_close = None
+             try:
+                 candles = self.kis.get_daily_candles(code_key, count=30)
+             except Exception:
+                 candles = []
+             recent_high, recent_low = 0.0, 0.0
+             ma_fast, ma_slow = 0.0, 0.0
+             volatility = 0.0
+             closes: List[float] = []
+             highs: List[float] = []
+             lows: List[float] = []
+             for candle in candles or []:
+                 try:
+                     closes.append(float(candle.get("close") or 0.0))
+                     highs.append(float(candle.get("high") or 0.0))
+                     lows.append(float(candle.get("low") or 0.0))
+                 except Exception:
+                     continue
+             if highs:
+                 recent_high = max(highs[-10:]) if len(highs) >= 10 else max(highs)
+             if lows:
+                 recent_low = min(lows[-10:]) if len(lows) >= 10 else min(lows)
+             if closes:
+                 window = min(len(closes), 20)
+                 ma_fast = sum(closes[-5:]) / min(len(closes), 5)
+                 ma_slow = sum(closes[-window:]) / window
+                 if recent_high and recent_low and prev_close:
+                     volatility = (recent_high - recent_low) / prev_close * 100
++                if len(closes) >= 3:
++                    reversal_price = max(closes[-3:])
++                else:
++                    reversal_price = price
++            prev_close_val = float(prev_close or 0.0)
+             market_data[code_key] = {
+                 "price": price,
+                 "ask": snap.get("ap"),
+                 "bid": snap.get("bp"),
+-                "prev_close": prev_close,
++                "prev_close": prev_close_val,
+                 "recent_high": recent_high,
+                 "recent_low": recent_low,
++                "reversal_price": reversal_price,
+                 "ma_fast": ma_fast,
+                 "ma_slow": ma_slow,
+                 "mean_price": ma_slow,
+                 "volatility": volatility,
+-                "vwap": snap.get("tp"),  # fallback: 실시간 VWAP 불가 시 현재가 사용
++                "vwap": float(snap.get("tp") or price),  # fallback: 실시간 VWAP 불가 시 현재가 사용
+             }
+         return market_data
+ 
+     def run_cycle(
+         self,
+         state: Dict[str, Any],
+         balance: Dict[str, Any],
+         candidates: Iterable[str] | None = None,
+     ) -> Dict[str, Any]:
+         positions = state.get("positions", {})
+         symbols = self._candidate_symbols(positions, candidates)
+         if not symbols:
+             logger.info("[STRAT] no symbols to evaluate")
+             return {"entries": 0, "exits": 0}
+         market_data = self.fetch_market_data(symbols)
+         exits = self._evaluate_exits(state, market_data)
+         entries = self._evaluate_entries(state, market_data, balance)
+         return {"entries": entries, "exits": exits}
+ 
+     def _evaluate_entries(
+         self,
+         state: Dict[str, Any],
+         market_data: Dict[str, Dict[str, Any]],
+         balance: Dict[str, Any],
+     ) -> int:
+         total_cash = float(balance.get("cash") or 0.0) if isinstance(balance, dict) else 0.0
+         if total_cash <= 0:
+             total_cash = float(DAILY_CAPITAL)
+         allocations = self._capital_by_strategy(total_cash)
+         positions = state.get("positions", {})
+         entries = 0
+         for sid, strategy in self.strategies.items():
+             alloc = allocations.get(sid, total_cash / max(len(self.strategies), 1))
+             cfg = self.strategy_configs.get(strategy.name, {})
+             entry_pct = cfg.get("entry_allocation_pct") or 0.2
+             if entry_pct > 1:
+                 entry_pct = entry_pct / 100.0
+             budget = alloc * float(entry_pct)
+             for code, data in market_data.items():
++                # skip if any strategy already holds the symbol
+                 if normalize_code(code) in positions:
+                     continue
+                 if not strategy.should_enter(code, data):
+                     continue
+                 entry_price = strategy.compute_entry_price(code, data)
+                 qty = self._qty_for_budget(budget, entry_price)
+                 if qty <= 0:
+                     logger.debug(
+                         "[STRAT][ENTRY_SKIP] %s sid=%s budget=%.0f px=%.2f qty<=0",
+                         code,
+                         sid,
+                         budget,
+                         entry_price,
+                     )
+                     continue
+                 ts = now_kst().isoformat()
+                 mark_order(state, code, "BUY", sid, qty, entry_price, ts)
+                 try:
+                     resp = (
+                         self.kis.buy_stock_limit_guarded(code, qty, int(entry_price))
+                         if entry_price > 0
+                         else self.kis.buy_stock_market_guarded(code, qty)
+                     )
+                 except Exception as e:
+                     logger.error("[STRAT][BUY_FAIL] %s sid=%s ex=%s", code, sid, e)

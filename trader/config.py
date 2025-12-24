@@ -74,7 +74,7 @@ CONFIG = {
     "USE_PULLBACK_ENTRY": "true",          # true면 '신고가 → 3일 연속 하락 → 반등' 패턴 충족 시에만 눌림목 진입 허용
     "PULLBACK_LOOKBACK": "60",             # 신고가 탐색 범위(거래일 기준)
     "PULLBACK_DAYS": "3",                  # 연속 하락 일수
-    "PULLBACK_REVERSAL_BUFFER_PCT": "0.2", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
+    "PULLBACK_REVERSAL_BUFFER_PCT": "0.5", # 되돌림 확인 여유(%): 직전 하락일 고가 대비 여유율
     "PULLBACK_TOPN": "50",                 # 눌림목 스캔용 코스닥 시총 상위 종목 수
     "PULLBACK_UNIT_WEIGHT": "0.03",        # 눌림목 매수 1건당 자본 배분(활성 자본 비율)
     "PULLBACK_MAX_BUYS_PER_DAY": "5",      # 눌림목 하루 최대 신규 매수 건수
@@ -118,14 +118,18 @@ CONFIG = {
     "BREAKOUT_STOP_LOSS_PCT": "5.0",
     "BREAKOUT_ENTRY_PCT": "20.0",
     "BREAKOUT_K_FACTOR": "0.5",
+    "BREAKOUT_MAX_MA_DIST_PCT": "10.0",
     "PULLBACK_PROFIT_TARGET_PCT": "3.5",
     "PULLBACK_STOP_LOSS_PCT": "4.0",
     "PULLBACK_ENTRY_PCT": "20.0",
-    "PULLBACK_REVERSAL_BUFFER": "0.2",
+    "PULLBACK_REVERSAL_BUFFER": "0.5",
+    "PULLBACK_DROP_THRESHOLD_PCT": "3.0",
+    "PULLBACK_MAX_DROP_PCT": "15.0",
     "MOMENTUM_PROFIT_TARGET_PCT": "2.5",
     "MOMENTUM_STOP_LOSS_PCT": "3.0",
     "MOMENTUM_ENTRY_PCT": "20.0",
     "MOMENTUM_MIN_MOMENTUM_PCT": "0.5",
+    "MOMENTUM_MAX_MA_DIST_PCT": "10.0",
     "MEANREV_PROFIT_TARGET_PCT": "2.0",
     "MEANREV_STOP_LOSS_PCT": "2.5",
     "MEANREV_ENTRY_PCT": "20.0",
@@ -295,13 +299,16 @@ STRATEGY_CONFIG = {
         "stop_loss_pct": _pct_value(_cfg("BREAKOUT_STOP_LOSS_PCT"), 5.0),
         "entry_allocation_pct": _alloc_pct(_cfg("BREAKOUT_ENTRY_PCT"), 20.0),
         "k_factor": _pct_value(_cfg("BREAKOUT_K_FACTOR"), 0.5),
+        "max_ma_dist_pct": _pct_value(_cfg("BREAKOUT_MAX_MA_DIST_PCT"), 10.0),
     },
     "pullback": {
         "strategy_id": 2,
         "profit_target_pct": _pct_value(_cfg("PULLBACK_PROFIT_TARGET_PCT"), 3.5),
         "stop_loss_pct": _pct_value(_cfg("PULLBACK_STOP_LOSS_PCT"), 4.0),
         "entry_allocation_pct": _alloc_pct(_cfg("PULLBACK_ENTRY_PCT"), 20.0),
-        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.2),
+        "reversal_buffer_pct": _pct_value(_cfg("PULLBACK_REVERSAL_BUFFER"), 0.5),
+        "drop_threshold_pct": _pct_value(_cfg("PULLBACK_DROP_THRESHOLD_PCT"), 3.0),
+        "max_drop_pct": _pct_value(_cfg("PULLBACK_MAX_DROP_PCT"), 15.0),
     },
     "momentum": {
         "strategy_id": 3,
@@ -309,6 +316,7 @@ STRATEGY_CONFIG = {
         "stop_loss_pct": _pct_value(_cfg("MOMENTUM_STOP_LOSS_PCT"), 3.0),
         "entry_allocation_pct": _alloc_pct(_cfg("MOMENTUM_ENTRY_PCT"), 20.0),
         "min_momentum_pct": _pct_value(_cfg("MOMENTUM_MIN_MOMENTUM_PCT"), 0.5),
+        "max_ma_dist_pct": _pct_value(_cfg("MOMENTUM_MAX_MA_DIST_PCT"), 10.0),
     },
     "mean_reversion": {
         "strategy_id": 4,
@@ -329,7 +337,7 @@ STRATEGY_CONFIG = {
 USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
 PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
 PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
-PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
+PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.5")
 PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
 PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
 PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")

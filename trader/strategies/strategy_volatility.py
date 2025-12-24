@@ -12,12 +12,17 @@ class VolatilityStrategy(BaseStrategy):
 
     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
         price = float(market_data.get("price") or 0.0)
-        recent_high = float(market_data.get("recent_high") or market_data.get("high") or 0.0)
+        recent_high = float(market_data.get("recent_high") or 0.0)
+        fast = float(market_data.get("ma_fast") or 0.0)
         volatility = float(market_data.get("volatility") or 0.0)
         threshold = self._pct_value("volatility_threshold_pct", 1.5)
-        if price <= 0 or recent_high <= 0:
+        if price <= 0 or recent_high <= 0 or fast <= 0:
             return False
-        return volatility >= threshold and price >= recent_high
+        if not (volatility >= threshold and price >= recent_high):
+            return False
+        if price < fast:
+            return False
+        return True
 
     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
         return float(market_data.get("price") or 0.0)

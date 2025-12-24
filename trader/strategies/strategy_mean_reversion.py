@@ -13,11 +13,14 @@ class MeanReversionStrategy(BaseStrategy):
     def should_enter(self, symbol: str, market_data: Dict[str, Any]) -> bool:
         price = float(market_data.get("price") or 0.0)
         mean = float(market_data.get("mean_price") or market_data.get("ma_slow") or 0.0)
+        fast = float(market_data.get("ma_fast") or 0.0)
         band_width_pct = self._pct_value("band_width_pct", 2.0)
-        if price <= 0 or mean <= 0:
+        if price <= 0 or mean <= 0 or fast <= 0:
             return False
         lower_band = mean * (1 - band_width_pct / 100.0)
-        return price <= lower_band
+        if not (price <= lower_band and fast < mean):
+            return False
+        return True
 
     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
         return float(market_data.get("price") or 0.0)

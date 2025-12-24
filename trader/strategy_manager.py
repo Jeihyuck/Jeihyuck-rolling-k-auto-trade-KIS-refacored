@@ -104,6 +104,7 @@ class StrategyManager:
                 logger.warning("[STRAT] snapshot fail %s: %s", code_key, e)
             price = float(snap.get("tp") or 0.0)
             prev_close = None
+            reversal_price = price
             try:
                 prev_close = float(self.kis.get_prev_close(code_key) or 0.0)
             except Exception:
@@ -135,18 +136,24 @@ class StrategyManager:
                 ma_slow = sum(closes[-window:]) / window
                 if recent_high and recent_low and prev_close:
                     volatility = (recent_high - recent_low) / prev_close * 100
+                if len(closes) >= 3:
+                    reversal_price = max(closes[-3:])
+                else:
+                    reversal_price = price
+            prev_close_val = float(prev_close or 0.0)
             market_data[code_key] = {
                 "price": price,
                 "ask": snap.get("ap"),
                 "bid": snap.get("bp"),
-                "prev_close": prev_close,
+                "prev_close": prev_close_val,
                 "recent_high": recent_high,
                 "recent_low": recent_low,
+                "reversal_price": reversal_price,
                 "ma_fast": ma_fast,
                 "ma_slow": ma_slow,
                 "mean_price": ma_slow,
                 "volatility": volatility,
-                "vwap": snap.get("tp"),  # fallback: 실시간 VWAP 불가 시 현재가 사용
+                "vwap": float(snap.get("tp") or price),  # fallback: 실시간 VWAP 불가 시 현재가 사용
             }
         return market_data
 
@@ -186,6 +193,7 @@ class StrategyManager:
                 entry_pct = entry_pct / 100.0
             budget = alloc * float(entry_pct)
             for code, data in market_data.items():
+                # skip if any strategy already holds the symbol
                 if normalize_code(code) in positions:
                     continue
                 if not strategy.should_enter(code, data):

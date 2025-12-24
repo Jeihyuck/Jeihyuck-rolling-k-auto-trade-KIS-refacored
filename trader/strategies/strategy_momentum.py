@@ -17,10 +17,15 @@ class MomentumStrategy(BaseStrategy):
         slow = float(market_data.get("ma_slow") or 0.0)
         prev_close = float(market_data.get("prev_close") or 0.0)
         min_mom = self._pct_value("min_momentum_pct", 0.5)
-        if price <= 0 or fast <= 0 or slow <= 0 or prev_close <= 0:
+        if price <= 0 or fast <= 0 or slow <= 0 or prev_close <= 0 or vwap <= 0:
             return False
-        momentum_pct = (price - prev_close) / prev_close * 100
-        return fast > slow and price >= vwap and momentum_pct >= min_mom
+        momentum_pct = (price - prev_close) / prev_close * 100.0
+        if not (fast > slow and price >= vwap and momentum_pct >= min_mom):
+            return False
+        max_dist = self._pct_value("max_ma_dist_pct", 10.0)
+        if fast > 0 and ((price - fast) / fast * 100.0) > max_dist:
+            return False
+        return True
 
     def compute_entry_price(self, symbol: str, market_data: Dict[str, Any]) -> float:
         return float(market_data.get("price") or 0.0)
