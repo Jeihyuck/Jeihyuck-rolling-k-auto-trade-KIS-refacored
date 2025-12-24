@@ -20,14 +20,11 @@ on:
 
 jobs:
   monitor-trade:
-    # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
-    # if: github.ref == 'refs/heads/main'
+    # bot-state 브랜치에서 돌면 루프/충돌 나므로 차단
     if: github.ref != 'refs/heads/bot-state'
     runs-on: ubuntu-latest
 
     env:
-      #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
-      #ALLOW_NON_TRADING_ORDER: "1"
       # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
       KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
@@ -39,7 +36,7 @@ jobs:
       ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
       KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
 
-      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
+      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요 (그래도 있으면 주입)
       API_BASE_URL:   ${{ secrets.API_BASE_URL }}
 
       # === trader.py 운영 파라미터 ===
@@ -61,8 +58,7 @@ jobs:
       SLIPPAGE_LIMIT_PCT: "0.25"
       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
 
-      # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
-      # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
+      # VWAP 전략용 허용 오차
       VWAP_TOL: "0.003"
 
       W_MAX_ONE: "0.25"
@@ -96,8 +92,7 @@ jobs:
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
-      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
-      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
+      # === VWAP 분봉 TR ===
       KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
       KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
 
@@ -122,13 +117,14 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore bot_state from bot-state branch
+      # ✅ bot-state에서 상태를 "파일만" 안전하게 복원 (로컬 bot-state 브랜치에 fetch/checkout 금지)
+      - name: Restore bot_state from origin/bot-state
         if: github.event_name != 'pull_request'
         run: |
-          git fetch origin bot-state:bot-state || true
-          if git show-ref --verify --quiet refs/heads/bot-state; then
-            git checkout bot-state -- bot_state || true
-          fi
+          set -euo pipefail
+          git fetch origin bot-state || true
+          git checkout origin/bot-state -- bot_state || true
+
           mkdir -p trader/state
           if [ -d bot_state/trader_state ]; then
             cp -a bot_state/trader_state/. trader/state/ || true
@@ -162,12 +158,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # NOTE: chmod 단계 제거 (bash로 실행하면 실행권한 불필요)
-      - name: Pull state (plain)
-        if: github.event_name != 'pull_request'
-        run: |
-          bash scripts/state_pull_plain.sh
-
       - name: Dependencies 설치
         run: |
           python -m pip install --upgrade pip
@@ -191,7 +181,6 @@ jobs:
               chk(k)
           PY
 
-      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
       - name: (디버그) trader 모듈 경로 및 내용 확인
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -216,7 +205,7 @@ jobs:
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30  # 서버 기동 대기
+          sleep 30
 
       - name: Compile modules
         run: |
@@ -240,12 +229,7 @@ jobs:
         run: |
           ls -al trader/logs || true
 
-      - name: Push state (plain)
-        if: github.event_name != 'pull_request'
-        run: |
-          test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
-
-      # ✅ FIX: bot-state 브랜치를 checkout 하지 않고 worktree로 별도 작업공간에서 커밋/푸시
+      # ✅ 핵심 FIX: plain push 제거 + worktree로만 bot-state에 커밋/푸시 (로컬 bot-state 브랜치 덮어쓰기 금지)
       - name: Persist trader state to bot-state branch (worktree)
         if: github.event_name != 'pull_request'
         run: |
@@ -260,20 +244,29 @@ jobs:
             cp -a trader/fills/. "$TMP_DIR/fills/" || true
           fi
 
-          # bot-state 브랜치 준비
-          git fetch origin bot-state:bot-state || true
-          if ! git show-ref --verify --quiet refs/heads/bot-state; then
-            git branch bot-state || true
-          fi
+          git fetch origin bot-state || true
 
           WT_DIR="$(mktemp -d)"
-          git worktree add "$WT_DIR" bot-state
+          cleanup() {
+            git worktree remove "$WT_DIR" --force 2>/dev/null || true
+            rm -rf "$WT_DIR" "$TMP_DIR" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          if git show-ref --verify --quiet refs/remotes/origin/bot-state; then
+            git worktree add -B bot-state "$WT_DIR" origin/bot-state
+          else
+            git worktree add -B bot-state "$WT_DIR"
+          fi
 
           mkdir -p "$WT_DIR/bot_state/trader_state"
           cp -a "$TMP_DIR/state/." "$WT_DIR/bot_state/trader_state/" || true
           cp -a "$TMP_DIR/fills/." "$WT_DIR/bot_state/trader_state/" || true
 
           pushd "$WT_DIR" >/dev/null
+          git config user.name "trade-bot"
+          git config user.email "trade-bot@users.noreply.github.com"
+
           git add -f bot_state/trader_state || true
           if git diff --cached --quiet; then
             echo "No bot_state changes to commit."
@@ -282,8 +275,6 @@ jobs:
             git push origin bot-state
           fi
           popd >/dev/null
-
-          git worktree remove "$WT_DIR" --force
 
       - name: Save state snapshot as artifact (audit only)
         if: always()
