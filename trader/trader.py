@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.kis_wrapper import KisAPI
 from trader import state_store as runtime_state_store
 from trader.strategy_manager import StrategyManager
 from trader.ledger import load_ledger_entries, strategy_map_from_ledger
-from trader.time_utils import is_trading_day, now_kst
+from trader.time_utils import MARKET_CLOSE, is_trading_day, is_trading_window, now_kst
 from trader.core_utils import get_rebalance_anchor_date
 from trader.code_utils import normalize_code
 from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
@@ -42,10 +43,11 @@ def main() -> None:
     runtime_state = runtime_state_store.load_state()
     kis: KisAPI | None = None
     balance: dict[str, object] = {}
+    preferred_strategy: dict[str, object] = {}
     try:
         kis = KisAPI()
         ledger_entries = load_ledger_entries()
-        preferred_strategy = strategy_map_from_ledger(ledger_entries)
+        preferred_strategy = strategy_map_from_ledger(ledger_entries) or {}
         balance = kis.get_balance()
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
             runtime_state, balance, preferred_strategy=preferred_strategy
@@ -59,13 +61,45 @@ def main() -> None:
         kis = kis or KisAPI()
         manager = StrategyManager(kis=kis)
         candidates = _collect_rebalance_candidates()
-        # open positions도 관찰 대상에 포함
-        candidates.update(runtime_state.get("positions", {}).keys())
-        result = manager.run_cycle(runtime_state, balance, candidates)
-        runtime_state_store.save_state(runtime_state)
-        logger.info("[TRADER] strategy cycle complete %s", result)
+        cycle_count = 0
+        while True:
+            now = now_kst()
+            if now.time() >= MARKET_CLOSE:
+                logger.info("[TRADER] 장마감(%s) → 거래 루프 종료", now.isoformat())
+                break
+            if not is_trading_window(now):
+                logger.info("[TRADER] 장외 시간(%s) → 대기", now.isoformat())
+                time.sleep(30)
+                continue
+            cycle_count += 1
+            try:
+                balance = kis.get_balance()
+                runtime_state = runtime_state_store.reconcile_with_kis_balance(
+                    runtime_state, balance, preferred_strategy=preferred_strategy
+                )
+            except Exception:
+                logger.exception("[TRADER] balance fetch/reconcile failed")
+            cycle_candidates = set(candidates)
+            cycle_candidates.update(runtime_state.get("positions", {}).keys())
+            try:
+                result = manager.run_cycle(runtime_state, balance, cycle_candidates)
+            except Exception:
+                logger.exception("[TRADER] strategy cycle failed")
+                result = {"entries": 0, "exits": 0}
+            runtime_state_store.save_state(runtime_state)
+            logger.info(
+                "[TRADER] strategy cycle %d complete (entries=%s, exits=%s)",
+                cycle_count,
+                result.get("entries"),
+                result.get("exits"),
+            )
+            time.sleep(15)
     except Exception:
-        logger.exception("[TRADER] strategy cycle failed")
+        logger.exception("[TRADER] strategy loop failed")
+    except KeyboardInterrupt:
+        logger.info("[TRADER] 수동 종료 신호 → 거래 루프 종료")
+    finally:
+        runtime_state_store.save_state(runtime_state)
 
 
 if __name__ == "__main__":
