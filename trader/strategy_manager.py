@@ -13,6 +13,7 @@ from .config import (
 )
 from .ledger import record_trade_ledger
 from .state_store import mark_fill, mark_order
+from .strategy_registry import normalize_sid
 from .time_utils import now_kst
 from .kis_wrapper import KisAPI
 from .strategies import (
@@ -53,43 +54,53 @@ class StrategyManager:
         self.watchlist = [normalize_code(code) for code in (watchlist or STRATEGY_WATCHLIST) if normalize_code(code)]
         self.strategies = self._init_strategies()
 
-    def _init_strategies(self) -> Dict[int, BaseStrategy]:
-        strategies: Dict[int, BaseStrategy] = {}
+    def _init_strategies(self) -> Dict[str, BaseStrategy]:
+        strategies: Dict[str, BaseStrategy] = {}
         for name, cfg in self.strategy_configs.items():
             cls = STRATEGY_CLASS_MAP.get(name)
             if not cls:
                 continue
             try:
                 strat: BaseStrategy = cls(cfg)
-                sid = int(cfg.get("strategy_id"))
+                sid = normalize_sid(cfg.get("strategy_id"))
             except Exception:
                 continue
             strategies[sid] = strat
         return strategies
 
     def _strategy_for_id(self, strategy_id: Any) -> Optional[BaseStrategy]:
-        try:
-            sid = int(strategy_id)
-        except Exception:
-            return None
+        sid = normalize_sid(strategy_id)
         return self.strategies.get(sid)
 
-    def _capital_by_strategy(self, total_cash: float) -> Dict[int, float]:
-        allocations: Dict[int, float] = {}
+    def _capital_by_strategy(self, total_cash: float) -> Dict[str, float]:
+        allocations: Dict[str, float] = {}
         for sid, weight in self.strategy_weights.items():
-            allocations[int(sid)] = float(total_cash) * float(weight)
+            allocations[normalize_sid(sid)] = float(total_cash) * float(weight)
         if not allocations and total_cash > 0:
             per = float(total_cash) / max(len(self.strategies), 1)
             for sid in self.strategies:
                 allocations[sid] = per
         return allocations
 
-    def _candidate_symbols(self, positions: Dict[str, Any], extra: Iterable[str] | None) -> List[str]:
+    def _candidate_symbols(self, lots: List[Dict[str, Any]], extra: Iterable[str] | None) -> List[str]:
         universe = set(self.watchlist)
-        universe.update(positions.keys())
+        for lot in lots:
+            pdno = normalize_code(lot.get("pdno") or "")
+            if pdno:
+                universe.add(pdno)
         if extra:
             universe.update(normalize_code(code) for code in extra if normalize_code(code))
         return [code for code in universe if code]
+
+    @staticmethod
+    def _extract_order_id(resp: Any) -> str | None:
+        try:
+            out = resp.get("output") if isinstance(resp, dict) else None
+            if isinstance(out, dict):
+                return out.get("ODNO") or out.get("ord_no") or out.get("odno")
+        except Exception:
+            return None
+        return None
 
     def fetch_market_data(self, symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
         market_data: Dict[str, Dict[str, Any]] = {}
@@ -163,19 +174,20 @@ class StrategyManager:
         balance: Dict[str, Any],
         candidates: Iterable[str] | None = None,
     ) -> Dict[str, Any]:
-        positions = state.get("positions", {})
-        symbols = self._candidate_symbols(positions, candidates)
+        lots = [lot for lot in state.get("lots", []) if int(lot.get("remaining_qty") or lot.get("qty") or 0) > 0]
+        symbols = self._candidate_symbols(lots, candidates)
         if not symbols:
             logger.info("[STRAT] no symbols to evaluate")
             return {"entries": 0, "exits": 0}
         market_data = self.fetch_market_data(symbols)
-        exits = self._evaluate_exits(state, market_data)
-        entries = self._evaluate_entries(state, market_data, balance)
+        exits = self._evaluate_exits(state, lots, market_data)
+        entries = self._evaluate_entries(state, lots, market_data, balance)
         return {"entries": entries, "exits": exits}
 
     def _evaluate_entries(
         self,
         state: Dict[str, Any],
+        lots: List[Dict[str, Any]],
         market_data: Dict[str, Dict[str, Any]],
         balance: Dict[str, Any],
     ) -> int:
@@ -183,7 +195,6 @@ class StrategyManager:
         if total_cash <= 0:
             total_cash = float(DAILY_CAPITAL)
         allocations = self._capital_by_strategy(total_cash)
-        positions = state.get("positions", {})
         entries = 0
         for sid, strategy in self.strategies.items():
             alloc = allocations.get(sid, total_cash / max(len(self.strategies), 1))
@@ -192,9 +203,14 @@ class StrategyManager:
             if entry_pct > 1:
                 entry_pct = entry_pct / 100.0
             budget = alloc * float(entry_pct)
+            existing_codes = {
+                normalize_code(lot.get("pdno") or "")
+                for lot in lots
+                if normalize_sid(lot.get("strategy_id")) == sid and int(lot.get("remaining_qty") or lot.get("qty") or 0) > 0
+            }
             for code, data in market_data.items():
                 # skip if any strategy already holds the symbol
-                if normalize_code(code) in positions:
+                if normalize_code(code) in existing_codes:
                     continue
                 if not strategy.should_enter(code, data):
                     continue
@@ -210,18 +226,43 @@ class StrategyManager:
                     )
                     continue
                 ts = now_kst().isoformat()
-                mark_order(state, code, "BUY", sid, qty, entry_price, ts)
+                oid = mark_order(state, code, "BUY", sid, qty, entry_price, ts, reason="strategy_entry")
                 try:
                     resp = (
-                        self.kis.buy_stock_limit_guarded(code, qty, int(entry_price))
+                        self.kis.buy_stock_limit_guarded(code, qty, int(entry_price), sid=sid)
                         if entry_price > 0
-                        else self.kis.buy_stock_market_guarded(code, qty)
+                        else self.kis.buy_stock_market_guarded(code, qty, sid=sid)
                     )
                 except Exception as e:
                     logger.error("[STRAT][BUY_FAIL] %s sid=%s ex=%s", code, sid, e)
                     continue
+                order_id = self._extract_order_id(resp)
+                if order_id:
+                    mark_order(
+                        state,
+                        code,
+                        "BUY",
+                        sid,
+                        qty,
+                        entry_price,
+                        ts,
+                        order_id=order_id,
+                        status="ack",
+                        reason="order_ack",
+                    )
                 if self.kis.check_filled(resp):
-                    mark_fill(state, code, "BUY", sid, qty, entry_price, ts, status="filled")
+                    mark_fill(
+                        state,
+                        code,
+                        "BUY",
+                        sid,
+                        qty,
+                        entry_price,
+                        ts,
+                        status="filled",
+                        order_id=order_id or oid,
+                        source="strategy_manager",
+                    )
                     record_trade_ledger(
                         timestamp=ts,
                         code=code,
@@ -242,47 +283,62 @@ class StrategyManager:
                     )
         return entries
 
-    def _evaluate_exits(self, state: Dict[str, Any], market_data: Dict[str, Dict[str, Any]]) -> int:
-        positions = state.get("positions", {})
+    def _evaluate_exits(
+        self, state: Dict[str, Any], lots: List[Dict[str, Any]], market_data: Dict[str, Dict[str, Any]]
+    ) -> int:
         exits = 0
-        for code, pos in list(positions.items()):
-            code_key = normalize_code(code)
-            strategy_id = pos.get("strategy_id")
-            strategy = self._strategy_for_id(strategy_id)
+        for lot in list(lots):
+            remaining = int(lot.get("remaining_qty") or lot.get("qty") or 0)
+            if remaining <= 0:
+                continue
+            code_key = normalize_code(lot.get("pdno") or "")
+            sid = normalize_sid(lot.get("strategy_id"))
+            strategy = self._strategy_for_id(sid)
             if not strategy:
                 continue
             data = market_data.get(code_key) or {}
-            if not strategy.should_exit(pos, data):
-                continue
-            qty = int(pos.get("qty") or 0)
-            if qty <= 0:
+            pos_state = {"qty": remaining, "avg_price": float(lot.get("entry_price") or 0.0)}
+            if not strategy.should_exit(pos_state, data):
                 continue
             ts = now_kst().isoformat()
-            mark_order(state, code_key, "SELL", strategy_id, qty, data.get("price") or 0.0, ts)
+            oid = mark_order(state, code_key, "SELL", sid, remaining, data.get("price") or 0.0, ts, reason="strategy_exit")
             try:
-                resp = self.kis.sell_stock_market_guarded(code_key, qty)
+                resp = self.kis.sell_stock_market_guarded(code_key, remaining, sid=sid)
             except Exception as e:
-                logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, strategy_id, e)
+                logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, sid, e)
                 continue
+            order_id = self._extract_order_id(resp)
+            if order_id:
+                mark_order(
+                    state,
+                    code_key,
+                    "SELL",
+                    sid,
+                    remaining,
+                    data.get("price") or 0.0,
+                    ts,
+                    order_id=order_id,
+                    status="ack",
+                    reason="order_ack",
+                )
             if self.kis.check_filled(resp):
                 price = float(data.get("price") or 0.0)
-                mark_fill(state, code_key, "SELL", strategy_id, qty, price, ts, status="filled")
+                mark_fill(state, code_key, "SELL", sid, remaining, price, ts, status="filled", order_id=order_id or oid)
                 record_trade_ledger(
                     timestamp=ts,
                     code=code_key,
-                    strategy_id=strategy_id,
+                    strategy_id=sid,
                     side="SELL",
-                    qty=qty,
+                    qty=remaining,
                     price=price,
                     meta={"engine": "strategy_manager", "resp": resp},
                 )
-                positions.pop(code_key, None)
                 exits += 1
                 logger.info(
                     "[STRAT][EXIT] code=%s sid=%s qty=%s price=%.2f reason=signal",
                     code_key,
-                    strategy_id,
-                    qty,
+                    sid,
+                    remaining,
                     price,
                 )
         return exits

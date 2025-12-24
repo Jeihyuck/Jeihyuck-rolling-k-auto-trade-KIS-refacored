@@ -9,6 +9,8 @@ from typing import Any, Dict, List
 from .config import KST
 from .code_utils import normalize_code
 from .strategy_ids import STRATEGY_INT_IDS
+from .strategy_recovery import recover_sid_for_holding
+from .strategy_registry import normalize_sid
 
 LEDGER_DIR = Path("fills")
 LEDGER_PATH = LEDGER_DIR / "ledger.jsonl"
@@ -257,13 +259,18 @@ def strategy_avg_price(
 
 def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[str, Any]]) -> None:
     lots = _ensure_state(state)
+    now_ts = datetime.now(KST)
+    before_len = len(lots)
+    evidence_dirs = {
+        "state_lots": lots,
+    }
     holdings_map: Dict[str, Dict[str, Any]] = {}
     for row in holdings:
         code = normalize_code(row.get("code") or row.get("pdno") or "")
         if not code:
             continue
         qty = int(row.get("qty") or 0)
-        avg_price = row.get("avg_price")
+        avg_price = float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0)
         existing = holdings_map.get(code)
         if existing:
             existing["qty"] += qty
@@ -272,12 +279,11 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
         else:
             holdings_map[code] = {"qty": qty, "avg_price": avg_price}
 
-    now_ts = datetime.now(KST).isoformat()
-
     for lot in lots:
-        if str(lot.get("strategy_id")) in {"ORPHAN", "UNKNOWN"}:
-            # legacy migration only: map deprecated sid to MANUAL
+        sid = normalize_sid(lot.get("strategy_id"))
+        if sid == "UNKNOWN":
             lot["strategy_id"] = "MANUAL"
+            lot.setdefault("meta", {})["sell_blocked"] = True
 
     for lot in lots:
         pdno = normalize_code(lot.get("pdno"))
@@ -285,40 +291,65 @@ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[st
             if int(lot.get("remaining_qty") or 0) > 0:
                 lot["remaining_qty"] = 0
 
+    recovered = 0
+    manual_created = 0
+    adjusted = 0
+
     for pdno, payload in holdings_map.items():
         hold_qty = int(payload.get("qty") or 0)
         if hold_qty <= 0:
             continue
-        total_remaining = sum(
-            int(lot.get("remaining_qty") or 0)
-            for lot in lots
-            if normalize_code(lot.get("pdno")) == pdno
-        )
+        avg_price = float(payload.get("avg_price") or 0.0)
+        existing = [lot for lot in lots if normalize_code(lot.get("pdno")) == pdno]
+        total_remaining = sum(int(lot.get("remaining_qty") or 0) for lot in existing)
+        if total_remaining == hold_qty:
+            continue
         if total_remaining < hold_qty:
             diff = hold_qty - total_remaining
+            sid, conf, reasons = recover_sid_for_holding(pdno, diff, avg_price, now_ts, evidence_dirs)
+            meta = {"reconciled": True}
+            if sid == "MANUAL":
+                meta["sell_blocked"] = True
+                meta["reasons"] = reasons
+                manual_created += 1
+            else:
+                recovered += 1
             lots.append(
                 {
-                    "lot_id": f"{pdno}-RECON-{now_ts}",
+                    "lot_id": f"{pdno}-RECON-{now_ts.isoformat()}",
                     "pdno": pdno,
-                    "strategy_id": "MANUAL",
+                    "strategy_id": sid,
                     "engine": "reconcile",
-                    "entry_ts": now_ts,
-                    "entry_price": float(payload.get("avg_price") or 0.0),
+                    "entry_ts": now_ts.isoformat(),
+                    "entry_price": avg_price,
                     "qty": int(diff),
                     "remaining_qty": int(diff),
-                    "meta": {"reconciled": True, "manual": True},
+                    "meta": meta,
                 }
             )
         elif total_remaining > hold_qty:
             extra = total_remaining - hold_qty
-            for lot in reversed(lots):
-                if normalize_code(lot.get("pdno")) != pdno:
-                    continue
+            for lot in sorted(
+                [lot for lot in existing if int(lot.get("remaining_qty") or 0) > 0],
+                key=lambda x: x.get("entry_ts") or "",
+                reverse=True,
+            ):
                 lot_remaining = int(lot.get("remaining_qty") or 0)
                 if lot_remaining <= 0:
                     continue
                 delta = min(lot_remaining, extra)
                 lot["remaining_qty"] = int(lot_remaining - delta)
+                adjusted += delta
                 extra -= delta
                 if extra <= 0:
                     break
+
+    logger.info(
+        "[RECONCILE] holdings=%d lots_before=%d lots_after=%d recovered=%d manual_created=%d adjusted=%d",
+        len(holdings_map),
+        before_len,
+        len(lots),
+        recovered,
+        manual_created,
+        adjusted,
+    )

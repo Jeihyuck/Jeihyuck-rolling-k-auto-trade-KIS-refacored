@@ -1,0 +1,2803 @@
+diff --git a/.github/workflows/trade-monitor.yml b/.github/workflows/trade-monitor.yml
+index b1094b1703ffaa19cf122f80cb05d006d7c1ce19..baacd11090a17fb6b0c55bb2d22a70325dd556d0 100644
+--- a/.github/workflows/trade-monitor.yml
++++ b/.github/workflows/trade-monitor.yml
+@@ -101,86 +101,89 @@ jobs:
+       MAX_MDD_PCT: "30"
+       MIN_WINRATE: "50"
+       MIN_CUMRET: "2"
+       TOP_K_LIMIT: "20"
+       TOTAL_CAPITAL: "10000000"
+       MIN_QTY_PER_TICKET: "1"
+       K_MIN: "0.1"
+       K_MAX: "0.9"
+       K_STEP: "0.1"
+       ALLOW_AFTER_HOURS: "0"
+       REBALANCE_OUT_DIR: "rebalance_results"
+ 
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+       - name: Ensure output dirs exist (pre)
+         run: |
+           set -euo pipefail
+           mkdir -p trader/state trader/fills trader/logs rebalance_results bot_state
+ 
+       # ✅ bot-state에서 상태를 "파일만" 안전하게 복원 (로컬 bot-state 브랜치에 fetch/checkout 금지)
+-      - name: Restore bot_state from origin/bot-state
++      - name: Restore trader state from bot-state worktree
+         if: github.event_name != 'pull_request'
+         run: |
+           set -euo pipefail
+-          git fetch origin bot-state || true
+-          git checkout origin/bot-state -- bot_state || true
+-
+-          mkdir -p trader/state
+-          if [ -d bot_state/trader_state ]; then
+-            cp -a bot_state/trader_state/. trader/state/ || true
++          git fetch origin bot-state --prune || true
++          git worktree prune || true
++          WT_DIR="$(mktemp -d)"
++          cleanup() {
++            git worktree remove "$WT_DIR" --force 2>/dev/null || true
++          }
++          trap cleanup EXIT
++          if git show-ref --verify --quiet refs/remotes/origin/bot-state; then
++            git worktree add -B bot-state "$WT_DIR" origin/bot-state
++          else
++            git worktree add -B bot-state "$WT_DIR"
++          fi
++          if [ -d "$WT_DIR/bot_state/trader_state/trader" ]; then
++            mkdir -p trader
++            cp -a "$WT_DIR/bot_state/trader_state/trader/." trader/ || true
+           fi
+-
+-      - name: Restore state cache (fallback only)
+-        uses: actions/cache/restore@v4
+-        with:
+-          path: |
+-            bot_state/state.json
+-            trader/state/state.json
+-          key: trader-state-${{ github.ref_name }}
+-          restore-keys: |
+-            trader-state-${{ github.ref_name }}-
+ 
+       - name: Set git identity
+         run: |
+           git config user.name "trade-bot"
+           git config user.email "trade-bot@users.noreply.github.com"
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Dependencies 설치
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
++      - name: Recovery self test
++        run: |
++          python -m trader.recovery_self_test
++
+       - name: Ledger smoke test
+         run: |
+           python -m trader.ledger_test
+ 
+       - name: (진단) 핵심 환경변수 주입 여부만 확인
+         run: |
+           python - << 'PY'
+           import os
+           keys = [
+             'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
+             'CANO','ACNT_PRDT_CD','KIS_ENV'
+           ]
+           for k in keys:
+               v = os.getenv(k) or ''
+               print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
+           PY
+ 
+       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+         run: |
+           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+           sleep 30  # 서버 기동 대기
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader rolling_k_auto_trade_api
+@@ -201,140 +204,134 @@ jobs:
+       # ✅ FIX 1) 코드가 루트에 state.json을 만들면 trader/state로 복사해서 "표준 경로"로 정규화
+       - name: Normalize state paths (copy root state.json -> trader/state)
+         if: always()
+         run: |
+           set -euo pipefail
+           mkdir -p trader/state
+           if [ -f state.json ]; then
+             cp -a state.json trader/state/state.json
+             echo "[NORMALIZE] copied ./state.json -> trader/state/state.json"
+           fi
+ 
+       # ✅ (디버그) 실제 파일 생성 여부를 런에서 바로 확인
+       - name: (DEBUG) list outputs before bundling
+         if: always()
+         run: |
+           set -euo pipefail
+           echo "== PWD =="; pwd
+           echo "== ls -al =="; ls -al
+           echo "== trader/state =="; ls -al trader/state || true
+           echo "== trader/fills =="; ls -al trader/fills || true
+           echo "== trader/logs =="; ls -al trader/logs || true
+           echo "== rebalance_results =="; ls -al rebalance_results || true
+           echo "== bot_state =="; ls -al bot_state || true
+           echo "== find ledger/state ==";
+           find . -maxdepth 6 -type f \( -name "ledger.jsonl" -o -name "state.json" -o -name "CEO_Report_*.md" \) -print || true
++          echo "== find trader files =="
++          find trader -maxdepth 4 -type f -print || true
+ 
+       # ✅ FIX 2) 업로드 경로가 흔들려도 항상 모이도록 번들 폴더에 수집
+       - name: Collect artifact bundle (force-create trader/)
+         if: always()
+         run: |
+           set -euo pipefail
+ 
+           BUNDLE="artifact_bundle"
+           rm -rf "$BUNDLE" || true
+           mkdir -p "$BUNDLE/trader/state" "$BUNDLE/trader/fills" "$BUNDLE/trader/logs" \
+                    "$BUNDLE/rebalance_results" "$BUNDLE/bot_state"
+ 
+           # 1) 표준 위치 복사(있으면)
+           if [ -d trader/state ]; then cp -a trader/state/. "$BUNDLE/trader/state/" || true; fi
+           if [ -d trader/fills ]; then cp -a trader/fills/. "$BUNDLE/trader/fills/" || true; fi
+           if [ -d trader/logs ]; then cp -a trader/logs/. "$BUNDLE/trader/logs/" || true; fi
+           if [ -d rebalance_results ]; then cp -a rebalance_results/. "$BUNDLE/rebalance_results/" || true; fi
+           if [ -d bot_state ]; then cp -a bot_state/. "$BUNDLE/bot_state/" || true; fi
+ 
+           # 2) 혹시 다른 위치에 생성된 파일이 있으면 찾아서 추가(경로 흔들림 대응)
+           for f in $(find . -maxdepth 6 -type f -name "ledger.jsonl" 2>/dev/null || true); do
+             echo "[BUNDLE] found ledger: $f"
+             cp -a "$f" "$BUNDLE/trader/logs/" || true
+           done
+ 
+           for f in $(find . -maxdepth 6 -type f -name "CEO_Report_*.md" 2>/dev/null || true); do
+             echo "[BUNDLE] found report: $f"
+             cp -a "$f" "$BUNDLE/trader/logs/" || true
+           done
+ 
+           # 3) 최소 placeholder 생성: 업로드 경고/누락 방지
+           date -Iseconds > "$BUNDLE/_bundle_created_at.txt"
+           echo "ok" > "$BUNDLE/trader/_trader_dir_exists.txt"
+ 
+           echo "== Bundle tree =="
+           find "$BUNDLE" -maxdepth 4 -print
+ 
+       # ✅ FIX 3) bot-state 브랜치에 상태를 worktree로만 커밋/푸시 (충돌 방지)
+       - name: Persist trader state to bot-state branch (worktree)
+         if: github.event_name != 'pull_request'
+         run: |
+           set -euo pipefail
+-
+-          TMP_DIR="$(mktemp -d)"
+-          mkdir -p "$TMP_DIR/state" "$TMP_DIR/fills"
+-          if [ -d trader/state ]; then cp -a trader/state/. "$TMP_DIR/state/" || true; fi
+-          if [ -d trader/fills ]; then cp -a trader/fills/. "$TMP_DIR/fills/" || true; fi
+-
+-          git fetch origin bot-state || true
++          git fetch origin bot-state --prune || true
++          git worktree prune || true
+ 
+           WT_DIR="$(mktemp -d)"
+           cleanup() {
+             git worktree remove "$WT_DIR" --force 2>/dev/null || true
+-            rm -rf "$WT_DIR" "$TMP_DIR" 2>/dev/null || true
+           }
+           trap cleanup EXIT
+ 
+           if git show-ref --verify --quiet refs/remotes/origin/bot-state; then
+             git worktree add -B bot-state "$WT_DIR" origin/bot-state
+           else
+             git worktree add -B bot-state "$WT_DIR"
+           fi
+ 
+           mkdir -p "$WT_DIR/bot_state/trader_state"
+-          cp -a "$TMP_DIR/state/." "$WT_DIR/bot_state/trader_state/" || true
+-          cp -a "$TMP_DIR/fills/." "$WT_DIR/bot_state/trader_state/" || true
++          rm -rf "$WT_DIR/bot_state/trader_state/trader"
++          cp -a trader "$WT_DIR/bot_state/trader_state/" || true
+ 
+           pushd "$WT_DIR" >/dev/null
+           git config user.name "trade-bot"
+           git config user.email "trade-bot@users.noreply.github.com"
+ 
+-          git add -f bot_state/trader_state || true
++          git add -f bot_state/trader_state/trader || true
+           if git diff --cached --quiet; then
+             echo "No bot_state changes to commit."
+           else
+-            git commit -m "Update trader state"
++            git commit -m "Update trader state [skip ci]"
+             git push origin bot-state
+           fi
+           popd >/dev/null
+ 
+       # ✅ FIX 4) 아티팩트는 번들 폴더만 업로드 (trader/ 누락 문제 구조적으로 제거)
+       - name: Upload trader-state artifact (bundle)
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trader-state-${{ github.run_id }}
+           path: artifact_bundle/**
+           retention-days: 30
+ 
+       - name: Upload rebalance-results artifact
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: rebalance-results-${{ github.run_id }}
+           path: rebalance_results/*.json
+           if-no-files-found: warn
+           retention-days: 60
+ 
+       - name: FastAPI 로그 출력 (cat)
+         if: always()
+         run: |
+           echo "::group::FastAPI Server Log"
+           cat fastapi.log || true
+           echo "::endgroup::"
+ 
+       - name: Upload fastapi-log artifact
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: fastapi-log-${{ github.run_id }}
+           path: fastapi.log
+           if-no-files-found: ignore
+           retention-days: 14
+-
+-
+diff --git a/.gitignore b/.gitignore
+index 3292ac2655b3aa679127eceae82744c91cf2cf8a..672e6eb6b10824a88b0972818d9bfcee8290d772 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,10 +1,12 @@
+ __pycache__/
+ .venv/
+ .vscode/
+ .idea/
+ logs/
+ watchlists/
+ *.log
+ *.json
+ .env
+ bot_state/state.json
++trader/state/
++trader/fills/
+diff --git a/rolling_k_auto_trade_api/main.py b/rolling_k_auto_trade_api/main.py
+index 1c47e5a8a9f8daf5e00a74333e9dbc17dafac2d7..663252c8e008aa5cd7ba5b488a64898e6a9f8c16 100644
+--- a/rolling_k_auto_trade_api/main.py
++++ b/rolling_k_auto_trade_api/main.py
+@@ -168,93 +168,94 @@ except Exception:
+ 
+ if _NEED_FALLBACK_REBALANCE:
+     @app.post("/rebalance/run/{date}")
+     def run_rebalance(date: str, force_order: bool = Query(False, description="주문 강제 여부(서버 내부 로직 용)")):
+         """
+         리밸런싱 실행(API 계약):
+         응답은 `selected` 혹은 `selected_stocks`(동일 배열) 포함.
+         각 원소는 code/name/best_k/qty(or weight)/prev_* 필드를 갖도록 보정됨.
+         """
+         try:
+             result = _run_strategy(date=date, force_order=force_order)
+             logger.info("[rebalance] %s -> %d stocks", date, len(result.get("selected", [])))
+             return result
+         except HTTPException:
+             raise
+         except Exception as e:
+             logger.exception("[rebalance] failed: %s", e)
+             raise HTTPException(status_code=500, detail=f"rebalance failed: {e}")
+ 
+ 
+ # ========== 주문 모델/엔드포인트 ==========
+ class OrderRequest(BaseModel):
+     code: str
+     qty: int
+     price: Optional[float] = None  # None이면 시장가
++    sid: Optional[str] = "MANUAL"
+ 
+ 
+ kis = KisAPI()
+ 
+ 
+ @app.post("/buy-order/")
+ def buy_order(req: OrderRequest):
+     """
+     매수 주문:
+     - price가 주어지면: buy_stock_limit_guarded 우선, 없으면 buy_stock_market_guarded
+     - 가드형 API 미지원 환경은 기본 buy_stock 호출로 폴백
+     """
+     try:
+         code = req.code.strip()
+         qty = int(req.qty)
+         if qty <= 0:
+             raise ValueError("qty must be > 0")
+ 
+         if req.price is not None and float(req.price) > 0:
+             # 지정가 + 예산 가드
+             if hasattr(kis, "buy_stock_limit_guarded"):
+-                result = kis.buy_stock_limit_guarded(code, qty, int(float(req.price)))
++                result = kis.buy_stock_limit_guarded(code, qty, int(float(req.price)), sid=req.sid)
+             else:
+-                result = kis.buy_stock_limit(code, qty, int(float(req.price)))  # type: ignore
++                result = kis.buy_stock_limit(code, qty, int(float(req.price)), sid=req.sid)  # type: ignore
+         else:
+             # 시장가 + 예산 가드
+             if hasattr(kis, "buy_stock_market_guarded"):
+-                result = kis.buy_stock_market_guarded(code, qty)
++                result = kis.buy_stock_market_guarded(code, qty, sid=req.sid)
+             elif hasattr(kis, "buy_stock_market"):
+-                result = kis.buy_stock_market(code, qty)  # type: ignore
++                result = kis.buy_stock_market(code, qty, sid=req.sid)  # type: ignore
+             else:
+-                result = kis.buy_stock(code, qty, None)  # type: ignore
++                result = kis.buy_stock(code, qty, None, sid=req.sid)  # type: ignore
+ 
+         return {"result": result}
+     except HTTPException:
+         raise
+     except Exception as e:
+         logger.error("[BUY_ORDER_FAIL] %s", e)
+         raise HTTPException(status_code=400, detail=str(e))
+ 
+ 
+ @app.post("/sell-order/")
+ def sell_order(req: OrderRequest):
+     """
+     매도 주문:
+     - price가 주어지면 지정가, 아니면 시장가
+     - kis_wrapper의 보유수량 사전점검/중복매도 방지 로직이 적용됨
+     """
+     try:
+         code = req.code.strip()
+         qty = int(req.qty)
+         if qty <= 0:
+             raise ValueError("qty must be > 0")
+ 
+         if req.price is not None and float(req.price) > 0:
+-            result = kis.sell_stock_limit(code, qty, int(float(req.price)))  # type: ignore
++            result = kis.sell_stock_limit(code, qty, int(float(req.price)), sid=req.sid)  # type: ignore
+         else:
+             if hasattr(kis, "sell_stock_market"):
+-                result = kis.sell_stock_market(code, qty)  # type: ignore
++                result = kis.sell_stock_market(code, qty, sid=req.sid)  # type: ignore
+             else:
+-                result = kis.sell_stock(code, qty, None)  # type: ignore
++                result = kis.sell_stock(code, qty, None, sid=req.sid)  # type: ignore
+ 
+         return {"result": result}
+     except HTTPException:
+         raise
+     except Exception as e:
+         logger.error("[SELL_ORDER_FAIL] %s", e)
+         raise HTTPException(status_code=400, detail=str(e))
+diff --git a/trader/execution.py b/trader/execution.py
+index aa015bc55d4e6a438fbeca93e0d11a7a30ba7781..1194f1c889971eb65a1a99e080f6d98af96d2b58 100644
+--- a/trader/execution.py
++++ b/trader/execution.py
+@@ -706,51 +706,51 @@ def compute_entry_target(kis: KisAPI, stk: Dict[str, Any]) -> Tuple[Optional[flo
+         prev_low  = _to_float(stk.get("prev_low"))
+         if prev_high is None or prev_low is None:
+             logger.warning(f"[TARGET/prev_candle_fail] {code} 전일 캔들/백업 모두 부재")
+             return None, None
+ 
+     rng = max(0.0, float(prev_high) - float(prev_low))
+     k_used = float(stk.get("best_k") or stk.get("K") or stk.get("k") or 0.5)
+     raw_target = float(today_open) + rng * k_used
+ 
+     eff_target_price = float(_round_to_tick(raw_target, mode="up"))
+     return float(eff_target_price), float(k_used)
+ 
+ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) -> Dict[str, Any]:
+     """
+     매수 주문(지정가 우선, 실패시 시장가 Fallback) + 체결가/슬리피지/네트워크 장애/실패 상세 로깅
+     """
+     code = normalize_code(code)
+     result_limit: Optional[Dict[str, Any]] = None
+     order_price = _round_to_tick(limit_price, mode="up") if (limit_price and limit_price > 0) else 0
+     fill_price = None
+     trade_logged = False
+ 
+     try:
+         # [PATCH] 예수금/과매수 방지: 가드형 지정가 사용
+         if hasattr(kis, "buy_stock_limit_guarded") and order_price and order_price > 0:  # [PATCH]
+-            result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price))  # [PATCH]
++            result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price), sid="MANUAL")  # [PATCH]
+             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
+             time.sleep(2.0)
+             filled = False
+             if hasattr(kis, "check_filled"):
+                 try:
+                     filled = bool(_with_retry(kis.check_filled, result_limit))
+                 except Exception:
+                     filled = False
+             if filled:
+                 try:
+                     fill_price = float(result_limit.get("output", {}).get("prdt_price", 0)) or None
+                 except Exception:
+                     fill_price = None
+                 if fill_price is None:
+                     try:
+                         fill_price = kis.get_current_price(code)
+                     except Exception:
+                         fill_price = None
+                 slippage = ((fill_price - order_price) / order_price * 100.0) if (fill_price and order_price) else None
+                 log_trade({
+                     "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                     "code": code,
+                     "side": "BUY",
+                     "order_price": order_price,
+                     "fill_price": fill_price,
+@@ -764,51 +764,51 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int)
+                 if slippage is not None and abs(slippage) > SLIPPAGE_LIMIT_PCT:
+                     logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
+                 return result_limit
+         else:
+             logger.info("[BUY-LIMIT] API 미지원 또는 limit_price 무효 → 시장가로 진행")
+     except Exception as e:
+         logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, order_price, e)
+         log_trade({
+             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+             "code": code,
+             "side": "BUY",
+             "order_price": order_price,
+             "fill_price": None,
+             "slippage_pct": None,
+             "qty": qty,
+             "result": None,
+             "status": "failed",
+             "fail_reason": str(e)
+         })
+         trade_logged = True
+ 
+     # --- 시장가 Fallback ---
+     try:
+         # [PATCH] 예수금/과매수 방지: 가드형 시장가 사용
+         if hasattr(kis, "buy_stock_market_guarded"):  # [PATCH]
+-            result_mkt = _with_retry(kis.buy_stock_market_guarded, code, qty)  # [PATCH]
++            result_mkt = _with_retry(kis.buy_stock_market_guarded, code, qty, sid="MANUAL")  # [PATCH]
+         elif hasattr(kis, "buy_stock_market"):
+             result_mkt = _with_retry(kis.buy_stock_market, code, qty)
+         else:
+             result_mkt = _with_retry(kis.buy_stock, code, qty)
+         logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, order_price, result_mkt)
+         try:
+             fill_price = float(result_mkt.get("output", {}).get("prdt_price", 0)) or None
+         except Exception:
+             fill_price = None
+         if fill_price is None:
+             try:
+                 fill_price = kis.get_current_price(code)
+             except Exception:
+                 fill_price = None
+         slippage = ((fill_price - order_price) / order_price * 100.0) if (fill_price and order_price) else None
+         log_trade({
+             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+             "code": code,
+             "side": "BUY",
+             "order_price": order_price or None,
+             "fill_price": fill_price,
+             "slippage_pct": round(slippage, 2) if slippage is not None else None,
+             "qty": qty,
+             "result": result_mkt,
+             "status": "filled" if result_mkt and result_mkt.get("rt_cd") == "0" else "failed",
+diff --git a/trader/fill_store.py b/trader/fill_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90cbb9b6b113f06733736c01ed644fcc7371bcf5
+--- /dev/null
++++ b/trader/fill_store.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++import json
++import logging
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Dict, List
++
++from .io_atomic import append_jsonl
++from .paths import FILLS_DIR, ensure_dirs
++from .strategy_registry import normalize_sid
++
++logger = logging.getLogger(__name__)
++
++
++def _fills_path(ts: datetime | None = None) -> Path:
++    ts = ts or datetime.now()
++    day_tag = ts.strftime("%Y%m%d")
++    return FILLS_DIR / f"fills_{day_tag}.jsonl"
++
++
++def append_fill(
++    *,
++    ts: str,
++    order_id: str | None,
++    pdno: str,
++    sid: Any,
++    side: str,
++    qty: int,
++    price: float,
++    source: str,
++    note: str = "",
++    run_id: str | None = None,
++) -> Dict[str, Any]:
++    ensure_dirs()
++    record = {
++        "ts": ts,
++        "order_id": order_id,
++        "pdno": pdno,
++        "sid": normalize_sid(sid),
++        "side": side.upper(),
++        "qty": int(qty),
++        "price": float(price),
++        "source": source,
++        "note": note,
++    }
++    if run_id:
++        record["run_id"] = run_id
++    append_jsonl(_fills_path(), record)
++    return record
++
++
++def load_fills_index(path: Path | None = None) -> List[Dict[str, Any]]:
++    ensure_dirs()
++    rows: List[Dict[str, Any]] = []
++    if path:
++        p = Path(path)
++        if p.is_dir():
++            paths = sorted(p.glob("fills_*.jsonl"))
++        else:
++            paths = [p]
++    else:
++        paths = sorted(FILLS_DIR.glob("fills_*.jsonl"))
++    for p in paths:
++        try:
++            with open(p, "r", encoding="utf-8") as f:
++                for line in f:
++                    line = line.strip()
++                    if not line:
++                        continue
++                    try:
++                        rows.append(json.loads(line))
++                    except json.JSONDecodeError:
++                        continue
++        except FileNotFoundError:
++            continue
++        except Exception:
++            logger.exception("[FILL_STORE] failed to read %s", p)
++    return rows
+diff --git a/trader/fills.py b/trader/fills.py
+index 7b403976d43effbb62ecc212f3d1e9b6ee99fc57..b4d074e85bac9b9370c059f8b9b60106251e0ce4 100644
+--- a/trader/fills.py
++++ b/trader/fills.py
+@@ -1,34 +1,22 @@
+ from datetime import datetime
+-import csv, os
++from typing import Any
+ 
+-def append_fill(side, code, name, qty, price, odno, note="", reason=""):
++from .fill_store import append_fill as append_fill_jsonl
++from .strategy_registry import normalize_sid
++
++
++def append_fill(side, code, name, qty, price, odno, note: str = "", reason: str = "", sid: Any | None = None):
+     """
+-    체결 기록을 CSV로 저장
+-    side: "BUY" or "SELL"
+-    code: 종목 코드
+-    name: 종목 이름
+-    qty: 체결 수량
+-    price: 체결 단가
+-    odno: 주문번호
+-    note: 추가 메모
++    체결 기록을 JSONL로 저장 (backward compatibility wrapper).
+     """
+-    os.makedirs("fills", exist_ok=True)
+-    path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
+-    header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note", "reason"]
+-    row = [
+-        datetime.now().isoformat(),
+-        side,
+-        code,
+-        name,
+-        int(qty),
+-        float(price),
+-        str(odno),
+-        note,
+-        reason or "",
+-    ]
+-    new = not os.path.exists(path)
+-    with open(path, "a", newline="", encoding="utf-8") as f:
+-        w = csv.writer(f)
+-        if new:
+-            w.writerow(header)
+-        w.writerow(row)
++    append_fill_jsonl(
++        ts=datetime.now().isoformat(),
++        order_id=odno,
++        pdno=str(code),
++        sid=normalize_sid(sid),
++        side=str(side).upper(),
++        qty=int(qty),
++        price=float(price),
++        source=reason or "append_fill",
++        note=note,
++    )
+diff --git a/trader/io_atomic.py b/trader/io_atomic.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c44c34159b4423a6228162dbd442878ec9653eea
+--- /dev/null
++++ b/trader/io_atomic.py
+@@ -0,0 +1,31 @@
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++from typing import Any, Dict
++
++
++def _flush_and_sync(fobj) -> None:
++    fobj.flush()
++    try:
++        os.fsync(fobj.fileno())
++    except Exception:
++        # fsync may be unavailable on some platforms; ignore to avoid hard failure.
++        pass
++
++
++def atomic_write_json(path: Path, obj: Dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(obj, f, ensure_ascii=False, indent=None)
++        _flush_and_sync(f)
++    os.replace(tmp, path)
++
++
++def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
++        _flush_and_sync(f)
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 9ea6981be08c9c2f3a3f65b6f22667b6ffbdc529..a32f5209fd4a63ec0e212c14a76caf8544124dc3 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -1248,51 +1248,51 @@ class KisAPI:
+         mp: Dict[str, int] = {}
+         for row in pos or []:
+             try:
+                 pdno = safe_strip(row.get("pdno"))
+                 hldg = int(float(row.get("hldg_qty", "0")))
+                 ord_psbl = int(float(row.get("ord_psbl_qty", "0")))
+                 qty = hldg if hldg > 0 else ord_psbl
+                 if pdno and qty > 0:
+                     mp[pdno] = qty
+             except Exception:
+                 continue
+         logger.info(f"[보유수량맵] {len(mp)}종목")
+         return mp
+ 
+     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+     def get_balance(self) -> Dict[str, object]:
+         return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
+ 
+     def get_balance_all(self) -> Dict[str, object]:
+         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
+         return self.get_balance()
+ 
+     # -------------------------------
+     # 주문 공통, 시장가/지정가, 매수/매도
+     # -------------------------------
+-    def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
++    def _order_cash(self, body: dict, *, is_sell: bool, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+ 
+         # TR 후보 순차 시도
+         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
+ 
+         now = now_kst()
+         block_reason = _order_block_reason(now)
+         if block_reason:
+             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, body.get("PDNO"), body.get("ORD_QTY"))
+             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+ 
+         # Fallback: 시장가 → IOC시장가 → 최유리
+         ord_dvsn_chain = ["01", "13", "03"]
+         last_err = None
+ 
+         for tr_id in tr_list:
+             for ord_dvsn in ord_dvsn_chain:
+                 body["ORD_DVSN"] = ord_dvsn
+                 body["ORD_UNPR"] = "0"
+                 if is_sell and not body.get("SLL_TYPE"):
+                     body["SLL_TYPE"] = "01"
+                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+ 
+                 # HashKey
+                 try:
+@@ -1347,203 +1347,205 @@ class KisAPI:
+                             qty = int(float(body.get("ORD_QTY", "0")))
+                             # 가능한 경우 지정가 사용, 아니면 현재가로 추정
+                             price_for_fill = None
+                             try:
+                                 ord_unpr = body.get("ORD_UNPR")
+                                 if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
+                                     price_for_fill = float(ord_unpr)
+                                 else:
+                                     try:
+                                         price_for_fill = float(self.get_last_price(pdno))
+                                     except Exception:
+                                         price_for_fill = 0.0
+                             except Exception:
+                                 price_for_fill = 0.0
+ 
+                             side = "SELL" if is_sell else "BUY"
+                             append_fill(
+                                 side=side,
+                                 code=pdno,
+                                 name="",
+                                 qty=qty,
+                                 price=price_for_fill,
+                                 odno=odno,
+                                 note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
+                                 reason="order_cash",
++                                sid=sid,
+                             )
+                         except Exception as e:
+                             logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                         return data
+ 
+                     msg_cd = data.get("msg_cd", "")
+                     msg1 = data.get("msg1", "")
+                     # 게이트웨이/서버 에러류는 재시도
+                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
+                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
+                         logger.error(
+                             f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
+                             f"resp={data} → sleep {backoff:.2f}s"
+                         )
+                         time.sleep(backoff)
+                         last_err = data
+                         continue
+ 
+                     logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
+                     blocked = _is_order_disallowed(data)
+                     if blocked:
+                         _mark_order_blocked(blocked, now)
+                     return None
+ 
+                 logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
+ 
+         raise Exception(f"주문 실패: {last_err}")
+ 
+     # -------------------------------
+     # 매수/매도 (기본)
+     # -------------------------------
+-    def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
++    def buy_stock_market(self, pdno: str, qty: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
+         pdno = normalize_code(pdno)
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "01",  # 시장가
+             "ORD_UNPR": "0",
+         }
+-        return self._order_cash(body, is_sell=False)
++        return self._order_cash(body, is_sell=False, sid=sid, run_id=run_id)
+ 
+-    def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
++    def sell_stock_market(self, pdno: str, qty: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
+         pdno = normalize_code(pdno)
+         # --- 강화된 사전점검: 보유수량 우선 ---
+         pos = self.get_positions() or []
+         hldg = 0
+         ord_psbl = 0
+         for r in pos:
+             if normalize_code(r.get("pdno")) == pdno:
+                 hldg = int(float(r.get("hldg_qty", "0")))
+                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                 break
+ 
+         base_qty = hldg if hldg > 0 else ord_psbl
+         if base_qty <= 0:
+             logger.error(f"[SELL_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
+             return None
+ 
+         if qty > base_qty:
+             logger.warning(
+                 f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+             )
+             qty = base_qty
+ 
+         # --- 중복 매도 방지(메모리 기반) ---
+         now_ts = time.time()
+         with self._recent_sells_lock:
+             last = self._recent_sells.get(pdno)
+             if last and (now_ts - last) < self._recent_sells_cooldown:
+                 logger.warning(
+                     f"[SELL_DUP_BLOCK] 최근 매도 기록으로 중복 매도 차단 pdno={pdno} "
+                     f"last={last} age={now_ts-last:.1f}s"
+                 )
+                 return {"status": "SKIPPED", "skip_reason": "DUP_BLOCK"}
+ 
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "SLL_TYPE": "01",  # 일반매도
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "01",
+             "ORD_UNPR": "0",
+             "EXCG_ID_DVSN_CD": "KRX",
+         }
+-        resp = self._order_cash(body, is_sell=True)
++        resp = self._order_cash(body, is_sell=True, sid=sid, run_id=run_id)
+         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+             with self._recent_sells_lock:
+                 self._recent_sells[pdno] = time.time()
+                 cutoff = time.time() - (self._recent_sells_cooldown * 5)
+                 keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
+                 for k in keys_to_del:
+                     del self._recent_sells[k]
+         return resp
+ 
+-    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
++    def buy_stock_limit(self, pdno: str, qty: int, price: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
+         pdno = normalize_code(pdno)
+         now = now_kst()
+         block_reason = _order_block_reason(now)
+         if block_reason:
+             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
+             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+ 
+         body = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(pdno),
+             "ORD_QTY": str(int(qty)),
+             "ORD_DVSN": "00",  # 지정가
+             "ORD_UNPR": str(int(price)),
+             "EXCG_ID_DVSN_CD": "KRX",
+         }
+         hk = self._create_hashkey(body)
+         tr_list = _pick_tr(self.env, "ORDER_BUY")
+         if not tr_list:
+             raise Exception("ORDER_BUY TR 미구성")
+         tr_id = tr_list[0]
+         headers = self._headers(tr_id, hk)
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+         # [CHG] 안전요청 사용
+         resp = self._safe_request(
+             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+         )
+         data = resp.json()
+         if resp.status_code == 200 and data.get("rt_cd") == "0":
+             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
+             try:
+                 out = data.get("output") or {}
+                 odno = out.get("ODNO") or out.get("ord_no") or ""
+                 pdno = safe_strip(body.get("PDNO", ""))
+                 qty_int = int(float(body.get("ORD_QTY", "0")))
+                 price_for_fill = float(body.get("ORD_UNPR", 0))
+                 append_fill(
+                     side="BUY",
+                     code=pdno,
+                     name="",
+                     qty=qty_int,
+                     price=price_for_fill,
+                     odno=odno,
+                     note=f"limit,tr={tr_id}",
++                    sid=sid,
+                 )
+             except Exception as e:
+                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
+             return data
+         logger.error(f"[BUY_LIMIT_FAIL] {data}")
+         blocked = _is_order_disallowed(data)
+         if blocked:
+             _mark_order_blocked(blocked, now)
+         return None
+ 
+-    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
++    def sell_stock_limit(self, pdno: str, qty: int, price: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
+         pdno = normalize_code(pdno)
+         now = now_kst()
+         block_reason = _order_block_reason(now)
+         if block_reason:
+             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
+             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+ 
+         # --- 강화된 사전점검: 보유수량 우선 ---
+         pos = self.get_positions() or []
+         hldg = 0
+         ord_psbl = 0
+         for r in pos:
+             if safe_strip(r.get("pdno")) == safe_strip(pdno):
+                 hldg = int(float(r.get("hldg_qty", "0")))
+                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
+                 break
+ 
+         base_qty = hldg if hldg > 0 else ord_psbl
+         if base_qty <= 0:
+             logger.error(
+                 f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}"
+             )
+             return None
+ 
+         if qty > base_qty:
+@@ -1581,157 +1583,158 @@ class KisAPI:
+         tr_id = tr_list[0]
+         headers = self._headers(tr_id, hk)
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+         # [CHG] 안전요청 사용
+         resp = self._safe_request(
+             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
+         )
+         data = resp.json()
+         if resp.status_code == 200 and data.get("rt_cd") == "0":
+             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
+             try:
+                 out = data.get("output") or {}
+                 odno = out.get("ODNO") or out.get("ord_no") or ""
+                 pdno = safe_strip(body.get("PDNO", ""))
+                 qty_int = int(float(body.get("ORD_QTY", "0")))
+                 price_for_fill = float(body.get("ORD_UNPR", 0))
+                 append_fill(
+                     side="SELL",
+                     code=pdno,
+                     name="",
+                     qty=qty_int,
+                     price=price_for_fill,
+                     odno=odno,
+                     note=f"limit,tr={tr_id}",
+                     reason="sell_limit",
++                    sid=sid,
+                 )
+             except Exception as e:
+                 logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+             with self._recent_sells_lock:
+                 self._recent_sells[pdno] = time.time()
+             return data
+         logger.error(f"[SELL_LIMIT_FAIL] {data}")
+         blocked = _is_order_disallowed(data)
+         if blocked:
+             _mark_order_blocked(blocked, now)
+         return None
+ 
+     # -------------------------------
+     # 매수/매도 (신규 가드 사용 버전)
+     # -------------------------------
+-    def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, **kwargs):
++    def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, *, sid: Any | None = None, run_id: str | None = None, **kwargs):
+         """
+         지정가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
+         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
+         """
+         code = normalize_code(code)
+         # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
+         if self.env == "practice":
+             logger.info(
+                 f"[BUY_GUARD] practice env → guard 생략, 직접 지정가 주문 "
+                 f"(code={code}, qty={qty}, limit={limit_price})"
+             )
+-            return self.buy_stock_limit(code, qty, limit_price)
++            return self.buy_stock_limit(code, qty, limit_price, sid=sid, run_id=run_id)
+ 
+         try:
+             limit_price = int(limit_price)
+         except Exception:
+             limit_price = 0
+         if limit_price <= 0 or int(qty) <= 0:
+             raise ValueError("invalid limit buy params")
+ 
+         # 기준가격: 지정가와 현재가 중 더 보수적인 값 사용(더 높은 값)
+         try:
+             cur = self.get_last_price(code)
+             ref_px = float(cur) if cur is not None else None
+         except Exception:
+             ref_px = None
+         ref_px = float(limit_price) if ref_px is None else max(float(limit_price), float(ref_px))
+ 
+         adj_qty = self.affordable_qty(code, ref_px, qty)
+         if adj_qty <= 0:
+             logger.warning(f"[BUY_GUARD] {code} 예수금 부족 → 매수 스킵 (req={qty}, px={ref_px})")
+             return {"rt_cd": "1", "msg1": "INSUFFICIENT_CASH", "output": {}}
+ 
+         if adj_qty < qty:
+             logger.info(f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px={ref_px})")
+ 
+         # 기존 지정가 매수 호출
+-        return self.buy_stock_limit(code, adj_qty, limit_price)
++        return self.buy_stock_limit(code, adj_qty, limit_price, sid=sid, run_id=run_id)
+ 
+-    def buy_stock_market_guarded(self, code: str, qty: int, **kwargs):
++    def buy_stock_market_guarded(self, code: str, qty: int, *, sid: Any | None = None, run_id: str | None = None, **kwargs):
+         """
+         시장가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
+         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
+         """
+         code = normalize_code(code)
+         # 🔸 모의투자(practice) 계좌에서는 예수금 가드 사용 X → 바로 KIS로 주문
+         if self.env == "practice":
+             logger.info(
+                 f"[BUY_GUARD] practice env → guard 생략, 직접 시장가 주문 "
+                 f"(code={code}, qty={qty})"
+             )
+-            return self.buy_stock_market(code, qty)
++            return self.buy_stock_market(code, qty, sid=sid, run_id=run_id)
+ 
+         try:
+             cur = self.get_last_price(code)
+             ref_px = float(cur) if cur is not None else 0.0
+         except Exception:
+             ref_px = 0.0
+ 
+         if ref_px <= 0:
+             snap = self.get_quote_snapshot(code)
+             ref_px = float(snap.get("tp") or 0.0)
+ 
+         adj_qty = self.affordable_qty(code, ref_px, qty)
+         if adj_qty <= 0:
+             logger.warning(
+                 f"[BUY_GUARD] {code} 예수금 부족 → 매수 스킵 (req={qty}, px≈{ref_px})"
+             )
+             return {"rt_cd": "1", "msg1": "INSUFFICIENT_CASH", "output": {}}
+ 
+         if adj_qty < qty:
+             logger.info(
+                 f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px≈{ref_px})"
+             )
+ 
+-        return self.buy_stock_market(code, adj_qty)
++        return self.buy_stock_market(code, adj_qty, sid=sid, run_id=run_id)
+ 
+     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+-    def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
++    def buy_stock(self, code: str, qty: int, price: Optional[int] = None, *, sid: Any | None = None, run_id: str | None = None):
+         """기존 코드 호환용."""
+         code = normalize_code(code)
+         if price is None:
+-            return self.buy_stock_market(code, qty)
+-        return self.buy_stock_limit(code, qty, price)
++            return self.buy_stock_market(code, qty, sid=sid, run_id=run_id)
++        return self.buy_stock_limit(code, qty, price, sid=sid, run_id=run_id)
+ 
+-    def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
++    def sell_stock(self, code: str, qty: int, price: Optional[int] = None, *, sid: Any | None = None, run_id: str | None = None):
+         """기존 코드 호환용."""
+         code = normalize_code(code)
+         if price is None:
+-            return self.sell_stock_market(code, qty)
+-        return self.sell_stock_limit(code, qty, price)
++            return self.sell_stock_market(code, qty, sid=sid, run_id=run_id)
++        return self.sell_stock_limit(code, qty, price, sid=sid, run_id=run_id)
+ 
+     # ===== [NEW] 주문 후 확인/보조: 체결 후 잔고 동기화 =====
+     def refresh_after_order(self, wait_sec: float = 3.0, max_tries: int = 5) -> dict:
+         """
+         체결 직후 잔고/현금 재조회 (네트워크/지연 내성).
+         - 여러 번(기본 5회) 짧게 시도하여 output1/2가 채워진 시점에 반환
+         - 실패 시 마지막 성공 스냅샷 또는 빈 dict
+         """
+         snap: dict = {}
+         tries = max(1, int(max_tries))
+         delay = max(0.2, float(wait_sec) / tries)
+         for i in range(tries):
+             try:
+                 j = self.inquire_balance_all()
+                 if j and (j.get("output1") or j.get("output2")):
+                     snap = j
+                     logger.info("[SYNC] balance refreshed (try=%s)", i + 1)
+                     break
+             except Exception as e:
+                 logger.warning("[SYNC] balance refresh failed: %s", e)
+             time.sleep(delay)
+         return snap
+ 
+     def check_filled(self, order_resp: Optional[dict]) -> bool:
+         """간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주."""
+diff --git a/trader/ledger.py b/trader/ledger.py
+index 55de8580e8875c11548c770e5039627214fa33e0..a428bc118f30989a00c0aaa43b8d19576a33f428 100644
+--- a/trader/ledger.py
++++ b/trader/ledger.py
+@@ -1,36 +1,38 @@
+ from __future__ import annotations
+ 
+ import json
+ import os
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict, List
+ 
+ from .config import KST
+ from .code_utils import normalize_code
+ from .strategy_ids import STRATEGY_INT_IDS
++from .strategy_recovery import recover_sid_for_holding
++from .strategy_registry import normalize_sid
+ 
+ LEDGER_DIR = Path("fills")
+ LEDGER_PATH = LEDGER_DIR / "ledger.jsonl"
+ 
+ 
+ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+     LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+     with open(path, "a", encoding="utf-8") as f:
+         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+         f.flush()
+         try:
+             os.fsync(f.fileno())
+         except Exception:
+             # 일부 플랫폼에서는 fsync 미지원
+             pass
+ 
+ 
+ def record_trade_ledger(
+     *,
+     timestamp: str,
+     code: str,
+     strategy_id: int | str | None,
+     side: str,
+     qty: int,
+     price: float,
+@@ -235,90 +237,119 @@ def strategy_avg_price(
+ ) -> float | None:
+     lots = _ensure_state(state)
+     pdno_key = normalize_code(pdno)
+     if not pdno_key:
+         return None
+     total_qty = 0
+     total_cost = 0.0
+     for lot in lots:
+         if normalize_code(lot.get("pdno")) != pdno_key:
+             continue
+         if _norm_sid(lot.get("strategy_id")) != _norm_sid(strategy_id):
+             continue
+         remaining = int(lot.get("remaining_qty") or 0)
+         if remaining <= 0:
+             continue
+         entry_price = float(lot.get("entry_price") or 0.0)
+         total_qty += remaining
+         total_cost += entry_price * remaining
+     if total_qty <= 0:
+         return None
+     return total_cost / total_qty
+ 
+ 
+ def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[str, Any]]) -> None:
+     lots = _ensure_state(state)
++    now_ts = datetime.now(KST)
++    before_len = len(lots)
++    evidence_dirs = {
++        "state_lots": lots,
++    }
+     holdings_map: Dict[str, Dict[str, Any]] = {}
+     for row in holdings:
+         code = normalize_code(row.get("code") or row.get("pdno") or "")
+         if not code:
+             continue
+         qty = int(row.get("qty") or 0)
+-        avg_price = row.get("avg_price")
++        avg_price = float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0)
+         existing = holdings_map.get(code)
+         if existing:
+             existing["qty"] += qty
+             if existing.get("avg_price") is None:
+                 existing["avg_price"] = avg_price
+         else:
+             holdings_map[code] = {"qty": qty, "avg_price": avg_price}
+ 
+-    now_ts = datetime.now(KST).isoformat()
+-
+     for lot in lots:
+-        if str(lot.get("strategy_id")) in {"ORPHAN", "UNKNOWN"}:
+-            # legacy migration only: map deprecated sid to MANUAL
++        sid = normalize_sid(lot.get("strategy_id"))
++        if sid == "UNKNOWN":
+             lot["strategy_id"] = "MANUAL"
++            lot.setdefault("meta", {})["sell_blocked"] = True
+ 
+     for lot in lots:
+         pdno = normalize_code(lot.get("pdno"))
+         if pdno not in holdings_map or holdings_map[pdno]["qty"] <= 0:
+             if int(lot.get("remaining_qty") or 0) > 0:
+                 lot["remaining_qty"] = 0
+ 
++    recovered = 0
++    manual_created = 0
++    adjusted = 0
++
+     for pdno, payload in holdings_map.items():
+         hold_qty = int(payload.get("qty") or 0)
+         if hold_qty <= 0:
+             continue
+-        total_remaining = sum(
+-            int(lot.get("remaining_qty") or 0)
+-            for lot in lots
+-            if normalize_code(lot.get("pdno")) == pdno
+-        )
++        avg_price = float(payload.get("avg_price") or 0.0)
++        existing = [lot for lot in lots if normalize_code(lot.get("pdno")) == pdno]
++        total_remaining = sum(int(lot.get("remaining_qty") or 0) for lot in existing)
++        if total_remaining == hold_qty:
++            continue
+         if total_remaining < hold_qty:
+             diff = hold_qty - total_remaining
++            sid, conf, reasons = recover_sid_for_holding(pdno, diff, avg_price, now_ts, evidence_dirs)
++            meta = {"reconciled": True}
++            if sid == "MANUAL":
++                meta["sell_blocked"] = True
++                meta["reasons"] = reasons
++                manual_created += 1
++            else:
++                recovered += 1
+             lots.append(
+                 {
+-                    "lot_id": f"{pdno}-RECON-{now_ts}",
++                    "lot_id": f"{pdno}-RECON-{now_ts.isoformat()}",
+                     "pdno": pdno,
+-                    "strategy_id": "MANUAL",
++                    "strategy_id": sid,
+                     "engine": "reconcile",
+-                    "entry_ts": now_ts,
+-                    "entry_price": float(payload.get("avg_price") or 0.0),
++                    "entry_ts": now_ts.isoformat(),
++                    "entry_price": avg_price,
+                     "qty": int(diff),
+                     "remaining_qty": int(diff),
+-                    "meta": {"reconciled": True, "manual": True},
++                    "meta": meta,
+                 }
+             )
+         elif total_remaining > hold_qty:
+             extra = total_remaining - hold_qty
+-            for lot in reversed(lots):
+-                if normalize_code(lot.get("pdno")) != pdno:
+-                    continue
++            for lot in sorted(
++                [lot for lot in existing if int(lot.get("remaining_qty") or 0) > 0],
++                key=lambda x: x.get("entry_ts") or "",
++                reverse=True,
++            ):
+                 lot_remaining = int(lot.get("remaining_qty") or 0)
+                 if lot_remaining <= 0:
+                     continue
+                 delta = min(lot_remaining, extra)
+                 lot["remaining_qty"] = int(lot_remaining - delta)
++                adjusted += delta
+                 extra -= delta
+                 if extra <= 0:
+                     break
++
++    logger.info(
++        "[RECONCILE] holdings=%d lots_before=%d lots_after=%d recovered=%d manual_created=%d adjusted=%d",
++        len(holdings_map),
++        before_len,
++        len(lots),
++        recovered,
++        manual_created,
++        adjusted,
++    )
+diff --git a/trader/order_map_store.py b/trader/order_map_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..152f671ecacd940df7bc8e93282471864f5875ae
+--- /dev/null
++++ b/trader/order_map_store.py
+@@ -0,0 +1,72 @@
++from __future__ import annotations
++
++import json
++import logging
++import uuid
++from pathlib import Path
++from typing import Any, Dict
++
++from .io_atomic import append_jsonl
++from .paths import STATE_DIR, ensure_dirs
++from .strategy_registry import normalize_sid
++
++logger = logging.getLogger(__name__)
++
++ORDERS_MAP_PATH = STATE_DIR / "orders_map.jsonl"
++
++
++def append_order_map(
++    order_id: str | None,
++    pdno: str,
++    sid: Any,
++    side: str,
++    qty: int,
++    price: float,
++    reason: str,
++    ts: str,
++    run_id: str | None = None,
++) -> Dict[str, Any]:
++    ensure_dirs()
++    normalized_sid = normalize_sid(sid)
++    oid = order_id or f"client-{uuid.uuid4().hex}"
++    record = {
++        "order_id": oid,
++        "pdno": pdno,
++        "sid": normalized_sid,
++        "side": side.upper(),
++        "qty": int(qty),
++        "price": float(price),
++        "ts": ts,
++        "reason": reason,
++    }
++    if run_id:
++        record["run_id"] = run_id
++    if order_id is None:
++        record["client_generated"] = True
++        logger.warning("[ORDER_MAP] missing order_id -> generated client id %s for %s/%s", oid, pdno, normalized_sid)
++    append_jsonl(ORDERS_MAP_PATH, record)
++    return record
++
++
++def load_order_map_index(path: Path | None = None) -> Dict[str, Dict[str, Any]]:
++    path = path or ORDERS_MAP_PATH
++    if not path.exists():
++        return {}
++    index: Dict[str, Dict[str, Any]] = {}
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    payload = json.loads(line)
++                except json.JSONDecodeError:
++                    continue
++                oid = payload.get("order_id") or payload.get("client_id")
++                if not oid:
++                    continue
++                index[str(oid)] = payload
++    except Exception:
++        logger.exception("[ORDER_MAP] failed to load index from %s", path)
++    return index
+diff --git a/trader/paths.py b/trader/paths.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3def98cd87181beb934d7b3594e8ccb221901cc
+--- /dev/null
++++ b/trader/paths.py
+@@ -0,0 +1,17 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++TRADER_DIR = REPO_ROOT / "trader"
++STATE_DIR = TRADER_DIR / "state"
++FILLS_DIR = TRADER_DIR / "fills"
++LOG_DIR = TRADER_DIR / "logs"
++BOT_STATE_MIRROR_DIR = REPO_ROOT / "bot_state" / "trader_state" / "trader"
++
++
++def ensure_dirs() -> None:
++    STATE_DIR.mkdir(parents=True, exist_ok=True)
++    FILLS_DIR.mkdir(parents=True, exist_ok=True)
++    LOG_DIR.mkdir(parents=True, exist_ok=True)
+diff --git a/trader/recovery_self_test.py b/trader/recovery_self_test.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f7cc6f071927c33cbc174676c8f1fba707ef357
+--- /dev/null
++++ b/trader/recovery_self_test.py
+@@ -0,0 +1,149 @@
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import tempfile
++from datetime import datetime, timedelta
++from pathlib import Path
++
++from trader import state_store
++from trader.io_atomic import append_jsonl
++from trader.strategy_recovery import recover_sid_for_holding
++
++
++def _setup_temp_dir() -> Path:
++    return Path(tempfile.mkdtemp(prefix="recovery_test_"))
++
++
++def _write_order(path: Path, pdno: str, sid: str, ts: datetime) -> None:
++    append_jsonl(
++        path,
++        {
++            "order_id": f"{pdno}-{sid}-{ts.timestamp()}",
++            "pdno": pdno,
++            "sid": sid,
++            "side": "BUY",
++            "qty": 1,
++            "price": 1000,
++            "ts": ts.isoformat(),
++            "reason": "test",
++        },
++    )
++
++
++def _write_fill(path: Path, pdno: str, sid: str, ts: datetime) -> None:
++    append_jsonl(
++        path,
++        {
++            "ts": ts.isoformat(),
++            "order_id": f"{pdno}-{sid}-{ts.timestamp()}",
++            "pdno": pdno,
++            "sid": sid,
++            "side": "BUY",
++            "qty": 1,
++            "price": 1000,
++            "source": "test",
++            "note": "fill",
++        },
++    )
++
++
++def test_recovery_prefers_recent_fill() -> None:
++    tmp = _setup_temp_dir()
++    orders_path = tmp / "orders_map.jsonl"
++    fills_dir = tmp / "fills"
++    fills_dir.mkdir(parents=True, exist_ok=True)
++
++    now = datetime.now()
++    _write_order(orders_path, "000001", "S1", now - timedelta(days=40))
++    _write_order(orders_path, "000001", "S3", now - timedelta(days=1))
++    _write_fill(fills_dir / f"fills_{now.strftime('%Y%m%d')}.jsonl", "000001", "S3", now - timedelta(hours=2))
++
++    sid, conf, reasons = recover_sid_for_holding(
++        "000001",
++        10,
++        1000.0,
++        now,
++        {"orders_map": orders_path, "fills_dir": fills_dir},
++    )
++    assert sid == "S3" and conf >= 0.8, f"expected S3 with confidence, got {sid} {conf} {reasons}"
++
++
++def test_conflict_returns_manual() -> None:
++    tmp = _setup_temp_dir()
++    orders_path = tmp / "orders_map.jsonl"
++    fills_dir = tmp / "fills"
++    fills_dir.mkdir(parents=True, exist_ok=True)
++    now = datetime.now()
++
++    _write_order(orders_path, "000002", "S1", now - timedelta(hours=1))
++    _write_fill(fills_dir / f"fills_{now.strftime('%Y%m%d')}.jsonl", "000002", "S3", now - timedelta(minutes=10))
++
++    sid, conf, reasons = recover_sid_for_holding(
++        "000002",
++        5,
++        0.0,
++        now,
++        {"orders_map": orders_path, "fills_dir": fills_dir},
++    )
++    assert sid == "MANUAL" or any("conflict" in r for r in reasons)
++
++
++def test_no_evidence_is_manual() -> None:
++    sid, conf, _ = recover_sid_for_holding("000003", 1, 0.0, datetime.now(), {})
++    assert sid == "MANUAL"
++    assert conf < 0.8
++
++
++def test_legacy_migration_unknown_to_manual() -> None:
++    tmp = _setup_temp_dir()
++    bot_state_dir = tmp / "bot_state"
++    bot_state_dir.mkdir(parents=True, exist_ok=True)
++    legacy_path = bot_state_dir / "state.json"
++    legacy_path.write_text(json.dumps({"version": 1, "lots": [{"pdno": "000010", "remaining_qty": 2, "strategy_id": "UNKNOWN"}]}))
++
++    orig_cwd = Path.cwd()
++    orig_state_path = state_store.STATE_PATH
++    orig_state_dir = state_store.STATE_DIR
++    orig_orders_map = state_store.ORDERS_MAP_PATH
++    orig_log_dir = state_store.LOG_DIR
++    orig_ensure_dirs = state_store.ensure_dirs
++    try:
++        tmp_state_dir = tmp / "trader" / "state"
++        tmp_log_dir = tmp / "trader" / "logs"
++        tmp_state_dir.mkdir(parents=True, exist_ok=True)
++        tmp_log_dir.mkdir(parents=True, exist_ok=True)
++
++        def _ensure_dirs() -> None:
++            tmp_state_dir.mkdir(parents=True, exist_ok=True)
++            (tmp / "trader" / "fills").mkdir(parents=True, exist_ok=True)
++            tmp_log_dir.mkdir(parents=True, exist_ok=True)
++
++        state_store.STATE_DIR = tmp_state_dir
++        state_store.STATE_PATH = tmp_state_dir / "state.json"
++        state_store.ORDERS_MAP_PATH = tmp_state_dir / "orders_map.jsonl"
++        state_store.LOG_DIR = tmp_log_dir
++        state_store.ensure_dirs = _ensure_dirs  # type: ignore[assignment]
++
++        os.chdir(tmp)
++        migrated = state_store.load_state()
++        assert migrated["schema_version"] == 2
++        assert migrated["lots"]
++        assert migrated["lots"][0]["strategy_id"] in {"MANUAL", "S1", "S2", "S3", "S4", "S5"}
++    finally:
++        state_store.STATE_PATH = orig_state_path
++        state_store.STATE_DIR = orig_state_dir
++        state_store.ORDERS_MAP_PATH = orig_orders_map
++        state_store.LOG_DIR = orig_log_dir
++        state_store.ensure_dirs = orig_ensure_dirs  # type: ignore[assignment]
++        os.chdir(orig_cwd)
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    test_recovery_prefers_recent_fill()
++    test_conflict_returns_manual()
++    test_no_evidence_is_manual()
++    test_legacy_migration_unknown_to_manual()
++    print("recovery_self_test: OK")
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 659750826a488b3e9532c67007bccb207e8b715f..1fb955cfca815931df0801d32bfdd7ea4df9c7dc 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -1,263 +1,358 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Any, Dict
++from typing import Any, Dict, List, Tuple
+ 
+-from .config import KST
+ from .code_utils import normalize_code
+-from .state_io import atomic_write_json
++from .config import KST
++from .fill_store import append_fill as append_fill_jsonl
++from .io_atomic import atomic_write_json
++from .order_map_store import ORDERS_MAP_PATH, append_order_map, load_order_map_index
++from .paths import BOT_STATE_MIRROR_DIR, LOG_DIR, STATE_DIR, ensure_dirs
++from .strategy_recovery import recover_sid_for_holding
++from .strategy_registry import normalize_sid
+ 
+ logger = logging.getLogger(__name__)
+ 
+-SCHEMA_VERSION = 1
+-RUNTIME_STATE_DIR = Path(".runtime")
+-RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
+-BREAKOUT_WATCH_PATH = Path(__file__).parent / "state" / "breakout_watch.json"
++SCHEMA_VERSION = 2
++STATE_PATH = STATE_DIR / "state.json"
+ 
+ 
+-def _default_runtime_state() -> Dict[str, Any]:
++def _default_state() -> Dict[str, Any]:
+     return {
+         "schema_version": SCHEMA_VERSION,
+-        "updated_at": None,
+-        "positions": {},
++        "updated_at": datetime.now(KST).isoformat(),
++        "lots": [],
+         "orders": {},
++        "positions": {},
++        "meta": {"created_by": "state_store"},
+     }
+ 
+ 
+-def load_state() -> Dict[str, Any]:
+-    if not RUNTIME_STATE_PATH.exists():
+-        return _default_runtime_state()
++def _touch(path: Path) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.touch(exist_ok=True)
++
++
++def ensure_minimum_files() -> None:
++    ensure_dirs()
++    if not STATE_PATH.exists():
++        save_state(_default_state())
++    _touch(ORDERS_MAP_PATH)
++    _touch(LOG_DIR / "ledger.jsonl")
++
++
++def _load_json(path: Path) -> Dict[str, Any] | None:
++    if not path.exists():
++        return None
+     try:
+-        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
+-            state = json.load(f)
+-        if not isinstance(state, dict):
+-            logger.warning("[RUNTIME_STATE] invalid state format: %s", type(state))
+-            return _default_runtime_state()
+-        state.setdefault("schema_version", SCHEMA_VERSION)
+-        state.setdefault("positions", {})
+-        state.setdefault("orders", {})
+-        state.setdefault("updated_at", None)
+-        return state
++        with open(path, "r", encoding="utf-8") as f:
++            payload = json.load(f)
++        return payload if isinstance(payload, dict) else None
+     except Exception:
+-        logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
+-        return _default_runtime_state()
++        logger.exception("[STATE] failed to load %s", path)
++        return None
++
++
++def _normalize_lot_from_legacy(lot: Dict[str, Any], asof: datetime, evidence: Dict[str, Any]) -> Dict[str, Any]:
++    pdno = normalize_code(lot.get("pdno") or lot.get("code") or "")
++    qty = int(lot.get("remaining_qty") or lot.get("qty") or 0)
++    avg_price = float(lot.get("avg_price") or lot.get("entry_price") or 0.0)
++    sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
++    if sid in {"UNKNOWN", ""}:
++        sid, conf, reasons = recover_sid_for_holding(pdno, qty, avg_price, asof, evidence)
++        logger.info("[STATE_MIGRATE] recovered sid=%s conf=%.2f reasons=%s pdno=%s qty=%s", sid, conf, reasons, pdno, qty)
++    entry_ts = lot.get("entry_ts") or asof.isoformat()
++    meta = {"migrated": True, **(lot.get("meta") or {})}
++    if sid == "MANUAL":
++        meta["sell_blocked"] = True
++    return {
++        "lot_id": lot.get("lot_id") or f"{pdno}-{sid}-{entry_ts}",
++        "pdno": pdno,
++        "strategy_id": sid,
++        "engine": lot.get("engine") or "migrated",
++        "entry_ts": entry_ts,
++        "entry_price": avg_price,
++        "qty": qty,
++        "remaining_qty": qty,
++        "meta": meta,
++    }
++
++
++def _migrate_legacy_state() -> Dict[str, Any]:
++    candidates = [
++        Path("bot_state/state.json"),
++        BOT_STATE_MIRROR_DIR / "state.json",
++        BOT_STATE_MIRROR_DIR / "state" / "state.json",
++    ]
++    asof = datetime.now(KST)
++    evidence = {
++        "orders_map": ORDERS_MAP_PATH,
++        "ledger_path": LOG_DIR / "ledger.jsonl",
++        "fills_dir": STATE_DIR.parent / "fills",
++        "log_dir": LOG_DIR,
++        "rebalance_dir": Path("rebalance_results"),
++    }
++    for path in candidates:
++        payload = _load_json(path)
++        if not payload:
++            continue
++        lots_raw = payload.get("lots") or []
++        migrated_lots = [_normalize_lot_from_legacy(lot, asof, evidence) for lot in lots_raw if isinstance(lot, dict)]
++        state = _default_state()
++        state["lots"] = migrated_lots
++        state["meta"]["migrated_from"] = str(path)
++        save_state(state)
++        logger.info("[STATE_MIGRATE] migrated legacy lots=%d from %s", len(migrated_lots), path)
++        return state
++    return _default_state()
++
++
++def load_state() -> Dict[str, Any]:
++    ensure_dirs()
++    payload = _load_json(STATE_PATH)
++    if payload is None:
++        payload = _migrate_legacy_state()
++    payload.setdefault("schema_version", SCHEMA_VERSION)
++    payload.setdefault("lots", [])
++    payload.setdefault("orders", {})
++    payload.setdefault("positions", {})
++    payload.setdefault("meta", {})
++    payload["updated_at"] = payload.get("updated_at") or datetime.now(KST).isoformat()
++
++    # Normalize any lingering UNKNOWN to MANUAL
++    for lot in payload.get("lots", []):
++        sid = normalize_sid(lot.get("strategy_id"))
++        if sid == "UNKNOWN":
++            lot["strategy_id"] = "MANUAL"
++            lot.setdefault("meta", {})["sell_blocked"] = True
++    return payload
+ 
+ 
+ def save_state(state: Dict[str, Any]) -> None:
+     try:
+         payload = dict(state)
+-        payload.setdefault("schema_version", SCHEMA_VERSION)
+-        payload.setdefault("positions", {})
+-        payload.setdefault("orders", {})
++        payload["schema_version"] = SCHEMA_VERSION
+         payload["updated_at"] = datetime.now(KST).isoformat()
+-        atomic_write_json(RUNTIME_STATE_PATH, payload)
++        atomic_write_json(STATE_PATH, payload)
+     except Exception:
+-        logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
++        logger.exception("[STATE] failed to save %s", STATE_PATH)
+ 
+ 
+ def get_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any] | None:
+     positions = state.get("positions", {})
+     if not isinstance(positions, dict):
+         return None
+     return positions.get(normalize_code(symbol))
+ 
+ 
+ def upsert_position(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) -> None:
+     positions = state.setdefault("positions", {})
+     key = normalize_code(symbol)
+     pos = positions.setdefault(key, {})
+     for field, value in fields.items():
+         pos[field] = value
+ 
+ 
+ def _order_bucket(state: Dict[str, Any], symbol: str, side: str) -> Dict[str, Any]:
+-    orders = state.setdefault("orders", {})
++    orders = state.setdefault("order_windows", {})
+     symbol_key = normalize_code(symbol)
+     symbol_bucket = orders.setdefault(symbol_key, {})
+     return symbol_bucket.setdefault(side.upper(), {})
+ 
+ 
+ def should_block_order(
+     state: Dict[str, Any],
+     symbol: str,
+     side: str,
+     now_ts: str,
+     *,
+     window_sec: int = 300,
+     max_attempts: int = 2,
+ ) -> bool:
+     bucket = _order_bucket(state, symbol, side)
+     last_ts = bucket.get("last_ts")
+     attempts = int(bucket.get("attempts") or 0)
+     if attempts >= max_attempts:
+         return True
+     if isinstance(last_ts, str):
+         try:
+             last_dt = datetime.fromisoformat(last_ts)
+             now_dt = datetime.fromisoformat(now_ts)
+             if (now_dt - last_dt).total_seconds() <= window_sec:
+                 return True
+         except Exception:
+             return False
+     return False
+ 
+ 
+ def mark_order(
+     state: Dict[str, Any],
+     symbol: str,
+     side: str,
+     strategy_id: Any,
+     qty: int,
+     price: float,
+     ts: str,
+     order_id: str | None = None,
+     status: str = "submitted",
+-) -> None:
++    reason: str = "strategy",
++    run_id: str | None = None,
++) -> str:
++    pdno = normalize_code(symbol)
++    sid = normalize_sid(strategy_id)
++    record = {
++        "pdno": pdno,
++        "sid": sid,
++        "side": side.upper(),
++        "qty": int(qty),
++        "price": float(price),
++        "ts": ts,
++        "status": status,
++        "reason": reason,
++    }
++    entry = append_order_map(order_id, pdno, sid, side, qty, price, reason, ts, run_id)
++    oid = entry["order_id"]
++    state.setdefault("orders", {})[oid] = record
+     bucket = _order_bucket(state, symbol, side)
+     bucket["last_ts"] = ts
+-    bucket["last_order_id"] = order_id
++    bucket["last_order_id"] = oid
+     bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
+-    upsert_position(
+-        state,
+-        symbol,
+-        {
+-            "strategy_id": strategy_id,
+-            "last_action": side.upper(),
+-            "last_action_ts": ts,
+-            "last_order_status": status,
+-            "last_order_qty": int(qty),
+-            "last_order_price": float(price),
+-        },
+-    )
++    save_state(state)
++    logger.info("[ORDER_SENT] odno=%s pdno=%s sid=%s qty=%s price=%s reason=%s", oid, pdno, sid, qty, price, reason)
++    return oid
++
++
++def _apply_fill_to_lots(
++    lots: List[Dict[str, Any]],
++    *,
++    pdno: str,
++    sid: str,
++    side: str,
++    qty: int,
++    price: float,
++    ts: str,
++) -> Tuple[int, int]:
++    pdno_key = normalize_code(pdno)
++    remaining_before = sum(int(lot.get("remaining_qty") or 0) for lot in lots if normalize_code(lot.get("pdno")) == pdno_key)
++    if side.upper() == "BUY":
++        lot_id = f"{pdno_key}-{sid}-{ts}"
++        meta: Dict[str, Any] = {}
++        if sid == "MANUAL":
++            meta["sell_blocked"] = True
++        lots.append(
++            {
++                "lot_id": lot_id,
++                "pdno": pdno_key,
++                "strategy_id": sid,
++                "engine": "fill",
++                "entry_ts": ts,
++                "entry_price": float(price),
++                "qty": int(qty),
++                "remaining_qty": int(qty),
++                "meta": meta,
++            }
++        )
++    else:
++        allow_manual = os.getenv("FORCE_SELL_MANUAL") == "1"
++        remaining_to_sell = int(qty)
++        for lot in lots:
++            if normalize_code(lot.get("pdno")) != pdno_key:
++                continue
++            lot_sid = normalize_sid(lot.get("strategy_id"))
++            if lot_sid != sid and not (lot_sid == "MANUAL" and allow_manual):
++                continue
++            if lot_sid == "MANUAL" and lot.get("meta", {}).get("sell_blocked") and not allow_manual:
++                continue
++            lot_remaining = int(lot.get("remaining_qty") or 0)
++            if lot_remaining <= 0:
++                continue
++            delta = min(lot_remaining, remaining_to_sell)
++            lot["remaining_qty"] = lot_remaining - delta
++            lot["last_sell_ts"] = ts
++            remaining_to_sell -= delta
++            if remaining_to_sell <= 0:
++                break
++    remaining_after = sum(int(lot.get("remaining_qty") or 0) for lot in lots if normalize_code(lot.get("pdno")) == pdno_key)
++    return remaining_before, remaining_after
+ 
+ 
+ def mark_fill(
+     state: Dict[str, Any],
+     symbol: str,
+     side: str,
+     strategy_id: Any,
+     qty: int,
+     price: float,
+     ts: str,
+     order_id: str | None = None,
+     status: str = "filled",
++    source: str = "mark_fill",
++    run_id: str | None = None,
+ ) -> None:
+-    pos = get_position(state, symbol) or {}
+-    cur_qty = int(pos.get("qty") or 0)
+-    cur_avg = float(pos.get("avg_price") or 0.0)
+-    if side.upper() == "BUY":
+-        total_qty = cur_qty + int(qty)
+-        avg_price = (
+-            (cur_avg * cur_qty + float(price) * int(qty)) / total_qty
+-            if total_qty > 0
+-            else 0.0
+-        )
+-        pos.update({"qty": total_qty, "avg_price": avg_price, "last_buy_ts": ts})
+-    else:
+-        pos.update({"qty": max(0, cur_qty - int(qty)), "last_sell_ts": ts})
+-    pos["strategy_id"] = strategy_id
+-    pos["last_order_id"] = order_id
+-    pos["last_action"] = side.upper()
+-    pos["last_action_ts"] = ts
+-    pos["last_order_status"] = status
+-    upsert_position(state, symbol, pos)
+-
+-
+-def reconcile_with_kis_balance(
+-    state: Dict[str, Any],
+-    balance: Dict[str, Any],
+-    *,
+-    preferred_strategy: Dict[str, Any] | None = None,
+-) -> Dict[str, Any]:
+-    preferred_strategy = preferred_strategy or {}
+-    positions = state.setdefault("positions", {})
+-    balance_positions = balance.get("positions") if isinstance(balance, dict) else None
+-    if not isinstance(balance_positions, list):
+-        return state
+-    seen = set()
+-    for row in balance_positions:
+-        symbol = normalize_code(row.get("code") or row.get("pdno") or "")
+-        if not symbol:
+-            continue
+-        qty = int(row.get("qty") or 0)
+-        if qty <= 0:
+-            continue
+-        seen.add(symbol)
+-        pos = positions.setdefault(symbol, {})
+-        strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "MANUAL"
+-        pos.update(
+-            {
+-                "strategy_id": strategy_id,
+-                "qty": qty,
+-                "avg_price": float(row.get("avg_price") or 0.0),
+-                "last_action": "RECONCILE",
+-            }
++    pdno = normalize_code(symbol)
++    sid = normalize_sid(strategy_id)
++    lots = state.setdefault("lots", [])
++    if sid == "UNKNOWN" and order_id:
++        cached = state.get("orders", {}).get(order_id, {})
++        sid = normalize_sid(cached.get("sid") or cached.get("strategy_id"))
++        if sid == "UNKNOWN":
++            om = load_order_map_index()
++            if order_id in om:
++                sid = normalize_sid(om[order_id].get("sid"))
++    if sid == "UNKNOWN":
++        try:
++            asof = datetime.fromisoformat(ts)
++        except Exception:
++            asof = datetime.now(KST)
++        recovered_sid, conf, reasons = recover_sid_for_holding(
++            pdno,
++            qty,
++            price,
++            asof,
++            {"state_lots": lots},
+         )
+-        positions[symbol] = pos
+-    for symbol, pos in list(positions.items()):
+-        if symbol not in seen:
+-            positions.pop(symbol, None)
+-    return state
+-
+-
+-def _default_lot_state() -> Dict[str, Any]:
+-    return {"version": SCHEMA_VERSION, "lots": [], "updated_at": None}
+-
+-
+-def load_lot_state(path_json: str) -> Dict[str, Any]:
+-    path = Path(path_json)
+-    if not path.exists():
+-        return _default_lot_state()
+-    try:
+-        with open(path, "r", encoding="utf-8") as f:
+-            state = json.load(f)
+-        if not isinstance(state, dict):
+-            logger.warning("[STATE_STORE] invalid state format: %s", type(state))
+-            return _default_lot_state()
+-        state.setdefault("version", SCHEMA_VERSION)
+-        state.setdefault("lots", [])
+-        state.setdefault("updated_at", None)
+-        return state
+-    except Exception:
+-        logger.exception("[STATE_STORE] failed to load %s", path_json)
+-        return _default_lot_state()
+-
+-
+-def save_lot_state(path_json: str, state: Dict[str, Any]) -> None:
+-    path = Path(path_json)
+-    try:
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        payload = dict(state)
+-        payload.setdefault("version", SCHEMA_VERSION)
+-        payload.setdefault("lots", [])
+-        payload["updated_at"] = datetime.now(KST).isoformat()
+-        tmp_path = path.with_name(f"{path.name}.tmp")
+-        with open(tmp_path, "w", encoding="utf-8") as f:
+-            json.dump(payload, f, ensure_ascii=False, indent=2)
+-        os.replace(tmp_path, path)
+-    except Exception:
+-        logger.exception("[STATE_STORE] failed to save %s", path_json)
+-
+-
+-def load_breakout_watch() -> Dict[str, Any]:
+-    if not BREAKOUT_WATCH_PATH.exists():
+-        return {}
+-    try:
+-        with open(BREAKOUT_WATCH_PATH, "r", encoding="utf-8") as f:
+-            payload = json.load(f)
+-        return payload if isinstance(payload, dict) else {}
+-    except Exception:
+-        logger.exception("[BREAKOUT_WATCH] failed to load %s", BREAKOUT_WATCH_PATH)
+-        return {}
+-
+-
+-def save_breakout_watch(state: Dict[str, Any]) -> None:
+-    try:
+-        BREAKOUT_WATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+-        atomic_write_json(BREAKOUT_WATCH_PATH, state or {})
+-    except Exception:
+-        logger.exception("[BREAKOUT_WATCH] failed to save %s", BREAKOUT_WATCH_PATH)
++        if recovered_sid != "MANUAL" and conf >= 0.80:
++            sid = recovered_sid
++        else:
++            sid = "MANUAL"
++        logger.info("[FILL_RECOVERY] pdno=%s sid=%s conf=%.2f reasons=%s", pdno, sid, conf, reasons)
++    before, after = _apply_fill_to_lots(
++        lots,
++        pdno=pdno,
++        sid=sid,
++        side=side,
++        qty=qty,
++        price=price,
++        ts=ts,
++    )
++    append_fill_jsonl(
++        ts=ts,
++        order_id=order_id,
++        pdno=pdno,
++        sid=sid,
++        side=side,
++        qty=qty,
++        price=price,
++        source=source,
++        note=status,
++        run_id=run_id,
++    )
++    orders = state.setdefault("orders", {})
++    if order_id and order_id in orders:
++        orders[order_id]["status"] = status
++    save_state(state)
++    logger.info(
++        "[FILL_APPLIED] odno=%s pdno=%s sid=%s side=%s qty=%s remaining_before=%s remaining_after=%s",
++        order_id,
++        pdno,
++        sid,
++        side,
++        qty,
++        before,
++        after,
++    )
+diff --git a/trader/strategy_manager.py b/trader/strategy_manager.py
+index 6cfd6592882b548a7ac89689ecd696d5b69311b8..b5751c0eed36b7357be3e24765c5b08c1b60f7ca 100644
+--- a/trader/strategy_manager.py
++++ b/trader/strategy_manager.py
+@@ -1,118 +1,129 @@
+ from __future__ import annotations
+ 
+ import logging
+ from datetime import datetime
+ from typing import Any, Dict, Iterable, List, Optional
+ 
+ from .code_utils import normalize_code
+ from .config import (
+     DAILY_CAPITAL,
+     STRATEGY_CONFIG,
+     STRATEGY_WATCHLIST,
+     STRATEGY_WEIGHTS,
+ )
+ from .ledger import record_trade_ledger
+ from .state_store import mark_fill, mark_order
++from .strategy_registry import normalize_sid
+ from .time_utils import now_kst
+ from .kis_wrapper import KisAPI
+ from .strategies import (
+     BaseStrategy,
+     BreakoutStrategy,
+     MeanReversionStrategy,
+     MomentumStrategy,
+     PullbackStrategy,
+     VolatilityStrategy,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ STRATEGY_CLASS_MAP = {
+     "breakout": BreakoutStrategy,
+     "pullback": PullbackStrategy,
+     "momentum": MomentumStrategy,
+     "mean_reversion": MeanReversionStrategy,
+     "volatility": VolatilityStrategy,
+ }
+ 
+ 
+ class StrategyManager:
+     """Instantiate and orchestrate enabled strategies."""
+ 
+     def __init__(
+         self,
+         *,
+         kis: KisAPI,
+         strategy_configs: Dict[str, Dict[str, Any]] | None = None,
+         strategy_weights: Dict[int, float] | None = None,
+         watchlist: Iterable[str] | None = None,
+     ) -> None:
+         self.kis = kis
+         self.strategy_configs = strategy_configs or STRATEGY_CONFIG
+         self.strategy_weights = strategy_weights or STRATEGY_WEIGHTS
+         self.watchlist = [normalize_code(code) for code in (watchlist or STRATEGY_WATCHLIST) if normalize_code(code)]
+         self.strategies = self._init_strategies()
+ 
+-    def _init_strategies(self) -> Dict[int, BaseStrategy]:
+-        strategies: Dict[int, BaseStrategy] = {}
++    def _init_strategies(self) -> Dict[str, BaseStrategy]:
++        strategies: Dict[str, BaseStrategy] = {}
+         for name, cfg in self.strategy_configs.items():
+             cls = STRATEGY_CLASS_MAP.get(name)
+             if not cls:
+                 continue
+             try:
+                 strat: BaseStrategy = cls(cfg)
+-                sid = int(cfg.get("strategy_id"))
++                sid = normalize_sid(cfg.get("strategy_id"))
+             except Exception:
+                 continue
+             strategies[sid] = strat
+         return strategies
+ 
+     def _strategy_for_id(self, strategy_id: Any) -> Optional[BaseStrategy]:
+-        try:
+-            sid = int(strategy_id)
+-        except Exception:
+-            return None
++        sid = normalize_sid(strategy_id)
+         return self.strategies.get(sid)
+ 
+-    def _capital_by_strategy(self, total_cash: float) -> Dict[int, float]:
+-        allocations: Dict[int, float] = {}
++    def _capital_by_strategy(self, total_cash: float) -> Dict[str, float]:
++        allocations: Dict[str, float] = {}
+         for sid, weight in self.strategy_weights.items():
+-            allocations[int(sid)] = float(total_cash) * float(weight)
++            allocations[normalize_sid(sid)] = float(total_cash) * float(weight)
+         if not allocations and total_cash > 0:
+             per = float(total_cash) / max(len(self.strategies), 1)
+             for sid in self.strategies:
+                 allocations[sid] = per
+         return allocations
+ 
+-    def _candidate_symbols(self, positions: Dict[str, Any], extra: Iterable[str] | None) -> List[str]:
++    def _candidate_symbols(self, lots: List[Dict[str, Any]], extra: Iterable[str] | None) -> List[str]:
+         universe = set(self.watchlist)
+-        universe.update(positions.keys())
++        for lot in lots:
++            pdno = normalize_code(lot.get("pdno") or "")
++            if pdno:
++                universe.add(pdno)
+         if extra:
+             universe.update(normalize_code(code) for code in extra if normalize_code(code))
+         return [code for code in universe if code]
+ 
++    @staticmethod
++    def _extract_order_id(resp: Any) -> str | None:
++        try:
++            out = resp.get("output") if isinstance(resp, dict) else None
++            if isinstance(out, dict):
++                return out.get("ODNO") or out.get("ord_no") or out.get("odno")
++        except Exception:
++            return None
++        return None
++
+     def fetch_market_data(self, symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+         market_data: Dict[str, Dict[str, Any]] = {}
+         for code in symbols:
+             code_key = normalize_code(code)
+             if not code_key:
+                 continue
+             snap: Dict[str, Any] = {}
+             try:
+                 snap = self.kis.get_quote_snapshot(code_key)
+             except Exception as e:
+                 logger.warning("[STRAT] snapshot fail %s: %s", code_key, e)
+             price = float(snap.get("tp") or 0.0)
+             prev_close = None
+             reversal_price = price
+             try:
+                 prev_close = float(self.kis.get_prev_close(code_key) or 0.0)
+             except Exception:
+                 prev_close = None
+             try:
+                 candles = self.kis.get_daily_candles(code_key, count=30)
+             except Exception:
+                 candles = []
+             recent_high, recent_low = 0.0, 0.0
+             ma_fast, ma_slow = 0.0, 0.0
+             volatility = 0.0
+@@ -141,157 +152,202 @@ class StrategyManager:
+                 else:
+                     reversal_price = price
+             prev_close_val = float(prev_close or 0.0)
+             market_data[code_key] = {
+                 "price": price,
+                 "ask": snap.get("ap"),
+                 "bid": snap.get("bp"),
+                 "prev_close": prev_close_val,
+                 "recent_high": recent_high,
+                 "recent_low": recent_low,
+                 "reversal_price": reversal_price,
+                 "ma_fast": ma_fast,
+                 "ma_slow": ma_slow,
+                 "mean_price": ma_slow,
+                 "volatility": volatility,
+                 "vwap": float(snap.get("tp") or price),  # fallback: 실시간 VWAP 불가 시 현재가 사용
+             }
+         return market_data
+ 
+     def run_cycle(
+         self,
+         state: Dict[str, Any],
+         balance: Dict[str, Any],
+         candidates: Iterable[str] | None = None,
+     ) -> Dict[str, Any]:
+-        positions = state.get("positions", {})
+-        symbols = self._candidate_symbols(positions, candidates)
++        lots = [lot for lot in state.get("lots", []) if int(lot.get("remaining_qty") or lot.get("qty") or 0) > 0]
++        symbols = self._candidate_symbols(lots, candidates)
+         if not symbols:
+             logger.info("[STRAT] no symbols to evaluate")
+             return {"entries": 0, "exits": 0}
+         market_data = self.fetch_market_data(symbols)
+-        exits = self._evaluate_exits(state, market_data)
+-        entries = self._evaluate_entries(state, market_data, balance)
++        exits = self._evaluate_exits(state, lots, market_data)
++        entries = self._evaluate_entries(state, lots, market_data, balance)
+         return {"entries": entries, "exits": exits}
+ 
+     def _evaluate_entries(
+         self,
+         state: Dict[str, Any],
++        lots: List[Dict[str, Any]],
+         market_data: Dict[str, Dict[str, Any]],
+         balance: Dict[str, Any],
+     ) -> int:
+         total_cash = float(balance.get("cash") or 0.0) if isinstance(balance, dict) else 0.0
+         if total_cash <= 0:
+             total_cash = float(DAILY_CAPITAL)
+         allocations = self._capital_by_strategy(total_cash)
+-        positions = state.get("positions", {})
+         entries = 0
+         for sid, strategy in self.strategies.items():
+             alloc = allocations.get(sid, total_cash / max(len(self.strategies), 1))
+             cfg = self.strategy_configs.get(strategy.name, {})
+             entry_pct = cfg.get("entry_allocation_pct") or 0.2
+             if entry_pct > 1:
+                 entry_pct = entry_pct / 100.0
+             budget = alloc * float(entry_pct)
++            existing_codes = {
++                normalize_code(lot.get("pdno") or "")
++                for lot in lots
++                if normalize_sid(lot.get("strategy_id")) == sid and int(lot.get("remaining_qty") or lot.get("qty") or 0) > 0
++            }
+             for code, data in market_data.items():
+                 # skip if any strategy already holds the symbol
+-                if normalize_code(code) in positions:
++                if normalize_code(code) in existing_codes:
+                     continue
+                 if not strategy.should_enter(code, data):
+                     continue
+                 entry_price = strategy.compute_entry_price(code, data)
+                 qty = self._qty_for_budget(budget, entry_price)
+                 if qty <= 0:
+                     logger.debug(
+                         "[STRAT][ENTRY_SKIP] %s sid=%s budget=%.0f px=%.2f qty<=0",
+                         code,
+                         sid,
+                         budget,
+                         entry_price,
+                     )
+                     continue
+                 ts = now_kst().isoformat()
+-                mark_order(state, code, "BUY", sid, qty, entry_price, ts)
++                oid = mark_order(state, code, "BUY", sid, qty, entry_price, ts, reason="strategy_entry")
+                 try:
+                     resp = (
+-                        self.kis.buy_stock_limit_guarded(code, qty, int(entry_price))
++                        self.kis.buy_stock_limit_guarded(code, qty, int(entry_price), sid=sid)
+                         if entry_price > 0
+-                        else self.kis.buy_stock_market_guarded(code, qty)
++                        else self.kis.buy_stock_market_guarded(code, qty, sid=sid)
+                     )
+                 except Exception as e:
+                     logger.error("[STRAT][BUY_FAIL] %s sid=%s ex=%s", code, sid, e)
+                     continue
++                order_id = self._extract_order_id(resp)
++                if order_id:
++                    mark_order(
++                        state,
++                        code,
++                        "BUY",
++                        sid,
++                        qty,
++                        entry_price,
++                        ts,
++                        order_id=order_id,
++                        status="ack",
++                        reason="order_ack",
++                    )
+                 if self.kis.check_filled(resp):
+-                    mark_fill(state, code, "BUY", sid, qty, entry_price, ts, status="filled")
++                    mark_fill(
++                        state,
++                        code,
++                        "BUY",
++                        sid,
++                        qty,
++                        entry_price,
++                        ts,
++                        status="filled",
++                        order_id=order_id or oid,
++                        source="strategy_manager",
++                    )
+                     record_trade_ledger(
+                         timestamp=ts,
+                         code=code,
+                         strategy_id=sid,
+                         side="BUY",
+                         qty=qty,
+                         price=entry_price,
+                         meta={"engine": "strategy_manager", "resp": resp},
+                     )
+                     entries += 1
+                     logger.info(
+                         "[STRAT][ENTRY] code=%s sid=%s qty=%s price=%.2f budget=%.0f",
+                         code,
+                         sid,
+                         qty,
+                         entry_price,
+                         budget,
+                     )
+         return entries
+ 
+-    def _evaluate_exits(self, state: Dict[str, Any], market_data: Dict[str, Dict[str, Any]]) -> int:
+-        positions = state.get("positions", {})
++    def _evaluate_exits(
++        self, state: Dict[str, Any], lots: List[Dict[str, Any]], market_data: Dict[str, Dict[str, Any]]
++    ) -> int:
+         exits = 0
+-        for code, pos in list(positions.items()):
+-            code_key = normalize_code(code)
+-            strategy_id = pos.get("strategy_id")
+-            strategy = self._strategy_for_id(strategy_id)
++        for lot in list(lots):
++            remaining = int(lot.get("remaining_qty") or lot.get("qty") or 0)
++            if remaining <= 0:
++                continue
++            code_key = normalize_code(lot.get("pdno") or "")
++            sid = normalize_sid(lot.get("strategy_id"))
++            strategy = self._strategy_for_id(sid)
+             if not strategy:
+                 continue
+             data = market_data.get(code_key) or {}
+-            if not strategy.should_exit(pos, data):
+-                continue
+-            qty = int(pos.get("qty") or 0)
+-            if qty <= 0:
++            pos_state = {"qty": remaining, "avg_price": float(lot.get("entry_price") or 0.0)}
++            if not strategy.should_exit(pos_state, data):
+                 continue
+             ts = now_kst().isoformat()
+-            mark_order(state, code_key, "SELL", strategy_id, qty, data.get("price") or 0.0, ts)
++            oid = mark_order(state, code_key, "SELL", sid, remaining, data.get("price") or 0.0, ts, reason="strategy_exit")
+             try:
+-                resp = self.kis.sell_stock_market_guarded(code_key, qty)
++                resp = self.kis.sell_stock_market_guarded(code_key, remaining, sid=sid)
+             except Exception as e:
+-                logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, strategy_id, e)
++                logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, sid, e)
+                 continue
++            order_id = self._extract_order_id(resp)
++            if order_id:
++                mark_order(
++                    state,
++                    code_key,
++                    "SELL",
++                    sid,
++                    remaining,
++                    data.get("price") or 0.0,
++                    ts,
++                    order_id=order_id,
++                    status="ack",
++                    reason="order_ack",
++                )
+             if self.kis.check_filled(resp):
+                 price = float(data.get("price") or 0.0)
+-                mark_fill(state, code_key, "SELL", strategy_id, qty, price, ts, status="filled")
++                mark_fill(state, code_key, "SELL", sid, remaining, price, ts, status="filled", order_id=order_id or oid)
+                 record_trade_ledger(
+                     timestamp=ts,
+                     code=code_key,
+-                    strategy_id=strategy_id,
++                    strategy_id=sid,
+                     side="SELL",
+-                    qty=qty,
++                    qty=remaining,
+                     price=price,
+                     meta={"engine": "strategy_manager", "resp": resp},
+                 )
+-                positions.pop(code_key, None)
+                 exits += 1
+                 logger.info(
+                     "[STRAT][EXIT] code=%s sid=%s qty=%s price=%.2f reason=signal",
+                     code_key,
+-                    strategy_id,
+-                    qty,
++                    sid,
++                    remaining,
+                     price,
+                 )
+         return exits
+ 
+     @staticmethod
+     def _qty_for_budget(budget: float, price: float) -> int:
+         try:
+             if budget <= 0 or price <= 0:
+                 return 0
+             return int(budget // price)
+         except Exception:
+             return 0
+diff --git a/trader/strategy_recovery.py b/trader/strategy_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..533afdd82e35c167d9ed6f66e0ddf7bcdef0259f
+--- /dev/null
++++ b/trader/strategy_recovery.py
+@@ -0,0 +1,248 @@
++from __future__ import annotations
++
++import json
++import logging
++from datetime import datetime, timedelta
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Tuple
++
++from .fill_store import load_fills_index
++from .order_map_store import ORDERS_MAP_PATH, load_order_map_index
++from .paths import LOG_DIR, REPO_ROOT
++from .strategy_registry import normalize_sid
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_LOOKBACK_DAYS = 30
++
++
++def _parse_ts(value: Any, default: datetime) -> datetime:
++    if isinstance(value, (int, float)):
++        try:
++            return datetime.fromtimestamp(float(value))
++        except Exception:
++            return default
++    if isinstance(value, str):
++        try:
++            return datetime.fromisoformat(value.replace("Z", "+00:00"))
++        except Exception:
++            return default
++    return default
++
++
++def _load_json_lines(path: Path) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    if not path.exists():
++        return rows
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    rows.append(json.loads(line))
++                except json.JSONDecodeError:
++                    continue
++    except Exception:
++        logger.exception("[RECOVERY] failed reading %s", path)
++    return rows
++
++
++def _rebalance_candidates(rebalance_dir: Path, pdno: str, asof: datetime) -> Tuple[str | None, float, List[str]]:
++    files = sorted(rebalance_dir.glob("*.json"))
++    chosen = None
++    chosen_conf = 0.0
++    reason: List[str] = []
++    latest_ts = None
++    for fp in files:
++        try:
++            tag = fp.stem
++            ts = datetime.fromisoformat(tag) if len(tag) >= 8 else None
++        except Exception:
++            ts = None
++        if ts and ts > asof:
++            continue
++        try:
++            payload = json.loads(fp.read_text(encoding="utf-8"))
++        except Exception:
++            continue
++        strategy_hits: Dict[str, int] = {}
++        for key, val in payload.items():
++            if not isinstance(val, list):
++                continue
++            for row in val:
++                code = str(row.get("code") or row.get("pdno") or "").strip()
++                if code != pdno:
++                    continue
++                strategy_hits[key] = strategy_hits.get(key, 0) + 1
++        if not strategy_hits:
++            continue
++        if len(strategy_hits) == 1:
++            sid_raw = list(strategy_hits.keys())[0]
++            sid = normalize_sid(sid_raw if sid_raw.upper().startswith("S") else 1)
++            conf = 0.75
++        else:
++            sid = None
++            conf = 0.55
++        if latest_ts is None or (ts and ts > latest_ts):
++            latest_ts = ts
++            chosen = sid
++            chosen_conf = conf
++            reason = [f"rebalance:{fp.name}"]
++    return chosen, chosen_conf, reason
++
++
++def _scan_logs_for_sid(log_dir: Path, pdno: str, asof: datetime) -> Tuple[str | None, float, List[str]]:
++    candidates: Dict[str, int] = {}
++    reasons: List[str] = []
++    for fp in log_dir.glob("*.log"):
++        try:
++            with open(fp, "r", encoding="utf-8") as f:
++                for line in f:
++                    if pdno not in line:
++                        continue
++                    line_upper = line.upper()
++                    if "SID=" in line_upper:
++                        token = line_upper.split("SID=")[1].split()[0].strip(",;]")
++                        sid = normalize_sid(token)
++                        candidates[sid] = candidates.get(sid, 0) + 1
++                    elif "STRATEGY_ID" in line_upper:
++                        token = line_upper.split("STRATEGY_ID")[1].split("=")[1].split()[0].strip(",;]")
++                        sid = normalize_sid(token)
++                        candidates[sid] = candidates.get(sid, 0) + 1
++        except Exception:
++            continue
++    if not candidates:
++        return None, 0.0, reasons
++    if len(candidates) == 1:
++        sid = list(candidates.keys())[0]
++        return sid, 0.85, [f"log:{next(iter(log_dir.glob('*.log')), None)}"]
++    sorted_hits = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
++    sid, _ = sorted_hits[0]
++    reasons.append(f"log_ambiguous:{candidates}")
++    return sid, 0.7, reasons
++
++
++def recover_sid_for_holding(
++    pdno: str,
++    qty: int,
++    avg_price: float | None,
++    asof_ts: datetime | None = None,
++    evidence_dirs: Dict[str, Any] | None = None,
++) -> Tuple[str, float, List[str]]:
++    asof = asof_ts or datetime.now()
++    evidence_dirs = evidence_dirs or {}
++    reasons: List[str] = []
++    candidates: List[Tuple[str, float, List[str]]] = []
++
++    # Current state lots (for remainder allocation)
++    state_lots: List[Dict[str, Any]] = evidence_dirs.get("state_lots") or []
++    for lot in state_lots:
++        lot_pdno = str(lot.get("pdno") or "").strip()
++        if lot_pdno != pdno:
++            continue
++        sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
++        if sid in {"UNKNOWN", "MANUAL"}:
++            continue
++        rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
++        if rem > 0:
++            candidates.append((sid, 0.95, ["existing_open_lot"]))
++            break
++
++    # E1 orders_map recent buy
++    orders_path = evidence_dirs.get("orders_map") or ORDERS_MAP_PATH
++    om_index = load_order_map_index(orders_path) if isinstance(orders_path, Path) or orders_path else load_order_map_index()
++    lookback = timedelta(days=DEFAULT_LOOKBACK_DAYS)
++    now_dt = asof
++    for payload in om_index.values():
++        if str(payload.get("pdno") or "").strip() != pdno:
++            continue
++        if str(payload.get("side") or "").upper() != "BUY":
++            continue
++        ts = _parse_ts(payload.get("ts"), now_dt)
++        if now_dt - ts > lookback:
++            continue
++        sid = normalize_sid(payload.get("sid"))
++        recency = max(0.0, 1.0 - (now_dt - ts).total_seconds() / lookback.total_seconds())
++        conf = 0.90 + (0.09 * recency)
++        candidates.append((sid, conf, ["orders_map_recent_buy"]))
++
++    # E2 fills/ledger
++    fills_dir = evidence_dirs.get("fills_dir")
++    fills_rows = load_fills_index() if fills_dir is None else load_fills_index(Path(fills_dir))  # type: ignore[arg-type]
++    latest_fill = None
++    for row in fills_rows:
++        if str(row.get("pdno") or "").strip() != pdno:
++            continue
++        if str(row.get("side") or "").upper() != "BUY":
++            continue
++        ts = _parse_ts(row.get("ts"), now_dt)
++        if latest_fill is None or ts > latest_fill[0]:
++            latest_fill = (ts, row)
++    if latest_fill:
++        ts, row = latest_fill
++        if now_dt - ts <= timedelta(days=DEFAULT_LOOKBACK_DAYS):
++            sid = normalize_sid(row.get("sid"))
++            candidates.append((sid, 0.95, ["fills_recent_buy"]))
++    ledger_path = Path(evidence_dirs.get("ledger_path") or LOG_DIR / "ledger.jsonl")
++    ledger_rows = _load_json_lines(ledger_path)
++    for row in ledger_rows:
++        code = str(row.get("code") or row.get("pdno") or "").strip()
++        if code != pdno:
++            continue
++        sid = normalize_sid(row.get("strategy_id"))
++        side = str(row.get("side") or "").upper()
++        if sid not in {"UNKNOWN", "MANUAL"} and side in {"BUY", "SELL"}:
++            candidates.append((sid, 0.9, [f"ledger:{ledger_path.name}"]))
++            break
++
++    # E3 logs
++    log_dir = Path(evidence_dirs.get("log_dir") or LOG_DIR)
++    sid_from_logs, log_conf, log_reason = _scan_logs_for_sid(log_dir, pdno, asof)
++    if sid_from_logs:
++        candidates.append((sid_from_logs, log_conf, log_reason or ["logs"]))
++
++    # E4 rebalance json
++    rebalance_dir = Path(evidence_dirs.get("rebalance_dir") or REPO_ROOT / "rebalance_results")
++    reb_sid, reb_conf, reb_reason = _rebalance_candidates(rebalance_dir, pdno, asof)
++    if reb_sid:
++        candidates.append((reb_sid, reb_conf, reb_reason))
++
++    # E5 proportional allocation (weak)
++    if not candidates and state_lots:
++        allocations: Dict[str, int] = {}
++        for lot in state_lots:
++            if str(lot.get("pdno") or "").strip() != pdno:
++                continue
++            sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
++            rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
++            allocations[sid] = allocations.get(sid, 0) + rem
++        if allocations:
++            sid = max(allocations.items(), key=lambda x: x[1])[0]
++            candidates.append((sid, 0.7, ["allocation_heuristic"]))
++
++    if not candidates:
++        return "MANUAL", 0.4, ["no_evidence"]
++
++    # Aggregate per sid choose best confidence
++    merged: Dict[str, Tuple[float, List[str]]] = {}
++    for sid, conf, rs in candidates:
++        best_conf, best_reasons = merged.get(sid, (0.0, []))
++        if conf > best_conf:
++            merged[sid] = (conf, rs)
++        elif conf == best_conf:
++            merged[sid] = (conf, best_reasons + rs)
++
++    sorted_candidates = sorted(merged.items(), key=lambda x: x[1][0], reverse=True)
++    best_sid, (best_conf, best_reasons) = sorted_candidates[0]
++    if len(sorted_candidates) > 1:
++        second_conf = sorted_candidates[1][1][0]
++        if best_conf - second_conf < 0.15:
++            conflict_reasons = [f"conflict:{[(sid, conf) for sid, (conf, _) in sorted_candidates[:3]]}"]
++            return "MANUAL", 0.5, best_reasons + conflict_reasons
++
++    final_sid = best_sid if best_conf >= 0.80 else "MANUAL"
++    if final_sid == "MANUAL" and "confidence_low" not in best_reasons:
++        best_reasons.append("confidence_low")
++    return final_sid, best_conf, best_reasons
+diff --git a/trader/strategy_registry.py b/trader/strategy_registry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfefd6fa7083d817ebbee5ea7c2ea3bb6e600a56
+--- /dev/null
++++ b/trader/strategy_registry.py
+@@ -0,0 +1,22 @@
++from __future__ import annotations
++
++from typing import Any
++
++
++VALID_SIDS = {f"S{i}" for i in range(1, 6)}
++
++
++def normalize_sid(value: Any) -> str:
++    if value is None:
++        return "UNKNOWN"
++    if isinstance(value, str):
++        text = value.strip().upper()
++    else:
++        text = str(value).strip().upper()
++    if text in VALID_SIDS:
++        return text
++    if text.isdigit() and 1 <= int(text) <= 5:
++        return f"S{int(text)}"
++    if text == "MANUAL":
++        return "MANUAL"
++    return "UNKNOWN"
+diff --git a/trader/trader.py b/trader/trader.py
+index f74eda37559bedc3980a3a78744df05d927dfb55..730782eb4fad4c10f2081c90b9fac0f6fdd15cb0 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,63 +1,66 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ import time
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.kis_wrapper import KisAPI
+ from trader import state_store as runtime_state_store
++from trader.state_store import ensure_minimum_files
+ from trader.strategy_manager import StrategyManager
+ from trader.ledger import load_ledger_entries, strategy_map_from_ledger
+ from trader.time_utils import MARKET_CLOSE, is_trading_day, is_trading_window, now_kst
+ from trader.core_utils import get_rebalance_anchor_date
+ from trader.code_utils import normalize_code
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _collect_rebalance_candidates() -> set[str]:
+     candidates: set[str] = set()
+     try:
+         rebalance_date = str(get_rebalance_anchor_date())
+         payload = run_rebalance(rebalance_date, return_by_market=True)
+         selected_by_market = payload.get("selected_by_market") or {}
+         for items in selected_by_market.values():
+             for row in items or []:
+                 code = normalize_code(row.get("code") or row.get("pdno") or row.get("symbol") or "")
+                 if code:
+                     candidates.add(code)
+         logger.info("[TRADER] rebalance candidates=%d (date=%s)", len(candidates), rebalance_date)
+     except Exception:
+         logger.exception("[TRADER] rebalance candidate fetch failed")
+     return candidates
+ 
+ 
+ def main() -> None:
++    ensure_minimum_files()
++    logger.info("[BOOT] ensured state/orders_map/ledger placeholders")
+     now = now_kst()
+     if not is_trading_day(now):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
+         return
+     runtime_state = runtime_state_store.load_state()
+     kis: KisAPI | None = None
+     balance: dict[str, object] = {}
+     preferred_strategy: dict[str, object] = {}
+     try:
+         kis = KisAPI()
+         ledger_entries = load_ledger_entries()
+         preferred_strategy = strategy_map_from_ledger(ledger_entries) or {}
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state, balance, preferred_strategy=preferred_strategy
+         )
+         runtime_state_store.save_state(runtime_state)
+         logger.info("[TRADER] runtime state reconciled (positions=%d)", len(runtime_state.get("positions", {})))
+     except Exception:
+         logger.exception("[TRADER] runtime state reconcile failed")
+ 
+     try:
+         kis = kis or KisAPI()
+         manager = StrategyManager(kis=kis)
+         candidates = _collect_rebalance_candidates()

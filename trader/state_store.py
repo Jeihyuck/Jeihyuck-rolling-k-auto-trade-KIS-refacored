@@ -5,58 +5,142 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
-from .config import KST
 from .code_utils import normalize_code
-from .state_io import atomic_write_json
+from .config import KST
+from .fill_store import append_fill as append_fill_jsonl
+from .io_atomic import atomic_write_json
+from .order_map_store import ORDERS_MAP_PATH, append_order_map, load_order_map_index
+from .paths import BOT_STATE_MIRROR_DIR, LOG_DIR, STATE_DIR, ensure_dirs
+from .strategy_recovery import recover_sid_for_holding
+from .strategy_registry import normalize_sid
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
-RUNTIME_STATE_DIR = Path(".runtime")
-RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
-BREAKOUT_WATCH_PATH = Path(__file__).parent / "state" / "breakout_watch.json"
+SCHEMA_VERSION = 2
+STATE_PATH = STATE_DIR / "state.json"
 
 
-def _default_runtime_state() -> Dict[str, Any]:
+def _default_state() -> Dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "updated_at": None,
-        "positions": {},
+        "updated_at": datetime.now(KST).isoformat(),
+        "lots": [],
         "orders": {},
+        "positions": {},
+        "meta": {"created_by": "state_store"},
     }
 
 
-def load_state() -> Dict[str, Any]:
-    if not RUNTIME_STATE_PATH.exists():
-        return _default_runtime_state()
+def _touch(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+
+
+def ensure_minimum_files() -> None:
+    ensure_dirs()
+    if not STATE_PATH.exists():
+        save_state(_default_state())
+    _touch(ORDERS_MAP_PATH)
+    _touch(LOG_DIR / "ledger.jsonl")
+
+
+def _load_json(path: Path) -> Dict[str, Any] | None:
+    if not path.exists():
+        return None
     try:
-        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
-            logger.warning("[RUNTIME_STATE] invalid state format: %s", type(state))
-            return _default_runtime_state()
-        state.setdefault("schema_version", SCHEMA_VERSION)
-        state.setdefault("positions", {})
-        state.setdefault("orders", {})
-        state.setdefault("updated_at", None)
-        return state
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
     except Exception:
-        logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
-        return _default_runtime_state()
+        logger.exception("[STATE] failed to load %s", path)
+        return None
+
+
+def _normalize_lot_from_legacy(lot: Dict[str, Any], asof: datetime, evidence: Dict[str, Any]) -> Dict[str, Any]:
+    pdno = normalize_code(lot.get("pdno") or lot.get("code") or "")
+    qty = int(lot.get("remaining_qty") or lot.get("qty") or 0)
+    avg_price = float(lot.get("avg_price") or lot.get("entry_price") or 0.0)
+    sid = normalize_sid(lot.get("strategy_id") or lot.get("sid"))
+    if sid in {"UNKNOWN", ""}:
+        sid, conf, reasons = recover_sid_for_holding(pdno, qty, avg_price, asof, evidence)
+        logger.info("[STATE_MIGRATE] recovered sid=%s conf=%.2f reasons=%s pdno=%s qty=%s", sid, conf, reasons, pdno, qty)
+    entry_ts = lot.get("entry_ts") or asof.isoformat()
+    meta = {"migrated": True, **(lot.get("meta") or {})}
+    if sid == "MANUAL":
+        meta["sell_blocked"] = True
+    return {
+        "lot_id": lot.get("lot_id") or f"{pdno}-{sid}-{entry_ts}",
+        "pdno": pdno,
+        "strategy_id": sid,
+        "engine": lot.get("engine") or "migrated",
+        "entry_ts": entry_ts,
+        "entry_price": avg_price,
+        "qty": qty,
+        "remaining_qty": qty,
+        "meta": meta,
+    }
+
+
+def _migrate_legacy_state() -> Dict[str, Any]:
+    candidates = [
+        Path("bot_state/state.json"),
+        BOT_STATE_MIRROR_DIR / "state.json",
+        BOT_STATE_MIRROR_DIR / "state" / "state.json",
+    ]
+    asof = datetime.now(KST)
+    evidence = {
+        "orders_map": ORDERS_MAP_PATH,
+        "ledger_path": LOG_DIR / "ledger.jsonl",
+        "fills_dir": STATE_DIR.parent / "fills",
+        "log_dir": LOG_DIR,
+        "rebalance_dir": Path("rebalance_results"),
+    }
+    for path in candidates:
+        payload = _load_json(path)
+        if not payload:
+            continue
+        lots_raw = payload.get("lots") or []
+        migrated_lots = [_normalize_lot_from_legacy(lot, asof, evidence) for lot in lots_raw if isinstance(lot, dict)]
+        state = _default_state()
+        state["lots"] = migrated_lots
+        state["meta"]["migrated_from"] = str(path)
+        save_state(state)
+        logger.info("[STATE_MIGRATE] migrated legacy lots=%d from %s", len(migrated_lots), path)
+        return state
+    return _default_state()
+
+
+def load_state() -> Dict[str, Any]:
+    ensure_dirs()
+    payload = _load_json(STATE_PATH)
+    if payload is None:
+        payload = _migrate_legacy_state()
+    payload.setdefault("schema_version", SCHEMA_VERSION)
+    payload.setdefault("lots", [])
+    payload.setdefault("orders", {})
+    payload.setdefault("positions", {})
+    payload.setdefault("meta", {})
+    payload["updated_at"] = payload.get("updated_at") or datetime.now(KST).isoformat()
+
+    # Normalize any lingering UNKNOWN to MANUAL
+    for lot in payload.get("lots", []):
+        sid = normalize_sid(lot.get("strategy_id"))
+        if sid == "UNKNOWN":
+            lot["strategy_id"] = "MANUAL"
+            lot.setdefault("meta", {})["sell_blocked"] = True
+    return payload
 
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
         payload = dict(state)
-        payload.setdefault("schema_version", SCHEMA_VERSION)
-        payload.setdefault("positions", {})
-        payload.setdefault("orders", {})
+        payload["schema_version"] = SCHEMA_VERSION
         payload["updated_at"] = datetime.now(KST).isoformat()
-        atomic_write_json(RUNTIME_STATE_PATH, payload)
+        atomic_write_json(STATE_PATH, payload)
     except Exception:
-        logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
+        logger.exception("[STATE] failed to save %s", STATE_PATH)
 
 
 def get_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any] | None:
@@ -75,7 +159,7 @@ def upsert_position(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) 
 
 
 def _order_bucket(state: Dict[str, Any], symbol: str, side: str) -> Dict[str, Any]:
-    orders = state.setdefault("orders", {})
+    orders = state.setdefault("order_windows", {})
     symbol_key = normalize_code(symbol)
     symbol_bucket = orders.setdefault(symbol_key, {})
     return symbol_bucket.setdefault(side.upper(), {})
@@ -116,23 +200,85 @@ def mark_order(
     ts: str,
     order_id: str | None = None,
     status: str = "submitted",
-) -> None:
+    reason: str = "strategy",
+    run_id: str | None = None,
+) -> str:
+    pdno = normalize_code(symbol)
+    sid = normalize_sid(strategy_id)
+    record = {
+        "pdno": pdno,
+        "sid": sid,
+        "side": side.upper(),
+        "qty": int(qty),
+        "price": float(price),
+        "ts": ts,
+        "status": status,
+        "reason": reason,
+    }
+    entry = append_order_map(order_id, pdno, sid, side, qty, price, reason, ts, run_id)
+    oid = entry["order_id"]
+    state.setdefault("orders", {})[oid] = record
     bucket = _order_bucket(state, symbol, side)
     bucket["last_ts"] = ts
-    bucket["last_order_id"] = order_id
+    bucket["last_order_id"] = oid
     bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
-    upsert_position(
-        state,
-        symbol,
-        {
-            "strategy_id": strategy_id,
-            "last_action": side.upper(),
-            "last_action_ts": ts,
-            "last_order_status": status,
-            "last_order_qty": int(qty),
-            "last_order_price": float(price),
-        },
-    )
+    save_state(state)
+    logger.info("[ORDER_SENT] odno=%s pdno=%s sid=%s qty=%s price=%s reason=%s", oid, pdno, sid, qty, price, reason)
+    return oid
+
+
+def _apply_fill_to_lots(
+    lots: List[Dict[str, Any]],
+    *,
+    pdno: str,
+    sid: str,
+    side: str,
+    qty: int,
+    price: float,
+    ts: str,
+) -> Tuple[int, int]:
+    pdno_key = normalize_code(pdno)
+    remaining_before = sum(int(lot.get("remaining_qty") or 0) for lot in lots if normalize_code(lot.get("pdno")) == pdno_key)
+    if side.upper() == "BUY":
+        lot_id = f"{pdno_key}-{sid}-{ts}"
+        meta: Dict[str, Any] = {}
+        if sid == "MANUAL":
+            meta["sell_blocked"] = True
+        lots.append(
+            {
+                "lot_id": lot_id,
+                "pdno": pdno_key,
+                "strategy_id": sid,
+                "engine": "fill",
+                "entry_ts": ts,
+                "entry_price": float(price),
+                "qty": int(qty),
+                "remaining_qty": int(qty),
+                "meta": meta,
+            }
+        )
+    else:
+        allow_manual = os.getenv("FORCE_SELL_MANUAL") == "1"
+        remaining_to_sell = int(qty)
+        for lot in lots:
+            if normalize_code(lot.get("pdno")) != pdno_key:
+                continue
+            lot_sid = normalize_sid(lot.get("strategy_id"))
+            if lot_sid != sid and not (lot_sid == "MANUAL" and allow_manual):
+                continue
+            if lot_sid == "MANUAL" and lot.get("meta", {}).get("sell_blocked") and not allow_manual:
+                continue
+            lot_remaining = int(lot.get("remaining_qty") or 0)
+            if lot_remaining <= 0:
+                continue
+            delta = min(lot_remaining, remaining_to_sell)
+            lot["remaining_qty"] = lot_remaining - delta
+            lot["last_sell_ts"] = ts
+            remaining_to_sell -= delta
+            if remaining_to_sell <= 0:
+                break
+    remaining_after = sum(int(lot.get("remaining_qty") or 0) for lot in lots if normalize_code(lot.get("pdno")) == pdno_key)
+    return remaining_before, remaining_after
 
 
 def mark_fill(
@@ -145,119 +291,68 @@ def mark_fill(
     ts: str,
     order_id: str | None = None,
     status: str = "filled",
+    source: str = "mark_fill",
+    run_id: str | None = None,
 ) -> None:
-    pos = get_position(state, symbol) or {}
-    cur_qty = int(pos.get("qty") or 0)
-    cur_avg = float(pos.get("avg_price") or 0.0)
-    if side.upper() == "BUY":
-        total_qty = cur_qty + int(qty)
-        avg_price = (
-            (cur_avg * cur_qty + float(price) * int(qty)) / total_qty
-            if total_qty > 0
-            else 0.0
+    pdno = normalize_code(symbol)
+    sid = normalize_sid(strategy_id)
+    lots = state.setdefault("lots", [])
+    if sid == "UNKNOWN" and order_id:
+        cached = state.get("orders", {}).get(order_id, {})
+        sid = normalize_sid(cached.get("sid") or cached.get("strategy_id"))
+        if sid == "UNKNOWN":
+            om = load_order_map_index()
+            if order_id in om:
+                sid = normalize_sid(om[order_id].get("sid"))
+    if sid == "UNKNOWN":
+        try:
+            asof = datetime.fromisoformat(ts)
+        except Exception:
+            asof = datetime.now(KST)
+        recovered_sid, conf, reasons = recover_sid_for_holding(
+            pdno,
+            qty,
+            price,
+            asof,
+            {"state_lots": lots},
         )
-        pos.update({"qty": total_qty, "avg_price": avg_price, "last_buy_ts": ts})
-    else:
-        pos.update({"qty": max(0, cur_qty - int(qty)), "last_sell_ts": ts})
-    pos["strategy_id"] = strategy_id
-    pos["last_order_id"] = order_id
-    pos["last_action"] = side.upper()
-    pos["last_action_ts"] = ts
-    pos["last_order_status"] = status
-    upsert_position(state, symbol, pos)
-
-
-def reconcile_with_kis_balance(
-    state: Dict[str, Any],
-    balance: Dict[str, Any],
-    *,
-    preferred_strategy: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    preferred_strategy = preferred_strategy or {}
-    positions = state.setdefault("positions", {})
-    balance_positions = balance.get("positions") if isinstance(balance, dict) else None
-    if not isinstance(balance_positions, list):
-        return state
-    seen = set()
-    for row in balance_positions:
-        symbol = normalize_code(row.get("code") or row.get("pdno") or "")
-        if not symbol:
-            continue
-        qty = int(row.get("qty") or 0)
-        if qty <= 0:
-            continue
-        seen.add(symbol)
-        pos = positions.setdefault(symbol, {})
-        strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "MANUAL"
-        pos.update(
-            {
-                "strategy_id": strategy_id,
-                "qty": qty,
-                "avg_price": float(row.get("avg_price") or 0.0),
-                "last_action": "RECONCILE",
-            }
-        )
-        positions[symbol] = pos
-    for symbol, pos in list(positions.items()):
-        if symbol not in seen:
-            positions.pop(symbol, None)
-    return state
-
-
-def _default_lot_state() -> Dict[str, Any]:
-    return {"version": SCHEMA_VERSION, "lots": [], "updated_at": None}
-
-
-def load_lot_state(path_json: str) -> Dict[str, Any]:
-    path = Path(path_json)
-    if not path.exists():
-        return _default_lot_state()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
-            logger.warning("[STATE_STORE] invalid state format: %s", type(state))
-            return _default_lot_state()
-        state.setdefault("version", SCHEMA_VERSION)
-        state.setdefault("lots", [])
-        state.setdefault("updated_at", None)
-        return state
-    except Exception:
-        logger.exception("[STATE_STORE] failed to load %s", path_json)
-        return _default_lot_state()
-
-
-def save_lot_state(path_json: str, state: Dict[str, Any]) -> None:
-    path = Path(path_json)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = dict(state)
-        payload.setdefault("version", SCHEMA_VERSION)
-        payload.setdefault("lots", [])
-        payload["updated_at"] = datetime.now(KST).isoformat()
-        tmp_path = path.with_name(f"{path.name}.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
-    except Exception:
-        logger.exception("[STATE_STORE] failed to save %s", path_json)
-
-
-def load_breakout_watch() -> Dict[str, Any]:
-    if not BREAKOUT_WATCH_PATH.exists():
-        return {}
-    try:
-        with open(BREAKOUT_WATCH_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        logger.exception("[BREAKOUT_WATCH] failed to load %s", BREAKOUT_WATCH_PATH)
-        return {}
-
-
-def save_breakout_watch(state: Dict[str, Any]) -> None:
-    try:
-        BREAKOUT_WATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(BREAKOUT_WATCH_PATH, state or {})
-    except Exception:
-        logger.exception("[BREAKOUT_WATCH] failed to save %s", BREAKOUT_WATCH_PATH)
+        if recovered_sid != "MANUAL" and conf >= 0.80:
+            sid = recovered_sid
+        else:
+            sid = "MANUAL"
+        logger.info("[FILL_RECOVERY] pdno=%s sid=%s conf=%.2f reasons=%s", pdno, sid, conf, reasons)
+    before, after = _apply_fill_to_lots(
+        lots,
+        pdno=pdno,
+        sid=sid,
+        side=side,
+        qty=qty,
+        price=price,
+        ts=ts,
+    )
+    append_fill_jsonl(
+        ts=ts,
+        order_id=order_id,
+        pdno=pdno,
+        sid=sid,
+        side=side,
+        qty=qty,
+        price=price,
+        source=source,
+        note=status,
+        run_id=run_id,
+    )
+    orders = state.setdefault("orders", {})
+    if order_id and order_id in orders:
+        orders[order_id]["status"] = status
+    save_state(state)
+    logger.info(
+        "[FILL_APPLIED] odno=%s pdno=%s sid=%s side=%s qty=%s remaining_before=%s remaining_after=%s",
+        order_id,
+        pdno,
+        sid,
+        side,
+        qty,
+        before,
+        after,
+    )

@@ -123,27 +123,26 @@ jobs:
           mkdir -p trader/state trader/fills trader/logs rebalance_results bot_state
 
       # ✅ bot-state에서 상태를 "파일만" 안전하게 복원 (로컬 bot-state 브랜치에 fetch/checkout 금지)
-      - name: Restore bot_state from origin/bot-state
+      - name: Restore trader state from bot-state worktree
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
-          git fetch origin bot-state || true
-          git checkout origin/bot-state -- bot_state || true
-
-          mkdir -p trader/state
-          if [ -d bot_state/trader_state ]; then
-            cp -a bot_state/trader_state/. trader/state/ || true
+          git fetch origin bot-state --prune || true
+          git worktree prune || true
+          WT_DIR="$(mktemp -d)"
+          cleanup() {
+            git worktree remove "$WT_DIR" --force 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          if git show-ref --verify --quiet refs/remotes/origin/bot-state; then
+            git worktree add -B bot-state "$WT_DIR" origin/bot-state
+          else
+            git worktree add -B bot-state "$WT_DIR"
           fi
-
-      - name: Restore state cache (fallback only)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-          restore-keys: |
-            trader-state-${{ github.ref_name }}-
+          if [ -d "$WT_DIR/bot_state/trader_state/trader" ]; then
+            mkdir -p trader
+            cp -a "$WT_DIR/bot_state/trader_state/trader/." trader/ || true
+          fi
 
       - name: Set git identity
         run: |
@@ -158,6 +157,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Recovery self test
+        run: |
+          python -m trader.recovery_self_test
 
       - name: Ledger smoke test
         run: |
@@ -223,6 +226,8 @@ jobs:
           echo "== bot_state =="; ls -al bot_state || true
           echo "== find ledger/state ==";
           find . -maxdepth 6 -type f \( -name "ledger.jsonl" -o -name "state.json" -o -name "CEO_Report_*.md" \) -print || true
+          echo "== find trader files =="
+          find trader -maxdepth 4 -type f -print || true
 
       # ✅ FIX 2) 업로드 경로가 흔들려도 항상 모이도록 번들 폴더에 수집
       - name: Collect artifact bundle (force-create trader/)
@@ -265,18 +270,12 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
-
-          TMP_DIR="$(mktemp -d)"
-          mkdir -p "$TMP_DIR/state" "$TMP_DIR/fills"
-          if [ -d trader/state ]; then cp -a trader/state/. "$TMP_DIR/state/" || true; fi
-          if [ -d trader/fills ]; then cp -a trader/fills/. "$TMP_DIR/fills/" || true; fi
-
-          git fetch origin bot-state || true
+          git fetch origin bot-state --prune || true
+          git worktree prune || true
 
           WT_DIR="$(mktemp -d)"
           cleanup() {
             git worktree remove "$WT_DIR" --force 2>/dev/null || true
-            rm -rf "$WT_DIR" "$TMP_DIR" 2>/dev/null || true
           }
           trap cleanup EXIT
 
@@ -287,18 +286,18 @@ jobs:
           fi
 
           mkdir -p "$WT_DIR/bot_state/trader_state"
-          cp -a "$TMP_DIR/state/." "$WT_DIR/bot_state/trader_state/" || true
-          cp -a "$TMP_DIR/fills/." "$WT_DIR/bot_state/trader_state/" || true
+          rm -rf "$WT_DIR/bot_state/trader_state/trader"
+          cp -a trader "$WT_DIR/bot_state/trader_state/" || true
 
           pushd "$WT_DIR" >/dev/null
           git config user.name "trade-bot"
           git config user.email "trade-bot@users.noreply.github.com"
 
-          git add -f bot_state/trader_state || true
+          git add -f bot_state/trader_state/trader || true
           if git diff --cached --quiet; then
             echo "No bot_state changes to commit."
           else
-            git commit -m "Update trader state"
+            git commit -m "Update trader state [skip ci]"
             git push origin bot-state
           fi
           popd >/dev/null
@@ -336,5 +335,3 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
-
-

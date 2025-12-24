@@ -1,34 +1,22 @@
 from datetime import datetime
-import csv, os
+from typing import Any
 
-def append_fill(side, code, name, qty, price, odno, note="", reason=""):
+from .fill_store import append_fill as append_fill_jsonl
+from .strategy_registry import normalize_sid
+
+
+def append_fill(side, code, name, qty, price, odno, note: str = "", reason: str = "", sid: Any | None = None):
     """
-    체결 기록을 CSV로 저장
-    side: "BUY" or "SELL"
-    code: 종목 코드
-    name: 종목 이름
-    qty: 체결 수량
-    price: 체결 단가
-    odno: 주문번호
-    note: 추가 메모
+    체결 기록을 JSONL로 저장 (backward compatibility wrapper).
     """
-    os.makedirs("fills", exist_ok=True)
-    path = f"fills/fills_{datetime.now().strftime('%Y%m%d')}.csv"
-    header = ["ts", "side", "code", "name", "qty", "price", "ODNO", "note", "reason"]
-    row = [
-        datetime.now().isoformat(),
-        side,
-        code,
-        name,
-        int(qty),
-        float(price),
-        str(odno),
-        note,
-        reason or "",
-    ]
-    new = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(header)
-        w.writerow(row)
+    append_fill_jsonl(
+        ts=datetime.now().isoformat(),
+        order_id=odno,
+        pdno=str(code),
+        sid=normalize_sid(sid),
+        side=str(side).upper(),
+        qty=int(qty),
+        price=float(price),
+        source=reason or "append_fill",
+        note=note,
+    )

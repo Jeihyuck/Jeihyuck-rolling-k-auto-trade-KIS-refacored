@@ -190,6 +190,7 @@ class OrderRequest(BaseModel):
     code: str
     qty: int
     price: Optional[float] = None  # None이면 시장가
+    sid: Optional[str] = "MANUAL"
 
 
 kis = KisAPI()
@@ -211,17 +212,17 @@ def buy_order(req: OrderRequest):
         if req.price is not None and float(req.price) > 0:
             # 지정가 + 예산 가드
             if hasattr(kis, "buy_stock_limit_guarded"):
-                result = kis.buy_stock_limit_guarded(code, qty, int(float(req.price)))
+                result = kis.buy_stock_limit_guarded(code, qty, int(float(req.price)), sid=req.sid)
             else:
-                result = kis.buy_stock_limit(code, qty, int(float(req.price)))  # type: ignore
+                result = kis.buy_stock_limit(code, qty, int(float(req.price)), sid=req.sid)  # type: ignore
         else:
             # 시장가 + 예산 가드
             if hasattr(kis, "buy_stock_market_guarded"):
-                result = kis.buy_stock_market_guarded(code, qty)
+                result = kis.buy_stock_market_guarded(code, qty, sid=req.sid)
             elif hasattr(kis, "buy_stock_market"):
-                result = kis.buy_stock_market(code, qty)  # type: ignore
+                result = kis.buy_stock_market(code, qty, sid=req.sid)  # type: ignore
             else:
-                result = kis.buy_stock(code, qty, None)  # type: ignore
+                result = kis.buy_stock(code, qty, None, sid=req.sid)  # type: ignore
 
         return {"result": result}
     except HTTPException:
@@ -245,12 +246,12 @@ def sell_order(req: OrderRequest):
             raise ValueError("qty must be > 0")
 
         if req.price is not None and float(req.price) > 0:
-            result = kis.sell_stock_limit(code, qty, int(float(req.price)))  # type: ignore
+            result = kis.sell_stock_limit(code, qty, int(float(req.price)), sid=req.sid)  # type: ignore
         else:
             if hasattr(kis, "sell_stock_market"):
-                result = kis.sell_stock_market(code, qty)  # type: ignore
+                result = kis.sell_stock_market(code, qty, sid=req.sid)  # type: ignore
             else:
-                result = kis.sell_stock(code, qty, None)  # type: ignore
+                result = kis.sell_stock(code, qty, None, sid=req.sid)  # type: ignore
 
         return {"result": result}
     except HTTPException:

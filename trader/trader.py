@@ -8,6 +8,7 @@ import time
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.kis_wrapper import KisAPI
 from trader import state_store as runtime_state_store
+from trader.state_store import ensure_minimum_files
 from trader.strategy_manager import StrategyManager
 from trader.ledger import load_ledger_entries, strategy_map_from_ledger
 from trader.time_utils import MARKET_CLOSE, is_trading_day, is_trading_window, now_kst
@@ -36,6 +37,8 @@ def _collect_rebalance_candidates() -> set[str]:
 
 
 def main() -> None:
+    ensure_minimum_files()
+    logger.info("[BOOT] ensured state/orders_map/ledger placeholders")
     now = now_kst()
     if not is_trading_day(now):
         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())

@@ -1270,7 +1270,7 @@ class KisAPI:
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도
     # -------------------------------
-    def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
+    def _order_cash(self, body: dict, *, is_sell: bool, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
 
         # TR 후보 순차 시도
@@ -1369,6 +1369,7 @@ class KisAPI:
                                 odno=odno,
                                 note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
                                 reason="order_cash",
+                                sid=sid,
                             )
                         except Exception as e:
                             logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
@@ -1400,7 +1401,7 @@ class KisAPI:
     # -------------------------------
     # 매수/매도 (기본)
     # -------------------------------
-    def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+    def buy_stock_market(self, pdno: str, qty: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
         pdno = normalize_code(pdno)
         body = {
             "CANO": self.CANO,
@@ -1410,9 +1411,9 @@ class KisAPI:
             "ORD_DVSN": "01",  # 시장가
             "ORD_UNPR": "0",
         }
-        return self._order_cash(body, is_sell=False)
+        return self._order_cash(body, is_sell=False, sid=sid, run_id=run_id)
 
-    def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+    def sell_stock_market(self, pdno: str, qty: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
         pdno = normalize_code(pdno)
         # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
@@ -1456,7 +1457,7 @@ class KisAPI:
             "ORD_UNPR": "0",
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        resp = self._order_cash(body, is_sell=True)
+        resp = self._order_cash(body, is_sell=True, sid=sid, run_id=run_id)
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             with self._recent_sells_lock:
                 self._recent_sells[pdno] = time.time()
@@ -1466,7 +1467,7 @@ class KisAPI:
                     del self._recent_sells[k]
         return resp
 
-    def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+    def buy_stock_limit(self, pdno: str, qty: int, price: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
         pdno = normalize_code(pdno)
         now = now_kst()
         block_reason = _order_block_reason(now)
@@ -1511,6 +1512,7 @@ class KisAPI:
                     price=price_for_fill,
                     odno=odno,
                     note=f"limit,tr={tr_id}",
+                    sid=sid,
                 )
             except Exception as e:
                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
@@ -1521,7 +1523,7 @@ class KisAPI:
             _mark_order_blocked(blocked, now)
         return None
 
-    def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+    def sell_stock_limit(self, pdno: str, qty: int, price: int, *, sid: Any | None = None, run_id: str | None = None) -> Optional[dict]:
         pdno = normalize_code(pdno)
         now = now_kst()
         block_reason = _order_block_reason(now)
@@ -1603,6 +1605,7 @@ class KisAPI:
                     odno=odno,
                     note=f"limit,tr={tr_id}",
                     reason="sell_limit",
+                    sid=sid,
                 )
             except Exception as e:
                 logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
@@ -1618,7 +1621,7 @@ class KisAPI:
     # -------------------------------
     # 매수/매도 (신규 가드 사용 버전)
     # -------------------------------
-    def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, **kwargs):
+    def buy_stock_limit_guarded(self, code: str, qty: int, limit_price: int, *, sid: Any | None = None, run_id: str | None = None, **kwargs):
         """
         지정가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
@@ -1630,7 +1633,7 @@ class KisAPI:
                 f"[BUY_GUARD] practice env → guard 생략, 직접 지정가 주문 "
                 f"(code={code}, qty={qty}, limit={limit_price})"
             )
-            return self.buy_stock_limit(code, qty, limit_price)
+            return self.buy_stock_limit(code, qty, limit_price, sid=sid, run_id=run_id)
 
         try:
             limit_price = int(limit_price)
@@ -1656,9 +1659,9 @@ class KisAPI:
             logger.info(f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px={ref_px})")
 
         # 기존 지정가 매수 호출
-        return self.buy_stock_limit(code, adj_qty, limit_price)
+        return self.buy_stock_limit(code, adj_qty, limit_price, sid=sid, run_id=run_id)
 
-    def buy_stock_market_guarded(self, code: str, qty: int, **kwargs):
+    def buy_stock_market_guarded(self, code: str, qty: int, *, sid: Any | None = None, run_id: str | None = None, **kwargs):
         """
         시장가 매수 시 예수금 부족/과매수 자동 축소 또는 스킵.
         ✅ practice 환경에서는 KIS에게 직접 판단을 맡기고, 내부 가드는 생략.
@@ -1670,7 +1673,7 @@ class KisAPI:
                 f"[BUY_GUARD] practice env → guard 생략, 직접 시장가 주문 "
                 f"(code={code}, qty={qty})"
             )
-            return self.buy_stock_market(code, qty)
+            return self.buy_stock_market(code, qty, sid=sid, run_id=run_id)
 
         try:
             cur = self.get_last_price(code)
@@ -1694,22 +1697,22 @@ class KisAPI:
                 f"[BUY_GUARD] {code} 요청 {qty} → 가능한 {adj_qty}로 축소 (px≈{ref_px})"
             )
 
-        return self.buy_stock_market(code, adj_qty)
+        return self.buy_stock_market(code, adj_qty, sid=sid, run_id=run_id)
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
-    def buy_stock(self, code: str, qty: int, price: Optional[int] = None):
+    def buy_stock(self, code: str, qty: int, price: Optional[int] = None, *, sid: Any | None = None, run_id: str | None = None):
         """기존 코드 호환용."""
         code = normalize_code(code)
         if price is None:
-            return self.buy_stock_market(code, qty)
-        return self.buy_stock_limit(code, qty, price)
+            return self.buy_stock_market(code, qty, sid=sid, run_id=run_id)
+        return self.buy_stock_limit(code, qty, price, sid=sid, run_id=run_id)
 
-    def sell_stock(self, code: str, qty: int, price: Optional[int] = None):
+    def sell_stock(self, code: str, qty: int, price: Optional[int] = None, *, sid: Any | None = None, run_id: str | None = None):
         """기존 코드 호환용."""
         code = normalize_code(code)
         if price is None:
-            return self.sell_stock_market(code, qty)
-        return self.sell_stock_limit(code, qty, price)
+            return self.sell_stock_market(code, qty, sid=sid, run_id=run_id)
+        return self.sell_stock_limit(code, qty, price, sid=sid, run_id=run_id)
 
     # ===== [NEW] 주문 후 확인/보조: 체결 후 잔고 동기화 =====
     def refresh_after_order(self, wait_sec: float = 3.0, max_tries: int = 5) -> dict:

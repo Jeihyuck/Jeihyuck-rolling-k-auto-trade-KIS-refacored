@@ -8,3 +8,5 @@ watchlists/
 *.json
 .env
 bot_state/state.json
+trader/state/
+trader/fills/
