@@ -16,6 +16,11 @@ for f in "$STATE_SRC/state.json" "$STATE_SRC/orders_map.jsonl"; do
   fi
 done
 
+if ! git remote get-url origin >/dev/null 2>&1; then
+  echo "[STATE_PUSH] origin remote missing. skip push."
+  exit 0
+fi
+
 WORKTREE_DIR="$(mktemp -d)"
 cleanup() {
   git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
@@ -30,19 +35,20 @@ else
   git worktree add -B bot-state "$WORKTREE_DIR"
 fi
 
-TARGET="$WORKTREE_DIR/bot_state/trader_state"
-export TARGET
-mkdir -p "$TARGET/state" "$TARGET/logs" "$TARGET/fills" "$TARGET/rebalance_results"
+TARGET_BASE="$WORKTREE_DIR/bot_state/trader_state"
+TARGET="$TARGET_BASE/trader"
+export TARGET TARGET_BASE
+mkdir -p "$TARGET/state" "$TARGET/logs" "$TARGET/fills" "$TARGET_BASE/rebalance_results"
 
 rsync -av --delete --exclude '__pycache__' --exclude '*.pyc' "$STATE_SRC/" "$TARGET/state/"
 rsync -av --delete --exclude '__pycache__' --exclude '*.pyc' "$LOG_SRC/" "$TARGET/logs/" || true
 rsync -av --delete --exclude '__pycache__' --exclude '*.pyc' "$FILLS_SRC/" "$TARGET/fills/" || true
-rsync -av --delete --exclude '__pycache__' --exclude '*.pyc' "$REBAL_SRC/" "$TARGET/rebalance_results/" || true
+rsync -av --delete --exclude '__pycache__' --exclude '*.pyc' "$REBAL_SRC/" "$TARGET_BASE/rebalance_results/" || true
 
-find "$TARGET" -name "*.py" -o -name "*.pyc" -o -path "*/__pycache__*" -print -delete
+find "$TARGET_BASE" \( -name "__pycache__" -o -name "*.pyc" -o -name "*.py" \) -prune -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$TARGET/trader" || true
 
-MANIFEST="$TARGET/MANIFEST.json"
+MANIFEST="$TARGET_BASE/MANIFEST.json"
 run_id="${GITHUB_RUN_ID:-local}"
 commit_sha="$(git rev-parse --short HEAD)"
 now_ts="$(date -Iseconds)"
@@ -106,11 +112,12 @@ if git diff --cached --quiet; then
   exit 0
 fi
 
-if git diff --name-only --cached | grep -E "bot_state/trader_state/trader|\\.py$|\\.pyc$|__pycache__" >/dev/null; then
-  echo "[STATE_PUSH] forbidden file staged. aborting."
-  git reset --hard
-  exit 1
-fi
+while read -r f; do
+  case "$f" in
+    bot_state/trader_state/trader/state/*|bot_state/trader_state/trader/logs/*|bot_state/trader_state/trader/fills/*|bot_state/trader_state/rebalance_results/*|bot_state/trader_state/MANIFEST.json) ;;
+    *) echo "[STATE_PUSH] forbidden file staged: $f"; git reset --hard; exit 1;;
+  esac
+done < <(git diff --name-only --cached)
 
 git commit -m "Update trader state [skip ci]"
 git push origin bot-state

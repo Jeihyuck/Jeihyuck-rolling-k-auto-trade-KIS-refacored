@@ -7,6 +7,7 @@ from trader.ledger import apply_sell_fill_fifo, record_buy_fill, remaining_qty_f
 from trader.position_state_store import migrate_position_state
 from trader import state_store as runtime_state_store
 from trader.code_utils import normalize_code
+from trader.order_map_store import load_order_map_index
 
 
 def _sample_state() -> dict:
@@ -208,6 +209,26 @@ def test_idempotent_order_block() -> None:
     assert runtime_state_store.should_block_order(
         state, "000001", "BUY", "2025-01-01T10:01:00+09:00"
     )
+
+
+def test_rejected_order_does_not_update_window() -> None:
+    state: dict = {"orders": {}, "order_windows": {}}
+    ts = "2025-01-02T10:00:00+09:00"
+    oid = runtime_state_store.mark_order(
+        state,
+        "000002",
+        "BUY",
+        "S1",
+        1,
+        100.0,
+        ts,
+        status="rejected",
+        update_window=False,
+        rejection_reason="closed",
+    )
+    assert not state.get("order_windows")
+    omap = load_order_map_index()
+    assert omap.get(oid, {}).get("status") == "rejected"
 
 
 def main() -> None:

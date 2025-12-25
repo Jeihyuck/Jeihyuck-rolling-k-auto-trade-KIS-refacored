@@ -226,7 +226,6 @@ class StrategyManager:
                     )
                     continue
                 ts = now_kst().isoformat()
-                oid = mark_order(state, code, "BUY", sid, qty, entry_price, ts, reason="strategy_entry")
                 try:
                     resp = (
                         self.kis.buy_stock_limit_guarded(code, qty, int(entry_price), sid=sid)
@@ -235,9 +234,25 @@ class StrategyManager:
                     )
                 except Exception as e:
                     logger.error("[STRAT][BUY_FAIL] %s sid=%s ex=%s", code, sid, e)
+                    mark_order(
+                        state,
+                        code,
+                        "BUY",
+                        sid,
+                        qty,
+                        entry_price,
+                        ts,
+                        status="rejected",
+                        reason="buy_exception",
+                        update_window=False,
+                        rejection_reason=str(e),
+                    )
                     continue
                 order_id = self._extract_order_id(resp)
-                if order_id:
+                if not (isinstance(resp, dict) and resp.get("rt_cd") == "0"):
+                    rej_msg = ""
+                    if isinstance(resp, dict):
+                        rej_msg = str(resp.get("msg1") or resp.get("msg") or "")
                     mark_order(
                         state,
                         code,
@@ -247,9 +262,26 @@ class StrategyManager:
                         entry_price,
                         ts,
                         order_id=order_id,
-                        status="ack",
-                        reason="order_ack",
+                        status="rejected",
+                        reason="order_rejected",
+                        update_window=False,
+                        rejection_reason=rej_msg or "order_not_allowed",
                     )
+                    continue
+
+                oid = mark_order(
+                    state,
+                    code,
+                    "BUY",
+                    sid,
+                    qty,
+                    entry_price,
+                    ts,
+                    order_id=order_id,
+                    status="submitted",
+                    reason="strategy_entry",
+                    update_window=True,
+                )
                 if self.kis.check_filled(resp):
                     mark_fill(
                         state,
@@ -301,14 +333,29 @@ class StrategyManager:
             if not strategy.should_exit(pos_state, data):
                 continue
             ts = now_kst().isoformat()
-            oid = mark_order(state, code_key, "SELL", sid, remaining, data.get("price") or 0.0, ts, reason="strategy_exit")
             try:
                 resp = self.kis.sell_stock_market_guarded(code_key, remaining, sid=sid)
             except Exception as e:
                 logger.error("[STRAT][SELL_FAIL] %s sid=%s ex=%s", code_key, sid, e)
+                mark_order(
+                    state,
+                    code_key,
+                    "SELL",
+                    sid,
+                    remaining,
+                    data.get("price") or 0.0,
+                    ts,
+                    status="rejected",
+                    reason="sell_exception",
+                    update_window=False,
+                    rejection_reason=str(e),
+                )
                 continue
             order_id = self._extract_order_id(resp)
-            if order_id:
+            if not (isinstance(resp, dict) and resp.get("rt_cd") == "0"):
+                rej_msg = ""
+                if isinstance(resp, dict):
+                    rej_msg = str(resp.get("msg1") or resp.get("msg") or "")
                 mark_order(
                     state,
                     code_key,
@@ -318,9 +365,26 @@ class StrategyManager:
                     data.get("price") or 0.0,
                     ts,
                     order_id=order_id,
-                    status="ack",
-                    reason="order_ack",
+                    status="rejected",
+                    reason="order_rejected",
+                    update_window=False,
+                    rejection_reason=rej_msg or "order_not_allowed",
                 )
+                continue
+
+            oid = mark_order(
+                state,
+                code_key,
+                "SELL",
+                sid,
+                remaining,
+                data.get("price") or 0.0,
+                ts,
+                order_id=order_id,
+                status="submitted",
+                reason="strategy_exit",
+                update_window=True,
+            )
             if self.kis.check_filled(resp):
                 price = float(data.get("price") or 0.0)
                 mark_fill(state, code_key, "SELL", sid, remaining, price, ts, status="filled", order_id=order_id or oid)

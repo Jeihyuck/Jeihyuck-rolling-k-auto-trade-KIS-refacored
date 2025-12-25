@@ -25,10 +25,17 @@ def append_order_map(
     reason: str,
     ts: str,
     run_id: str | None = None,
+    *,
+    status: str = "submitted",
+    rejection_reason: str | None = None,
 ) -> Dict[str, Any]:
     ensure_dirs()
     normalized_sid = normalize_sid(sid)
     oid = order_id or f"client-{normalized_sid}-{uuid.uuid4().hex}"
+    client_prefix = f"client-{normalized_sid}-"
+    if not oid.startswith(client_prefix) and order_id is None:
+        oid = f"{client_prefix}{uuid.uuid4().hex}"
+    status_norm = str(status or "submitted").lower()
     record = {
         "order_id": oid,
         "pdno": pdno,
@@ -38,7 +45,10 @@ def append_order_map(
         "price": float(price),
         "ts": ts,
         "reason": reason,
+        "status": status_norm,
     }
+    if rejection_reason:
+        record["rejection_reason"] = rejection_reason
     if run_id:
         record["run_id"] = run_id
     if order_id is None:

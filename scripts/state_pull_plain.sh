@@ -11,8 +11,9 @@ TARGET_REBAL_DIR="rebalance_results"
 
 mkdir -p "$TARGET_STATE_DIR" "$TARGET_LOG_DIR" "$TARGET_FILLS_DIR" "$TARGET_REBAL_DIR"
 
-if ! git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
-  echo "[STATE_PULL] bot-state branch missing. Nothing to pull."
+if ! git remote get-url origin >/dev/null 2>&1; then
+  echo "[STATE_PULL] origin remote missing. Nothing to pull."
+  touch "$TARGET_STATE_DIR/state.json" "$TARGET_STATE_DIR/orders_map.jsonl" "$TARGET_LOG_DIR/ledger.jsonl"
   exit 0
 fi
 
@@ -38,11 +39,18 @@ copy_tree() {
   done
 }
 
-copy_path "bot_state/trader_state/state/state.json" "$TARGET_STATE_DIR/state.json"
-copy_path "bot_state/trader_state/state/orders_map.jsonl" "$TARGET_STATE_DIR/orders_map.jsonl"
-copy_tree "bot_state/trader_state/logs" "$TARGET_LOG_DIR"
-copy_tree "bot_state/trader_state/fills" "$TARGET_FILLS_DIR"
+copy_path "bot_state/trader_state/trader/state/state.json" "$TARGET_STATE_DIR/state.json"
+copy_path "bot_state/trader_state/trader/state/orders_map.jsonl" "$TARGET_STATE_DIR/orders_map.jsonl"
+copy_tree "bot_state/trader_state/trader/logs" "$TARGET_LOG_DIR"
+copy_tree "bot_state/trader_state/trader/fills" "$TARGET_FILLS_DIR"
 copy_tree "bot_state/trader_state/rebalance_results" "$TARGET_REBAL_DIR"
+# fallback for legacy layout
+if [[ ! -s "$TARGET_STATE_DIR/state.json" ]]; then
+  copy_path "bot_state/trader_state/state/state.json" "$TARGET_STATE_DIR/state.json"
+fi
+if [[ ! -s "$TARGET_STATE_DIR/orders_map.jsonl" ]]; then
+  copy_path "bot_state/trader_state/state/orders_map.jsonl" "$TARGET_STATE_DIR/orders_map.jsonl"
+fi
 
 touch "$TARGET_STATE_DIR/state.json" "$TARGET_STATE_DIR/orders_map.jsonl" "$TARGET_LOG_DIR/ledger.jsonl"
 echo "[STATE_PULL] done."

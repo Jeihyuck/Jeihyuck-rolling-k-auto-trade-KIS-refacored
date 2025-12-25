@@ -5,9 +5,10 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .code_utils import normalize_code
+from .config import KST
 from .fill_store import load_fills_index
 from .order_map_store import ORDERS_MAP_PATH, load_order_map_index
 from .paths import LOG_DIR, REPO_ROOT
@@ -24,6 +25,207 @@ class RecoveredLot:
     qty: int
     entry_price: float
     meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _normalize_qty(value: Any) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def _load_rebalance_candidates(rebalance_files: Sequence[Path]) -> Dict[str, str]:
+    """Return pdno -> sid map from rebalance result files (latest file wins)."""
+    mapping: Dict[str, str] = {}
+    for path in rebalance_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for sid_raw, rows in payload.items():
+            if not isinstance(rows, list):
+                continue
+            sid = normalize_sid(sid_raw if str(sid_raw).upper().startswith("S") else f"S{sid_raw}")
+            for row in rows:
+                code = normalize_code(row.get("code") or row.get("pdno") or "")
+                if code:
+                    mapping[code] = sid
+    return mapping
+
+
+def _normalize_holdings(kis_positions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    holdings: List[Dict[str, Any]] = []
+    for row in kis_positions or []:
+        pdno = normalize_code(row.get("pdno") or row.get("code") or "")
+        if not pdno:
+            continue
+        qty = _normalize_qty(row.get("hldg_qty") or row.get("qty"))
+        if qty <= 0:
+            continue
+        avg_price = float(row.get("pchs_avg_pric") or row.get("avg_price") or 0.0)
+        holdings.append({"pdno": pdno, "qty": qty, "avg_price": avg_price})
+    return holdings
+
+
+def recover_lots_from_sources(
+    kis_positions: Iterable[Dict[str, Any]],
+    state: Dict[str, Any],
+    orders_map: Dict[str, Dict[str, Any]],
+    ledger_rows: List[Dict[str, Any]],
+    rebalance_files: Sequence[Path],
+    logs_dir: Path,
+    *,
+    preferred_strategy: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Recover lots per KIS holding using multi-source hints.
+
+    Priority: orders_map -> ledger -> rebalance -> logs -> manual fallback.
+    """
+
+    now = datetime.now(KST)
+    holdings = _normalize_holdings(kis_positions)
+    diagnostics: Dict[str, Any] = {"recovered": {}, "missing": []}
+    recovered_lots: List[Dict[str, Any]] = []
+
+    engine_events = _load_json_lines(logs_dir / "engine_events.jsonl")
+    rebalance_map = _load_rebalance_candidates(rebalance_files)
+
+    recovery_helper = StrategyRecovery(
+        now_ts=now,
+        preferred_strategy=preferred_strategy,
+    )
+    recovery_helper.orders_map = orders_map or {}
+    recovery_helper.ledger_rows = ledger_rows or []
+    recovery_helper.engine_events = engine_events
+
+    for holding in holdings:
+        pdno = holding["pdno"]
+        target_qty = int(holding.get("qty") or 0)
+        avg_price = float(holding.get("avg_price") or 0.0)
+        remaining = target_qty
+        pd_diagnostics = {"target_qty": target_qty, "steps": []}
+
+        def _append_lot(sid: str, qty: int, source: str, confidence: float, meta_extra: Optional[Dict[str, Any]] = None) -> None:
+            nonlocal remaining
+            if qty <= 0 or remaining <= 0:
+                return
+            take = min(qty, remaining)
+            lot_meta = {
+                "recovery_source": source,
+                "recovery_confidence": float(confidence),
+                "confidence": float(confidence),
+                "created_at": now.isoformat(),
+                "last_update": now.isoformat(),
+                "reconciled": True,
+            }
+            lot_meta.update(meta_extra or {})
+            if sid in {"MANUAL", "UNKNOWN"}:
+                lot_meta.setdefault("safe_exit_required", True)
+            lot_id = f"{pdno}-{sid}-{int(now.timestamp())}-{len(recovered_lots)}"
+            recovered_lots.append(
+                {
+                    "lot_id": lot_id,
+                    "pdno": pdno,
+                    "sid": sid,
+                    "strategy_id": sid,
+                    "engine": "recovery",
+                    "entry_ts": now.isoformat(),
+                    "entry_price": avg_price,
+                    "qty": take,
+                    "remaining_qty": take,
+                    "meta": lot_meta,
+                }
+            )
+            remaining -= take
+            pd_diagnostics["steps"].append({"source": source, "sid": sid, "qty": take, "confidence": confidence})
+
+        # 1) orders_map
+        order_rows = [
+            row
+            for row in (orders_map or {}).values()
+            if normalize_code(row.get("pdno") or "") == pdno
+            and str(row.get("side") or "").upper() == "BUY"
+            and str(row.get("status") or "submitted").lower() != "rejected"
+        ]
+        order_rows.sort(key=lambda r: r.get("ts") or r.get("timestamp") or "")
+        for row in order_rows:
+            qty = _normalize_qty(row.get("qty"))
+            sid = normalize_sid(row.get("sid"))
+            price = float(row.get("price") or avg_price)
+            _append_lot(sid, qty, "orders_map", 0.95, {"order_price": price})
+            if remaining <= 0:
+                break
+
+        # 2) ledger rows (BUY/FILL)
+        if remaining > 0:
+            ledger_candidates = []
+            for row in ledger_rows or []:
+                code = normalize_code(row.get("code") or row.get("pdno") or "")
+                if code != pdno:
+                    continue
+                side = str(row.get("side") or row.get("event") or "").upper()
+                event = str(row.get("event") or "").upper()
+                if side not in {"BUY", ""} and event not in {"FILL", "TRADE"}:
+                    continue
+                qty = _normalize_qty(row.get("qty") or row.get("remaining_qty"))
+                if qty <= 0:
+                    continue
+                ts_val = row.get("ts") or row.get("timestamp") or ""
+                ledger_candidates.append((ts_val, row))
+            ledger_candidates.sort(key=lambda x: x[0])
+            for _ts, row in ledger_candidates:
+                qty = _normalize_qty(row.get("qty"))
+                sid = normalize_sid(row.get("sid") or row.get("strategy_id"))
+                _append_lot(sid, qty, "ledger", 0.82, {"ledger_event": row.get("event")})
+                if remaining <= 0:
+                    break
+
+        # 3) rebalance hint
+        if remaining > 0 and pdno in rebalance_map:
+            sid = rebalance_map[pdno]
+            _append_lot(sid, remaining, "rebalance", 0.40, {"hint": "rebalance_results"})
+
+        # 4) engine logs hint
+        if remaining > 0:
+            for row in reversed(engine_events):
+                code = normalize_code(row.get("pdno") or row.get("code") or "")
+                if code != pdno:
+                    continue
+                side = str(row.get("side") or "").upper()
+                if side and side != "BUY":
+                    continue
+                sid = normalize_sid(row.get("sid") or row.get("strategy_id"))
+                _append_lot(sid, remaining, "engine_logs", 0.35, {"event": row.get("event")})
+                break
+
+        # 5) fallback to heuristic/manual
+        if remaining > 0:
+            lots = recovery_helper.recover(pdno, remaining, avg_price, {"source": "fallback"})
+            if not lots:
+                lots = [
+                    {
+                        "sid": "MANUAL",
+                        "qty": remaining,
+                        "entry_price": avg_price,
+                        "meta": {"recovery_source": "none", "recovery_confidence": 0.0, "safe_exit_required": True},
+                    }
+                ]
+            for lot in lots:
+                _append_lot(
+                    normalize_sid(lot.get("sid")),
+                    _normalize_qty(lot.get("qty") or remaining),
+                    lot.get("meta", {}).get("recovery_source", "heuristic"),
+                    float(lot.get("meta", {}).get("recovery_confidence", lot.get("meta", {}).get("confidence", 0.5))),
+                    lot.get("meta"),
+                )
+
+        if remaining > 0:
+            pd_diagnostics["remaining"] = remaining
+            diagnostics["missing"].append({"pdno": pdno, "remaining": remaining})
+        diagnostics["recovered"][pdno] = pd_diagnostics
+
+    diagnostics["recovery_stats"] = recovery_helper.stats
+    return recovered_lots, diagnostics
 
 
 def _load_json_lines(path: Path) -> List[Dict[str, Any]]:
@@ -78,7 +280,9 @@ class StrategyRecovery:
             if sid == "UNKNOWN":
                 oid = row.get("order_id") or row.get("client_order_id")
                 if oid and oid in self.orders_map:
-                    sid = normalize_sid(self.orders_map[oid].get("sid"))
+                    om_row = self.orders_map[oid]
+                    if str(om_row.get("status") or "").lower() != "rejected":
+                        sid = normalize_sid(om_row.get("sid"))
                 elif isinstance(oid, str) and oid.startswith("client-") and "-" in oid:
                     sid = normalize_sid(oid.split("-")[1])
             qty_by_sid[sid] = qty_by_sid.get(sid, 0) + int(row.get("qty") or 0)
@@ -98,6 +302,9 @@ class StrategyRecovery:
         for payload in self.orders_map.values():
             code = normalize_code(payload.get("pdno") or "")
             if code != pdno_key:
+                continue
+            status = str(payload.get("status") or "submitted").lower()
+            if status == "rejected":
                 continue
             if str(payload.get("side") or "").upper() != "BUY":
                 continue

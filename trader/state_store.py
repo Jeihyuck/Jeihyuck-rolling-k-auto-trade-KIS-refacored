@@ -11,9 +11,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from .code_utils import normalize_code
 from .config import KST
 from .io_atomic import atomic_write_json
+from .ledger import load_ledger_entries
 from .order_map_store import ORDERS_MAP_PATH, append_order_map, load_order_map_index
-from .paths import BOT_STATE_MIRROR_DIR, FILLS_DIR, LOG_DIR, STATE_DIR, ensure_dirs
-from .strategy_recovery import StrategyRecovery
+from .paths import BOT_STATE_MIRROR_DIR, FILLS_DIR, LOG_DIR, REPO_ROOT, STATE_DIR, ensure_dirs
+from .strategy_recovery import StrategyRecovery, recover_lots_from_sources
 from .strategy_registry import normalize_sid
 
 logger = logging.getLogger(__name__)
@@ -225,7 +226,9 @@ def mark_order(
     order_id: str | None = None,
     status: str = "submitted",
     reason: str = "strategy",
+    update_window: bool = True,
     run_id: str | None = None,
+    rejection_reason: str | None = None,
 ) -> str:
     pdno = normalize_code(symbol)
     sid = normalize_sid(strategy_id)
@@ -239,15 +242,59 @@ def mark_order(
         "status": status,
         "reason": reason,
     }
-    entry = append_order_map(order_id, pdno, sid, side, qty, price, reason, ts, run_id)
+    entry = append_order_map(
+        order_id,
+        pdno,
+        sid,
+        side,
+        qty,
+        price,
+        reason,
+        ts,
+        run_id,
+        status=status,
+        rejection_reason=rejection_reason,
+    )
     oid = entry["order_id"]
+    if rejection_reason:
+        record["rejection_reason"] = rejection_reason
     state.setdefault("orders", {})[oid] = record
-    bucket = _order_bucket(state, symbol, side)
-    bucket["last_ts"] = ts
-    bucket["last_order_id"] = oid
-    bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
+    if update_window and str(status).lower() != "rejected":
+        bucket = _order_bucket(state, symbol, side)
+        bucket["last_ts"] = ts
+        bucket["last_order_id"] = oid
+        bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
     save_state_atomic(state)
-    logger.info("[ORDER_SENT] odno=%s pdno=%s sid=%s qty=%s price=%s reason=%s", oid, pdno, sid, qty, price, reason)
+    try:
+        from .ledger import append_ledger_event  # lazy import to avoid cycle
+
+        append_ledger_event(
+            "ORDER_REJECTED" if str(status).lower() == "rejected" else "ORDER_SUBMITTED",
+            {
+                "ts": ts,
+                "order_id": oid,
+                "pdno": pdno,
+                "sid": sid,
+                "side": side.upper(),
+                "qty": int(qty),
+                "price": float(price),
+                "reason": reason,
+                "run_id": run_id,
+                "rejection_reason": rejection_reason,
+            },
+        )
+    except Exception:
+        logger.debug("[ORDER_LOG] ledger append failed", exc_info=True)
+    logger.info(
+        "[ORDER_%s] odno=%s pdno=%s sid=%s qty=%s price=%s reason=%s",
+        str(status).upper(),
+        oid,
+        pdno,
+        sid,
+        qty,
+        price,
+        reason,
+    )
     return oid
 
 
@@ -348,7 +395,7 @@ def mark_fill(
     from .ledger import append_ledger_event  # lazy import to avoid cycle
 
     append_ledger_event(
-        event_type="fill",
+        event_type="FILL",
         payload={
             "ts": ts,
             "order_id": order_id,
@@ -446,89 +493,39 @@ def reconcile_with_kis_balance(
     state_path: Path | None = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Reconcile runtime state with KIS reported holdings using strategy recovery.
+    """Reconcile runtime state with KIS reported holdings using strategy recovery."""
 
-    This function is intentionally deterministic and atomic so GitHub Actions restarts
-    cannot corrupt state.json. The returned state is already saved to disk.
-    """
-
+    ensure_placeholders()
     state = state or load_state_v3(state_path)
     now = now_ts or datetime.now(KST)
     holdings = _normalize_holdings(kis_balance)
-    lots = state.setdefault("lots", [])
+    order_map_index = load_order_map_index()
+    ledger_rows = load_ledger_entries()
+    rebalance_dir = REPO_ROOT / "rebalance_results"
+    rebalance_files = sorted(rebalance_dir.glob("*.json"))
 
-    # Clear out positions that disappeared
-    holdings_keys = {h.pdno for h in holdings}
-    for lot in lots:
-        if normalize_code(lot.get("pdno")) not in holdings_keys:
-            if int(lot.get("remaining_qty") or 0) > 0:
-                lot["remaining_qty"] = 0
-                lot.setdefault("meta", {})["closed_at"] = now.isoformat()
-
-    recovery = StrategyRecovery(
-        now_ts=now,
+    lots, diagnostics = recover_lots_from_sources(
+        [{"pdno": h.pdno, "qty": h.qty, "avg_price": h.avg_price} for h in holdings],
+        state,
+        order_map_index,
+        ledger_rows,
+        rebalance_files,
+        LOG_DIR,
         preferred_strategy=preferred_strategy or {},
     )
 
-    for holding in holdings:
-        pdno = holding.pdno
-        h_qty = holding.qty
-        avg_price = holding.avg_price
-        existing_qty = sum(
-            int(lot.get("remaining_qty") or 0) for lot in lots if normalize_code(lot.get("pdno")) == pdno
-        )
-        if existing_qty < h_qty:
-            diff = h_qty - existing_qty
-            recovered = recovery.recover(pdno, diff, avg_price, {"balance_ts": now.isoformat()})
-            if not recovered:
-                recovered = [
-                    {
-                        "sid": "MANUAL",
-                        "qty": diff,
-                        "entry_price": avg_price,
-                        "meta": {"confidence": 0.1, "sources": ["fallback"], "reconciled": True, "sell_blocked": False},
-                    }
-                ]
-            for idx, lot_info in enumerate(recovered):
-                lot_qty = int(lot_info.get("qty") or 0)
-                if lot_qty <= 0:
-                    continue
-                sid = normalize_sid(lot_info.get("sid"))
-                meta = {"reconciled": True, **(lot_info.get("meta") or {})}
-                meta.setdefault("sell_blocked", False)
-                lot_id = f"{pdno}-{sid}-{int(now.timestamp())}-{idx}"
-                lots.append(
-                    {
-                        "lot_id": lot_id,
-                        "pdno": pdno,
-                        "sid": sid,
-                        "strategy_id": sid,
-                        "engine": "reconcile",
-                        "entry_ts": now.isoformat(),
-                        "entry_price": float(lot_info.get("entry_price") or avg_price),
-                        "qty": lot_qty,
-                        "remaining_qty": lot_qty,
-                        "meta": meta,
-                    }
-                )
-        elif existing_qty > h_qty:
-            _reduce_excess(lots, pdno, h_qty)
-
-    # Safe exit guard: MANUAL lots must be sellable after force time windows
-    for lot in lots:
-        sid = _lot_sid(lot)
-        if sid in {"MANUAL", "UNKNOWN"}:
-            meta = lot.setdefault("meta", {})
-            meta.setdefault("sell_blocked", False)
-            meta.setdefault("confidence", 0.1)
-
+    state["lots"] = lots
     state["positions"] = _summarize_positions(lots)
-    state.setdefault("meta", {})["recovery_stats"] = recovery.stats
+    meta = state.setdefault("meta", {})
+    meta["recovery_stats"] = diagnostics.get("recovery_stats", {})
+    meta["diagnostics"] = diagnostics
+    meta.setdefault("created_at", now.isoformat())
     save_state_atomic(state, state_path)
     logger.info(
-        "[RECONCILE] holdings=%d lots=%d recovery=%s",
+        "[RECONCILE] holdings=%d lots=%d recovered=%d sources=%s",
         len(holdings),
         len(lots),
-        recovery.stats,
+        diagnostics.get("recovered") and len(diagnostics["recovered"]),
+        {k: v for k, v in diagnostics.items() if k != "recovered"},
     )
     return state

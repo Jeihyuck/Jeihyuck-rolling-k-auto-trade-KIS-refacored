@@ -27,7 +27,7 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def append_ledger_event(event_type: str, payload: Dict[str, Any]) -> None:
-    entry = {"event": event_type, **payload}
+    entry = {"event": str(event_type or "").upper(), **payload}
     _append_jsonl(LEDGER_PATH, entry)
 
 
@@ -51,7 +51,10 @@ def record_trade_ledger(
         "price": float(price),
         "meta": meta or {},
     }
-    append_ledger_event("trade", entry if path is None else {**entry, "path_override": str(path)})
+    append_ledger_event(
+        "EXIT" if str(side).upper() == "SELL" else "FILL",
+        {**entry, "sid": normalize_sid(strategy_id)} if path is None else {**entry, "path_override": str(path)},
+    )
     return entry
 
 
@@ -103,6 +106,31 @@ def _norm_sid(value: int | str | None) -> int | str | None:
         return None
     text = str(value)
     return int(text) if text.isdigit() else text
+
+
+def _summarize_positions(lots: List[Dict[str, Any]]) -> Dict[str, Any]:
+    positions: Dict[str, Any] = {}
+    for lot in lots:
+        pdno = normalize_code(lot.get("pdno") or "")
+        remaining = int(lot.get("remaining_qty") or 0)
+        if not pdno or remaining <= 0:
+            continue
+        sid = _norm_sid(lot.get("sid") or lot.get("strategy_id"))
+        entry_price = float(lot.get("entry_price") or 0.0)
+        pos = positions.setdefault(pdno, {"qty": 0, "avg_price": 0.0, "by_sid": {}})
+        pos["qty"] += remaining
+        pos["avg_price"] += entry_price * remaining
+        by_sid = pos.setdefault("by_sid", {})
+        bucket = by_sid.setdefault(str(sid), {"qty": 0, "avg_price": 0.0})
+        bucket["qty"] += remaining
+        bucket["avg_price"] += entry_price * remaining
+    for pos in positions.values():
+        qty = pos.get("qty") or 0
+        pos["avg_price"] = (pos["avg_price"] / qty) if qty else 0.0
+        for sid, bucket in (pos.get("by_sid") or {}).items():
+            bqty = bucket.get("qty") or 0
+            bucket["avg_price"] = (bucket["avg_price"] / bqty) if bqty else 0.0
+    return positions
 
 
 def record_buy_fill(
@@ -259,110 +287,42 @@ def strategy_avg_price(
 
 
 def reconcile_with_broker_holdings(state: Dict[str, Any], holdings: List[Dict[str, Any]]) -> None:
-    lots = _ensure_state(state)
     now_ts = datetime.now(KST)
-    before_len = len(lots)
-    evidence_dirs = {
-        "state_lots": lots,
-    }
-    holdings_map: Dict[str, Dict[str, Any]] = {}
+    normalized_holdings = []
     for row in holdings:
         code = normalize_code(row.get("code") or row.get("pdno") or "")
         if not code:
             continue
-        qty = int(row.get("qty") or 0)
-        avg_price = float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0)
-        existing = holdings_map.get(code)
-        if existing:
-            existing["qty"] += qty
-            if existing.get("avg_price") is None:
-                existing["avg_price"] = avg_price
-        else:
-            holdings_map[code] = {"qty": qty, "avg_price": avg_price}
+        normalized_holdings.append(
+            {"pdno": code, "qty": int(row.get("qty") or 0), "avg_price": float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0)}
+        )
 
-    for lot in lots:
-        sid = normalize_sid(lot.get("strategy_id"))
-        if sid == "UNKNOWN":
-            lot["strategy_id"] = "MANUAL"
-            lot.setdefault("meta", {})["sell_blocked"] = True
+    from .order_map_store import load_order_map_index
+    from .paths import REPO_ROOT
+    from .strategy_recovery import recover_lots_from_sources
 
-    for lot in lots:
-        pdno = normalize_code(lot.get("pdno"))
-        if pdno not in holdings_map or holdings_map[pdno]["qty"] <= 0:
-            if int(lot.get("remaining_qty") or 0) > 0:
-                lot["remaining_qty"] = 0
-
-    recovered = 0
-    manual_created = 0
-    adjusted = 0
-
-    for pdno, payload in holdings_map.items():
-        hold_qty = int(payload.get("qty") or 0)
-        if hold_qty <= 0:
-            continue
-        avg_price = float(payload.get("avg_price") or 0.0)
-        existing = [lot for lot in lots if normalize_code(lot.get("pdno")) == pdno]
-        total_remaining = sum(int(lot.get("remaining_qty") or 0) for lot in existing)
-        if total_remaining == hold_qty:
-            continue
-        if total_remaining < hold_qty:
-            diff = hold_qty - total_remaining
-            from .strategy_recovery import StrategyRecovery
-
-            recovered_lots = StrategyRecovery(now_ts=now_ts).recover(pdno, diff, avg_price, evidence_dirs)
-            if not recovered_lots:
-                recovered_lots = [
-                    {
-                        "sid": "MANUAL",
-                        "qty": diff,
-                        "entry_price": avg_price,
-                        "meta": {"confidence": 0.1, "sources": ["fallback"], "sell_blocked": False},
-                    }
-                ]
-            for lot_info in recovered_lots:
-                sid = lot_info.get("sid") or "MANUAL"
-                meta = {"reconciled": True, **(lot_info.get("meta") or {})}
-                if sid == "MANUAL":
-                    manual_created += 1
-                else:
-                    recovered += 1
-                lots.append(
-                    {
-                        "lot_id": f"{pdno}-RECON-{now_ts.isoformat()}",
-                        "pdno": pdno,
-                        "strategy_id": sid,
-                        "sid": sid,
-                        "engine": "reconcile",
-                        "entry_ts": now_ts.isoformat(),
-                        "entry_price": avg_price,
-                        "qty": int(lot_info.get("qty") or diff),
-                        "remaining_qty": int(lot_info.get("qty") or diff),
-                        "meta": meta,
-                    }
-                )
-        elif total_remaining > hold_qty:
-            extra = total_remaining - hold_qty
-            for lot in sorted(
-                [lot for lot in existing if int(lot.get("remaining_qty") or 0) > 0],
-                key=lambda x: x.get("entry_ts") or "",
-                reverse=True,
-            ):
-                lot_remaining = int(lot.get("remaining_qty") or 0)
-                if lot_remaining <= 0:
-                    continue
-                delta = min(lot_remaining, extra)
-                lot["remaining_qty"] = int(lot_remaining - delta)
-                adjusted += delta
-                extra -= delta
-                if extra <= 0:
-                    break
-
+    lots, diagnostics = recover_lots_from_sources(
+        normalized_holdings,
+        state,
+        load_order_map_index(),
+        load_ledger_entries(),
+        sorted((REPO_ROOT / "rebalance_results").glob("*.json")),
+        LOG_DIR,
+    )
+    state["lots"] = lots
+    state["positions"] = _summarize_positions(lots)
+    state.setdefault("meta", {})["diagnostics"] = diagnostics
+    append_ledger_event(
+        "RECOVERY",
+        {
+            "ts": now_ts.isoformat(),
+            "holdings": normalized_holdings,
+            "stats": diagnostics.get("recovery_stats", {}),
+        },
+    )
     logger.info(
-        "[RECONCILE] holdings=%d lots_before=%d lots_after=%d recovered=%d manual_created=%d adjusted=%d",
-        len(holdings_map),
-        before_len,
+        "[RECONCILE] holdings=%d lots_after=%d stats=%s",
+        len(normalized_holdings),
         len(lots),
-        recovered,
-        manual_created,
-        adjusted,
+        diagnostics.get("recovery_stats", {}),
     )

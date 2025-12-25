@@ -9,18 +9,18 @@ concurrency:
 
 on:
   push:
-    branches: [ youtube, main ]
+    branches: [ youtube ]
     paths-ignore:
       - "bot_state/**"
   pull_request:
-    branches: [ youtube, main ]
+    branches: [ youtube ]
   schedule:
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
 
 jobs:
   monitor-trade:
-    if: github.ref != 'refs/heads/bot-state'
+    if: github.ref != 'refs/heads/bot-state' && (github.ref == 'refs/heads/youtube' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     runs-on: ubuntu-latest
 
     env:
@@ -164,6 +164,7 @@ jobs:
       - name: trader 자동매매 로직 실행
         env:
           PYTHONPATH: ${{ github.workspace }}
+          MAX_RUNTIME_SEC: "900"
         run: |
           python -m trader.trader
 
@@ -187,8 +188,14 @@ jobs:
           cp -a rebalance_results/. "$BUNDLE/rebalance_results/" || true
           date -Iseconds > "$BUNDLE/_bundle_created_at.txt"
 
+      - name: (디버그) state/logs snapshot
+        if: always()
+        run: |
+          ls -al trader/state trader/logs trader/fills
+          du -ah trader/logs | head
+
       - name: Persist trader state to bot-state branch
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && always()
         run: |
           set -euo pipefail
           bash scripts/state_push_plain.sh

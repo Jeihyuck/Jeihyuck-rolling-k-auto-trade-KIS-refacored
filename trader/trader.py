@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
@@ -39,41 +40,64 @@ def _collect_rebalance_candidates() -> set[str]:
 def main() -> None:
     ensure_minimum_files()
     logger.info("[BOOT] ensured state/orders_map/ledger placeholders")
-    now = now_kst()
-    if not is_trading_day(now):
-        logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
-        return
+    start_ts = time.time()
+    max_runtime_sec = int(os.getenv("MAX_RUNTIME_SEC", "900"))
+
+    def _finalize(state: dict[str, object]) -> None:
+        runtime_state_store.save_state_atomic(state)
+        try:
+            from trader import report_ceo
+
+            report_ceo.ceo_report(now_kst(), period=os.getenv("CEO_REPORT_PERIOD", "daily"))
+        except Exception:
+            logger.exception("[TRADER] CEO report generation failed")
+
     runtime_state = runtime_state_store.load_state()
     kis: KisAPI | None = None
-    balance: dict[str, object] = {}
+    balance: dict[str, object] = {"positions": []}
     preferred_strategy: dict[str, object] = {}
     try:
-        kis = KisAPI()
         ledger_entries = load_ledger_entries()
         preferred_strategy = strategy_map_from_ledger(ledger_entries) or {}
+    except Exception:
+        logger.exception("[TRADER] ledger preload failed")
+
+    try:
+        kis = KisAPI()
         balance = kis.get_balance()
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
             balance, preferred_strategy=preferred_strategy, state=runtime_state
         )
-        runtime_state_store.save_state(runtime_state)
+        runtime_state_store.save_state_atomic(runtime_state)
         logger.info("[TRADER] runtime state reconciled (positions=%d)", len(runtime_state.get("positions", {})))
-    except Exception:
-        logger.exception("[TRADER] runtime state reconcile failed")
+    except Exception as e:
+        logger.exception("[TRADER] runtime state reconcile failed: %s", e)
+        runtime_state.setdefault("lots", [])
+        runtime_state["positions"] = {}
+        runtime_state.setdefault("meta", {})["reconcile_error"] = str(e)
+        _finalize(runtime_state)
+        return
+
+    now = now_kst()
+    if not is_trading_day(now) or not is_trading_window(now):
+        logger.warning("[TRADER] 비거래일/장외(%s) → 단일 실행 후 종료", now.isoformat())
+        _finalize(runtime_state)
+        return
 
     try:
-        kis = kis or KisAPI()
+        if kis is None:
+            kis = KisAPI()
         manager = StrategyManager(kis=kis)
         candidates = _collect_rebalance_candidates()
         cycle_count = 0
         while True:
             now = now_kst()
-            if now.time() >= MARKET_CLOSE:
-                logger.info("[TRADER] 장마감(%s) → 거래 루프 종료", now.isoformat())
+            if (time.time() - start_ts) > max_runtime_sec:
+                logger.warning("[TRADER] max runtime reached (%ss) → 종료", max_runtime_sec)
                 break
-            if not is_trading_window(now):
-                logger.info("[TRADER] 장외 시간(%s) → 대기", now.isoformat())
-                time.sleep(30)
-                continue
+            if now.time() >= MARKET_CLOSE or not is_trading_window(now):
+                logger.info("[TRADER] 장마감/장외(%s) → 거래 루프 종료", now.isoformat())
+                break
             cycle_count += 1
             try:
                 balance = kis.get_balance()
@@ -89,7 +113,7 @@ def main() -> None:
             except Exception:
                 logger.exception("[TRADER] strategy cycle failed")
                 result = {"entries": 0, "exits": 0}
-            runtime_state_store.save_state(runtime_state)
+            runtime_state_store.save_state_atomic(runtime_state)
             logger.info(
                 "[TRADER] strategy cycle %d complete (entries=%s, exits=%s)",
                 cycle_count,
@@ -102,7 +126,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("[TRADER] 수동 종료 신호 → 거래 루프 종료")
     finally:
-        runtime_state_store.save_state(runtime_state)
+        _finalize(runtime_state)
 
 
 if __name__ == "__main__":
