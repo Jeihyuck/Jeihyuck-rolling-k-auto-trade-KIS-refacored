@@ -9,11 +9,11 @@ concurrency:
 
 on:
   push:
-    branches: [ main, trader_refactor ]
+    branches: [ main, trader_r1 ]
     paths-ignore:
       - "bot_state/**"
   pull_request:
-    branches: [ main, trader_refactor ]
+    branches: [ main, trader_r1 ]
   schedule:
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
   monitor-trade:
     # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
     # if: github.ref == 'refs/heads/main'
-    if: github.ref != 'refs/heads/bot-state'
+    # if: github.ref != 'refs/heads/bot-state'
     runs-on: ubuntu-latest
 
     env:
