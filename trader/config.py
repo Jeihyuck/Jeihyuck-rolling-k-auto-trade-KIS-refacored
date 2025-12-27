@@ -92,6 +92,18 @@ CONFIG = {
     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
     "EMERGENCY_GLOBAL_SELL": "false",
     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+    # === Strategy intent/exec defaults ===
+    "ENABLED_STRATEGIES": "",
+    "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+    "STRATEGY_DRY_RUN": "true",
+    "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+    "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+    "STRATEGY_MAX_OPEN_INTENTS": "20",
+    "STRATEGY_MAX_POSITION_PCT": "0.10",
+    "STRATEGY_ALLOW_SELL_ONLY": "false",
+    "STRATEGY_WEIGHTS": "",
+    "DISABLE_KOSDAQ_LOOP": "false",
+    "DISABLE_KOSPI_ENGINE": "false",
 }
 
 
@@ -168,6 +180,62 @@ SUBJECT_FLOW_EMPTY_POLICY = (_cfg("SUBJECT_FLOW_EMPTY_POLICY") or "TREAT_AS_FAIL
 SUBJECT_FLOW_DEGRADED_TURNOVER_MULT = float(_cfg("SUBJECT_FLOW_DEGRADED_TURNOVER_MULT") or "1.5")
 SUBJECT_FLOW_DEGRADED_OB_ADD = float(_cfg("SUBJECT_FLOW_DEGRADED_OB_ADD") or "10")
 SUBJECT_FLOW_MAX_CALLS_PER_RUN = int(_cfg("SUBJECT_FLOW_MAX_CALLS_PER_RUN") or "200")
+# 전략별 활성/가중치 파싱
+def parse_enabled_strategies(raw: str) -> set[str]:
+    strategies: set[str] = set()
+    for name in (raw or "").split(","):
+        cleaned = name.strip().lower()
+        if cleaned:
+            strategies.add(cleaned)
+    return strategies
+
+
+def _parse_strategy_weights(raw: str) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    for item in (raw or "").split(","):
+        if not item.strip():
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+        elif ":" in item:
+            key, value = item.split(":", 1)
+        else:
+            key, value = item, "0"
+        key = key.strip().lower()
+        try:
+            weight = float(value)
+        except ValueError:
+            weight = 0.0
+        if key:
+            weights[key] = weight
+    return weights
+
+
+ENABLED_STRATEGIES_SET = parse_enabled_strategies(_cfg("ENABLED_STRATEGIES"))
+RAW_STRATEGY_WEIGHTS = _parse_strategy_weights(_cfg("STRATEGY_WEIGHTS"))
+
+if ENABLED_STRATEGIES_SET:
+    STRATEGY_WEIGHTS = {
+        name: (RAW_STRATEGY_WEIGHTS.get(name, 0.0) if name in ENABLED_STRATEGIES_SET else 0.0)
+        for name in ENABLED_STRATEGIES_SET.union(RAW_STRATEGY_WEIGHTS.keys())
+    }
+else:
+    STRATEGY_WEIGHTS = {name: 0.0 for name in RAW_STRATEGY_WEIGHTS.keys()}
+
+STRATEGY_MODE = (_cfg("STRATEGY_MODE") or "INTENT_ONLY").upper()
+STRATEGY_DRY_RUN = (_cfg("STRATEGY_DRY_RUN") or "true").lower() in ("1", "true", "yes")
+STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
+STRATEGY_INTENTS_STATE_PATH = Path(
+    _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
+)
+STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
+STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
+STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # 전략별 레짐 축소 우선순위
 def _parse_strategy_priority(raw: str) -> list[int]:
     priorities: list[int] = []
@@ -234,6 +302,8 @@ def _parse_hhmm(hhmm: str) -> dtime:
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
 ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
+DISABLE_KOSDAQ_LOOP = (_cfg("DISABLE_KOSDAQ_LOOP") or "false").lower() in ("1", "true", "yes")
+DISABLE_KOSPI_ENGINE = (_cfg("DISABLE_KOSPI_ENGINE") or "false").lower() in ("1", "true", "yes")
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"

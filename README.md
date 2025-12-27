@@ -33,6 +33,13 @@ This initializes the portfolio manager, runs KOSPI rebalance if due, then execut
 
 Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 상태를 유지합니다.
 
+## Strategy intent mode (single-account multi-strategy)
+- A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
+- All five strategies (`breakout`~`volatility`) are present but **disabled by default**: `ENABLED_STRATEGIES=""` means no strategies run, and missing weights are treated as zero even when listed.
+- Enable a subset for testing, e.g. `ENABLED_STRATEGIES="momentum"` with optional weights `STRATEGY_WEIGHTS="momentum=0.10"`. Keep `STRATEGY_MODE=INTENT_ONLY` and `STRATEGY_DRY_RUN=true` (defaults) to avoid any KIS orders.
+- PortfolioManager order: strategies → KOSPI → KOSDAQ. During isolated testing use `DISABLE_KOSPI_ENGINE=true` or `DISABLE_KOSDAQ_LOOP=true` to skip respective engines.
+- State sync scripts in `scripts/state_pull_plain.sh` and `scripts/state_push_plain.sh` now copy the intent log/cursor alongside `trader/state/state.json` into the `bot-state` branch.
+
 ## CI and live-trading safeguards
 - CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
 - The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.
