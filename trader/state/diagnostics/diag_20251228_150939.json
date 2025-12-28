@@ -1,0 +1,2300 @@
+{
+  "ts": "2025-12-28T15:09:39.896194+09:00",
+  "diag_enabled": true,
+  "trading_day": false,
+  "selected_by_market": {
+    "KOSDAQ": [
+      {
+        "code": "247540",
+        "name": "에코프로비엠",
+        "market": "KOSDAQ",
+        "best_k": 0.3,
+        "avg_return_pct": 1.01,
+        "win_rate_pct": 44.44,
+        "mdd_pct": 4.42,
+        "trades": 9,
+        "cumulative_return_pct": 9.12,
+        "avg_holding_days": 2.2,
+        "sharpe_m": 0.0,
+        "목표가": 157800,
+        "target_price": 157800,
+        "close": 156300.0,
+        "prev_open": 157900.0,
+        "prev_high": 160300.0,
+        "prev_low": 155200.0,
+        "prev_close": 156300.0,
+        "prev_volume": 269772.0,
+        "prev_turnover": 42165363600.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "298380",
+        "name": "에이비엘바이오",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 0.84,
+        "win_rate_pct": 69.23,
+        "mdd_pct": 12.01,
+        "trades": 13,
+        "cumulative_return_pct": 10.06,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 200500,
+        "target_price": 200500,
+        "close": 199000.0,
+        "prev_open": 188000.0,
+        "prev_high": 199100.0,
+        "prev_low": 184000.0,
+        "prev_close": 199000.0,
+        "prev_volume": 1693203.0,
+        "prev_turnover": 336947397000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "277810",
+        "name": "레인보우로보틱스",
+        "market": "KOSDAQ",
+        "best_k": 0.2,
+        "avg_return_pct": 0.73,
+        "win_rate_pct": 58.33,
+        "mdd_pct": 2.98,
+        "trades": 12,
+        "cumulative_return_pct": 8.77,
+        "avg_holding_days": 1.4,
+        "sharpe_m": 0.0,
+        "목표가": 477700,
+        "target_price": 477700,
+        "close": 473500.0,
+        "prev_open": 487000.0,
+        "prev_high": 488500.0,
+        "prev_low": 467500.0,
+        "prev_close": 473500.0,
+        "prev_volume": 210295.0,
+        "prev_turnover": 99574682500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "310210",
+        "name": "보로노이",
+        "market": "KOSDAQ",
+        "best_k": 0.6,
+        "avg_return_pct": 0.19,
+        "win_rate_pct": 66.67,
+        "mdd_pct": 2.76,
+        "trades": 6,
+        "cumulative_return_pct": 1.1,
+        "avg_holding_days": 3.6,
+        "sharpe_m": 0.0,
+        "목표가": 236400,
+        "target_price": 236400,
+        "close": 228500.0,
+        "prev_open": 218000.0,
+        "prev_high": 230250.0,
+        "prev_low": 217000.0,
+        "prev_close": 228500.0,
+        "prev_volume": 221134.0,
+        "prev_turnover": 50529119000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "347850",
+        "name": "디앤디파마텍",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 0.38,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 7.46,
+        "trades": 16,
+        "cumulative_return_pct": 5.43,
+        "avg_holding_days": 1.2,
+        "sharpe_m": 0.0,
+        "목표가": 95700,
+        "target_price": 95700,
+        "close": 94900.0,
+        "prev_open": 89800.0,
+        "prev_high": 96500.0,
+        "prev_low": 88200.0,
+        "prev_close": 94900.0,
+        "prev_volume": 2305957.0,
+        "prev_turnover": 218835319300.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "039030",
+        "name": "이오테크닉스",
+        "market": "KOSDAQ",
+        "best_k": 0.3,
+        "avg_return_pct": 0.05,
+        "win_rate_pct": 27.27,
+        "mdd_pct": 2.25,
+        "trades": 11,
+        "cumulative_return_pct": 0.45,
+        "avg_holding_days": 1.8,
+        "sharpe_m": 0.0,
+        "목표가": 263900,
+        "target_price": 263900,
+        "close": 260000.0,
+        "prev_open": 257500.0,
+        "prev_high": 267500.0,
+        "prev_low": 254500.0,
+        "prev_close": 260000.0,
+        "prev_volume": 136445.0,
+        "prev_turnover": 35475700000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "030530",
+        "name": "원익홀딩스",
+        "market": "KOSDAQ",
+        "best_k": 0.7,
+        "avg_return_pct": 3.39,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 7.51,
+        "trades": 7,
+        "cumulative_return_pct": 23.43,
+        "avg_holding_days": 3.0,
+        "sharpe_m": 0.0,
+        "목표가": 44050,
+        "target_price": 44050,
+        "close": 40100.0,
+        "prev_open": 36850.0,
+        "prev_high": 41900.0,
+        "prev_low": 36200.0,
+        "prev_close": 40100.0,
+        "prev_volume": 19278062.0,
+        "prev_turnover": 773050286200.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "145020",
+        "name": "휴젤",
+        "market": "KOSDAQ",
+        "best_k": 0.4,
+        "avg_return_pct": 0.34,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 4.89,
+        "trades": 7,
+        "cumulative_return_pct": 2.21,
+        "avg_holding_days": 2.8,
+        "sharpe_m": 0.0,
+        "목표가": 230600,
+        "target_price": 230600,
+        "close": 227000.0,
+        "prev_open": 234000.0,
+        "prev_high": 234000.0,
+        "prev_low": 225000.0,
+        "prev_close": 227000.0,
+        "prev_volume": 28626.0,
+        "prev_turnover": 6498102000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "226950",
+        "name": "올릭스",
+        "market": "KOSDAQ",
+        "best_k": 0.3,
+        "avg_return_pct": 0.87,
+        "win_rate_pct": 80.0,
+        "mdd_pct": 3.52,
+        "trades": 10,
+        "cumulative_return_pct": 8.73,
+        "avg_holding_days": 2.0,
+        "sharpe_m": 0.0,
+        "목표가": 137800,
+        "target_price": 137800,
+        "close": 134800.0,
+        "prev_open": 129400.0,
+        "prev_high": 135900.0,
+        "prev_low": 125600.0,
+        "prev_close": 134800.0,
+        "prev_volume": 719599.0,
+        "prev_turnover": 97001945200.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "035900",
+        "name": "JYP Ent.",
+        "market": "KOSDAQ",
+        "best_k": 0.2,
+        "avg_return_pct": 0.35,
+        "win_rate_pct": 55.56,
+        "mdd_pct": 1.73,
+        "trades": 9,
+        "cumulative_return_pct": 3.1,
+        "avg_holding_days": 1.9,
+        "sharpe_m": 0.0,
+        "목표가": 71400,
+        "target_price": 71400,
+        "close": 71100.0,
+        "prev_open": 72100.0,
+        "prev_high": 72100.0,
+        "prev_low": 70600.0,
+        "prev_close": 71100.0,
+        "prev_volume": 255294.0,
+        "prev_turnover": 18151403400.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "237690",
+        "name": "에스티팜",
+        "market": "KOSDAQ",
+        "best_k": 0.4,
+        "avg_return_pct": 0.44,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 0.92,
+        "trades": 7,
+        "cumulative_return_pct": 3.03,
+        "avg_holding_days": 1.8,
+        "sharpe_m": 0.0,
+        "목표가": 122600,
+        "target_price": 122600,
+        "close": 120900.0,
+        "prev_open": 125000.0,
+        "prev_high": 125000.0,
+        "prev_low": 120600.0,
+        "prev_close": 120900.0,
+        "prev_volume": 178623.0,
+        "prev_turnover": 21595520700.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "475830",
+        "name": "오름테라퓨틱",
+        "market": "KOSDAQ",
+        "best_k": 0.7,
+        "avg_return_pct": 4.81,
+        "win_rate_pct": 83.33,
+        "mdd_pct": 0.99,
+        "trades": 6,
+        "cumulative_return_pct": 32.3,
+        "avg_holding_days": 3.6,
+        "sharpe_m": 0.0,
+        "목표가": 112400,
+        "target_price": 112400,
+        "close": 104300.0,
+        "prev_open": 96200.0,
+        "prev_high": 107700.0,
+        "prev_low": 96000.0,
+        "prev_close": 104300.0,
+        "prev_volume": 754653.0,
+        "prev_turnover": 78710307900.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "319400",
+        "name": "현대무벡스",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 2.33,
+        "win_rate_pct": 44.44,
+        "mdd_pct": 7.08,
+        "trades": 18,
+        "cumulative_return_pct": 47.21,
+        "avg_holding_days": 1.1,
+        "sharpe_m": 0.0,
+        "목표가": 19400,
+        "target_price": 19400,
+        "close": 19260.0,
+        "prev_open": 19120.0,
+        "prev_high": 20500.0,
+        "prev_low": 19000.0,
+        "prev_close": 19260.0,
+        "prev_volume": 25772258.0,
+        "prev_turnover": 496373689080.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "005290",
+        "name": "동진쎄미켐",
+        "market": "KOSDAQ",
+        "best_k": 0.2,
+        "avg_return_pct": 0.85,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 2.26,
+        "trades": 8,
+        "cumulative_return_pct": 6.73,
+        "avg_holding_days": 2.6,
+        "sharpe_m": 0.0,
+        "목표가": 38300,
+        "target_price": 38300,
+        "close": 38150.0,
+        "prev_open": 37750.0,
+        "prev_high": 38450.0,
+        "prev_low": 37500.0,
+        "prev_close": 38150.0,
+        "prev_volume": 508709.0,
+        "prev_turnover": 19407248350.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "058610",
+        "name": "에스피지",
+        "market": "KOSDAQ",
+        "best_k": 0.7,
+        "avg_return_pct": 2.7,
+        "win_rate_pct": 60.0,
+        "mdd_pct": 4.19,
+        "trades": 5,
+        "cumulative_return_pct": 13.17,
+        "avg_holding_days": 2.8,
+        "sharpe_m": 0.0,
+        "목표가": 90200,
+        "target_price": 90200,
+        "close": 84600.0,
+        "prev_open": 86400.0,
+        "prev_high": 89600.0,
+        "prev_low": 81600.0,
+        "prev_close": 84600.0,
+        "prev_volume": 1347472.0,
+        "prev_turnover": 113996131200.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "160190",
+        "name": "하이젠알앤엠",
+        "market": "KOSDAQ",
+        "best_k": 0.2,
+        "avg_return_pct": 0.39,
+        "win_rate_pct": 58.33,
+        "mdd_pct": 8.09,
+        "trades": 12,
+        "cumulative_return_pct": 4.07,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 59150,
+        "target_price": 59150,
+        "close": 58400.0,
+        "prev_open": 58100.0,
+        "prev_high": 59400.0,
+        "prev_low": 55600.0,
+        "prev_close": 58400.0,
+        "prev_volume": 155549.0,
+        "prev_turnover": 9084061600.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "437730",
+        "name": "삼현",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 1.17,
+        "win_rate_pct": 61.11,
+        "mdd_pct": 11.55,
+        "trades": 18,
+        "cumulative_return_pct": 19.76,
+        "avg_holding_days": 1.1,
+        "sharpe_m": 0.0,
+        "목표가": 55850,
+        "target_price": 55850,
+        "close": 55300.0,
+        "prev_open": 58100.0,
+        "prev_high": 58700.0,
+        "prev_low": 53200.0,
+        "prev_close": 55300.0,
+        "prev_volume": 1242856.0,
+        "prev_turnover": 68729936800.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "445680",
+        "name": "큐리옥스바이오시스템즈",
+        "market": "KOSDAQ",
+        "best_k": 0.3,
+        "avg_return_pct": 1.66,
+        "win_rate_pct": 88.89,
+        "mdd_pct": 1.64,
+        "trades": 9,
+        "cumulative_return_pct": 15.81,
+        "avg_holding_days": 2.1,
+        "sharpe_m": 0.0,
+        "목표가": 103700,
+        "target_price": 103700,
+        "close": 101900.0,
+        "prev_open": 98800.0,
+        "prev_high": 102900.0,
+        "prev_low": 96800.0,
+        "prev_close": 101900.0,
+        "prev_volume": 205169.0,
+        "prev_turnover": 20906721100.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "064760",
+        "name": "티씨케이",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 0.63,
+        "win_rate_pct": 66.67,
+        "mdd_pct": 1.9,
+        "trades": 9,
+        "cumulative_return_pct": 5.74,
+        "avg_holding_days": 2.2,
+        "sharpe_m": 0.0,
+        "목표가": 146500,
+        "target_price": 146500,
+        "close": 146000.0,
+        "prev_open": 144200.0,
+        "prev_high": 148000.0,
+        "prev_low": 142100.0,
+        "prev_close": 146000.0,
+        "prev_volume": 44762.0,
+        "prev_turnover": 6535252000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "067310",
+        "name": "하나마이크론",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 0.87,
+        "win_rate_pct": 58.33,
+        "mdd_pct": 3.58,
+        "trades": 12,
+        "cumulative_return_pct": 10.55,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 25250,
+        "target_price": 25250,
+        "close": 25100.0,
+        "prev_open": 24250.0,
+        "prev_high": 25500.0,
+        "prev_low": 23950.0,
+        "prev_close": 25100.0,
+        "prev_volume": 1860273.0,
+        "prev_turnover": 46692852300.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "466100",
+        "name": "클로봇",
+        "market": "KOSDAQ",
+        "best_k": 0.5,
+        "avg_return_pct": 2.72,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 6.83,
+        "trades": 8,
+        "cumulative_return_pct": 20.99,
+        "avg_holding_days": 2.1,
+        "sharpe_m": 0.0,
+        "목표가": 66200,
+        "target_price": 66200,
+        "close": 64100.0,
+        "prev_open": 67000.0,
+        "prev_high": 67800.0,
+        "prev_low": 63600.0,
+        "prev_close": 64100.0,
+        "prev_volume": 2252351.0,
+        "prev_turnover": 144375699100.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      },
+      {
+        "code": "065350",
+        "name": "신성델타테크",
+        "market": "KOSDAQ",
+        "best_k": 0.1,
+        "avg_return_pct": 0.64,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 3.75,
+        "trades": 12,
+        "cumulative_return_pct": 7.72,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 57650,
+        "target_price": 57650,
+        "close": 57400.0,
+        "prev_open": 59500.0,
+        "prev_high": 59600.0,
+        "prev_low": 57100.0,
+        "prev_close": 57400.0,
+        "prev_volume": 118848.0,
+        "prev_turnover": 6821875200.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.04545454545454547
+      }
+    ],
+    "KOSPI": [
+      {
+        "code": "000660",
+        "name": "SK하이닉스",
+        "market": "KOSPI",
+        "best_k": 0.3,
+        "avg_return_pct": 0.92,
+        "win_rate_pct": 66.67,
+        "mdd_pct": 1.86,
+        "trades": 12,
+        "cumulative_return_pct": 11.47,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 603500,
+        "target_price": 603500,
+        "close": 599000.0,
+        "prev_open": 594000.0,
+        "prev_high": 605000.0,
+        "prev_low": 590000.0,
+        "prev_close": 599000.0,
+        "prev_volume": 4165535.0,
+        "prev_turnover": 2495155465000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "373220",
+        "name": "LG에너지솔루션",
+        "market": "KOSPI",
+        "best_k": 0.3,
+        "avg_return_pct": 0.36,
+        "win_rate_pct": 33.33,
+        "mdd_pct": 1.4,
+        "trades": 6,
+        "cumulative_return_pct": 2.13,
+        "avg_holding_days": 3.0,
+        "sharpe_m": 0.0,
+        "목표가": 386600,
+        "target_price": 386600,
+        "close": 383500.0,
+        "prev_open": 391500.0,
+        "prev_high": 391500.0,
+        "prev_low": 381000.0,
+        "prev_close": 383500.0,
+        "prev_volume": 206573.0,
+        "prev_turnover": 79220745500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "005935",
+        "name": "삼성전자우",
+        "market": "KOSPI",
+        "best_k": 0.4,
+        "avg_return_pct": 0.42,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 2.12,
+        "trades": 7,
+        "cumulative_return_pct": 2.89,
+        "avg_holding_days": 2.5,
+        "sharpe_m": 0.0,
+        "목표가": 89600,
+        "target_price": 89600,
+        "close": 88500.0,
+        "prev_open": 86300.0,
+        "prev_high": 88600.0,
+        "prev_low": 85800.0,
+        "prev_close": 88500.0,
+        "prev_volume": 3821665.0,
+        "prev_turnover": 338217352500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "005380",
+        "name": "현대차",
+        "market": "KOSPI",
+        "best_k": 0.4,
+        "avg_return_pct": 1.13,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 5.72,
+        "trades": 7,
+        "cumulative_return_pct": 7.65,
+        "avg_holding_days": 2.7,
+        "sharpe_m": 0.0,
+        "목표가": 288800,
+        "target_price": 288800,
+        "close": 286000.0,
+        "prev_open": 292000.0,
+        "prev_high": 292000.0,
+        "prev_low": 285000.0,
+        "prev_close": 286000.0,
+        "prev_volume": 846875.0,
+        "prev_turnover": 242206250000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "012450",
+        "name": "한화에어로스페이스",
+        "market": "KOSPI",
+        "best_k": 0.5,
+        "avg_return_pct": 0.7,
+        "win_rate_pct": 71.43,
+        "mdd_pct": 1.38,
+        "trades": 7,
+        "cumulative_return_pct": 4.96,
+        "avg_holding_days": 2.5,
+        "sharpe_m": 0.0,
+        "목표가": 884500,
+        "target_price": 884500,
+        "close": 870000.0,
+        "prev_open": 879000.0,
+        "prev_high": 893000.0,
+        "prev_low": 864000.0,
+        "prev_close": 870000.0,
+        "prev_volume": 102344.0,
+        "prev_turnover": 89039280000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "402340",
+        "name": "SK스퀘어",
+        "market": "KOSPI",
+        "best_k": 0.1,
+        "avg_return_pct": 0.45,
+        "win_rate_pct": 37.5,
+        "mdd_pct": 4.87,
+        "trades": 16,
+        "cumulative_return_pct": 7.11,
+        "avg_holding_days": 1.2,
+        "sharpe_m": 0.0,
+        "목표가": 336300,
+        "target_price": 336300,
+        "close": 334500.0,
+        "prev_open": 333000.0,
+        "prev_high": 348000.0,
+        "prev_low": 330000.0,
+        "prev_close": 334500.0,
+        "prev_volume": 458435.0,
+        "prev_turnover": 153346507500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "032830",
+        "name": "삼성생명",
+        "market": "KOSPI",
+        "best_k": 0.2,
+        "avg_return_pct": 0.09,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 1.72,
+        "trades": 12,
+        "cumulative_return_pct": 0.99,
+        "avg_holding_days": 1.6,
+        "sharpe_m": 0.0,
+        "목표가": 163400,
+        "target_price": 163400,
+        "close": 162500.0,
+        "prev_open": 163200.0,
+        "prev_high": 166300.0,
+        "prev_low": 161500.0,
+        "prev_close": 162500.0,
+        "prev_volume": 252266.0,
+        "prev_turnover": 40993225000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "012330",
+        "name": "현대모비스",
+        "market": "KOSPI",
+        "best_k": 0.1,
+        "avg_return_pct": 0.35,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 6.21,
+        "trades": 16,
+        "cumulative_return_pct": 5.27,
+        "avg_holding_days": 1.1,
+        "sharpe_m": 0.0,
+        "목표가": 359300,
+        "target_price": 359300,
+        "close": 358000.0,
+        "prev_open": 369000.0,
+        "prev_high": 369000.0,
+        "prev_low": 356000.0,
+        "prev_close": 358000.0,
+        "prev_volume": 135892.0,
+        "prev_turnover": 48649336000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "009540",
+        "name": "HD한국조선해양",
+        "market": "KOSPI",
+        "best_k": 0.5,
+        "avg_return_pct": 0.26,
+        "win_rate_pct": 57.14,
+        "mdd_pct": 0.66,
+        "trades": 7,
+        "cumulative_return_pct": 1.8,
+        "avg_holding_days": 2.5,
+        "sharpe_m": 0.0,
+        "목표가": 411000,
+        "target_price": 411000,
+        "close": 403000.0,
+        "prev_open": 415000.0,
+        "prev_high": 417500.0,
+        "prev_low": 401500.0,
+        "prev_close": 403000.0,
+        "prev_volume": 155267.0,
+        "prev_turnover": 62572601000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "035720",
+        "name": "카카오",
+        "market": "KOSPI",
+        "best_k": 0.3,
+        "avg_return_pct": 0.14,
+        "win_rate_pct": 50.0,
+        "mdd_pct": 1.29,
+        "trades": 10,
+        "cumulative_return_pct": 1.35,
+        "avg_holding_days": 1.9,
+        "sharpe_m": 0.0,
+        "목표가": 58700,
+        "target_price": 58700,
+        "close": 58100.0,
+        "prev_open": 59800.0,
+        "prev_high": 60000.0,
+        "prev_low": 58000.0,
+        "prev_close": 58100.0,
+        "prev_volume": 1862813.0,
+        "prev_turnover": 108229435300.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "010130",
+        "name": "고려아연",
+        "market": "KOSPI",
+        "best_k": 0.1,
+        "avg_return_pct": 0.22,
+        "win_rate_pct": 45.45,
+        "mdd_pct": 5.68,
+        "trades": 11,
+        "cumulative_return_pct": 2.07,
+        "avg_holding_days": 1.7,
+        "sharpe_m": 0.0,
+        "목표가": 1292000,
+        "target_price": 1292000,
+        "close": 1288000.0,
+        "prev_open": 1321000.0,
+        "prev_high": 1324000.0,
+        "prev_low": 1279000.0,
+        "prev_close": 1288000.0,
+        "prev_volume": 34258.0,
+        "prev_turnover": 44124304000.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "064350",
+        "name": "현대로템",
+        "market": "KOSPI",
+        "best_k": 0.4,
+        "avg_return_pct": 0.19,
+        "win_rate_pct": 62.5,
+        "mdd_pct": 1.69,
+        "trades": 8,
+        "cumulative_return_pct": 1.51,
+        "avg_holding_days": 2.0,
+        "sharpe_m": 0.0,
+        "목표가": 182800,
+        "target_price": 182800,
+        "close": 179800.0,
+        "prev_open": 184000.0,
+        "prev_high": 186300.0,
+        "prev_low": 178700.0,
+        "prev_close": 179800.0,
+        "prev_volume": 505954.0,
+        "prev_turnover": 90970529200.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "066570",
+        "name": "LG전자",
+        "market": "KOSPI",
+        "best_k": 0.7,
+        "avg_return_pct": 0.52,
+        "win_rate_pct": 60.0,
+        "mdd_pct": 0.81,
+        "trades": 5,
+        "cumulative_return_pct": 2.6,
+        "avg_holding_days": 2.8,
+        "sharpe_m": 0.0,
+        "목표가": 92900,
+        "target_price": 92900,
+        "close": 91600.0,
+        "prev_open": 93400.0,
+        "prev_high": 93400.0,
+        "prev_low": 91500.0,
+        "prev_close": 91600.0,
+        "prev_volume": 368644.0,
+        "prev_turnover": 33767790400.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "267250",
+        "name": "HD현대",
+        "market": "KOSPI",
+        "best_k": 0.4,
+        "avg_return_pct": 1.09,
+        "win_rate_pct": 66.67,
+        "mdd_pct": 1.36,
+        "trades": 6,
+        "cumulative_return_pct": 6.66,
+        "avg_holding_days": 2.4,
+        "sharpe_m": 0.0,
+        "목표가": 191200,
+        "target_price": 191200,
+        "close": 188500.0,
+        "prev_open": 192600.0,
+        "prev_high": 193000.0,
+        "prev_low": 186200.0,
+        "prev_close": 188500.0,
+        "prev_volume": 162775.0,
+        "prev_turnover": 30683087500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "030200",
+        "name": "KT",
+        "market": "KOSPI",
+        "best_k": 0.2,
+        "avg_return_pct": 0.01,
+        "win_rate_pct": 33.33,
+        "mdd_pct": 3.25,
+        "trades": 12,
+        "cumulative_return_pct": -0.05,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 53550,
+        "target_price": 53550,
+        "close": 53400.0,
+        "prev_open": 54000.0,
+        "prev_high": 54000.0,
+        "prev_low": 53100.0,
+        "prev_close": 53400.0,
+        "prev_volume": 260596.0,
+        "prev_turnover": 13915826400.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      },
+      {
+        "code": "352820",
+        "name": "하이브",
+        "market": "KOSPI",
+        "best_k": 0.2,
+        "avg_return_pct": 0.31,
+        "win_rate_pct": 66.67,
+        "mdd_pct": 2.32,
+        "trades": 12,
+        "cumulative_return_pct": 3.66,
+        "avg_holding_days": 1.5,
+        "sharpe_m": 0.0,
+        "목표가": 316300,
+        "target_price": 316300,
+        "close": 314500.0,
+        "prev_open": 321000.0,
+        "prev_high": 321000.0,
+        "prev_low": 312000.0,
+        "prev_close": 314500.0,
+        "prev_volume": 243361.0,
+        "prev_turnover": 76537034500.0,
+        "forced_include": false,
+        "k_grid_mode": "fixed",
+        "qty": null,
+        "weight": 0.0625
+      }
+    ]
+  },
+  "data_health": {
+    "000660": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 599000.0,
+      "vwap": 589247.6589001272,
+      "last_price": 599000.0,
+      "reasons": []
+    },
+    "005290": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 38150.0,
+      "vwap": 37488.33010818894,
+      "last_price": 38150.0,
+      "reasons": []
+    },
+    "005380": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 286000.0,
+      "vwap": 289218.21111535846,
+      "last_price": 286000.0,
+      "reasons": []
+    },
+    "005935": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 88500.0,
+      "vwap": 85932.03237230147,
+      "last_price": 88500.0,
+      "reasons": []
+    },
+    "009540": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 403000.0,
+      "vwap": 416186.7725509214,
+      "last_price": 403000.0,
+      "reasons": []
+    },
+    "010130": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 1288000.0,
+      "vwap": 1314967.0605612998,
+      "last_price": 1288000.0,
+      "reasons": []
+    },
+    "012330": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 358000.0,
+      "vwap": 365283.6196166293,
+      "last_price": 358000.0,
+      "reasons": []
+    },
+    "012450": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 870000.0,
+      "vwap": 875926.6828136038,
+      "last_price": 870000.0,
+      "reasons": []
+    },
+    "030200": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 53400.0,
+      "vwap": 53485.17712920537,
+      "last_price": 53400.0,
+      "reasons": []
+    },
+    "030530": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 40100.0,
+      "vwap": 36375.83082658726,
+      "last_price": 40100.0,
+      "reasons": []
+    },
+    "032830": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 162500.0,
+      "vwap": 163760.6313200328,
+      "last_price": 162500.0,
+      "reasons": []
+    },
+    "035720": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 58100.0,
+      "vwap": 59714.94488181435,
+      "last_price": 58100.0,
+      "reasons": []
+    },
+    "035900": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 71100.0,
+      "vwap": 72021.33807829181,
+      "last_price": 71100.0,
+      "reasons": []
+    },
+    "039030": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 260000.0,
+      "vwap": 255020.69910897876,
+      "last_price": 260000.0,
+      "reasons": []
+    },
+    "058610": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 84600.0,
+      "vwap": 84781.64823102254,
+      "last_price": 84600.0,
+      "reasons": []
+    },
+    "064350": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 179800.0,
+      "vwap": 183790.62614203923,
+      "last_price": 179800.0,
+      "reasons": []
+    },
+    "064760": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 146000.0,
+      "vwap": 142859.1883614089,
+      "last_price": 146000.0,
+      "reasons": []
+    },
+    "065350": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 57400.0,
+      "vwap": 58740.12854847348,
+      "last_price": 57400.0,
+      "reasons": []
+    },
+    "066570": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 91600.0,
+      "vwap": 92668.60439048785,
+      "last_price": 91600.0,
+      "reasons": []
+    },
+    "067310": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 25100.0,
+      "vwap": 24062.433282880585,
+      "last_price": 25100.0,
+      "reasons": []
+    },
+    "145020": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 227000.0,
+      "vwap": 231637.41164591047,
+      "last_price": 227000.0,
+      "reasons": []
+    },
+    "160190": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 58400.0,
+      "vwap": 57035.92971413585,
+      "last_price": 58400.0,
+      "reasons": []
+    },
+    "226950": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 134800.0,
+      "vwap": 129490.87862563075,
+      "last_price": 134800.0,
+      "reasons": []
+    },
+    "237690": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 120900.0,
+      "vwap": 124854.5716112532,
+      "last_price": 120900.0,
+      "reasons": []
+    },
+    "247540": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 156300.0,
+      "vwap": 157660.24880126078,
+      "last_price": 156300.0,
+      "reasons": []
+    },
+    "267250": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 188500.0,
+      "vwap": 192473.43758484008,
+      "last_price": 188500.0,
+      "reasons": []
+    },
+    "277810": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 473500.0,
+      "vwap": 482781.48511285416,
+      "last_price": 473500.0,
+      "reasons": []
+    },
+    "298380": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 199000.0,
+      "vwap": 188565.93173859848,
+      "last_price": 199000.0,
+      "reasons": []
+    },
+    "310210": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 228500.0,
+      "vwap": 215976.29147098924,
+      "last_price": 228500.0,
+      "reasons": []
+    },
+    "319400": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 19260.0,
+      "vwap": 18936.67484063774,
+      "last_price": 19260.0,
+      "reasons": []
+    },
+    "347850": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 94900.0,
+      "vwap": 89421.5991942222,
+      "last_price": 94900.0,
+      "reasons": []
+    },
+    "352820": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 314500.0,
+      "vwap": 321689.776988356,
+      "last_price": 314500.0,
+      "reasons": []
+    },
+    "373220": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 383500.0,
+      "vwap": 389651.5360524942,
+      "last_price": 383500.0,
+      "reasons": []
+    },
+    "402340": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 334500.0,
+      "vwap": 327064.54704163346,
+      "last_price": 334500.0,
+      "reasons": []
+    },
+    "437730": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 55300.0,
+      "vwap": 57230.99550291205,
+      "last_price": 55300.0,
+      "reasons": []
+    },
+    "445680": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 101900.0,
+      "vwap": 98970.73853266821,
+      "last_price": 101900.0,
+      "reasons": []
+    },
+    "466100": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 64100.0,
+      "vwap": 66445.47361036846,
+      "last_price": 64100.0,
+      "reasons": []
+    },
+    "475830": {
+      "ok": true,
+      "daily_n": 60,
+      "intraday_n": 30,
+      "prev_close": 104300.0,
+      "vwap": 96561.39358142993,
+      "last_price": 104300.0,
+      "reasons": []
+    }
+  },
+  "setup": {
+    "000660": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "005290": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "005380": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "005935": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "009540": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "010130": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "012330": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "012450": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "030200": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "030530": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "032830": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "035720": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "035900": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "039030": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "058610": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "064350": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "064760": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "065350": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "066570": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "067310": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "145020": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "160190": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "226950": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "237690": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "247540": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "267250": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "277810": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "298380": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "310210": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "319400": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "347850": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "352820": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "373220": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "402340": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "437730": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "445680": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "466100": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    },
+    "475830": {
+      "setup_ok": true,
+      "missing": [],
+      "reasons": [],
+      "daily": {},
+      "intra": {}
+    }
+  },
+  "orphans": [],
+  "unknowns": [],
+  "exit_checks": [],
+  "positions": {
+    "000660": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 599000.0,
+        "vwap": 589247.6589001272,
+        "last_price": 599000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "005290": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 38150.0,
+        "vwap": 37488.33010818894,
+        "last_price": 38150.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "005380": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 286000.0,
+        "vwap": 289218.21111535846,
+        "last_price": 286000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "005935": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 88500.0,
+        "vwap": 85932.03237230147,
+        "last_price": 88500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "009540": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 403000.0,
+        "vwap": 416186.7725509214,
+        "last_price": 403000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "010130": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 1288000.0,
+        "vwap": 1314967.0605612998,
+        "last_price": 1288000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "012330": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 358000.0,
+        "vwap": 365283.6196166293,
+        "last_price": 358000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "012450": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 870000.0,
+        "vwap": 875926.6828136038,
+        "last_price": 870000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "030200": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 53400.0,
+        "vwap": 53485.17712920537,
+        "last_price": 53400.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "030530": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 40100.0,
+        "vwap": 36375.83082658726,
+        "last_price": 40100.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "032830": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 162500.0,
+        "vwap": 163760.6313200328,
+        "last_price": 162500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "035720": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 58100.0,
+        "vwap": 59714.94488181435,
+        "last_price": 58100.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "035900": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 71100.0,
+        "vwap": 72021.33807829181,
+        "last_price": 71100.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "039030": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 260000.0,
+        "vwap": 255020.69910897876,
+        "last_price": 260000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "058610": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 84600.0,
+        "vwap": 84781.64823102254,
+        "last_price": 84600.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "064350": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 179800.0,
+        "vwap": 183790.62614203923,
+        "last_price": 179800.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "064760": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 146000.0,
+        "vwap": 142859.1883614089,
+        "last_price": 146000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "065350": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 57400.0,
+        "vwap": 58740.12854847348,
+        "last_price": 57400.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "066570": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 91600.0,
+        "vwap": 92668.60439048785,
+        "last_price": 91600.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "067310": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 25100.0,
+        "vwap": 24062.433282880585,
+        "last_price": 25100.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "145020": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 227000.0,
+        "vwap": 231637.41164591047,
+        "last_price": 227000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "160190": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 58400.0,
+        "vwap": 57035.92971413585,
+        "last_price": 58400.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "226950": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 134800.0,
+        "vwap": 129490.87862563075,
+        "last_price": 134800.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "237690": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 120900.0,
+        "vwap": 124854.5716112532,
+        "last_price": 120900.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "247540": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 156300.0,
+        "vwap": 157660.24880126078,
+        "last_price": 156300.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "267250": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 188500.0,
+        "vwap": 192473.43758484008,
+        "last_price": 188500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "277810": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 473500.0,
+        "vwap": 482781.48511285416,
+        "last_price": 473500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "298380": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 199000.0,
+        "vwap": 188565.93173859848,
+        "last_price": 199000.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "310210": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 228500.0,
+        "vwap": 215976.29147098924,
+        "last_price": 228500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "319400": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 19260.0,
+        "vwap": 18936.67484063774,
+        "last_price": 19260.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "347850": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 94900.0,
+        "vwap": 89421.5991942222,
+        "last_price": 94900.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "352820": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 314500.0,
+        "vwap": 321689.776988356,
+        "last_price": 314500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "373220": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 383500.0,
+        "vwap": 389651.5360524942,
+        "last_price": 383500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "402340": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 334500.0,
+        "vwap": 327064.54704163346,
+        "last_price": 334500.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "437730": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 55300.0,
+        "vwap": 57230.99550291205,
+        "last_price": 55300.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "445680": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 101900.0,
+        "vwap": 98970.73853266821,
+        "last_price": 101900.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "466100": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 64100.0,
+        "vwap": 66445.47361036846,
+        "last_price": 64100.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "475830": {
+      "data_health": {
+        "ok": true,
+        "daily_n": 60,
+        "intraday_n": 30,
+        "prev_close": 104300.0,
+        "vwap": 96561.39358142993,
+        "last_price": 104300.0,
+        "reasons": []
+      },
+      "setup": {
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [],
+        "daily": {},
+        "intra": {}
+      }
+    }
+  }
+}
