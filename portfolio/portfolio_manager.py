@@ -10,16 +10,14 @@ from strategy.market_data import build_market_data
 import trader.intent_store as intent_store
 from trader.config import (
     DAILY_CAPITAL,
-    DIAGNOSTIC_MAX_SYMBOLS,
-    DIAGNOSTIC_MODE,
+    DIAG_ENABLED,
     DIAGNOSTIC_ONLY,
     DISABLE_KOSDAQ_LOOP,
     DISABLE_KOSPI_ENGINE,
     STRATEGY_INTENTS_PATH,
 )
-from trader.diagnostics import run_diagnostics
+from trader.diagnostics_runner import run_diagnostics_once
 from trader.intent_executor import IntentExecutor
-from trader.kis_wrapper import KisAPI
 import trader.state_store as state_store
 from trader.core_utils import get_rebalance_anchor_date
 from trader.subject_flow import reset_flow_call_count
@@ -59,8 +57,6 @@ class PortfolioManager:
         reset_flow_call_count()
         selected_by_market: Dict[str, Any] = {}
         diag_result: Dict[str, Any] | None = None
-        holdings: list[dict[str, Any]] = []
-        kis_client: KisAPI | None = None
         try:
             rebalance_date = str(get_rebalance_anchor_date())
             rebalance_payload = run_rebalance(rebalance_date, return_by_market=True)
@@ -75,45 +71,15 @@ class PortfolioManager:
             logger.exception("[PORTFOLIO] rebalance fetch failed: %s", e)
 
         runtime_state = state_store.load_state()
-        try:
-            kis_client = KisAPI()
-            holdings = kis_client.get_positions()
-        except Exception as e:
-            logger.exception("[PORTFOLIO] failed to init KIS client for diagnostics: %s", e)
-            kis_client = None
-            holdings = []
-
-        symbols: list[str] = []
-        for rows in (selected_by_market or {}).values():
-            for row in rows or []:
-                code = str(row.get("code") or row.get("stock_code") or "").strip().lstrip("A").zfill(6)
-                if code and code != "000000":
-                    symbols.append(code)
-        for row in holdings or []:
-            code = str(row.get("pdno") or row.get("code") or "").strip().lstrip("A").zfill(6)
-            if code and code != "000000":
-                symbols.append(code)
-        if symbols:
-            symbols = sorted({c for c in symbols if c})[:DIAGNOSTIC_MAX_SYMBOLS]
-
         logger.info(
             "[DIAG][PM] diagnostic_mode=%s diagnostic_only=%s",
-            DIAGNOSTIC_MODE,
+            DIAG_ENABLED,
             DIAGNOSTIC_ONLY,
         )
-        if DIAGNOSTIC_MODE:
+        if DIAG_ENABLED:
             os.environ["DISABLE_LIVE_TRADING"] = "true"
-            logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true")
-            diag_result = run_diagnostics(
-                selected_by_market=selected_by_market,
-                kis_client=kis_client,
-                pos_state=runtime_state,
-                symbols=symbols,
-            )
-            try:
-                state_store.save_state(runtime_state)
-            except Exception as e:
-                logger.exception("[DIAG][PM] failed to save diagnostic state: %s", e)
+            logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s", DIAG_ENABLED)
+            diag_result = run_diagnostics_once()
             if DIAGNOSTIC_ONLY:
                 return {
                     "diagnostics": diag_result,

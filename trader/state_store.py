@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -14,6 +15,11 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 2
 RUNTIME_STATE_DIR = Path(".runtime")
 RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
+_LOT_ID_PREFIX = "LOT"
+
+
+def _normalize_code(symbol: str | int | None) -> str:
+    return str(symbol or "").zfill(6)
 
 
 def _default_runtime_state() -> Dict[str, Any]:
@@ -22,6 +28,7 @@ def _default_runtime_state() -> Dict[str, Any]:
         "updated_at": None,
         "positions": {},
         "orders": {},
+        "lots": [],
         "memory": {"last_price": {}, "last_seen": {}, "last_strategy_id": {}},
     }
 
@@ -46,6 +53,10 @@ def load_state() -> Dict[str, Any]:
         memory.setdefault("last_seen", {})
         memory.setdefault("last_strategy_id", {})
         state.setdefault("updated_at", None)
+        lots = state.get("lots")
+        if not isinstance(lots, list):
+            lots = []
+            state["lots"] = lots
         positions = state.get("positions")
         if isinstance(positions, dict):
             for sym, payload in list(positions.items()):
@@ -64,6 +75,7 @@ def save_state(state: Dict[str, Any]) -> None:
         payload.setdefault("schema_version", SCHEMA_VERSION)
         payload.setdefault("positions", {})
         payload.setdefault("orders", {})
+        payload.setdefault("lots", [])
         payload.setdefault("memory", {"last_price": {}, "last_seen": {}, "last_strategy_id": {}})
         payload["updated_at"] = datetime.now(KST).isoformat()
         tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
@@ -80,6 +92,127 @@ def save_state(state: Dict[str, Any]) -> None:
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
 
+
+def _ensure_lots(state: Dict[str, Any]) -> list[dict[str, Any]]:
+    lots = state.get("lots")
+    if not isinstance(lots, list):
+        lots = []
+        state["lots"] = lots
+    return lots
+
+
+def _generate_lot_id(code: str, ts: str | None = None) -> str:
+    suffix = ts or datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+    return f"{_LOT_ID_PREFIX}-{_normalize_code(code)}-{suffix}-{uuid.uuid4().hex[:6]}"
+
+
+def _norm_sid(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return str(value)
+
+
+def record_lot_open(
+    state: Dict[str, Any],
+    *,
+    code: str,
+    sid: Any,
+    strategy: str,
+    engine: str,
+    qty: int,
+    entry_price: float,
+    entry_ts: str | None = None,
+    order_id: str | None = None,
+    lot_id: str | None = None,
+) -> Dict[str, Any]:
+    lots = _ensure_lots(state)
+    ts = entry_ts or datetime.now(KST).isoformat()
+    lot_identifier = lot_id or _generate_lot_id(code, ts)
+    payload = {
+        "lot_id": lot_identifier,
+        "code": _normalize_code(code),
+        "pdno": _normalize_code(code),
+        "sid": sid,
+        "strategy_id": sid,
+        "strategy": strategy,
+        "engine": engine,
+        "qty": int(qty),
+        "remaining_qty": int(qty),
+        "entry_ts": ts,
+        "entry_price": float(entry_price),
+        "order_id": order_id,
+        "status": "OPEN",
+    }
+    lots.append(payload)
+    logger.info(
+        "[LOT-OPEN] lot_id=%s code=%s sid=%s strategy=%s qty=%s entry_px=%s",
+        lot_identifier,
+        payload["code"],
+        sid,
+        strategy,
+        qty,
+        entry_price,
+    )
+    return payload
+
+
+def _apply_sell_to_lots(
+    state: Dict[str, Any],
+    *,
+    code: str,
+    qty: int,
+    strategy_id: Any = None,
+    order_id: str | None = None,
+    price: float | None = None,
+    ts: str | None = None,
+) -> None:
+    lots = _ensure_lots(state)
+    remaining = int(qty)
+    if remaining <= 0:
+        return
+    ts_val = ts or datetime.now(KST).isoformat()
+    target_code = _normalize_code(code)
+    sid_filter = _norm_sid(strategy_id)
+
+    def _consume(filter_sid: Any | None, remaining_qty: int) -> int:
+        for lot in lots:
+            if str(lot.get("status") or "OPEN").upper() != "OPEN":
+                continue
+            if _normalize_code(lot.get("code") or lot.get("pdno")) != target_code:
+                continue
+            lot_sid = _norm_sid(lot.get("sid") or lot.get("strategy_id"))
+            if filter_sid is not None and lot_sid != filter_sid:
+                continue
+            lot_rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
+            if lot_rem <= 0:
+                continue
+            delta = min(lot_rem, remaining_qty)
+            lot["remaining_qty"] = int(lot_rem - delta)
+            lot["qty"] = int(max(0, int(lot.get("qty") or 0) - delta))
+            lot["last_order_id"] = order_id or lot.get("last_order_id")
+            lot["last_exit_ts"] = ts_val
+            if price is not None:
+                lot["last_exit_price"] = float(price)
+            if int(lot.get("remaining_qty") or 0) <= 0:
+                lot["status"] = "CLOSED"
+            remaining_qty -= delta
+            if remaining_qty <= 0:
+                break
+        return remaining_qty
+
+    remaining = _consume(sid_filter, remaining)
+    if remaining > 0 and sid_filter is not None:
+        remaining = _consume(None, remaining)
+    if remaining > 0:
+        logger.warning(
+            "[RUNTIME_STATE][LOT_SELL_MISMATCH] code=%s sid=%s remaining_unmatched=%s",
+            target_code,
+            sid_filter,
+            remaining,
+        )
 
 def get_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any] | None:
     positions = state.get("positions", {})
@@ -178,6 +311,31 @@ def mark_fill(
     status: str = "filled",
 ) -> None:
     pos = get_position(state, symbol) or {}
+    try:
+        if side.upper() == "BUY":
+            record_lot_open(
+                state,
+                code=symbol,
+                sid=strategy_id,
+                strategy=str(strategy_id),
+                engine=str(pos.get("engine") or "unknown"),
+                qty=int(qty),
+                entry_price=float(price),
+                entry_ts=ts,
+                order_id=order_id,
+            )
+        else:
+            _apply_sell_to_lots(
+                state,
+                code=symbol,
+                qty=int(qty),
+                strategy_id=strategy_id,
+                order_id=order_id,
+                price=float(price),
+                ts=ts,
+            )
+    except Exception:
+        logger.exception("[RUNTIME_STATE] lot update failed for %s", symbol)
     cur_qty = int(pos.get("qty") or 0)
     cur_avg = float(pos.get("avg_price") or 0.0)
     if side.upper() == "BUY":
@@ -196,6 +354,11 @@ def mark_fill(
     pos["last_action_ts"] = ts
     pos["last_order_status"] = status
     update_position_fields(state, symbol, pos)
+    try:
+        if side.upper() == "BUY":
+            save_state(state)
+    except Exception:
+        logger.exception("[RUNTIME_STATE] failed to persist after lot open for %s", symbol)
 
 
 def reconcile_with_kis_balance(
@@ -206,6 +369,16 @@ def reconcile_with_kis_balance(
 ) -> Dict[str, Any]:
     preferred_strategy = preferred_strategy or {}
     positions = state.setdefault("positions", {})
+    lots = _ensure_lots(state)
+    open_qty_by_code: Dict[str, int] = {}
+    for lot in lots:
+        if str(lot.get("status") or "OPEN").upper() != "OPEN":
+            continue
+        code_key = _normalize_code(lot.get("code") or lot.get("pdno"))
+        rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
+        if not code_key or rem <= 0:
+            continue
+        open_qty_by_code[code_key] = open_qty_by_code.get(code_key, 0) + rem
     balance_positions = balance.get("positions") if isinstance(balance, dict) else None
     if not isinstance(balance_positions, list):
         return state
@@ -228,6 +401,28 @@ def reconcile_with_kis_balance(
                 "last_action": "RECONCILE",
             }
         )
+        open_qty = open_qty_by_code.get(symbol, 0)
+        if open_qty < qty:
+            orphan_qty = qty - open_qty
+            try:
+                record_lot_open(
+                    state,
+                    code=symbol,
+                    sid="UNKNOWN",
+                    strategy="ORPHAN",
+                    engine="reconcile",
+                    qty=orphan_qty,
+                    entry_price=float(row.get("avg_price") or 0.0),
+                    entry_ts=datetime.now(KST).isoformat(),
+                )
+                logger.warning(
+                    "[ORPHAN-LOT] code=%s qty=%s reason=%s",
+                    symbol,
+                    orphan_qty,
+                    "RECONCILE_NO_LOT",
+                )
+            except Exception:
+                logger.exception("[ORPHAN-LOT][FAIL] code=%s qty=%s", symbol, orphan_qty)
     for symbol, pos in list(positions.items()):
         if symbol not in seen:
             pos["qty"] = 0

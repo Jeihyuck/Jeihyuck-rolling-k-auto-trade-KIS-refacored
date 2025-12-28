@@ -38,8 +38,14 @@ Run a diagnostics-only pass (no KIS orders) even on non-trading days:
 ```
 DIAGNOSTIC_MODE=true DIAGNOSTIC_ONLY=true python -m trader.trader
 ```
-Expected log markers for grep:
-- `[DIAG][START]`, `[DIAG][RECONCILE]`, `[DIAG][DATA-HEALTH]`, `[DIAG][SETUP]`, `[DIAG][EXIT-PROBE]`, `[DIAG][END]`
+Key log markers for grep:
+- `[DIAG][TRADER] forcing DISABLE_LIVE_TRADING=true ...`
+- `[DIAG][STATE] reconciled positions=...`
+- `[DIAG][REBALANCE] kospi=... kosdaq=...`
+- `[DATA-HEALTH] code=... reasons=[...]`
+- `[SETUP-BAD] ... reasons=['...']` (never empty on failures)
+- `[ORPHAN]` / `[UNKNOWN]` aggregates
+- `[DIAG][DUMP] path=...`
 
 ## Strategy intent mode (single-account multi-strategy)
 - A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
