@@ -17,12 +17,16 @@ from strategy.strategies import (
 )
 from strategy.types import OrderIntent
 from trader.config import (
+    ACTIVE_STRATEGIES,
+    ALLOW_ADOPT_UNMANAGED,
     DAILY_CAPITAL,
     ENABLED_STRATEGIES_SET,
     KST,
     STRATEGY_MAX_POSITION_PCT,
     STRATEGY_WEIGHTS,
+    UNMANAGED_STRATEGY_ID,
 )
+from trader import state_store as runtime_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +68,14 @@ class StrategyManager:
     def enabled_slots(self) -> list[StrategySlot]:
         enabled: list[StrategySlot] = []
         for slot in self.slots:
+            if slot.sid not in ACTIVE_STRATEGIES:
+                logger.info(
+                    "[STRATEGY_MANAGER] strategy %s sid=%s not in active_strategies=%s -> skipped",
+                    slot.name,
+                    slot.sid,
+                    sorted(ACTIVE_STRATEGIES),
+                )
+                continue
             if slot.name not in ENABLED_STRATEGIES_SET:
                 continue
             if float(slot.weight) <= 0:
@@ -99,6 +111,8 @@ class StrategyManager:
         return max(qty, 0)
 
     def _position_matches_strategy(self, position: Dict[str, Any], slot: StrategySlot) -> bool:
+        if not bool(position.get("managed")):
+            return False
         strategy_id = position.get("strategy_id")
         if strategy_id is None:
             return False
@@ -151,6 +165,32 @@ class StrategyManager:
         qty = self._size_position(slot.weight, float(price or 0))
         if qty <= 0:
             return []
+        pos = (portfolio_state.get("positions") or {}).get(str(symbol).zfill(6)) if isinstance(portfolio_state, dict) else None
+        if slot.sid == 1 and isinstance(pos, dict) and not bool(pos.get("managed")):
+            if not ALLOW_ADOPT_UNMANAGED:
+                logger.info(
+                    "[UNMANAGED-SKIP-ENTRY] code=%s reason=ALREADY_HELD_UNMANAGED strategy_id=%s",
+                    str(symbol).zfill(6),
+                    pos.get("strategy_id"),
+                )
+                return []
+            pos["strategy_id"] = slot.sid
+            pos["managed"] = True
+            pos["position_key"] = f"{str(symbol).zfill(6)}:{slot.sid}"
+            pos.setdefault("opened_at", pos.get("opened_at") or datetime.now(KST).isoformat())
+            pos["updated_at"] = datetime.now(KST).isoformat()
+            try:
+                state = portfolio_state or runtime_state_store.load_state()
+                state.setdefault("positions", {})[str(symbol).zfill(6)] = pos
+                runtime_state_store.save_state(state)
+                logger.info(
+                    "[UNMANAGED-ADOPT] code=%s adopted_by_strategy=%s allow_adopt_unmanaged=%s",
+                    str(symbol).zfill(6),
+                    slot.sid,
+                    ALLOW_ADOPT_UNMANAGED,
+                )
+            except Exception:
+                logger.exception("[UNMANAGED-ADOPT][FAIL] code=%s strategy=%s", str(symbol).zfill(6), slot.sid)
         order_type = entry.get("order_type") or "MARKET"
         limit_price = entry.get("limit_price")
         reason = entry.get("reason") or f"{slot.name}_entry"
@@ -178,6 +218,14 @@ class StrategyManager:
         positions = portfolio_state.get("positions", {}) if isinstance(portfolio_state, dict) else {}
         for symbol, position in positions.items():
             if not isinstance(position, dict):
+                continue
+            if not bool(position.get("managed")):
+                logger.info(
+                    "[UNMANAGED-SKIP-EXIT] code=%s qty=%s strategy_id=%s reason=UNMANAGED_HOLDING",
+                    symbol,
+                    position.get("qty"),
+                    position.get("strategy_id"),
+                )
                 continue
             if not self._position_matches_strategy(position, slot):
                 continue

@@ -8,11 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from .config import KST, STATE_PATH
+from .config import ACTIVE_STRATEGIES, KST, STATE_PATH, UNMANAGED_STRATEGY_ID
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RUNTIME_STATE_DIR = Path(".runtime")
 RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
 _LOT_ID_PREFIX = "LOT"
@@ -20,6 +20,23 @@ _LOT_ID_PREFIX = "LOT"
 
 def _normalize_code(symbol: str | int | None) -> str:
     return str(symbol or "").zfill(6)
+
+
+def _normalize_strategy_id(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return value
+
+
+def _is_managed(strategy_id: Any, active_strategies: set[int] | None = None) -> bool:
+    try:
+        sid_int = int(strategy_id)
+    except Exception:
+        return False
+    return sid_int in (active_strategies or ACTIVE_STRATEGIES)
 
 
 def _default_runtime_state() -> Dict[str, Any]:
@@ -62,6 +79,16 @@ def load_state() -> Dict[str, Any]:
             for sym, payload in list(positions.items()):
                 if not isinstance(payload, dict):
                     positions[sym] = {}
+                    payload = positions[sym]
+                code_norm = _normalize_code(sym)
+                payload.setdefault("code", code_norm)
+                sid = _normalize_strategy_id(payload.get("strategy_id"))
+                payload["strategy_id"] = sid if sid is not None else UNMANAGED_STRATEGY_ID
+                payload["managed"] = _is_managed(payload.get("strategy_id"))
+                payload.setdefault("opened_at", payload.get("opened_at") or None)
+                payload.setdefault("updated_at", payload.get("updated_at") or None)
+                payload.setdefault("meta", {})
+                payload["position_key"] = f"{code_norm}:{payload.get('strategy_id')}"
         return state
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
@@ -245,6 +272,14 @@ def upsert_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     if not isinstance(pos, dict):
         pos = {}
     positions[key] = pos
+    pos.setdefault("code", key)
+    sid = _normalize_strategy_id(pos.get("strategy_id"))
+    if sid is None:
+        pos["strategy_id"] = UNMANAGED_STRATEGY_ID
+    else:
+        pos["strategy_id"] = sid
+    pos["managed"] = _is_managed(pos.get("strategy_id"))
+    pos["position_key"] = f"{key}:{pos.get('strategy_id')}"
     return pos
 
 
@@ -355,6 +390,12 @@ def mark_fill(
         logger.exception("[RUNTIME_STATE] lot update failed for %s", symbol)
     cur_qty = int(pos.get("qty") or 0)
     cur_avg = float(pos.get("avg_price") or 0.0)
+    code_key = _normalize_code(symbol)
+    pos.setdefault("code", code_key)
+    pos["strategy_id"] = _normalize_strategy_id(strategy_id)
+    pos["managed"] = _is_managed(pos.get("strategy_id"))
+    pos["position_key"] = f"{code_key}:{pos.get('strategy_id')}"
+    pos.setdefault("opened_at", pos.get("opened_at") or ts)
     if side.upper() == "BUY":
         total_qty = cur_qty + int(qty)
         avg_price = (
@@ -365,17 +406,16 @@ def mark_fill(
         pos.update({"qty": total_qty, "avg_price": avg_price, "last_buy_ts": ts})
     else:
         pos.update({"qty": max(0, cur_qty - int(qty)), "last_sell_ts": ts})
-    pos["strategy_id"] = strategy_id
     pos["last_order_id"] = order_id
     pos["last_action"] = side.upper()
     pos["last_action_ts"] = ts
     pos["last_order_status"] = status
+    pos["updated_at"] = ts
     update_position_fields(state, symbol, pos)
     try:
-        if side.upper() == "BUY":
-            save_state(state)
+        save_state(state)
     except Exception:
-        logger.exception("[RUNTIME_STATE] failed to persist after lot open for %s", symbol)
+        logger.exception("[RUNTIME_STATE] failed to persist after lot update for %s", symbol)
 
 
 def reconcile_with_kis_balance(
@@ -383,8 +423,11 @@ def reconcile_with_kis_balance(
     balance: Dict[str, Any],
     *,
     preferred_strategy: Dict[str, Any] | None = None,
+    active_strategies: set[int] | None = None,
+    unmanaged_strategy_id: int = 0,
 ) -> Dict[str, Any]:
     preferred_strategy = preferred_strategy or {}
+    active_strategies = active_strategies or set()
     positions = state.setdefault("positions", {})
     lots = _ensure_lots(state)
     state_lots_by_code: Dict[str, list[dict[str, Any]]] = {}
@@ -427,15 +470,29 @@ def reconcile_with_kis_balance(
         avg = holding["avg"] if holding["avg"] != 0.0 else None
         cur = holding["cur"]
         pos = upsert_position(state, code)
-        strategy_id = pos.get("strategy_id") or preferred_strategy.get(code) or "UNKNOWN"
+        pos_meta = pos.setdefault("meta", {})
+        raw_strategy_id = pos.get("strategy_id") or preferred_strategy.get(code)
+        strategy_id = raw_strategy_id if raw_strategy_id not in (None, "") else unmanaged_strategy_id
+        managed = _is_managed(strategy_id, active_strategies)
+        if not managed and raw_strategy_id not in (None, "", unmanaged_strategy_id):
+            strategy_id = unmanaged_strategy_id
         pos.update(
             {
                 "strategy_id": strategy_id,
+                "managed": managed,
                 "qty": qty,
                 "avg_price": float(holding["avg"] or 0.0),
                 "last_action": "RECONCILE",
+                "updated_at": now_iso,
+                "opened_at": pos.get("opened_at") or now_iso,
+                "position_key": f"{code}:{strategy_id}",
             }
         )
+        if not managed:
+            pos_meta.setdefault("created_by", "reconcile_unmanaged")
+            notes = pos_meta.setdefault("notes", [])
+            if isinstance(notes, list):
+                notes.append("UNMANAGED_HOLDING")
         state_lots = state_lots_by_code.get(code, [])
         state_sum = sum(int(l.get("remaining_qty") or l.get("qty") or 0) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN")
         if not state_lots:

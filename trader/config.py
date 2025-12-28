@@ -111,6 +111,8 @@ CONFIG = {
     "STRATEGY_WEIGHTS": "",
     "DISABLE_KOSDAQ_LOOP": "false",
     "DISABLE_KOSPI_ENGINE": "false",
+    "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+    "ALLOW_ADOPT_UNMANAGED": "false",
 }
 
 
@@ -290,6 +292,32 @@ def _parse_strategy_priority(raw: str) -> list[int]:
 
 STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
     _cfg("STRATEGY_REDUCTION_PRIORITY")
+)
+
+
+def _parse_active_strategies(raw: str) -> set[int]:
+    strategies: set[int] = set()
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            sid = int(item)
+        except ValueError:
+            continue
+        if sid >= 0:
+            strategies.add(sid)
+    if not strategies:
+        return {1}
+    return strategies
+
+
+ACTIVE_STRATEGIES = _parse_active_strategies(_cfg("ACTIVE_STRATEGIES"))
+UNMANAGED_STRATEGY_ID = 0
+ALLOW_ADOPT_UNMANAGED = (_cfg("ALLOW_ADOPT_UNMANAGED") or "false").lower() in (
+    "1",
+    "true",
+    "yes",
 )
 # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
 USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"

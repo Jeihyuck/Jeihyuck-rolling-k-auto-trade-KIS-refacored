@@ -9,11 +9,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader import state_store as runtime_state_store
 from trader.config import (
+    ACTIVE_STRATEGIES,
     DIAG_ENABLED,
     DIAGNOSTIC_DUMP_DIR,
     DIAGNOSTIC_MAX_SYMBOLS,
     DIAGNOSTIC_TARGET_MARKETS,
     KST,
+    UNMANAGED_STRATEGY_ID,
 )
 from trader.core_utils import get_rebalance_anchor_date
 from trader.data_health import check_data_health
@@ -203,7 +205,12 @@ def run_diagnostics(
     selected_by_market = _filter_markets(selected_by_market, target_markets)
     balance, holdings = _load_balance(kis)
     try:
-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance)
+        runtime_state = runtime_state_store.reconcile_with_kis_balance(
+            runtime_state,
+            balance,
+            active_strategies=ACTIVE_STRATEGIES,
+            unmanaged_strategy_id=UNMANAGED_STRATEGY_ID,
+        )
         runtime_state_store.save_state(runtime_state)
         logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
     except Exception:
@@ -220,6 +227,8 @@ def run_diagnostics(
 
     orphan_n = 0
     unknown_n = 0
+    unmanaged_n = 0
+    managed_n = 0
     for row in holdings:
         qty = _safe_qty(row)
         if qty <= 0:
@@ -242,7 +251,19 @@ def run_diagnostics(
             )
             continue
         sid = pos.get("sid") or pos.get("strategy_id")
-        if sid is None or str(sid).strip() == "" or str(sid).upper() == "UNKNOWN":
+        sid_str = str(sid).strip()
+        if sid is None or sid_str == "" or sid_str == str(UNMANAGED_STRATEGY_ID):
+            unmanaged_n += 1
+            _record_orphan_or_unknown(
+                runtime_state=runtime_state,
+                code=code,
+                qty=qty,
+                avg=avg,
+                kind="UNMANAGED",
+                reason="STRATEGY_ID_UNMANAGED",
+                ts=ts_iso,
+            )
+        elif sid_str.upper() == "UNKNOWN":
             unknown_n += 1
             _record_orphan_or_unknown(
                 runtime_state=runtime_state,
@@ -253,6 +274,8 @@ def run_diagnostics(
                 reason="STRATEGY_ID_UNKNOWN",
                 ts=ts_iso,
             )
+        else:
+            managed_n += 1
 
     data_health_results: Dict[str, Any] = {}
     setup_eval_results: Dict[str, Any] = {}
@@ -322,27 +345,30 @@ def run_diagnostics(
     exit_eval_results: Dict[str, Any] = {}
     for code, pos in (positions or {}).items():
         qty = int(pos.get("qty") or 0)
-        sid = pos.get("sid") or pos.get("strategy_id") or "UNKNOWN"
-        strategy_id = pos.get("strategy_id") or "UNKNOWN"
+        sid = pos.get("sid") or pos.get("strategy_id") or UNMANAGED_STRATEGY_ID
+        strategy_id = pos.get("strategy_id") or UNMANAGED_STRATEGY_ID
+        sid_str = str(sid).strip().upper()
+        strategy_id_str = str(strategy_id).strip().upper()
+        managed = bool(pos.get("managed")) and strategy_id_str not in {"", "UNKNOWN"} and strategy_id_str != str(UNMANAGED_STRATEGY_ID)
         reasons: List[str] = []
-        if sid in (None, "", "UNKNOWN"):
-            reasons.append("MISSING_SID")
-        if strategy_id in (None, "", "UNKNOWN"):
-            reasons.append("MISSING_STRATEGY_ID")
+        if not managed:
+            if strategy_id_str == "UNKNOWN":
+                unknown_n += 1
+                reasons.append("UNKNOWN_STRATEGY_ID")
+            else:
+                unmanaged_n += 1
+                reasons.append("UNMANAGED_HOLDING")
+            logger.info(
+                "[UNMANAGED-SKIP-EXIT] code=%s qty=%s strategy_id=%s reason=%s",
+                code,
+                qty,
+                strategy_id,
+                reasons[-1],
+            )
         if qty <= 0:
             reasons.append("QTY_ZERO")
-        if sid in (None, "", "UNKNOWN") or strategy_id in (None, "", "UNKNOWN"):
-            unknown_n += 1
-            _record_orphan_or_unknown(
-                runtime_state=runtime_state,
-                code=code,
-                qty=qty,
-                avg=float(pos.get("avg_price") or 0.0),
-                kind="UNKNOWN",
-                reason="EXIT_STRATEGY_ID_MISSING",
-                ts=ts_iso,
-                source="state",
-            )
+        if managed:
+            managed_n += 1
         if not reasons:
             exit_ok = True
             reasons = ["EMPTY_EXIT_REASON_GUARD"]
@@ -353,6 +379,7 @@ def run_diagnostics(
             "sid": sid or "UNKNOWN",
             "strategy_id": strategy_id,
             "qty": qty,
+            "managed": managed,
             "exit_ok": exit_ok,
             "reasons": reasons,
         }
@@ -370,6 +397,20 @@ def run_diagnostics(
     data_health_fail_n = sum(1 for v in data_health_results.values() if not v.get("ok"))
     setup_bad_n = sum(1 for v in setup_eval_results.values() if not v.get("setup_ok"))
 
+    managed_positions_count = 0
+    unmanaged_positions_count = 0
+    unknown_positions_count = 0
+    if isinstance(positions, dict):
+        for pos in positions.values():
+            sid_val = str((pos or {}).get("strategy_id")).strip().upper()
+            if sid_val == "UNKNOWN":
+                unknown_positions_count += 1
+                continue
+            if bool((pos or {}).get("managed")):
+                managed_positions_count += 1
+            else:
+                unmanaged_positions_count += 1
+
     diag_payload = {
         "as_of": ts_iso,
         "diag_enabled": bool(DIAG_ENABLED),
@@ -384,6 +425,9 @@ def run_diagnostics(
         "orphans": runtime_state["diagnostics"]["orphans"],
         "selected_by_market": selected_by_market or {},
         "balance": balance,
+        "managed_positions": managed_positions_count,
+        "unmanaged_positions": unmanaged_positions_count,
+        "unknown_positions": unknown_positions_count,
     }
 
     diag_path = DIAGNOSTIC_DUMP_DIR / "diag_latest.json"

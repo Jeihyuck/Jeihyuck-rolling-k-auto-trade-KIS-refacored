@@ -1054,7 +1054,7 @@ class KisAPI:
         return {"price": None, "prev_close": None, "vwap": None}
 
     # ----- 잔고/포지션 -----
-    def _parse_cash_from_output2(self, out2: Any) -> int:
+    def _parse_cash_from_output2(self, out2: Any) -> tuple[int, dict]:
         """
         ✅ 예수금 파싱 규칙:
         1) ord_psbl_cash (주문가능현금)
@@ -1077,19 +1077,22 @@ class KisAPI:
         elif isinstance(out2, dict):
             row = out2
         else:
-            return 0
+            return 0, {}
 
-        cash = _to_int(row.get("ord_psbl_cash"))
-        if cash <= 0:
-            cash = _to_int(row.get("nrcvb_buy_amt"))
-        if cash <= 0:
-            cash = _to_int(row.get("dnca_tot_amt"))
-
-        if cash < 0:
-            logger.warning("[CASH_BALANCE] 음수 → 0 보정 (raw=%s)", cash)
-            cash = 0
-
-        return cash
+        raw_fields = {
+            "ord_psbl_cash": row.get("ord_psbl_cash"),
+            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+            "dnca_tot_amt": row.get("dnca_tot_amt"),
+        }
+        selected_key = None
+        cash = 0
+        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
+            if key in row:
+                selected_key = key
+                cash = _to_int(row.get(key))
+                break
+        clamp_applied = False
+        return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
 
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
         """잔고 1페이지 호출(예외는 상위에서 처리)."""
@@ -1171,7 +1174,14 @@ class KisAPI:
         try:
             j = self.inquire_balance_all()
             out2 = j.get("output2")
-            cash = self._parse_cash_from_output2(out2)
+            cash, meta = self._parse_cash_from_output2(out2)
+            logger.info(
+                "[CASH] raw=%s orderable=%s source_fields=%s clamp_applied=%s",
+                meta.get("raw_fields"),
+                cash,
+                meta.get("selected_key"),
+                meta.get("clamp_applied"),
+            )
             if cash > 0:
                 self._last_cash = cash
                 logger.info("[CASH_BALANCE_OK] ord_psbl_cash≈%s원", f"{cash:,}")

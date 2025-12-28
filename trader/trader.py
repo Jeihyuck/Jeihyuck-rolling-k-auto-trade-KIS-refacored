@@ -10,7 +10,14 @@ from trader.kis_wrapper import KisAPI
 from trader import state_store as runtime_state_store
 from trader.time_utils import is_trading_day, now_kst
 from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
-from trader.config import DIAG_ENABLED, DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
+from trader.config import (
+    ACTIVE_STRATEGIES,
+    ALLOW_ADOPT_UNMANAGED,
+    DIAG_ENABLED,
+    DIAGNOSTIC_FORCE_RUN,
+    DIAGNOSTIC_MODE,
+    DIAGNOSTIC_ONLY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +25,7 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     now = now_kst()
     diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
+    disable_live_env = os.getenv("DISABLE_LIVE_TRADING", "").lower()
     logger.info(
         "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
         now.isoformat(),
@@ -26,6 +34,12 @@ def main() -> None:
         DIAGNOSTIC_FORCE_RUN,
         DIAGNOSTIC_ONLY,
         DIAGNOSTIC_MODE,
+    )
+    logger.info(
+        "[TRADER][STARTUP] active_strategies=%s live_trading_enabled_env=%s allow_adopt_unmanaged=%s",
+        sorted(ACTIVE_STRATEGIES),
+        disable_live_env not in {"1", "true", "yes", "on"},
+        ALLOW_ADOPT_UNMANAGED,
     )
     if diag_enabled:
         os.environ["DISABLE_LIVE_TRADING"] = "true"
@@ -51,7 +65,9 @@ def main() -> None:
         kis = KisAPI()
         balance = kis.get_balance()
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
-            runtime_state, balance
+            runtime_state,
+            balance,
+            active_strategies=ACTIVE_STRATEGIES,
         )
         runtime_state_store.save_state(runtime_state)
         logger.info("[TRADER] runtime state reconciled")
