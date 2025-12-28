@@ -1,16 +1,1006 @@
 {
   "schema_version": 2,
-  "updated_at": "2025-12-28T22:02:30.153930+09:00",
-  "positions": {},
+  "updated_at": "2025-12-28T22:38:14.327073+09:00",
+  "positions": {
+    "000660": {
+      "strategy_id": "UNKNOWN",
+      "qty": 42,
+      "avg_price": 591517.857,
+      "last_action": "RECONCILE"
+    },
+    "005290": {
+      "strategy_id": "UNKNOWN",
+      "qty": 746,
+      "avg_price": 37600.0,
+      "last_action": "RECONCILE"
+    },
+    "005380": {
+      "strategy_id": "UNKNOWN",
+      "qty": 61,
+      "avg_price": 290975.409,
+      "last_action": "RECONCILE"
+    },
+    "006800": {
+      "strategy_id": "UNKNOWN",
+      "qty": 599,
+      "avg_price": 23403.171,
+      "last_action": "RECONCILE"
+    },
+    "009540": {
+      "strategy_id": "UNKNOWN",
+      "qty": 86,
+      "avg_price": 414703.488,
+      "last_action": "RECONCILE"
+    },
+    "010120": {
+      "strategy_id": "UNKNOWN",
+      "qty": 77,
+      "avg_price": 461340.573,
+      "last_action": "RECONCILE"
+    },
+    "010130": {
+      "strategy_id": "UNKNOWN",
+      "qty": 26,
+      "avg_price": 1321769.23,
+      "last_action": "RECONCILE"
+    },
+    "012330": {
+      "strategy_id": "UNKNOWN",
+      "qty": 49,
+      "avg_price": 365096.365,
+      "last_action": "RECONCILE"
+    },
+    "012450": {
+      "strategy_id": "UNKNOWN",
+      "qty": 24,
+      "avg_price": 884613.333,
+      "last_action": "RECONCILE"
+    },
+    "015760": {
+      "strategy_id": "UNKNOWN",
+      "qty": 752,
+      "avg_price": 48278.588,
+      "last_action": "RECONCILE"
+    },
+    "028260": {
+      "strategy_id": "UNKNOWN",
+      "qty": 91,
+      "avg_price": 242082.417,
+      "last_action": "RECONCILE"
+    },
+    "030200": {
+      "strategy_id": "UNKNOWN",
+      "qty": 415,
+      "avg_price": 53751.084,
+      "last_action": "RECONCILE"
+    },
+    "035420": {
+      "strategy_id": "UNKNOWN",
+      "qty": 213,
+      "avg_price": 233720.707,
+      "last_action": "RECONCILE"
+    },
+    "035720": {
+      "strategy_id": "UNKNOWN",
+      "qty": 241,
+      "avg_price": 58100.0,
+      "last_action": "RECONCILE"
+    },
+    "064760": {
+      "strategy_id": "UNKNOWN",
+      "qty": 194,
+      "avg_price": 143934.02,
+      "last_action": "RECONCILE"
+    },
+    "065350": {
+      "strategy_id": "UNKNOWN",
+      "qty": 483,
+      "avg_price": 58019.047,
+      "last_action": "RECONCILE"
+    },
+    "066570": {
+      "strategy_id": "UNKNOWN",
+      "qty": 388,
+      "avg_price": 93458.762,
+      "last_action": "RECONCILE"
+    },
+    "098460": {
+      "strategy_id": "UNKNOWN",
+      "qty": 1204,
+      "avg_price": 23324.75,
+      "last_action": "RECONCILE"
+    },
+    "108490": {
+      "strategy_id": "UNKNOWN",
+      "qty": 53,
+      "avg_price": 264500.0,
+      "last_action": "RECONCILE"
+    },
+    "140410": {
+      "strategy_id": "UNKNOWN",
+      "qty": 169,
+      "avg_price": 82473.333,
+      "last_action": "RECONCILE"
+    },
+    "141080": {
+      "strategy_id": "UNKNOWN",
+      "qty": 41,
+      "avg_price": 170993.902,
+      "last_action": "RECONCILE"
+    },
+    "145020": {
+      "strategy_id": "UNKNOWN",
+      "qty": 60,
+      "avg_price": 233500.0,
+      "last_action": "RECONCILE"
+    },
+    "160190": {
+      "strategy_id": "UNKNOWN",
+      "qty": 717,
+      "avg_price": 58478.521,
+      "last_action": "RECONCILE"
+    },
+    "214450": {
+      "strategy_id": "UNKNOWN",
+      "qty": 37,
+      "avg_price": 378297.297,
+      "last_action": "RECONCILE"
+    },
+    "222800": {
+      "strategy_id": "UNKNOWN",
+      "qty": 366,
+      "avg_price": 49756.967,
+      "last_action": "RECONCILE"
+    },
+    "226950": {
+      "strategy_id": "UNKNOWN",
+      "qty": 104,
+      "avg_price": 134541.826,
+      "last_action": "RECONCILE"
+    },
+    "237690": {
+      "strategy_id": "UNKNOWN",
+      "qty": 112,
+      "avg_price": 125100.892,
+      "last_action": "RECONCILE"
+    },
+    "247540": {
+      "strategy_id": "UNKNOWN",
+      "qty": 265,
+      "avg_price": 157924.528,
+      "last_action": "RECONCILE"
+    },
+    "267250": {
+      "strategy_id": "UNKNOWN",
+      "qty": 114,
+      "avg_price": 193446.491,
+      "last_action": "RECONCILE"
+    },
+    "290650": {
+      "strategy_id": "UNKNOWN",
+      "qty": 224,
+      "avg_price": 62500.0,
+      "last_action": "RECONCILE"
+    },
+    "298380": {
+      "strategy_id": "UNKNOWN",
+      "qty": 26,
+      "avg_price": 187500.0,
+      "last_action": "RECONCILE"
+    },
+    "316140": {
+      "strategy_id": "UNKNOWN",
+      "qty": 300,
+      "avg_price": 27963.169,
+      "last_action": "RECONCILE"
+    },
+    "347850": {
+      "strategy_id": "UNKNOWN",
+      "qty": 292,
+      "avg_price": 95850.0,
+      "last_action": "RECONCILE"
+    },
+    "352820": {
+      "strategy_id": "UNKNOWN",
+      "qty": 13,
+      "avg_price": 310500.0,
+      "last_action": "RECONCILE"
+    },
+    "357780": {
+      "strategy_id": "UNKNOWN",
+      "qty": 107,
+      "avg_price": 259436.915,
+      "last_action": "RECONCILE"
+    },
+    "373220": {
+      "strategy_id": "UNKNOWN",
+      "qty": 92,
+      "avg_price": 390027.173,
+      "last_action": "RECONCILE"
+    },
+    "445680": {
+      "strategy_id": "UNKNOWN",
+      "qty": 414,
+      "avg_price": 101202.898,
+      "last_action": "RECONCILE"
+    },
+    "475830": {
+      "strategy_id": "UNKNOWN",
+      "qty": 186,
+      "avg_price": 101329.061,
+      "last_action": "RECONCILE"
+    }
+  },
   "orders": {},
-  "lots": [],
+  "lots": [
+    {
+      "lot_id": "ORPHAN-000660-20251228T223416.309543+0900",
+      "code": "000660",
+      "pdno": "000660",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 42,
+      "remaining_qty": 42,
+      "entry_price": 591517.857,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-005290-20251228T223416.309543+0900",
+      "code": "005290",
+      "pdno": "005290",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 746,
+      "remaining_qty": 746,
+      "entry_price": 37600.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-005380-20251228T223416.309543+0900",
+      "code": "005380",
+      "pdno": "005380",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 61,
+      "remaining_qty": 61,
+      "entry_price": 290975.409,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-006800-20251228T223416.309543+0900",
+      "code": "006800",
+      "pdno": "006800",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 599,
+      "remaining_qty": 599,
+      "entry_price": 23403.171,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-009540-20251228T223416.309543+0900",
+      "code": "009540",
+      "pdno": "009540",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 86,
+      "remaining_qty": 86,
+      "entry_price": 414703.488,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-010120-20251228T223416.309543+0900",
+      "code": "010120",
+      "pdno": "010120",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 77,
+      "remaining_qty": 77,
+      "entry_price": 461340.573,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-010130-20251228T223416.309543+0900",
+      "code": "010130",
+      "pdno": "010130",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 26,
+      "remaining_qty": 26,
+      "entry_price": 1321769.23,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-012330-20251228T223416.309543+0900",
+      "code": "012330",
+      "pdno": "012330",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 49,
+      "remaining_qty": 49,
+      "entry_price": 365096.365,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-012450-20251228T223416.309543+0900",
+      "code": "012450",
+      "pdno": "012450",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 24,
+      "remaining_qty": 24,
+      "entry_price": 884613.333,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-015760-20251228T223416.309543+0900",
+      "code": "015760",
+      "pdno": "015760",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 752,
+      "remaining_qty": 752,
+      "entry_price": 48278.588,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-028260-20251228T223416.309543+0900",
+      "code": "028260",
+      "pdno": "028260",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 91,
+      "remaining_qty": 91,
+      "entry_price": 242082.417,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-030200-20251228T223416.309543+0900",
+      "code": "030200",
+      "pdno": "030200",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 415,
+      "remaining_qty": 415,
+      "entry_price": 53751.084,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-035420-20251228T223416.309543+0900",
+      "code": "035420",
+      "pdno": "035420",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 213,
+      "remaining_qty": 213,
+      "entry_price": 233720.707,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-035720-20251228T223416.309543+0900",
+      "code": "035720",
+      "pdno": "035720",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 241,
+      "remaining_qty": 241,
+      "entry_price": 58100.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-064760-20251228T223416.309543+0900",
+      "code": "064760",
+      "pdno": "064760",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 194,
+      "remaining_qty": 194,
+      "entry_price": 143934.02,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-065350-20251228T223416.309543+0900",
+      "code": "065350",
+      "pdno": "065350",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 483,
+      "remaining_qty": 483,
+      "entry_price": 58019.047,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-066570-20251228T223416.309543+0900",
+      "code": "066570",
+      "pdno": "066570",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 388,
+      "remaining_qty": 388,
+      "entry_price": 93458.762,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-098460-20251228T223416.309543+0900",
+      "code": "098460",
+      "pdno": "098460",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 1204,
+      "remaining_qty": 1204,
+      "entry_price": 23324.75,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-108490-20251228T223416.309543+0900",
+      "code": "108490",
+      "pdno": "108490",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 53,
+      "remaining_qty": 53,
+      "entry_price": 264500.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-140410-20251228T223416.309543+0900",
+      "code": "140410",
+      "pdno": "140410",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 169,
+      "remaining_qty": 169,
+      "entry_price": 82473.333,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-141080-20251228T223416.309543+0900",
+      "code": "141080",
+      "pdno": "141080",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 41,
+      "remaining_qty": 41,
+      "entry_price": 170993.902,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-145020-20251228T223416.309543+0900",
+      "code": "145020",
+      "pdno": "145020",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 60,
+      "remaining_qty": 60,
+      "entry_price": 233500.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-160190-20251228T223416.309543+0900",
+      "code": "160190",
+      "pdno": "160190",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 717,
+      "remaining_qty": 717,
+      "entry_price": 58478.521,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-214450-20251228T223416.309543+0900",
+      "code": "214450",
+      "pdno": "214450",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 37,
+      "remaining_qty": 37,
+      "entry_price": 378297.297,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-222800-20251228T223416.309543+0900",
+      "code": "222800",
+      "pdno": "222800",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 366,
+      "remaining_qty": 366,
+      "entry_price": 49756.967,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-226950-20251228T223416.309543+0900",
+      "code": "226950",
+      "pdno": "226950",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 104,
+      "remaining_qty": 104,
+      "entry_price": 134541.826,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-237690-20251228T223416.309543+0900",
+      "code": "237690",
+      "pdno": "237690",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 112,
+      "remaining_qty": 112,
+      "entry_price": 125100.892,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-247540-20251228T223416.309543+0900",
+      "code": "247540",
+      "pdno": "247540",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 265,
+      "remaining_qty": 265,
+      "entry_price": 157924.528,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-267250-20251228T223416.309543+0900",
+      "code": "267250",
+      "pdno": "267250",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 114,
+      "remaining_qty": 114,
+      "entry_price": 193446.491,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-290650-20251228T223416.309543+0900",
+      "code": "290650",
+      "pdno": "290650",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 224,
+      "remaining_qty": 224,
+      "entry_price": 62500.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-298380-20251228T223416.309543+0900",
+      "code": "298380",
+      "pdno": "298380",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 26,
+      "remaining_qty": 26,
+      "entry_price": 187500.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-316140-20251228T223416.309543+0900",
+      "code": "316140",
+      "pdno": "316140",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 300,
+      "remaining_qty": 300,
+      "entry_price": 27963.169,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-347850-20251228T223416.309543+0900",
+      "code": "347850",
+      "pdno": "347850",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 292,
+      "remaining_qty": 292,
+      "entry_price": 95850.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-352820-20251228T223416.309543+0900",
+      "code": "352820",
+      "pdno": "352820",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 13,
+      "remaining_qty": 13,
+      "entry_price": 310500.0,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-357780-20251228T223416.309543+0900",
+      "code": "357780",
+      "pdno": "357780",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 107,
+      "remaining_qty": 107,
+      "entry_price": 259436.915,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-373220-20251228T223416.309543+0900",
+      "code": "373220",
+      "pdno": "373220",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 92,
+      "remaining_qty": 92,
+      "entry_price": 390027.173,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-445680-20251228T223416.309543+0900",
+      "code": "445680",
+      "pdno": "445680",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 414,
+      "remaining_qty": 414,
+      "entry_price": 101202.898,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    },
+    {
+      "lot_id": "ORPHAN-475830-20251228T223416.309543+0900",
+      "code": "475830",
+      "pdno": "475830",
+      "sid": "ORPHAN",
+      "strategy_id": "ORPHAN",
+      "strategy": "ORPHAN",
+      "engine": "reconcile_kis_balance",
+      "qty": 186,
+      "remaining_qty": 186,
+      "entry_price": 101329.061,
+      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "status": "OPEN",
+      "source": "reconcile_kis_balance",
+      "created_at": "2025-12-28T22:34:16.309543+09:00",
+      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "notes": [
+        "MISSING_IN_STATE"
+      ]
+    }
+  ],
   "memory": {
     "last_price": {},
     "last_seen": {},
     "last_strategy_id": {},
     "data_health": {
       "000660": {
-        "ts": "2025-12-28T22:00:46.709674+09:00",
+        "ts": "2025-12-28T22:36:14.415107+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -24,7 +1014,7 @@
         "intraday_n": 30
       },
       "005290": {
-        "ts": "2025-12-28T22:00:48.460686+09:00",
+        "ts": "2025-12-28T22:36:16.538828+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -38,7 +1028,7 @@
         "intraday_n": 30
       },
       "005380": {
-        "ts": "2025-12-28T22:00:50.095550+09:00",
+        "ts": "2025-12-28T22:36:18.573044+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -52,7 +1042,7 @@
         "intraday_n": 30
       },
       "005935": {
-        "ts": "2025-12-28T22:00:52.189441+09:00",
+        "ts": "2025-12-28T22:36:20.495310+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -66,7 +1056,7 @@
         "intraday_n": 30
       },
       "006800": {
-        "ts": "2025-12-28T22:00:54.203772+09:00",
+        "ts": "2025-12-28T22:36:22.413281+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -80,7 +1070,7 @@
         "intraday_n": 30
       },
       "009540": {
-        "ts": "2025-12-28T22:00:56.353451+09:00",
+        "ts": "2025-12-28T22:36:24.426821+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -94,7 +1084,7 @@
         "intraday_n": 30
       },
       "010120": {
-        "ts": "2025-12-28T22:00:58.378025+09:00",
+        "ts": "2025-12-28T22:36:26.375139+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -108,7 +1098,7 @@
         "intraday_n": 30
       },
       "010130": {
-        "ts": "2025-12-28T22:01:00.406276+09:00",
+        "ts": "2025-12-28T22:36:28.308433+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -122,7 +1112,7 @@
         "intraday_n": 30
       },
       "012330": {
-        "ts": "2025-12-28T22:01:02.411357+09:00",
+        "ts": "2025-12-28T22:36:32.528244+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -136,7 +1126,7 @@
         "intraday_n": 30
       },
       "012450": {
-        "ts": "2025-12-28T22:01:04.443126+09:00",
+        "ts": "2025-12-28T22:36:34.476322+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -150,7 +1140,7 @@
         "intraday_n": 30
       },
       "015760": {
-        "ts": "2025-12-28T22:01:06.472599+09:00",
+        "ts": "2025-12-28T22:36:36.444834+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -164,7 +1154,7 @@
         "intraday_n": 30
       },
       "028260": {
-        "ts": "2025-12-28T22:01:08.090839+09:00",
+        "ts": "2025-12-28T22:36:38.493961+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -178,7 +1168,7 @@
         "intraday_n": 30
       },
       "030200": {
-        "ts": "2025-12-28T22:01:10.091680+09:00",
+        "ts": "2025-12-28T22:36:40.416352+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -192,7 +1182,7 @@
         "intraday_n": 30
       },
       "030530": {
-        "ts": "2025-12-28T22:01:12.121260+09:00",
+        "ts": "2025-12-28T22:36:42.451691+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -206,7 +1196,7 @@
         "intraday_n": 30
       },
       "032830": {
-        "ts": "2025-12-28T22:01:14.139117+09:00",
+        "ts": "2025-12-28T22:36:44.378767+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -220,7 +1210,7 @@
         "intraday_n": 30
       },
       "035420": {
-        "ts": "2025-12-28T22:01:16.145436+09:00",
+        "ts": "2025-12-28T22:36:46.306596+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -234,7 +1224,7 @@
         "intraday_n": 30
       },
       "035720": {
-        "ts": "2025-12-28T22:01:18.171682+09:00",
+        "ts": "2025-12-28T22:36:50.117100+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -248,7 +1238,7 @@
         "intraday_n": 30
       },
       "035900": {
-        "ts": "2025-12-28T22:01:20.176362+09:00",
+        "ts": "2025-12-28T22:36:52.605803+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -262,7 +1252,7 @@
         "intraday_n": 30
       },
       "039030": {
-        "ts": "2025-12-28T22:01:22.193845+09:00",
+        "ts": "2025-12-28T22:36:54.527786+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -276,7 +1266,7 @@
         "intraday_n": 30
       },
       "058610": {
-        "ts": "2025-12-28T22:01:24.274832+09:00",
+        "ts": "2025-12-28T22:36:56.536328+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -290,7 +1280,7 @@
         "intraday_n": 30
       },
       "064350": {
-        "ts": "2025-12-28T22:01:26.295771+09:00",
+        "ts": "2025-12-28T22:36:58.651181+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -304,7 +1294,7 @@
         "intraday_n": 30
       },
       "064760": {
-        "ts": "2025-12-28T22:01:28.311071+09:00",
+        "ts": "2025-12-28T22:37:00.584094+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -318,7 +1308,7 @@
         "intraday_n": 30
       },
       "065350": {
-        "ts": "2025-12-28T22:01:30.324723+09:00",
+        "ts": "2025-12-28T22:37:02.519644+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -332,7 +1322,7 @@
         "intraday_n": 30
       },
       "066570": {
-        "ts": "2025-12-28T22:01:32.354871+09:00",
+        "ts": "2025-12-28T22:37:04.425322+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -346,7 +1336,7 @@
         "intraday_n": 30
       },
       "067310": {
-        "ts": "2025-12-28T22:01:34.375963+09:00",
+        "ts": "2025-12-28T22:37:06.381302+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -360,7 +1350,7 @@
         "intraday_n": 30
       },
       "098460": {
-        "ts": "2025-12-28T22:01:36.406995+09:00",
+        "ts": "2025-12-28T22:37:08.303837+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -374,7 +1364,7 @@
         "intraday_n": 30
       },
       "108490": {
-        "ts": "2025-12-28T22:01:38.409759+09:00",
+        "ts": "2025-12-28T22:37:12.564898+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -388,7 +1378,7 @@
         "intraday_n": 30
       },
       "140410": {
-        "ts": "2025-12-28T22:01:40.425766+09:00",
+        "ts": "2025-12-28T22:37:14.494579+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -402,7 +1392,7 @@
         "intraday_n": 30
       },
       "141080": {
-        "ts": "2025-12-28T22:01:42.434443+09:00",
+        "ts": "2025-12-28T22:37:16.441225+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -416,7 +1406,7 @@
         "intraday_n": 30
       },
       "145020": {
-        "ts": "2025-12-28T22:01:44.448599+09:00",
+        "ts": "2025-12-28T22:37:18.373441+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -430,7 +1420,7 @@
         "intraday_n": 30
       },
       "160190": {
-        "ts": "2025-12-28T22:01:46.478342+09:00",
+        "ts": "2025-12-28T22:37:20.293573+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -444,7 +1434,7 @@
         "intraday_n": 30
       },
       "214450": {
-        "ts": "2025-12-28T22:01:48.492489+09:00",
+        "ts": "2025-12-28T22:37:24.533524+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -458,7 +1448,7 @@
         "intraday_n": 30
       },
       "222800": {
-        "ts": "2025-12-28T22:01:50.510328+09:00",
+        "ts": "2025-12-28T22:37:26.471582+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -472,7 +1462,7 @@
         "intraday_n": 30
       },
       "226950": {
-        "ts": "2025-12-28T22:01:52.510048+09:00",
+        "ts": "2025-12-28T22:37:28.377885+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -486,7 +1476,7 @@
         "intraday_n": 30
       },
       "237690": {
-        "ts": "2025-12-28T22:01:54.084456+09:00",
+        "ts": "2025-12-28T22:37:30.331654+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -500,7 +1490,7 @@
         "intraday_n": 30
       },
       "247540": {
-        "ts": "2025-12-28T22:01:56.087775+09:00",
+        "ts": "2025-12-28T22:37:34.576315+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -514,7 +1504,7 @@
         "intraday_n": 30
       },
       "267250": {
-        "ts": "2025-12-28T22:01:58.111237+09:00",
+        "ts": "2025-12-28T22:37:36.495785+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -528,7 +1518,7 @@
         "intraday_n": 30
       },
       "277810": {
-        "ts": "2025-12-28T22:02:00.261449+09:00",
+        "ts": "2025-12-28T22:37:38.417257+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -542,7 +1532,7 @@
         "intraday_n": 30
       },
       "290650": {
-        "ts": "2025-12-28T22:02:02.263236+09:00",
+        "ts": "2025-12-28T22:37:40.353454+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -556,7 +1546,7 @@
         "intraday_n": 30
       },
       "298380": {
-        "ts": "2025-12-28T22:02:04.276025+09:00",
+        "ts": "2025-12-28T22:37:42.281939+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -570,7 +1560,7 @@
         "intraday_n": 30
       },
       "310210": {
-        "ts": "2025-12-28T22:02:06.291026+09:00",
+        "ts": "2025-12-28T22:37:46.519838+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -584,7 +1574,7 @@
         "intraday_n": 30
       },
       "316140": {
-        "ts": "2025-12-28T22:02:08.301454+09:00",
+        "ts": "2025-12-28T22:37:48.448399+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -598,7 +1588,7 @@
         "intraday_n": 30
       },
       "319400": {
-        "ts": "2025-12-28T22:02:10.322272+09:00",
+        "ts": "2025-12-28T22:37:50.388495+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -612,7 +1602,7 @@
         "intraday_n": 30
       },
       "347850": {
-        "ts": "2025-12-28T22:02:12.347913+09:00",
+        "ts": "2025-12-28T22:37:52.314291+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -626,7 +1616,7 @@
         "intraday_n": 30
       },
       "352820": {
-        "ts": "2025-12-28T22:02:14.379129+09:00",
+        "ts": "2025-12-28T22:37:56.554241+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -640,7 +1630,7 @@
         "intraday_n": 30
       },
       "357780": {
-        "ts": "2025-12-28T22:02:16.381293+09:00",
+        "ts": "2025-12-28T22:37:58.492664+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -654,7 +1644,7 @@
         "intraday_n": 30
       },
       "373220": {
-        "ts": "2025-12-28T22:02:18.393077+09:00",
+        "ts": "2025-12-28T22:38:00.411093+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -668,7 +1658,7 @@
         "intraday_n": 30
       },
       "402340": {
-        "ts": "2025-12-28T22:02:20.416094+09:00",
+        "ts": "2025-12-28T22:38:02.361217+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -682,7 +1672,7 @@
         "intraday_n": 30
       },
       "437730": {
-        "ts": "2025-12-28T22:02:22.116064+09:00",
+        "ts": "2025-12-28T22:38:04.286423+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -696,7 +1686,7 @@
         "intraday_n": 30
       },
       "445680": {
-        "ts": "2025-12-28T22:02:24.106983+09:00",
+        "ts": "2025-12-28T22:38:08.510020+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -710,7 +1700,7 @@
         "intraday_n": 30
       },
       "466100": {
-        "ts": "2025-12-28T22:02:26.129039+09:00",
+        "ts": "2025-12-28T22:38:10.455790+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -724,7 +1714,7 @@
         "intraday_n": 30
       },
       "475830": {
-        "ts": "2025-12-28T22:02:28.131789+09:00",
+        "ts": "2025-12-28T22:38:12.386080+09:00",
         "ok": true,
         "daily_len": 60,
         "intraday_len": 30,
@@ -740,7 +1730,7 @@
     },
     "setup_eval": {
       "000660": {
-        "ts": "2025-12-28T22:00:48.460627+09:00",
+        "ts": "2025-12-28T22:36:16.538760+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -750,7 +1740,7 @@
         "intra": {}
       },
       "005290": {
-        "ts": "2025-12-28T22:00:50.095485+09:00",
+        "ts": "2025-12-28T22:36:18.572976+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -760,7 +1750,7 @@
         "intra": {}
       },
       "005380": {
-        "ts": "2025-12-28T22:00:52.189387+09:00",
+        "ts": "2025-12-28T22:36:20.495243+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -770,7 +1760,7 @@
         "intra": {}
       },
       "005935": {
-        "ts": "2025-12-28T22:00:54.203723+09:00",
+        "ts": "2025-12-28T22:36:22.413217+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -780,7 +1770,7 @@
         "intra": {}
       },
       "006800": {
-        "ts": "2025-12-28T22:00:56.353411+09:00",
+        "ts": "2025-12-28T22:36:24.426766+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -790,7 +1780,7 @@
         "intra": {}
       },
       "009540": {
-        "ts": "2025-12-28T22:00:58.377982+09:00",
+        "ts": "2025-12-28T22:36:26.375074+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -800,7 +1790,7 @@
         "intra": {}
       },
       "010120": {
-        "ts": "2025-12-28T22:01:00.406230+09:00",
+        "ts": "2025-12-28T22:36:28.308367+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -810,7 +1800,7 @@
         "intra": {}
       },
       "010130": {
-        "ts": "2025-12-28T22:01:02.411300+09:00",
+        "ts": "2025-12-28T22:36:32.528176+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -820,7 +1810,7 @@
         "intra": {}
       },
       "012330": {
-        "ts": "2025-12-28T22:01:04.443073+09:00",
+        "ts": "2025-12-28T22:36:34.476260+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -830,7 +1820,7 @@
         "intra": {}
       },
       "012450": {
-        "ts": "2025-12-28T22:01:06.472553+09:00",
+        "ts": "2025-12-28T22:36:36.444767+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -840,7 +1830,7 @@
         "intra": {}
       },
       "015760": {
-        "ts": "2025-12-28T22:01:08.090796+09:00",
+        "ts": "2025-12-28T22:36:38.493894+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -850,7 +1840,7 @@
         "intra": {}
       },
       "028260": {
-        "ts": "2025-12-28T22:01:10.091639+09:00",
+        "ts": "2025-12-28T22:36:40.416287+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -860,7 +1850,7 @@
         "intra": {}
       },
       "030200": {
-        "ts": "2025-12-28T22:01:12.121210+09:00",
+        "ts": "2025-12-28T22:36:42.451646+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -870,7 +1860,7 @@
         "intra": {}
       },
       "030530": {
-        "ts": "2025-12-28T22:01:14.139077+09:00",
+        "ts": "2025-12-28T22:36:44.378683+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -880,7 +1870,7 @@
         "intra": {}
       },
       "032830": {
-        "ts": "2025-12-28T22:01:16.145395+09:00",
+        "ts": "2025-12-28T22:36:46.306533+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -890,7 +1880,7 @@
         "intra": {}
       },
       "035420": {
-        "ts": "2025-12-28T22:01:18.171642+09:00",
+        "ts": "2025-12-28T22:36:50.117056+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -900,7 +1890,7 @@
         "intra": {}
       },
       "035720": {
-        "ts": "2025-12-28T22:01:20.176324+09:00",
+        "ts": "2025-12-28T22:36:52.605732+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -910,7 +1900,7 @@
         "intra": {}
       },
       "035900": {
-        "ts": "2025-12-28T22:01:22.193792+09:00",
+        "ts": "2025-12-28T22:36:54.527721+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -920,7 +1910,7 @@
         "intra": {}
       },
       "039030": {
-        "ts": "2025-12-28T22:01:24.274777+09:00",
+        "ts": "2025-12-28T22:36:56.536256+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -930,7 +1920,7 @@
         "intra": {}
       },
       "058610": {
-        "ts": "2025-12-28T22:01:26.295710+09:00",
+        "ts": "2025-12-28T22:36:58.651137+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -940,7 +1930,7 @@
         "intra": {}
       },
       "064350": {
-        "ts": "2025-12-28T22:01:28.311016+09:00",
+        "ts": "2025-12-28T22:37:00.584029+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -950,7 +1940,7 @@
         "intra": {}
       },
       "064760": {
-        "ts": "2025-12-28T22:01:30.324667+09:00",
+        "ts": "2025-12-28T22:37:02.519567+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -960,7 +1950,7 @@
         "intra": {}
       },
       "065350": {
-        "ts": "2025-12-28T22:01:32.354811+09:00",
+        "ts": "2025-12-28T22:37:04.425257+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -970,7 +1960,7 @@
         "intra": {}
       },
       "066570": {
-        "ts": "2025-12-28T22:01:34.375882+09:00",
+        "ts": "2025-12-28T22:37:06.381240+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -980,7 +1970,7 @@
         "intra": {}
       },
       "067310": {
-        "ts": "2025-12-28T22:01:36.406953+09:00",
+        "ts": "2025-12-28T22:37:08.303775+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -990,7 +1980,7 @@
         "intra": {}
       },
       "098460": {
-        "ts": "2025-12-28T22:01:38.409719+09:00",
+        "ts": "2025-12-28T22:37:12.564829+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1000,7 +1990,7 @@
         "intra": {}
       },
       "108490": {
-        "ts": "2025-12-28T22:01:40.425728+09:00",
+        "ts": "2025-12-28T22:37:14.494510+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1010,7 +2000,7 @@
         "intra": {}
       },
       "140410": {
-        "ts": "2025-12-28T22:01:42.434403+09:00",
+        "ts": "2025-12-28T22:37:16.441159+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1020,7 +2010,7 @@
         "intra": {}
       },
       "141080": {
-        "ts": "2025-12-28T22:01:44.448558+09:00",
+        "ts": "2025-12-28T22:37:18.373376+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1030,7 +2020,7 @@
         "intra": {}
       },
       "145020": {
-        "ts": "2025-12-28T22:01:46.478296+09:00",
+        "ts": "2025-12-28T22:37:20.293510+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1040,7 +2030,7 @@
         "intra": {}
       },
       "160190": {
-        "ts": "2025-12-28T22:01:48.492448+09:00",
+        "ts": "2025-12-28T22:37:24.533462+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1050,7 +2040,7 @@
         "intra": {}
       },
       "214450": {
-        "ts": "2025-12-28T22:01:50.510288+09:00",
+        "ts": "2025-12-28T22:37:26.471528+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1060,7 +2050,7 @@
         "intra": {}
       },
       "222800": {
-        "ts": "2025-12-28T22:01:52.510008+09:00",
+        "ts": "2025-12-28T22:37:28.377819+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1070,7 +2060,7 @@
         "intra": {}
       },
       "226950": {
-        "ts": "2025-12-28T22:01:54.084409+09:00",
+        "ts": "2025-12-28T22:37:30.331583+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1080,7 +2070,7 @@
         "intra": {}
       },
       "237690": {
-        "ts": "2025-12-28T22:01:56.087737+09:00",
+        "ts": "2025-12-28T22:37:34.576252+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1090,7 +2080,7 @@
         "intra": {}
       },
       "247540": {
-        "ts": "2025-12-28T22:01:58.111197+09:00",
+        "ts": "2025-12-28T22:37:36.495718+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1100,7 +2090,7 @@
         "intra": {}
       },
       "267250": {
-        "ts": "2025-12-28T22:02:00.261411+09:00",
+        "ts": "2025-12-28T22:37:38.417202+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1110,7 +2100,7 @@
         "intra": {}
       },
       "277810": {
-        "ts": "2025-12-28T22:02:02.263188+09:00",
+        "ts": "2025-12-28T22:37:40.353403+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1120,7 +2110,7 @@
         "intra": {}
       },
       "290650": {
-        "ts": "2025-12-28T22:02:04.275986+09:00",
+        "ts": "2025-12-28T22:37:42.281877+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1130,7 +2120,7 @@
         "intra": {}
       },
       "298380": {
-        "ts": "2025-12-28T22:02:06.290986+09:00",
+        "ts": "2025-12-28T22:37:46.519770+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1140,7 +2130,7 @@
         "intra": {}
       },
       "310210": {
-        "ts": "2025-12-28T22:02:08.301401+09:00",
+        "ts": "2025-12-28T22:37:48.448335+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1150,7 +2140,7 @@
         "intra": {}
       },
       "316140": {
-        "ts": "2025-12-28T22:02:10.322232+09:00",
+        "ts": "2025-12-28T22:37:50.388431+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1160,7 +2150,7 @@
         "intra": {}
       },
       "319400": {
-        "ts": "2025-12-28T22:02:12.347856+09:00",
+        "ts": "2025-12-28T22:37:52.314219+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1170,7 +2160,7 @@
         "intra": {}
       },
       "347850": {
-        "ts": "2025-12-28T22:02:14.379090+09:00",
+        "ts": "2025-12-28T22:37:56.554178+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1180,7 +2170,7 @@
         "intra": {}
       },
       "352820": {
-        "ts": "2025-12-28T22:02:16.381239+09:00",
+        "ts": "2025-12-28T22:37:58.492613+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1190,7 +2180,7 @@
         "intra": {}
       },
       "357780": {
-        "ts": "2025-12-28T22:02:18.393030+09:00",
+        "ts": "2025-12-28T22:38:00.411042+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1200,7 +2190,7 @@
         "intra": {}
       },
       "373220": {
-        "ts": "2025-12-28T22:02:20.416041+09:00",
+        "ts": "2025-12-28T22:38:02.361165+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1210,7 +2200,7 @@
         "intra": {}
       },
       "402340": {
-        "ts": "2025-12-28T22:02:22.116009+09:00",
+        "ts": "2025-12-28T22:38:04.286351+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1220,7 +2210,7 @@
         "intra": {}
       },
       "437730": {
-        "ts": "2025-12-28T22:02:24.106922+09:00",
+        "ts": "2025-12-28T22:38:08.509951+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1230,7 +2220,7 @@
         "intra": {}
       },
       "445680": {
-        "ts": "2025-12-28T22:02:26.128989+09:00",
+        "ts": "2025-12-28T22:38:10.455720+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1240,7 +2230,7 @@
         "intra": {}
       },
       "466100": {
-        "ts": "2025-12-28T22:02:28.131734+09:00",
+        "ts": "2025-12-28T22:38:12.386018+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1250,7 +2240,7 @@
         "intra": {}
       },
       "475830": {
-        "ts": "2025-12-28T22:02:30.146701+09:00",
+        "ts": "2025-12-28T22:38:14.316203+09:00",
         "setup_ok": true,
         "missing": [],
         "reasons": [
@@ -1260,279 +2250,736 @@
         "intra": {}
       }
     },
-    "exit_eval": {}
+    "exit_eval": {
+      "000660": {
+        "ts": "2025-12-28T22:38:14.316326+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 42,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "005290": {
+        "ts": "2025-12-28T22:38:14.316404+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 746,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "005380": {
+        "ts": "2025-12-28T22:38:14.316474+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 61,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "006800": {
+        "ts": "2025-12-28T22:38:14.316539+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 599,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "009540": {
+        "ts": "2025-12-28T22:38:14.316603+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 86,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "010120": {
+        "ts": "2025-12-28T22:38:14.316668+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 77,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "010130": {
+        "ts": "2025-12-28T22:38:14.316758+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 26,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "012330": {
+        "ts": "2025-12-28T22:38:14.316825+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 49,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "012450": {
+        "ts": "2025-12-28T22:38:14.316889+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 24,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "015760": {
+        "ts": "2025-12-28T22:38:14.316955+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 752,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "028260": {
+        "ts": "2025-12-28T22:38:14.317010+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 91,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "030200": {
+        "ts": "2025-12-28T22:38:14.317081+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 415,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "035420": {
+        "ts": "2025-12-28T22:38:14.317132+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 213,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "035720": {
+        "ts": "2025-12-28T22:38:14.317178+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 241,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "064760": {
+        "ts": "2025-12-28T22:38:14.317234+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 194,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "065350": {
+        "ts": "2025-12-28T22:38:14.317303+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 483,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "066570": {
+        "ts": "2025-12-28T22:38:14.317393+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 388,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "098460": {
+        "ts": "2025-12-28T22:38:14.317479+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 1204,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "108490": {
+        "ts": "2025-12-28T22:38:14.317562+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 53,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "140410": {
+        "ts": "2025-12-28T22:38:14.317643+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 169,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "141080": {
+        "ts": "2025-12-28T22:38:14.317741+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 41,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "145020": {
+        "ts": "2025-12-28T22:38:14.317823+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 60,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "160190": {
+        "ts": "2025-12-28T22:38:14.317912+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 717,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "214450": {
+        "ts": "2025-12-28T22:38:14.317992+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 37,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "222800": {
+        "ts": "2025-12-28T22:38:14.318074+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 366,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "226950": {
+        "ts": "2025-12-28T22:38:14.318158+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 104,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "237690": {
+        "ts": "2025-12-28T22:38:14.318239+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 112,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "247540": {
+        "ts": "2025-12-28T22:38:14.318322+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 265,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "267250": {
+        "ts": "2025-12-28T22:38:14.318403+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 114,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "290650": {
+        "ts": "2025-12-28T22:38:14.318484+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 224,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "298380": {
+        "ts": "2025-12-28T22:38:14.318564+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 26,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "316140": {
+        "ts": "2025-12-28T22:38:14.318644+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 300,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "347850": {
+        "ts": "2025-12-28T22:38:14.318741+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 292,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "352820": {
+        "ts": "2025-12-28T22:38:14.318822+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 13,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "357780": {
+        "ts": "2025-12-28T22:38:14.318907+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 107,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "373220": {
+        "ts": "2025-12-28T22:38:14.318989+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 92,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "445680": {
+        "ts": "2025-12-28T22:38:14.319071+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 414,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      },
+      "475830": {
+        "ts": "2025-12-28T22:38:14.319154+09:00",
+        "sid": "UNKNOWN",
+        "strategy_id": "UNKNOWN",
+        "qty": 186,
+        "exit_ok": false,
+        "reasons": [
+          "MISSING_SID",
+          "MISSING_STRATEGY_ID"
+        ]
+      }
+    }
   },
   "diagnostics": {
     "orphans": {
       "000660": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 42,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 591517.857,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "005290": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 746,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 37600.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "005380": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 61,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 290975.409,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "006800": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 599,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 23403.171,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "009540": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 86,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 414703.488,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "010120": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 77,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 461340.573,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "010130": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 26,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 1321769.23,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "012330": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 49,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 365096.365,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "012450": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 24,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 884613.333,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "015760": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 752,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 48278.588,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "028260": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 91,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 242082.417,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "030200": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 415,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 53751.084,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "035420": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 213,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 233720.707,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "035720": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 241,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 58100.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "064760": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 194,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 143934.02,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "065350": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 483,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 58019.047,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "066570": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 388,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 93458.762,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "098460": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 1204,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 23324.75,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "108490": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 53,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 264500.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "140410": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 169,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 82473.333,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "141080": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 41,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 170993.902,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "145020": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 60,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 233500.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "160190": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 717,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 58478.521,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "214450": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 37,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 378297.297,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "222800": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 366,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 49756.967,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "226950": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 104,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 134541.826,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "237690": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 112,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 125100.892,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "247540": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 265,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 157924.528,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "267250": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 114,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 193446.491,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "290650": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 224,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 62500.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "298380": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 26,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 187500.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "316140": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 300,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 27963.169,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "347850": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 292,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 95850.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "352820": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 13,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 310500.0,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "357780": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 107,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 259436.915,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "373220": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 92,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 390027.173,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "445680": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 414,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 101202.898,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       },
       "475830": {
-        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "ts": "2025-12-28T22:34:16.316086+09:00",
         "qty": 186,
-        "avg": 0.0,
-        "kind": "ORPHAN",
-        "reason": "MISSING_IN_STATE"
+        "avg": 101329.061,
+        "kind": "UNKNOWN",
+        "reason": "EXIT_STRATEGY_ID_MISSING",
+        "source": "state"
       }
     },
     "last_run": {
-      "ts": "2025-12-28T21:59:10.024313+09:00",
+      "ts": "2025-12-28T22:34:16.316086+09:00",
       "targets": [
         "000660",
         "005290",
