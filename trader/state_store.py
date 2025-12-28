@@ -11,7 +11,7 @@ from .config import KST
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RUNTIME_STATE_DIR = Path(".runtime")
 RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
 
@@ -22,6 +22,7 @@ def _default_runtime_state() -> Dict[str, Any]:
         "updated_at": None,
         "positions": {},
         "orders": {},
+        "memory": {"last_price": {}, "last_seen": {}, "last_strategy_id": {}},
     }
 
 
@@ -37,7 +38,19 @@ def load_state() -> Dict[str, Any]:
         state.setdefault("schema_version", SCHEMA_VERSION)
         state.setdefault("positions", {})
         state.setdefault("orders", {})
+        memory = state.get("memory")
+        if not isinstance(memory, dict):
+            memory = {}
+            state["memory"] = memory
+        memory.setdefault("last_price", {})
+        memory.setdefault("last_seen", {})
+        memory.setdefault("last_strategy_id", {})
         state.setdefault("updated_at", None)
+        positions = state.get("positions")
+        if isinstance(positions, dict):
+            for sym, payload in list(positions.items()):
+                if not isinstance(payload, dict):
+                    positions[sym] = {}
         return state
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
@@ -51,11 +64,19 @@ def save_state(state: Dict[str, Any]) -> None:
         payload.setdefault("schema_version", SCHEMA_VERSION)
         payload.setdefault("positions", {})
         payload.setdefault("orders", {})
+        payload.setdefault("memory", {"last_price": {}, "last_seen": {}, "last_strategy_id": {}})
         payload["updated_at"] = datetime.now(KST).isoformat()
         tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, RUNTIME_STATE_PATH)
+        try:
+            size = RUNTIME_STATE_PATH.stat().st_size
+            logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
+        except Exception:
+            logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
 
@@ -67,12 +88,21 @@ def get_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any] | None:
     return positions.get(str(symbol).zfill(6))
 
 
-def upsert_position(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) -> None:
+def upsert_position(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     positions = state.setdefault("positions", {})
     key = str(symbol).zfill(6)
-    pos = positions.setdefault(key, {})
+    pos = positions.get(key)
+    if not isinstance(pos, dict):
+        pos = {}
+    positions[key] = pos
+    return pos
+
+
+def update_position_fields(state: Dict[str, Any], symbol: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    pos = upsert_position(state, symbol)
     for field, value in fields.items():
         pos[field] = value
+    return pos
 
 
 def _order_bucket(state: Dict[str, Any], symbol: str, side: str) -> Dict[str, Any]:
@@ -122,7 +152,7 @@ def mark_order(
     bucket["last_ts"] = ts
     bucket["last_order_id"] = order_id
     bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
-    upsert_position(
+    update_position_fields(
         state,
         symbol,
         {
@@ -165,7 +195,7 @@ def mark_fill(
     pos["last_action"] = side.upper()
     pos["last_action_ts"] = ts
     pos["last_order_status"] = status
-    upsert_position(state, symbol, pos)
+    update_position_fields(state, symbol, pos)
 
 
 def reconcile_with_kis_balance(
@@ -188,7 +218,7 @@ def reconcile_with_kis_balance(
         if qty <= 0:
             continue
         seen.add(symbol)
-        pos = positions.setdefault(symbol, {})
+        pos = upsert_position(state, symbol)
         strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "UNKNOWN"
         pos.update(
             {
@@ -198,7 +228,6 @@ def reconcile_with_kis_balance(
                 "last_action": "RECONCILE",
             }
         )
-        positions[symbol] = pos
     for symbol, pos in list(positions.items()):
         if symbol not in seen:
             pos["qty"] = 0

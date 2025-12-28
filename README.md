@@ -33,6 +33,14 @@ This initializes the portfolio manager, runs KOSPI rebalance if due, then execut
 
 Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 상태를 유지합니다.
 
+## Diagnostic mode (no-order safety)
+Run a diagnostics-only pass (no KIS orders) even on non-trading days:
+```
+DIAGNOSTIC_MODE=true DIAGNOSTIC_ONLY=true python -m trader.trader
+```
+Expected log markers for grep:
+- `[DIAG][START]`, `[DIAG][RECONCILE]`, `[DIAG][DATA-HEALTH]`, `[DIAG][SETUP]`, `[DIAG][EXIT-PROBE]`, `[DIAG][END]`
+
 ## Strategy intent mode (single-account multi-strategy)
 - A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
 - All five strategies (`breakout`~`volatility`) are present but **disabled by default**: `ENABLED_STRATEGIES=""` means no strategies run, and missing weights are treated as zero even when listed.

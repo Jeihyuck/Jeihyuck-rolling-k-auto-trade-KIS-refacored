@@ -2405,11 +2405,23 @@ def main(
                 setup_state = signals.evaluate_setup_gate(
                     daily_ctx, intra_ctx, regime_state=regime_state
                 )
+                missing = setup_state.get("missing_conditions") or []
+                reasons = setup_state.get("reasons") or []
+                data_health_ctx = setup_state.get("data_health") or daily_ctx.get("data_health") or {}
+                if data_health_ctx and not data_health_ctx.get("ok", True):
+                    if "DATA_HEALTH_DEGRADED" not in reasons:
+                        reasons.append("DATA_HEALTH_DEGRADED")
+                    for r in data_health_ctx.get("reasons") or []:
+                        if r not in reasons:
+                            reasons.append(r)
                 if not setup_state.get("ok"):
+                    if not reasons:
+                        reasons = ["NO_SETUP_REASON"]
                     logger.info(
-                        "[SETUP-BAD] %s | reasons=%s | daily=%s intra=%s regime=%s",
+                        "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s regime=%s",
                         code,
-                        setup_state.get("reasons"),
+                        missing,
+                        reasons,
                         daily_ctx,
                         intra_ctx,
                         regime_state,

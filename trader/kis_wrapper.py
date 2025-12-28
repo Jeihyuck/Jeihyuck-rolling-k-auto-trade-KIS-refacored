@@ -909,6 +909,48 @@ class KisAPI:
         close_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
         return open_time <= now <= close_time
 
+    # ===== Diagnostics-safe fetchers =====
+    def safe_get_daily_candles(self, code: str, count: int = 60) -> List[Dict[str, Any]]:
+        try:
+            return self.get_daily_candles(code, count=count)
+        except Exception as e:
+            logger.warning("[DIAG][FETCH] symbol=%s kind=%s error=%s", code, "daily", str(e))
+            return []
+
+    def safe_get_intraday_bars(self, code: str, interval: str = "1m") -> List[Dict[str, Any]]:
+        try:
+            # interval currently unused; KIS only supports 1m intraday endpoint here
+            return self.get_intraday_candles_today(code)
+        except Exception as e:
+            logger.warning("[DIAG][FETCH] symbol=%s kind=%s error=%s", code, "intraday", str(e))
+            return []
+
+    def safe_get_prev_close(self, code: str) -> Optional[float]:
+        try:
+            candles = self.get_daily_candles(code, count=2)
+            if candles:
+                return float(candles[-1].get("close") or 0.0)
+        except Exception as e:
+            logger.warning("[DIAG][FETCH] symbol=%s kind=%s error=%s", code, "prev_close", str(e))
+        return None
+
+    def safe_compute_vwap(self, intraday_bars: List[Dict[str, Any]]) -> Optional[float]:
+        total_vol = 0.0
+        total_tr = 0.0
+        for bar in intraday_bars or []:
+            try:
+                vol = float(bar.get("volume") or bar.get("cntg_vol") or 0.0)
+                price = float(bar.get("price") or bar.get("stck_prpr") or 0.0)
+            except Exception:
+                continue
+            if vol <= 0 or price <= 0:
+                continue
+            total_vol += vol
+            total_tr += vol * price
+        if total_vol <= 0:
+            return None
+        return total_tr / total_vol
+
     # ===== 보조 시세/지수/스냅샷 =====
     def get_close_price(self, code: str) -> Optional[float]:
         """최근 일봉 종가(전일 또는 당일 종가) → 실패 시 현재가 폴백."""

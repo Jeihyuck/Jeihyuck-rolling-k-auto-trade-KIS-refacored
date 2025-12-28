@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from portfolio.portfolio_manager import PortfolioManager
 from trader.kis_wrapper import KisAPI
 from trader import state_store as runtime_state_store
 from trader.time_utils import is_trading_day, now_kst
 from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+from trader.config import DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
     now = now_kst()
-    if not is_trading_day(now):
+    if DIAGNOSTIC_MODE:
+        os.environ["DISABLE_LIVE_TRADING"] = "true"
+        logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true")
+    if not is_trading_day(now) and not (DIAGNOSTIC_MODE and DIAGNOSTIC_FORCE_RUN):
         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
         return
     try:

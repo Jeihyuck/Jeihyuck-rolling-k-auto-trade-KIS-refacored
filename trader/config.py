@@ -92,6 +92,12 @@ CONFIG = {
     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
     "EMERGENCY_GLOBAL_SELL": "false",
     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+    # Diagnostics
+    "DIAGNOSTIC_MODE": "false",
+    "DIAGNOSTIC_ONLY": "true",
+    "DIAGNOSTIC_FORCE_RUN": "true",
+    "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
+    "DIAGNOSTIC_MAX_SYMBOLS": "200",
     # === Strategy intent/exec defaults ===
     "ENABLED_STRATEGIES": "",
     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
@@ -234,6 +240,30 @@ STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower()
     "1",
     "true",
     "yes",
+)
+
+DIAGNOSTIC_MODE = (_cfg("DIAGNOSTIC_MODE") or "false").lower() in ("1", "true", "yes")
+DIAGNOSTIC_ONLY = (_cfg("DIAGNOSTIC_ONLY") or "false").lower() in ("1", "true", "yes")
+DIAGNOSTIC_FORCE_RUN = (_cfg("DIAGNOSTIC_FORCE_RUN") or "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+DIAGNOSTIC_DUMP_DIR = Path(_cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"])
+DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+
+if DIAGNOSTIC_MODE:
+    STRATEGY_MODE = "INTENT_ONLY"
+    STRATEGY_DRY_RUN = True
+    STRATEGY_ALLOW_SELL_ONLY = True
+
+logger.info(
+    "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s",
+    DIAGNOSTIC_MODE,
+    DIAGNOSTIC_ONLY,
+    DIAGNOSTIC_FORCE_RUN,
+    str(DIAGNOSTIC_DUMP_DIR),
 )
 
 # 전략별 레짐 축소 우선순위
