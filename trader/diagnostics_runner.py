@@ -111,10 +111,11 @@ def _record_orphan_or_unknown(
     runtime_state: Dict[str, Any],
     code: str,
     qty: int,
-    avg: float,
+    avg: float | None,
     kind: str,
     reason: str,
     ts: str,
+    source: str = "state",
 ) -> None:
     runtime_state["diagnostics"]["orphans"][code] = {
         "ts": ts,
@@ -122,9 +123,17 @@ def _record_orphan_or_unknown(
         "avg": avg,
         "kind": kind,
         "reason": reason,
+        "source": source,
     }
     if kind == "ORPHAN":
-        logger.warning("[ORPHAN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
+        logger.warning(
+            "[ORPHAN] code=%s qty=%s avg=%s reason=%s source=%s",
+            code,
+            qty,
+            avg,
+            reason,
+            source,
+        )
     else:
         logger.warning("[UNKNOWN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
 
@@ -142,7 +151,7 @@ def _guard_reasons(
         )
         return injected
     if (not setup_ok) and not reasons:
-        injected = ["EMPTY_SETUP_REASON_GUARD"]
+        injected = ["UNKNOWN_SETUP_FAIL"]
         logger.warning(
             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
             code,
@@ -193,6 +202,12 @@ def run_diagnostics(
     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
     selected_by_market = _filter_markets(selected_by_market, target_markets)
     balance, holdings = _load_balance(kis)
+    try:
+        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance)
+        runtime_state_store.save_state(runtime_state)
+        logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
+    except Exception:
+        logger.exception("[DIAG][STATE] reconcile failed during diagnostics")
     positions = runtime_state.get("positions") or {}
 
     targets = _collect_target_symbols(
@@ -200,6 +215,7 @@ def run_diagnostics(
         runtime_state=runtime_state,
         selected_by_market=selected_by_market,
     )
+    logger.info("[DIAG][MD] symbols=%d as_of=%s", len(targets), ts_iso)
     runtime_state["diagnostics"]["last_run"].update({"ts": ts_iso, "targets": targets})
 
     orphan_n = 0
@@ -209,7 +225,8 @@ def run_diagnostics(
         if qty <= 0:
             continue
         code = _normalize_code(row.get("code") or row.get("pdno"))
-        avg = _safe_avg(row)
+        avg_value = _safe_avg(row)
+        avg = avg_value if avg_value != 0.0 else None
         pos = positions.get(code) if isinstance(positions, dict) else None
         if not pos:
             orphan_n += 1
@@ -221,6 +238,7 @@ def run_diagnostics(
                 kind="ORPHAN",
                 reason="MISSING_IN_STATE",
                 ts=ts_iso,
+                source="kis",
             )
             continue
         sid = pos.get("sid") or pos.get("strategy_id")
@@ -244,10 +262,22 @@ def run_diagnostics(
         health["ts"] = health.get("ts") or _iso_now()
         reasons = health.get("reasons") or []
         ok = bool(health.get("ok"))
-        if ok and not reasons:
-            reasons = ["OK"]
-        if (not ok) and not reasons:
-            reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
+        if ok:
+            if not reasons:
+                reasons = ["OK"]
+        else:
+            if not reasons:
+                reasons = []
+            if health.get("daily_len") is not None and health.get("daily_len") < 21:
+                reasons.append("daily_len<21")
+            if health.get("intraday_len") is not None and health.get("intraday_len") < 20:
+                reasons.append("intraday_len<20")
+            if health.get("prev_close") is None:
+                reasons.append("prev_close=None")
+            if health.get("vwap") is None:
+                reasons.append("vwap=None")
+            if not reasons:
+                reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
         health["reasons"] = reasons
         data_health_results[code] = health
         runtime_state["memory"]["data_health"][code] = health
@@ -311,6 +341,7 @@ def run_diagnostics(
                 kind="UNKNOWN",
                 reason="EXIT_STRATEGY_ID_MISSING",
                 ts=ts_iso,
+                source="state",
             )
         if not reasons:
             exit_ok = True

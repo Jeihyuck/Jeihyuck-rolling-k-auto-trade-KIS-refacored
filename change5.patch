@@ -1,0 +1,906 @@
+diff --git a/.gitignore b/.gitignore
+index 3292ac2655b3aa679127eceae82744c91cf2cf8a..df8f531ad0dc8a4bcb79c006a7258aac2dc2788f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,10 +1,14 @@
+ __pycache__/
++.runtime/
++**/__pycache__/
+ .venv/
+ .vscode/
+ .idea/
+ logs/
+ watchlists/
+ *.log
+ *.json
+ .env
+ bot_state/state.json
++kis_token_cache.json
++fastapi.log
+diff --git a/scripts/state_push_plain.sh b/scripts/state_push_plain.sh
+index eaa94ba5b924314c30e50022407ede868fe124af..4a104d7f1da80cd6cb952db7478d35fd8197dddc 100755
+--- a/scripts/state_push_plain.sh
++++ b/scripts/state_push_plain.sh
+@@ -1,76 +1,93 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
+ STATE_DIR="bot_state"
+ JSON_PATH="${STATE_DIR}/state.json"
+ POS_STATE_DIR="trader/state"
+ POS_JSON_PATH="${POS_STATE_DIR}/state.json"
+ INTENT_LOG_PATH="${POS_STATE_DIR}/strategy_intents.jsonl"
+ INTENT_CURSOR_PATH="${POS_STATE_DIR}/strategy_intents_state.json"
+ DIAG_DIR="${POS_STATE_DIR}/diagnostics"
+ DIAG_LATEST="${DIAG_DIR}/diag_latest.json"
++LEDGER_JSON="${POS_STATE_DIR}/../logs/ledger.jsonl"
+ 
+ if [[ ! -f "${JSON_PATH}" ]]; then
+   echo "[STATE] WARN: ${JSON_PATH} not found. Skipping."
+   exit 0
+ fi
+ if [[ ! -f "${POS_JSON_PATH}" ]]; then
+   echo "[STATE] WARN: ${POS_JSON_PATH} not found. Skipping."
+   exit 0
+ fi
+ 
+ tmp_state="$(mktemp)"
+ tmp_pos_state="$(mktemp)"
+ tmp_intent_log="$(mktemp)"
+ tmp_intent_cursor="$(mktemp)"
+ tmp_diag_dir="$(mktemp -d)"
+ trap 'rm -f "${tmp_state}" "${tmp_pos_state}" "${tmp_intent_log}" "${tmp_intent_cursor}"; rm -rf "${tmp_diag_dir}"' EXIT
+ cp -f "${JSON_PATH}" "${tmp_state}"
+ cp -f "${POS_JSON_PATH}" "${tmp_pos_state}"
+ cp -f "${INTENT_LOG_PATH}" "${tmp_intent_log}" 2>/dev/null || touch "${tmp_intent_log}"
+ cp -f "${INTENT_CURSOR_PATH}" "${tmp_intent_cursor}" 2>/dev/null || touch "${tmp_intent_cursor}"
+ if [[ -f "${DIAG_LATEST}" ]]; then
+   cp -f "${DIAG_LATEST}" "${tmp_diag_dir}/diag_latest.json"
+ fi
++if [[ -d "${DIAG_DIR}" ]]; then
++  find "${DIAG_DIR}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${tmp_diag_dir}/" \;
++fi
++if [[ -f "${LEDGER_JSON}" ]]; then
++  cp -f "${LEDGER_JSON}" "${tmp_diag_dir}/ledger.jsonl" 2>/dev/null || true
++fi
+ 
+ # IMPORTANT: avoid "untracked would be overwritten by checkout"
+ rm -f "${JSON_PATH}" || true
+ rm -f "${POS_JSON_PATH}" || true
+ rm -f "${INTENT_LOG_PATH}" || true
+ rm -f "${INTENT_CURSOR_PATH}" || true
+ rm -rf "${DIAG_DIR}" || true
+ 
+ if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+   git fetch --no-tags origin bot-state:refs/remotes/origin/bot-state >/dev/null 2>&1 || true
+   git checkout -B bot-state origin/bot-state
+ else
+   git checkout --orphan bot-state
+   git rm -r --cached . >/dev/null 2>&1 || true
+ fi
+ 
+ mkdir -p "${STATE_DIR}"
+ cp -f "${tmp_state}" "${JSON_PATH}"
+ mkdir -p "${POS_STATE_DIR}"
+ cp -f "${tmp_pos_state}" "${POS_JSON_PATH}"
+ cp -f "${tmp_intent_log}" "${INTENT_LOG_PATH}"
+ cp -f "${tmp_intent_cursor}" "${INTENT_CURSOR_PATH}"
+ mkdir -p "${DIAG_DIR}"
+ if [[ -d "${tmp_diag_dir}" ]]; then
+   cp -f "${tmp_diag_dir}/diag_latest.json" "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
++  find "${tmp_diag_dir}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${DIAG_DIR}/" \;
++  if [[ -f "${tmp_diag_dir}/ledger.jsonl" ]]; then
++    mkdir -p "$(dirname "${LEDGER_JSON}")"
++    cp -f "${tmp_diag_dir}/ledger.jsonl" "${LEDGER_JSON}" 2>/dev/null || true
++  fi
+ fi
+ 
+ git add -f "${JSON_PATH}"
+ git add -f "${POS_JSON_PATH}"
+ git add -f "${INTENT_LOG_PATH}"
+ git add -f "${INTENT_CURSOR_PATH}"
++git add -f ${DIAG_DIR}/diag_*.json 2>/dev/null || true
+ git add -f "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
++git add -f "${POS_STATE_DIR}/strategy_intents_state.json" 2>/dev/null || true
++git add -f "${POS_STATE_DIR}/strategy_intents.jsonl" 2>/dev/null || true
++git add -f "${LEDGER_JSON}" 2>/dev/null || true
++echo "[STATE] Staged diagnostics + state.json"
+ git status --porcelain
+ if git diff --cached --quiet; then
+   echo "[STATE] No changes to commit."
+   exit 0
+ fi
+ 
+ git commit -m "Update bot state (plain) [skip ci]"
+ git push --force-with-lease origin HEAD:bot-state
+ echo "[STATE] Pushed ${JSON_PATH} to bot-state branch."
+ echo "[STATE] Pushed diagnostics dumps to bot-state branch."
+diff --git a/trader/config.py b/trader/config.py
+index cd52be60ce97bcbaa9d52895227ead589491fe65..e92ce52cdb6728f51e42069c58ec664f0fc77c4f 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -234,63 +234,64 @@ STRATEGY_DRY_RUN = (_cfg("STRATEGY_DRY_RUN") or "true").lower() in ("1", "true",
+ STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
+ STRATEGY_INTENTS_STATE_PATH = Path(
+     _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
+ )
+ STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
+ STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
+ STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower() in (
+     "1",
+     "true",
+     "yes",
+ )
+ 
+ DIAGNOSTIC_MODE = (_cfg("DIAGNOSTIC_MODE") or "false").lower() in ("1", "true", "yes")
+ DIAGNOSTIC_ONLY = (_cfg("DIAGNOSTIC_ONLY") or "false").lower() in ("1", "true", "yes")
+ DIAGNOSTIC_FORCE_RUN = (_cfg("DIAGNOSTIC_FORCE_RUN") or "false").lower() in (
+     "1",
+     "true",
+     "yes",
+ )
+ DIAGNOSTIC_DUMP_DIR = Path(
+     _cfg("DIAGNOSTIC_DUMP_DIR") or _cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"]
+ )
+ DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+ DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+ DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
+-DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY or DIAGNOSTIC_FORCE_RUN
++DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
+ 
+ if DIAGNOSTIC_MODE:
+     STRATEGY_MODE = "INTENT_ONLY"
+     STRATEGY_DRY_RUN = True
+     STRATEGY_ALLOW_SELL_ONLY = True
+ 
+ logger.info(
+-    "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s",
++    "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
++    DIAG_ENABLED,
+ )
+ 
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             value = int(item)
+         except ValueError:
+             continue
+         if 1 <= value <= 5 and value not in priorities:
+             priorities.append(value)
+     return priorities or [5, 4, 3, 2, 1]
+ 
+ 
+ STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+     _cfg("STRATEGY_REDUCTION_PRIORITY")
+ )
+ # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
+ USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
+ PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
+ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+diff --git a/trader/diagnostics_runner.py b/trader/diagnostics_runner.py
+index ea5e6a6122a47d58b2623d4d88ddd9ebeebabfeb..98b1dbcf9cddeb2201f7a652e403cde4821fc9a6 100644
+--- a/trader/diagnostics_runner.py
++++ b/trader/diagnostics_runner.py
+@@ -89,187 +89,217 @@ def _collect_target_symbols(
+     *,
+     holdings: List[Dict[str, Any]],
+     runtime_state: Dict[str, Any],
+     selected_by_market: Dict[str, Any] | None,
+ ) -> list[str]:
+     symbols: set[str] = set()
+     for row in holdings or []:
+         code = _normalize_code(row.get("code") or row.get("pdno"))
+         if code and code != "000000" and _safe_qty(row) > 0:
+             symbols.add(code)
+     positions = runtime_state.get("positions") or {}
+     if isinstance(positions, dict):
+         symbols.update(positions.keys())
+     symbols.update(_collect_selected_symbols(selected_by_market))
+     symbols_list = sorted(symbols)
+     if DIAGNOSTIC_MAX_SYMBOLS and len(symbols_list) > DIAGNOSTIC_MAX_SYMBOLS:
+         return symbols_list[:DIAGNOSTIC_MAX_SYMBOLS]
+     return symbols_list
+ 
+ 
+ def _record_orphan_or_unknown(
+     *,
+     runtime_state: Dict[str, Any],
+     code: str,
+     qty: int,
+-    avg: float,
++    avg: float | None,
+     kind: str,
+     reason: str,
+     ts: str,
++    source: str = "state",
+ ) -> None:
+     runtime_state["diagnostics"]["orphans"][code] = {
+         "ts": ts,
+         "qty": qty,
+         "avg": avg,
+         "kind": kind,
+         "reason": reason,
++        "source": source,
+     }
+     if kind == "ORPHAN":
+-        logger.warning("[ORPHAN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
++        logger.warning(
++            "[ORPHAN] code=%s qty=%s avg=%s reason=%s source=%s",
++            code,
++            qty,
++            avg,
++            reason,
++            source,
++        )
+     else:
+         logger.warning("[UNKNOWN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
+ 
+ 
+ def _guard_reasons(
+     *, code: str, setup_ok: bool, reasons: List[str]
+ ) -> List[str]:
+     if setup_ok and not reasons:
+         injected = ["OK"]
+         logger.warning(
+             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+             code,
+             setup_ok,
+             injected,
+         )
+         return injected
+     if (not setup_ok) and not reasons:
+-        injected = ["EMPTY_SETUP_REASON_GUARD"]
++        injected = ["UNKNOWN_SETUP_FAIL"]
+         logger.warning(
+             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+             code,
+             setup_ok,
+             injected,
+         )
+         return injected
+     return reasons
+ 
+ 
+ def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+     with open(path, "w", encoding="utf-8") as f:
+         json.dump(payload, f, ensure_ascii=False, indent=2)
+ 
+ 
+ def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+     if kis is None:
+         return {}, []
+     try:
+         balance = kis.get_balance()
+         positions = balance.get("positions") or []
+         return balance, positions
+     except Exception as e:
+         logger.exception("[DIAG][BALANCE] failed to fetch: %s", e)
+         return {}, []
+ 
+ 
+ def run_diagnostics(
+     *,
+     kis: Optional[KisAPI],
+     runtime_state: Dict[str, Any],
+     selected_by_market: Dict[str, Any] | None,
+ ) -> Dict[str, Any]:
+     runtime_state = runtime_state or runtime_state_store.load_state()
+     _ensure_runtime_keys(runtime_state)
+     ts = now_kst()
+     ts_iso = ts.isoformat()
+ 
+     if selected_by_market is None:
+         try:
+             rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
+             selected_by_market = rebalance_payload.get("selected_by_market") or {}
+         except Exception as e:
+             logger.exception("[DIAG][REBALANCE] failed: %s", e)
+             selected_by_market = {}
+ 
+     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
+     selected_by_market = _filter_markets(selected_by_market, target_markets)
+     balance, holdings = _load_balance(kis)
++    try:
++        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance)
++        runtime_state_store.save_state(runtime_state)
++        logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
++    except Exception:
++        logger.exception("[DIAG][STATE] reconcile failed during diagnostics")
+     positions = runtime_state.get("positions") or {}
+ 
+     targets = _collect_target_symbols(
+         holdings=holdings,
+         runtime_state=runtime_state,
+         selected_by_market=selected_by_market,
+     )
++    logger.info("[DIAG][MD] symbols=%d as_of=%s", len(targets), ts_iso)
+     runtime_state["diagnostics"]["last_run"].update({"ts": ts_iso, "targets": targets})
+ 
+     orphan_n = 0
+     unknown_n = 0
+     for row in holdings:
+         qty = _safe_qty(row)
+         if qty <= 0:
+             continue
+         code = _normalize_code(row.get("code") or row.get("pdno"))
+-        avg = _safe_avg(row)
++        avg_value = _safe_avg(row)
++        avg = avg_value if avg_value != 0.0 else None
+         pos = positions.get(code) if isinstance(positions, dict) else None
+         if not pos:
+             orphan_n += 1
+             _record_orphan_or_unknown(
+                 runtime_state=runtime_state,
+                 code=code,
+                 qty=qty,
+                 avg=avg,
+                 kind="ORPHAN",
+                 reason="MISSING_IN_STATE",
+                 ts=ts_iso,
++                source="kis",
+             )
+             continue
+         sid = pos.get("sid") or pos.get("strategy_id")
+         if sid is None or str(sid).strip() == "" or str(sid).upper() == "UNKNOWN":
+             unknown_n += 1
+             _record_orphan_or_unknown(
+                 runtime_state=runtime_state,
+                 code=code,
+                 qty=qty,
+                 avg=avg,
+                 kind="UNKNOWN",
+                 reason="STRATEGY_ID_UNKNOWN",
+                 ts=ts_iso,
+             )
+ 
+     data_health_results: Dict[str, Any] = {}
+     setup_eval_results: Dict[str, Any] = {}
+ 
+     for code in targets:
+         health = check_data_health(code, kis)
+         health["ts"] = health.get("ts") or _iso_now()
+         reasons = health.get("reasons") or []
+         ok = bool(health.get("ok"))
+-        if ok and not reasons:
+-            reasons = ["OK"]
+-        if (not ok) and not reasons:
+-            reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
++        if ok:
++            if not reasons:
++                reasons = ["OK"]
++        else:
++            if not reasons:
++                reasons = []
++            if health.get("daily_len") is not None and health.get("daily_len") < 21:
++                reasons.append("daily_len<21")
++            if health.get("intraday_len") is not None and health.get("intraday_len") < 20:
++                reasons.append("intraday_len<20")
++            if health.get("prev_close") is None:
++                reasons.append("prev_close=None")
++            if health.get("vwap") is None:
++                reasons.append("vwap=None")
++            if not reasons:
++                reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
+         health["reasons"] = reasons
+         data_health_results[code] = health
+         runtime_state["memory"]["data_health"][code] = health
+         logger.info(
+             "[DATA-HEALTH] code=%s ok=%s reasons=%s daily_len=%s intraday_len=%s prev_close=%s vwap=%s",
+             code,
+             health.get("ok"),
+             health.get("reasons"),
+             health.get("daily_len"),
+             health.get("intraday_len"),
+             health.get("prev_close"),
+             health.get("vwap"),
+         )
+ 
+         setup = evaluate_setup(code, kis, health, runtime_state)
+         setup["ts"] = setup.get("ts") or _iso_now()
+         setup_ok = bool(setup.get("setup_ok"))
+         setup_reasons = _guard_reasons(
+             code=code, setup_ok=setup_ok, reasons=setup.get("reasons") or []
+         )
+         setup["reasons"] = setup_reasons
+         setup_eval_results[code] = setup
+         runtime_state["memory"]["setup_eval"][code] = setup
+         if setup_ok:
+             logger.info(
+@@ -289,50 +319,51 @@ def run_diagnostics(
+                 setup.get("intra", {}),
+             )
+ 
+     exit_eval_results: Dict[str, Any] = {}
+     for code, pos in (positions or {}).items():
+         qty = int(pos.get("qty") or 0)
+         sid = pos.get("sid") or pos.get("strategy_id") or "UNKNOWN"
+         strategy_id = pos.get("strategy_id") or "UNKNOWN"
+         reasons: List[str] = []
+         if sid in (None, "", "UNKNOWN"):
+             reasons.append("MISSING_SID")
+         if strategy_id in (None, "", "UNKNOWN"):
+             reasons.append("MISSING_STRATEGY_ID")
+         if qty <= 0:
+             reasons.append("QTY_ZERO")
+         if sid in (None, "", "UNKNOWN") or strategy_id in (None, "", "UNKNOWN"):
+             unknown_n += 1
+             _record_orphan_or_unknown(
+                 runtime_state=runtime_state,
+                 code=code,
+                 qty=qty,
+                 avg=float(pos.get("avg_price") or 0.0),
+                 kind="UNKNOWN",
+                 reason="EXIT_STRATEGY_ID_MISSING",
+                 ts=ts_iso,
++                source="state",
+             )
+         if not reasons:
+             exit_ok = True
+             reasons = ["EMPTY_EXIT_REASON_GUARD"]
+         else:
+             exit_ok = False
+         exit_eval_results[code] = {
+             "ts": _iso_now(),
+             "sid": sid or "UNKNOWN",
+             "strategy_id": strategy_id,
+             "qty": qty,
+             "exit_ok": exit_ok,
+             "reasons": reasons,
+         }
+         runtime_state["memory"]["exit_eval"][code] = exit_eval_results[code]
+         logger.info(
+             "[EXIT-CHECK] code=%s sid=%s strategy_id=%s qty=%s exit_ok=%s reasons=%s",
+             code,
+             sid,
+             strategy_id,
+             qty,
+             exit_ok,
+             reasons,
+         )
+ 
+diff --git a/trader/setup_eval.py b/trader/setup_eval.py
+index 60cb4e4d8061995dd451026863b70b372f15fbd1..4fbd31e371b4517bdd2c46227651dc0e0fbdcbfc 100644
+--- a/trader/setup_eval.py
++++ b/trader/setup_eval.py
+@@ -18,44 +18,44 @@ def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], sta
+ 
+     if not health.get("ok", False):
+         setup_ok = False
+         health_reasons = health.get("reasons") or []
+         joined = ",".join(str(r) for r in health_reasons)
+         reasons.append(f"DATA_HEALTH_BAD:{joined}" if joined else "DATA_HEALTH_BAD")
+ 
+     positions = (state or {}).get("positions") if isinstance(state, dict) else {}
+     pos = (positions or {}).get(str(code).zfill(6), {})
+     daily_ctx: Dict[str, Any] = {}
+     intra_ctx: Dict[str, Any] = {}
+ 
+     if isinstance(pos, dict):
+         daily_ctx = pos.get("data_health") or {}
+         intra_ctx = pos.get("setup") or {}
+ 
+     if setup_ok and not reasons:
+         reasons = ["OK"]
+         logger.warning(
+             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+             code,
+             setup_ok,
+             reasons,
+         )
+     if setup_ok is False and not reasons:
+-        reasons = ["EMPTY_SETUP_REASON_GUARD"]
++        reasons = ["UNKNOWN_SETUP_FAIL"]
+         logger.warning(
+             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+             code,
+             setup_ok,
+             reasons,
+         )
+     if setup_ok is False and not missing:
+         missing.append("UNKNOWN_MISSING")
+ 
+     payload = {
+         "ts": datetime.now(KST).isoformat(),
+         "setup_ok": setup_ok,
+         "missing": missing,
+-        "reasons": reasons if setup_ok is False or reasons else [],
++        "reasons": reasons if setup_ok is False or reasons else ["OK"],
+         "daily": daily_ctx,
+         "intra": intra_ctx,
+     }
+     return payload
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 83d8c7132793cb75e68c5d28e87da9a924c47c52..ad6609bd6f5ba00f89e5b778d326a80a02ccffaa 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -83,50 +83,57 @@ def save_state(state: Dict[str, Any]) -> None:
+             json.dump(payload, f, ensure_ascii=False, indent=2)
+             f.flush()
+             os.fsync(f.fileno())
+         os.replace(tmp_path, RUNTIME_STATE_PATH)
+         try:
+             size = RUNTIME_STATE_PATH.stat().st_size
+             logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
+         except Exception:
+             logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
+         try:
+             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+             tmp_state_path = STATE_PATH.with_name(f"{STATE_PATH.name}.tmp")
+             with open(tmp_state_path, "w", encoding="utf-8") as f:
+                 json.dump(payload, f, ensure_ascii=False, indent=2)
+                 f.flush()
+                 os.fsync(f.fileno())
+             os.replace(tmp_state_path, STATE_PATH)
+         except Exception:
+             logger.exception("[STATE][SAVE] failed to mirror %s", STATE_PATH)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
+ 
+ 
+ def _ensure_lots(state: Dict[str, Any]) -> list[dict[str, Any]]:
+     lots = state.get("lots")
++    if isinstance(lots, dict):
++        combined: list[dict[str, Any]] = []
++        for bucket in lots.values():
++            if isinstance(bucket, list):
++                combined.extend([lot for lot in bucket if isinstance(lot, dict)])
++        lots = combined
++        state["lots"] = lots
+     if not isinstance(lots, list):
+         lots = []
+         state["lots"] = lots
+     return lots
+ 
+ 
+ def _generate_lot_id(code: str, ts: str | None = None) -> str:
+     suffix = ts or datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+     return f"{_LOT_ID_PREFIX}-{_normalize_code(code)}-{suffix}-{uuid.uuid4().hex[:6]}"
+ 
+ 
+ def _norm_sid(value: Any) -> Any:
+     if value is None:
+         return None
+     try:
+         return int(value)
+     except Exception:
+         return str(value)
+ 
+ 
+ def record_lot_open(
+     state: Dict[str, Any],
+     *,
+     code: str,
+     sid: Any,
+@@ -358,108 +365,189 @@ def mark_fill(
+         pos.update({"qty": total_qty, "avg_price": avg_price, "last_buy_ts": ts})
+     else:
+         pos.update({"qty": max(0, cur_qty - int(qty)), "last_sell_ts": ts})
+     pos["strategy_id"] = strategy_id
+     pos["last_order_id"] = order_id
+     pos["last_action"] = side.upper()
+     pos["last_action_ts"] = ts
+     pos["last_order_status"] = status
+     update_position_fields(state, symbol, pos)
+     try:
+         if side.upper() == "BUY":
+             save_state(state)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to persist after lot open for %s", symbol)
+ 
+ 
+ def reconcile_with_kis_balance(
+     state: Dict[str, Any],
+     balance: Dict[str, Any],
+     *,
+     preferred_strategy: Dict[str, Any] | None = None,
+ ) -> Dict[str, Any]:
+     preferred_strategy = preferred_strategy or {}
+     positions = state.setdefault("positions", {})
+     lots = _ensure_lots(state)
+-    open_qty_by_code: Dict[str, int] = {}
++    state_lots_by_code: Dict[str, list[dict[str, Any]]] = {}
+     for lot in lots:
+-        if str(lot.get("status") or "OPEN").upper() != "OPEN":
+-            continue
+         code_key = _normalize_code(lot.get("code") or lot.get("pdno"))
+-        rem = int(lot.get("remaining_qty") or lot.get("qty") or 0)
+-        if not code_key or rem <= 0:
++        if not code_key:
+             continue
+-        open_qty_by_code[code_key] = open_qty_by_code.get(code_key, 0) + rem
++        bucket = state_lots_by_code.setdefault(code_key, [])
++        bucket.append(lot)
++
+     balance_positions = balance.get("positions") if isinstance(balance, dict) else None
+     if not isinstance(balance_positions, list):
++        logger.warning("[STATE][RECONCILE] balance.positions missing or invalid")
+         return state
+-    seen = set()
++
++    now_iso = datetime.now(KST).isoformat()
++    holdings = []
+     for row in balance_positions:
+-        symbol = str(row.get("code") or row.get("pdno") or "").zfill(6)
+-        if not symbol:
+-            continue
+-        qty = int(row.get("qty") or 0)
+-        if qty <= 0:
++        symbol = _normalize_code(row.get("code") or row.get("pdno"))
++        qty = int(float(row.get("qty") or row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
++        if not symbol or qty <= 0:
+             continue
+-        seen.add(symbol)
+-        pos = upsert_position(state, symbol)
+-        strategy_id = pos.get("strategy_id") or preferred_strategy.get(symbol) or "UNKNOWN"
++        holdings.append(
++            {
++                "code": symbol,
++                "qty": qty,
++                "avg": float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0),
++                "cur": float(row.get("prpr") or 0.0) if row.get("prpr") not in (None, "") else None,
++            }
++        )
++    logger.info("[STATE][RECONCILE] kis_holdings=%d", len(holdings))
++
++    created_orphans = 0
++    qty_adjusted = 0
++    updated_codes = 0
++
++    for holding in holdings:
++        code = holding["code"]
++        qty = holding["qty"]
++        avg = holding["avg"] if holding["avg"] != 0.0 else None
++        cur = holding["cur"]
++        pos = upsert_position(state, code)
++        strategy_id = pos.get("strategy_id") or preferred_strategy.get(code) or "UNKNOWN"
+         pos.update(
+             {
+                 "strategy_id": strategy_id,
+                 "qty": qty,
+-                "avg_price": float(row.get("avg_price") or 0.0),
++                "avg_price": float(holding["avg"] or 0.0),
+                 "last_action": "RECONCILE",
+             }
+         )
+-        open_qty = open_qty_by_code.get(symbol, 0)
+-        if open_qty < qty:
+-            orphan_qty = qty - open_qty
+-            try:
+-                record_lot_open(
+-                    state,
+-                    code=symbol,
+-                    sid="UNKNOWN",
+-                    strategy="ORPHAN",
+-                    engine="reconcile",
+-                    qty=orphan_qty,
+-                    entry_price=float(row.get("avg_price") or 0.0),
+-                    entry_ts=datetime.now(KST).isoformat(),
++        state_lots = state_lots_by_code.get(code, [])
++        state_sum = sum(int(l.get("remaining_qty") or l.get("qty") or 0) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN")
++        if not state_lots:
++            lot = {
++                "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
++                "code": code,
++                "pdno": code,
++                "sid": "ORPHAN",
++                "strategy_id": "ORPHAN",
++                "strategy": "ORPHAN",
++                "engine": "reconcile_kis_balance",
++                "qty": qty,
++                "remaining_qty": qty,
++                "entry_price": avg if avg is not None else None,
++                "entry_ts": now_iso,
++                "status": "OPEN",
++                "source": "reconcile_kis_balance",
++                "created_at": now_iso,
++                "updated_at": now_iso,
++                "notes": ["MISSING_IN_STATE"],
++            }
++            lots.append(lot)
++            created_orphans += 1
++            updated_codes += 1
++            logger.warning(
++                "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s",
++                code,
++                qty,
++                avg,
++                cur,
++            )
++            continue
++        if state_sum != qty:
++            delta = qty - state_sum
++            notes = [
++                "QTY_MISMATCH_STATE_TO_KIS",
++                f"state_sum={state_sum}",
++                f"kis={qty}",
++            ]
++            if delta > 0:
++                lot = {
++                    "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
++                    "code": code,
++                    "pdno": code,
++                    "sid": "ORPHAN",
++                    "strategy_id": "ORPHAN",
++                    "strategy": "ORPHAN",
++                    "engine": "reconcile_kis_balance",
++                    "qty": delta,
++                    "remaining_qty": delta,
++                    "entry_price": avg if avg is not None else None,
++                    "entry_ts": now_iso,
++                    "status": "OPEN",
++                    "source": "reconcile_kis_balance",
++                    "created_at": now_iso,
++                    "updated_at": now_iso,
++                    "notes": notes,
++                }
++                lots.append(lot)
++                qty_adjusted += 1
++                updated_codes += 1
++                logger.warning(
++                    "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s notes=%s",
++                    code,
++                    delta,
++                    avg,
++                    cur,
++                    notes,
+                 )
++            else:
+                 logger.warning(
+-                    "[ORPHAN-LOT] code=%s qty=%s reason=%s",
+-                    symbol,
+-                    orphan_qty,
+-                    "RECONCILE_NO_LOT",
++                    "[STATE][RECONCILE][STATE_GT_KIS] code=%s state_sum=%d kis=%d notes=%s",
++                    code,
++                    state_sum,
++                    qty,
++                    notes,
+                 )
+-            except Exception:
+-                logger.exception("[ORPHAN-LOT][FAIL] code=%s qty=%s", symbol, orphan_qty)
++        else:
++            updated_codes += 1
+     for symbol, pos in list(positions.items()):
+-        if symbol not in seen:
++        if symbol not in {h["code"] for h in holdings}:
+             pos["qty"] = 0
+             pos["last_action"] = "RECONCILE"
+             positions[symbol] = pos
++    logger.info(
++        "[STATE][RECONCILE] created_orphans=%d qty_adjusted=%d updated_codes=%d",
++        created_orphans,
++        qty_adjusted,
++        updated_codes,
++    )
+     return state
+ 
+ 
+ def _default_lot_state() -> Dict[str, Any]:
+     return {"version": SCHEMA_VERSION, "lots": [], "updated_at": None}
+ 
+ 
+ def load_lot_state(path_json: str) -> Dict[str, Any]:
+     path = Path(path_json)
+     if not path.exists():
+         return _default_lot_state()
+     try:
+         with open(path, "r", encoding="utf-8") as f:
+             state = json.load(f)
+         if not isinstance(state, dict):
+             logger.warning("[STATE_STORE] invalid state format: %s", type(state))
+             return _default_lot_state()
+         state.setdefault("version", SCHEMA_VERSION)
+         state.setdefault("lots", [])
+         state.setdefault("updated_at", None)
+         return state
+     except Exception:
+         logger.exception("[STATE_STORE] failed to load %s", path_json)
+         return _default_lot_state()
+ 
+diff --git a/trader/trader.py b/trader/trader.py
+index 40afa938c213246e0408ce5690dd6a765a2836de..6f749272b26196ad27b0b48e996e795c2d07f76b 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,79 +1,88 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ 
+ from portfolio.portfolio_manager import PortfolioManager
+ from trader.kis_wrapper import KisAPI
+ from trader import state_store as runtime_state_store
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+-from trader.config import DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
++from trader.config import DIAG_ENABLED, DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> None:
+     now = now_kst()
+-    diag_enabled = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY or DIAGNOSTIC_FORCE_RUN
++    diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
++    logger.info(
++        "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
++        now.isoformat(),
++        is_trading_day(now),
++        DIAG_ENABLED,
++        DIAGNOSTIC_FORCE_RUN,
++        DIAGNOSTIC_ONLY,
++        DIAGNOSTIC_MODE,
++    )
+     if diag_enabled:
+         os.environ["DISABLE_LIVE_TRADING"] = "true"
+         logger.info(
+             "[DIAG][TRADER] forcing DISABLE_LIVE_TRADING=true (diag_enabled=%s)",
+             diag_enabled,
+         )
+     trading_day = is_trading_day(now)
+-    if (not trading_day) and (not diag_enabled):
++    if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
+         return
+     if (not trading_day) and diag_enabled:
+         logger.warning(
+             "[DIAG][TRADER] non-trading-day(%s) but running diagnostics (only=%s force_run=%s)",
+             now.date(),
+             DIAGNOSTIC_ONLY,
+             DIAGNOSTIC_FORCE_RUN,
+         )
+     runtime_state = {}
+     kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state, balance
+         )
+         runtime_state_store.save_state(runtime_state)
+         logger.info("[TRADER] runtime state reconciled")
+     except Exception:
+         logger.exception("[TRADER] runtime state reconcile failed")
+         runtime_state = runtime_state or runtime_state_store.load_state()
+ 
+     if DIAGNOSTIC_ONLY:
+         from trader.diagnostics_runner import run_diagnostics
+ 
+         run_diagnostics(kis=kis, runtime_state=runtime_state, selected_by_market=None)
+-        logger.info("[DIAG][TRADER] diagnostics-only complete -> exit")
++        logger.info("[DIAG][TRADER] diagnostic_only complete")
+         return
+ 
+     diag_result = None
+     if DIAGNOSTIC_MODE:
+         try:
+             from trader.diagnostics_runner import run_diagnostics
+ 
+             diag_result = run_diagnostics(
+                 kis=kis, runtime_state=runtime_state, selected_by_market=None
+             )
+         except Exception:
+             logger.exception("[DIAG][TRADER] diagnostics run failed")
+ 
+     mgr = PortfolioManager()
+     result = mgr.run_once()
+     if isinstance(result, dict) and diag_result is not None:
+         result.setdefault("diagnostics", diag_result)
+     logger.info("[TRADER] cycle complete %s", result)
+ 
+ 
+ if __name__ == "__main__":
+     main()

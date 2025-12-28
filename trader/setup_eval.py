@@ -40,7 +40,7 @@ def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], sta
             reasons,
         )
     if setup_ok is False and not reasons:
-        reasons = ["EMPTY_SETUP_REASON_GUARD"]
+        reasons = ["UNKNOWN_SETUP_FAIL"]
         logger.warning(
             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
             code,
@@ -54,7 +54,7 @@ def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], sta
         "ts": datetime.now(KST).isoformat(),
         "setup_ok": setup_ok,
         "missing": missing,
-        "reasons": reasons if setup_ok is False or reasons else [],
+        "reasons": reasons if setup_ok is False or reasons else ["OK"],
         "daily": daily_ctx,
         "intra": intra_ctx,
     }

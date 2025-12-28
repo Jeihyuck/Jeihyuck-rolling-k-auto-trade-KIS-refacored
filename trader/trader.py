@@ -10,14 +10,23 @@ from trader.kis_wrapper import KisAPI
 from trader import state_store as runtime_state_store
 from trader.time_utils import is_trading_day, now_kst
 from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
-from trader.config import DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
+from trader.config import DIAG_ENABLED, DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
     now = now_kst()
-    diag_enabled = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY or DIAGNOSTIC_FORCE_RUN
+    diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
+    logger.info(
+        "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
+        now.isoformat(),
+        is_trading_day(now),
+        DIAG_ENABLED,
+        DIAGNOSTIC_FORCE_RUN,
+        DIAGNOSTIC_ONLY,
+        DIAGNOSTIC_MODE,
+    )
     if diag_enabled:
         os.environ["DISABLE_LIVE_TRADING"] = "true"
         logger.info(
@@ -25,7 +34,7 @@ def main() -> None:
             diag_enabled,
         )
     trading_day = is_trading_day(now)
-    if (not trading_day) and (not diag_enabled):
+    if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
         return
     if (not trading_day) and diag_enabled:
@@ -54,7 +63,7 @@ def main() -> None:
         from trader.diagnostics_runner import run_diagnostics
 
         run_diagnostics(kis=kis, runtime_state=runtime_state, selected_by_market=None)
-        logger.info("[DIAG][TRADER] diagnostics-only complete -> exit")
+        logger.info("[DIAG][TRADER] diagnostic_only complete")
         return
 
     diag_result = None

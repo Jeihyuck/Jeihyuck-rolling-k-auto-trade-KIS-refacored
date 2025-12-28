@@ -9,6 +9,7 @@ INTENT_LOG_PATH="${POS_STATE_DIR}/strategy_intents.jsonl"
 INTENT_CURSOR_PATH="${POS_STATE_DIR}/strategy_intents_state.json"
 DIAG_DIR="${POS_STATE_DIR}/diagnostics"
 DIAG_LATEST="${DIAG_DIR}/diag_latest.json"
+LEDGER_JSON="${POS_STATE_DIR}/../logs/ledger.jsonl"
 
 if [[ ! -f "${JSON_PATH}" ]]; then
   echo "[STATE] WARN: ${JSON_PATH} not found. Skipping."
@@ -31,6 +32,12 @@ cp -f "${INTENT_LOG_PATH}" "${tmp_intent_log}" 2>/dev/null || touch "${tmp_inten
 cp -f "${INTENT_CURSOR_PATH}" "${tmp_intent_cursor}" 2>/dev/null || touch "${tmp_intent_cursor}"
 if [[ -f "${DIAG_LATEST}" ]]; then
   cp -f "${DIAG_LATEST}" "${tmp_diag_dir}/diag_latest.json"
+fi
+if [[ -d "${DIAG_DIR}" ]]; then
+  find "${DIAG_DIR}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${tmp_diag_dir}/" \;
+fi
+if [[ -f "${LEDGER_JSON}" ]]; then
+  cp -f "${LEDGER_JSON}" "${tmp_diag_dir}/ledger.jsonl" 2>/dev/null || true
 fi
 
 # IMPORTANT: avoid "untracked would be overwritten by checkout"
@@ -57,13 +64,23 @@ cp -f "${tmp_intent_cursor}" "${INTENT_CURSOR_PATH}"
 mkdir -p "${DIAG_DIR}"
 if [[ -d "${tmp_diag_dir}" ]]; then
   cp -f "${tmp_diag_dir}/diag_latest.json" "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
+  find "${tmp_diag_dir}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${DIAG_DIR}/" \;
+  if [[ -f "${tmp_diag_dir}/ledger.jsonl" ]]; then
+    mkdir -p "$(dirname "${LEDGER_JSON}")"
+    cp -f "${tmp_diag_dir}/ledger.jsonl" "${LEDGER_JSON}" 2>/dev/null || true
+  fi
 fi
 
 git add -f "${JSON_PATH}"
 git add -f "${POS_JSON_PATH}"
 git add -f "${INTENT_LOG_PATH}"
 git add -f "${INTENT_CURSOR_PATH}"
+git add -f ${DIAG_DIR}/diag_*.json 2>/dev/null || true
 git add -f "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
+git add -f "${POS_STATE_DIR}/strategy_intents_state.json" 2>/dev/null || true
+git add -f "${POS_STATE_DIR}/strategy_intents.jsonl" 2>/dev/null || true
+git add -f "${LEDGER_JSON}" 2>/dev/null || true
+echo "[STATE] Staged diagnostics + state.json"
 git status --porcelain
 if git diff --cached --quiet; then
   echo "[STATE] No changes to commit."
