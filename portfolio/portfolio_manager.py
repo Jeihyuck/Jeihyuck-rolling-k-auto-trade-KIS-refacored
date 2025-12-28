@@ -79,7 +79,7 @@ class PortfolioManager:
         if DIAG_ENABLED:
             os.environ["DISABLE_LIVE_TRADING"] = "true"
             logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s", DIAG_ENABLED)
-            diag_result = run_diagnostics_once()
+            diag_result = run_diagnostics_once(selected_by_market=selected_by_market)
             if DIAGNOSTIC_ONLY:
                 return {
                     "diagnostics": diag_result,

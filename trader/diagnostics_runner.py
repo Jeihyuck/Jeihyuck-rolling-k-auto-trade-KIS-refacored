@@ -4,28 +4,42 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
-from strategy.market_data import build_market_data
 from trader import state_store as runtime_state_store
 from trader.config import (
     DIAG_ENABLED,
     DIAGNOSTIC_DUMP_DIR,
     DIAGNOSTIC_MAX_SYMBOLS,
     DIAGNOSTIC_TARGET_MARKETS,
+    KST,
 )
 from trader.core_utils import get_rebalance_anchor_date
 from trader.data_health import check_data_health
 from trader.kis_wrapper import KisAPI
 from trader.setup_eval import evaluate_setup
-from trader.time_utils import is_trading_day, now_kst
+from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_code(sym: str | None) -> str:
     return str(sym or "").strip().lstrip("A").zfill(6)
+
+
+def _iso_now() -> str:
+    return datetime.now(KST).isoformat()
+
+
+def _ensure_runtime_keys(runtime_state: Dict[str, Any]) -> None:
+    runtime_state.setdefault("diagnostics", {})
+    runtime_state.setdefault("memory", {})
+    runtime_state["diagnostics"].setdefault("orphans", {})
+    runtime_state["memory"].setdefault("data_health", {})
+    runtime_state["memory"].setdefault("setup_eval", {})
+    runtime_state["memory"].setdefault("exit_eval", {})
+    runtime_state["diagnostics"].setdefault("last_run", {})
 
 
 def _filter_markets(
@@ -39,179 +53,340 @@ def _filter_markets(
     return {k: v for k, v in (selected_by_market or {}).items() if k.upper() in markets}
 
 
-def _collect_target_symbols(
-    selected_by_market: Dict[str, Any] | None, runtime_state: Dict[str, Any]
-) -> list[str]:
+def _safe_qty(row: Dict[str, Any]) -> int:
+    for key in ("qty", "hldg_qty", "ord_psbl_qty"):
+        try:
+            qty = int(float(row.get(key) or 0))
+            if qty > 0:
+                return qty
+        except Exception:
+            continue
+    return 0
+
+
+def _safe_avg(row: Dict[str, Any]) -> float:
+    for key in ("avg_price", "pchs_avg_pric", "pchs_avg_price"):
+        try:
+            return float(row.get(key) or 0.0)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _collect_selected_symbols(selected_by_market: Dict[str, Any] | None) -> set[str]:
     symbols: set[str] = set()
     for rows in (selected_by_market or {}).values():
         for row in rows or []:
-            code = _normalize_code(row.get("code") or row.get("stock_code") or row.get("pdno"))
+            code = _normalize_code(
+                row.get("code") or row.get("stock_code") or row.get("pdno")
+            )
             if code and code != "000000":
                 symbols.add(code)
+    return symbols
+
+
+def _collect_target_symbols(
+    *,
+    holdings: List[Dict[str, Any]],
+    runtime_state: Dict[str, Any],
+    selected_by_market: Dict[str, Any] | None,
+) -> list[str]:
+    symbols: set[str] = set()
+    for row in holdings or []:
+        code = _normalize_code(row.get("code") or row.get("pdno"))
+        if code and code != "000000" and _safe_qty(row) > 0:
+            symbols.add(code)
     positions = runtime_state.get("positions") or {}
     if isinstance(positions, dict):
         symbols.update(positions.keys())
-    lots = runtime_state.get("lots") or []
-    if isinstance(lots, list):
-        for lot in lots:
-            code = _normalize_code(lot.get("code") or lot.get("pdno"))
-            if code and code != "000000":
-                symbols.add(code)
+    symbols.update(_collect_selected_symbols(selected_by_market))
     symbols_list = sorted(symbols)
     if DIAGNOSTIC_MAX_SYMBOLS and len(symbols_list) > DIAGNOSTIC_MAX_SYMBOLS:
         return symbols_list[:DIAGNOSTIC_MAX_SYMBOLS]
     return symbols_list
 
 
-def _dump_payload(path: Path, payload: Dict[str, Any]) -> None:
+def _record_orphan_or_unknown(
+    *,
+    runtime_state: Dict[str, Any],
+    code: str,
+    qty: int,
+    avg: float,
+    kind: str,
+    reason: str,
+    ts: str,
+) -> None:
+    runtime_state["diagnostics"]["orphans"][code] = {
+        "ts": ts,
+        "qty": qty,
+        "avg": avg,
+        "kind": kind,
+        "reason": reason,
+    }
+    if kind == "ORPHAN":
+        logger.warning("[ORPHAN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
+    else:
+        logger.warning("[UNKNOWN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
+
+
+def _guard_reasons(
+    *, code: str, setup_ok: bool, reasons: List[str]
+) -> List[str]:
+    if setup_ok and not reasons:
+        injected = ["OK"]
+        logger.warning(
+            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+            code,
+            setup_ok,
+            injected,
+        )
+        return injected
+    if (not setup_ok) and not reasons:
+        injected = ["EMPTY_SETUP_REASON_GUARD"]
+        logger.warning(
+            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+            code,
+            setup_ok,
+            injected,
+        )
+        return injected
+    return reasons
+
+
+def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    size = path.stat().st_size
-    logger.info("[DIAG][DUMP] path=%s bytes=%d", path, size)
 
 
-def run_diagnostics_once() -> Dict[str, Any]:
-    now = now_kst()
-    trading_day = is_trading_day(now)
-    runtime_state = runtime_state_store.load_state()
-
-    kis: KisAPI | None = None
+def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if kis is None:
+        return {}, []
     try:
-        kis = KisAPI()
+        balance = kis.get_balance()
+        positions = balance.get("positions") or []
+        return balance, positions
     except Exception as e:
-        logger.exception("[DIAG][INIT] failed to init KisAPI: %s", e)
+        logger.exception("[DIAG][BALANCE] failed to fetch: %s", e)
+        return {}, []
 
-    try:
-        balance = kis.get_balance() if kis else {}
-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance)
-        runtime_state_store.save_state(runtime_state)
-        logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
-    except Exception as e:
-        logger.exception("[DIAG][STATE] reconcile failed: %s", e)
 
-    try:
-        rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
-        selected_by_market = rebalance_payload.get("selected_by_market") or {}
-    except Exception as e:
-        logger.exception("[DIAG][REBALANCE] failed: %s", e)
-        selected_by_market = {}
+def run_diagnostics(
+    *,
+    kis: Optional[KisAPI],
+    runtime_state: Dict[str, Any],
+    selected_by_market: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    runtime_state = runtime_state or runtime_state_store.load_state()
+    _ensure_runtime_keys(runtime_state)
+    ts = now_kst()
+    ts_iso = ts.isoformat()
+
+    if selected_by_market is None:
+        try:
+            rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
+            selected_by_market = rebalance_payload.get("selected_by_market") or {}
+        except Exception as e:
+            logger.exception("[DIAG][REBALANCE] failed: %s", e)
+            selected_by_market = {}
 
     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
     selected_by_market = _filter_markets(selected_by_market, target_markets)
-    logger.info(
-        "[DIAG][REBALANCE] kospi=%d kosdaq=%d",
-        len(selected_by_market.get("KOSPI", []) or []),
-        len(selected_by_market.get("KOSDAQ", []) or []),
-    )
+    balance, holdings = _load_balance(kis)
+    positions = runtime_state.get("positions") or {}
 
-    market_data = build_market_data(selected_by_market, kis_client=kis)
-    logger.info(
-        "[DIAG][MD] symbols=%d as_of=%s",
-        len(market_data.get("prices", {})),
-        market_data.get("as_of"),
+    targets = _collect_target_symbols(
+        holdings=holdings,
+        runtime_state=runtime_state,
+        selected_by_market=selected_by_market,
     )
+    runtime_state["diagnostics"]["last_run"].update({"ts": ts_iso, "targets": targets})
 
-    symbols = _collect_target_symbols(selected_by_market, runtime_state)
-    data_health: Dict[str, Any] = {}
-    setup_result: Dict[str, Any] = {}
-    for code in symbols:
+    orphan_n = 0
+    unknown_n = 0
+    for row in holdings:
+        qty = _safe_qty(row)
+        if qty <= 0:
+            continue
+        code = _normalize_code(row.get("code") or row.get("pdno"))
+        avg = _safe_avg(row)
+        pos = positions.get(code) if isinstance(positions, dict) else None
+        if not pos:
+            orphan_n += 1
+            _record_orphan_or_unknown(
+                runtime_state=runtime_state,
+                code=code,
+                qty=qty,
+                avg=avg,
+                kind="ORPHAN",
+                reason="MISSING_IN_STATE",
+                ts=ts_iso,
+            )
+            continue
+        sid = pos.get("sid") or pos.get("strategy_id")
+        if sid is None or str(sid).strip() == "" or str(sid).upper() == "UNKNOWN":
+            unknown_n += 1
+            _record_orphan_or_unknown(
+                runtime_state=runtime_state,
+                code=code,
+                qty=qty,
+                avg=avg,
+                kind="UNKNOWN",
+                reason="STRATEGY_ID_UNKNOWN",
+                ts=ts_iso,
+            )
+
+    data_health_results: Dict[str, Any] = {}
+    setup_eval_results: Dict[str, Any] = {}
+
+    for code in targets:
         health = check_data_health(code, kis)
-        data_health[code] = health
+        health["ts"] = health.get("ts") or _iso_now()
+        reasons = health.get("reasons") or []
+        ok = bool(health.get("ok"))
+        if ok and not reasons:
+            reasons = ["OK"]
+        if (not ok) and not reasons:
+            reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
+        health["reasons"] = reasons
+        data_health_results[code] = health
+        runtime_state["memory"]["data_health"][code] = health
         logger.info(
-            "[DATA-HEALTH] code=%s ok=%s daily_n=%s prev_close=%s intraday_n=%s vwap=%s reasons=%s",
+            "[DATA-HEALTH] code=%s ok=%s reasons=%s daily_len=%s intraday_len=%s prev_close=%s vwap=%s",
             code,
             health.get("ok"),
-            health.get("daily_n"),
-            health.get("prev_close"),
-            health.get("intraday_n"),
-            health.get("vwap"),
             health.get("reasons"),
+            health.get("daily_len"),
+            health.get("intraday_len"),
+            health.get("prev_close"),
+            health.get("vwap"),
         )
+
         setup = evaluate_setup(code, kis, health, runtime_state)
-        setup_result[code] = setup
-        if setup.get("setup_ok"):
-            logger.info("[SETUP-OK] code=%s reasons=%s", code, setup.get("reasons"))
+        setup["ts"] = setup.get("ts") or _iso_now()
+        setup_ok = bool(setup.get("setup_ok"))
+        setup_reasons = _guard_reasons(
+            code=code, setup_ok=setup_ok, reasons=setup.get("reasons") or []
+        )
+        setup["reasons"] = setup_reasons
+        setup_eval_results[code] = setup
+        runtime_state["memory"]["setup_eval"][code] = setup
+        if setup_ok:
+            logger.info(
+                "[SETUP-OK] %s | reasons=%s | daily=%s intra=%s",
+                code,
+                setup_reasons,
+                setup.get("daily", {}),
+                setup.get("intra", {}),
+            )
         else:
             logger.info(
                 "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s",
                 code,
                 setup.get("missing"),
-                setup.get("reasons"),
+                setup_reasons,
                 setup.get("daily", {}),
                 setup.get("intra", {}),
             )
-        try:
-            pos = runtime_state_store.upsert_position(runtime_state, code)
-            pos["data_health"] = health
-            pos["setup"] = setup
-        except Exception:
-            logger.exception("[DIAG][STATE] failed to attach diagnostics for %s", code)
 
-    exit_checks: list[Dict[str, Any]] = []
-    for lot in runtime_state.get("lots") or []:
-        if str(lot.get("status") or "OPEN").upper() != "OPEN":
-            continue
-        lot_code = _normalize_code(lot.get("code") or lot.get("pdno"))
-        record = {
-            "lot_id": lot.get("lot_id"),
-            "code": lot_code,
-            "sid": lot.get("sid") or lot.get("strategy_id"),
-            "strategy": lot.get("strategy") or "unknown",
-            "qty": int(lot.get("remaining_qty") or lot.get("qty") or 0),
-            "decision": "SKIP_DIAG",
-            "reasons": [],
+    exit_eval_results: Dict[str, Any] = {}
+    for code, pos in (positions or {}).items():
+        qty = int(pos.get("qty") or 0)
+        sid = pos.get("sid") or pos.get("strategy_id") or "UNKNOWN"
+        strategy_id = pos.get("strategy_id") or "UNKNOWN"
+        reasons: List[str] = []
+        if sid in (None, "", "UNKNOWN"):
+            reasons.append("MISSING_SID")
+        if strategy_id in (None, "", "UNKNOWN"):
+            reasons.append("MISSING_STRATEGY_ID")
+        if qty <= 0:
+            reasons.append("QTY_ZERO")
+        if sid in (None, "", "UNKNOWN") or strategy_id in (None, "", "UNKNOWN"):
+            unknown_n += 1
+            _record_orphan_or_unknown(
+                runtime_state=runtime_state,
+                code=code,
+                qty=qty,
+                avg=float(pos.get("avg_price") or 0.0),
+                kind="UNKNOWN",
+                reason="EXIT_STRATEGY_ID_MISSING",
+                ts=ts_iso,
+            )
+        if not reasons:
+            exit_ok = True
+            reasons = ["EMPTY_EXIT_REASON_GUARD"]
+        else:
+            exit_ok = False
+        exit_eval_results[code] = {
+            "ts": _iso_now(),
+            "sid": sid or "UNKNOWN",
+            "strategy_id": strategy_id,
+            "qty": qty,
+            "exit_ok": exit_ok,
+            "reasons": reasons,
         }
-        exit_checks.append(record)
+        runtime_state["memory"]["exit_eval"][code] = exit_eval_results[code]
         logger.info(
-            "[EXIT-CHECK] lot_id=%s code=%s sid=%s strategy=%s qty=%s decision=%s reasons=%s",
-            record["lot_id"],
-            lot_code,
-            record["sid"],
-            record["strategy"],
-            record["qty"],
-            record["decision"],
-            record["reasons"],
+            "[EXIT-CHECK] code=%s sid=%s strategy_id=%s qty=%s exit_ok=%s reasons=%s",
+            code,
+            sid,
+            strategy_id,
+            qty,
+            exit_ok,
+            reasons,
         )
 
-    orphan_symbols: list[str] = []
-    unknown_symbols: list[str] = []
-    for code, pos in (runtime_state.get("positions") or {}).items():
-        qty = int(pos.get("qty") or 0)
-        if qty <= 0:
-            continue
-        strategy_id = pos.get("strategy_id")
-        if strategy_id is None or strategy_id == "":
-            orphan_symbols.append(code)
-        elif str(strategy_id).upper() == "UNKNOWN":
-            unknown_symbols.append(code)
-    if orphan_symbols:
-        logger.warning("[ORPHAN] n=%d symbols=%s", len(orphan_symbols), orphan_symbols[:20])
-    if unknown_symbols:
-        logger.warning("[UNKNOWN] n=%d symbols=%s", len(unknown_symbols), unknown_symbols[:20])
+    data_health_fail_n = sum(1 for v in data_health_results.values() if not v.get("ok"))
+    setup_bad_n = sum(1 for v in setup_eval_results.values() if not v.get("setup_ok"))
 
-    payload = {
-        "ts": now.isoformat(),
+    diag_payload = {
+        "as_of": ts_iso,
         "diag_enabled": bool(DIAG_ENABLED),
-        "trading_day": trading_day,
-        "selected_by_market": selected_by_market,
-        "data_health": data_health,
-        "setup": setup_result,
-        "orphans": orphan_symbols,
-        "unknowns": unknown_symbols,
-        "exit_checks": exit_checks,
-        "positions": runtime_state.get("positions", {}),
+        "targets": targets,
+        "orphans_n": orphan_n,
+        "unknown_n": unknown_n,
+        "data_health_fail_n": data_health_fail_n,
+        "setup_bad_n": setup_bad_n,
+        "data_health": data_health_results,
+        "setup_eval": setup_eval_results,
+        "exit_eval": exit_eval_results,
+        "orphans": runtime_state["diagnostics"]["orphans"],
+        "selected_by_market": selected_by_market or {},
+        "balance": balance,
     }
+
+    diag_path = DIAGNOSTIC_DUMP_DIR / "diag_latest.json"
+    timestamped_path = DIAGNOSTIC_DUMP_DIR / f"diag_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        _dump_json(diag_path, diag_payload)
+        _dump_json(timestamped_path, diag_payload)
+        logger.info(
+            "[DIAG][DUMP] wrote=%s targets=%d orphans=%d unknown=%d",
+            diag_path,
+            len(targets),
+            orphan_n,
+            unknown_n,
+        )
+    except Exception as e:
+        logger.exception("[DIAG][DUMP_FAIL] path=%s err=%s", diag_path, e)
 
     try:
         runtime_state_store.save_state(runtime_state)
     except Exception:
         logger.exception("[DIAG][STATE] failed to persist diagnostic annotations")
 
-    dump_path = DIAGNOSTIC_DUMP_DIR / f"diag_{now.strftime('%Y%m%d_%H%M%S')}.json"
-    try:
-        _dump_payload(dump_path, payload)
-    except Exception as e:
-        logger.warning("[DIAG][DUMP_FAIL] path=%s err=%s", dump_path, e)
+    return diag_payload
 
-    return payload
+
+def run_diagnostics_once(selected_by_market: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    runtime_state = runtime_state_store.load_state()
+    kis: KisAPI | None = None
+    try:
+        kis = KisAPI()
+    except Exception as e:
+        logger.exception("[DIAG][INIT] failed to init KisAPI: %s", e)
+    return run_diagnostics(
+        kis=kis,
+        runtime_state=runtime_state,
+        selected_by_market=selected_by_market,
+    )

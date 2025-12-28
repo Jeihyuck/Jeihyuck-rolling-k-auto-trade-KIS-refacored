@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from .config import KST
+from .config import KST, STATE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,16 @@ def save_state(state: Dict[str, Any]) -> None:
             logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
         except Exception:
             logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
+        try:
+            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_state_path = STATE_PATH.with_name(f"{STATE_PATH.name}.tmp")
+            with open(tmp_state_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_state_path, STATE_PATH)
+        except Exception:
+            logger.exception("[STATE][SAVE] failed to mirror %s", STATE_PATH)
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
 

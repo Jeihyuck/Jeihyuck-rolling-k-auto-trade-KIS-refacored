@@ -2414,9 +2414,26 @@ def main(
                     for r in data_health_ctx.get("reasons") or []:
                         if r not in reasons:
                             reasons.append(r)
-                if not setup_state.get("ok"):
-                    if not reasons:
-                        reasons = ["NO_SETUP_REASON"]
+                setup_ok = bool(setup_state.get("ok"))
+                if not setup_ok and not reasons:
+                    injected = ["EMPTY_SETUP_REASON_GUARD"]
+                    logger.warning(
+                        "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+                        code,
+                        setup_ok,
+                        injected,
+                    )
+                    reasons = injected
+                if setup_ok and not reasons:
+                    injected = ["OK"]
+                    logger.warning(
+                        "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+                        code,
+                        setup_ok,
+                        injected,
+                    )
+                    reasons = injected
+                if not setup_ok:
                     logger.info(
                         "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s regime=%s",
                         code,

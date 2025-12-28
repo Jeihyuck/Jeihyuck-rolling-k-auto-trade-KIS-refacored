@@ -52,13 +52,9 @@ if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
     echo "[STATE] WARN: intent cursor not found in bot-state branch. Initializing."
     echo "${DEFAULT_INTENT_CURSOR}" > "${INTENT_CURSOR_PATH}"
   fi
-  diag_files=$(git ls-tree -r --name-only origin/bot-state "${DIAG_DIR}" 2>/dev/null | sort | tail -n "${DIAG_KEEP}")
-  if [[ -n "${diag_files}" ]]; then
-    while IFS= read -r path; do
-      mkdir -p "$(dirname "${path}")"
-      git show "origin/bot-state:${path}" > "${path}"
-    done <<< "${diag_files}"
-    echo "[STATE] Pulled trader/state/diagnostics/* (limited) from bot-state branch."
+  if git cat-file -e "origin/bot-state:${DIAG_DIR}/diag_latest.json" 2>/dev/null; then
+    git show "origin/bot-state:${DIAG_DIR}/diag_latest.json" > "${DIAG_DIR}/diag_latest.json"
+    echo "[STATE] Pulled trader/state/diagnostics/diag_latest.json from bot-state branch."
   else
     echo "[STATE] WARN: diagnostics dumps not found in bot-state branch."
   fi

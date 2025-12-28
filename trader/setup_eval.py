@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from trader.kis_wrapper import KisAPI
+from trader.config import KST
+
+logger = logging.getLogger(__name__)
 
 
 def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
@@ -26,12 +31,27 @@ def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], sta
         daily_ctx = pos.get("data_health") or {}
         intra_ctx = pos.get("setup") or {}
 
+    if setup_ok and not reasons:
+        reasons = ["OK"]
+        logger.warning(
+            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+            code,
+            setup_ok,
+            reasons,
+        )
     if setup_ok is False and not reasons:
-        reasons.append("UNKNOWN_SETUP_FAIL")
+        reasons = ["EMPTY_SETUP_REASON_GUARD"]
+        logger.warning(
+            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
+            code,
+            setup_ok,
+            reasons,
+        )
     if setup_ok is False and not missing:
         missing.append("UNKNOWN_MISSING")
 
     payload = {
+        "ts": datetime.now(KST).isoformat(),
         "setup_ok": setup_ok,
         "missing": missing,
         "reasons": reasons if setup_ok is False or reasons else [],

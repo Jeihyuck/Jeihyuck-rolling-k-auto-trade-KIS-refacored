@@ -1,0 +1,1271 @@
+diff --git a/portfolio/portfolio_manager.py b/portfolio/portfolio_manager.py
+index c453ceea72da1898c85b088a31656ac3aae9c61c..3c18e0aee322cdfc586d2e4ad313a6801199ba6c 100644
+--- a/portfolio/portfolio_manager.py
++++ b/portfolio/portfolio_manager.py
+@@ -57,51 +57,51 @@ class PortfolioManager:
+         reset_flow_call_count()
+         selected_by_market: Dict[str, Any] = {}
+         diag_result: Dict[str, Any] | None = None
+         try:
+             rebalance_date = str(get_rebalance_anchor_date())
+             rebalance_payload = run_rebalance(rebalance_date, return_by_market=True)
+             selected_by_market = rebalance_payload.get("selected_by_market") or {}
+             logger.info(
+                 "[PORTFOLIO][REBALANCE] date=%s kospi=%d kosdaq=%d",
+                 rebalance_date,
+                 len(selected_by_market.get("KOSPI", [])),
+                 len(selected_by_market.get("KOSDAQ", [])),
+             )
+         except Exception as e:
+             logger.exception("[PORTFOLIO] rebalance fetch failed: %s", e)
+ 
+         runtime_state = state_store.load_state()
+         logger.info(
+             "[DIAG][PM] diagnostic_mode=%s diagnostic_only=%s",
+             DIAG_ENABLED,
+             DIAGNOSTIC_ONLY,
+         )
+         if DIAG_ENABLED:
+             os.environ["DISABLE_LIVE_TRADING"] = "true"
+             logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s", DIAG_ENABLED)
+-            diag_result = run_diagnostics_once()
++            diag_result = run_diagnostics_once(selected_by_market=selected_by_market)
+             if DIAGNOSTIC_ONLY:
+                 return {
+                     "diagnostics": diag_result,
+                     "kospi": {"status": "skipped"},
+                     "kosdaq": {"status": "skipped"},
+                 }
+ 
+         try:
+             market_data = build_market_data(selected_by_market)
+             strategy_result = self.strategy_manager.run_once(
+                 market_data=market_data, portfolio_state=runtime_state
+             )
+             intents = strategy_result.get("intents") or []
+         except Exception as e:
+             logger.exception("[PORTFOLIO] strategy manager failure: %s", e)
+             strategy_result = {"status": "error", "message": str(e), "enabled": [], "intents": []}
+             intents = []
+ 
+         try:
+             STRATEGY_INTENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+             STRATEGY_INTENTS_PATH.touch(exist_ok=True)
+             intent_store.append_intents(intents, STRATEGY_INTENTS_PATH)
+             executor_result = self.intent_executor.run_once()
+         except Exception as e:
+             logger.exception("[PORTFOLIO] intent executor failure: %s", e)
+diff --git a/scripts/state_pull_plain.sh b/scripts/state_pull_plain.sh
+index cd5da7fcbfe40c5595da5c5d7b325379ea81fbf6..bceebbccdad2cf109d4609bd8a0468c0628756de 100755
+--- a/scripts/state_pull_plain.sh
++++ b/scripts/state_pull_plain.sh
+@@ -30,42 +30,38 @@ if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+   else
+     echo "[STATE] WARN: state.json not found in bot-state branch. Initializing."
+     echo "${DEFAULT_STATE}" > "${JSON_PATH}"
+   fi
+   if git cat-file -e "origin/bot-state:${POS_REMOTE_PATH}" 2>/dev/null; then
+     git show "origin/bot-state:${POS_REMOTE_PATH}" > "${POS_JSON_PATH}"
+     echo "[STATE] Pulled ${POS_REMOTE_PATH} from bot-state branch."
+   else
+     echo "[STATE] WARN: position state not found in bot-state branch. Initializing."
+     echo "${DEFAULT_POS_STATE}" > "${POS_JSON_PATH}"
+   fi
+   if git cat-file -e "origin/bot-state:${INTENT_REMOTE_PATH}" 2>/dev/null; then
+     git show "origin/bot-state:${INTENT_REMOTE_PATH}" > "${INTENT_LOG_PATH}"
+     echo "[STATE] Pulled ${INTENT_REMOTE_PATH} from bot-state branch."
+   else
+     echo "[STATE] WARN: intent log not found in bot-state branch. Initializing."
+     echo -n "${DEFAULT_INTENT_LOG}" > "${INTENT_LOG_PATH}"
+   fi
+   if git cat-file -e "origin/bot-state:${INTENT_CURSOR_REMOTE_PATH}" 2>/dev/null; then
+     git show "origin/bot-state:${INTENT_CURSOR_REMOTE_PATH}" > "${INTENT_CURSOR_PATH}"
+     echo "[STATE] Pulled ${INTENT_CURSOR_REMOTE_PATH} from bot-state branch."
+   else
+     echo "[STATE] WARN: intent cursor not found in bot-state branch. Initializing."
+     echo "${DEFAULT_INTENT_CURSOR}" > "${INTENT_CURSOR_PATH}"
+   fi
+-  diag_files=$(git ls-tree -r --name-only origin/bot-state "${DIAG_DIR}" 2>/dev/null | sort | tail -n "${DIAG_KEEP}")
+-  if [[ -n "${diag_files}" ]]; then
+-    while IFS= read -r path; do
+-      mkdir -p "$(dirname "${path}")"
+-      git show "origin/bot-state:${path}" > "${path}"
+-    done <<< "${diag_files}"
+-    echo "[STATE] Pulled trader/state/diagnostics/* (limited) from bot-state branch."
++  if git cat-file -e "origin/bot-state:${DIAG_DIR}/diag_latest.json" 2>/dev/null; then
++    git show "origin/bot-state:${DIAG_DIR}/diag_latest.json" > "${DIAG_DIR}/diag_latest.json"
++    echo "[STATE] Pulled trader/state/diagnostics/diag_latest.json from bot-state branch."
+   else
+     echo "[STATE] WARN: diagnostics dumps not found in bot-state branch."
+   fi
+ else
+   echo "[STATE] WARN: bot-state branch not found. Initializing."
+   echo "${DEFAULT_STATE}" > "${JSON_PATH}"
+   echo "${DEFAULT_POS_STATE}" > "${POS_JSON_PATH}"
+   echo -n "${DEFAULT_INTENT_LOG}" > "${INTENT_LOG_PATH}"
+   echo "${DEFAULT_INTENT_CURSOR}" > "${INTENT_CURSOR_PATH}"
+ fi
+diff --git a/scripts/state_push_plain.sh b/scripts/state_push_plain.sh
+index 909587100705180a84e4dca00019cc8ea4fd17a3..eaa94ba5b924314c30e50022407ede868fe124af 100755
+--- a/scripts/state_push_plain.sh
++++ b/scripts/state_push_plain.sh
+@@ -1,85 +1,76 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
+ STATE_DIR="bot_state"
+ JSON_PATH="${STATE_DIR}/state.json"
+ POS_STATE_DIR="trader/state"
+ POS_JSON_PATH="${POS_STATE_DIR}/state.json"
+ INTENT_LOG_PATH="${POS_STATE_DIR}/strategy_intents.jsonl"
+ INTENT_CURSOR_PATH="${POS_STATE_DIR}/strategy_intents_state.json"
+ DIAG_DIR="${POS_STATE_DIR}/diagnostics"
+-DIAG_KEEP=20
++DIAG_LATEST="${DIAG_DIR}/diag_latest.json"
+ 
+ if [[ ! -f "${JSON_PATH}" ]]; then
+   echo "[STATE] WARN: ${JSON_PATH} not found. Skipping."
+   exit 0
+ fi
+ if [[ ! -f "${POS_JSON_PATH}" ]]; then
+   echo "[STATE] WARN: ${POS_JSON_PATH} not found. Skipping."
+   exit 0
+ fi
+ 
+ tmp_state="$(mktemp)"
+ tmp_pos_state="$(mktemp)"
+ tmp_intent_log="$(mktemp)"
+ tmp_intent_cursor="$(mktemp)"
+ tmp_diag_dir="$(mktemp -d)"
+ trap 'rm -f "${tmp_state}" "${tmp_pos_state}" "${tmp_intent_log}" "${tmp_intent_cursor}"; rm -rf "${tmp_diag_dir}"' EXIT
+ cp -f "${JSON_PATH}" "${tmp_state}"
+ cp -f "${POS_JSON_PATH}" "${tmp_pos_state}"
+ cp -f "${INTENT_LOG_PATH}" "${tmp_intent_log}" 2>/dev/null || touch "${tmp_intent_log}"
+ cp -f "${INTENT_CURSOR_PATH}" "${tmp_intent_cursor}" 2>/dev/null || touch "${tmp_intent_cursor}"
+-if [[ -d "${DIAG_DIR}" ]]; then
+-  cp -f "${DIAG_DIR}"/* "${tmp_diag_dir}/" 2>/dev/null || true
++if [[ -f "${DIAG_LATEST}" ]]; then
++  cp -f "${DIAG_LATEST}" "${tmp_diag_dir}/diag_latest.json"
+ fi
+ 
+ # IMPORTANT: avoid "untracked would be overwritten by checkout"
+ rm -f "${JSON_PATH}" || true
+ rm -f "${POS_JSON_PATH}" || true
+ rm -f "${INTENT_LOG_PATH}" || true
+ rm -f "${INTENT_CURSOR_PATH}" || true
+ rm -rf "${DIAG_DIR}" || true
+ 
+ if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+   git fetch --no-tags origin bot-state:refs/remotes/origin/bot-state >/dev/null 2>&1 || true
+   git checkout -B bot-state origin/bot-state
+ else
+   git checkout --orphan bot-state
+   git rm -r --cached . >/dev/null 2>&1 || true
+ fi
+ 
+ mkdir -p "${STATE_DIR}"
+ cp -f "${tmp_state}" "${JSON_PATH}"
+ mkdir -p "${POS_STATE_DIR}"
+ cp -f "${tmp_pos_state}" "${POS_JSON_PATH}"
+ cp -f "${tmp_intent_log}" "${INTENT_LOG_PATH}"
+ cp -f "${tmp_intent_cursor}" "${INTENT_CURSOR_PATH}"
+ mkdir -p "${DIAG_DIR}"
+ if [[ -d "${tmp_diag_dir}" ]]; then
+-  cp -f "${tmp_diag_dir}"/* "${DIAG_DIR}/" 2>/dev/null || true
+-fi
+-if ls -1 "${DIAG_DIR}" >/dev/null 2>&1; then
+-  # keep only the most recent DIAG_KEEP files (lexicographic order assumes timestamped names)
+-  to_prune=$(ls -1 "${DIAG_DIR}" | sort | head -n -${DIAG_KEEP} 2>/dev/null || true)
+-  if [[ -n "${to_prune}" ]]; then
+-    while IFS= read -r f; do
+-      rm -f "${DIAG_DIR}/${f}"
+-    done <<< "${to_prune}"
+-  fi
++  cp -f "${tmp_diag_dir}/diag_latest.json" "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
+ fi
+ 
+ git add -f "${JSON_PATH}"
+ git add -f "${POS_JSON_PATH}"
+ git add -f "${INTENT_LOG_PATH}"
+ git add -f "${INTENT_CURSOR_PATH}"
+-git add -f "${DIAG_DIR}"/*.json 2>/dev/null || true
++git add -f "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
+ git status --porcelain
+ if git diff --cached --quiet; then
+   echo "[STATE] No changes to commit."
+   exit 0
+ fi
+ 
+ git commit -m "Update bot state (plain) [skip ci]"
+ git push --force-with-lease origin HEAD:bot-state
+ echo "[STATE] Pushed ${JSON_PATH} to bot-state branch."
+-echo "[STATE] Pushed trader/state/diagnostics/* (limited) to bot-state branch."
++echo "[STATE] Pushed diagnostics dumps to bot-state branch."
+diff --git a/trader/config.py b/trader/config.py
+index 0dff7c2d2855bde42aabb758650ec0fbc55d72c6..cd52be60ce97bcbaa9d52895227ead589491fe65 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -234,51 +234,51 @@ STRATEGY_DRY_RUN = (_cfg("STRATEGY_DRY_RUN") or "true").lower() in ("1", "true",
+ STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
+ STRATEGY_INTENTS_STATE_PATH = Path(
+     _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
+ )
+ STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
+ STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
+ STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower() in (
+     "1",
+     "true",
+     "yes",
+ )
+ 
+ DIAGNOSTIC_MODE = (_cfg("DIAGNOSTIC_MODE") or "false").lower() in ("1", "true", "yes")
+ DIAGNOSTIC_ONLY = (_cfg("DIAGNOSTIC_ONLY") or "false").lower() in ("1", "true", "yes")
+ DIAGNOSTIC_FORCE_RUN = (_cfg("DIAGNOSTIC_FORCE_RUN") or "false").lower() in (
+     "1",
+     "true",
+     "yes",
+ )
+ DIAGNOSTIC_DUMP_DIR = Path(
+     _cfg("DIAGNOSTIC_DUMP_DIR") or _cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"]
+ )
+ DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+ DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+ DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
+-DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
++DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY or DIAGNOSTIC_FORCE_RUN
+ 
+ if DIAGNOSTIC_MODE:
+     STRATEGY_MODE = "INTENT_ONLY"
+     STRATEGY_DRY_RUN = True
+     STRATEGY_ALLOW_SELL_ONLY = True
+ 
+ logger.info(
+     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
+ )
+ 
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             value = int(item)
+         except ValueError:
+             continue
+diff --git a/trader/data_health.py b/trader/data_health.py
+index d9497b4b74b48ac820caf97fb1d89f0826f7d944..1a548348e04e05b11c0b796f6926b05f04058eba 100644
+--- a/trader/data_health.py
++++ b/trader/data_health.py
+@@ -1,91 +1,97 @@
+ from __future__ import annotations
+ 
+ import logging
++from datetime import datetime
+ from typing import Any, Dict, Optional
+ 
+ from trader.kis_wrapper import KisAPI
++from trader.config import KST
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _short_error(err: Exception) -> str:
+     text = str(err)
+     if len(text) > 40:
+         return text[:37] + "..."
+     return text or err.__class__.__name__
+ 
+ 
+ def check_data_health(code: str, kis: Optional[KisAPI]) -> Dict[str, Any]:
++    ts = datetime.now(KST).isoformat()
+     reasons: list[str] = []
+-    daily_n = 0
+-    intraday_n = 0
++    daily_len: int | None = None
++    intraday_len: int | None = None
+     prev_close = None
+     vwap = None
+     last_price = None
+ 
+     if kis is None:
+-        return {
+-            "ok": False,
+-            "daily_n": daily_n,
+-            "intraday_n": intraday_n,
+-            "prev_close": prev_close,
+-            "vwap": vwap,
+-            "last_price": last_price,
+-            "reasons": ["API_ERROR:NO_CLIENT"],
+-        }
++        reasons.append("API_ERROR:NO_CLIENT")
++    else:
++        try:
++            daily = kis.safe_get_daily_candles(code)
++            daily_len = len(daily)
++            if daily_len < 21:
++                reasons.append("DAILY_LT_21")
++        except Exception as e:
++            reasons.append(f"DAILY_FETCH_FAIL:{_short_error(e)}")
+ 
+-    try:
+-        daily = kis.safe_get_daily_candles(code)
+-        daily_n = len(daily)
+-        if daily_n < 21:
+-            reasons.append("DAILY_LT_21")
+-    except Exception as e:
+-        reasons.append(f"API_ERROR:{_short_error(e)}")
++        try:
++            prev_close = kis.safe_get_prev_close(code)
++            if prev_close is None:
++                reasons.append("PREV_CLOSE_MISSING")
++        except Exception as e:
++            reasons.append(f"PREV_CLOSE_FAIL:{_short_error(e)}")
+ 
+-    try:
+-        prev_close = kis.safe_get_prev_close(code)
+-        if prev_close is None:
+-            reasons.append("PREV_CLOSE_NONE")
+-    except Exception as e:
+-        reasons.append(f"API_ERROR:{_short_error(e)}")
++        bars: list[dict[str, Any]] | None = None
++        try:
++            bars = kis.safe_get_intraday_bars(code)
++            intraday_len = len(bars)
++            if intraday_len <= 0:
++                reasons.append("INTRADAY_FETCH_EMPTY")
++        except Exception as e:
++            reasons.append(f"INTRADAY_FETCH_FAIL:{_short_error(e)}")
+ 
+-    bars: list[dict[str, Any]] | None = None
+-    try:
+-        bars = kis.safe_get_intraday_bars(code)
+-        intraday_n = len(bars)
+-        if intraday_n <= 0:
+-            reasons.append("INTRADAY_EMPTY")
+-    except Exception as e:
+-        reasons.append(f"API_ERROR:{_short_error(e)}")
++        try:
++            vwap = kis.safe_compute_vwap(bars or [])
++            if vwap is None:
++                reasons.append("VWAP_UNAVAILABLE")
++        except Exception as e:
++            reasons.append(f"VWAP_COMPUTE_FAIL:{_short_error(e)}")
+ 
+-    try:
+-        vwap = kis.safe_compute_vwap(bars or [])
+-        if vwap is None:
+-            reasons.append("VWAP_NONE")
+-    except Exception as e:
+-        reasons.append(f"API_ERROR:{_short_error(e)}")
+-
+-    try:
+-        last_price = kis.get_last_price(code)
+-    except Exception as e:
+-        reasons.append(f"API_ERROR:{_short_error(e)}")
+-    if last_price is None:
+-        reasons.append("LAST_PRICE_NONE")
++        try:
++            last_price = kis.get_last_price(code)
++        except Exception as e:
++            reasons.append(f"LAST_PRICE_FAIL:{_short_error(e)}")
++        if last_price is None:
++            reasons.append("LAST_PRICE_NONE")
+ 
+     ok = (
+-        daily_n >= 21
++        kis is not None
++        and daily_len is not None
++        and daily_len >= 21
+         and prev_close is not None
+-        and last_price is not None
+         and vwap is not None
++        and intraday_len is not None
++        and intraday_len > 0
+         and not any(str(r or "").startswith("API_ERROR:") for r in reasons)
+     )
++    if ok and not reasons:
++        reasons.append("OK")
++    if (not ok) and not reasons:
++        reasons.append("UNKNOWN_DATA_HEALTH_FAIL")
+ 
+     return {
++        "ts": ts,
+         "ok": ok,
+-        "daily_n": int(daily_n),
+-        "intraday_n": int(intraday_n),
++        "daily_len": daily_len,
++        "intraday_len": intraday_len,
+         "prev_close": prev_close,
+         "vwap": vwap,
+         "last_price": last_price,
+         "reasons": reasons,
++        # legacy keys for compatibility
++        "daily_n": daily_len if daily_len is not None else 0,
++        "intraday_n": intraday_len if intraday_len is not None else 0,
+     }
+diff --git a/trader/diagnostics_runner.py b/trader/diagnostics_runner.py
+index 9af0ef0cea6684428fc7182865d7f638ff4f5509..ea5e6a6122a47d58b2623d4d88ddd9ebeebabfeb 100644
+--- a/trader/diagnostics_runner.py
++++ b/trader/diagnostics_runner.py
+@@ -1,217 +1,392 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Any, Dict, Iterable
++from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+-from strategy.market_data import build_market_data
+ from trader import state_store as runtime_state_store
+ from trader.config import (
+     DIAG_ENABLED,
+     DIAGNOSTIC_DUMP_DIR,
+     DIAGNOSTIC_MAX_SYMBOLS,
+     DIAGNOSTIC_TARGET_MARKETS,
++    KST,
+ )
+ from trader.core_utils import get_rebalance_anchor_date
+ from trader.data_health import check_data_health
+ from trader.kis_wrapper import KisAPI
+ from trader.setup_eval import evaluate_setup
+-from trader.time_utils import is_trading_day, now_kst
++from trader.time_utils import now_kst
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _normalize_code(sym: str | None) -> str:
+     return str(sym or "").strip().lstrip("A").zfill(6)
+ 
+ 
++def _iso_now() -> str:
++    return datetime.now(KST).isoformat()
++
++
++def _ensure_runtime_keys(runtime_state: Dict[str, Any]) -> None:
++    runtime_state.setdefault("diagnostics", {})
++    runtime_state.setdefault("memory", {})
++    runtime_state["diagnostics"].setdefault("orphans", {})
++    runtime_state["memory"].setdefault("data_health", {})
++    runtime_state["memory"].setdefault("setup_eval", {})
++    runtime_state["memory"].setdefault("exit_eval", {})
++    runtime_state["diagnostics"].setdefault("last_run", {})
++
++
+ def _filter_markets(
+     selected_by_market: Dict[str, Any] | None, allowed_markets: Iterable[str] | None
+ ) -> Dict[str, Any]:
+     if not allowed_markets:
+         return selected_by_market or {}
+     markets = {m.strip().upper() for m in allowed_markets if m and m.strip()}
+     if not markets:
+         return selected_by_market or {}
+     return {k: v for k, v in (selected_by_market or {}).items() if k.upper() in markets}
+ 
+ 
+-def _collect_target_symbols(
+-    selected_by_market: Dict[str, Any] | None, runtime_state: Dict[str, Any]
+-) -> list[str]:
++def _safe_qty(row: Dict[str, Any]) -> int:
++    for key in ("qty", "hldg_qty", "ord_psbl_qty"):
++        try:
++            qty = int(float(row.get(key) or 0))
++            if qty > 0:
++                return qty
++        except Exception:
++            continue
++    return 0
++
++
++def _safe_avg(row: Dict[str, Any]) -> float:
++    for key in ("avg_price", "pchs_avg_pric", "pchs_avg_price"):
++        try:
++            return float(row.get(key) or 0.0)
++        except Exception:
++            continue
++    return 0.0
++
++
++def _collect_selected_symbols(selected_by_market: Dict[str, Any] | None) -> set[str]:
+     symbols: set[str] = set()
+     for rows in (selected_by_market or {}).values():
+         for row in rows or []:
+-            code = _normalize_code(row.get("code") or row.get("stock_code") or row.get("pdno"))
++            code = _normalize_code(
++                row.get("code") or row.get("stock_code") or row.get("pdno")
++            )
+             if code and code != "000000":
+                 symbols.add(code)
++    return symbols
++
++
++def _collect_target_symbols(
++    *,
++    holdings: List[Dict[str, Any]],
++    runtime_state: Dict[str, Any],
++    selected_by_market: Dict[str, Any] | None,
++) -> list[str]:
++    symbols: set[str] = set()
++    for row in holdings or []:
++        code = _normalize_code(row.get("code") or row.get("pdno"))
++        if code and code != "000000" and _safe_qty(row) > 0:
++            symbols.add(code)
+     positions = runtime_state.get("positions") or {}
+     if isinstance(positions, dict):
+         symbols.update(positions.keys())
+-    lots = runtime_state.get("lots") or []
+-    if isinstance(lots, list):
+-        for lot in lots:
+-            code = _normalize_code(lot.get("code") or lot.get("pdno"))
+-            if code and code != "000000":
+-                symbols.add(code)
++    symbols.update(_collect_selected_symbols(selected_by_market))
+     symbols_list = sorted(symbols)
+     if DIAGNOSTIC_MAX_SYMBOLS and len(symbols_list) > DIAGNOSTIC_MAX_SYMBOLS:
+         return symbols_list[:DIAGNOSTIC_MAX_SYMBOLS]
+     return symbols_list
+ 
+ 
+-def _dump_payload(path: Path, payload: Dict[str, Any]) -> None:
++def _record_orphan_or_unknown(
++    *,
++    runtime_state: Dict[str, Any],
++    code: str,
++    qty: int,
++    avg: float,
++    kind: str,
++    reason: str,
++    ts: str,
++) -> None:
++    runtime_state["diagnostics"]["orphans"][code] = {
++        "ts": ts,
++        "qty": qty,
++        "avg": avg,
++        "kind": kind,
++        "reason": reason,
++    }
++    if kind == "ORPHAN":
++        logger.warning("[ORPHAN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
++    else:
++        logger.warning("[UNKNOWN] code=%s qty=%s avg=%s reason=%s", code, qty, avg, reason)
++
++
++def _guard_reasons(
++    *, code: str, setup_ok: bool, reasons: List[str]
++) -> List[str]:
++    if setup_ok and not reasons:
++        injected = ["OK"]
++        logger.warning(
++            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++            code,
++            setup_ok,
++            injected,
++        )
++        return injected
++    if (not setup_ok) and not reasons:
++        injected = ["EMPTY_SETUP_REASON_GUARD"]
++        logger.warning(
++            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++            code,
++            setup_ok,
++            injected,
++        )
++        return injected
++    return reasons
++
++
++def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+     with open(path, "w", encoding="utf-8") as f:
+         json.dump(payload, f, ensure_ascii=False, indent=2)
+-    size = path.stat().st_size
+-    logger.info("[DIAG][DUMP] path=%s bytes=%d", path, size)
+-
+ 
+-def run_diagnostics_once() -> Dict[str, Any]:
+-    now = now_kst()
+-    trading_day = is_trading_day(now)
+-    runtime_state = runtime_state_store.load_state()
+ 
+-    kis: KisAPI | None = None
++def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
++    if kis is None:
++        return {}, []
+     try:
+-        kis = KisAPI()
++        balance = kis.get_balance()
++        positions = balance.get("positions") or []
++        return balance, positions
+     except Exception as e:
+-        logger.exception("[DIAG][INIT] failed to init KisAPI: %s", e)
++        logger.exception("[DIAG][BALANCE] failed to fetch: %s", e)
++        return {}, []
+ 
+-    try:
+-        balance = kis.get_balance() if kis else {}
+-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance)
+-        runtime_state_store.save_state(runtime_state)
+-        logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
+-    except Exception as e:
+-        logger.exception("[DIAG][STATE] reconcile failed: %s", e)
+ 
+-    try:
+-        rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
+-        selected_by_market = rebalance_payload.get("selected_by_market") or {}
+-    except Exception as e:
+-        logger.exception("[DIAG][REBALANCE] failed: %s", e)
+-        selected_by_market = {}
++def run_diagnostics(
++    *,
++    kis: Optional[KisAPI],
++    runtime_state: Dict[str, Any],
++    selected_by_market: Dict[str, Any] | None,
++) -> Dict[str, Any]:
++    runtime_state = runtime_state or runtime_state_store.load_state()
++    _ensure_runtime_keys(runtime_state)
++    ts = now_kst()
++    ts_iso = ts.isoformat()
++
++    if selected_by_market is None:
++        try:
++            rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
++            selected_by_market = rebalance_payload.get("selected_by_market") or {}
++        except Exception as e:
++            logger.exception("[DIAG][REBALANCE] failed: %s", e)
++            selected_by_market = {}
+ 
+     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
+     selected_by_market = _filter_markets(selected_by_market, target_markets)
+-    logger.info(
+-        "[DIAG][REBALANCE] kospi=%d kosdaq=%d",
+-        len(selected_by_market.get("KOSPI", []) or []),
+-        len(selected_by_market.get("KOSDAQ", []) or []),
+-    )
++    balance, holdings = _load_balance(kis)
++    positions = runtime_state.get("positions") or {}
+ 
+-    market_data = build_market_data(selected_by_market, kis_client=kis)
+-    logger.info(
+-        "[DIAG][MD] symbols=%d as_of=%s",
+-        len(market_data.get("prices", {})),
+-        market_data.get("as_of"),
++    targets = _collect_target_symbols(
++        holdings=holdings,
++        runtime_state=runtime_state,
++        selected_by_market=selected_by_market,
+     )
++    runtime_state["diagnostics"]["last_run"].update({"ts": ts_iso, "targets": targets})
+ 
+-    symbols = _collect_target_symbols(selected_by_market, runtime_state)
+-    data_health: Dict[str, Any] = {}
+-    setup_result: Dict[str, Any] = {}
+-    for code in symbols:
++    orphan_n = 0
++    unknown_n = 0
++    for row in holdings:
++        qty = _safe_qty(row)
++        if qty <= 0:
++            continue
++        code = _normalize_code(row.get("code") or row.get("pdno"))
++        avg = _safe_avg(row)
++        pos = positions.get(code) if isinstance(positions, dict) else None
++        if not pos:
++            orphan_n += 1
++            _record_orphan_or_unknown(
++                runtime_state=runtime_state,
++                code=code,
++                qty=qty,
++                avg=avg,
++                kind="ORPHAN",
++                reason="MISSING_IN_STATE",
++                ts=ts_iso,
++            )
++            continue
++        sid = pos.get("sid") or pos.get("strategy_id")
++        if sid is None or str(sid).strip() == "" or str(sid).upper() == "UNKNOWN":
++            unknown_n += 1
++            _record_orphan_or_unknown(
++                runtime_state=runtime_state,
++                code=code,
++                qty=qty,
++                avg=avg,
++                kind="UNKNOWN",
++                reason="STRATEGY_ID_UNKNOWN",
++                ts=ts_iso,
++            )
++
++    data_health_results: Dict[str, Any] = {}
++    setup_eval_results: Dict[str, Any] = {}
++
++    for code in targets:
+         health = check_data_health(code, kis)
+-        data_health[code] = health
++        health["ts"] = health.get("ts") or _iso_now()
++        reasons = health.get("reasons") or []
++        ok = bool(health.get("ok"))
++        if ok and not reasons:
++            reasons = ["OK"]
++        if (not ok) and not reasons:
++            reasons = ["UNKNOWN_DATA_HEALTH_FAIL"]
++        health["reasons"] = reasons
++        data_health_results[code] = health
++        runtime_state["memory"]["data_health"][code] = health
+         logger.info(
+-            "[DATA-HEALTH] code=%s ok=%s daily_n=%s prev_close=%s intraday_n=%s vwap=%s reasons=%s",
++            "[DATA-HEALTH] code=%s ok=%s reasons=%s daily_len=%s intraday_len=%s prev_close=%s vwap=%s",
+             code,
+             health.get("ok"),
+-            health.get("daily_n"),
++            health.get("reasons"),
++            health.get("daily_len"),
++            health.get("intraday_len"),
+             health.get("prev_close"),
+-            health.get("intraday_n"),
+             health.get("vwap"),
+-            health.get("reasons"),
+         )
++
+         setup = evaluate_setup(code, kis, health, runtime_state)
+-        setup_result[code] = setup
+-        if setup.get("setup_ok"):
+-            logger.info("[SETUP-OK] code=%s reasons=%s", code, setup.get("reasons"))
++        setup["ts"] = setup.get("ts") or _iso_now()
++        setup_ok = bool(setup.get("setup_ok"))
++        setup_reasons = _guard_reasons(
++            code=code, setup_ok=setup_ok, reasons=setup.get("reasons") or []
++        )
++        setup["reasons"] = setup_reasons
++        setup_eval_results[code] = setup
++        runtime_state["memory"]["setup_eval"][code] = setup
++        if setup_ok:
++            logger.info(
++                "[SETUP-OK] %s | reasons=%s | daily=%s intra=%s",
++                code,
++                setup_reasons,
++                setup.get("daily", {}),
++                setup.get("intra", {}),
++            )
+         else:
+             logger.info(
+                 "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s",
+                 code,
+                 setup.get("missing"),
+-                setup.get("reasons"),
++                setup_reasons,
+                 setup.get("daily", {}),
+                 setup.get("intra", {}),
+             )
+-        try:
+-            pos = runtime_state_store.upsert_position(runtime_state, code)
+-            pos["data_health"] = health
+-            pos["setup"] = setup
+-        except Exception:
+-            logger.exception("[DIAG][STATE] failed to attach diagnostics for %s", code)
+ 
+-    exit_checks: list[Dict[str, Any]] = []
+-    for lot in runtime_state.get("lots") or []:
+-        if str(lot.get("status") or "OPEN").upper() != "OPEN":
+-            continue
+-        lot_code = _normalize_code(lot.get("code") or lot.get("pdno"))
+-        record = {
+-            "lot_id": lot.get("lot_id"),
+-            "code": lot_code,
+-            "sid": lot.get("sid") or lot.get("strategy_id"),
+-            "strategy": lot.get("strategy") or "unknown",
+-            "qty": int(lot.get("remaining_qty") or lot.get("qty") or 0),
+-            "decision": "SKIP_DIAG",
+-            "reasons": [],
++    exit_eval_results: Dict[str, Any] = {}
++    for code, pos in (positions or {}).items():
++        qty = int(pos.get("qty") or 0)
++        sid = pos.get("sid") or pos.get("strategy_id") or "UNKNOWN"
++        strategy_id = pos.get("strategy_id") or "UNKNOWN"
++        reasons: List[str] = []
++        if sid in (None, "", "UNKNOWN"):
++            reasons.append("MISSING_SID")
++        if strategy_id in (None, "", "UNKNOWN"):
++            reasons.append("MISSING_STRATEGY_ID")
++        if qty <= 0:
++            reasons.append("QTY_ZERO")
++        if sid in (None, "", "UNKNOWN") or strategy_id in (None, "", "UNKNOWN"):
++            unknown_n += 1
++            _record_orphan_or_unknown(
++                runtime_state=runtime_state,
++                code=code,
++                qty=qty,
++                avg=float(pos.get("avg_price") or 0.0),
++                kind="UNKNOWN",
++                reason="EXIT_STRATEGY_ID_MISSING",
++                ts=ts_iso,
++            )
++        if not reasons:
++            exit_ok = True
++            reasons = ["EMPTY_EXIT_REASON_GUARD"]
++        else:
++            exit_ok = False
++        exit_eval_results[code] = {
++            "ts": _iso_now(),
++            "sid": sid or "UNKNOWN",
++            "strategy_id": strategy_id,
++            "qty": qty,
++            "exit_ok": exit_ok,
++            "reasons": reasons,
+         }
+-        exit_checks.append(record)
++        runtime_state["memory"]["exit_eval"][code] = exit_eval_results[code]
+         logger.info(
+-            "[EXIT-CHECK] lot_id=%s code=%s sid=%s strategy=%s qty=%s decision=%s reasons=%s",
+-            record["lot_id"],
+-            lot_code,
+-            record["sid"],
+-            record["strategy"],
+-            record["qty"],
+-            record["decision"],
+-            record["reasons"],
++            "[EXIT-CHECK] code=%s sid=%s strategy_id=%s qty=%s exit_ok=%s reasons=%s",
++            code,
++            sid,
++            strategy_id,
++            qty,
++            exit_ok,
++            reasons,
+         )
+ 
+-    orphan_symbols: list[str] = []
+-    unknown_symbols: list[str] = []
+-    for code, pos in (runtime_state.get("positions") or {}).items():
+-        qty = int(pos.get("qty") or 0)
+-        if qty <= 0:
+-            continue
+-        strategy_id = pos.get("strategy_id")
+-        if strategy_id is None or strategy_id == "":
+-            orphan_symbols.append(code)
+-        elif str(strategy_id).upper() == "UNKNOWN":
+-            unknown_symbols.append(code)
+-    if orphan_symbols:
+-        logger.warning("[ORPHAN] n=%d symbols=%s", len(orphan_symbols), orphan_symbols[:20])
+-    if unknown_symbols:
+-        logger.warning("[UNKNOWN] n=%d symbols=%s", len(unknown_symbols), unknown_symbols[:20])
+-
+-    payload = {
+-        "ts": now.isoformat(),
++    data_health_fail_n = sum(1 for v in data_health_results.values() if not v.get("ok"))
++    setup_bad_n = sum(1 for v in setup_eval_results.values() if not v.get("setup_ok"))
++
++    diag_payload = {
++        "as_of": ts_iso,
+         "diag_enabled": bool(DIAG_ENABLED),
+-        "trading_day": trading_day,
+-        "selected_by_market": selected_by_market,
+-        "data_health": data_health,
+-        "setup": setup_result,
+-        "orphans": orphan_symbols,
+-        "unknowns": unknown_symbols,
+-        "exit_checks": exit_checks,
+-        "positions": runtime_state.get("positions", {}),
++        "targets": targets,
++        "orphans_n": orphan_n,
++        "unknown_n": unknown_n,
++        "data_health_fail_n": data_health_fail_n,
++        "setup_bad_n": setup_bad_n,
++        "data_health": data_health_results,
++        "setup_eval": setup_eval_results,
++        "exit_eval": exit_eval_results,
++        "orphans": runtime_state["diagnostics"]["orphans"],
++        "selected_by_market": selected_by_market or {},
++        "balance": balance,
+     }
+ 
++    diag_path = DIAGNOSTIC_DUMP_DIR / "diag_latest.json"
++    timestamped_path = DIAGNOSTIC_DUMP_DIR / f"diag_{ts.strftime('%Y%m%d_%H%M%S')}.json"
++    try:
++        _dump_json(diag_path, diag_payload)
++        _dump_json(timestamped_path, diag_payload)
++        logger.info(
++            "[DIAG][DUMP] wrote=%s targets=%d orphans=%d unknown=%d",
++            diag_path,
++            len(targets),
++            orphan_n,
++            unknown_n,
++        )
++    except Exception as e:
++        logger.exception("[DIAG][DUMP_FAIL] path=%s err=%s", diag_path, e)
++
+     try:
+         runtime_state_store.save_state(runtime_state)
+     except Exception:
+         logger.exception("[DIAG][STATE] failed to persist diagnostic annotations")
+ 
+-    dump_path = DIAGNOSTIC_DUMP_DIR / f"diag_{now.strftime('%Y%m%d_%H%M%S')}.json"
++    return diag_payload
++
++
++def run_diagnostics_once(selected_by_market: Dict[str, Any] | None = None) -> Dict[str, Any]:
++    runtime_state = runtime_state_store.load_state()
++    kis: KisAPI | None = None
+     try:
+-        _dump_payload(dump_path, payload)
++        kis = KisAPI()
+     except Exception as e:
+-        logger.warning("[DIAG][DUMP_FAIL] path=%s err=%s", dump_path, e)
+-
+-    return payload
++        logger.exception("[DIAG][INIT] failed to init KisAPI: %s", e)
++    return run_diagnostics(
++        kis=kis,
++        runtime_state=runtime_state,
++        selected_by_market=selected_by_market,
++    )
+diff --git a/trader/legacy_kosdaq_runner.py b/trader/legacy_kosdaq_runner.py
+index c06796f7a543eecc63f8618966fe327db7683631..9129739cb9536ab2769d38899d3c32bc8dc680d7 100644
+--- a/trader/legacy_kosdaq_runner.py
++++ b/trader/legacy_kosdaq_runner.py
+@@ -2392,53 +2392,70 @@ def main(
+                     daily_ctx.get("strong_trend")
+                     or intra_ctx.get("vwap_reclaim")
+                     or intra_ctx.get("range_break")
+                 )
+ 
+                 if mode == "neutral" and not (
+                     info.get("champion_grade") in ("A", "B") or momentum_confirmed
+                 ):
+                     logger.info(
+                         f"[ENTRY-SKIP] {code}: neutral 레짐에서 비챔피언/모멘텀 미확인 → 신규 진입 보류"
+                     )
+                     continue
+ 
+                 setup_state = signals.evaluate_setup_gate(
+                     daily_ctx, intra_ctx, regime_state=regime_state
+                 )
+                 missing = setup_state.get("missing_conditions") or []
+                 reasons = setup_state.get("reasons") or []
+                 data_health_ctx = setup_state.get("data_health") or daily_ctx.get("data_health") or {}
+                 if data_health_ctx and not data_health_ctx.get("ok", True):
+                     if "DATA_HEALTH_DEGRADED" not in reasons:
+                         reasons.append("DATA_HEALTH_DEGRADED")
+                     for r in data_health_ctx.get("reasons") or []:
+                         if r not in reasons:
+                             reasons.append(r)
+-                if not setup_state.get("ok"):
+-                    if not reasons:
+-                        reasons = ["NO_SETUP_REASON"]
++                setup_ok = bool(setup_state.get("ok"))
++                if not setup_ok and not reasons:
++                    injected = ["EMPTY_SETUP_REASON_GUARD"]
++                    logger.warning(
++                        "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++                        code,
++                        setup_ok,
++                        injected,
++                    )
++                    reasons = injected
++                if setup_ok and not reasons:
++                    injected = ["OK"]
++                    logger.warning(
++                        "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++                        code,
++                        setup_ok,
++                        injected,
++                    )
++                    reasons = injected
++                if not setup_ok:
+                     logger.info(
+                         "[SETUP-BAD] %s | missing=%s reasons=%s | daily=%s intra=%s regime=%s",
+                         code,
+                         missing,
+                         reasons,
+                         daily_ctx,
+                         intra_ctx,
+                         regime_state,
+                     )
+                     continue
+                 logger.info(
+                     "[SETUP-OK] %s | daily=%s intra=%s regime=%s",
+                     code,
+                     daily_ctx,
+                     intra_ctx,
+                     regime_state,
+                 )
+ 
+                 trigger_label = "breakout_cross"
+                 strategy_name = str(strategy or "").lower()
+                 if "pullback" in strategy_name:
+                     trigger_label = "pullback_rebound"
+                 elif "close" in strategy_name:
+                     trigger_label = "close_betting"
+ 
+diff --git a/trader/setup_eval.py b/trader/setup_eval.py
+index c97be3a645707b6937c82ebf39d67af86eb1d71f..60cb4e4d8061995dd451026863b70b372f15fbd1 100644
+--- a/trader/setup_eval.py
++++ b/trader/setup_eval.py
+@@ -1,41 +1,61 @@
+ from __future__ import annotations
+ 
++import logging
++from datetime import datetime
+ from typing import Any, Dict, List, Optional
+ 
+ from trader.kis_wrapper import KisAPI
++from trader.config import KST
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def evaluate_setup(code: str, kis: Optional[KisAPI], health: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+     health = health or {}
+     reasons: List[str] = []
+     missing: List[str] = []
+     setup_ok = True
+ 
+     if not health.get("ok", False):
+         setup_ok = False
+         health_reasons = health.get("reasons") or []
+         joined = ",".join(str(r) for r in health_reasons)
+         reasons.append(f"DATA_HEALTH_BAD:{joined}" if joined else "DATA_HEALTH_BAD")
+ 
+     positions = (state or {}).get("positions") if isinstance(state, dict) else {}
+     pos = (positions or {}).get(str(code).zfill(6), {})
+     daily_ctx: Dict[str, Any] = {}
+     intra_ctx: Dict[str, Any] = {}
+ 
+     if isinstance(pos, dict):
+         daily_ctx = pos.get("data_health") or {}
+         intra_ctx = pos.get("setup") or {}
+ 
++    if setup_ok and not reasons:
++        reasons = ["OK"]
++        logger.warning(
++            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++            code,
++            setup_ok,
++            reasons,
++        )
+     if setup_ok is False and not reasons:
+-        reasons.append("UNKNOWN_SETUP_FAIL")
++        reasons = ["EMPTY_SETUP_REASON_GUARD"]
++        logger.warning(
++            "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
++            code,
++            setup_ok,
++            reasons,
++        )
+     if setup_ok is False and not missing:
+         missing.append("UNKNOWN_MISSING")
+ 
+     payload = {
++        "ts": datetime.now(KST).isoformat(),
+         "setup_ok": setup_ok,
+         "missing": missing,
+         "reasons": reasons if setup_ok is False or reasons else [],
+         "daily": daily_ctx,
+         "intra": intra_ctx,
+     }
+     return payload
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 413ca3083193e9ab5be0794d5c6840c926f87be0..83d8c7132793cb75e68c5d28e87da9a924c47c52 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -1,36 +1,36 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ import uuid
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict
+ 
+-from .config import KST
++from .config import KST, STATE_PATH
+ 
+ logger = logging.getLogger(__name__)
+ 
+ SCHEMA_VERSION = 2
+ RUNTIME_STATE_DIR = Path(".runtime")
+ RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
+ _LOT_ID_PREFIX = "LOT"
+ 
+ 
+ def _normalize_code(symbol: str | int | None) -> str:
+     return str(symbol or "").zfill(6)
+ 
+ 
+ def _default_runtime_state() -> Dict[str, Any]:
+     return {
+         "schema_version": SCHEMA_VERSION,
+         "updated_at": None,
+         "positions": {},
+         "orders": {},
+         "lots": [],
+         "memory": {"last_price": {}, "last_seen": {}, "last_strategy_id": {}},
+     }
+ 
+ 
+ def load_state() -> Dict[str, Any]:
+@@ -67,50 +67,60 @@ def load_state() -> Dict[str, Any]:
+         logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
+         return _default_runtime_state()
+ 
+ 
+ def save_state(state: Dict[str, Any]) -> None:
+     try:
+         RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
+         payload = dict(state)
+         payload.setdefault("schema_version", SCHEMA_VERSION)
+         payload.setdefault("positions", {})
+         payload.setdefault("orders", {})
+         payload.setdefault("lots", [])
+         payload.setdefault("memory", {"last_price": {}, "last_seen": {}, "last_strategy_id": {}})
+         payload["updated_at"] = datetime.now(KST).isoformat()
+         tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
+         with open(tmp_path, "w", encoding="utf-8") as f:
+             json.dump(payload, f, ensure_ascii=False, indent=2)
+             f.flush()
+             os.fsync(f.fileno())
+         os.replace(tmp_path, RUNTIME_STATE_PATH)
+         try:
+             size = RUNTIME_STATE_PATH.stat().st_size
+             logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
+         except Exception:
+             logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
++        try:
++            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
++            tmp_state_path = STATE_PATH.with_name(f"{STATE_PATH.name}.tmp")
++            with open(tmp_state_path, "w", encoding="utf-8") as f:
++                json.dump(payload, f, ensure_ascii=False, indent=2)
++                f.flush()
++                os.fsync(f.fileno())
++            os.replace(tmp_state_path, STATE_PATH)
++        except Exception:
++            logger.exception("[STATE][SAVE] failed to mirror %s", STATE_PATH)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
+ 
+ 
+ def _ensure_lots(state: Dict[str, Any]) -> list[dict[str, Any]]:
+     lots = state.get("lots")
+     if not isinstance(lots, list):
+         lots = []
+         state["lots"] = lots
+     return lots
+ 
+ 
+ def _generate_lot_id(code: str, ts: str | None = None) -> str:
+     suffix = ts or datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+     return f"{_LOT_ID_PREFIX}-{_normalize_code(code)}-{suffix}-{uuid.uuid4().hex[:6]}"
+ 
+ 
+ def _norm_sid(value: Any) -> Any:
+     if value is None:
+         return None
+     try:
+         return int(value)
+     except Exception:
+         return str(value)
+ 
+diff --git a/trader/trader.py b/trader/trader.py
+index 08c47ec127da29d30d088f3b1c36658fa353bdee..40afa938c213246e0408ce5690dd6a765a2836de 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,65 +1,79 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ 
+ from portfolio.portfolio_manager import PortfolioManager
+ from trader.kis_wrapper import KisAPI
+ from trader import state_store as runtime_state_store
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+-from trader.config import DIAG_ENABLED, DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
++from trader.config import DIAGNOSTIC_FORCE_RUN, DIAGNOSTIC_MODE, DIAGNOSTIC_ONLY
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> None:
+     now = now_kst()
+-    diag_enabled = DIAG_ENABLED
++    diag_enabled = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY or DIAGNOSTIC_FORCE_RUN
+     if diag_enabled:
+         os.environ["DISABLE_LIVE_TRADING"] = "true"
+         logger.info(
+-            "[DIAG][TRADER] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s",
++            "[DIAG][TRADER] forcing DISABLE_LIVE_TRADING=true (diag_enabled=%s)",
+             diag_enabled,
+         )
+-    if not is_trading_day(now) and not (diag_enabled and DIAGNOSTIC_FORCE_RUN):
++    trading_day = is_trading_day(now)
++    if (not trading_day) and (not diag_enabled):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료", now.date())
+         return
+-    if DIAGNOSTIC_ONLY:
+-        from trader.diagnostics_runner import run_diagnostics_once
+-
+-        run_diagnostics_once()
+-        logger.info("[DIAG][TRADER] diagnostic_only complete")
+-        return
++    if (not trading_day) and diag_enabled:
++        logger.warning(
++            "[DIAG][TRADER] non-trading-day(%s) but running diagnostics (only=%s force_run=%s)",
++            now.date(),
++            DIAGNOSTIC_ONLY,
++            DIAGNOSTIC_FORCE_RUN,
++        )
++    runtime_state = {}
++    kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state, balance
+         )
+         runtime_state_store.save_state(runtime_state)
+         logger.info("[TRADER] runtime state reconciled")
+     except Exception:
+         logger.exception("[TRADER] runtime state reconcile failed")
++        runtime_state = runtime_state or runtime_state_store.load_state()
++
++    if DIAGNOSTIC_ONLY:
++        from trader.diagnostics_runner import run_diagnostics
++
++        run_diagnostics(kis=kis, runtime_state=runtime_state, selected_by_market=None)
++        logger.info("[DIAG][TRADER] diagnostics-only complete -> exit")
++        return
+ 
+     diag_result = None
+     if DIAGNOSTIC_MODE:
+         try:
+-            from trader.diagnostics_runner import run_diagnostics_once
++            from trader.diagnostics_runner import run_diagnostics
+ 
+-            diag_result = run_diagnostics_once()
++            diag_result = run_diagnostics(
++                kis=kis, runtime_state=runtime_state, selected_by_market=None
++            )
+         except Exception:
+             logger.exception("[DIAG][TRADER] diagnostics run failed")
+ 
+     mgr = PortfolioManager()
+     result = mgr.run_once()
+     if isinstance(result, dict) and diag_result is not None:
+         result.setdefault("diagnostics", diag_result)
+     logger.info("[TRADER] cycle complete %s", result)
+ 
+ 
+ if __name__ == "__main__":
+     main()
