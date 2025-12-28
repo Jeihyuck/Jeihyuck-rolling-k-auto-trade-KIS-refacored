@@ -1,240 +1,658 @@
 {
-  "schema_version": 2,
-  "updated_at": "2025-12-28T22:38:14.327073+09:00",
+  "schema_version": 3,
+  "updated_at": "2025-12-29T08:57:02.511688+09:00",
   "positions": {
     "000660": {
-      "strategy_id": "UNKNOWN",
+      "code": "000660",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "000660:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 42,
       "avg_price": 591517.857,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "005290": {
-      "strategy_id": "UNKNOWN",
+      "code": "005290",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "005290:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 746,
       "avg_price": 37600.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "005380": {
-      "strategy_id": "UNKNOWN",
+      "code": "005380",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "005380:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 61,
       "avg_price": 290975.409,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "006800": {
-      "strategy_id": "UNKNOWN",
+      "code": "006800",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "006800:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 599,
       "avg_price": 23403.171,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "009540": {
-      "strategy_id": "UNKNOWN",
+      "code": "009540",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "009540:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 86,
       "avg_price": 414703.488,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "010120": {
-      "strategy_id": "UNKNOWN",
+      "code": "010120",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "010120:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 77,
       "avg_price": 461340.573,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "010130": {
-      "strategy_id": "UNKNOWN",
+      "code": "010130",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "010130:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 26,
       "avg_price": 1321769.23,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "012330": {
-      "strategy_id": "UNKNOWN",
+      "code": "012330",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "012330:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 49,
       "avg_price": 365096.365,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "012450": {
-      "strategy_id": "UNKNOWN",
+      "code": "012450",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "012450:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 24,
       "avg_price": 884613.333,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "015760": {
-      "strategy_id": "UNKNOWN",
+      "code": "015760",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "015760:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 752,
       "avg_price": 48278.588,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "028260": {
-      "strategy_id": "UNKNOWN",
+      "code": "028260",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "028260:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 91,
       "avg_price": 242082.417,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "030200": {
-      "strategy_id": "UNKNOWN",
+      "code": "030200",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "030200:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 415,
       "avg_price": 53751.084,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "035420": {
-      "strategy_id": "UNKNOWN",
+      "code": "035420",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "035420:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 213,
       "avg_price": 233720.707,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "035720": {
-      "strategy_id": "UNKNOWN",
+      "code": "035720",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "035720:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 241,
       "avg_price": 58100.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "064760": {
-      "strategy_id": "UNKNOWN",
+      "code": "064760",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "064760:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 194,
       "avg_price": 143934.02,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "065350": {
-      "strategy_id": "UNKNOWN",
+      "code": "065350",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "065350:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 483,
       "avg_price": 58019.047,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "066570": {
-      "strategy_id": "UNKNOWN",
+      "code": "066570",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "066570:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 388,
       "avg_price": 93458.762,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "098460": {
-      "strategy_id": "UNKNOWN",
+      "code": "098460",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "098460:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 1204,
       "avg_price": 23324.75,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "108490": {
-      "strategy_id": "UNKNOWN",
+      "code": "108490",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "108490:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 53,
       "avg_price": 264500.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "140410": {
-      "strategy_id": "UNKNOWN",
+      "code": "140410",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "140410:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 169,
       "avg_price": 82473.333,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "141080": {
-      "strategy_id": "UNKNOWN",
+      "code": "141080",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "141080:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 41,
       "avg_price": 170993.902,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "145020": {
-      "strategy_id": "UNKNOWN",
+      "code": "145020",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "145020:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 60,
       "avg_price": 233500.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "160190": {
-      "strategy_id": "UNKNOWN",
+      "code": "160190",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "160190:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 717,
       "avg_price": 58478.521,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "214450": {
-      "strategy_id": "UNKNOWN",
+      "code": "214450",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "214450:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 37,
       "avg_price": 378297.297,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "222800": {
-      "strategy_id": "UNKNOWN",
+      "code": "222800",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "222800:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 366,
       "avg_price": 49756.967,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "226950": {
-      "strategy_id": "UNKNOWN",
+      "code": "226950",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "226950:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 104,
       "avg_price": 134541.826,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "237690": {
-      "strategy_id": "UNKNOWN",
+      "code": "237690",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "237690:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 112,
       "avg_price": 125100.892,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "247540": {
-      "strategy_id": "UNKNOWN",
+      "code": "247540",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "247540:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 265,
       "avg_price": 157924.528,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "267250": {
-      "strategy_id": "UNKNOWN",
+      "code": "267250",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "267250:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 114,
       "avg_price": 193446.491,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "290650": {
-      "strategy_id": "UNKNOWN",
+      "code": "290650",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "290650:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 224,
       "avg_price": 62500.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "298380": {
-      "strategy_id": "UNKNOWN",
+      "code": "298380",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "298380:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 26,
       "avg_price": 187500.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "316140": {
-      "strategy_id": "UNKNOWN",
+      "code": "316140",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "316140:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 300,
       "avg_price": 27963.169,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "347850": {
-      "strategy_id": "UNKNOWN",
+      "code": "347850",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "347850:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 292,
       "avg_price": 95850.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "352820": {
-      "strategy_id": "UNKNOWN",
+      "code": "352820",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "352820:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 13,
       "avg_price": 310500.0,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "357780": {
-      "strategy_id": "UNKNOWN",
+      "code": "357780",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "357780:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 107,
       "avg_price": 259436.915,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "373220": {
-      "strategy_id": "UNKNOWN",
+      "code": "373220",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "373220:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 92,
       "avg_price": 390027.173,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "445680": {
-      "strategy_id": "UNKNOWN",
+      "code": "445680",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "445680:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 414,
       "avg_price": 101202.898,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     },
     "475830": {
-      "strategy_id": "UNKNOWN",
+      "code": "475830",
+      "strategy_id": 0,
+      "managed": false,
+      "position_key": "475830:0",
+      "meta": {
+        "created_by": "reconcile_unmanaged",
+        "notes": [
+          "UNMANAGED_HOLDING"
+        ]
+      },
       "qty": 186,
       "avg_price": 101329.061,
-      "last_action": "RECONCILE"
+      "last_action": "RECONCILE",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
+      "opened_at": "2025-12-29T08:57:02.509364+09:00"
     }
   },
   "orders": {},
   "lots": [
     {
-      "lot_id": "ORPHAN-000660-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-000660-20251229T085702.509364+0900",
       "code": "000660",
       "pdno": "000660",
       "sid": "ORPHAN",
@@ -244,17 +662,17 @@
       "qty": 42,
       "remaining_qty": 42,
       "entry_price": 591517.857,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-005290-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-005290-20251229T085702.509364+0900",
       "code": "005290",
       "pdno": "005290",
       "sid": "ORPHAN",
@@ -264,17 +682,17 @@
       "qty": 746,
       "remaining_qty": 746,
       "entry_price": 37600.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-005380-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-005380-20251229T085702.509364+0900",
       "code": "005380",
       "pdno": "005380",
       "sid": "ORPHAN",
@@ -284,17 +702,17 @@
       "qty": 61,
       "remaining_qty": 61,
       "entry_price": 290975.409,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-006800-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-006800-20251229T085702.509364+0900",
       "code": "006800",
       "pdno": "006800",
       "sid": "ORPHAN",
@@ -304,17 +722,17 @@
       "qty": 599,
       "remaining_qty": 599,
       "entry_price": 23403.171,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-009540-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-009540-20251229T085702.509364+0900",
       "code": "009540",
       "pdno": "009540",
       "sid": "ORPHAN",
@@ -324,17 +742,17 @@
       "qty": 86,
       "remaining_qty": 86,
       "entry_price": 414703.488,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-010120-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-010120-20251229T085702.509364+0900",
       "code": "010120",
       "pdno": "010120",
       "sid": "ORPHAN",
@@ -344,17 +762,17 @@
       "qty": 77,
       "remaining_qty": 77,
       "entry_price": 461340.573,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-010130-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-010130-20251229T085702.509364+0900",
       "code": "010130",
       "pdno": "010130",
       "sid": "ORPHAN",
@@ -364,17 +782,17 @@
       "qty": 26,
       "remaining_qty": 26,
       "entry_price": 1321769.23,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-012330-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-012330-20251229T085702.509364+0900",
       "code": "012330",
       "pdno": "012330",
       "sid": "ORPHAN",
@@ -384,17 +802,17 @@
       "qty": 49,
       "remaining_qty": 49,
       "entry_price": 365096.365,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-012450-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-012450-20251229T085702.509364+0900",
       "code": "012450",
       "pdno": "012450",
       "sid": "ORPHAN",
@@ -404,17 +822,17 @@
       "qty": 24,
       "remaining_qty": 24,
       "entry_price": 884613.333,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-015760-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-015760-20251229T085702.509364+0900",
       "code": "015760",
       "pdno": "015760",
       "sid": "ORPHAN",
@@ -424,17 +842,17 @@
       "qty": 752,
       "remaining_qty": 752,
       "entry_price": 48278.588,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-028260-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-028260-20251229T085702.509364+0900",
       "code": "028260",
       "pdno": "028260",
       "sid": "ORPHAN",
@@ -444,17 +862,17 @@
       "qty": 91,
       "remaining_qty": 91,
       "entry_price": 242082.417,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-030200-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-030200-20251229T085702.509364+0900",
       "code": "030200",
       "pdno": "030200",
       "sid": "ORPHAN",
@@ -464,17 +882,17 @@
       "qty": 415,
       "remaining_qty": 415,
       "entry_price": 53751.084,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-035420-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-035420-20251229T085702.509364+0900",
       "code": "035420",
       "pdno": "035420",
       "sid": "ORPHAN",
@@ -484,17 +902,17 @@
       "qty": 213,
       "remaining_qty": 213,
       "entry_price": 233720.707,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-035720-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-035720-20251229T085702.509364+0900",
       "code": "035720",
       "pdno": "035720",
       "sid": "ORPHAN",
@@ -504,17 +922,17 @@
       "qty": 241,
       "remaining_qty": 241,
       "entry_price": 58100.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-064760-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-064760-20251229T085702.509364+0900",
       "code": "064760",
       "pdno": "064760",
       "sid": "ORPHAN",
@@ -524,17 +942,17 @@
       "qty": 194,
       "remaining_qty": 194,
       "entry_price": 143934.02,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-065350-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-065350-20251229T085702.509364+0900",
       "code": "065350",
       "pdno": "065350",
       "sid": "ORPHAN",
@@ -544,17 +962,17 @@
       "qty": 483,
       "remaining_qty": 483,
       "entry_price": 58019.047,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-066570-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-066570-20251229T085702.509364+0900",
       "code": "066570",
       "pdno": "066570",
       "sid": "ORPHAN",
@@ -564,17 +982,17 @@
       "qty": 388,
       "remaining_qty": 388,
       "entry_price": 93458.762,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-098460-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-098460-20251229T085702.509364+0900",
       "code": "098460",
       "pdno": "098460",
       "sid": "ORPHAN",
@@ -584,17 +1002,17 @@
       "qty": 1204,
       "remaining_qty": 1204,
       "entry_price": 23324.75,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-108490-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-108490-20251229T085702.509364+0900",
       "code": "108490",
       "pdno": "108490",
       "sid": "ORPHAN",
@@ -604,17 +1022,17 @@
       "qty": 53,
       "remaining_qty": 53,
       "entry_price": 264500.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-140410-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-140410-20251229T085702.509364+0900",
       "code": "140410",
       "pdno": "140410",
       "sid": "ORPHAN",
@@ -624,17 +1042,17 @@
       "qty": 169,
       "remaining_qty": 169,
       "entry_price": 82473.333,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-141080-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-141080-20251229T085702.509364+0900",
       "code": "141080",
       "pdno": "141080",
       "sid": "ORPHAN",
@@ -644,17 +1062,17 @@
       "qty": 41,
       "remaining_qty": 41,
       "entry_price": 170993.902,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-145020-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-145020-20251229T085702.509364+0900",
       "code": "145020",
       "pdno": "145020",
       "sid": "ORPHAN",
@@ -664,17 +1082,17 @@
       "qty": 60,
       "remaining_qty": 60,
       "entry_price": 233500.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-160190-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-160190-20251229T085702.509364+0900",
       "code": "160190",
       "pdno": "160190",
       "sid": "ORPHAN",
@@ -684,17 +1102,17 @@
       "qty": 717,
       "remaining_qty": 717,
       "entry_price": 58478.521,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-214450-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-214450-20251229T085702.509364+0900",
       "code": "214450",
       "pdno": "214450",
       "sid": "ORPHAN",
@@ -704,17 +1122,17 @@
       "qty": 37,
       "remaining_qty": 37,
       "entry_price": 378297.297,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-222800-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-222800-20251229T085702.509364+0900",
       "code": "222800",
       "pdno": "222800",
       "sid": "ORPHAN",
@@ -724,17 +1142,17 @@
       "qty": 366,
       "remaining_qty": 366,
       "entry_price": 49756.967,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-226950-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-226950-20251229T085702.509364+0900",
       "code": "226950",
       "pdno": "226950",
       "sid": "ORPHAN",
@@ -744,17 +1162,17 @@
       "qty": 104,
       "remaining_qty": 104,
       "entry_price": 134541.826,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-237690-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-237690-20251229T085702.509364+0900",
       "code": "237690",
       "pdno": "237690",
       "sid": "ORPHAN",
@@ -764,17 +1182,17 @@
       "qty": 112,
       "remaining_qty": 112,
       "entry_price": 125100.892,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-247540-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-247540-20251229T085702.509364+0900",
       "code": "247540",
       "pdno": "247540",
       "sid": "ORPHAN",
@@ -784,17 +1202,17 @@
       "qty": 265,
       "remaining_qty": 265,
       "entry_price": 157924.528,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-267250-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-267250-20251229T085702.509364+0900",
       "code": "267250",
       "pdno": "267250",
       "sid": "ORPHAN",
@@ -804,17 +1222,17 @@
       "qty": 114,
       "remaining_qty": 114,
       "entry_price": 193446.491,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-290650-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-290650-20251229T085702.509364+0900",
       "code": "290650",
       "pdno": "290650",
       "sid": "ORPHAN",
@@ -824,17 +1242,17 @@
       "qty": 224,
       "remaining_qty": 224,
       "entry_price": 62500.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-298380-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-298380-20251229T085702.509364+0900",
       "code": "298380",
       "pdno": "298380",
       "sid": "ORPHAN",
@@ -844,17 +1262,17 @@
       "qty": 26,
       "remaining_qty": 26,
       "entry_price": 187500.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-316140-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-316140-20251229T085702.509364+0900",
       "code": "316140",
       "pdno": "316140",
       "sid": "ORPHAN",
@@ -864,17 +1282,17 @@
       "qty": 300,
       "remaining_qty": 300,
       "entry_price": 27963.169,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-347850-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-347850-20251229T085702.509364+0900",
       "code": "347850",
       "pdno": "347850",
       "sid": "ORPHAN",
@@ -884,17 +1302,17 @@
       "qty": 292,
       "remaining_qty": 292,
       "entry_price": 95850.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-352820-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-352820-20251229T085702.509364+0900",
       "code": "352820",
       "pdno": "352820",
       "sid": "ORPHAN",
@@ -904,17 +1322,17 @@
       "qty": 13,
       "remaining_qty": 13,
       "entry_price": 310500.0,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-357780-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-357780-20251229T085702.509364+0900",
       "code": "357780",
       "pdno": "357780",
       "sid": "ORPHAN",
@@ -924,17 +1342,17 @@
       "qty": 107,
       "remaining_qty": 107,
       "entry_price": 259436.915,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-373220-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-373220-20251229T085702.509364+0900",
       "code": "373220",
       "pdno": "373220",
       "sid": "ORPHAN",
@@ -944,17 +1362,17 @@
       "qty": 92,
       "remaining_qty": 92,
       "entry_price": 390027.173,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-445680-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-445680-20251229T085702.509364+0900",
       "code": "445680",
       "pdno": "445680",
       "sid": "ORPHAN",
@@ -964,17 +1382,17 @@
       "qty": 414,
       "remaining_qty": 414,
       "entry_price": 101202.898,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
     },
     {
-      "lot_id": "ORPHAN-475830-20251228T223416.309543+0900",
+      "lot_id": "ORPHAN-475830-20251229T085702.509364+0900",
       "code": "475830",
       "pdno": "475830",
       "sid": "ORPHAN",
@@ -984,11 +1402,11 @@
       "qty": 186,
       "remaining_qty": 186,
       "entry_price": 101329.061,
-      "entry_ts": "2025-12-28T22:34:16.309543+09:00",
+      "entry_ts": "2025-12-29T08:57:02.509364+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
-      "created_at": "2025-12-28T22:34:16.309543+09:00",
-      "updated_at": "2025-12-28T22:34:16.309543+09:00",
+      "created_at": "2025-12-29T08:57:02.509364+09:00",
+      "updated_at": "2025-12-29T08:57:02.509364+09:00",
       "notes": [
         "MISSING_IN_STATE"
       ]
@@ -997,2043 +1415,6 @@
   "memory": {
     "last_price": {},
     "last_seen": {},
-    "last_strategy_id": {},
-    "data_health": {
-      "000660": {
-        "ts": "2025-12-28T22:36:14.415107+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 599000.0,
-        "vwap": 589247.6589001272,
-        "last_price": 599000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "005290": {
-        "ts": "2025-12-28T22:36:16.538828+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 38150.0,
-        "vwap": 37488.33010818894,
-        "last_price": 38150.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "005380": {
-        "ts": "2025-12-28T22:36:18.573044+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 286000.0,
-        "vwap": 289218.21111535846,
-        "last_price": 286000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "005935": {
-        "ts": "2025-12-28T22:36:20.495310+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 88500.0,
-        "vwap": 85932.03237230147,
-        "last_price": 88500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "006800": {
-        "ts": "2025-12-28T22:36:22.413281+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 22900.0,
-        "vwap": 23176.318152764463,
-        "last_price": 22900.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "009540": {
-        "ts": "2025-12-28T22:36:24.426821+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 403000.0,
-        "vwap": 416186.7725509214,
-        "last_price": 403000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "010120": {
-        "ts": "2025-12-28T22:36:26.375139+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 455000.0,
-        "vwap": 464073.1965477935,
-        "last_price": 455000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "010130": {
-        "ts": "2025-12-28T22:36:28.308433+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 1288000.0,
-        "vwap": 1314967.0605612998,
-        "last_price": 1288000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "012330": {
-        "ts": "2025-12-28T22:36:32.528244+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 358000.0,
-        "vwap": 365283.6196166293,
-        "last_price": 358000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "012450": {
-        "ts": "2025-12-28T22:36:34.476322+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 870000.0,
-        "vwap": 875926.6828136038,
-        "last_price": 870000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "015760": {
-        "ts": "2025-12-28T22:36:36.444834+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 48500.0,
-        "vwap": 48218.877739209005,
-        "last_price": 48500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "028260": {
-        "ts": "2025-12-28T22:36:38.493961+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 240500.0,
-        "vwap": 239533.89636594345,
-        "last_price": 240500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "030200": {
-        "ts": "2025-12-28T22:36:40.416352+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 53400.0,
-        "vwap": 53485.17712920537,
-        "last_price": 53400.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "030530": {
-        "ts": "2025-12-28T22:36:42.451691+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 40100.0,
-        "vwap": 36375.83082658726,
-        "last_price": 40100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "032830": {
-        "ts": "2025-12-28T22:36:44.378767+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 162500.0,
-        "vwap": 163760.6313200328,
-        "last_price": 162500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "035420": {
-        "ts": "2025-12-28T22:36:46.306596+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 231500.0,
-        "vwap": 236488.09038228923,
-        "last_price": 231500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "035720": {
-        "ts": "2025-12-28T22:36:50.117100+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 58100.0,
-        "vwap": 59714.94488181435,
-        "last_price": 58100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "035900": {
-        "ts": "2025-12-28T22:36:52.605803+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 71100.0,
-        "vwap": 72021.33807829181,
-        "last_price": 71100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "039030": {
-        "ts": "2025-12-28T22:36:54.527786+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 260000.0,
-        "vwap": 255020.69910897876,
-        "last_price": 260000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "058610": {
-        "ts": "2025-12-28T22:36:56.536328+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 84600.0,
-        "vwap": 84781.64823102254,
-        "last_price": 84600.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "064350": {
-        "ts": "2025-12-28T22:36:58.651181+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 179800.0,
-        "vwap": 183790.62614203923,
-        "last_price": 179800.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "064760": {
-        "ts": "2025-12-28T22:37:00.584094+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 146000.0,
-        "vwap": 142859.1883614089,
-        "last_price": 146000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "065350": {
-        "ts": "2025-12-28T22:37:02.519644+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 57400.0,
-        "vwap": 58740.12854847348,
-        "last_price": 57400.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "066570": {
-        "ts": "2025-12-28T22:37:04.425322+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 91600.0,
-        "vwap": 92668.60439048785,
-        "last_price": 91600.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "067310": {
-        "ts": "2025-12-28T22:37:06.381302+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 25100.0,
-        "vwap": 24062.433282880585,
-        "last_price": 25100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "098460": {
-        "ts": "2025-12-28T22:37:08.303837+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 23100.0,
-        "vwap": 23206.005373010954,
-        "last_price": 23100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "108490": {
-        "ts": "2025-12-28T22:37:12.564898+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 268500.0,
-        "vwap": 269505.34345233487,
-        "last_price": 268500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "140410": {
-        "ts": "2025-12-28T22:37:14.494579+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 82000.0,
-        "vwap": 78786.42409206809,
-        "last_price": 82000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "141080": {
-        "ts": "2025-12-28T22:37:16.441225+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 180000.0,
-        "vwap": 173134.84430640715,
-        "last_price": 180000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "145020": {
-        "ts": "2025-12-28T22:37:18.373441+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 227000.0,
-        "vwap": 231637.41164591047,
-        "last_price": 227000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "160190": {
-        "ts": "2025-12-28T22:37:20.293573+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 58400.0,
-        "vwap": 57035.92971413585,
-        "last_price": 58400.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "214450": {
-        "ts": "2025-12-28T22:37:24.533524+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 378500.0,
-        "vwap": 395833.9535408209,
-        "last_price": 378500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "222800": {
-        "ts": "2025-12-28T22:37:26.471582+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 49750.0,
-        "vwap": 48908.71667726826,
-        "last_price": 49750.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "226950": {
-        "ts": "2025-12-28T22:37:28.377885+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 134800.0,
-        "vwap": 129490.87862563075,
-        "last_price": 134800.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "237690": {
-        "ts": "2025-12-28T22:37:30.331654+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 120900.0,
-        "vwap": 124854.5716112532,
-        "last_price": 120900.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "247540": {
-        "ts": "2025-12-28T22:37:34.576315+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 156300.0,
-        "vwap": 157660.24880126078,
-        "last_price": 156300.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "267250": {
-        "ts": "2025-12-28T22:37:36.495785+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 188500.0,
-        "vwap": 192473.43758484008,
-        "last_price": 188500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "277810": {
-        "ts": "2025-12-28T22:37:38.417257+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 473500.0,
-        "vwap": 482781.48511285416,
-        "last_price": 473500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "290650": {
-        "ts": "2025-12-28T22:37:40.353454+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 62600.0,
-        "vwap": 64374.1723868277,
-        "last_price": 62600.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "298380": {
-        "ts": "2025-12-28T22:37:42.281939+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 199000.0,
-        "vwap": 188565.93173859848,
-        "last_price": 199000.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "310210": {
-        "ts": "2025-12-28T22:37:46.519838+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 228500.0,
-        "vwap": 215976.29147098924,
-        "last_price": 228500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "316140": {
-        "ts": "2025-12-28T22:37:48.448399+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 28300.0,
-        "vwap": 28456.823516293593,
-        "last_price": 28300.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "319400": {
-        "ts": "2025-12-28T22:37:50.388495+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 19260.0,
-        "vwap": 18936.67484063774,
-        "last_price": 19260.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "347850": {
-        "ts": "2025-12-28T22:37:52.314291+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 94900.0,
-        "vwap": 89421.5991942222,
-        "last_price": 94900.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "352820": {
-        "ts": "2025-12-28T22:37:56.554241+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 314500.0,
-        "vwap": 321689.776988356,
-        "last_price": 314500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "357780": {
-        "ts": "2025-12-28T22:37:58.492664+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 260500.0,
-        "vwap": 257899.49466591803,
-        "last_price": 260500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "373220": {
-        "ts": "2025-12-28T22:38:00.411093+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 383500.0,
-        "vwap": 389651.5360524942,
-        "last_price": 383500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "402340": {
-        "ts": "2025-12-28T22:38:02.361217+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 334500.0,
-        "vwap": 327064.54704163346,
-        "last_price": 334500.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "437730": {
-        "ts": "2025-12-28T22:38:04.286423+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 55300.0,
-        "vwap": 57230.99550291205,
-        "last_price": 55300.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "445680": {
-        "ts": "2025-12-28T22:38:08.510020+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 101900.0,
-        "vwap": 98970.73853266821,
-        "last_price": 101900.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "466100": {
-        "ts": "2025-12-28T22:38:10.455790+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 64100.0,
-        "vwap": 66445.47361036846,
-        "last_price": 64100.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      },
-      "475830": {
-        "ts": "2025-12-28T22:38:12.386080+09:00",
-        "ok": true,
-        "daily_len": 60,
-        "intraday_len": 30,
-        "prev_close": 104300.0,
-        "vwap": 96561.39358142993,
-        "last_price": 104300.0,
-        "reasons": [
-          "OK"
-        ],
-        "daily_n": 60,
-        "intraday_n": 30
-      }
-    },
-    "setup_eval": {
-      "000660": {
-        "ts": "2025-12-28T22:36:16.538760+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "005290": {
-        "ts": "2025-12-28T22:36:18.572976+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "005380": {
-        "ts": "2025-12-28T22:36:20.495243+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "005935": {
-        "ts": "2025-12-28T22:36:22.413217+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "006800": {
-        "ts": "2025-12-28T22:36:24.426766+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "009540": {
-        "ts": "2025-12-28T22:36:26.375074+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "010120": {
-        "ts": "2025-12-28T22:36:28.308367+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "010130": {
-        "ts": "2025-12-28T22:36:32.528176+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "012330": {
-        "ts": "2025-12-28T22:36:34.476260+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "012450": {
-        "ts": "2025-12-28T22:36:36.444767+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "015760": {
-        "ts": "2025-12-28T22:36:38.493894+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "028260": {
-        "ts": "2025-12-28T22:36:40.416287+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "030200": {
-        "ts": "2025-12-28T22:36:42.451646+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "030530": {
-        "ts": "2025-12-28T22:36:44.378683+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "032830": {
-        "ts": "2025-12-28T22:36:46.306533+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "035420": {
-        "ts": "2025-12-28T22:36:50.117056+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "035720": {
-        "ts": "2025-12-28T22:36:52.605732+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "035900": {
-        "ts": "2025-12-28T22:36:54.527721+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "039030": {
-        "ts": "2025-12-28T22:36:56.536256+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "058610": {
-        "ts": "2025-12-28T22:36:58.651137+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "064350": {
-        "ts": "2025-12-28T22:37:00.584029+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "064760": {
-        "ts": "2025-12-28T22:37:02.519567+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "065350": {
-        "ts": "2025-12-28T22:37:04.425257+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "066570": {
-        "ts": "2025-12-28T22:37:06.381240+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "067310": {
-        "ts": "2025-12-28T22:37:08.303775+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "098460": {
-        "ts": "2025-12-28T22:37:12.564829+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "108490": {
-        "ts": "2025-12-28T22:37:14.494510+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "140410": {
-        "ts": "2025-12-28T22:37:16.441159+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "141080": {
-        "ts": "2025-12-28T22:37:18.373376+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "145020": {
-        "ts": "2025-12-28T22:37:20.293510+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "160190": {
-        "ts": "2025-12-28T22:37:24.533462+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "214450": {
-        "ts": "2025-12-28T22:37:26.471528+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "222800": {
-        "ts": "2025-12-28T22:37:28.377819+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "226950": {
-        "ts": "2025-12-28T22:37:30.331583+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "237690": {
-        "ts": "2025-12-28T22:37:34.576252+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "247540": {
-        "ts": "2025-12-28T22:37:36.495718+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "267250": {
-        "ts": "2025-12-28T22:37:38.417202+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "277810": {
-        "ts": "2025-12-28T22:37:40.353403+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "290650": {
-        "ts": "2025-12-28T22:37:42.281877+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "298380": {
-        "ts": "2025-12-28T22:37:46.519770+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "310210": {
-        "ts": "2025-12-28T22:37:48.448335+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "316140": {
-        "ts": "2025-12-28T22:37:50.388431+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "319400": {
-        "ts": "2025-12-28T22:37:52.314219+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "347850": {
-        "ts": "2025-12-28T22:37:56.554178+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "352820": {
-        "ts": "2025-12-28T22:37:58.492613+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "357780": {
-        "ts": "2025-12-28T22:38:00.411042+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "373220": {
-        "ts": "2025-12-28T22:38:02.361165+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "402340": {
-        "ts": "2025-12-28T22:38:04.286351+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "437730": {
-        "ts": "2025-12-28T22:38:08.509951+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "445680": {
-        "ts": "2025-12-28T22:38:10.455720+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "466100": {
-        "ts": "2025-12-28T22:38:12.386018+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      },
-      "475830": {
-        "ts": "2025-12-28T22:38:14.316203+09:00",
-        "setup_ok": true,
-        "missing": [],
-        "reasons": [
-          "OK"
-        ],
-        "daily": {},
-        "intra": {}
-      }
-    },
-    "exit_eval": {
-      "000660": {
-        "ts": "2025-12-28T22:38:14.316326+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 42,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "005290": {
-        "ts": "2025-12-28T22:38:14.316404+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 746,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "005380": {
-        "ts": "2025-12-28T22:38:14.316474+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 61,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "006800": {
-        "ts": "2025-12-28T22:38:14.316539+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 599,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "009540": {
-        "ts": "2025-12-28T22:38:14.316603+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 86,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "010120": {
-        "ts": "2025-12-28T22:38:14.316668+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 77,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "010130": {
-        "ts": "2025-12-28T22:38:14.316758+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 26,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "012330": {
-        "ts": "2025-12-28T22:38:14.316825+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 49,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "012450": {
-        "ts": "2025-12-28T22:38:14.316889+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 24,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "015760": {
-        "ts": "2025-12-28T22:38:14.316955+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 752,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "028260": {
-        "ts": "2025-12-28T22:38:14.317010+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 91,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "030200": {
-        "ts": "2025-12-28T22:38:14.317081+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 415,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "035420": {
-        "ts": "2025-12-28T22:38:14.317132+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 213,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "035720": {
-        "ts": "2025-12-28T22:38:14.317178+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 241,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "064760": {
-        "ts": "2025-12-28T22:38:14.317234+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 194,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "065350": {
-        "ts": "2025-12-28T22:38:14.317303+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 483,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "066570": {
-        "ts": "2025-12-28T22:38:14.317393+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 388,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "098460": {
-        "ts": "2025-12-28T22:38:14.317479+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 1204,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "108490": {
-        "ts": "2025-12-28T22:38:14.317562+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 53,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "140410": {
-        "ts": "2025-12-28T22:38:14.317643+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 169,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "141080": {
-        "ts": "2025-12-28T22:38:14.317741+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 41,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "145020": {
-        "ts": "2025-12-28T22:38:14.317823+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 60,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "160190": {
-        "ts": "2025-12-28T22:38:14.317912+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 717,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "214450": {
-        "ts": "2025-12-28T22:38:14.317992+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 37,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "222800": {
-        "ts": "2025-12-28T22:38:14.318074+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 366,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "226950": {
-        "ts": "2025-12-28T22:38:14.318158+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 104,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "237690": {
-        "ts": "2025-12-28T22:38:14.318239+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 112,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "247540": {
-        "ts": "2025-12-28T22:38:14.318322+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 265,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "267250": {
-        "ts": "2025-12-28T22:38:14.318403+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 114,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "290650": {
-        "ts": "2025-12-28T22:38:14.318484+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 224,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "298380": {
-        "ts": "2025-12-28T22:38:14.318564+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 26,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "316140": {
-        "ts": "2025-12-28T22:38:14.318644+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 300,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "347850": {
-        "ts": "2025-12-28T22:38:14.318741+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 292,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "352820": {
-        "ts": "2025-12-28T22:38:14.318822+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 13,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "357780": {
-        "ts": "2025-12-28T22:38:14.318907+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 107,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "373220": {
-        "ts": "2025-12-28T22:38:14.318989+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 92,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "445680": {
-        "ts": "2025-12-28T22:38:14.319071+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 414,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      },
-      "475830": {
-        "ts": "2025-12-28T22:38:14.319154+09:00",
-        "sid": "UNKNOWN",
-        "strategy_id": "UNKNOWN",
-        "qty": 186,
-        "exit_ok": false,
-        "reasons": [
-          "MISSING_SID",
-          "MISSING_STRATEGY_ID"
-        ]
-      }
-    }
-  },
-  "diagnostics": {
-    "orphans": {
-      "000660": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 42,
-        "avg": 591517.857,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "005290": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 746,
-        "avg": 37600.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "005380": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 61,
-        "avg": 290975.409,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "006800": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 599,
-        "avg": 23403.171,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "009540": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 86,
-        "avg": 414703.488,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "010120": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 77,
-        "avg": 461340.573,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "010130": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 26,
-        "avg": 1321769.23,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "012330": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 49,
-        "avg": 365096.365,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "012450": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 24,
-        "avg": 884613.333,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "015760": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 752,
-        "avg": 48278.588,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "028260": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 91,
-        "avg": 242082.417,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "030200": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 415,
-        "avg": 53751.084,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "035420": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 213,
-        "avg": 233720.707,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "035720": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 241,
-        "avg": 58100.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "064760": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 194,
-        "avg": 143934.02,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "065350": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 483,
-        "avg": 58019.047,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "066570": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 388,
-        "avg": 93458.762,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "098460": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 1204,
-        "avg": 23324.75,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "108490": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 53,
-        "avg": 264500.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "140410": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 169,
-        "avg": 82473.333,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "141080": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 41,
-        "avg": 170993.902,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "145020": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 60,
-        "avg": 233500.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "160190": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 717,
-        "avg": 58478.521,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "214450": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 37,
-        "avg": 378297.297,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "222800": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 366,
-        "avg": 49756.967,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "226950": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 104,
-        "avg": 134541.826,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "237690": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 112,
-        "avg": 125100.892,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "247540": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 265,
-        "avg": 157924.528,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "267250": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 114,
-        "avg": 193446.491,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "290650": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 224,
-        "avg": 62500.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "298380": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 26,
-        "avg": 187500.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "316140": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 300,
-        "avg": 27963.169,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "347850": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 292,
-        "avg": 95850.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "352820": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 13,
-        "avg": 310500.0,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "357780": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 107,
-        "avg": 259436.915,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "373220": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 92,
-        "avg": 390027.173,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "445680": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 414,
-        "avg": 101202.898,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      },
-      "475830": {
-        "ts": "2025-12-28T22:34:16.316086+09:00",
-        "qty": 186,
-        "avg": 101329.061,
-        "kind": "UNKNOWN",
-        "reason": "EXIT_STRATEGY_ID_MISSING",
-        "source": "state"
-      }
-    },
-    "last_run": {
-      "ts": "2025-12-28T22:34:16.316086+09:00",
-      "targets": [
-        "000660",
-        "005290",
-        "005380",
-        "005935",
-        "006800",
-        "009540",
-        "010120",
-        "010130",
-        "012330",
-        "012450",
-        "015760",
-        "028260",
-        "030200",
-        "030530",
-        "032830",
-        "035420",
-        "035720",
-        "035900",
-        "039030",
-        "058610",
-        "064350",
-        "064760",
-        "065350",
-        "066570",
-        "067310",
-        "098460",
-        "108490",
-        "140410",
-        "141080",
-        "145020",
-        "160190",
-        "214450",
-        "222800",
-        "226950",
-        "237690",
-        "247540",
-        "267250",
-        "277810",
-        "290650",
-        "298380",
-        "310210",
-        "316140",
-        "319400",
-        "347850",
-        "352820",
-        "357780",
-        "373220",
-        "402340",
-        "437730",
-        "445680",
-        "466100",
-        "475830"
-      ]
-    }
+    "last_strategy_id": {}
   }
 }
