@@ -1,1 +1,1592 @@
-{"schema_version": 2, "updated_at": null, "positions": {}, "memory": {"last_price": {}, "last_seen": {}}}
+{
+  "schema_version": 2,
+  "updated_at": "2025-12-28T22:02:30.153930+09:00",
+  "positions": {},
+  "orders": {},
+  "lots": [],
+  "memory": {
+    "last_price": {},
+    "last_seen": {},
+    "last_strategy_id": {},
+    "data_health": {
+      "000660": {
+        "ts": "2025-12-28T22:00:46.709674+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 599000.0,
+        "vwap": 589247.6589001272,
+        "last_price": 599000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "005290": {
+        "ts": "2025-12-28T22:00:48.460686+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 38150.0,
+        "vwap": 37488.33010818894,
+        "last_price": 38150.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "005380": {
+        "ts": "2025-12-28T22:00:50.095550+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 286000.0,
+        "vwap": 289218.21111535846,
+        "last_price": 286000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "005935": {
+        "ts": "2025-12-28T22:00:52.189441+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 88500.0,
+        "vwap": 85932.03237230147,
+        "last_price": 88500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "006800": {
+        "ts": "2025-12-28T22:00:54.203772+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 22900.0,
+        "vwap": 23176.318152764463,
+        "last_price": 22900.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "009540": {
+        "ts": "2025-12-28T22:00:56.353451+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 403000.0,
+        "vwap": 416186.7725509214,
+        "last_price": 403000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "010120": {
+        "ts": "2025-12-28T22:00:58.378025+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 455000.0,
+        "vwap": 464073.1965477935,
+        "last_price": 455000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "010130": {
+        "ts": "2025-12-28T22:01:00.406276+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 1288000.0,
+        "vwap": 1314967.0605612998,
+        "last_price": 1288000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "012330": {
+        "ts": "2025-12-28T22:01:02.411357+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 358000.0,
+        "vwap": 365283.6196166293,
+        "last_price": 358000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "012450": {
+        "ts": "2025-12-28T22:01:04.443126+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 870000.0,
+        "vwap": 875926.6828136038,
+        "last_price": 870000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "015760": {
+        "ts": "2025-12-28T22:01:06.472599+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 48500.0,
+        "vwap": 48218.877739209005,
+        "last_price": 48500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "028260": {
+        "ts": "2025-12-28T22:01:08.090839+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 240500.0,
+        "vwap": 239533.89636594345,
+        "last_price": 240500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "030200": {
+        "ts": "2025-12-28T22:01:10.091680+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 53400.0,
+        "vwap": 53485.17712920537,
+        "last_price": 53400.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "030530": {
+        "ts": "2025-12-28T22:01:12.121260+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 40100.0,
+        "vwap": 36375.83082658726,
+        "last_price": 40100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "032830": {
+        "ts": "2025-12-28T22:01:14.139117+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 162500.0,
+        "vwap": 163760.6313200328,
+        "last_price": 162500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "035420": {
+        "ts": "2025-12-28T22:01:16.145436+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 231500.0,
+        "vwap": 236488.09038228923,
+        "last_price": 231500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "035720": {
+        "ts": "2025-12-28T22:01:18.171682+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 58100.0,
+        "vwap": 59714.94488181435,
+        "last_price": 58100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "035900": {
+        "ts": "2025-12-28T22:01:20.176362+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 71100.0,
+        "vwap": 72021.33807829181,
+        "last_price": 71100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "039030": {
+        "ts": "2025-12-28T22:01:22.193845+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 260000.0,
+        "vwap": 255020.69910897876,
+        "last_price": 260000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "058610": {
+        "ts": "2025-12-28T22:01:24.274832+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 84600.0,
+        "vwap": 84781.64823102254,
+        "last_price": 84600.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "064350": {
+        "ts": "2025-12-28T22:01:26.295771+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 179800.0,
+        "vwap": 183790.62614203923,
+        "last_price": 179800.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "064760": {
+        "ts": "2025-12-28T22:01:28.311071+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 146000.0,
+        "vwap": 142859.1883614089,
+        "last_price": 146000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "065350": {
+        "ts": "2025-12-28T22:01:30.324723+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 57400.0,
+        "vwap": 58740.12854847348,
+        "last_price": 57400.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "066570": {
+        "ts": "2025-12-28T22:01:32.354871+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 91600.0,
+        "vwap": 92668.60439048785,
+        "last_price": 91600.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "067310": {
+        "ts": "2025-12-28T22:01:34.375963+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 25100.0,
+        "vwap": 24062.433282880585,
+        "last_price": 25100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "098460": {
+        "ts": "2025-12-28T22:01:36.406995+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 23100.0,
+        "vwap": 23206.005373010954,
+        "last_price": 23100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "108490": {
+        "ts": "2025-12-28T22:01:38.409759+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 268500.0,
+        "vwap": 269505.34345233487,
+        "last_price": 268500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "140410": {
+        "ts": "2025-12-28T22:01:40.425766+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 82000.0,
+        "vwap": 78786.42409206809,
+        "last_price": 82000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "141080": {
+        "ts": "2025-12-28T22:01:42.434443+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 180000.0,
+        "vwap": 173134.84430640715,
+        "last_price": 180000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "145020": {
+        "ts": "2025-12-28T22:01:44.448599+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 227000.0,
+        "vwap": 231637.41164591047,
+        "last_price": 227000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "160190": {
+        "ts": "2025-12-28T22:01:46.478342+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 58400.0,
+        "vwap": 57035.92971413585,
+        "last_price": 58400.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "214450": {
+        "ts": "2025-12-28T22:01:48.492489+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 378500.0,
+        "vwap": 395833.9535408209,
+        "last_price": 378500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "222800": {
+        "ts": "2025-12-28T22:01:50.510328+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 49750.0,
+        "vwap": 48908.71667726826,
+        "last_price": 49750.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "226950": {
+        "ts": "2025-12-28T22:01:52.510048+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 134800.0,
+        "vwap": 129490.87862563075,
+        "last_price": 134800.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "237690": {
+        "ts": "2025-12-28T22:01:54.084456+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 120900.0,
+        "vwap": 124854.5716112532,
+        "last_price": 120900.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "247540": {
+        "ts": "2025-12-28T22:01:56.087775+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 156300.0,
+        "vwap": 157660.24880126078,
+        "last_price": 156300.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "267250": {
+        "ts": "2025-12-28T22:01:58.111237+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 188500.0,
+        "vwap": 192473.43758484008,
+        "last_price": 188500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "277810": {
+        "ts": "2025-12-28T22:02:00.261449+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 473500.0,
+        "vwap": 482781.48511285416,
+        "last_price": 473500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "290650": {
+        "ts": "2025-12-28T22:02:02.263236+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 62600.0,
+        "vwap": 64374.1723868277,
+        "last_price": 62600.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "298380": {
+        "ts": "2025-12-28T22:02:04.276025+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 199000.0,
+        "vwap": 188565.93173859848,
+        "last_price": 199000.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "310210": {
+        "ts": "2025-12-28T22:02:06.291026+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 228500.0,
+        "vwap": 215976.29147098924,
+        "last_price": 228500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "316140": {
+        "ts": "2025-12-28T22:02:08.301454+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 28300.0,
+        "vwap": 28456.823516293593,
+        "last_price": 28300.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "319400": {
+        "ts": "2025-12-28T22:02:10.322272+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 19260.0,
+        "vwap": 18936.67484063774,
+        "last_price": 19260.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "347850": {
+        "ts": "2025-12-28T22:02:12.347913+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 94900.0,
+        "vwap": 89421.5991942222,
+        "last_price": 94900.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "352820": {
+        "ts": "2025-12-28T22:02:14.379129+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 314500.0,
+        "vwap": 321689.776988356,
+        "last_price": 314500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "357780": {
+        "ts": "2025-12-28T22:02:16.381293+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 260500.0,
+        "vwap": 257899.49466591803,
+        "last_price": 260500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "373220": {
+        "ts": "2025-12-28T22:02:18.393077+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 383500.0,
+        "vwap": 389651.5360524942,
+        "last_price": 383500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "402340": {
+        "ts": "2025-12-28T22:02:20.416094+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 334500.0,
+        "vwap": 327064.54704163346,
+        "last_price": 334500.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "437730": {
+        "ts": "2025-12-28T22:02:22.116064+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 55300.0,
+        "vwap": 57230.99550291205,
+        "last_price": 55300.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "445680": {
+        "ts": "2025-12-28T22:02:24.106983+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 101900.0,
+        "vwap": 98970.73853266821,
+        "last_price": 101900.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "466100": {
+        "ts": "2025-12-28T22:02:26.129039+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 64100.0,
+        "vwap": 66445.47361036846,
+        "last_price": 64100.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      },
+      "475830": {
+        "ts": "2025-12-28T22:02:28.131789+09:00",
+        "ok": true,
+        "daily_len": 60,
+        "intraday_len": 30,
+        "prev_close": 104300.0,
+        "vwap": 96561.39358142993,
+        "last_price": 104300.0,
+        "reasons": [
+          "OK"
+        ],
+        "daily_n": 60,
+        "intraday_n": 30
+      }
+    },
+    "setup_eval": {
+      "000660": {
+        "ts": "2025-12-28T22:00:48.460627+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "005290": {
+        "ts": "2025-12-28T22:00:50.095485+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "005380": {
+        "ts": "2025-12-28T22:00:52.189387+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "005935": {
+        "ts": "2025-12-28T22:00:54.203723+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "006800": {
+        "ts": "2025-12-28T22:00:56.353411+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "009540": {
+        "ts": "2025-12-28T22:00:58.377982+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "010120": {
+        "ts": "2025-12-28T22:01:00.406230+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "010130": {
+        "ts": "2025-12-28T22:01:02.411300+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "012330": {
+        "ts": "2025-12-28T22:01:04.443073+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "012450": {
+        "ts": "2025-12-28T22:01:06.472553+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "015760": {
+        "ts": "2025-12-28T22:01:08.090796+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "028260": {
+        "ts": "2025-12-28T22:01:10.091639+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "030200": {
+        "ts": "2025-12-28T22:01:12.121210+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "030530": {
+        "ts": "2025-12-28T22:01:14.139077+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "032830": {
+        "ts": "2025-12-28T22:01:16.145395+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "035420": {
+        "ts": "2025-12-28T22:01:18.171642+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "035720": {
+        "ts": "2025-12-28T22:01:20.176324+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "035900": {
+        "ts": "2025-12-28T22:01:22.193792+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "039030": {
+        "ts": "2025-12-28T22:01:24.274777+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "058610": {
+        "ts": "2025-12-28T22:01:26.295710+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "064350": {
+        "ts": "2025-12-28T22:01:28.311016+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "064760": {
+        "ts": "2025-12-28T22:01:30.324667+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "065350": {
+        "ts": "2025-12-28T22:01:32.354811+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "066570": {
+        "ts": "2025-12-28T22:01:34.375882+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "067310": {
+        "ts": "2025-12-28T22:01:36.406953+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "098460": {
+        "ts": "2025-12-28T22:01:38.409719+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "108490": {
+        "ts": "2025-12-28T22:01:40.425728+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "140410": {
+        "ts": "2025-12-28T22:01:42.434403+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "141080": {
+        "ts": "2025-12-28T22:01:44.448558+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "145020": {
+        "ts": "2025-12-28T22:01:46.478296+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "160190": {
+        "ts": "2025-12-28T22:01:48.492448+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "214450": {
+        "ts": "2025-12-28T22:01:50.510288+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "222800": {
+        "ts": "2025-12-28T22:01:52.510008+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "226950": {
+        "ts": "2025-12-28T22:01:54.084409+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "237690": {
+        "ts": "2025-12-28T22:01:56.087737+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "247540": {
+        "ts": "2025-12-28T22:01:58.111197+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "267250": {
+        "ts": "2025-12-28T22:02:00.261411+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "277810": {
+        "ts": "2025-12-28T22:02:02.263188+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "290650": {
+        "ts": "2025-12-28T22:02:04.275986+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "298380": {
+        "ts": "2025-12-28T22:02:06.290986+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "310210": {
+        "ts": "2025-12-28T22:02:08.301401+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "316140": {
+        "ts": "2025-12-28T22:02:10.322232+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "319400": {
+        "ts": "2025-12-28T22:02:12.347856+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "347850": {
+        "ts": "2025-12-28T22:02:14.379090+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "352820": {
+        "ts": "2025-12-28T22:02:16.381239+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "357780": {
+        "ts": "2025-12-28T22:02:18.393030+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "373220": {
+        "ts": "2025-12-28T22:02:20.416041+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "402340": {
+        "ts": "2025-12-28T22:02:22.116009+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "437730": {
+        "ts": "2025-12-28T22:02:24.106922+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "445680": {
+        "ts": "2025-12-28T22:02:26.128989+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "466100": {
+        "ts": "2025-12-28T22:02:28.131734+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      },
+      "475830": {
+        "ts": "2025-12-28T22:02:30.146701+09:00",
+        "setup_ok": true,
+        "missing": [],
+        "reasons": [
+          "OK"
+        ],
+        "daily": {},
+        "intra": {}
+      }
+    },
+    "exit_eval": {}
+  },
+  "diagnostics": {
+    "orphans": {
+      "000660": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 42,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "005290": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 746,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "005380": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 61,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "006800": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 599,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "009540": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 86,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "010120": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 77,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "010130": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 26,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "012330": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 49,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "012450": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 24,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "015760": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 752,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "028260": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 91,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "030200": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 415,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "035420": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 213,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "035720": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 241,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "064760": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 194,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "065350": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 483,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "066570": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 388,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "098460": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 1204,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "108490": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 53,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "140410": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 169,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "141080": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 41,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "145020": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 60,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "160190": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 717,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "214450": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 37,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "222800": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 366,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "226950": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 104,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "237690": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 112,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "247540": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 265,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "267250": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 114,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "290650": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 224,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "298380": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 26,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "316140": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 300,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "347850": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 292,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "352820": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 13,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "357780": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 107,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "373220": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 92,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "445680": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 414,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      },
+      "475830": {
+        "ts": "2025-12-28T21:59:10.024313+09:00",
+        "qty": 186,
+        "avg": 0.0,
+        "kind": "ORPHAN",
+        "reason": "MISSING_IN_STATE"
+      }
+    },
+    "last_run": {
+      "ts": "2025-12-28T21:59:10.024313+09:00",
+      "targets": [
+        "000660",
+        "005290",
+        "005380",
+        "005935",
+        "006800",
+        "009540",
+        "010120",
+        "010130",
+        "012330",
+        "012450",
+        "015760",
+        "028260",
+        "030200",
+        "030530",
+        "032830",
+        "035420",
+        "035720",
+        "035900",
+        "039030",
+        "058610",
+        "064350",
+        "064760",
+        "065350",
+        "066570",
+        "067310",
+        "098460",
+        "108490",
+        "140410",
+        "141080",
+        "145020",
+        "160190",
+        "214450",
+        "222800",
+        "226950",
+        "237690",
+        "247540",
+        "267250",
+        "277810",
+        "290650",
+        "298380",
+        "310210",
+        "316140",
+        "319400",
+        "347850",
+        "352820",
+        "357780",
+        "373220",
+        "402340",
+        "437730",
+        "445680",
+        "466100",
+        "475830"
+      ]
+    }
+  }
+}
