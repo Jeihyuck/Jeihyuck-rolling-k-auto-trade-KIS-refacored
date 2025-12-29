@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "updated_at": "2025-12-29T17:20:47.029627+09:00",
+  "updated_at": "2025-12-29T19:56:25.727033+09:00",
   "positions": {
     "000660": {
       "code": "000660",
@@ -13,13 +13,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 6,
       "avg_price": 591517.857,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "005290": {
@@ -33,13 +34,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 746,
       "avg_price": 37600.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "005380": {
@@ -53,13 +55,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 61,
       "avg_price": 290975.409,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "006800": {
@@ -73,13 +76,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 599,
       "avg_price": 23403.171,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "009540": {
@@ -93,13 +97,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 86,
       "avg_price": 414703.488,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "010120": {
@@ -113,13 +118,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 77,
       "avg_price": 461340.573,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "010130": {
@@ -150,13 +156,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 49,
       "avg_price": 365096.365,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "012450": {
@@ -170,13 +177,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 4,
       "avg_price": 884613.333,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "015760": {
@@ -190,13 +198,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 752,
       "avg_price": 48278.588,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "028260": {
@@ -210,13 +219,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 91,
       "avg_price": 242082.417,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "030200": {
@@ -230,13 +240,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 415,
       "avg_price": 53751.084,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "035420": {
@@ -250,13 +261,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 107,
       "avg_price": 233720.707,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "035720": {
@@ -270,13 +282,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 121,
       "avg_price": 58100.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "064760": {
@@ -290,13 +303,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 194,
       "avg_price": 143934.02,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "065350": {
@@ -310,13 +324,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 483,
       "avg_price": 58019.047,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "066570": {
@@ -330,13 +345,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 388,
       "avg_price": 93458.762,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "098460": {
@@ -367,13 +383,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 27,
       "avg_price": 264500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "145020": {
@@ -387,13 +404,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 60,
       "avg_price": 233500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "160190": {
@@ -424,13 +442,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 366,
       "avg_price": 49756.967,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "226950": {
@@ -461,13 +480,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 112,
       "avg_price": 125100.892,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "247540": {
@@ -481,13 +501,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 265,
       "avg_price": 157924.528,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "267250": {
@@ -501,13 +522,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 114,
       "avg_price": 193446.491,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "290650": {
@@ -521,13 +543,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 224,
       "avg_price": 62500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "316140": {
@@ -541,13 +564,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 300,
       "avg_price": 27963.169,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "347850": {
@@ -561,13 +585,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 292,
       "avg_price": 95850.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "352820": {
@@ -581,13 +606,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 7,
       "avg_price": 310500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "357780": {
@@ -601,13 +627,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 107,
       "avg_price": 259436.915,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "373220": {
@@ -621,13 +648,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 92,
       "avg_price": 390027.173,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     },
     "445680": {
@@ -641,13 +669,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 51,
       "avg_price": 101202.898,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T17:20:47.028843+09:00",
+      "updated_at": "2025-12-29T19:56:25.726155+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00"
     }
   },
