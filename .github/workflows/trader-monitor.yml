@@ -15,8 +15,39 @@ on:
   pull_request:
     branches: [ main, trader_r1 ]
   schedule:
+    # UTC 기준 23:57 = KST 08:57
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "실행할 코드 브랜치 (schedule은 자동으로 trader_r1 사용)"
+        required: false
+        default: "trader_r1"
+      run_mode:
+        description: "auto=장중 LIVE/휴일·장마감 DIAG, live=강제 LIVE, diag=강제 DIAG"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - live
+          - diag
+      active_strategies:
+        description: "ACTIVE_STRATEGIES (예: 1 또는 1,2,3)"
+        required: false
+        default: "1"
+      run_loop_minutes:
+        description: "LIVE 루프 지속 시간(분). 0이면 1회만 실행"
+        required: false
+        default: "360"
+      kis_env:
+        description: "practice(모의/VTS) 또는 real(실계좌)"
+        required: false
+        default: "practice"
+        type: choice
+        options:
+          - practice
+          - real
 
 jobs:
   monitor-trade:
@@ -34,7 +65,7 @@ jobs:
       CANO:           ${{ secrets.CANO }}
       ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
 
-      # 기본값은 secrets를 쓰되, LIVE step에서 practice/VTS로 강제 override 함
+      # 기본값은 secrets를 쓰되, LIVE step에서 practice/real에 맞게 override
       KIS_ENV:        ${{ secrets.KIS_ENV }}
       API_BASE_URL:   ${{ secrets.API_BASE_URL }}
 
@@ -105,34 +136,20 @@ jobs:
       ALLOW_AFTER_HOURS: "0"
       REBALANCE_OUT_DIR: "rebalance_results"
 
-      # LIVE 루프 지속 시간(분). 0이면 1회만 실행.
+      # 기본값(수동 입력 없을 때)
+      ACTIVE_STRATEGIES: "1"
       RUN_LOOP_MINUTES: "360"
 
     steps:
-      - uses: actions/checkout@v4
+      # schedule은 워크플로 파일은 main에서 트리거되지만,
+      # 실제 실행 코드는 trader_r1을 체크아웃해야 함(요구사항).
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Restore state cache (fallback only)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-          restore-keys: |
-            trader-state-${{ github.ref_name }}-
-
-      - name: Save state cache (dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || (github.event_name == 'schedule' && 'trader_r1' || github.ref) }}
 
       - name: Set git identity
         run: |
@@ -142,16 +159,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Ensure state scripts executable
-        if: github.event_name != 'pull_request'
-        run: |
-          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
-
-      - name: Pull state (plain)
-        if: github.event_name != 'pull_request'
-        run: |
-          bash scripts/state_pull_plain.sh || true
 
       - name: Dependencies 설치
         run: |
@@ -166,22 +173,138 @@ jobs:
         run: |
           python -m trader.ledger_test
 
-      - name: (DEBUG) show workflow + commit actually running
+      - name: (DEBUG) show workflow + ref actually running
         run: |
           echo "event=${{ github.event_name }} ref=${{ github.ref }} sha=${{ github.sha }}"
+          echo "checked_out_branch=$(git branch --show-current)"
           git rev-parse HEAD
-          ls -al .github/workflows || true
-          echo "===== .github/workflows/trader-monitor.yml (head) ====="
-          sed -n '1,220p' .github/workflows/trader-monitor.yml || true
 
-      - name: trader LIVE (PRACTICE/VTS) - schedule/dispatch only
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+      # ===== 핵심: LIVE/DIAG 실행 여부 결정 =====
+      - name: Decide LIVE vs DIAG
+        id: decide
+        env:
+          # workflow_dispatch 입력은 다른 이벤트에서 비어있을 수 있으니 안전하게 처리
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode || 'auto' }}
+          INPUT_ACTIVE_STRATEGIES: ${{ github.event_name == 'workflow_dispatch' && inputs.active_strategies || '1' }}
+          INPUT_RUN_LOOP_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.run_loop_minutes || '360' }}
+          INPUT_KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.kis_env || 'practice' }}
+        run: |
+          python - << 'PY'
+          import os
+          from datetime import datetime, time
+          try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("Asia/Seoul")
+          except Exception:
+            tz = None
+
+          event = os.getenv("GITHUB_EVENT_NAME", "")
+          run_mode = (os.getenv("RUN_MODE") or "auto").strip().lower()
+          active_strategies = (os.getenv("INPUT_ACTIVE_STRATEGIES") or "1").strip()
+          run_loop_minutes = (os.getenv("INPUT_RUN_LOOP_MINUTES") or "360").strip()
+          kis_env = (os.getenv("INPUT_KIS_ENV") or "practice").strip().lower()
+
+          now = datetime.now(tz) if tz else datetime.now()
+          hhmm = now.time()
+
+          # 장중 LIVE 윈도우: 08:40 ~ 15:40 (수동 실행이 17시 같은 시간이면 자동으로 DIAG로)
+          in_live_window = (hhmm >= time(8, 40)) and (hhmm < time(15, 40))
+
+          # 휴장(주말/공휴일) 판별: pykrx가 있으면 KRX 영업일 캘린더 활용 시도, 실패 시 평일 기준으로만
+          is_business_day = (now.weekday() < 5)  # fallback
+          reason_bd = "fallback_weekday"
+          try:
+            from pykrx import stock
+            ymd = now.strftime("%Y%m%d")
+            # get_previous_business_days가 있으면 그걸로 정확히 판정
+            if hasattr(stock, "get_previous_business_days"):
+              bds = stock.get_previous_business_days(ymd, ymd)
+              is_business_day = (len(bds) > 0)
+              reason_bd = "pykrx_business_day"
+          except Exception as e:
+            reason_bd = f"fallback_weekday(pykrx_fail:{type(e).__name__})"
+
+          # push/PR에서는 trader.trader를 아예 돌리지 않음(요구사항: DIAG는 휴일/장마감에만)
+          if event in ("push", "pull_request"):
+            mode = "NONE"
+            reason = f"event={event} => skip trader.trader (CI only)"
+          else:
+            if run_mode == "live":
+              mode = "LIVE"
+              reason = "forced_by_input(run_mode=live)"
+            elif run_mode == "diag":
+              mode = "DIAG"
+              reason = "forced_by_input(run_mode=diag)"
+            else:
+              # auto
+              if not is_business_day:
+                mode = "DIAG"
+                reason = f"auto:market_closed(non_business_day,{reason_bd})"
+              elif not in_live_window:
+                mode = "DIAG"
+                reason = "auto:market_closed(after_close_or_before_open)"
+              else:
+                mode = "LIVE"
+                reason = "auto:market_open_window"
+
+          run_live = "true" if mode == "LIVE" else "false"
+          run_diag = "true" if mode == "DIAG" else "false"
+          needs_state = "true" if mode in ("LIVE","DIAG") else "false"
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"mode={mode}\n")
+            f.write(f"run_live={run_live}\n")
+            f.write(f"run_diag={run_diag}\n")
+            f.write(f"needs_state={needs_state}\n")
+            f.write(f"reason={reason}\n")
+            f.write(f"active_strategies={active_strategies}\n")
+            f.write(f"run_loop_minutes={run_loop_minutes}\n")
+            f.write(f"kis_env={kis_env}\n")
+
+          print("==== DECISION ====")
+          print("event:", event)
+          print("now:", now.isoformat())
+          print("run_mode:", run_mode)
+          print("is_business_day:", is_business_day, "(", reason_bd, ")")
+          print("in_live_window:", in_live_window)
+          print("mode:", mode)
+          print("reason:", reason)
+          print("active_strategies:", active_strategies)
+          print("run_loop_minutes:", run_loop_minutes)
+          print("kis_env:", kis_env)
+          PY
+
+      - name: Ensure state scripts executable
+        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
+        run: |
+          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
+
+      - name: Pull state (plain)
+        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
+        run: |
+          bash scripts/state_pull_plain.sh || true
+
+      - name: Restore state cache (fallback only)
+        if: steps.decide.outputs.needs_state == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
+          restore-keys: |
+            trader-state-${{ github.ref_name }}-
+
+      # ===== LIVE: 장중에만(또는 강제 live) =====
+      - name: trader LIVE (PRACTICE/REAL)
+        if: steps.decide.outputs.run_live == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
 
-          # PRACTICE 강제 (모의투자 + LIVE 주문 로직)
-          KIS_ENV: "practice"
-          API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+          # env는 input 기반으로 결정
+          KIS_ENV: ${{ steps.decide.outputs.kis_env == 'real' && 'real' || 'practice' }}
+          API_BASE_URL: ${{ steps.decide.outputs.kis_env == 'real' && secrets.API_BASE_URL_REAL || 'https://openapivts.koreainvestment.com:29443' }}
 
           # LIVE 강제
           EXPECT_LIVE_TRADING: "1"
@@ -190,8 +313,11 @@ jobs:
           LIVE_TRADING_ENABLED: "1"
           STRATEGY_MODE: "LIVE"
 
-          # 엔진 ON/OFF
-          ACTIVE_STRATEGIES: "1"
+          # 전략/루프
+          ACTIVE_STRATEGIES: ${{ steps.decide.outputs.active_strategies }}
+          RUN_LOOP_MINUTES: ${{ steps.decide.outputs.run_loop_minutes }}
+
+          # 엔진 ON/OFF (필요한 것만 켜기)
           DISABLE_KOSDAQ_LOOP: "false"
           DISABLE_KOSPI_ENGINE: "true"
         run: |
@@ -207,19 +333,29 @@ jobs:
           print("API_BASE_URL=", os.getenv("API_BASE_URL"))
           print("DRY_RUN=", os.getenv("DRY_RUN"), "DISABLE_LIVE_TRADING=", os.getenv("DISABLE_LIVE_TRADING"),
                 "LIVE_TRADING_ENABLED=", os.getenv("LIVE_TRADING_ENABLED"), "STRATEGY_MODE=", os.getenv("STRATEGY_MODE"))
+          print("ACTIVE_STRATEGIES=", os.getenv("ACTIVE_STRATEGIES"), "RUN_LOOP_MINUTES=", os.getenv("RUN_LOOP_MINUTES"))
           PY
           python -m trader.trader
 
-      - name: trader DIAG (push only, no orders)
-        if: github.event_name == 'push'
+      # ===== DIAG: 휴일/주말 또는 장마감(15:40 이후)만(또는 강제 diag) =====
+      - name: trader DIAG (market closed only)
+        if: steps.decide.outputs.run_diag == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
+
           DRY_RUN: "1"
           DISABLE_LIVE_TRADING: "1"
           LIVE_TRADING_ENABLED: "0"
           EXPECT_LIVE_TRADING: "0"
           STRATEGY_MODE: "INTENT_ONLY"
-          ACTIVE_STRATEGIES: "1"
+
+          ACTIVE_STRATEGIES: ${{ steps.decide.outputs.active_strategies }}
+          RUN_LOOP_MINUTES: "0"
+
+          # DIAG는 휴장에도 데이터 점검/리포트 생성이 목적이면 true로
+          MARKET_DATA_WHEN_CLOSED: "true"
+
+          # 엔진 OFF
           DISABLE_KOSDAQ_LOOP: "1"
           DISABLE_KOSPI_ENGINE: "1"
         run: |
@@ -238,7 +374,7 @@ jobs:
           ls -al trader/logs || true
 
       - name: Push state (plain)
-        if: github.event_name != 'pull_request'
+        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
@@ -287,3 +423,4 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
