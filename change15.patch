@@ -1,0 +1,208 @@
+diff --git a/.github/workflows/ci-check.yml b/.github/workflows/ci-check.yml
+deleted file mode 100644
+index 18f5ccb2f76e62b973b4d21ebae438a3054e2416..0000000000000000000000000000000000000000
+--- a/.github/workflows/ci-check.yml
++++ /dev/null
+@@ -1,38 +0,0 @@
+-name: CI Checks (no live trader)
+-
+-on:
+-  push:
+-  pull_request:
+-
+-permissions:
+-  contents: read
+-
+-jobs:
+-  tests:
+-    runs-on: ubuntu-latest
+-    env:
+-      DRY_RUN: "1"
+-      DISABLE_LIVE_TRADING: "1"
+-      LIVE_TRADING_ENABLED: "0"
+-      EXPECT_LIVE_TRADING: "0"
+-    steps:
+-      - uses: actions/checkout@v4
+-        with:
+-          fetch-depth: 0
+-
+-      - uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: Static compile check
+-        run: |
+-          python -m compileall portfolio strategy trader rolling_k_auto_trade_api
+-
+-      - name: Ledger tests
+-        run: |
+-          python -m trader.ledger_test
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+deleted file mode 100644
+index 2e8063c97ab1e4c3f215b09445e6d91834cf17ab..0000000000000000000000000000000000000000
+--- a/.github/workflows/ci.yml
++++ /dev/null
+@@ -1,27 +0,0 @@
+-name: CI (no live trading)
+-
+-on:
+-  pull_request:
+-
+-jobs:
+-  build:
+-    runs-on: ubuntu-latest
+-    env:
+-      DISABLE_LIVE_TRADING: "true"
+-    steps:
+-      - uses: actions/checkout@v4
+-        with:
+-          fetch-depth: 0
+-
+-      - uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: Static compile check
+-        run: |
+-          python -m compileall portfolio strategy trader rolling_k_auto_trade_api
+diff --git a/.github/workflows/trade-monitor.yml b/.github/workflows/trader-monitor.yml
+similarity index 96%
+rename from .github/workflows/trade-monitor.yml
+rename to .github/workflows/trader-monitor.yml
+index 4deb37f71a1973c89806961f2c6a602854d3054e..83f7257e9ce38b8176ed3bff5e295e71a50e78ed 100644
+--- a/.github/workflows/trade-monitor.yml
++++ b/.github/workflows/trader-monitor.yml
+@@ -1,26 +1,26 @@
+-name: Trade Monitor (trader_refactor branch)
++name: Trader Monitor
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: false
+ 
+ on:
+   push:
+     branches: [ main, trader_refactor ]
+     paths-ignore:
+       - "bot_state/**"
+   pull_request:
+     branches: [ main, trader_refactor ]
+   schedule:
+     - cron: "57 23 * * 0-6"
+   workflow_dispatch:
+ 
+ jobs:
+   monitor-trade:
+     if: github.ref != 'refs/heads/bot-state'
+     runs-on: ubuntu-latest
+     timeout-minutes: 360
+ 
+@@ -149,91 +149,91 @@ jobs:
+           chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
+ 
+       - name: Pull state (plain)
+         if: github.event_name != 'pull_request'
+         run: |
+           bash scripts/state_pull_plain.sh || true
+ 
+       - name: Dependencies 설치
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader rolling_k_auto_trade_api portfolio strategy
+ 
+       - name: Ledger smoke test
+         run: |
+           python -m trader.ledger_test
+ 
+       - name: (DEBUG) show workflow + commit actually running
+         run: |
+           echo "event=${{ github.event_name }} ref=${{ github.ref }} sha=${{ github.sha }}"
+           git rev-parse HEAD
+           ls -al .github/workflows || true
+-          echo "===== .github/workflows/trade-monitor.yml (head) ====="
+-          sed -n '1,220p' .github/workflows/trade-monitor.yml || true
++          echo "===== .github/workflows/trader-monitor.yml (head) ====="
++          sed -n '1,220p' .github/workflows/trader-monitor.yml || true
+ 
+       - name: trader LIVE (PRACTICE/VTS) - schedule/dispatch only
+         if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+ 
+           # PRACTICE 강제 (모의투자 + LIVE 주문 로직)
+           KIS_ENV: "practice"
+           API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+ 
+           # LIVE 강제
+           EXPECT_LIVE_TRADING: "1"
+           DRY_RUN: "0"
+           DISABLE_LIVE_TRADING: "0"
+           LIVE_TRADING_ENABLED: "1"
+           STRATEGY_MODE: "LIVE"
+ 
+           # 엔진 ON/OFF
+           ACTIVE_STRATEGIES: "1"
+           DISABLE_KOSDAQ_LOOP: "false"
+           DISABLE_KOSPI_ENGINE: "true"
+         run: |
+           python - << 'PY'
+           import os, sys
+           must = ["KIS_APP_KEY","KIS_APP_SECRET","CANO","ACNT_PRDT_CD"]
+           miss = [k for k in must if not (os.getenv(k) or "").strip()]
+           if miss:
+             print("FATAL missing secrets:", miss)
+             sys.exit(2)
+           print("OK secrets present")
+           print("KIS_ENV=", os.getenv("KIS_ENV"))
+           print("API_BASE_URL=", os.getenv("API_BASE_URL"))
+           print("DRY_RUN=", os.getenv("DRY_RUN"), "DISABLE_LIVE_TRADING=", os.getenv("DISABLE_LIVE_TRADING"),
+                 "LIVE_TRADING_ENABLED=", os.getenv("LIVE_TRADING_ENABLED"), "STRATEGY_MODE=", os.getenv("STRATEGY_MODE"))
+           PY
+           python -m trader.trader
+ 
+-      - name: trader DIAG (push/PR only, no orders)
+-        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
++      - name: trader DIAG (push only, no orders)
++        if: github.event_name == 'push'
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+           DRY_RUN: "1"
+           DISABLE_LIVE_TRADING: "1"
+           LIVE_TRADING_ENABLED: "0"
+           EXPECT_LIVE_TRADING: "0"
+           STRATEGY_MODE: "INTENT_ONLY"
+           ACTIVE_STRATEGIES: "1"
+           DISABLE_KOSDAQ_LOOP: "1"
+           DISABLE_KOSPI_ENGINE: "1"
+         run: |
+           python -m trader.trader
+ 
+       - name: CEO 리포트 자동 생성
+         if: always()
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.report_ceo || true
+ 
+       - name: Verify logs
+         if: always()
+         run: |
+           ls -al trader/logs || true
+ 

@@ -1,4 +1,4 @@
-name: Trade Monitor (trader_refactor branch)
+name: Trader Monitor
 
 permissions:
   contents: write
@@ -171,8 +171,8 @@ jobs:
           echo "event=${{ github.event_name }} ref=${{ github.ref }} sha=${{ github.sha }}"
           git rev-parse HEAD
           ls -al .github/workflows || true
-          echo "===== .github/workflows/trade-monitor.yml (head) ====="
-          sed -n '1,220p' .github/workflows/trade-monitor.yml || true
+          echo "===== .github/workflows/trader-monitor.yml (head) ====="
+          sed -n '1,220p' .github/workflows/trader-monitor.yml || true
 
       - name: trader LIVE (PRACTICE/VTS) - schedule/dispatch only
         if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -210,8 +210,8 @@ jobs:
           PY
           python -m trader.trader
 
-      - name: trader DIAG (push/PR only, no orders)
-        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+      - name: trader DIAG (push only, no orders)
+        if: github.event_name == 'push'
         env:
           PYTHONPATH: ${{ github.workspace }}
           DRY_RUN: "1"
