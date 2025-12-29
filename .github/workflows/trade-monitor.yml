@@ -18,121 +18,113 @@ on:
   pull_request:
     branches: [ main, trader_r1 ]
 
-
 jobs:
   trade-live:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-
     env:
-      <<: &base_env
-        #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
-        #ALLOW_NON_TRADING_ORDER: "1"
-        # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
-        KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-        KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-        # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
-        APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-        APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      # === KIS 인증키 ===
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
 
-        CANO:           ${{ secrets.CANO }}
-        ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
-        KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}          # practice / real
+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
 
-        # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
-        API_BASE_URL:   ${{ secrets.API_BASE_URL }}
+      # === trader.py 운영 파라미터 ===
+      PARTIAL1: "0.5"
+      PARTIAL2: "0.3"
+      TRAIL_PCT: "0.02"
+      FAST_STOP: "0.01"
+      ATR_STOP: "1.5"
 
-        # === trader.py 운영 파라미터 ===
-        PARTIAL1: "0.5"
-        PARTIAL2: "0.3"
-        TRAIL_PCT: "0.02"
-        FAST_STOP: "0.01"
-        ATR_STOP: "1.5"
+      TIME_STOP_HHMM: "13:00"
+      SELL_FORCE_TIME: "14:40"
+      SELL_ALL_BALANCES_AT_CUTOFF: "0"
+      FORCE_SELL_PASSES_CUTOFF: "2"
+      FORCE_SELL_PASSES_CLOSE: "4"
 
-        TIME_STOP_HHMM: "13:00"
-        SELL_FORCE_TIME: "14:40"
-        SELL_ALL_BALANCES_AT_CUTOFF: "0"
-        FORCE_SELL_PASSES_CUTOFF: "2"
-        FORCE_SELL_PASSES_CLOSE: "4"
+      DEFAULT_PROFIT_PCT: "3.0"
+      DEFAULT_LOSS_PCT: "5.0"
 
-        DEFAULT_PROFIT_PCT: "3.0"
-        DEFAULT_LOSS_PCT: "5.0"
+      SLIPPAGE_LIMIT_PCT: "0.25"
+      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
 
-        SLIPPAGE_LIMIT_PCT: "0.25"
-        SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+      VWAP_TOL: "0.003"
 
-        # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
-        # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
-        VWAP_TOL: "0.003"
+      W_MAX_ONE: "0.25"
+      W_MIN_ONE: "0.03"
 
-        W_MAX_ONE: "0.25"
-        W_MIN_ONE: "0.03"
+      REBALANCE_ANCHOR: "weekly"
+      FORCE_WEEKLY_REBALANCE: "0"
+      MOMENTUM_OVERRIDES_FORCE_SELL: "1"
 
-        REBALANCE_ANCHOR: "weekly"
-        FORCE_WEEKLY_REBALANCE: "0"
-        MOMENTUM_OVERRIDES_FORCE_SELL: "1"
+      # 레짐/지수
+      KOSDAQ_INDEX_CODE: "KOSDAQ"
+      KOSDAQ_ETF_FALLBACK: "229200"
 
-        # 레짐/지수
-        KOSDAQ_INDEX_CODE: "KOSDAQ"
-        KOSDAQ_ETF_FALLBACK: "229200"
+      REG_BULL_MIN_UP_PCT: "0.5"
+      REG_BULL_MIN_MINUTES: "10"
+      REG_BEAR_VWAP_MINUTES: "10"
+      REG_BEAR_DROP_FROM_HIGH: "0.7"
+      REG_BEAR_STAGE1_MINUTES: "20"
+      REG_BEAR_STAGE2_ADD_DROP: "0.5"
 
-        REG_BULL_MIN_UP_PCT: "0.5"
-        REG_BULL_MIN_MINUTES: "10"
-        REG_BEAR_VWAP_MINUTES: "10"
-        REG_BEAR_DROP_FROM_HIGH: "0.7"
-        REG_BEAR_STAGE1_MINUTES: "20"
-        REG_BEAR_STAGE2_ADD_DROP: "0.5"
+      REG_PARTIAL_S1: "0.30"
+      REG_PARTIAL_S2: "0.30"
 
-        REG_PARTIAL_S1: "0.30"
-        REG_PARTIAL_S2: "0.30"
+      TRAIL_PCT_BULL: "0.025"
+      TRAIL_PCT_BEAR: "0.012"
+      TP_PROFIT_PCT_BULL: "3.5"
 
-        TRAIL_PCT_BULL: "0.025"
-        TRAIL_PCT_BEAR: "0.012"
-        TP_PROFIT_PCT_BULL: "3.5"
+      MARKET_DATA_WHEN_CLOSED: "0"
 
-        MARKET_DATA_WHEN_CLOSED: "0"
-        DIAGNOSTIC_ONLY: "0"
-        DIAGNOSTIC_FORCE_RUN: "0"
-        DIAGNOSTIC_ENABLED: "0"
-        DISABLE_KOSDAQ_LOOP: "1"
-        DISABLE_KOSPI_ENGINE: "1"
-        DISABLE_LIVE_TRADING: "1"
-        DRY_RUN: "1"
-        LIVE_TRADING_ENABLED: "0"
-        STRATEGY_MODE: "INTENT_ONLY"
-        EXPECT_LIVE_TRADING: "0"
-        ACTIVE_STRATEGIES: "1"
-        ALLOW_ADOPT_UNMANAGED: "0"
-        ALLOW_AFTER_HOURS: "0"
+      DIAGNOSTIC_ONLY: "0"
+      DIAGNOSTIC_FORCE_RUN: "0"
+      DIAGNOSTIC_ENABLED: "0"
 
-        # 배분/속도
-        DAILY_CAPITAL: "250000000"
-        API_RATE_SLEEP_SEC: "0.3"
-
-        # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
-        # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
-        KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
-        KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
-
-        # === FastAPI 리밸런싱 서버(선정 필터) ===
-        MIN_TRADES: "5"
-        MAX_MDD_PCT: "30"
-        MIN_WINRATE: "50"
-        MIN_CUMRET: "2"
-        TOP_K_LIMIT: "20"
-        TOTAL_CAPITAL: "10000000"
-        MIN_QTY_PER_TICKET: "1"
-        K_MIN: "0.1"
-        K_MAX: "0.9"
-        K_STEP: "0.1"
-        REBALANCE_OUT_DIR: "rebalance_results"
+      # ===== LIVE 강제 =====
       DRY_RUN: "0"
       DISABLE_LIVE_TRADING: "0"
       LIVE_TRADING_ENABLED: "1"
-      STRATEGY_MODE: "LIVE"
       EXPECT_LIVE_TRADING: "1"
+      STRATEGY_MODE: "LIVE"
+
+      # 전략 1만
+      ACTIVE_STRATEGIES: "1"
+
+      # 엔진 ON/OFF
       DISABLE_KOSDAQ_LOOP: "0"
       DISABLE_KOSPI_ENGINE: "1"
+
+      # 안전: 장외 금지
+      ALLOW_AFTER_HOURS: "0"
+      ALLOW_ADOPT_UNMANAGED: "0"
+
+      # 배분/속도
+      DAILY_CAPITAL: "250000000"
+      API_RATE_SLEEP_SEC: "0.3"
+
+      # === VWAP 분봉 TR ===
+      KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
+      KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
+
+      # === FastAPI 리밸런싱 서버(선정 필터) ===
+      MIN_TRADES: "5"
+      MAX_MDD_PCT: "30"
+      MIN_WINRATE: "50"
+      MIN_CUMRET: "2"
+      TOP_K_LIMIT: "20"
+      TOTAL_CAPITAL: "10000000"
+      MIN_QTY_PER_TICKET: "1"
+      K_MIN: "0.1"
+      K_MAX: "0.9"
+      K_STEP: "0.1"
+      ALLOW_AFTER_HOURS: "0"
+      REBALANCE_OUT_DIR: "rebalance_results"
 
     steps:
       - uses: actions/checkout@v4
@@ -150,14 +142,6 @@ jobs:
           key: trader-state-${{ github.ref_name }}
           restore-keys: |
             trader-state-${{ github.ref_name }}-
-      - name: Save state cache (dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
 
       - name: Set git identity
         run: |
@@ -169,12 +153,10 @@ jobs:
           python-version: "3.11"
 
       - name: Ensure state scripts executable
-        if: github.event_name != 'pull_request'
         run: |
           chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
 
       - name: Pull state (plain)
-        if: github.event_name != 'pull_request'
         run: |
           bash scripts/state_pull_plain.sh
 
@@ -187,63 +169,30 @@ jobs:
         run: |
           python -m trader.ledger_test
 
-      - name: (진단) 핵심 환경변수 주입 여부만 확인
+      - name: (LIVE 체크) 핵심 env 값 출력
         run: |
+          echo "GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
           python - << 'PY'
           import os
-          def chk(k):
-              v = os.getenv(k) or ''
-              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
-          for k in [
-              'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
-              'CANO','ACNT_PRDT_CD','KIS_ENV'
-          ]:
-              chk(k)
-          PY
-
-      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
-      - name: (디버그) trader 모듈 경로 및 내용 확인
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python - << 'PY'
-          import trader
-          from trader import trader as t
-          print("trader package path:", trader.__file__)
-          print("trader.trader module path:", t.__file__)
-          print("=== HEAD OF trader.trader ===")
-          try:
-              with open(t.__file__, 'r', encoding='utf-8') as f:
-                  for i in range(1, 80):
-                      line = f.readline()
-                      if not line:
-                          break
-                      print(f"{i:03}: {line.rstrip()}")
-          except Exception as e:
-              print("ERROR while reading trader.trader:", e)
+          keys = ["DRY_RUN","DISABLE_LIVE_TRADING","LIVE_TRADING_ENABLED","EXPECT_LIVE_TRADING","STRATEGY_MODE","KIS_ENV"]
+          for k in keys:
+              print(k, "=", os.getenv(k))
           PY
 
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30  # 서버 기동 대기
+          sleep 30
 
       - name: Compile modules
         run: |
           python -m compileall trader rolling_k_auto_trade_api
-      - name: Print live env expectations
-        run: |
-          echo "event=$GITHUB_EVENT_NAME"
-          python - << 'PY'
-          import os
-          keys = ["DRY_RUN", "LIVE_TRADING_ENABLED", "DISABLE_LIVE_TRADING", "STRATEGY_MODE", "EXPECT_LIVE_TRADING"]
-          for key in keys:
-              print(f"{key}={os.getenv(key)}")
-          PY
+
       - name: trader LIVE (strategy1 only)
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m trader.trader
+        run: |
+          python -m trader.trader
 
       - name: Normalize state path
         if: always()
@@ -259,13 +208,8 @@ jobs:
         run: |
           python -m trader.report_ceo || true
 
-      - name: Verify CEO report exists
-        if: always()
-        run: |
-          ls -al trader/logs || true
-
       - name: Push state (plain)
-        if: github.event_name != 'pull_request'
+        if: always()
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
@@ -316,17 +260,33 @@ jobs:
           retention-days: 14
 
   trade-diag:
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     env:
-      <<: *base_env
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+
+      # ===== DIAG 강제 =====
       DRY_RUN: "1"
       DISABLE_LIVE_TRADING: "1"
       LIVE_TRADING_ENABLED: "0"
-      STRATEGY_MODE: "INTENT_ONLY"
       EXPECT_LIVE_TRADING: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+
+      ACTIVE_STRATEGIES: "1"
       DISABLE_KOSDAQ_LOOP: "1"
       DISABLE_KOSPI_ENGINE: "1"
+
+      ALLOW_AFTER_HOURS: "0"
+      DAILY_CAPITAL: "250000000"
+      API_RATE_SLEEP_SEC: "0.3"
 
     steps:
       - uses: actions/checkout@v4
@@ -335,42 +295,9 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore state cache (fallback only)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-          restore-keys: |
-            trader-state-${{ github.ref_name }}-
-      - name: Save state cache (dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-
-      - name: Set git identity
-        run: |
-          git config user.name "trade-bot"
-          git config user.email "trade-bot@users.noreply.github.com"
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Ensure state scripts executable
-        if: github.event_name != 'pull_request'
-        run: |
-          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
-
-      - name: Pull state (plain)
-        if: github.event_name != 'pull_request'
-        run: |
-          bash scripts/state_pull_plain.sh
 
       - name: Dependencies 설치
         run: |
@@ -381,122 +308,14 @@ jobs:
         run: |
           python -m trader.ledger_test
 
-      - name: (진단) 핵심 환경변수 주입 여부만 확인
-        run: |
-          python - << 'PY'
-          import os
-          def chk(k):
-              v = os.getenv(k) or ''
-              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
-          for k in [
-              'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
-              'CANO','ACNT_PRDT_CD','KIS_ENV'
-          ]:
-              chk(k)
-          PY
-
-      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
-      - name: (디버그) trader 모듈 경로 및 내용 확인
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python - << 'PY'
-          import trader
-          from trader import trader as t
-          print("trader package path:", trader.__file__)
-          print("trader.trader module path:", t.__file__)
-          print("=== HEAD OF trader.trader ===")
-          try:
-              with open(t.__file__, 'r', encoding='utf-8') as f:
-                  for i in range(1, 80):
-                      line = f.readline()
-                      if not line:
-                          break
-                      print(f"{i:03}: {line.rstrip()}")
-          except Exception as e:
-              print("ERROR while reading trader.trader:", e)
-          PY
-
-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
-        run: |
-          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30  # 서버 기동 대기
-
       - name: Compile modules
         run: |
           python -m compileall trader rolling_k_auto_trade_api
+
       - name: trader DIAG (no live orders)
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m trader.trader
-
-      - name: Normalize state path
-        if: always()
         run: |
-          mkdir -p trader/state
-          test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
-          test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+          python -m trader.trader
 
-      - name: CEO 리포트 자동 생성
-        if: always()
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m trader.report_ceo || true
-
-      - name: Verify CEO report exists
-        if: always()
-        run: |
-          ls -al trader/logs || true
-
-      - name: Push state (plain)
-        if: github.event_name != 'pull_request'
-        run: |
-          test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
-
-      - name: Save state snapshot as artifact (audit only)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trader-state-${{ github.run_id }}
-          path: |
-            trader/state/state.json
-            bot_state/state.json
-            trader/logs/CEO_Report_*.md
-            trader/logs/ledger.jsonl
-          retention-days: 30
-
-      - name: Rebalance JSON artifact 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rebalance-results
-          path: rebalance_results/*.json
-          if-no-files-found: warn
-          retention-days: 60
-
-      - name: Trades 로그 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-logs
-          path: trader/logs/*.json
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: FastAPI 로그 출력 (cat)
-        if: always()
-        run: |
-          echo "::group::FastAPI Server Log"
-          cat fastapi.log || true
-          echo "::endgroup::"
-
-      - name: FastAPI 로그 업로드 (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fastapi-log
-          path: fastapi.log
-          if-no-files-found: ignore
-          retention-days: 14
    
