@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
 
+from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
+
 # =========================
 # [CONFIG] .env 없이도 동작
 # - 아래 값을 기본으로 사용
@@ -122,6 +124,20 @@ def _cfg(key: str) -> str:
     return os.getenv(key, CONFIG.get(key, ""))
 
 
+def _default_bool(key: str, fallback: bool = False) -> bool:
+    raw_default = str(CONFIG.get(key, "")).strip().lower()
+    if raw_default in TRUE_VALUES:
+        return True
+    if raw_default in FALSE_VALUES:
+        return False
+    return fallback
+
+
+def _cfg_bool(key: str, fallback: bool | None = None) -> bool:
+    default_value = _default_bool(key, fallback if fallback is not None else False)
+    return env_bool(key, default=default_value)
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -145,12 +161,12 @@ EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
 KST = ZoneInfo("Asia/Seoul")
 
 SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
-SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "true"
-EMERGENCY_GLOBAL_SELL = _cfg("EMERGENCY_GLOBAL_SELL").lower() in ("1", "true", "yes")
+SELL_ALL_BALANCES_AT_CUTOFF = _cfg_bool("SELL_ALL_BALANCES_AT_CUTOFF")
+EMERGENCY_GLOBAL_SELL = _cfg_bool("EMERGENCY_GLOBAL_SELL")
 RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
 FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
 FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
-FORCE_SELL_BLOCKED_LOTS = _cfg("FORCE_SELL_BLOCKED_LOTS").lower() in ("1", "true", "yes")
+FORCE_SELL_BLOCKED_LOTS = _cfg_bool("FORCE_SELL_BLOCKED_LOTS")
 PARTIAL1 = float(_cfg("PARTIAL1"))
 PARTIAL2 = float(_cfg("PARTIAL2"))
 TRAIL_PCT = float(_cfg("TRAIL_PCT"))
@@ -166,10 +182,10 @@ SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
 VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
 W_MAX_ONE = float(_cfg("W_MAX_ONE"))
 W_MIN_ONE = float(_cfg("W_MIN_ONE"))
-ALLOW_PYRAMID = (_cfg("ALLOW_PYRAMID") or "false").lower() == "true"
+ALLOW_PYRAMID = _cfg_bool("ALLOW_PYRAMID")
 REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
 WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
-MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
+MOMENTUM_OVERRIDES_FORCE_SELL = _cfg_bool("MOMENTUM_OVERRIDES_FORCE_SELL")
 BASE_QTY_MODE = (_cfg("BASE_QTY_MODE") or "initial").lower()
 if BASE_QTY_MODE not in {"initial", "current"}:
     logging.getLogger(__name__).warning(
@@ -234,30 +250,20 @@ if ENABLED_STRATEGIES_SET:
 else:
     STRATEGY_WEIGHTS = {name: 0.0 for name in RAW_STRATEGY_WEIGHTS.keys()}
 
-STRATEGY_MODE = (_cfg("STRATEGY_MODE") or "INTENT_ONLY").upper()
-_RAW_STRATEGY_DRY_RUN = os.getenv("DRY_RUN")
-if not _RAW_STRATEGY_DRY_RUN:
-    _RAW_STRATEGY_DRY_RUN = _cfg("STRATEGY_DRY_RUN") or "true"
-STRATEGY_DRY_RUN = str(_RAW_STRATEGY_DRY_RUN).lower() in ("1", "true", "yes")
+STRATEGY_MODE = resolve_mode(_cfg("STRATEGY_MODE") or "INTENT_ONLY")
+_STRATEGY_DRY_RUN_DEFAULT = _cfg_bool("STRATEGY_DRY_RUN", fallback=True)
+STRATEGY_DRY_RUN = env_bool("DRY_RUN", default=_STRATEGY_DRY_RUN_DEFAULT)
 STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
 STRATEGY_INTENTS_STATE_PATH = Path(
     _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
 )
 STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
 STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
-STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+STRATEGY_ALLOW_SELL_ONLY = _cfg_bool("STRATEGY_ALLOW_SELL_ONLY")
 
-DIAGNOSTIC_MODE = (_cfg("DIAGNOSTIC_MODE") or "false").lower() in ("1", "true", "yes")
-DIAGNOSTIC_ONLY = (_cfg("DIAGNOSTIC_ONLY") or "false").lower() in ("1", "true", "yes")
-DIAGNOSTIC_FORCE_RUN = (_cfg("DIAGNOSTIC_FORCE_RUN") or "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
+DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
+DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
 DIAGNOSTIC_DUMP_DIR = Path(
     _cfg("DIAGNOSTIC_DUMP_DIR") or _cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"]
 )
@@ -320,13 +326,9 @@ def _parse_active_strategies(raw: str) -> set[int]:
 
 ACTIVE_STRATEGIES = _parse_active_strategies(_cfg("ACTIVE_STRATEGIES"))
 UNMANAGED_STRATEGY_ID = 0
-ALLOW_ADOPT_UNMANAGED = (_cfg("ALLOW_ADOPT_UNMANAGED") or "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+ALLOW_ADOPT_UNMANAGED = _cfg_bool("ALLOW_ADOPT_UNMANAGED")
 # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
-USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
+USE_PULLBACK_ENTRY = _cfg_bool("USE_PULLBACK_ENTRY", fallback=True)
 PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
 PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
 PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
@@ -381,9 +383,9 @@ def _parse_hhmm(hhmm: str) -> dtime:
 
 SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
 TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
-ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
-DISABLE_KOSDAQ_LOOP = (_cfg("DISABLE_KOSDAQ_LOOP") or "false").lower() in ("1", "true", "yes")
-DISABLE_KOSPI_ENGINE = (_cfg("DISABLE_KOSPI_ENGINE") or "false").lower() in ("1", "true", "yes")
+ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"

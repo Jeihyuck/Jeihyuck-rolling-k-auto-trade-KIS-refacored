@@ -1,0 +1,1418 @@
+diff --git a/.github/workflows/trade-monitor.yml b/.github/workflows/trade-monitor.yml
+index d6ec9139d14cfe457540f1e492f283da43c6605d..207c335a38805af1f3ed177308d201ddca6cd0e2 100644
+--- a/.github/workflows/trade-monitor.yml
++++ b/.github/workflows/trade-monitor.yml
+@@ -1,150 +1,160 @@
+ name: Trade Monitor (trader_refactor branch)
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: false
+ 
+ on:
+   schedule:
+     - cron: "*/5 0-6 * * 1-5"
+   workflow_dispatch:
+   push:
+     branches: [ main, trader_r1 ]
+     paths-ignore:
+       - "bot_state/**"
+   pull_request:
+     branches: [ main, trader_r1 ]
+ 
+ 
+ jobs:
+-  monitor-trade:
+-    # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
+-    # if: github.ref == 'refs/heads/main'
+-    # if: github.ref != 'refs/heads/bot-state'
++  trade-live:
++    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+     runs-on: ubuntu-latest
+ 
+     env:
+-      #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
+-      #ALLOW_NON_TRADING_ORDER: "1"
+-      # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
+-      KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
+-      APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-
+-      CANO:           ${{ secrets.CANO }}
+-      ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
+-      KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+-
+-      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
+-      API_BASE_URL:   ${{ secrets.API_BASE_URL }}
+-
+-      # === trader.py 운영 파라미터 ===
+-      PARTIAL1: "0.5"
+-      PARTIAL2: "0.3"
+-      TRAIL_PCT: "0.02"
+-      FAST_STOP: "0.01"
+-      ATR_STOP: "1.5"
+-
+-      TIME_STOP_HHMM: "13:00"
+-      SELL_FORCE_TIME: "14:40"
+-      SELL_ALL_BALANCES_AT_CUTOFF: "false"
+-      FORCE_SELL_PASSES_CUTOFF: "2"
+-      FORCE_SELL_PASSES_CLOSE: "4"
+-
+-      DEFAULT_PROFIT_PCT: "3.0"
+-      DEFAULT_LOSS_PCT: "5.0"
+-
+-      SLIPPAGE_LIMIT_PCT: "0.25"
+-      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+-
+-      # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
+-      # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
+-      VWAP_TOL: "0.003"
+-
+-      W_MAX_ONE: "0.25"
+-      W_MIN_ONE: "0.03"
+-
+-      REBALANCE_ANCHOR: "weekly"
+-      FORCE_WEEKLY_REBALANCE: "0"
+-      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+-
+-      # 레짐/지수
+-      KOSDAQ_INDEX_CODE: "KOSDAQ"
+-      KOSDAQ_ETF_FALLBACK: "229200"
+-
+-      REG_BULL_MIN_UP_PCT: "0.5"
+-      REG_BULL_MIN_MINUTES: "10"
+-      REG_BEAR_VWAP_MINUTES: "10"
+-      REG_BEAR_DROP_FROM_HIGH: "0.7"
+-      REG_BEAR_STAGE1_MINUTES: "20"
+-      REG_BEAR_STAGE2_ADD_DROP: "0.5"
+-
+-      REG_PARTIAL_S1: "0.30"
+-      REG_PARTIAL_S2: "0.30"
+-
+-      TRAIL_PCT_BULL: "0.025"
+-      TRAIL_PCT_BEAR: "0.012"
+-      TP_PROFIT_PCT_BULL: "3.5"
+-
+-      MARKET_DATA_WHEN_CLOSED: "false"
+-      DIAGNOSTIC_ONLY: "0"
+-      DIAGNOSTIC_FORCE_RUN: "0"
+-      DIAGNOSTIC_ENABLED: "0"
+-      DISABLE_KOSDAQ_LOOP: "true"
+-      DISABLE_KOSPI_ENGINE: "true"
++      <<: &base_env
++        #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
++        #ALLOW_NON_TRADING_ORDER: "1"
++        # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
++        KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
++        KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
++        # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
++        APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
++        APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
++
++        CANO:           ${{ secrets.CANO }}
++        ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
++        KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
++
++        # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
++        API_BASE_URL:   ${{ secrets.API_BASE_URL }}
++
++        # === trader.py 운영 파라미터 ===
++        PARTIAL1: "0.5"
++        PARTIAL2: "0.3"
++        TRAIL_PCT: "0.02"
++        FAST_STOP: "0.01"
++        ATR_STOP: "1.5"
++
++        TIME_STOP_HHMM: "13:00"
++        SELL_FORCE_TIME: "14:40"
++        SELL_ALL_BALANCES_AT_CUTOFF: "0"
++        FORCE_SELL_PASSES_CUTOFF: "2"
++        FORCE_SELL_PASSES_CLOSE: "4"
++
++        DEFAULT_PROFIT_PCT: "3.0"
++        DEFAULT_LOSS_PCT: "5.0"
++
++        SLIPPAGE_LIMIT_PCT: "0.25"
++        SLIPPAGE_ENTER_GUARD_PCT: "2.5"
++
++        # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
++        # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
++        VWAP_TOL: "0.003"
++
++        W_MAX_ONE: "0.25"
++        W_MIN_ONE: "0.03"
++
++        REBALANCE_ANCHOR: "weekly"
++        FORCE_WEEKLY_REBALANCE: "0"
++        MOMENTUM_OVERRIDES_FORCE_SELL: "1"
++
++        # 레짐/지수
++        KOSDAQ_INDEX_CODE: "KOSDAQ"
++        KOSDAQ_ETF_FALLBACK: "229200"
++
++        REG_BULL_MIN_UP_PCT: "0.5"
++        REG_BULL_MIN_MINUTES: "10"
++        REG_BEAR_VWAP_MINUTES: "10"
++        REG_BEAR_DROP_FROM_HIGH: "0.7"
++        REG_BEAR_STAGE1_MINUTES: "20"
++        REG_BEAR_STAGE2_ADD_DROP: "0.5"
++
++        REG_PARTIAL_S1: "0.30"
++        REG_PARTIAL_S2: "0.30"
++
++        TRAIL_PCT_BULL: "0.025"
++        TRAIL_PCT_BEAR: "0.012"
++        TP_PROFIT_PCT_BULL: "3.5"
++
++        MARKET_DATA_WHEN_CLOSED: "0"
++        DIAGNOSTIC_ONLY: "0"
++        DIAGNOSTIC_FORCE_RUN: "0"
++        DIAGNOSTIC_ENABLED: "0"
++        DISABLE_KOSDAQ_LOOP: "1"
++        DISABLE_KOSPI_ENGINE: "1"
++        DISABLE_LIVE_TRADING: "1"
++        DRY_RUN: "1"
++        LIVE_TRADING_ENABLED: "0"
++        STRATEGY_MODE: "INTENT_ONLY"
++        EXPECT_LIVE_TRADING: "0"
++        ACTIVE_STRATEGIES: "1"
++        ALLOW_ADOPT_UNMANAGED: "0"
++        ALLOW_AFTER_HOURS: "0"
++
++        # 배분/속도
++        DAILY_CAPITAL: "250000000"
++        API_RATE_SLEEP_SEC: "0.3"
++
++        # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
++        # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
++        KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
++        KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
++
++        # === FastAPI 리밸런싱 서버(선정 필터) ===
++        MIN_TRADES: "5"
++        MAX_MDD_PCT: "30"
++        MIN_WINRATE: "50"
++        MIN_CUMRET: "2"
++        TOP_K_LIMIT: "20"
++        TOTAL_CAPITAL: "10000000"
++        MIN_QTY_PER_TICKET: "1"
++        K_MIN: "0.1"
++        K_MAX: "0.9"
++        K_STEP: "0.1"
++        REBALANCE_OUT_DIR: "rebalance_results"
++      DRY_RUN: "0"
+       DISABLE_LIVE_TRADING: "0"
+-      ACTIVE_STRATEGIES: "1"
+-      ALLOW_ADOPT_UNMANAGED: "0"
+-
+-      # 배분/속도
+-      DAILY_CAPITAL: "250000000"
+-      API_RATE_SLEEP_SEC: "0.3"
+-
+-      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
+-      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
+-      KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
+-      KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
+-
+-      # === FastAPI 리밸런싱 서버(선정 필터) ===
+-      MIN_TRADES: "5"
+-      MAX_MDD_PCT: "30"
+-      MIN_WINRATE: "50"
+-      MIN_CUMRET: "2"
+-      TOP_K_LIMIT: "20"
+-      TOTAL_CAPITAL: "10000000"
+-      MIN_QTY_PER_TICKET: "1"
+-      K_MIN: "0.1"
+-      K_MAX: "0.9"
+-      K_STEP: "0.1"
+-      ALLOW_AFTER_HOURS: "0"
+-      REBALANCE_OUT_DIR: "rebalance_results"
++      LIVE_TRADING_ENABLED: "1"
++      STRATEGY_MODE: "LIVE"
++      EXPECT_LIVE_TRADING: "1"
++      DISABLE_KOSDAQ_LOOP: "0"
++      DISABLE_KOSPI_ENGINE: "1"
+ 
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+       - name: Restore state cache (fallback only)
+         uses: actions/cache/restore@v4
+         with:
+           path: |
+             bot_state/state.json
+             trader/state/state.json
+           key: trader-state-${{ github.ref_name }}
+           restore-keys: |
+             trader-state-${{ github.ref_name }}-
+       - name: Save state cache (dispatch only)
+         if: github.event_name == 'workflow_dispatch'
+         uses: actions/cache/save@v4
+         with:
+           path: |
+             bot_state/state.json
+             trader/state/state.json
+           key: trader-state-${{ github.ref_name }}
+@@ -199,80 +209,247 @@ jobs:
+           python - << 'PY'
+           import trader
+           from trader import trader as t
+           print("trader package path:", trader.__file__)
+           print("trader.trader module path:", t.__file__)
+           print("=== HEAD OF trader.trader ===")
+           try:
+               with open(t.__file__, 'r', encoding='utf-8') as f:
+                   for i in range(1, 80):
+                       line = f.readline()
+                       if not line:
+                           break
+                       print(f"{i:03}: {line.rstrip()}")
+           except Exception as e:
+               print("ERROR while reading trader.trader:", e)
+           PY
+ 
+       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+         run: |
+           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+           sleep 30  # 서버 기동 대기
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader rolling_k_auto_trade_api
++      - name: Print live env expectations
++        run: |
++          echo "event=$GITHUB_EVENT_NAME"
++          python - << 'PY'
++          import os
++          keys = ["DRY_RUN", "LIVE_TRADING_ENABLED", "DISABLE_LIVE_TRADING", "STRATEGY_MODE", "EXPECT_LIVE_TRADING"]
++          for key in keys:
++              print(f"{key}={os.getenv(key)}")
++          PY
+       - name: trader LIVE (strategy1 only)
+-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+-          # LIVE 강제
+-          DRY_RUN: "false"
+-          DISABLE_LIVE_TRADING: "false"
+-          LIVE_TRADING_ENABLED: "true"
+-          STRATEGY_MODE: "LIVE"
++        run: python -m trader.trader
+ 
+-          # 전략 1만
+-          ACTIVE_STRATEGIES: "1"
++      - name: Normalize state path
++        if: always()
++        run: |
++          mkdir -p trader/state
++          test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
++          test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+ 
+-          # 최소 1개 엔진 ON (우선 KOSDAQ만 ON)
+-          DISABLE_KOSDAQ_LOOP: "false"
+-          DISABLE_KOSPI_ENGINE: "true"
++      - name: CEO 리포트 자동 생성
++        if: always()
++        env:
++          PYTHONPATH: ${{ github.workspace }}
++        run: |
++          python -m trader.report_ceo || true
+ 
+-          # 안전: 장외 금지
+-          ALLOW_AFTER_HOURS: "0"
+-        run: python -m trader.trader
++      - name: Verify CEO report exists
++        if: always()
++        run: |
++          ls -al trader/logs || true
++
++      - name: Push state (plain)
++        if: github.event_name != 'pull_request'
++        run: |
++          test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
++
++      - name: Save state snapshot as artifact (audit only)
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: trader-state-${{ github.run_id }}
++          path: |
++            trader/state/state.json
++            bot_state/state.json
++            trader/logs/CEO_Report_*.md
++            trader/logs/ledger.jsonl
++          retention-days: 30
++
++      - name: Rebalance JSON artifact 업로드
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: rebalance-results
++          path: rebalance_results/*.json
++          if-no-files-found: warn
++          retention-days: 60
++
++      - name: Trades 로그 업로드
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: trade-logs
++          path: trader/logs/*.json
++          if-no-files-found: ignore
++          retention-days: 14
++
++      - name: FastAPI 로그 출력 (cat)
++        if: always()
++        run: |
++          echo "::group::FastAPI Server Log"
++          cat fastapi.log || true
++          echo "::endgroup::"
++
++      - name: FastAPI 로그 업로드 (artifact)
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: fastapi-log
++          path: fastapi.log
++          if-no-files-found: ignore
++          retention-days: 14
++
++  trade-diag:
++    if: github.event_name == 'push' || github.event_name == 'pull_request'
++    runs-on: ubuntu-latest
++    env:
++      <<: *base_env
++      DRY_RUN: "1"
++      DISABLE_LIVE_TRADING: "1"
++      LIVE_TRADING_ENABLED: "0"
++      STRATEGY_MODE: "INTENT_ONLY"
++      EXPECT_LIVE_TRADING: "0"
++      DISABLE_KOSDAQ_LOOP: "1"
++      DISABLE_KOSPI_ENGINE: "1"
++
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          persist-credentials: true
++          token: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Restore state cache (fallback only)
++        uses: actions/cache/restore@v4
++        with:
++          path: |
++            bot_state/state.json
++            trader/state/state.json
++          key: trader-state-${{ github.ref_name }}
++          restore-keys: |
++            trader-state-${{ github.ref_name }}-
++      - name: Save state cache (dispatch only)
++        if: github.event_name == 'workflow_dispatch'
++        uses: actions/cache/save@v4
++        with:
++          path: |
++            bot_state/state.json
++            trader/state/state.json
++          key: trader-state-${{ github.ref_name }}
++
++      - name: Set git identity
++        run: |
++          git config user.name "trade-bot"
++          git config user.email "trade-bot@users.noreply.github.com"
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Ensure state scripts executable
++        if: github.event_name != 'pull_request'
++        run: |
++          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
++
++      - name: Pull state (plain)
++        if: github.event_name != 'pull_request'
++        run: |
++          bash scripts/state_pull_plain.sh
+ 
++      - name: Dependencies 설치
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r requirements.txt
++
++      - name: Ledger smoke test
++        run: |
++          python -m trader.ledger_test
++
++      - name: (진단) 핵심 환경변수 주입 여부만 확인
++        run: |
++          python - << 'PY'
++          import os
++          def chk(k):
++              v = os.getenv(k) or ''
++              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
++          for k in [
++              'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
++              'CANO','ACNT_PRDT_CD','KIS_ENV'
++          ]:
++              chk(k)
++          PY
++
++      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
++      - name: (디버그) trader 모듈 경로 및 내용 확인
++        env:
++          PYTHONPATH: ${{ github.workspace }}
++        run: |
++          python - << 'PY'
++          import trader
++          from trader import trader as t
++          print("trader package path:", trader.__file__)
++          print("trader.trader module path:", t.__file__)
++          print("=== HEAD OF trader.trader ===")
++          try:
++              with open(t.__file__, 'r', encoding='utf-8') as f:
++                  for i in range(1, 80):
++                      line = f.readline()
++                      if not line:
++                          break
++                      print(f"{i:03}: {line.rstrip()}")
++          except Exception as e:
++              print("ERROR while reading trader.trader:", e)
++          PY
++
++      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
++        run: |
++          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
++          sleep 30  # 서버 기동 대기
++
++      - name: Compile modules
++        run: |
++          python -m compileall trader rolling_k_auto_trade_api
+       - name: trader DIAG (no live orders)
+-        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+-          DRY_RUN: "true"
+-          DISABLE_LIVE_TRADING: "true"
+-          LIVE_TRADING_ENABLED: "false"
+-          STRATEGY_MODE: "INTENT_ONLY"
+-          ACTIVE_STRATEGIES: "1"
+         run: python -m trader.trader
+ 
+       - name: Normalize state path
+         if: always()
+         run: |
+           mkdir -p trader/state
+           test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
+           test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+ 
+       - name: CEO 리포트 자동 생성
+         if: always()
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.report_ceo || true
+ 
+       - name: Verify CEO report exists
+         if: always()
+         run: |
+           ls -al trader/logs || true
+ 
+       - name: Push state (plain)
+         if: github.event_name != 'pull_request'
+         run: |
+           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+@@ -300,27 +477,25 @@ jobs:
+ 
+       - name: Trades 로그 업로드
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trade-logs
+           path: trader/logs/*.json
+           if-no-files-found: ignore
+           retention-days: 14
+ 
+       - name: FastAPI 로그 출력 (cat)
+         if: always()
+         run: |
+           echo "::group::FastAPI Server Log"
+           cat fastapi.log || true
+           echo "::endgroup::"
+ 
+       - name: FastAPI 로그 업로드 (artifact)
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: fastapi-log
+           path: fastapi.log
+           if-no-files-found: ignore
+           retention-days: 14
+-
+-      
+diff --git a/portfolio/portfolio_manager.py b/portfolio/portfolio_manager.py
+index ef621f03f7cefe3f49b2bb2f3aa02df5d43b0075..b0aeee514bfb0f884814fbcd1482f22f9f5f45d8 100644
+--- a/portfolio/portfolio_manager.py
++++ b/portfolio/portfolio_manager.py
+@@ -62,52 +62,52 @@ class PortfolioManager:
+     def run_once(self) -> Dict[str, Any]:
+         reset_flow_call_count()
+         selected_by_market: Dict[str, Any] = {}
+         diag_result: Dict[str, Any] | None = None
+         try:
+             rebalance_date = str(get_rebalance_anchor_date())
+             rebalance_payload = run_rebalance(rebalance_date, return_by_market=True)
+             selected_by_market = rebalance_payload.get("selected_by_market") or {}
+             logger.info(
+                 "[PORTFOLIO][REBALANCE] date=%s kospi=%d kosdaq=%d",
+                 rebalance_date,
+                 len(selected_by_market.get("KOSPI", [])),
+                 len(selected_by_market.get("KOSDAQ", [])),
+             )
+         except Exception as e:
+             logger.exception("[PORTFOLIO] rebalance fetch failed: %s", e)
+ 
+         runtime_state = state_store.load_state()
+         logger.info(
+             "[DIAG][PM] diagnostic_mode=%s diagnostic_only=%s active_strategies=%s",
+             DIAG_ENABLED,
+             DIAGNOSTIC_ONLY,
+             sorted(self.strategy_manager.active_strategies),
+         )
+         if DIAG_ENABLED:
+-            os.environ["DISABLE_LIVE_TRADING"] = "true"
+-            logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s", DIAG_ENABLED)
++            os.environ["DISABLE_LIVE_TRADING"] = "1"
++            logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=1 diag_enabled=%s", DIAG_ENABLED)
+             diag_result = run_diagnostics_once(selected_by_market=selected_by_market)
+             if DIAGNOSTIC_ONLY:
+                 skip_reason = "diagnostic_only_mode"
+                 return {
+                     "diagnostics": diag_result,
+                     "kospi": {"status": "skipped", "reason": skip_reason},
+                     "kosdaq": {"status": "skipped", "reason": skip_reason},
+                     "active_strategies": sorted(self.strategy_manager.active_strategies),
+                 }
+ 
+         try:
+             market_data = build_market_data(selected_by_market)
+             strategy_result = self.strategy_manager.run_once(
+                 market_data=market_data, portfolio_state=runtime_state
+             )
+             intents = strategy_result.get("intents") or []
+         except Exception as e:
+             logger.exception("[PORTFOLIO] strategy manager failure: %s", e)
+             strategy_result = {"status": "error", "message": str(e), "enabled": [], "intents": []}
+             intents = []
+ 
+         try:
+             STRATEGY_INTENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+             STRATEGY_INTENTS_PATH.touch(exist_ok=True)
+             intent_store.append_intents(intents, STRATEGY_INTENTS_PATH)
+diff --git a/rolling_k_auto_trade_api/kis_api.py b/rolling_k_auto_trade_api/kis_api.py
+index 2d3caaf5d3a20182c3a09a5d7b019a33cc9a5c08..81e27d5f074dc8bfdb27e4320ddfb682ca14ac47 100644
+--- a/rolling_k_auto_trade_api/kis_api.py
++++ b/rolling_k_auto_trade_api/kis_api.py
+@@ -3,69 +3,71 @@ from __future__ import annotations
+ rolling_k_auto_trade_api.kis_api — 최신 응답로깅 + 파라미터 최신화 (전체 파일)
+ 
+ 핵심 개선
+ - send_order: KIS 응답 원문(raw text) 및 JSON 모두 상세 로깅(민감정보 마스킹) + 실패 사유/코드 함께 기록
+ - HashKey 및 주문 파라미터 최신화: /uapi/hashkey, /uapi/domestic-stock/v1/trading/order-cash
+ - TR_ID 자동 전환: (모의) VTTC0012U/VTTC0011U, (실전) TTTC0012U/TTTC0011U
+ - 주문 방식 체인: 시장가→IOC시장가→최유리(매수/매도 공통)로 폴백
+ - 견고한 재시도: 게이트웨이/5xx/네트워크 오류에 백오프 재시도
+ - inquire_balance(단일/전체), inquire_cash_balance, inquire_filled_order(응답 로깅 포함)
+ 
+ 주의: settings 모듈이 있으면 우선 사용하고, 없으면 환경변수에서 읽습니다.
+ """
+ 
+ import os
+ import json
+ import time
+ import random
+ import logging
+ from datetime import datetime, time as dtime, timedelta, timezone
+ from typing import Any, Dict, Optional, List
+ 
+ import requests
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
++from trader.utils.env import env_bool
++
+ logger = logging.getLogger(__name__)
+ KST = timezone(timedelta(hours=9))
+ MARKET_OPEN = dtime(9, 0)
+ MARKET_CLOSE = dtime(15, 20)
+ 
+ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+ 
+ # =============================
+ # 실행 보호 플래그 (CI 등에서 실거래 방지)
+ # =============================
+ 
+ 
+ class LiveTradingDisabledError(RuntimeError):
+     """Raised when live KIS order calls are disabled via environment flag."""
+ 
+ 
+ def _is_live_trading_enabled() -> bool:
+-    live_enabled = str(os.getenv("LIVE_TRADING_ENABLED", "")).lower() in {"1", "true", "yes"}
+-    disable_live = str(os.getenv("DISABLE_LIVE_TRADING", "")).lower() in {"1", "true", "yes"}
++    live_enabled = env_bool("LIVE_TRADING_ENABLED", False)
++    disable_live = env_bool("DISABLE_LIVE_TRADING", False)
+     return live_enabled and (not disable_live)
+ 
+ 
+ def _guard_order_calls(op_name: str) -> None:
+     if not _is_live_trading_enabled():
+         logger.warning("[KIS_DISABLED] %s blocked because live trading is disabled", op_name)
+         raise LiveTradingDisabledError(f"Live trading disabled; order call blocked: {op_name}")
+ 
+ 
+ def _is_trading_day(ts: Optional[datetime] = None) -> bool:
+     ts = ts or datetime.now(tz=KST)
+     return ts.weekday() < 5
+ 
+ 
+ def _is_trading_window(ts: Optional[datetime] = None) -> bool:
+     ts = ts or datetime.now(tz=KST)
+     return _is_trading_day(ts) and MARKET_OPEN <= ts.time() <= MARKET_CLOSE
+ 
+ 
+ def _order_block_reason(now: Optional[datetime] = None) -> Optional[str]:
+     now = now or datetime.now(tz=KST)
+     state_date = _ORDER_BLOCK_STATE.get("date")
+     state_reason = _ORDER_BLOCK_STATE.get("reason")
+     if state_date and state_date != now.date():
+         _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
+diff --git a/trader/config.py b/trader/config.py
+index 7a3ba1e6c1024bc905411d3d3b1194ff7b6d4601..1afa881ac2698f971c33d15e8a459f4aead01ed5 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -1,40 +1,42 @@
+ # -*- coding: utf-8 -*-
+ """공용 설정 및 환경 파싱 모듈.
+ 
+ trader.py가 분리되어도 모든 전략/유틸이 동일한 설정을 참조할 수 있도록
+ CONFIG와 파생 상수를 한 곳에 모았다.
+ """
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ from datetime import datetime, time as dtime
+ from pathlib import Path
+ from typing import Dict
+ from zoneinfo import ZoneInfo
+ 
++from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
++
+ # =========================
+ # [CONFIG] .env 없이도 동작
+ # - 아래 값을 기본으로 사용
+ # - (선택) 동일 키를 환경변수로 넘기면 override
+ # =========================
+ CONFIG = {
+     "SELL_FORCE_TIME": "14:40",
+     "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
+     "API_RATE_SLEEP_SEC": "0.5",
+     "FORCE_SELL_PASSES_CUTOFF": "2",
+     "FORCE_SELL_PASSES_CLOSE": "4",
+     "FORCE_SELL_BLOCKED_LOTS": "0",
+     "PARTIAL1": "0.5",
+     "PARTIAL2": "0.3",
+     "TRAIL_PCT": "0.02",
+     "FAST_STOP": "0.01",
+     "ATR_STOP": "1.5",
+     "TIME_STOP_HHMM": "13:00",
+     "DEFAULT_PROFIT_PCT": "3.0",
+     "DEFAULT_LOSS_PCT": "-5.0",
+     "DAILY_CAPITAL": "250000000",
+     "CAP_CAP": "0.8",
+     "SLIPPAGE_LIMIT_PCT": "0.25",
+     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
+     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
+@@ -100,98 +102,112 @@ CONFIG = {
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "trader/state/state.json",
+ }
+ 
+ 
+ def _cfg(key: str) -> str:
+     """환경변수 > CONFIG 기본값"""
+     return os.getenv(key, CONFIG.get(key, ""))
+ 
+ 
++def _default_bool(key: str, fallback: bool = False) -> bool:
++    raw_default = str(CONFIG.get(key, "")).strip().lower()
++    if raw_default in TRUE_VALUES:
++        return True
++    if raw_default in FALSE_VALUES:
++        return False
++    return fallback
++
++
++def _cfg_bool(key: str, fallback: bool | None = None) -> bool:
++    default_value = _default_bool(key, fallback if fallback is not None else False)
++    return env_bool(key, default=default_value)
++
++
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ LOG_DIR = Path(__file__).parent / "logs"
+ LOG_DIR.mkdir(exist_ok=True)
+ STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
+ STATE_DIR_RAW = _cfg("STATE_DIR")
+ STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else Path(__file__).parent / "state"
+ STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
+ STATE_DIR.mkdir(parents=True, exist_ok=True)
+ STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+ 
+ # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
+ MARKET_MAP: Dict[str, str] = {
+     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
+ }
+ 
+ # 데이터 없음 1차 감지 상태 저장(연속 DATA_EMPTY 확인용)
+ EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
+ 
+ KST = ZoneInfo("Asia/Seoul")
+ 
+ SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
+-SELL_ALL_BALANCES_AT_CUTOFF = _cfg("SELL_ALL_BALANCES_AT_CUTOFF").lower() == "true"
+-EMERGENCY_GLOBAL_SELL = _cfg("EMERGENCY_GLOBAL_SELL").lower() in ("1", "true", "yes")
++SELL_ALL_BALANCES_AT_CUTOFF = _cfg_bool("SELL_ALL_BALANCES_AT_CUTOFF")
++EMERGENCY_GLOBAL_SELL = _cfg_bool("EMERGENCY_GLOBAL_SELL")
+ RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
+ FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
+ FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
+-FORCE_SELL_BLOCKED_LOTS = _cfg("FORCE_SELL_BLOCKED_LOTS").lower() in ("1", "true", "yes")
++FORCE_SELL_BLOCKED_LOTS = _cfg_bool("FORCE_SELL_BLOCKED_LOTS")
+ PARTIAL1 = float(_cfg("PARTIAL1"))
+ PARTIAL2 = float(_cfg("PARTIAL2"))
+ TRAIL_PCT = float(_cfg("TRAIL_PCT"))
+ FAST_STOP = float(_cfg("FAST_STOP"))
+ ATR_STOP = float(_cfg("ATR_STOP"))
+ TIME_STOP_HHMM = _cfg("TIME_STOP_HHMM")
+ DEFAULT_PROFIT_PCT = float(_cfg("DEFAULT_PROFIT_PCT"))
+ DEFAULT_LOSS_PCT = float(_cfg("DEFAULT_LOSS_PCT"))
+ DAILY_CAPITAL = int(_cfg("DAILY_CAPITAL"))
+ CAP_CAP = float(_cfg("CAP_CAP"))
+ SLIPPAGE_LIMIT_PCT = float(_cfg("SLIPPAGE_LIMIT_PCT"))
+ SLIPPAGE_ENTER_GUARD_PCT = float(_cfg("SLIPPAGE_ENTER_GUARD_PCT"))
+ VWAP_TOL = float(_cfg("VWAP_TOL"))  # 🔸 VWAP 허용 오차(예: 0.003 = -0.3%까지 허용)
+ W_MAX_ONE = float(_cfg("W_MAX_ONE"))
+ W_MIN_ONE = float(_cfg("W_MIN_ONE"))
+-ALLOW_PYRAMID = (_cfg("ALLOW_PYRAMID") or "false").lower() == "true"
++ALLOW_PYRAMID = _cfg_bool("ALLOW_PYRAMID")
+ REBALANCE_ANCHOR = _cfg("REBALANCE_ANCHOR")
+ WEEKLY_ANCHOR_REF = _cfg("WEEKLY_ANCHOR_REF").lower()
+-MOMENTUM_OVERRIDES_FORCE_SELL = _cfg("MOMENTUM_OVERRIDES_FORCE_SELL").lower() == "true"
++MOMENTUM_OVERRIDES_FORCE_SELL = _cfg_bool("MOMENTUM_OVERRIDES_FORCE_SELL")
+ BASE_QTY_MODE = (_cfg("BASE_QTY_MODE") or "initial").lower()
+ if BASE_QTY_MODE not in {"initial", "current"}:
+     logging.getLogger(__name__).warning(
+         f"[CONFIG] BASE_QTY_MODE={BASE_QTY_MODE} 지원 안 함 → initial로 대체"
+     )
+     BASE_QTY_MODE = "initial"
+ 
+ # NEW: 1분봉 모멘텀 파라미터
+ MOM_FAST = int(_cfg("MOM_FAST") or "5")
+ MOM_SLOW = int(_cfg("MOM_SLOW") or "20")
+ MOM_TH_PCT = float(_cfg("MOM_TH_PCT") or "0.5")
+ # subject flow
+ MIN_SMART_MONEY_RATIO_KOSPI = float(_cfg("MIN_SMART_MONEY_RATIO_KOSPI") or "0.02")
+ MIN_SMART_MONEY_RATIO_KOSDAQ = float(_cfg("MIN_SMART_MONEY_RATIO_KOSDAQ") or "0.03")
+ SUBJECT_FLOW_TIMEOUT_SEC = float(_cfg("SUBJECT_FLOW_TIMEOUT_SEC") or "1.2")
+ SUBJECT_FLOW_RETRY = int(_cfg("SUBJECT_FLOW_RETRY") or "1")
+ SUBJECT_FLOW_CACHE_TTL_SEC = float(_cfg("SUBJECT_FLOW_CACHE_TTL_SEC") or "60")
+ SUBJECT_FLOW_FAIL_POLICY = (_cfg("SUBJECT_FLOW_FAIL_POLICY") or "CACHE").upper()
+ SUBJECT_FLOW_EMPTY_POLICY = (_cfg("SUBJECT_FLOW_EMPTY_POLICY") or "TREAT_AS_FAIL").upper()
+ SUBJECT_FLOW_DEGRADED_TURNOVER_MULT = float(_cfg("SUBJECT_FLOW_DEGRADED_TURNOVER_MULT") or "1.5")
+ SUBJECT_FLOW_DEGRADED_OB_ADD = float(_cfg("SUBJECT_FLOW_DEGRADED_OB_ADD") or "10")
+ SUBJECT_FLOW_MAX_CALLS_PER_RUN = int(_cfg("SUBJECT_FLOW_MAX_CALLS_PER_RUN") or "200")
+ # 전략별 활성/가중치 파싱
+ def parse_enabled_strategies(raw: str) -> set[str]:
+     strategies: set[str] = set()
+@@ -212,74 +228,64 @@ def _parse_strategy_weights(raw: str) -> Dict[str, float]:
+         elif ":" in item:
+             key, value = item.split(":", 1)
+         else:
+             key, value = item, "0"
+         key = key.strip().lower()
+         try:
+             weight = float(value)
+         except ValueError:
+             weight = 0.0
+         if key:
+             weights[key] = weight
+     return weights
+ 
+ 
+ ENABLED_STRATEGIES_SET = parse_enabled_strategies(_cfg("ENABLED_STRATEGIES"))
+ RAW_STRATEGY_WEIGHTS = _parse_strategy_weights(_cfg("STRATEGY_WEIGHTS"))
+ 
+ if ENABLED_STRATEGIES_SET:
+     STRATEGY_WEIGHTS = {
+         name: (RAW_STRATEGY_WEIGHTS.get(name, 0.0) if name in ENABLED_STRATEGIES_SET else 0.0)
+         for name in ENABLED_STRATEGIES_SET.union(RAW_STRATEGY_WEIGHTS.keys())
+     }
+ else:
+     STRATEGY_WEIGHTS = {name: 0.0 for name in RAW_STRATEGY_WEIGHTS.keys()}
+ 
+-STRATEGY_MODE = (_cfg("STRATEGY_MODE") or "INTENT_ONLY").upper()
+-_RAW_STRATEGY_DRY_RUN = os.getenv("DRY_RUN")
+-if not _RAW_STRATEGY_DRY_RUN:
+-    _RAW_STRATEGY_DRY_RUN = _cfg("STRATEGY_DRY_RUN") or "true"
+-STRATEGY_DRY_RUN = str(_RAW_STRATEGY_DRY_RUN).lower() in ("1", "true", "yes")
++STRATEGY_MODE = resolve_mode(_cfg("STRATEGY_MODE") or "INTENT_ONLY")
++_STRATEGY_DRY_RUN_DEFAULT = _cfg_bool("STRATEGY_DRY_RUN", fallback=True)
++STRATEGY_DRY_RUN = env_bool("DRY_RUN", default=_STRATEGY_DRY_RUN_DEFAULT)
+ STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
+ STRATEGY_INTENTS_STATE_PATH = Path(
+     _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
+ )
+ STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
+ STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
+-STRATEGY_ALLOW_SELL_ONLY = (_cfg("STRATEGY_ALLOW_SELL_ONLY") or "false").lower() in (
+-    "1",
+-    "true",
+-    "yes",
+-)
++STRATEGY_ALLOW_SELL_ONLY = _cfg_bool("STRATEGY_ALLOW_SELL_ONLY")
+ 
+-DIAGNOSTIC_MODE = (_cfg("DIAGNOSTIC_MODE") or "false").lower() in ("1", "true", "yes")
+-DIAGNOSTIC_ONLY = (_cfg("DIAGNOSTIC_ONLY") or "false").lower() in ("1", "true", "yes")
+-DIAGNOSTIC_FORCE_RUN = (_cfg("DIAGNOSTIC_FORCE_RUN") or "false").lower() in (
+-    "1",
+-    "true",
+-    "yes",
+-)
++DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
++DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
++DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
+ DIAGNOSTIC_DUMP_DIR = Path(
+     _cfg("DIAGNOSTIC_DUMP_DIR") or _cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"]
+ )
+ DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+ DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+ DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
+ DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
+ 
+ if DIAGNOSTIC_MODE:
+     STRATEGY_MODE = "INTENT_ONLY"
+     STRATEGY_DRY_RUN = True
+     STRATEGY_ALLOW_SELL_ONLY = True
+ 
+ logger.info(
+     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
+     DIAG_ENABLED,
+ )
+ 
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+@@ -298,57 +304,53 @@ def _parse_strategy_priority(raw: str) -> list[int]:
+ 
+ STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+     _cfg("STRATEGY_REDUCTION_PRIORITY")
+ )
+ 
+ 
+ def _parse_active_strategies(raw: str) -> set[int]:
+     strategies: set[int] = set()
+     for item in (raw or "").split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             sid = int(item)
+         except ValueError:
+             continue
+         if sid >= 0:
+             strategies.add(sid)
+     if not strategies:
+         return {1}
+     return strategies
+ 
+ 
+ ACTIVE_STRATEGIES = _parse_active_strategies(_cfg("ACTIVE_STRATEGIES"))
+ UNMANAGED_STRATEGY_ID = 0
+-ALLOW_ADOPT_UNMANAGED = (_cfg("ALLOW_ADOPT_UNMANAGED") or "false").lower() in (
+-    "1",
+-    "true",
+-    "yes",
+-)
++ALLOW_ADOPT_UNMANAGED = _cfg_bool("ALLOW_ADOPT_UNMANAGED")
+ # 신고가 → 3일 눌림 → 반등 확인 후 매수 파라미터
+-USE_PULLBACK_ENTRY = _cfg("USE_PULLBACK_ENTRY").lower() != "false"
++USE_PULLBACK_ENTRY = _cfg_bool("USE_PULLBACK_ENTRY", fallback=True)
+ PULLBACK_LOOKBACK = int(_cfg("PULLBACK_LOOKBACK") or "60")
+ PULLBACK_DAYS = int(_cfg("PULLBACK_DAYS") or "3")
+ PULLBACK_REVERSAL_BUFFER_PCT = float(_cfg("PULLBACK_REVERSAL_BUFFER_PCT") or "0.2")
+ PULLBACK_TOPN = int(_cfg("PULLBACK_TOPN") or "50")
+ PULLBACK_UNIT_WEIGHT = float(_cfg("PULLBACK_UNIT_WEIGHT") or "0.03")
+ PULLBACK_MAX_BUYS_PER_DAY = int(_cfg("PULLBACK_MAX_BUYS_PER_DAY") or "5")
+ CHAMPION_MIN_TRADES = int(_cfg("CHAMPION_MIN_TRADES") or "5")
+ CHAMPION_MIN_WINRATE = float(_cfg("CHAMPION_MIN_WINRATE") or "45.0")
+ CHAMPION_MAX_MDD = float(_cfg("CHAMPION_MAX_MDD") or "30.0")
+ CHAMPION_MIN_SHARPE = float(_cfg("CHAMPION_MIN_SHARPE") or "0.0")
+ 
+ # 챔피언 등급 & GOOD/BAD 타점 판별 파라미터
+ CHAMPION_A_RULES = {
+     "min_trades": 30,
+     "min_cumret_pct": 40.0,
+     "max_mdd_pct": 25.0,
+     "min_win_pct": 50.0,
+     "min_sharpe": 1.2,
+     "min_turnover": 3_000_000_000,  # 30억
+ }
+ 
+ GOOD_ENTRY_PULLBACK_RANGE = (5.0, 15.0)  # 신고가 대비 눌림폭(%): 최소~최대
+ GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
+ GOOD_ENTRY_MAX_FROM_PEAK = 0.97  # 현재가/최근고점 최대치(≤0.97)
+ GOOD_ENTRY_MIN_RR = 2.0  # 기대수익/리스크 최소 비율
+@@ -359,35 +361,35 @@ def resolve_active_strategies(raw: str | None = None) -> set[int]:
+     """환경변수 ACTIVE_STRATEGIES를 우선 적용하여 활성 전략 집합을 반환한다."""
+ 
+     raw_env = os.getenv("ACTIVE_STRATEGIES") if raw is None else raw
+     parsed = _parse_active_strategies(raw_env or "")
+     if parsed:
+         return parsed
+     return ACTIVE_STRATEGIES
+ 
+ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+ BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+ NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
+ 
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+-ALLOW_WHEN_CLOSED = _cfg("MARKET_DATA_WHEN_CLOSED").lower() == "true"
+-DISABLE_KOSDAQ_LOOP = (_cfg("DISABLE_KOSDAQ_LOOP") or "false").lower() in ("1", "true", "yes")
+-DISABLE_KOSPI_ENGINE = (_cfg("DISABLE_KOSPI_ENGINE") or "false").lower() in ("1", "true", "yes")
++ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
++DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
++DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ 
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+ 
+ def _this_iso_week_key(now=None):
+     now = now or datetime.now(KST)
+     return f"{now.year}-W{now.isocalendar().week:02d}"
+diff --git a/trader/intent_executor.py b/trader/intent_executor.py
+index 1dafbbd03f8716c5ab64a5bcaf1916b9a79862d3..9d9e7fa3a29ffc5da7accc53fe44379f77d3b7a0 100644
+--- a/trader/intent_executor.py
++++ b/trader/intent_executor.py
+@@ -1,56 +1,56 @@
+ from __future__ import annotations
+ 
+ import logging
+-import os
+ from typing import Any, Dict
+ 
+ import trader.intent_store as intent_store
++from trader.utils.env import env_bool
+ from strategy.types import ExecutionAck
+ from trader.config import (
+     STRATEGY_ALLOW_SELL_ONLY,
+     STRATEGY_DRY_RUN,
+     STRATEGY_INTENTS_PATH,
+     STRATEGY_INTENTS_STATE_PATH,
+     STRATEGY_MAX_OPEN_INTENTS,
+     STRATEGY_MODE,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class IntentExecutor:
+     """Strategy intent executor (Phase 1: dry-run)."""
+ 
+     def __init__(self) -> None:
+         self.intents_path = STRATEGY_INTENTS_PATH
+         self.cursor_state_path = STRATEGY_INTENTS_STATE_PATH
+         self.allow_sell_only = STRATEGY_ALLOW_SELL_ONLY
+         self.max_open_intents = int(STRATEGY_MAX_OPEN_INTENTS)
+ 
+     def _should_dry_run(self) -> tuple[bool, str]:
+-        disable_live = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
++        disable_live = env_bool("DISABLE_LIVE_TRADING", False)
+         reasons = []
+         if disable_live:
+             reasons.append("DISABLE_LIVE_TRADING env=true")
+         if STRATEGY_DRY_RUN:
+             reasons.append("STRATEGY_DRY_RUN config=true")
+         if STRATEGY_MODE == "INTENT_ONLY":
+             reasons.append("STRATEGY_MODE=INTENT_ONLY")
+         dry_run = bool(reasons)
+         return dry_run, ",".join(reasons) if dry_run else ""
+ 
+     def run_once(self) -> Dict[str, Any]:
+         intents: list[Dict[str, Any]] = []
+         cursor: Dict[str, Any] = {"offset": 0, "last_intent_id": None, "last_ts": None, "start_offset": 0}
+         try:
+             intents, cursor = intent_store.load_intents_since_cursor(
+                 self.intents_path, self.cursor_state_path
+             )
+             intents = intent_store.dedupe_intents(intents)
+         except Exception:
+             logger.exception("[INTENT_EXECUTOR] failed to load intents")
+             return {"acks": [], "status": "error"}
+ 
+         dry_run, dry_run_reason = self._should_dry_run()
+         logger.info(
+             "[INTENT_EXECUTOR] dry_run=%s reason=%s max_open_intents=%s",
+diff --git a/trader/legacy_kosdaq_runner.py b/trader/legacy_kosdaq_runner.py
+index 9129739cb9536ab2769d38899d3c32bc8dc680d7..43c001b3a18df0c4edff61994102843204904fe1 100644
+--- a/trader/legacy_kosdaq_runner.py
++++ b/trader/legacy_kosdaq_runner.py
+@@ -1,40 +1,42 @@
+ # -*- coding: utf-8 -*-
+ """거래 메인 루프.
+ 
+ 기존 trader.py의 설정/유틸을 분리하고, 메인 진입점만 남겨 전략 추가가
+ 쉬운 구조로 변경했다.
+ """
+ from __future__ import annotations
+ 
+ import json
+ import re
+ import time
+ import os
+ from datetime import date, datetime, time as dtime, timedelta
+ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+ 
++from trader.utils.env import env_bool
++
+ 
+ try:
+     from .config import (
+         DAILY_CAPITAL,
+         FAST_STOP,
+         FORCE_SELL_PASSES_CLOSE,
+         FORCE_SELL_PASSES_CUTOFF,
+         FORCE_SELL_BLOCKED_LOTS,
+         ALLOW_WHEN_CLOSED,
+         ALLOW_PYRAMID,
+         BASE_QTY_MODE,
+         KST,
+         LOG_DIR,
+         RATE_SLEEP_SEC,
+         EMERGENCY_GLOBAL_SELL,
+         SELL_ALL_BALANCES_AT_CUTOFF,
+         SELL_FORCE_TIME,
+         SLIPPAGE_ENTER_GUARD_PCT,
+         STATE_PATH,
+         STRATEGY_REDUCTION_PRIORITY,
+         USE_PULLBACK_ENTRY,
+         PULLBACK_MAX_BUYS_PER_DAY,
+         NEUTRAL_ENTRY_SCALE,
+         _cfg,
+         logger,
+@@ -101,51 +103,51 @@ if TYPE_CHECKING:
+         _update_market_regime,
+         _notional_to_qty,
+         _fetch_balances,
+         _init_position_state_from_balance,
+         _sell_once,
+         _adaptive_exit,
+         _compute_daily_entry_context,
+         _compute_intraday_entry_context,
+         _safe_get_price,
+         _round_to_tick,
+         _init_position_state,
+         _detect_pullback_reversal,
+         _has_bullish_trend_structure,
+     )
+ 
+ 
+ def main(
+     capital_override: float | None = None,
+     selected_stocks: list[dict[str, Any]] | None = None,
+ ):
+     reset_flow_call_count()
+     effective_capital = (
+         int(capital_override) if capital_override is not None else DAILY_CAPITAL
+     )
+     kis = KisAPI()
+-    dry_run = os.getenv("DRY_RUN", "0") == "1"
++    dry_run = env_bool("DRY_RUN", False)
+ 
+     rebalance_date = get_rebalance_anchor_date()
+     logger.info(
+         f"[ℹ️ 리밸런싱 기준일(KST)]: {rebalance_date} (anchor={REBALANCE_ANCHOR}, ref={WEEKLY_ANCHOR_REF})"
+     )
+     logger.info(
+         f"[⏱️ 커트오프(KST)] SELL_FORCE_TIME={SELL_FORCE_TIME.strftime('%H:%M')} / 전체잔고매도={SELL_ALL_BALANCES_AT_CUTOFF} / "
+         f"패스(커트오프/마감)={FORCE_SELL_PASSES_CUTOFF}/{FORCE_SELL_PASSES_CLOSE}"
+     )
+     logger.info(
+         f"[💰 CAPITAL] {effective_capital:,}원 (configured DAILY_CAPITAL={DAILY_CAPITAL:,})"
+     )
+     logger.info(f"[🛡️ SLIPPAGE_ENTER_GUARD_PCT] {SLIPPAGE_ENTER_GUARD_PCT:.2f}%")
+ 
+     # 상태 복구
+     state_loaded_at = datetime.now(KST)
+     state_loaded_date = state_loaded_at.strftime("%Y-%m-%d")
+     state_loaded_str = state_loaded_at.strftime("%Y-%m-%d %H:%M:%S")
+     state_loaded_midnight = f"{state_loaded_date} 00:00:00"
+ 
+     holding, traded = load_state()
+     lot_state_path = "bot_state/state.json"
+     lot_state = load_lot_state(lot_state_path)
+     position_state_path = str(STATE_PATH)
+     position_state = load_position_state(position_state_path)
+diff --git a/trader/trader.py b/trader/trader.py
+index 986a294b177b1e736084a76dffb585604f8f9fb5..b36d723971edb5e01d649d32ebc80e8f42881f8d 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -1,103 +1,124 @@
+ # -*- coding: utf-8 -*-
+ """Thin entrypoint orchestrating KOSPI core + KOSDAQ alpha engines."""
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ 
+ from portfolio.portfolio_manager import PortfolioManager
+ from trader.kis_wrapper import KisAPI
+ from trader import state_store as runtime_state_store
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+ from trader.config import (
+     ALLOW_ADOPT_UNMANAGED,
+     DIAG_ENABLED,
+     DIAGNOSTIC_FORCE_RUN,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     resolve_active_strategies,
+ )
++from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _env_flag(name: str, default: bool = False) -> bool:
+-    raw = os.getenv(name)
+-    if raw is None:
+-        return default
+-    return raw.lower() in {"1", "true", "yes", "on"}
+-
+-
+ def main() -> None:
+     now = now_kst()
+-    event_name = os.getenv("GITHUB_EVENT_NAME", "")
++    event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
++    event_name_lower = event_name.lower()
+     trading_day = is_trading_day(now)
+     active_strategies = resolve_active_strategies() or {1}
+-    live_trading_enabled_env = _env_flag("LIVE_TRADING_ENABLED", True)
+-    disable_live_env = _env_flag("DISABLE_LIVE_TRADING", False)
+-    dry_run_env_raw = os.getenv("DRY_RUN", "")
+-    dry_run_env = dry_run_env_raw.lower() in {"1", "true", "yes", "on"}
+-    dry_run_reasons: list[str] = []
+-    if dry_run_env:
+-        dry_run_reasons.append(f"DRY_RUN env={dry_run_env_raw}")
+-    if event_name in {"push", "pull_request"}:
+-        dry_run_reasons.append(f"event={event_name} forces dry_run")
+-    if disable_live_env:
+-        dry_run_reasons.append("DISABLE_LIVE_TRADING env=true")
+-    if not live_trading_enabled_env:
+-        dry_run_reasons.append("LIVE_TRADING_ENABLED env=false")
++    dry_run_flag = parse_env_flag("DRY_RUN", default=False)
++    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
++    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
++    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
++    mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+     diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
++
++    dry_run_reasons: list[str] = []
++    if mode == "INTENT_ONLY":
++        dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
++    if disable_live_flag.value:
++        dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+     if diag_enabled:
+         dry_run_reasons.append("diagnostic_mode")
++    if not live_trading_flag.value and mode == "LIVE":
++        dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
++    if dry_run_flag.value:
++        dry_run_reasons.append("DRY_RUN=1")
++    if event_name_lower in {"push", "pull_request"} and mode == "LIVE":
++        dry_run_reasons.append(f"event={event_name_lower}")
++    for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
++        if not flag.valid:
++            dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
++
+     dry_run = bool(dry_run_reasons)
+     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
++    live_trading_enabled = bool(
++        mode == "LIVE" and live_trading_flag.value and not disable_live_flag.value and not dry_run
++    )
+     engine_disabled_reason = dry_run_reason if dry_run else (
+-        "DISABLE_LIVE_TRADING env=true" if disable_live_env else (
+-            "LIVE_TRADING_ENABLED env=false" if not live_trading_enabled_env else "enabled"
++        "DISABLE_LIVE_TRADING env=true" if disable_live_flag.value else (
++            "LIVE_TRADING_ENABLED env=false" if not live_trading_flag.value else "enabled"
+         )
+     )
+-    live_trading_enabled = bool(live_trading_enabled_env and not disable_live_env and not dry_run)
+-    if dry_run:
+-        os.environ["DISABLE_LIVE_TRADING"] = "true"
++
++    os.environ["DRY_RUN"] = "1" if dry_run else "0"
++    os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry_run or disable_live_flag.value) else "0"
++    os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
++    os.environ["STRATEGY_MODE"] = mode
++
++    if expect_live_flag and dry_run:
++        resolved_values = (
++            f"DRY_RUN={dry_run_flag.raw!r} DISABLE_LIVE_TRADING={disable_live_flag.raw!r} "
++            f"LIVE_TRADING_ENABLED={live_trading_flag.raw!r} mode={mode} event={event_name_lower or 'unknown'}"
++        )
++        raise SystemExit(
++            f"EXPECT_LIVE_TRADING=1 but dry_run resolved True. reasons={dry_run_reasons} values={resolved_values}"
++        )
+     logger.info(
+         "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
+         now.isoformat(),
+         trading_day,
+         DIAG_ENABLED,
+         DIAGNOSTIC_FORCE_RUN,
+         DIAGNOSTIC_ONLY,
+         DIAGNOSTIC_MODE,
+     )
+     logger.info(
+-        "[TRADER][STARTUP] event=%s trading_day=%s dry_run=%s dry_run_reason=%s live_trading_enabled=%s active_strategies=%s allow_adopt_unmanaged=%s engine_disabled_reason=%s",
++        "[TRADER][STARTUP] event=%s trading_day=%s mode=%s dry_run=%s reasons=%s live_trading_enabled=%s disable_live_flag=%s dry_run_flag=%s live_trading_flag=%s active_strategies=%s allow_adopt_unmanaged=%s engine_disabled_reason=%s",
+         event_name or "unknown",
+         trading_day,
++        mode,
+         dry_run,
+-        dry_run_reason,
++        dry_run_reasons,
+         live_trading_enabled,
++        disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
++        dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
++        live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
+         sorted(active_strategies) if active_strategies else [1],
+         ALLOW_ADOPT_UNMANAGED,
+         engine_disabled_reason,
+     )
+     if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료 dry_run=%s reason=%s", now.date(), dry_run, dry_run_reason)
+         return
+     if (not trading_day) and diag_enabled:
+         logger.warning(
+             "[DIAG][TRADER] non-trading-day(%s) but running diagnostics (only=%s force_run=%s)",
+             now.date(),
+             DIAGNOSTIC_ONLY,
+             DIAGNOSTIC_FORCE_RUN,
+         )
+     runtime_state = {}
+     kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state,
+             balance,
+             active_strategies=active_strategies,
+         )
+diff --git a/trader/utils/env.py b/trader/utils/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e3354d4ca024da3ca45ee49c91469a1c46d748f
+--- /dev/null
++++ b/trader/utils/env.py
+@@ -0,0 +1,49 @@
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
++FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
++
++
++@dataclass
++class EnvFlag:
++    name: str
++    value: bool
++    raw: str | None
++    normalized: str | None
++    default: bool
++    valid: bool
++
++
++def env_str(name: str, default: str = "") -> str:
++    raw = os.getenv(name)
++    if raw is None or str(raw).strip() == "":
++        return default
++    return str(raw)
++
++
++def parse_env_flag(name: str, default: bool = False) -> EnvFlag:
++    raw = os.getenv(name)
++    if raw is None or str(raw).strip() == "":
++        return EnvFlag(name=name, value=default, raw=raw, normalized=None, default=default, valid=True)
++    normalized = str(raw).strip().lower()
++    if normalized in TRUE_VALUES:
++        return EnvFlag(name=name, value=True, raw=raw, normalized=normalized, default=default, valid=True)
++    if normalized in FALSE_VALUES:
++        return EnvFlag(name=name, value=False, raw=raw, normalized=normalized, default=default, valid=True)
++    return EnvFlag(name=name, value=default, raw=raw, normalized=normalized, default=default, valid=False)
++
++
++def env_bool(name: str, default: bool = False) -> bool:
++    return parse_env_flag(name, default=default).value
++
++
++def resolve_mode(raw: str | None) -> str:
++    normalized = (raw or "").strip().upper()
++    if normalized in {"LIVE", "EXECUTE", "EXECUTION"}:
++        return "LIVE"
++    if normalized in {"INTENT_ONLY", "INTENT", "DIAG", "DIAGNOSTIC"}:
++        return "INTENT_ONLY"
++    return "INTENT_ONLY"

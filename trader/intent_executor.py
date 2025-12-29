@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict
 
 import trader.intent_store as intent_store
+from trader.utils.env import env_bool
 from strategy.types import ExecutionAck
 from trader.config import (
     STRATEGY_ALLOW_SELL_ONLY,
@@ -28,7 +28,7 @@ class IntentExecutor:
         self.max_open_intents = int(STRATEGY_MAX_OPEN_INTENTS)
 
     def _should_dry_run(self) -> tuple[bool, str]:
-        disable_live = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
+        disable_live = env_bool("DISABLE_LIVE_TRADING", False)
         reasons = []
         if disable_live:
             reasons.append("DISABLE_LIVE_TRADING env=true")

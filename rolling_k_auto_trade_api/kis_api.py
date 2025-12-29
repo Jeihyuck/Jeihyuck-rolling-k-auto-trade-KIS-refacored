@@ -25,6 +25,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from trader.utils.env import env_bool
+
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 MARKET_OPEN = dtime(9, 0)
@@ -42,8 +44,8 @@ class LiveTradingDisabledError(RuntimeError):
 
 
 def _is_live_trading_enabled() -> bool:
-    live_enabled = str(os.getenv("LIVE_TRADING_ENABLED", "")).lower() in {"1", "true", "yes"}
-    disable_live = str(os.getenv("DISABLE_LIVE_TRADING", "")).lower() in {"1", "true", "yes"}
+    live_enabled = env_bool("LIVE_TRADING_ENABLED", False)
+    disable_live = env_bool("DISABLE_LIVE_TRADING", False)
     return live_enabled and (not disable_live)
 
 

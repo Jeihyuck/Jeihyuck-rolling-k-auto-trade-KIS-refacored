@@ -13,6 +13,8 @@ import os
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
+from trader.utils.env import env_bool
+
 
 try:
     from .config import (
@@ -123,7 +125,7 @@ def main(
         int(capital_override) if capital_override is not None else DAILY_CAPITAL
     )
     kis = KisAPI()
-    dry_run = os.getenv("DRY_RUN", "0") == "1"
+    dry_run = env_bool("DRY_RUN", False)
 
     rebalance_date = get_rebalance_anchor_date()
     logger.info(

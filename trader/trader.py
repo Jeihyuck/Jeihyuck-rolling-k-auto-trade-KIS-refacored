@@ -18,48 +18,65 @@ from trader.config import (
     DIAGNOSTIC_ONLY,
     resolve_active_strategies,
 )
+from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 
 logger = logging.getLogger(__name__)
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.lower() in {"1", "true", "yes", "on"}
-
-
 def main() -> None:
     now = now_kst()
-    event_name = os.getenv("GITHUB_EVENT_NAME", "")
+    event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
+    event_name_lower = event_name.lower()
     trading_day = is_trading_day(now)
     active_strategies = resolve_active_strategies() or {1}
-    live_trading_enabled_env = _env_flag("LIVE_TRADING_ENABLED", True)
-    disable_live_env = _env_flag("DISABLE_LIVE_TRADING", False)
-    dry_run_env_raw = os.getenv("DRY_RUN", "")
-    dry_run_env = dry_run_env_raw.lower() in {"1", "true", "yes", "on"}
-    dry_run_reasons: list[str] = []
-    if dry_run_env:
-        dry_run_reasons.append(f"DRY_RUN env={dry_run_env_raw}")
-    if event_name in {"push", "pull_request"}:
-        dry_run_reasons.append(f"event={event_name} forces dry_run")
-    if disable_live_env:
-        dry_run_reasons.append("DISABLE_LIVE_TRADING env=true")
-    if not live_trading_enabled_env:
-        dry_run_reasons.append("LIVE_TRADING_ENABLED env=false")
+    dry_run_flag = parse_env_flag("DRY_RUN", default=False)
+    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
+    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
+    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+    mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
+
+    dry_run_reasons: list[str] = []
+    if mode == "INTENT_ONLY":
+        dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+    if disable_live_flag.value:
+        dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
     if diag_enabled:
         dry_run_reasons.append("diagnostic_mode")
+    if not live_trading_flag.value and mode == "LIVE":
+        dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+    if dry_run_flag.value:
+        dry_run_reasons.append("DRY_RUN=1")
+    if event_name_lower in {"push", "pull_request"} and mode == "LIVE":
+        dry_run_reasons.append(f"event={event_name_lower}")
+    for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
+        if not flag.valid:
+            dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+
     dry_run = bool(dry_run_reasons)
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+    live_trading_enabled = bool(
+        mode == "LIVE" and live_trading_flag.value and not disable_live_flag.value and not dry_run
+    )
     engine_disabled_reason = dry_run_reason if dry_run else (
-        "DISABLE_LIVE_TRADING env=true" if disable_live_env else (
-            "LIVE_TRADING_ENABLED env=false" if not live_trading_enabled_env else "enabled"
+        "DISABLE_LIVE_TRADING env=true" if disable_live_flag.value else (
+            "LIVE_TRADING_ENABLED env=false" if not live_trading_flag.value else "enabled"
         )
     )
-    live_trading_enabled = bool(live_trading_enabled_env and not disable_live_env and not dry_run)
-    if dry_run:
-        os.environ["DISABLE_LIVE_TRADING"] = "true"
+
+    os.environ["DRY_RUN"] = "1" if dry_run else "0"
+    os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry_run or disable_live_flag.value) else "0"
+    os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
+    os.environ["STRATEGY_MODE"] = mode
+
+    if expect_live_flag and dry_run:
+        resolved_values = (
+            f"DRY_RUN={dry_run_flag.raw!r} DISABLE_LIVE_TRADING={disable_live_flag.raw!r} "
+            f"LIVE_TRADING_ENABLED={live_trading_flag.raw!r} mode={mode} event={event_name_lower or 'unknown'}"
+        )
+        raise SystemExit(
+            f"EXPECT_LIVE_TRADING=1 but dry_run resolved True. reasons={dry_run_reasons} values={resolved_values}"
+        )
     logger.info(
         "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
         now.isoformat(),
@@ -70,12 +87,16 @@ def main() -> None:
         DIAGNOSTIC_MODE,
     )
     logger.info(
-        "[TRADER][STARTUP] event=%s trading_day=%s dry_run=%s dry_run_reason=%s live_trading_enabled=%s active_strategies=%s allow_adopt_unmanaged=%s engine_disabled_reason=%s",
+        "[TRADER][STARTUP] event=%s trading_day=%s mode=%s dry_run=%s reasons=%s live_trading_enabled=%s disable_live_flag=%s dry_run_flag=%s live_trading_flag=%s active_strategies=%s allow_adopt_unmanaged=%s engine_disabled_reason=%s",
         event_name or "unknown",
         trading_day,
+        mode,
         dry_run,
-        dry_run_reason,
+        dry_run_reasons,
         live_trading_enabled,
+        disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
+        dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
+        live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
         sorted(active_strategies) if active_strategies else [1],
         ALLOW_ADOPT_UNMANAGED,
         engine_disabled_reason,
