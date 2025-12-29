@@ -66,7 +66,13 @@ class PerformanceTracker:
         engine_capitals: engine name -> allocated capital (absolute, not ratio)
         """
 
-        cash = float(inquire_cash_balance())
+        try:
+            cash = float(inquire_cash_balance())
+            cash_reason = "kis_api"
+        except Exception as e:
+            logger.warning("[PERF] cash_balance failed -> fallback 0.0 (%s)", e)
+            cash = 0.0
+            cash_reason = "fallback"
         positions = self._mark_positions()
         equity_value = sum(p.market_value for p in positions)
         unrealized = sum(p.unrealized_pnl for p in positions)
@@ -125,6 +131,7 @@ class PerformanceTracker:
         return {
             "portfolio": {
                 "cash": cash,
+                "cash_reason": cash_reason,
                 "equity_value": equity_value,
                 "total_value": total_value,
                 "unrealized": unrealized,

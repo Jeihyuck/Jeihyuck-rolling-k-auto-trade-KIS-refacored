@@ -33,7 +33,7 @@ def main() -> None:
     now = now_kst()
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     trading_day = is_trading_day(now)
-    active_strategies = resolve_active_strategies()
+    active_strategies = resolve_active_strategies() or {1}
     live_trading_enabled_env = _env_flag("LIVE_TRADING_ENABLED", True)
     disable_live_env = _env_flag("DISABLE_LIVE_TRADING", False)
     dry_run_env_raw = os.getenv("DRY_RUN", "")
@@ -52,6 +52,12 @@ def main() -> None:
         dry_run_reasons.append("diagnostic_mode")
     dry_run = bool(dry_run_reasons)
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+    engine_disabled_reason = dry_run_reason if dry_run else (
+        "DISABLE_LIVE_TRADING env=true" if disable_live_env else (
+            "LIVE_TRADING_ENABLED env=false" if not live_trading_enabled_env else "enabled"
+        )
+    )
+    live_trading_enabled = bool(live_trading_enabled_env and not disable_live_env and not dry_run)
     if dry_run:
         os.environ["DISABLE_LIVE_TRADING"] = "true"
     logger.info(
@@ -69,10 +75,10 @@ def main() -> None:
         trading_day,
         dry_run,
         dry_run_reason,
-        live_trading_enabled_env and not dry_run and not disable_live_env,
-        sorted(active_strategies),
+        live_trading_enabled,
+        sorted(active_strategies) if active_strategies else [1],
         ALLOW_ADOPT_UNMANAGED,
-        dry_run_reason if dry_run else ("DISABLE_LIVE_TRADING" if disable_live_env else "enabled"),
+        engine_disabled_reason,
     )
     if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료 dry_run=%s reason=%s", now.date(), dry_run, dry_run_reason)

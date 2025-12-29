@@ -8,15 +8,15 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  schedule:
+    - cron: "*/5 0-6 * * 1-5"
+  workflow_dispatch:
   push:
     branches: [ main, trader_r1 ]
     paths-ignore:
       - "bot_state/**"
   pull_request:
     branches: [ main, trader_r1 ]
-  schedule:
-    - cron: "*/5 0-6 * * 1-5"
-  workflow_dispatch:
 
 
 jobs:
@@ -221,40 +221,44 @@ jobs:
       - name: Compile modules
         run: |
           python -m compileall trader rolling_k_auto_trade_api
-      - name: trader 자동매매 로직 실행 (DRY RUN - push/pr)
-        if: github.event_name == 'push' || github.event_name == 'pull_request'
+      - name: trader LIVE (strategy1 only)
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          # LIVE 강제
+          DRY_RUN: "false"
+          DISABLE_LIVE_TRADING: "false"
+          LIVE_TRADING_ENABLED: "true"
+          STRATEGY_MODE: "LIVE"
+
+          # 전략 1만
+          ACTIVE_STRATEGIES: "1"
+
+          # 최소 1개 엔진 ON (우선 KOSDAQ만 ON)
+          DISABLE_KOSDAQ_LOOP: "false"
+          DISABLE_KOSPI_ENGINE: "true"
+
+          # 안전: 장외 금지
+          ALLOW_AFTER_HOURS: "0"
+        run: python -m trader.trader
+
+      - name: trader DIAG (no live orders)
+        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
         env:
           PYTHONPATH: ${{ github.workspace }}
           DRY_RUN: "true"
-          LIVE_TRADING_ENABLED: "false"
-          ACTIVE_STRATEGIES: "1"
-          STRATEGY_MODE: "INTENT_ONLY"
           DISABLE_LIVE_TRADING: "true"
-          DISABLE_KOSDAQ_LOOP: "true"
-          DISABLE_KOSPI_ENGINE: "true"
-        run: |
-          python -m trader.trader
-
-      - name: trader 자동매매 로직 실행 (LIVE - schedule/dispatch)
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          DRY_RUN: "false"
-          LIVE_TRADING_ENABLED: "true"
+          LIVE_TRADING_ENABLED: "false"
+          STRATEGY_MODE: "INTENT_ONLY"
           ACTIVE_STRATEGIES: "1"
-          STRATEGY_MODE: "LIVE"
-          STRATEGY_DRY_RUN: "false"
-          DISABLE_LIVE_TRADING: "false"
-          DISABLE_KOSDAQ_LOOP: "false"
-          DISABLE_KOSPI_ENGINE: "false"
-        run: |
-          python -m trader.trader
+        run: python -m trader.trader
 
-      - name: Copy reconciled state to trader/state/state.json
+      - name: Normalize state path
         if: always()
         run: |
           mkdir -p trader/state
           test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
+          test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
 
       - name: CEO 리포트 자동 생성
         if: always()

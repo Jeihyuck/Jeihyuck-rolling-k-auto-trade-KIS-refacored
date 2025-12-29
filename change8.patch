@@ -1,0 +1,776 @@
+diff --git a/.github/workflows/trade-monitor.yml b/.github/workflows/trade-monitor.yml
+index e3640551808f417b54889a6bd0853299f4cd321f..791047c7f7e7d74891e7787242046db352dc3e11 100644
+--- a/.github/workflows/trade-monitor.yml
++++ b/.github/workflows/trade-monitor.yml
+@@ -1,44 +1,44 @@
+ name: Trade Monitor (trader_refactor branch)
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: false
+ 
+ on:
++  schedule:
++    - cron: "*/5 0-6 * * 1-5"
++  workflow_dispatch:
+   push:
+-    branches: [ main, trader_r1 ]
++    branches: [ main ]
+     paths-ignore:
+       - "bot_state/**"
+   pull_request:
+-    branches: [ main, trader_r1 ]
+-  schedule:
+-    - cron: "*/5 0-6 * * 1-5"
+-  workflow_dispatch:
++    branches: [ main ]
+ 
+ 
+ jobs:
+   monitor-trade:
+     # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
+     # if: github.ref == 'refs/heads/main'
+     # if: github.ref != 'refs/heads/bot-state'
+     runs-on: ubuntu-latest
+ 
+     env:
+       #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
+       #ALLOW_NON_TRADING_ORDER: "1"
+       # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
+       KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
+       APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+ 
+       CANO:           ${{ secrets.CANO }}
+       ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+ 
+       # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
+       API_BASE_URL:   ${{ secrets.API_BASE_URL }}
+@@ -199,84 +199,88 @@ jobs:
+           python - << 'PY'
+           import trader
+           from trader import trader as t
+           print("trader package path:", trader.__file__)
+           print("trader.trader module path:", t.__file__)
+           print("=== HEAD OF trader.trader ===")
+           try:
+               with open(t.__file__, 'r', encoding='utf-8') as f:
+                   for i in range(1, 80):
+                       line = f.readline()
+                       if not line:
+                           break
+                       print(f"{i:03}: {line.rstrip()}")
+           except Exception as e:
+               print("ERROR while reading trader.trader:", e)
+           PY
+ 
+       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+         run: |
+           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+           sleep 30  # 서버 기동 대기
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader rolling_k_auto_trade_api
+-      - name: trader 자동매매 로직 실행 (DRY RUN - push/pr)
+-        if: github.event_name == 'push' || github.event_name == 'pull_request'
++      - name: trader LIVE (strategy1 only)
++        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+-          DRY_RUN: "true"
+-          LIVE_TRADING_ENABLED: "false"
++          # LIVE 강제
++          DRY_RUN: "false"
++          DISABLE_LIVE_TRADING: "false"
++          LIVE_TRADING_ENABLED: "true"
++          STRATEGY_MODE: "LIVE"
++
++          # 전략 1만
+           ACTIVE_STRATEGIES: "1"
+-          STRATEGY_MODE: "INTENT_ONLY"
+-          DISABLE_LIVE_TRADING: "true"
+-          DISABLE_KOSDAQ_LOOP: "true"
++
++          # 최소 1개 엔진 ON (우선 KOSDAQ만 ON)
++          DISABLE_KOSDAQ_LOOP: "false"
+           DISABLE_KOSPI_ENGINE: "true"
+-        run: |
+-          python -m trader.trader
+ 
+-      - name: trader 자동매매 로직 실행 (LIVE - schedule/dispatch)
+-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
++          # 안전: 장외 금지
++          ALLOW_AFTER_HOURS: "0"
++        run: python -m trader.trader
++
++      - name: trader DIAG (no live orders)
++        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+-          DRY_RUN: "false"
+-          LIVE_TRADING_ENABLED: "true"
++          DRY_RUN: "true"
++          DISABLE_LIVE_TRADING: "true"
++          LIVE_TRADING_ENABLED: "false"
++          STRATEGY_MODE: "INTENT_ONLY"
+           ACTIVE_STRATEGIES: "1"
+-          STRATEGY_MODE: "LIVE"
+-          STRATEGY_DRY_RUN: "false"
+-          DISABLE_LIVE_TRADING: "false"
+-          DISABLE_KOSDAQ_LOOP: "false"
+-          DISABLE_KOSPI_ENGINE: "false"
+-        run: |
+-          python -m trader.trader
++        run: python -m trader.trader
+ 
+-      - name: Copy reconciled state to trader/state/state.json
++      - name: Normalize state path
+         if: always()
+         run: |
+           mkdir -p trader/state
+           test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
++          test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+ 
+       - name: CEO 리포트 자동 생성
+         if: always()
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.report_ceo || true
+ 
+       - name: Verify CEO report exists
+         if: always()
+         run: |
+           ls -al trader/logs || true
+ 
+       - name: Push state (plain)
+         if: github.event_name != 'pull_request'
+         run: |
+           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+ 
+       - name: Save state snapshot as artifact (audit only)
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trader-state-${{ github.run_id }}
+           path: |
+             trader/state/state.json
+diff --git a/portfolio/performance.py b/portfolio/performance.py
+index 196bc616f14bc601b26d21c830d82f1c9da73937..8e7fc81324e768442fdb1fca1cf2d33e5f3c1800 100644
+--- a/portfolio/performance.py
++++ b/portfolio/performance.py
+@@ -44,51 +44,57 @@ class PerformanceTracker:
+                     quote = get_price_quote(code)
+                     last_price = float(quote.get("stck_prpr") or quote.get("askp1") or 0)
+                 except Exception:
+                     logger.exception("[PERF] quote fail for %s", code)
+                     last_price = 0.0
+             market_value = max(last_price, 0.0) * qty
+             unrealized_pnl = (last_price - avg_price) * qty if avg_price else 0.0
+             positions.append(
+                 PositionSnapshot(
+                     code=code,
+                     qty=qty,
+                     avg_price=avg_price,
+                     last_price=last_price,
+                     market_value=market_value,
+                     unrealized_pnl=unrealized_pnl,
+                 )
+             )
+         return positions
+ 
+     def snapshot(self, engine_capitals: Dict[str, float]) -> Dict[str, Any]:
+         """Return per-engine and portfolio PnL snapshots.
+ 
+         engine_capitals: engine name -> allocated capital (absolute, not ratio)
+         """
+ 
+-        cash = float(inquire_cash_balance())
++        try:
++            cash = float(inquire_cash_balance())
++            cash_reason = "kis_api"
++        except Exception as e:
++            logger.warning("[PERF] cash_balance failed -> fallback 0.0 (%s)", e)
++            cash = 0.0
++            cash_reason = "fallback"
+         positions = self._mark_positions()
+         equity_value = sum(p.market_value for p in positions)
+         unrealized = sum(p.unrealized_pnl for p in positions)
+         total_allocated = sum(engine_capitals.values())
+         total_value = cash + equity_value
+         pnl = total_value - float(total_allocated)
+         pnl_pct = (pnl / float(total_allocated) * 100) if total_allocated else 0.0
+ 
+         if self._peak_value is None or total_value > self._peak_value:
+             self._peak_value = total_value
+         drawdown_pct = 0.0
+         if self._peak_value:
+             drawdown_pct = max((self._peak_value - total_value) / self._peak_value * 100, 0.0)
+             self._max_drawdown_pct = max(self._max_drawdown_pct, drawdown_pct)
+ 
+         engines: Dict[str, Dict[str, Any]] = {}
+         for name, cap in engine_capitals.items():
+             ratio = cap / total_allocated if total_allocated else 0.0
+             engine_cash = cash * ratio
+             engine_equity = equity_value * ratio
+             engine_value = engine_cash + engine_equity
+             engine_pnl = engine_value - cap
+             engine_pct = (engine_pnl / cap * 100) if cap else 0.0
+             engines[name] = {
+                 "allocated_capital": cap,
+@@ -103,36 +109,37 @@ class PerformanceTracker:
+                 name.upper(),
+                 cap,
+                 engine_value,
+                 engine_pnl,
+                 engine_pct,
+             )
+ 
+         logger.info(
+             "[PORTFOLIO][PERF] total=%.0f cash=%.0f equity=%.0f pnl=%.0f (%.2f%%)",
+             total_value,
+             cash,
+             equity_value,
+             pnl,
+             pnl_pct,
+         )
+ 
+         logger.info(
+             "[PORTFOLIO][DRAWDOWN] current=%.2f%% max=%.2f%%",
+             drawdown_pct,
+             self._max_drawdown_pct,
+         )
+ 
+         return {
+             "portfolio": {
+                 "cash": cash,
++                "cash_reason": cash_reason,
+                 "equity_value": equity_value,
+                 "total_value": total_value,
+                 "unrealized": unrealized,
+                 "pnl": pnl,
+                 "pnl_pct": pnl_pct,
+                 "drawdown_pct": drawdown_pct,
+                 "max_drawdown_pct": self._max_drawdown_pct,
+             },
+             "engines": engines,
+             "positions": [p.__dict__ for p in positions],
+         }
+diff --git a/rolling_k_auto_trade_api/kis_api.py b/rolling_k_auto_trade_api/kis_api.py
+index 9cc4baf8f37a073846d9fb14dfed2d9bd70f2d9b..2d3caaf5d3a20182c3a09a5d7b019a33cc9a5c08 100644
+--- a/rolling_k_auto_trade_api/kis_api.py
++++ b/rolling_k_auto_trade_api/kis_api.py
+@@ -16,62 +16,63 @@ rolling_k_auto_trade_api.kis_api — 최신 응답로깅 + 파라미터 최신
+ import os
+ import json
+ import time
+ import random
+ import logging
+ from datetime import datetime, time as dtime, timedelta, timezone
+ from typing import Any, Dict, Optional, List
+ 
+ import requests
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
+ logger = logging.getLogger(__name__)
+ KST = timezone(timedelta(hours=9))
+ MARKET_OPEN = dtime(9, 0)
+ MARKET_CLOSE = dtime(15, 20)
+ 
+ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+ 
+ # =============================
+ # 실행 보호 플래그 (CI 등에서 실거래 방지)
+ # =============================
+ 
+ 
+ class LiveTradingDisabledError(RuntimeError):
+-    """Raised when live KIS API calls are disabled via environment flag."""
++    """Raised when live KIS order calls are disabled via environment flag."""
+ 
+ 
+-LIVE_TRADING_DISABLED = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
++def _is_live_trading_enabled() -> bool:
++    live_enabled = str(os.getenv("LIVE_TRADING_ENABLED", "")).lower() in {"1", "true", "yes"}
++    disable_live = str(os.getenv("DISABLE_LIVE_TRADING", "")).lower() in {"1", "true", "yes"}
++    return live_enabled and (not disable_live)
+ 
+ 
+-def _guard_live_trading(action: str) -> None:
+-    if LIVE_TRADING_DISABLED:
+-        logger.warning(
+-            f"[KIS_DISABLED] {action} skipped because DISABLE_LIVE_TRADING is set"
+-        )
+-        raise LiveTradingDisabledError("DISABLE_LIVE_TRADING is enabled; KIS API calls are blocked.")
++def _guard_order_calls(op_name: str) -> None:
++    if not _is_live_trading_enabled():
++        logger.warning("[KIS_DISABLED] %s blocked because live trading is disabled", op_name)
++        raise LiveTradingDisabledError(f"Live trading disabled; order call blocked: {op_name}")
+ 
+ 
+ def _is_trading_day(ts: Optional[datetime] = None) -> bool:
+     ts = ts or datetime.now(tz=KST)
+     return ts.weekday() < 5
+ 
+ 
+ def _is_trading_window(ts: Optional[datetime] = None) -> bool:
+     ts = ts or datetime.now(tz=KST)
+     return _is_trading_day(ts) and MARKET_OPEN <= ts.time() <= MARKET_CLOSE
+ 
+ 
+ def _order_block_reason(now: Optional[datetime] = None) -> Optional[str]:
+     now = now or datetime.now(tz=KST)
+     state_date = _ORDER_BLOCK_STATE.get("date")
+     state_reason = _ORDER_BLOCK_STATE.get("reason")
+     if state_date and state_date != now.date():
+         _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
+         state_date, state_reason = None, None
+     if state_date == now.date() and state_reason:
+         return str(state_reason)
+     if not _is_trading_day(now):
+         _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
+         return "NON_TRADING_DAY"
+     if not _is_trading_window(now):
+@@ -134,98 +135,95 @@ logger.info(f"[KIS] ENV={KIS_ENV} API_BASE_URL={API_BASE_URL} CANO={'***' if CAN
+ # 세션/재시도
+ # =============================
+ session = requests.Session()
+ retry = Retry(
+     total=3,
+     connect=3,
+     read=3,
+     status=3,
+     backoff_factor=0.5,
+     status_forcelist=(500, 502, 503, 504),
+     allowed_methods=frozenset(["GET", "POST"]),
+     raise_on_status=False,
+ )
+ adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+ session.mount("https://", adapter)
+ session.mount("http://", adapter)
+ 
+ # =============================
+ # 시세 조회 (실시간/당일)
+ # =============================
+ 
+ 
+ def get_price_quote(stock_code: str) -> Dict[str, Any]:
+     """실시간/당일 시세 조회."""
+ 
+-    _guard_live_trading("quote")
+     code = str(stock_code).zfill(6)
+     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+     tr_id = "FHKST01010100"
+ 
+     r = session.get(url, headers=_headers(tr_id), params=params, timeout=(3.0, 7.0))
+     try:
+         j = r.json()
+     except Exception:
+         logger.error(f"[QUOTE_RAW] status={r.status_code} text={r.text[:400]}")
+         raise
+ 
+     if r.status_code != 200:
+         logger.error(f"[QUOTE_FAIL] code={code} status={r.status_code} resp={j}")
+         raise RuntimeError(f"quote fail: {j}")
+ 
+     output = j.get("output") or {}
+     if not output:
+         logger.error(f"[QUOTE_EMPTY] code={code} resp={j}")
+     return output
+ 
+ # =============================
+ # 토큰 캐시
+ # =============================
+ _TOKEN_CACHE = {"token": None, "expires_at": 0.0, "last_issued": 0.0}
+ _TOKEN_FILE = os.getenv("KIS_TOKEN_CACHE", "kis_token_cache.json")
+ 
+ 
+ def _issue_token() -> Dict[str, Any]:
+-    _guard_live_trading("token")
+     path = "/oauth2/tokenP" if KIS_ENV == "practice" else "/oauth2/token"
+     url = f"{API_BASE_URL}{path}"
+     hdr = {"content-type": "application/json"}
+     data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
+     r = session.post(url, json=data, headers=hdr, timeout=(3.0, 7.0))
+     try:
+         j = r.json()
+     except Exception:
+         logger.error(f"[🔑 TOKEN_RESP_RAW] status={r.status_code} text={r.text[:400]}")
+         raise
+     if "access_token" in j:
+         return j
+     raise RuntimeError(f"TOKEN_FAIL: {j}")
+ 
+ 
+ def _get_token() -> str:
+-    _guard_live_trading("token")
+     now = time.time()
+     if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"] - 300:
+         return _TOKEN_CACHE["token"]
+     # 파일 캐시
+     if os.path.exists(_TOKEN_FILE):
+         try:
+             with open(_TOKEN_FILE, "r", encoding="utf-8") as f:
+                 c = json.load(f)
+             if c.get("access_token") and now < float(c.get("expires_at", 0)) - 300:
+                 _TOKEN_CACHE.update({"token": c["access_token"], "expires_at": float(c["expires_at"]), "last_issued": float(c.get("last_issued", 0))})
+                 logger.info("[TOKEN] file cache reuse")
+                 return c["access_token"]
+         except Exception as e:
+             logger.warning(f"[TOKEN_CACHE_READ_FAIL] {e}")
+     # 발급 빈도 제한(1분)
+     if now - _TOKEN_CACHE["last_issued"] < 61 and _TOKEN_CACHE["token"]:
+         logger.warning("[TOKEN] throttle: reuse current token")
+         return _TOKEN_CACHE["token"]
+     j = _issue_token()
+     token = j["access_token"]
+     exp_in = int(j.get("expires_in", 86400))
+     _TOKEN_CACHE.update({"token": token, "expires_at": now + exp_in, "last_issued": now})
+     try:
+         with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
+             json.dump({"access_token": token, "expires_at": now + exp_in, "last_issued": now}, f, ensure_ascii=False)
+@@ -235,73 +233,72 @@ def _get_token() -> str:
+ 
+ 
+ # =============================
+ # 공통 헤더/HashKey
+ # =============================
+ 
+ def _headers(tr_id: str, *, hashkey: Optional[str] = None) -> Dict[str, str]:
+     h = {
+         "authorization": f"Bearer {_get_token()}",
+         "appkey": APP_KEY,
+         "appsecret": APP_SECRET,
+         "tr_id": tr_id,
+         "custtype": "P",
+         "content-type": "application/json; charset=utf-8",
+     }
+     if hashkey:
+         h["hashkey"] = hashkey
+     return h
+ 
+ 
+ def _json_dumps(body: Dict[str, Any]) -> str:
+     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+ 
+ 
+ def _create_hashkey(body: Dict[str, Any]) -> str:
+-    _guard_live_trading("hashkey")
+     url = f"{API_BASE_URL}/uapi/hashkey"
+     hdr = {"content-type": "application/json; charset=utf-8", "appkey": APP_KEY, "appsecret": APP_SECRET}
+     body_str = _json_dumps(body)
+     r = session.post(url, headers=hdr, data=body_str.encode("utf-8"), timeout=(3.0, 5.0))
+     try:
+         j = r.json()
+     except Exception:
+         logger.error(f"[HASHKEY_RAW] status={r.status_code} text={r.text[:400]}")
+         raise
+     hk = j.get("HASH") or j.get("hash") or j.get("hashkey")
+     if not hk:
+         logger.error(f"[HASHKEY_FAIL] resp={j}")
+         raise RuntimeError(f"hashkey fail: {j}")
+     return hk
+ 
+ 
+ # =============================
+ # 주문 (현금)
+ # =============================
+ 
+ def _order_cash(body: Dict[str, Any], *, is_sell: bool) -> Dict[str, Any]:
+-    _guard_live_trading("order")
++    _guard_order_calls("order_cash")
+     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+     tr_id = ("VTTC0011U" if KIS_ENV == "practice" else "TTTC0011U") if is_sell else ("VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U")
+ 
+     # 시장가→IOC시장가→최유리(03)
+     ord_chain = ["01", "13", "03"]
+     last_err: Any = None
+ 
+     for ord_dvsn in ord_chain:
+         body["ORD_DVSN"] = ord_dvsn
+         body["ORD_UNPR"] = body.get("ORD_UNPR", "0") if ord_dvsn == "00" else "0"
+         if is_sell and not body.get("SLL_TYPE"):
+             body["SLL_TYPE"] = "01"  # 일반매도
+         body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+ 
+         hk = _create_hashkey(body)
+         hdr = _headers(tr_id, hashkey=hk)
+ 
+         # 마스킹 로그
+         log_body = {k: ("***" if k in ("CANO", "ACNT_PRDT_CD") else v) for k, v in body.items()}
+         logger.info(f"[ORDER_REQ] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body}")
+ 
+         for attempt in range(1, 4):
+             try:
+                 r = session.post(url, headers=hdr, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+                 raw = r.text
+@@ -334,51 +331,51 @@ def _order_cash(body: Dict[str, Any], *, is_sell: bool) -> Dict[str, Any]:
+                 continue
+ 
+             # 비즈니스 실패는 그대로 반환(상위에서 판단)
+             logger.error(f"[ORDER_FAIL_BIZ] ord_dvsn={ord_dvsn} resp={j} raw_head={raw[:300]}")
+             return j if isinstance(j, dict) else {"_status": r.status_code, "raw": raw[:500]}
+ 
+         logger.warning(f"[ORDER_FALLBACK] ord_dvsn={ord_dvsn} 실패 → 다음 방식")
+ 
+     raise RuntimeError(f"ORDER_FAIL: {last_err}")
+ 
+ 
+ def send_order(
+     code: str,
+     qty: int,
+     price: Optional[int] = None,
+     side: str = "buy",
+     order_type: Optional[str] = None,
+     **kwargs: Any,
+ ) -> Dict[str, Any]:
+     """공용 주문 API
+     side: 'buy' or 'sell'
+     price: None이면 시장가 체인, 지정가면 지정가 고정(00)
+     order_type: 과거 호출부 호환용(예: "market"); 인식 가능한 값은 price를 무시하고 시장가로 처리
+     반환: KIS 응답(dict). 비정상 응답 시에도 원문/상태 일부 포함
+     """
+-    _guard_live_trading("order")
++    _guard_order_calls("send_order")
+     code = str(code).strip()
+     is_sell = (side.lower() == "sell")
+     now = datetime.now(tz=KST)
+ 
+     block_reason = _order_block_reason(now)
+     if block_reason:
+         logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, code, qty)
+         return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+ 
+     # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
+     ord_type_norm = str(order_type).lower() if order_type is not None else ""
+     if ord_type_norm in {"market", "mkt"}:
+         price = None
+     if kwargs:
+         logger.debug(f"[ORDER_KWARGS_IGNORED] extra_keys={list(kwargs.keys())}")
+ 
+     # 호환성 처리: order_type="market" 등으로 호출돼도 TypeError 없이 시장가로 처리
+     ord_type_norm = str(order_type).lower() if order_type is not None else ""
+     if ord_type_norm in {"market", "mkt"}:
+         price = None
+     if kwargs:
+         logger.debug(f"[ORDER_KWARGS_IGNORED] extra_keys={list(kwargs.keys())}")
+ 
+     if price is None:
+         # 시장가 체인
+@@ -409,102 +406,99 @@ def send_order(
+         hk = _create_hashkey(body)
+         tr_id = ("VTTC0011U" if KIS_ENV == "practice" else "TTTC0011U") if is_sell else ("VTTC0012U" if KIS_ENV == "practice" else "TTTC0012U")
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+         hdr = _headers(tr_id, hashkey=hk)
+ 
+         log_body = {k: ("***" if k in ("CANO", "ACNT_PRDT_CD") else v) for k, v in body.items()}
+         logger.info(f"[ORDER_REQ_LIMIT] tr_id={tr_id} body={log_body}")
+         r = session.post(url, headers=hdr, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0))
+         raw = r.text
+         try:
+             j = r.json()
+         except Exception:
+             j = {"_non_json": True}
+         logger.info(f"[ORDER_RESP_LIMIT] status={r.status_code} json={j} raw_head={raw[:300]}")
+         blocked = _is_order_disallowed(j)
+         if blocked:
+             _mark_order_blocked(blocked, now)
+         return j if isinstance(j, dict) else {"_status": r.status_code, "raw": raw[:500]}
+ 
+ 
+ # =============================
+ # 잔고/예수금/체결 조회
+ # =============================
+ 
+ def inquire_cash_balance() -> int:
+-    _guard_live_trading("cash_balance")
+     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+     tr_id = "VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R"
+     hdr = _headers(tr_id)
+     params = {
+         "CANO": CANO,
+         "ACNT_PRDT_CD": ACNT_PRDT_CD,
+         "AFHR_FLPR_YN": "N",
+         "UNPR_YN": "N",
+         "UNPR_DVSN": "01",
+         "FUND_STTL_ICLD_YN": "N",
+         "FNCG_AMT_AUTO_RDPT_YN": "N",
+         "PRCS_DVSN": "01",
+         "OFL_YN": "N",
+         "INQR_DVSN": "02",
+         "CTX_AREA_FK100": "",
+         "CTX_AREA_NK100": "",
+     }
+     logger.info(f"[INQ_BAL_REQ] params={{...masked...}}")
+     r = session.get(url, headers=hdr, params=params, timeout=(3.0, 7.0))
+     raw = r.text
+     try:
+         j = r.json()
+     except Exception:
+         logger.error(f"[INQ_BAL_RAW] status={r.status_code} raw={raw[:300]}")
+         return 0
+     logger.info(f"[INQ_BAL_RESP] {j}")
+     try:
+         if j.get("rt_cd") == "0" and j.get("output2"):
+             return int(j["output2"][0]["dnca_tot_amt"])  # 예수금
+     except Exception as e:
+         logger.error(f"[INQ_BAL_PARSE_FAIL] {e}")
+     return 0
+ 
+ 
+ def inquire_balance(code: Optional[str] = None) -> List[Dict[str, Any]]:
+-    _guard_live_trading("positions")
+     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+     tr_id = "VTTC8434R" if KIS_ENV == "practice" else "TTTC8434R"
+     hdr = _headers(tr_id)
+     params = {
+         "CANO": CANO,
+         "ACNT_PRDT_CD": ACNT_PRDT_CD,
+         "AFHR_FLPR_YN": "N",
+         "UNPR_YN": "N",
+         "UNPR_DVSN": "01",
+         "FUND_STTL_ICLD_YN": "N",
+         "FNCG_AMT_AUTO_RDPT_YN": "N",
+         "PRCS_DVSN": "01",
+         "OFL_YN": "N",
+         "INQR_DVSN": "02",
+         "CTX_AREA_FK100": "",
+         "CTX_AREA_NK100": "",
+     }
+     r = session.get(url, headers=hdr, params=params, timeout=(3.0, 7.0))
+     raw = r.text
+     try:
+         j = r.json()
+     except Exception:
+         logger.error(f"[INQ_POS_RAW] status={r.status_code} raw={raw[:300]}")
+         return []
+     out = j.get("output1") or []
+     if code:
+         out = [o for o in out if str(o.get("pdno")) == str(code)]
+     logger.info(f"[INQ_POS_RESP] count={len(out)} code={code}")
+     return out
+ 
+ 
+ def inquire_filled_order(ord_no: str) -> Dict[str, Any]:
+     """체결/주문 조회 (간편형)
+     주의: KIS의 체결 조회 API는 계좌/일자/주문번호 등 다양한 TR이 있으므로
+     실제 배포 환경에 맞추어 상세 TR을 교체해야 합니다. 여기서는 요청/응답 로깅에 중점.
+     """
+-    _guard_live_trading("filled_order")
+     # 데모용: 주문번호만 로깅/에코
+     logger.info(f"[INQ_FILL] ord_no={ord_no}")
+     return {"ord_no": ord_no, "status": "dummy", "note": "Fill inquiry TR 연결 필요"}
+diff --git a/trader/trader.py b/trader/trader.py
+index f8a583e949c3e31f34edc75b7cf3f1317bed7853..986a294b177b1e736084a76dffb585604f8f9fb5 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -11,90 +11,96 @@ from trader import state_store as runtime_state_store
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
+ from trader.config import (
+     ALLOW_ADOPT_UNMANAGED,
+     DIAG_ENABLED,
+     DIAGNOSTIC_FORCE_RUN,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     resolve_active_strategies,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _env_flag(name: str, default: bool = False) -> bool:
+     raw = os.getenv(name)
+     if raw is None:
+         return default
+     return raw.lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ def main() -> None:
+     now = now_kst()
+     event_name = os.getenv("GITHUB_EVENT_NAME", "")
+     trading_day = is_trading_day(now)
+-    active_strategies = resolve_active_strategies()
++    active_strategies = resolve_active_strategies() or {1}
+     live_trading_enabled_env = _env_flag("LIVE_TRADING_ENABLED", True)
+     disable_live_env = _env_flag("DISABLE_LIVE_TRADING", False)
+     dry_run_env_raw = os.getenv("DRY_RUN", "")
+     dry_run_env = dry_run_env_raw.lower() in {"1", "true", "yes", "on"}
+     dry_run_reasons: list[str] = []
+     if dry_run_env:
+         dry_run_reasons.append(f"DRY_RUN env={dry_run_env_raw}")
+     if event_name in {"push", "pull_request"}:
+         dry_run_reasons.append(f"event={event_name} forces dry_run")
+     if disable_live_env:
+         dry_run_reasons.append("DISABLE_LIVE_TRADING env=true")
+     if not live_trading_enabled_env:
+         dry_run_reasons.append("LIVE_TRADING_ENABLED env=false")
+     diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
+     if diag_enabled:
+         dry_run_reasons.append("diagnostic_mode")
+     dry_run = bool(dry_run_reasons)
+     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
++    engine_disabled_reason = dry_run_reason if dry_run else (
++        "DISABLE_LIVE_TRADING env=true" if disable_live_env else (
++            "LIVE_TRADING_ENABLED env=false" if not live_trading_enabled_env else "enabled"
++        )
++    )
++    live_trading_enabled = bool(live_trading_enabled_env and not disable_live_env and not dry_run)
+     if dry_run:
+         os.environ["DISABLE_LIVE_TRADING"] = "true"
+     logger.info(
+         "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
+         now.isoformat(),
+         trading_day,
+         DIAG_ENABLED,
+         DIAGNOSTIC_FORCE_RUN,
+         DIAGNOSTIC_ONLY,
+         DIAGNOSTIC_MODE,
+     )
+     logger.info(
+         "[TRADER][STARTUP] event=%s trading_day=%s dry_run=%s dry_run_reason=%s live_trading_enabled=%s active_strategies=%s allow_adopt_unmanaged=%s engine_disabled_reason=%s",
+         event_name or "unknown",
+         trading_day,
+         dry_run,
+         dry_run_reason,
+-        live_trading_enabled_env and not dry_run and not disable_live_env,
+-        sorted(active_strategies),
++        live_trading_enabled,
++        sorted(active_strategies) if active_strategies else [1],
+         ALLOW_ADOPT_UNMANAGED,
+-        dry_run_reason if dry_run else ("DISABLE_LIVE_TRADING" if disable_live_env else "enabled"),
++        engine_disabled_reason,
+     )
+     if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
+         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료 dry_run=%s reason=%s", now.date(), dry_run, dry_run_reason)
+         return
+     if (not trading_day) and diag_enabled:
+         logger.warning(
+             "[DIAG][TRADER] non-trading-day(%s) but running diagnostics (only=%s force_run=%s)",
+             now.date(),
+             DIAGNOSTIC_ONLY,
+             DIAGNOSTIC_FORCE_RUN,
+         )
+     runtime_state = {}
+     kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state,
+             balance,
+             active_strategies=active_strategies,
+         )
+         runtime_state_store.save_state(runtime_state)
+         logger.info("[TRADER] runtime state reconciled")
+     except Exception:
