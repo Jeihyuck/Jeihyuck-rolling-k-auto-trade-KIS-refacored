@@ -123,7 +123,6 @@ jobs:
       K_MIN: "0.1"
       K_MAX: "0.9"
       K_STEP: "0.1"
-      ALLOW_AFTER_HOURS: "0"
       REBALANCE_OUT_DIR: "rebalance_results"
 
     steps:
@@ -284,7 +283,6 @@ jobs:
       DISABLE_KOSDAQ_LOOP: "1"
       DISABLE_KOSPI_ENGINE: "1"
 
-      ALLOW_AFTER_HOURS: "0"
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
