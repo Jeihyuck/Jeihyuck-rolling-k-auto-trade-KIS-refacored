@@ -2,6 +2,8 @@
 import os
 import logging
 
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
+
 def safe_strip(val):
     """모든 입력값에서 개행, 캐리지리턴, 양쪽 공백 제거."""
     if val is None:
