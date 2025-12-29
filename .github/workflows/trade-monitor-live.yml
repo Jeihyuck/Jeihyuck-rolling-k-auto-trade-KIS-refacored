@@ -1,4 +1,4 @@
-name: Trade Monitor LIVE (practice VTS)
+name: Trade Monitor (trader_refactor branch)
 
 permissions:
   contents: write
@@ -8,30 +8,35 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  push:
+    branches: [ main, trader_refactor ]
+    paths-ignore:
+      - "bot_state/**"
+  pull_request:
+    branches: [ main, trader_refactor ]
   schedule:
-    - cron: "*/5 0-6 * * 1-5"
+    - cron: "57 23 * * 0-6"
   workflow_dispatch:
-    inputs:
-      run_minutes:
-        description: "Minutes to run trader loop (60s interval)"
-        required: false
-        default: "360"
 
 jobs:
-  trade-live:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+  monitor-trade:
+    if: github.ref != 'refs/heads/bot-state'
     runs-on: ubuntu-latest
-    env:
-      # === KIS 인증키 ===
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+    timeout-minutes: 360
 
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: "practice"
-      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+    env:
+      # === KIS 인증키(두 이름 모두 대응) ===
+      KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+
+      CANO:           ${{ secrets.CANO }}
+      ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
+
+      # 기본값은 secrets를 쓰되, LIVE step에서 practice/VTS로 강제 override 함
+      KIS_ENV:        ${{ secrets.KIS_ENV }}
+      API_BASE_URL:   ${{ secrets.API_BASE_URL }}
 
       # === trader.py 운영 파라미터 ===
       PARTIAL1: "0.5"
@@ -42,7 +47,7 @@ jobs:
 
       TIME_STOP_HHMM: "13:00"
       SELL_FORCE_TIME: "14:40"
-      SELL_ALL_BALANCES_AT_CUTOFF: "0"
+      SELL_ALL_BALANCES_AT_CUTOFF: "false"
       FORCE_SELL_PASSES_CUTOFF: "2"
       FORCE_SELL_PASSES_CLOSE: "4"
 
@@ -59,9 +64,8 @@ jobs:
 
       REBALANCE_ANCHOR: "weekly"
       FORCE_WEEKLY_REBALANCE: "0"
-      MOMENTUM_OVERRIDES_FORCE_SELL: "1"
+      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
 
-      # 레짐/지수
       KOSDAQ_INDEX_CODE: "KOSDAQ"
       KOSDAQ_ETF_FALLBACK: "229200"
 
@@ -79,40 +83,15 @@ jobs:
       TRAIL_PCT_BEAR: "0.012"
       TP_PROFIT_PCT_BULL: "3.5"
 
-      MARKET_DATA_WHEN_CLOSED: "0"
+      MARKET_DATA_WHEN_CLOSED: "false"
 
-      DIAGNOSTIC_ONLY: "0"
-      DIAGNOSTIC_FORCE_RUN: "0"
-      DIAGNOSTIC_ENABLED: "0"
-
-      # ===== LIVE 강제 =====
-      DRY_RUN: "0"
-      DISABLE_LIVE_TRADING: "0"
-      LIVE_TRADING_ENABLED: "1"
-      EXPECT_LIVE_TRADING: "1"
-      EXPECT_KIS_ENV: "practice"
-      STRATEGY_MODE: "LIVE"
-
-      # 전략 1만
-      ACTIVE_STRATEGIES: "1"
-
-      # 엔진 ON/OFF
-      DISABLE_KOSDAQ_LOOP: "0"
-      DISABLE_KOSPI_ENGINE: "1"
-
-      # 안전: 장외 금지
-      ALLOW_AFTER_HOURS: "0"
-      ALLOW_ADOPT_UNMANAGED: "0"
-
-      # 배분/속도
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
-      # === VWAP 분봉 TR ===
       KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
       KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
 
-      # === FastAPI 리밸런싱 서버(선정 필터) ===
+      # === 리밸런싱 필터 ===
       MIN_TRADES: "5"
       MAX_MDD_PCT: "30"
       MIN_WINRATE: "50"
@@ -123,58 +102,37 @@ jobs:
       K_MIN: "0.1"
       K_MAX: "0.9"
       K_STEP: "0.1"
+      ALLOW_AFTER_HOURS: "0"
       REBALANCE_OUT_DIR: "rebalance_results"
 
-      RUN_MINUTES: ${{ github.event.inputs.run_minutes || 360 }}
+      # LIVE 루프 지속 시간(분). 0이면 1회만 실행.
+      RUN_LOOP_MINUTES: "360"
 
     steps:
-      - name: Preflight (secrets/event/practice)
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" != "schedule" && "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
-            echo "[FAIL] Invalid trigger: ${GITHUB_EVENT_NAME}" >&2
-            exit 1
-          fi
-          required_envs=(KIS_APP_KEY KIS_APP_SECRET APP_KEY APP_SECRET CANO ACNT_PRDT_CD)
-          missing=()
-          for key in "${required_envs[@]}"; do
-            if [[ -z "${!key:-}" ]]; then
-              missing+=("${key}")
-            fi
-          done
-          if (( ${#missing[@]} > 0 )); then
-            echo "[FAIL] Missing required secrets/env: ${missing[*]}" >&2
-            exit 1
-          fi
-          if [[ "${KIS_ENV,,}" != "practice" ]]; then
-            echo "[FAIL] KIS_ENV must be practice (VTS)" >&2
-            exit 1
-          fi
-          api_lower="${API_BASE_URL,,}"
-          if [[ "${api_lower}" != *"openapivts"* ]]; then
-            echo "[FAIL] API_BASE_URL must point to openapivts practice endpoint" >&2
-            exit 1
-          fi
-          if ! [[ "${RUN_MINUTES}" =~ ^[0-9]+$ ]]; then
-            echo "[FAIL] RUN_MINUTES must be a positive integer" >&2
-            exit 1
-          fi
-          if [[ "${RUN_MINUTES}" -lt 1 ]]; then
-            echo "[FAIL] RUN_MINUTES must be >=1" >&2
-            exit 1
-          fi
-          echo "[OK] Preflight checks passed"
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
-          ref: trader_r1
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Ensure trader_r1 branch checked out
-        run: |
-          git checkout trader_r1
+      - name: Restore state cache (fallback only)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
+          restore-keys: |
+            trader-state-${{ github.ref_name }}-
+
+      - name: Save state cache (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
 
       - name: Set git identity
         run: |
@@ -186,14 +144,16 @@ jobs:
           python-version: "3.11"
 
       - name: Ensure state scripts executable
+        if: github.event_name != 'pull_request'
         run: |
           chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
 
       - name: Pull state (plain)
+        if: github.event_name != 'pull_request'
         run: |
-          bash scripts/state_pull_plain.sh
+          bash scripts/state_pull_plain.sh || true
 
-      - name: Install dependencies
+      - name: Dependencies 설치
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -202,26 +162,100 @@ jobs:
         run: |
           python -m compileall trader rolling_k_auto_trade_api portfolio strategy
 
-      - name: Run trader LIVE loop (60s interval)
+      - name: Ledger smoke test
+        run: |
+          python -m trader.ledger_test
+
+      - name: (진단) 핵심 환경변수 주입 여부만 확인
+        run: |
+          python - << 'PY'
+          import os
+          def chk(k):
+              v = os.getenv(k) or ''
+              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
+          for k in ['KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET','CANO','ACNT_PRDT_CD','KIS_ENV','API_BASE_URL']:
+              chk(k)
+          PY
+
+      - name: (디버그) trader 모듈 경로 확인
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          set -euo pipefail
-          minutes=${RUN_MINUTES}
-          for ((i=0; i<minutes; i++)); do
-            echo "[TRADER][${i}/${minutes}] cycle start $(date -u --iso-8601=seconds)"
-            python -m trader.trader
-            if [[ $((i + 1)) -lt minutes ]]; then
-              sleep 60
-            fi
-          done
+          python - << 'PY'
+          import trader
+          from trader import trader as t
+          print("trader package path:", trader.__file__)
+          print("trader.trader module path:", t.__file__)
+          PY
 
-      - name: Normalize state path
-        if: always()
+      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
-          mkdir -p trader/state
-          test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
-          test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+          sleep 10
+
+      # ✅ LIVE: schedule/dispatch에서만, practice/VTS로 강제 + LIVE 플래그 강제
+      - name: trader LIVE (PRACTICE, loop)
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+          # PRACTICE 강제(모의투자에서 LIVE 주문 로직)
+          KIS_ENV: "practice"
+          API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+
+          # LIVE 강제
+          EXPECT_LIVE_TRADING: "1"
+          DRY_RUN: "0"
+          DISABLE_LIVE_TRADING: "0"
+          LIVE_TRADING_ENABLED: "1"
+          STRATEGY_MODE: "LIVE"
+
+          # 엔진 ON/OFF
+          ACTIVE_STRATEGIES: "1"
+          DISABLE_KOSDAQ_LOOP: "false"
+          DISABLE_KOSPI_ENGINE: "true"
+        run: |
+          echo "[LIVE] event=${{ github.event_name }} RUN_LOOP_MINUTES=${RUN_LOOP_MINUTES}"
+          python - << 'PY'
+          import os, sys
+          # 필수 값 체크
+          req = ["KIS_APP_KEY","KIS_APP_SECRET","CANO","ACNT_PRDT_CD"]
+          miss = [k for k in req if not (os.getenv(k) or "").strip()]
+          if miss:
+              print("FATAL missing secrets:", miss); sys.exit(2)
+          # practice/VTS 체크
+          if os.getenv("KIS_ENV") != "practice":
+              print("FATAL KIS_ENV must be practice"); sys.exit(2)
+          if "openapivts" not in (os.getenv("API_BASE_URL") or "").lower():
+              print("FATAL API_BASE_URL must be VTS(openapivts)"); sys.exit(2)
+          print("OK preflight")
+          PY
+
+          if [ "${RUN_LOOP_MINUTES}" = "0" ]; then
+            python -m trader.trader
+          else
+            for i in $(seq 1 "${RUN_LOOP_MINUTES}"); do
+              echo "[LIVE] tick=${i}"
+              python -m trader.trader
+              sleep 60
+            done
+          fi
+
+      # ✅ DIAG: push/PR에서는 무조건 DRY_RUN으로 고정 (라이브 주문 방지)
+      - name: trader DIAG (push/PR only, no orders)
+        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DRY_RUN: "1"
+          DISABLE_LIVE_TRADING: "1"
+          LIVE_TRADING_ENABLED: "0"
+          EXPECT_LIVE_TRADING: "0"
+          STRATEGY_MODE: "INTENT_ONLY"
+          ACTIVE_STRATEGIES: "1"
+          DISABLE_KOSDAQ_LOOP: "1"
+          DISABLE_KOSPI_ENGINE: "1"
+        run: |
+          python -m trader.trader
 
       - name: CEO 리포트 자동 생성
         if: always()
@@ -230,18 +264,59 @@ jobs:
         run: |
           python -m trader.report_ceo || true
 
-      - name: Push state (plain)
+      - name: Verify logs
         if: always()
+        run: |
+          ls -al trader/logs || true
+
+      - name: Push state (plain)
+        if: github.event_name != 'pull_request'
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
-      - name: Upload logs and state
+      - name: Save state snapshot as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-trade-state-and-logs
+          name: trader-state-${{ github.run_id }}
           path: |
-            fastapi.log
             trader/state/state.json
-            .runtime/state.json
+            bot_state/state.json
+            trader/logs/CEO_Report_*.md
+            trader/logs/ledger.jsonl
+          retention-days: 30
+
+      - name: Rebalance JSON artifact 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebalance-results
+          path: rebalance_results/*.json
+          if-no-files-found: warn
+          retention-days: 60
+
+      - name: Trades 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs
+          path: trader/logs/*.json
           if-no-files-found: ignore
+          retention-days: 14
+
+      - name: FastAPI 로그 출력 (cat)
+        if: always()
+        run: |
+          echo "::group::FastAPI Server Log"
+          cat fastapi.log || true
+          echo "::endgroup::"
+
+      - name: FastAPI 로그 업로드 (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-log
+          path: fastapi.log
+          if-no-files-found: ignore
+          retention-days: 14
+
