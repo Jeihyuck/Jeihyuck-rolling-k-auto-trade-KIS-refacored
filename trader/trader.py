@@ -64,6 +64,30 @@ def main() -> None:
         )
     )
 
+    expect_kis_env = os.getenv("EXPECT_KIS_ENV")
+    kis_env = (os.getenv("KIS_ENV") or "").strip()
+    api_base_url = (os.getenv("API_BASE_URL") or "").lower()
+    if expect_live_flag:
+        snapshot = {
+            "DRY_RUN": dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
+            "DISABLE_LIVE_TRADING": disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
+            "LIVE_TRADING_ENABLED": live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
+            "STRATEGY_MODE": mode,
+            "EXPECT_KIS_ENV": expect_kis_env,
+            "KIS_ENV": kis_env,
+            "API_BASE_URL": api_base_url,
+            "event": event_name_lower or "unknown",
+        }
+        if dry_run or disable_live_flag.value or (not live_trading_flag.value) or mode != "LIVE":
+            logger.error("[TRADER][GUARD] EXPECT_LIVE_TRADING=1 but live flags invalid: %s", snapshot)
+            raise SystemExit(2)
+        if expect_kis_env and kis_env != expect_kis_env:
+            logger.error("[TRADER][GUARD] EXPECT_KIS_ENV mismatch: %s", snapshot)
+            raise SystemExit(2)
+        if kis_env == "practice" and "openapivts" not in api_base_url:
+            logger.error("[TRADER][GUARD] practice env requires openapivts endpoint: %s", snapshot)
+            raise SystemExit(2)
+
     os.environ["DRY_RUN"] = "1" if dry_run else "0"
     os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry_run or disable_live_flag.value) else "0"
     os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"

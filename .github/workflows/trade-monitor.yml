@@ -1,4 +1,4 @@
-name: Trade Monitor (trader_refactor branch)
+name: Trade Monitor (practice live only)
 
 permissions:
   contents: write
@@ -11,12 +11,6 @@ on:
   schedule:
     - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
-  push:
-    branches: [ main, trader_r1 ]
-    paths-ignore:
-      - "bot_state/**"
-  pull_request:
-    branches: [ main, trader_r1 ]
 
 jobs:
   trade-live:
@@ -31,8 +25,8 @@ jobs:
 
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}          # practice / real
-      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+      KIS_ENV: "practice"
+      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
 
       # === trader.py 운영 파라미터 ===
       PARTIAL1: "0.5"
@@ -91,6 +85,7 @@ jobs:
       DISABLE_LIVE_TRADING: "0"
       LIVE_TRADING_ENABLED: "1"
       EXPECT_LIVE_TRADING: "1"
+      EXPECT_KIS_ENV: "practice"
       STRATEGY_MODE: "LIVE"
 
       # 전략 1만
@@ -130,6 +125,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          ref: trader_r1
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore state cache (fallback only)
@@ -167,16 +163,6 @@ jobs:
       - name: Ledger smoke test
         run: |
           python -m trader.ledger_test
-
-      - name: (LIVE 체크) 핵심 env 값 출력
-        run: |
-          echo "GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
-          python - << 'PY'
-          import os
-          keys = ["DRY_RUN","DISABLE_LIVE_TRADING","LIVE_TRADING_ENABLED","EXPECT_LIVE_TRADING","STRATEGY_MODE","KIS_ENV"]
-          for k in keys:
-              print(k, "=", os.getenv(k))
-          PY
 
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
         run: |
@@ -257,63 +243,3 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
-
-  trade-diag:
-    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
-    env:
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
-      API_BASE_URL: ${{ secrets.API_BASE_URL }}
-
-      # ===== DIAG 강제 =====
-      DRY_RUN: "1"
-      DISABLE_LIVE_TRADING: "1"
-      LIVE_TRADING_ENABLED: "0"
-      EXPECT_LIVE_TRADING: "0"
-      STRATEGY_MODE: "INTENT_ONLY"
-
-      ACTIVE_STRATEGIES: "1"
-      DISABLE_KOSDAQ_LOOP: "1"
-      DISABLE_KOSPI_ENGINE: "1"
-
-      DAILY_CAPITAL: "250000000"
-      API_RATE_SLEEP_SEC: "0.3"
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Dependencies 설치
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Ledger smoke test
-        run: |
-          python -m trader.ledger_test
-
-      - name: Compile modules
-        run: |
-          python -m compileall trader rolling_k_auto_trade_api
-
-      - name: trader DIAG (no live orders)
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m trader.trader
-
-   

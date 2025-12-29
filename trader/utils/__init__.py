@@ -1,7 +1,10 @@
 import logging
 import requests
 
-from settings import SLACK_WEBHOOK
+try:
+    from settings import SLACK_WEBHOOK
+except Exception:
+    SLACK_WEBHOOK = ""
 from .env import (
     EnvFlag,
     FALSE_VALUES,
