@@ -15,7 +15,7 @@ on:
   pull_request:
     branches: [ main, trader_r1 ]
   schedule:
-    - cron: "57 23 * * 0-6"
+    - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
 
 
@@ -221,11 +221,40 @@ jobs:
       - name: Compile modules
         run: |
           python -m compileall trader rolling_k_auto_trade_api
-      - name: trader 자동매매 로직 실행
+      - name: trader 자동매매 로직 실행 (DRY RUN - push/pr)
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         env:
           PYTHONPATH: ${{ github.workspace }}
+          DRY_RUN: "true"
+          LIVE_TRADING_ENABLED: "false"
+          ACTIVE_STRATEGIES: "1"
+          STRATEGY_MODE: "INTENT_ONLY"
+          DISABLE_LIVE_TRADING: "true"
+          DISABLE_KOSDAQ_LOOP: "true"
+          DISABLE_KOSPI_ENGINE: "true"
         run: |
           python -m trader.trader
+
+      - name: trader 자동매매 로직 실행 (LIVE - schedule/dispatch)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DRY_RUN: "false"
+          LIVE_TRADING_ENABLED: "true"
+          ACTIVE_STRATEGIES: "1"
+          STRATEGY_MODE: "LIVE"
+          STRATEGY_DRY_RUN: "false"
+          DISABLE_LIVE_TRADING: "false"
+          DISABLE_KOSDAQ_LOOP: "false"
+          DISABLE_KOSPI_ENGINE: "false"
+        run: |
+          python -m trader.trader
+
+      - name: Copy reconciled state to trader/state/state.json
+        if: always()
+        run: |
+          mkdir -p trader/state
+          test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
 
       - name: CEO 리포트 자동 생성
         if: always()

@@ -13,8 +13,11 @@ from .config import ACTIVE_STRATEGIES, KST, STATE_PATH, UNMANAGED_STRATEGY_ID
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 3
-RUNTIME_STATE_DIR = Path(".runtime")
-RUNTIME_STATE_PATH = RUNTIME_STATE_DIR / "state.json"
+STATE_PRIMARY_PATH = Path(os.getenv("STATE_PATH") or STATE_PATH)
+RUNTIME_STATE_DIR = STATE_PRIMARY_PATH.parent
+RUNTIME_STATE_PATH = STATE_PRIMARY_PATH
+LEGACY_RUNTIME_DIR = Path(".runtime")
+LEGACY_RUNTIME_PATH = LEGACY_RUNTIME_DIR / "state.json"
 _LOT_ID_PREFIX = "LOT"
 
 
@@ -50,15 +53,15 @@ def _default_runtime_state() -> Dict[str, Any]:
     }
 
 
-def load_state() -> Dict[str, Any]:
-    if not RUNTIME_STATE_PATH.exists():
-        return _default_runtime_state()
+def _load_from_path(path: Path) -> Dict[str, Any] | None:
+    if not path.exists():
+        return None
     try:
-        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
         if not isinstance(state, dict):
             logger.warning("[RUNTIME_STATE] invalid state format: %s", type(state))
-            return _default_runtime_state()
+            return None
         state.setdefault("schema_version", SCHEMA_VERSION)
         state.setdefault("positions", {})
         state.setdefault("orders", {})
@@ -91,8 +94,21 @@ def load_state() -> Dict[str, Any]:
                 payload["position_key"] = f"{code_norm}:{payload.get('strategy_id')}"
         return state
     except Exception:
-        logger.exception("[RUNTIME_STATE] failed to load %s", RUNTIME_STATE_PATH)
-        return _default_runtime_state()
+        logger.exception("[RUNTIME_STATE] failed to load %s", path)
+        return None
+
+
+def load_state() -> Dict[str, Any]:
+    primary = _load_from_path(RUNTIME_STATE_PATH)
+    if primary is not None:
+        logger.info("[STATE][LOAD] path=%s source=primary", RUNTIME_STATE_PATH)
+        return primary
+    legacy = _load_from_path(LEGACY_RUNTIME_PATH)
+    if legacy is not None:
+        logger.info("[STATE][LOAD] path=%s source=legacy_runtime", LEGACY_RUNTIME_PATH)
+        return legacy
+    logger.info("[STATE][LOAD] path=%s source=default", RUNTIME_STATE_PATH)
+    return _default_runtime_state()
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -116,16 +132,18 @@ def save_state(state: Dict[str, Any]) -> None:
             logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
         except Exception:
             logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
-        try:
-            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            tmp_state_path = STATE_PATH.with_name(f"{STATE_PATH.name}.tmp")
-            with open(tmp_state_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_state_path, STATE_PATH)
-        except Exception:
-            logger.exception("[STATE][SAVE] failed to mirror %s", STATE_PATH)
+        if LEGACY_RUNTIME_PATH != RUNTIME_STATE_PATH:
+            try:
+                LEGACY_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                tmp_legacy_path = LEGACY_RUNTIME_PATH.with_name(f"{LEGACY_RUNTIME_PATH.name}.tmp")
+                with open(tmp_legacy_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_legacy_path, LEGACY_RUNTIME_PATH)
+                logger.info("[STATE][SAVE] path=%s bytes=%d (legacy_mirror)", LEGACY_RUNTIME_PATH, LEGACY_RUNTIME_PATH.stat().st_size)
+            except Exception:
+                logger.exception("[STATE][SAVE] failed to mirror legacy path %s", LEGACY_RUNTIME_PATH)
     except Exception:
         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
 

@@ -40,10 +40,11 @@ class StrategySlot:
 
 
 class StrategyManager:
-    def __init__(self, total_capital: float | None = None) -> None:
+    def __init__(self, total_capital: float | None = None, active_strategies: set[int] | None = None) -> None:
         self.total_capital = float(total_capital or DAILY_CAPITAL)
         self._seq = 0
         self._zero_weight_warned: set[str] = set()
+        self.active_strategies = set(active_strategies) if active_strategies else set(ACTIVE_STRATEGIES)
         self.slots: list[StrategySlot] = self._register_strategies()
 
     def _register_strategies(self) -> list[StrategySlot]:
@@ -68,12 +69,12 @@ class StrategyManager:
     def enabled_slots(self) -> list[StrategySlot]:
         enabled: list[StrategySlot] = []
         for slot in self.slots:
-            if slot.sid not in ACTIVE_STRATEGIES:
+            if slot.sid not in self.active_strategies:
                 logger.info(
-                    "[STRATEGY_MANAGER] strategy %s sid=%s not in active_strategies=%s -> skipped",
+                    "[STRATEGY_MANAGER] strategy %s sid=%s not in active_strategies=%s -> skipped reason=not_active",
                     slot.name,
                     slot.sid,
-                    sorted(ACTIVE_STRATEGIES),
+                    sorted(self.active_strategies),
                 )
                 continue
             if slot.name not in ENABLED_STRATEGIES_SET:
@@ -287,4 +288,8 @@ class StrategyManager:
                 dedupe_keys.add(key)
                 intents.append(intent)
 
-        return {"enabled": enabled, "intents": [asdict(intent) for intent in intents]}
+        return {
+            "enabled": enabled,
+            "intents": [asdict(intent) for intent in intents],
+            "active_strategies": sorted(self.active_strategies),
+        }

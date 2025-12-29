@@ -113,6 +113,7 @@ CONFIG = {
     "DISABLE_KOSPI_ENGINE": "false",
     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
     "ALLOW_ADOPT_UNMANAGED": "false",
+    "STATE_PATH": "trader/state/state.json",
 }
 
 
@@ -127,9 +128,11 @@ logger = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
-STATE_DIR = Path(__file__).parent / "state"
-STATE_PATH = STATE_DIR / "state.json"
+STATE_DIR_RAW = _cfg("STATE_DIR")
+STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else Path(__file__).parent / "state"
+STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
 MARKET_MAP: Dict[str, str] = {
@@ -232,7 +235,10 @@ else:
     STRATEGY_WEIGHTS = {name: 0.0 for name in RAW_STRATEGY_WEIGHTS.keys()}
 
 STRATEGY_MODE = (_cfg("STRATEGY_MODE") or "INTENT_ONLY").upper()
-STRATEGY_DRY_RUN = (_cfg("STRATEGY_DRY_RUN") or "true").lower() in ("1", "true", "yes")
+_RAW_STRATEGY_DRY_RUN = os.getenv("DRY_RUN")
+if not _RAW_STRATEGY_DRY_RUN:
+    _RAW_STRATEGY_DRY_RUN = _cfg("STRATEGY_DRY_RUN") or "true"
+STRATEGY_DRY_RUN = str(_RAW_STRATEGY_DRY_RUN).lower() in ("1", "true", "yes")
 STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
 STRATEGY_INTENTS_STATE_PATH = Path(
     _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
@@ -347,6 +353,16 @@ GOOD_ENTRY_MA20_RANGE = (1.0, 1.15)  # 현재가/20MA 허용 구간
 GOOD_ENTRY_MAX_FROM_PEAK = 0.97  # 현재가/최근고점 최대치(≤0.97)
 GOOD_ENTRY_MIN_RR = 2.0  # 기대수익/리스크 최소 비율
 GOOD_ENTRY_MIN_INTRADAY_SIG = 2  # GOOD 타점으로 인정하기 위한 최소 intraday 시그널 개수
+
+
+def resolve_active_strategies(raw: str | None = None) -> set[int]:
+    """환경변수 ACTIVE_STRATEGIES를 우선 적용하여 활성 전략 집합을 반환한다."""
+
+    raw_env = os.getenv("ACTIVE_STRATEGIES") if raw is None else raw
+    parsed = _parse_active_strategies(raw_env or "")
+    if parsed:
+        return parsed
+    return ACTIVE_STRATEGIES
 
 BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
 BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)

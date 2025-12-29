@@ -27,9 +27,17 @@ class IntentExecutor:
         self.allow_sell_only = STRATEGY_ALLOW_SELL_ONLY
         self.max_open_intents = int(STRATEGY_MAX_OPEN_INTENTS)
 
-    def _should_dry_run(self) -> bool:
+    def _should_dry_run(self) -> tuple[bool, str]:
         disable_live = os.getenv("DISABLE_LIVE_TRADING", "").lower() in {"1", "true", "yes", "on"}
-        return disable_live or STRATEGY_DRY_RUN or STRATEGY_MODE == "INTENT_ONLY"
+        reasons = []
+        if disable_live:
+            reasons.append("DISABLE_LIVE_TRADING env=true")
+        if STRATEGY_DRY_RUN:
+            reasons.append("STRATEGY_DRY_RUN config=true")
+        if STRATEGY_MODE == "INTENT_ONLY":
+            reasons.append("STRATEGY_MODE=INTENT_ONLY")
+        dry_run = bool(reasons)
+        return dry_run, ",".join(reasons) if dry_run else ""
 
     def run_once(self) -> Dict[str, Any]:
         intents: list[Dict[str, Any]] = []
@@ -43,7 +51,13 @@ class IntentExecutor:
             logger.exception("[INTENT_EXECUTOR] failed to load intents")
             return {"acks": [], "status": "error"}
 
-        dry_run = self._should_dry_run()
+        dry_run, dry_run_reason = self._should_dry_run()
+        logger.info(
+            "[INTENT_EXECUTOR] dry_run=%s reason=%s max_open_intents=%s",
+            dry_run,
+            dry_run_reason or "live",
+            self.max_open_intents,
+        )
         acks: list[ExecutionAck] = []
         processed = 0
         last_processed_offset = int(cursor.get("start_offset") or cursor.get("offset") or 0)
@@ -128,4 +142,9 @@ class IntentExecutor:
             last_intent_id=last_intent_id,
             last_ts=last_ts,
         )
-        return {"acks": [ack.__dict__ for ack in acks], "processed": processed, "dry_run": dry_run}
+        return {
+            "acks": [ack.__dict__ for ack in acks],
+            "processed": processed,
+            "dry_run": dry_run,
+            "dry_run_reason": dry_run_reason if dry_run else "",
+        }

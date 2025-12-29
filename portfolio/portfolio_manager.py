@@ -34,8 +34,10 @@ class PortfolioManager:
         total_capital: float | None = None,
         kospi_ratio: float = 0.6,
         kosdaq_ratio: float = 0.4,
+        active_strategies: set[int] | None = None,
     ) -> None:
         self.total_capital = float(total_capital or DAILY_CAPITAL)
+        self.active_strategies = set(active_strategies) if active_strategies else set()
         if kospi_ratio + kosdaq_ratio == 0:
             kospi_ratio, kosdaq_ratio = 0.6, 0.4
         norm = kospi_ratio + kosdaq_ratio
@@ -44,13 +46,17 @@ class PortfolioManager:
         self.kospi_engine = KospiCoreEngine(capital=self.total_capital * self.kospi_ratio)
         self.kosdaq_engine = KosdaqAlphaEngine(capital=self.total_capital * self.kosdaq_ratio)
         self.performance = PerformanceTracker()
-        self.strategy_manager = StrategyManager(total_capital=self.total_capital)
+        self.strategy_manager = StrategyManager(
+            total_capital=self.total_capital,
+            active_strategies=self.active_strategies or None,
+        )
         self.intent_executor = IntentExecutor()
         logger.info(
-            "[PORTFOLIO] capital=%s kospi=%.0f%% kosdaq=%.0f%%",
+            "[PORTFOLIO] capital=%s kospi=%.0f%% kosdaq=%.0f%% active_strategies=%s",
             int(self.total_capital),
             self.kospi_ratio * 100,
             self.kosdaq_ratio * 100,
+            sorted(self.strategy_manager.active_strategies),
         )
 
     def run_once(self) -> Dict[str, Any]:
@@ -72,19 +78,22 @@ class PortfolioManager:
 
         runtime_state = state_store.load_state()
         logger.info(
-            "[DIAG][PM] diagnostic_mode=%s diagnostic_only=%s",
+            "[DIAG][PM] diagnostic_mode=%s diagnostic_only=%s active_strategies=%s",
             DIAG_ENABLED,
             DIAGNOSTIC_ONLY,
+            sorted(self.strategy_manager.active_strategies),
         )
         if DIAG_ENABLED:
             os.environ["DISABLE_LIVE_TRADING"] = "true"
             logger.info("[DIAG][PM] forcing DISABLE_LIVE_TRADING=true diag_enabled=%s", DIAG_ENABLED)
             diag_result = run_diagnostics_once(selected_by_market=selected_by_market)
             if DIAGNOSTIC_ONLY:
+                skip_reason = "diagnostic_only_mode"
                 return {
                     "diagnostics": diag_result,
-                    "kospi": {"status": "skipped"},
-                    "kosdaq": {"status": "skipped"},
+                    "kospi": {"status": "skipped", "reason": skip_reason},
+                    "kosdaq": {"status": "skipped", "reason": skip_reason},
+                    "active_strategies": sorted(self.strategy_manager.active_strategies),
                 }
 
         try:
@@ -109,7 +118,9 @@ class PortfolioManager:
 
         try:
             if DISABLE_KOSPI_ENGINE:
-                kospi = {"status": "disabled"}
+                kospi_disable_reason = "env DISABLE_KOSPI_ENGINE=true"
+                logger.warning("[KOSPI][DISABLED] reason=%s active_strategies=%s", kospi_disable_reason, sorted(self.strategy_manager.active_strategies))
+                kospi = {"status": "disabled", "reason": kospi_disable_reason}
             else:
                 kospi = self.kospi_engine.rebalance_if_needed(
                     selected_stocks=selected_by_market.get("KOSPI")
@@ -119,7 +130,9 @@ class PortfolioManager:
             kospi = {"status": "error", "message": str(e)}
         try:
             if DISABLE_KOSDAQ_LOOP:
-                kosdaq = {"status": "disabled"}
+                kosdaq_disable_reason = "env DISABLE_KOSDAQ_LOOP=true"
+                logger.warning("[KOSDAQ][DISABLED] reason=%s active_strategies=%s", kosdaq_disable_reason, sorted(self.strategy_manager.active_strategies))
+                kosdaq = {"status": "disabled", "reason": kosdaq_disable_reason}
             else:
                 kosdaq = self.kosdaq_engine.trade_loop(
                     selected_stocks=selected_by_market.get("KOSDAQ")
@@ -133,10 +146,12 @@ class PortfolioManager:
                 "kosdaq_alpha": self.kosdaq_engine.capital,
             }
         )
+        strategy_result.setdefault("active_strategies", sorted(self.strategy_manager.active_strategies))
         return {
             "strategies": {"manager": strategy_result, "executor": executor_result},
             "diagnostics": diag_result,
             "kospi": kospi,
             "kosdaq": kosdaq,
             "performance": perf,
+            "active_strategies": sorted(self.strategy_manager.active_strategies),
         }
