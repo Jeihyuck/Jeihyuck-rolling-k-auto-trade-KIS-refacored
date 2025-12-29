@@ -1,0 +1,399 @@
+diff --git a/.github/workflows/ci-check.yml b/.github/workflows/ci-check.yml
+index 40a09b3fca9061add6b455b1ca39b26e55f872ac..18f5ccb2f76e62b973b4d21ebae438a3054e2416 100644
+--- a/.github/workflows/ci-check.yml
++++ b/.github/workflows/ci-check.yml
+@@ -1,30 +1,38 @@
+-name: CI Checks
++name: CI Checks (no live trader)
+ 
+ on:
+   push:
+   pull_request:
+ 
++permissions:
++  contents: read
++
+ jobs:
+   tests:
+     runs-on: ubuntu-latest
++    env:
++      DRY_RUN: "1"
++      DISABLE_LIVE_TRADING: "1"
++      LIVE_TRADING_ENABLED: "0"
++      EXPECT_LIVE_TRADING: "0"
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
+       - name: Static compile check
+         run: |
+           python -m compileall portfolio strategy trader rolling_k_auto_trade_api
+ 
+       - name: Ledger tests
+         run: |
+           python -m trader.ledger_test
+diff --git a/.github/workflows/trade-monitor.yml b/.github/workflows/trade-monitor-live.yml
+similarity index 67%
+rename from .github/workflows/trade-monitor.yml
+rename to .github/workflows/trade-monitor-live.yml
+index 7baa7ae457964948cee9b1eff993aa54f4d03914..bd5fd6bfe8544a0cf2e43e32abaa1abfd8890539 100644
+--- a/.github/workflows/trade-monitor.yml
++++ b/.github/workflows/trade-monitor-live.yml
+@@ -1,38 +1,43 @@
+-name: Trade Monitor (practice live only)
++name: Trade Monitor LIVE (practice VTS)
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: false
+ 
+ on:
+   schedule:
+     - cron: "*/5 0-6 * * 1-5"
+   workflow_dispatch:
++    inputs:
++      run_minutes:
++        description: "Minutes to run trader loop (60s interval)"
++        required: false
++        default: "360"
+ 
+ jobs:
+   trade-live:
+     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+     runs-on: ubuntu-latest
+     env:
+       # === KIS 인증키 ===
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+ 
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ENV: "practice"
+       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+ 
+       # === trader.py 운영 파라미터 ===
+       PARTIAL1: "0.5"
+       PARTIAL2: "0.3"
+       TRAIL_PCT: "0.02"
+       FAST_STOP: "0.01"
+       ATR_STOP: "1.5"
+ 
+       TIME_STOP_HHMM: "13:00"
+@@ -98,148 +103,145 @@ jobs:
+       # 안전: 장외 금지
+       ALLOW_AFTER_HOURS: "0"
+       ALLOW_ADOPT_UNMANAGED: "0"
+ 
+       # 배분/속도
+       DAILY_CAPITAL: "250000000"
+       API_RATE_SLEEP_SEC: "0.3"
+ 
+       # === VWAP 분봉 TR ===
+       KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
+       KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
+ 
+       # === FastAPI 리밸런싱 서버(선정 필터) ===
+       MIN_TRADES: "5"
+       MAX_MDD_PCT: "30"
+       MIN_WINRATE: "50"
+       MIN_CUMRET: "2"
+       TOP_K_LIMIT: "20"
+       TOTAL_CAPITAL: "10000000"
+       MIN_QTY_PER_TICKET: "1"
+       K_MIN: "0.1"
+       K_MAX: "0.9"
+       K_STEP: "0.1"
+       REBALANCE_OUT_DIR: "rebalance_results"
+ 
++      RUN_MINUTES: ${{ github.event.inputs.run_minutes || 360 }}
++
+     steps:
++      - name: Preflight (secrets/event/practice)
++        run: |
++          set -euo pipefail
++          if [[ "${GITHUB_EVENT_NAME}" != "schedule" && "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
++            echo "[FAIL] Invalid trigger: ${GITHUB_EVENT_NAME}" >&2
++            exit 1
++          fi
++          required_envs=(KIS_APP_KEY KIS_APP_SECRET APP_KEY APP_SECRET CANO ACNT_PRDT_CD)
++          missing=()
++          for key in "${required_envs[@]}"; do
++            if [[ -z "${!key:-}" ]]; then
++              missing+=("${key}")
++            fi
++          done
++          if (( ${#missing[@]} > 0 )); then
++            echo "[FAIL] Missing required secrets/env: ${missing[*]}" >&2
++            exit 1
++          fi
++          if [[ "${KIS_ENV,,}" != "practice" ]]; then
++            echo "[FAIL] KIS_ENV must be practice (VTS)" >&2
++            exit 1
++          fi
++          api_lower="${API_BASE_URL,,}"
++          if [[ "${api_lower}" != *"openapivts"* ]]; then
++            echo "[FAIL] API_BASE_URL must point to openapivts practice endpoint" >&2
++            exit 1
++          fi
++          if ! [[ "${RUN_MINUTES}" =~ ^[0-9]+$ ]]; then
++            echo "[FAIL] RUN_MINUTES must be a positive integer" >&2
++            exit 1
++          fi
++          if [[ "${RUN_MINUTES}" -lt 1 ]]; then
++            echo "[FAIL] RUN_MINUTES must be >=1" >&2
++            exit 1
++          fi
++          echo "[OK] Preflight checks passed"
++
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           ref: trader_r1
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+-      - name: Restore state cache (fallback only)
+-        uses: actions/cache/restore@v4
+-        with:
+-          path: |
+-            bot_state/state.json
+-            trader/state/state.json
+-          key: trader-state-${{ github.ref_name }}
+-          restore-keys: |
+-            trader-state-${{ github.ref_name }}-
++      - name: Ensure trader_r1 branch checked out
++        run: |
++          git checkout trader_r1
+ 
+       - name: Set git identity
+         run: |
+           git config user.name "trade-bot"
+           git config user.email "trade-bot@users.noreply.github.com"
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Ensure state scripts executable
+         run: |
+           chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
+ 
+       - name: Pull state (plain)
+         run: |
+           bash scripts/state_pull_plain.sh
+ 
+-      - name: Dependencies 설치
++      - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
+-      - name: Ledger smoke test
+-        run: |
+-          python -m trader.ledger_test
+-
+-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+-        run: |
+-          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+-          sleep 30
+-
+       - name: Compile modules
+         run: |
+-          python -m compileall trader rolling_k_auto_trade_api
++          python -m compileall trader rolling_k_auto_trade_api portfolio strategy
+ 
+-      - name: trader LIVE (strategy1 only)
++      - name: Run trader LIVE loop (60s interval)
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+-          python -m trader.trader
++          set -euo pipefail
++          minutes=${RUN_MINUTES}
++          for ((i=0; i<minutes; i++)); do
++            echo "[TRADER][${i}/${minutes}] cycle start $(date -u --iso-8601=seconds)"
++            python -m trader.trader
++            if [[ $((i + 1)) -lt minutes ]]; then
++              sleep 60
++            fi
++          done
+ 
+       - name: Normalize state path
+         if: always()
+         run: |
+           mkdir -p trader/state
+           test -f .runtime/state.json && cp -f .runtime/state.json trader/state/state.json || true
+           test -f trader/state/state.json && echo "[STATE] trader/state/state.json exists" || echo "[STATE] missing!"
+ 
+       - name: CEO 리포트 자동 생성
+         if: always()
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.report_ceo || true
+ 
+       - name: Push state (plain)
+         if: always()
+         run: |
+           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+ 
+-      - name: Save state snapshot as artifact (audit only)
++      - name: Upload logs and state
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+-          name: trader-state-${{ github.run_id }}
++          name: live-trade-state-and-logs
+           path: |
++            fastapi.log
+             trader/state/state.json
+-            bot_state/state.json
+-            trader/logs/CEO_Report_*.md
+-            trader/logs/ledger.jsonl
+-          retention-days: 30
+-
+-      - name: Rebalance JSON artifact 업로드
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: rebalance-results
+-          path: rebalance_results/*.json
+-          if-no-files-found: warn
+-          retention-days: 60
+-
+-      - name: Trades 로그 업로드
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: trade-logs
+-          path: trader/logs/*.json
+-          if-no-files-found: ignore
+-          retention-days: 14
+-
+-      - name: FastAPI 로그 출력 (cat)
+-        if: always()
+-        run: |
+-          echo "::group::FastAPI Server Log"
+-          cat fastapi.log || true
+-          echo "::endgroup::"
+-
+-      - name: FastAPI 로그 업로드 (artifact)
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: fastapi-log
+-          path: fastapi.log
++            .runtime/state.json
+           if-no-files-found: ignore
+-          retention-days: 14
+diff --git a/trader/trader.py b/trader/trader.py
+index 12bb13daa61750dcd28fca391482b29e43585a82..f04b9b75467079127cc70bb90f5b7b5f8954893e 100644
+--- a/trader/trader.py
++++ b/trader/trader.py
+@@ -43,71 +43,81 @@ def main() -> None:
+         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+     if diag_enabled:
+         dry_run_reasons.append("diagnostic_mode")
+     if not live_trading_flag.value and mode == "LIVE":
+         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+     if dry_run_flag.value:
+         dry_run_reasons.append("DRY_RUN=1")
+     if event_name_lower in {"push", "pull_request"} and mode == "LIVE":
+         dry_run_reasons.append(f"event={event_name_lower}")
+     for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
+         if not flag.valid:
+             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+ 
+     dry_run = bool(dry_run_reasons)
+     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+     live_trading_enabled = bool(
+         mode == "LIVE" and live_trading_flag.value and not disable_live_flag.value and not dry_run
+     )
+     engine_disabled_reason = dry_run_reason if dry_run else (
+         "DISABLE_LIVE_TRADING env=true" if disable_live_flag.value else (
+             "LIVE_TRADING_ENABLED env=false" if not live_trading_flag.value else "enabled"
+         )
+     )
+ 
+     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
+-    kis_env = (os.getenv("KIS_ENV") or "").strip()
++    kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
++    kis_env = kis_env_raw.lower()
+     api_base_url = (os.getenv("API_BASE_URL") or "").lower()
+     if expect_live_flag:
+         snapshot = {
+             "DRY_RUN": dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
+             "DISABLE_LIVE_TRADING": disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
+             "LIVE_TRADING_ENABLED": live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
+             "STRATEGY_MODE": mode,
+             "EXPECT_KIS_ENV": expect_kis_env,
+-            "KIS_ENV": kis_env,
++            "KIS_ENV": kis_env_raw,
+             "API_BASE_URL": api_base_url,
+             "event": event_name_lower or "unknown",
+         }
+-        if dry_run or disable_live_flag.value or (not live_trading_flag.value) or mode != "LIVE":
+-            logger.error("[TRADER][GUARD] EXPECT_LIVE_TRADING=1 but live flags invalid: %s", snapshot)
+-            raise SystemExit(2)
+-        if expect_kis_env and kis_env != expect_kis_env:
+-            logger.error("[TRADER][GUARD] EXPECT_KIS_ENV mismatch: %s", snapshot)
+-            raise SystemExit(2)
+-        if kis_env == "practice" and "openapivts" not in api_base_url:
+-            logger.error("[TRADER][GUARD] practice env requires openapivts endpoint: %s", snapshot)
++        guard_failures: list[str] = []
++        if dry_run_flag.value or not dry_run_flag.valid:
++            guard_failures.append("DRY_RUN!=0")
++        if disable_live_flag.value or not disable_live_flag.valid:
++            guard_failures.append("DISABLE_LIVE_TRADING!=0")
++        if (not live_trading_flag.value) or (not live_trading_flag.valid):
++            guard_failures.append("LIVE_TRADING_ENABLED!=1")
++        if mode != "LIVE":
++            guard_failures.append("STRATEGY_MODE!=LIVE")
++        if kis_env != "practice":
++            guard_failures.append("KIS_ENV!=practice")
++        if "openapivts" not in api_base_url:
++            guard_failures.append("API_BASE_URL missing openapivts")
++        if expect_kis_env and kis_env_raw != expect_kis_env:
++            guard_failures.append("EXPECT_KIS_ENV mismatch")
++        if guard_failures:
++            logger.error("[TRADER][GUARD] EXPECT_LIVE_TRADING=1 but guard failed: %s reasons=%s", snapshot, guard_failures)
+             raise SystemExit(2)
+ 
+     os.environ["DRY_RUN"] = "1" if dry_run else "0"
+     os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry_run or disable_live_flag.value) else "0"
+     os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
+     os.environ["STRATEGY_MODE"] = mode
+ 
+     if expect_live_flag and dry_run:
+         resolved_values = (
+             f"DRY_RUN={dry_run_flag.raw!r} DISABLE_LIVE_TRADING={disable_live_flag.raw!r} "
+             f"LIVE_TRADING_ENABLED={live_trading_flag.raw!r} mode={mode} event={event_name_lower or 'unknown'}"
+         )
+         raise SystemExit(
+             f"EXPECT_LIVE_TRADING=1 but dry_run resolved True. reasons={dry_run_reasons} values={resolved_values}"
+         )
+     logger.info(
+         "[DIAG][TRADER] now=%s trading_day=%s diag_enabled=%s force_run=%s only=%s mode=%s",
+         now.isoformat(),
+         trading_day,
+         DIAG_ENABLED,
+         DIAGNOSTIC_FORCE_RUN,
+         DIAGNOSTIC_ONLY,
+         DIAGNOSTIC_MODE,
+     )
+     logger.info(

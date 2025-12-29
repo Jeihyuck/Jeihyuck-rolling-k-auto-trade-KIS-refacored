@@ -1,4 +1,4 @@
-name: Trade Monitor (practice live only)
+name: Trade Monitor LIVE (practice VTS)
 
 permissions:
   contents: write
@@ -11,6 +11,11 @@ on:
   schedule:
     - cron: "*/5 0-6 * * 1-5"
   workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "Minutes to run trader loop (60s interval)"
+        required: false
+        default: "360"
 
 jobs:
   trade-live:
@@ -120,7 +125,46 @@ jobs:
       K_STEP: "0.1"
       REBALANCE_OUT_DIR: "rebalance_results"
 
+      RUN_MINUTES: ${{ github.event.inputs.run_minutes || 360 }}
+
     steps:
+      - name: Preflight (secrets/event/practice)
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "schedule" && "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "[FAIL] Invalid trigger: ${GITHUB_EVENT_NAME}" >&2
+            exit 1
+          fi
+          required_envs=(KIS_APP_KEY KIS_APP_SECRET APP_KEY APP_SECRET CANO ACNT_PRDT_CD)
+          missing=()
+          for key in "${required_envs[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("${key}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "[FAIL] Missing required secrets/env: ${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ "${KIS_ENV,,}" != "practice" ]]; then
+            echo "[FAIL] KIS_ENV must be practice (VTS)" >&2
+            exit 1
+          fi
+          api_lower="${API_BASE_URL,,}"
+          if [[ "${api_lower}" != *"openapivts"* ]]; then
+            echo "[FAIL] API_BASE_URL must point to openapivts practice endpoint" >&2
+            exit 1
+          fi
+          if ! [[ "${RUN_MINUTES}" =~ ^[0-9]+$ ]]; then
+            echo "[FAIL] RUN_MINUTES must be a positive integer" >&2
+            exit 1
+          fi
+          if [[ "${RUN_MINUTES}" -lt 1 ]]; then
+            echo "[FAIL] RUN_MINUTES must be >=1" >&2
+            exit 1
+          fi
+          echo "[OK] Preflight checks passed"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -128,15 +172,9 @@ jobs:
           ref: trader_r1
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore state cache (fallback only)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-          restore-keys: |
-            trader-state-${{ github.ref_name }}-
+      - name: Ensure trader_r1 branch checked out
+        run: |
+          git checkout trader_r1
 
       - name: Set git identity
         run: |
@@ -155,29 +193,28 @@ jobs:
         run: |
           bash scripts/state_pull_plain.sh
 
-      - name: Dependencies 설치
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ledger smoke test
-        run: |
-          python -m trader.ledger_test
-
-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
-        run: |
-          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30
-
       - name: Compile modules
         run: |
-          python -m compileall trader rolling_k_auto_trade_api
+          python -m compileall trader rolling_k_auto_trade_api portfolio strategy
 
-      - name: trader LIVE (strategy1 only)
+      - name: Run trader LIVE loop (60s interval)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.trader
+          set -euo pipefail
+          minutes=${RUN_MINUTES}
+          for ((i=0; i<minutes; i++)); do
+            echo "[TRADER][${i}/${minutes}] cycle start $(date -u --iso-8601=seconds)"
+            python -m trader.trader
+            if [[ $((i + 1)) -lt minutes ]]; then
+              sleep 60
+            fi
+          done
 
       - name: Normalize state path
         if: always()
@@ -198,48 +235,13 @@ jobs:
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
-      - name: Save state snapshot as artifact (audit only)
+      - name: Upload logs and state
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trader-state-${{ github.run_id }}
+          name: live-trade-state-and-logs
           path: |
+            fastapi.log
             trader/state/state.json
-            bot_state/state.json
-            trader/logs/CEO_Report_*.md
-            trader/logs/ledger.jsonl
-          retention-days: 30
-
-      - name: Rebalance JSON artifact 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rebalance-results
-          path: rebalance_results/*.json
-          if-no-files-found: warn
-          retention-days: 60
-
-      - name: Trades 로그 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-logs
-          path: trader/logs/*.json
+            .runtime/state.json
           if-no-files-found: ignore
-          retention-days: 14
-
-      - name: FastAPI 로그 출력 (cat)
-        if: always()
-        run: |
-          echo "::group::FastAPI Server Log"
-          cat fastapi.log || true
-          echo "::endgroup::"
-
-      - name: FastAPI 로그 업로드 (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fastapi-log
-          path: fastapi.log
-          if-no-files-found: ignore
-          retention-days: 14

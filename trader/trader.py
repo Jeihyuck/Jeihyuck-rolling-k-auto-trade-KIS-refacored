@@ -65,7 +65,8 @@ def main() -> None:
     )
 
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
-    kis_env = (os.getenv("KIS_ENV") or "").strip()
+    kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
+    kis_env = kis_env_raw.lower()
     api_base_url = (os.getenv("API_BASE_URL") or "").lower()
     if expect_live_flag:
         snapshot = {
@@ -74,18 +75,27 @@ def main() -> None:
             "LIVE_TRADING_ENABLED": live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
             "STRATEGY_MODE": mode,
             "EXPECT_KIS_ENV": expect_kis_env,
-            "KIS_ENV": kis_env,
+            "KIS_ENV": kis_env_raw,
             "API_BASE_URL": api_base_url,
             "event": event_name_lower or "unknown",
         }
-        if dry_run or disable_live_flag.value or (not live_trading_flag.value) or mode != "LIVE":
-            logger.error("[TRADER][GUARD] EXPECT_LIVE_TRADING=1 but live flags invalid: %s", snapshot)
-            raise SystemExit(2)
-        if expect_kis_env and kis_env != expect_kis_env:
-            logger.error("[TRADER][GUARD] EXPECT_KIS_ENV mismatch: %s", snapshot)
-            raise SystemExit(2)
-        if kis_env == "practice" and "openapivts" not in api_base_url:
-            logger.error("[TRADER][GUARD] practice env requires openapivts endpoint: %s", snapshot)
+        guard_failures: list[str] = []
+        if dry_run_flag.value or not dry_run_flag.valid:
+            guard_failures.append("DRY_RUN!=0")
+        if disable_live_flag.value or not disable_live_flag.valid:
+            guard_failures.append("DISABLE_LIVE_TRADING!=0")
+        if (not live_trading_flag.value) or (not live_trading_flag.valid):
+            guard_failures.append("LIVE_TRADING_ENABLED!=1")
+        if mode != "LIVE":
+            guard_failures.append("STRATEGY_MODE!=LIVE")
+        if kis_env != "practice":
+            guard_failures.append("KIS_ENV!=practice")
+        if "openapivts" not in api_base_url:
+            guard_failures.append("API_BASE_URL missing openapivts")
+        if expect_kis_env and kis_env_raw != expect_kis_env:
+            guard_failures.append("EXPECT_KIS_ENV mismatch")
+        if guard_failures:
+            logger.error("[TRADER][GUARD] EXPECT_LIVE_TRADING=1 but guard failed: %s reasons=%s", snapshot, guard_failures)
             raise SystemExit(2)
 
     os.environ["DRY_RUN"] = "1" if dry_run else "0"
