@@ -169,6 +169,77 @@ jobs:
         run: |
           python -m trader.ledger_test
 
+      - name: Decide trading mode/env
+        id: decide-mode
+        run: |
+          ALLOW="${{ vars.ALLOW_LIVE_ON_PUSH || '0' }}"
+          EVENT="${{ github.event_name }}"
+          RUN_LIVE="1"
+          if [ "$EVENT" = "pull_request" ]; then
+            RUN_LIVE="0"
+          elif [ "$EVENT" = "push" ] && [ "$ALLOW" != "1" ]; then
+            RUN_LIVE="0"
+          fi
+
+          ALLOW_FOR_ENV="$ALLOW"
+
+          if [ "$RUN_LIVE" = "1" ]; then
+            DRY_RUN="0"
+            EXPECT_LIVE="1"
+            DISABLE_LIVE="0"
+            LIVE_ENABLED="1"
+            STRATEGY_MODE="LIVE"
+            ALLOW_FOR_ENV="1"
+          else
+            DRY_RUN="1"
+            EXPECT_LIVE="0"
+            DISABLE_LIVE="0"
+            LIVE_ENABLED="1"
+            STRATEGY_MODE="INTENT_ONLY"
+          fi
+
+          {
+            echo "allow_live_on_push=$ALLOW_FOR_ENV"
+            echo "run_live=$RUN_LIVE"
+            echo "dry_run=$DRY_RUN"
+            echo "expect_live=$EXPECT_LIVE"
+            echo "disable_live=$DISABLE_LIVE"
+            echo "live_enabled=$LIVE_ENABLED"
+            echo "strategy_mode=$STRATEGY_MODE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: (CI) Trading mode summary
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          ALLOW_LIVE_ON_PUSH: ${{ steps.decide-mode.outputs.allow_live_on_push }}
+          EXPECT_LIVE_TRADING: ${{ steps.decide-mode.outputs.expect_live }}
+          DRY_RUN: ${{ steps.decide-mode.outputs.dry_run }}
+          DISABLE_LIVE_TRADING: ${{ steps.decide-mode.outputs.disable_live }}
+          LIVE_TRADING_ENABLED: ${{ steps.decide-mode.outputs.live_enabled }}
+          STRATEGY_MODE: ${{ steps.decide-mode.outputs.strategy_mode }}
+        run: |
+          python - <<'PY'
+          import os
+          event = os.getenv("GITHUB_EVENT_NAME")
+          allow = os.getenv("ALLOW_LIVE_ON_PUSH")
+          expect = os.getenv("EXPECT_LIVE_TRADING")
+          dry_run = os.getenv("DRY_RUN")
+          disable = os.getenv("DISABLE_LIVE_TRADING")
+          live_enabled = os.getenv("LIVE_TRADING_ENABLED")
+          mode = os.getenv("STRATEGY_MODE")
+          print(f"event={event}")
+          print(f"ALLOW_LIVE_ON_PUSH={allow}")
+          print(f"EXPECT_LIVE_TRADING={expect}")
+          print(f"DRY_RUN={dry_run}")
+          print(f"DISABLE_LIVE_TRADING={disable}")
+          print(f"LIVE_TRADING_ENABLED={live_enabled}")
+          print(f"STRATEGY_MODE={mode}")
+          if dry_run == "1":
+            print("Trading mode: DRY_RUN (no live trades).")
+          else:
+            print("Trading mode: LIVE enabled.")
+          PY
+
       - name: (진단) 핵심 환경변수 주입 여부만 확인
         run: |
           python - << 'PY'
@@ -215,6 +286,12 @@ jobs:
           python -m compileall trader rolling_k_auto_trade_api
       - name: trader 자동매매 로직 실행
         env:
+          EXPECT_LIVE_TRADING: ${{ steps.decide-mode.outputs.expect_live }}
+          DRY_RUN: ${{ steps.decide-mode.outputs.dry_run }}
+          DISABLE_LIVE_TRADING: ${{ steps.decide-mode.outputs.disable_live }}
+          LIVE_TRADING_ENABLED: ${{ steps.decide-mode.outputs.live_enabled }}
+          STRATEGY_MODE: ${{ steps.decide-mode.outputs.strategy_mode }}
+          ALLOW_LIVE_ON_PUSH: ${{ steps.decide-mode.outputs.allow_live_on_push }}
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m trader.trader

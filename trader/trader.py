@@ -23,6 +23,10 @@ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 logger = logging.getLogger(__name__)
 
 
+def truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def main() -> None:
     now = now_kst()
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
@@ -33,25 +37,41 @@ def main() -> None:
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+    allow_live_on_push = truthy(os.getenv("ALLOW_LIVE_ON_PUSH", "0"))
     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
 
     dry_run_reasons: list[str] = []
+    decision_reasons: list[str] = []
     if mode == "INTENT_ONLY":
         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+        decision_reasons.append("STRATEGY_MODE=INTENT_ONLY")
     if disable_live_flag.value:
         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+        decision_reasons.append("DISABLE_LIVE_TRADING=1")
     if diag_enabled:
         dry_run_reasons.append("diagnostic_mode")
+        decision_reasons.append("diagnostic_mode")
     if not live_trading_flag.value and mode == "LIVE":
         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+        decision_reasons.append("LIVE_TRADING_ENABLED=0")
     if dry_run_flag.value:
         dry_run_reasons.append("DRY_RUN=1")
-    if event_name_lower in {"push", "pull_request"} and mode == "LIVE":
-        dry_run_reasons.append(f"event={event_name_lower}")
+        decision_reasons.append("DRY_RUN=1")
+    if mode == "LIVE":
+        if event_name_lower == "pull_request":
+            dry_run_reasons.append("event=pull_request")
+            decision_reasons.append("event=pull_request")
+        elif event_name_lower == "push":
+            if allow_live_on_push:
+                decision_reasons.append("event=push_allowed")
+            else:
+                dry_run_reasons.append("event=push")
+                decision_reasons.append("event=push")
     for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
         if not flag.valid:
             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+            decision_reasons.append(f"{flag.name}=invalid({flag.raw})")
 
     dry_run = bool(dry_run_reasons)
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
@@ -62,6 +82,21 @@ def main() -> None:
         "DISABLE_LIVE_TRADING env=true" if disable_live_flag.value else (
             "LIVE_TRADING_ENABLED env=false" if not live_trading_flag.value else "enabled"
         )
+    )
+
+    logger.info(
+        "[TRADER][DRY_RUN_RESOLVE] event=%s allow_live_on_push=%s dry_run=%s reasons=%s env_flags=%s",
+        event_name_lower or "unknown",
+        allow_live_on_push,
+        dry_run,
+        decision_reasons or ["live"],
+        {
+            "DRY_RUN": dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
+            "DISABLE_LIVE_TRADING": disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
+            "LIVE_TRADING_ENABLED": live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
+            "STRATEGY_MODE": mode,
+            "ALLOW_LIVE_ON_PUSH": allow_live_on_push,
+        },
     )
 
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
@@ -106,7 +141,8 @@ def main() -> None:
     if expect_live_flag and dry_run:
         resolved_values = (
             f"DRY_RUN={dry_run_flag.raw!r} DISABLE_LIVE_TRADING={disable_live_flag.raw!r} "
-            f"LIVE_TRADING_ENABLED={live_trading_flag.raw!r} mode={mode} event={event_name_lower or 'unknown'}"
+            f"LIVE_TRADING_ENABLED={live_trading_flag.raw!r} mode={mode} event={event_name_lower or 'unknown'} "
+            f"ALLOW_LIVE_ON_PUSH={allow_live_on_push!r}"
         )
         raise SystemExit(
             f"EXPECT_LIVE_TRADING=1 but dry_run resolved True. reasons={dry_run_reasons} values={resolved_values}"
