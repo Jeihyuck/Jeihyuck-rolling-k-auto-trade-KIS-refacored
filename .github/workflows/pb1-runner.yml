@@ -1,0 +1,66 @@
+name: PB1 Close Pullback Runner
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pb1-close-runner
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 23 * * *"
+    - cron: "*/5 0-2 * * *"
+    - cron: "*/5 5-6 * * *"
+
+jobs:
+  pb1-run:
+    if: github.ref != 'refs/heads/bot-state'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BOTSTATE_BRANCH: bot-state
+      MORNING_WINDOW_START: "08:50"
+      MORNING_WINDOW_END: "11:00"
+      MORNING_EXIT_START: "09:00"
+      MORNING_EXIT_END: "09:20"
+      AFTERNOON_WINDOW_START: "14:00"
+      AFTERNOON_WINDOW_END: "15:30"
+      CLOSE_AUCTION_START: "15:20"
+      CLOSE_AUCTION_END: "15:30"
+      ENABLE_BREAKOUT: "false"
+      LEDGER_BASE_DIR: "bot_state/trader_ledger"
+      LEDGER_LOOKBACK_DAYS: "120"
+      BOTSTATE_LOCK_TTL_SEC: "900"
+      STRATEGY_MODE: "INTENT_ONLY"
+      DRY_RUN: "1"
+      EXPECT_LIVE_TRADING: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set git identity
+        run: |
+          git config user.name "trade-bot"
+          git config user.email "trade-bot@users.noreply.github.com"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile modules
+        run: |
+          python -m compileall trader
+
+      - name: Run PB1 window router
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
