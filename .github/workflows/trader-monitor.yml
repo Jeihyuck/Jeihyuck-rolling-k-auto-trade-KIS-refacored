@@ -14,43 +14,21 @@ on:
       - "bot_state/**"
   pull_request:
     branches: [ main, trader_refactor ]
-  # ✅ UTC 23:40 = KST 08:40 (장 시작 전 대기/장중 LIVE 시작용)
   schedule:
-    - cron: "40 23 * * 0-6"
+    - cron: "57 23 * * 0-6"
   workflow_dispatch:
-    inputs:
-      run_mode:
-        description: "auto=규칙대로, live=강제 LIVE(장오픈전이면 대기 후 LIVE), diag=강제 DIAG"
-        required: false
-        default: "auto"
-        type: choice
-        options: [ auto, live, diag ]
-      active_strategies:
-        description: "ACTIVE_STRATEGIES (예: 1 또는 1,2,3)"
-        required: false
-        default: "1"
-      run_loop_minutes:
-        description: "LIVE 루프 지속 시간(분). 0이면 1회만 실행"
-        required: false
-        default: "360"
-      kis_env:
-        description: "practice(모의/VTS) 또는 real(실계좌)"
-        required: false
-        default: "practice"
-        type: choice
-        options: [ practice, real ]
+
 
 jobs:
   monitor-trade:
-    # 🔒 안전장치: bot-state 브랜치는 제외
+    # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
+    # if: github.ref == 'refs/heads/main'
     if: github.ref != 'refs/heads/bot-state'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
 
     env:
       #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
       #ALLOW_NON_TRADING_ORDER: "1"
-
       # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
       KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
@@ -60,14 +38,10 @@ jobs:
 
       CANO:           ${{ secrets.CANO }}
       ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
-
-      # 기본(비워져 있어도 LIVE 단계에서 최종 확정)
       KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+
       # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
       API_BASE_URL:   ${{ secrets.API_BASE_URL }}
-
-      # ✅ push에서도 LIVE 허용(파이썬 쪽이 이 env를 읽어야 효과 있음)
-      ALLOW_LIVE_ON_PUSH: "1"
 
       # === trader.py 운영 파라미터 ===
       PARTIAL1: "0.5"
@@ -89,6 +63,7 @@ jobs:
       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
 
       # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
+      # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
       VWAP_TOL: "0.003"
 
       W_MAX_ONE: "0.25"
@@ -122,7 +97,8 @@ jobs:
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
-      # === VWAP 분봉 TR ===
+      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
+      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
       KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
       KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
 
@@ -140,16 +116,30 @@ jobs:
       ALLOW_AFTER_HOURS: "0"
       REBALANCE_OUT_DIR: "rebalance_results"
 
-      # 기본값(수동 입력 없을 때)
-      ACTIVE_STRATEGIES: "1"
-      RUN_LOOP_MINUTES: "360"
-
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore state cache (fallback only)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
+          restore-keys: |
+            trader-state-${{ github.ref_name }}-
+      - name: Save state cache (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            bot_state/state.json
+            trader/state/state.json
+          key: trader-state-${{ github.ref_name }}
 
       - name: Set git identity
         run: |
@@ -160,167 +150,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Ensure state scripts executable
+        if: github.event_name != 'pull_request'
+        run: |
+          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
+
+      - name: Pull state (plain)
+        if: github.event_name != 'pull_request'
+        run: |
+          bash scripts/state_pull_plain.sh
+
       - name: Dependencies 설치
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compile modules
-        run: |
-          python -m compileall trader rolling_k_auto_trade_api
-
       - name: Ledger smoke test
         run: |
           python -m trader.ledger_test
 
-      # ===== 핵심: push든 뭐든 "장 오픈 전이면 대기 후 LIVE" / 주말은 DIAG =====
-      - name: Decide mode + (optional) wait seconds
-        id: decide
-        env:
-          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode || 'auto' }}
-          INPUT_ACTIVE_STRATEGIES: ${{ github.event_name == 'workflow_dispatch' && inputs.active_strategies || env.ACTIVE_STRATEGIES }}
-          INPUT_RUN_LOOP_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.run_loop_minutes || env.RUN_LOOP_MINUTES }}
-          INPUT_KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.kis_env || '' }}
-          DEFAULT_KIS_ENV: ${{ secrets.KIS_ENV }}
-          SECRET_API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          SECRET_API_BASE_URL_REAL: ${{ secrets.API_BASE_URL_REAL }}
-        run: |
-          python - << 'PY'
-          import os
-          from datetime import datetime, time
-          try:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo("Asia/Seoul")
-          except Exception:
-            tz = None
-
-          event = os.getenv("GITHUB_EVENT_NAME", "")
-          run_mode = (os.getenv("RUN_MODE") or "auto").strip().lower()
-          active_strategies = (os.getenv("INPUT_ACTIVE_STRATEGIES") or "1").strip()
-          run_loop_minutes = (os.getenv("INPUT_RUN_LOOP_MINUTES") or "360").strip()
-
-          input_kis_env = (os.getenv("INPUT_KIS_ENV") or "").strip().lower()
-          default_kis_env = (os.getenv("DEFAULT_KIS_ENV") or "").strip().lower()
-          kis_env = input_kis_env or default_kis_env or "practice"
-          kis_env = "real" if kis_env == "real" else "practice"
-
-          # base url 결정 (real일 때만 real url 사용)
-          vts_url = "https://openapivts.koreainvestment.com:29443"
-          real_fallback = "https://openapi.koreainvestment.com:9443"
-          secret_base = (os.getenv("SECRET_API_BASE_URL") or "").strip()
-          secret_real = (os.getenv("SECRET_API_BASE_URL_REAL") or "").strip()
-          api_base_url = vts_url if kis_env == "practice" else (secret_real or real_fallback or secret_base)
-
-          now = datetime.now(tz) if tz else datetime.now()
-          wk = now.weekday()  # 0=Mon ... 5=Sat 6=Sun
-          is_weekend = (wk >= 5)
-
-          open_t = time(8, 40)
-          close_t = time(15, 40)
-
-          sleep_seconds = 0
-          reason = ""
-
-          # PR은 안전상 거래/대기 모두 금지
-          if event == "pull_request":
-            mode = "NONE"
-            reason = "pull_request => NO TRADING"
-          else:
-            if is_weekend:
-              mode = "DIAG"
-              reason = "weekend => DIAG"
-            else:
-              if run_mode == "diag":
-                mode = "DIAG"
-                reason = "forced diag"
-              elif run_mode == "live":
-                if now.time() < open_t:
-                  mode = "WAIT_LIVE"
-                  target = datetime.combine(now.date(), open_t, tzinfo=now.tzinfo) if getattr(now, "tzinfo", None) else datetime.combine(now.date(), open_t)
-                  sleep_seconds = max(0, int((target - now).total_seconds()))
-                  reason = "forced live, wait until open"
-                elif now.time() < close_t:
-                  mode = "LIVE"
-                  reason = "forced live, in market window"
-                else:
-                  mode = "DIAG"
-                  reason = "forced live but after close => DIAG"
-              else:
-                if now.time() < open_t:
-                  mode = "WAIT_LIVE"
-                  target = datetime.combine(now.date(), open_t, tzinfo=now.tzinfo) if getattr(now, "tzinfo", None) else datetime.combine(now.date(), open_t)
-                  sleep_seconds = max(0, int((target - now).total_seconds()))
-                  reason = "auto: pre-open => wait then LIVE"
-                elif now.time() < close_t:
-                  mode = "LIVE"
-                  reason = "auto: market window => LIVE"
-                else:
-                  mode = "DIAG"
-                  reason = "auto: after close => DIAG"
-
-          run_live = "true" if mode in ("LIVE", "WAIT_LIVE") else "false"
-          run_diag = "true" if mode == "DIAG" else "false"
-          needs_state = "true" if mode in ("LIVE", "WAIT_LIVE", "DIAG") else "false"
-
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(out, "a", encoding="utf-8") as f:
-            f.write(f"mode={mode}\n")
-            f.write(f"run_live={run_live}\n")
-            f.write(f"run_diag={run_diag}\n")
-            f.write(f"needs_state={needs_state}\n")
-            f.write(f"sleep_seconds={sleep_seconds}\n")
-            f.write(f"reason={reason}\n")
-            f.write(f"active_strategies={active_strategies}\n")
-            f.write(f"run_loop_minutes={run_loop_minutes}\n")
-            f.write(f"kis_env={kis_env}\n")
-            f.write(f"api_base_url={api_base_url}\n")
-
-          print("==== DECISION ====")
-          print("event:", event)
-          print("now:", now.isoformat())
-          print("run_mode:", run_mode)
-          print("mode:", mode)
-          print("sleep_seconds:", sleep_seconds)
-          print("reason:", reason)
-          print("kis_env:", kis_env)
-          print("api_base_url:", api_base_url)
-          print("active_strategies:", active_strategies)
-          print("run_loop_minutes:", run_loop_minutes)
-          PY
-
-      # ===== 상태 복구/저장 =====
-      - name: Restore state cache (fallback only)
-        if: steps.decide.outputs.needs_state == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            bot_state/state.json
-            trader/state/state.json
-          key: trader-state-${{ github.ref_name }}
-          restore-keys: |
-            trader-state-${{ github.ref_name }}-
-
-      - name: Ensure state scripts executable
-        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
-        run: |
-          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
-
-      - name: Pull state (plain)
-        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
-        run: |
-          bash scripts/state_pull_plain.sh || true
-
-      # 장 오픈 전이면 여기서 대기
-      - name: Wait until market open (KST 08:40)
-        if: steps.decide.outputs.mode == 'WAIT_LIVE' && steps.decide.outputs.sleep_seconds != '0'
-        run: |
-          SLEEP="${{ steps.decide.outputs.sleep_seconds }}"
-          echo "Waiting ${SLEEP}s until market open... reason=${{ steps.decide.outputs.reason }}"
-          sleep "$SLEEP"
-
-      # 🔍 (진단) 핵심 환경변수 주입 여부만 확인
       - name: (진단) 핵심 환경변수 주입 여부만 확인
-        if: steps.decide.outputs.needs_state == 'true'
         run: |
           python - << 'PY'
           import os
@@ -329,15 +178,13 @@ jobs:
               print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
           for k in [
               'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
-              'CANO','ACNT_PRDT_CD','KIS_ENV','ALLOW_LIVE_ON_PUSH'
+              'CANO','ACNT_PRDT_CD','KIS_ENV'
           ]:
               chk(k)
-          print("GITHUB_EVENT_NAME:", os.getenv("GITHUB_EVENT_NAME"))
           PY
 
-      # 🔍 실제로 어떤 trader.trader 파일을 읽는지 확인
+      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
       - name: (디버그) trader 모듈 경로 및 내용 확인
-        if: steps.decide.outputs.needs_state == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -346,70 +193,29 @@ jobs:
           from trader import trader as t
           print("trader package path:", trader.__file__)
           print("trader.trader module path:", t.__file__)
+          print("=== HEAD OF trader.trader ===")
+          try:
+              with open(t.__file__, 'r', encoding='utf-8') as f:
+                  for i in range(1, 80):
+                      line = f.readline()
+                      if not line:
+                          break
+                      print(f"{i:03}: {line.rstrip()}")
+          except Exception as e:
+              print("ERROR while reading trader.trader:", e)
           PY
 
       - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
-        if: steps.decide.outputs.needs_state == 'true'
         run: |
           nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
-          sleep 30
+          sleep 30  # 서버 기동 대기
 
-      # ===== LIVE 실행 =====
-      - name: trader LIVE
-        if: steps.decide.outputs.run_live == 'true'
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          KIS_ENV: ${{ steps.decide.outputs.kis_env }}
-          API_BASE_URL: ${{ steps.decide.outputs.api_base_url }}
-
-          # ✅ 강제 LIVE 검증(코드가 이걸 보고 dry_run이면 죽게 하는 구조일 때)
-          EXPECT_LIVE_TRADING: "1"
-          DRY_RUN: "0"
-          DISABLE_LIVE_TRADING: "0"
-          LIVE_TRADING_ENABLED: "1"
-          STRATEGY_MODE: "LIVE"
-
-          ACTIVE_STRATEGIES: ${{ steps.decide.outputs.active_strategies }}
-          RUN_LOOP_MINUTES: ${{ steps.decide.outputs.run_loop_minutes }}
-
-          # ✅ push에서도 LIVE 허용(파이썬 코드가 반영해야 함)
-          ALLOW_LIVE_ON_PUSH: "1"
+      - name: Compile modules
         run: |
-          python - << 'PY'
-          import os, sys
-          must = ["KIS_APP_KEY","KIS_APP_SECRET","CANO","ACNT_PRDT_CD"]
-          miss = [k for k in must if not (os.getenv(k) or "").strip()]
-          if miss:
-              print("FATAL missing secrets:", miss)
-              sys.exit(2)
-          print("[LIVE PRECHECK]")
-          print("GITHUB_EVENT_NAME=", os.getenv("GITHUB_EVENT_NAME"))
-          print("ALLOW_LIVE_ON_PUSH=", os.getenv("ALLOW_LIVE_ON_PUSH"))
-          print("KIS_ENV=", os.getenv("KIS_ENV"))
-          print("API_BASE_URL=", os.getenv("API_BASE_URL"))
-          print("EXPECT_LIVE_TRADING=", os.getenv("EXPECT_LIVE_TRADING"))
-          print("DRY_RUN=", os.getenv("DRY_RUN"),
-                "DISABLE_LIVE_TRADING=", os.getenv("DISABLE_LIVE_TRADING"),
-                "LIVE_TRADING_ENABLED=", os.getenv("LIVE_TRADING_ENABLED"),
-                "STRATEGY_MODE=", os.getenv("STRATEGY_MODE"))
-          PY
-          python -m trader.trader
-
-      # ===== DIAG 실행 =====
-      - name: trader DIAG
-        if: steps.decide.outputs.run_diag == 'true'
+          python -m compileall trader rolling_k_auto_trade_api
+      - name: trader 자동매매 로직 실행
         env:
           PYTHONPATH: ${{ github.workspace }}
-          DRY_RUN: "1"
-          DISABLE_LIVE_TRADING: "1"
-          LIVE_TRADING_ENABLED: "0"
-          EXPECT_LIVE_TRADING: "0"
-          STRATEGY_MODE: "INTENT_ONLY"
-
-          ACTIVE_STRATEGIES: ${{ steps.decide.outputs.active_strategies }}
-          RUN_LOOP_MINUTES: "0"
-
-          MARKET_DATA_WHEN_CLOSED: "true"
         run: |
           python -m trader.trader
 
@@ -426,7 +232,7 @@ jobs:
           ls -al trader/logs || true
 
       - name: Push state (plain)
-        if: steps.decide.outputs.needs_state == 'true' && github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request'
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
@@ -475,6 +281,8 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
+      
 
 
 
