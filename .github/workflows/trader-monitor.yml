@@ -9,11 +9,11 @@ concurrency:
 
 on:
   push:
-    branches: [ main, trader_refactor ]
+    branches: [ main, trader_r1 ]
     paths-ignore:
       - "bot_state/**"
   pull_request:
-    branches: [ main, trader_refactor ]
+    branches: [ main, trader_r1 ]
   schedule:
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
