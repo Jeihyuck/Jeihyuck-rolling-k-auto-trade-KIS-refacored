@@ -135,6 +135,10 @@ jobs:
       ACTIVE_STRATEGIES: "1"
       RUN_LOOP_MINUTES: "360"
 
+      # ✅ 핵심: push에서도 LIVE가 막히지 않도록(코드가 event=push면 dry_run=True로 뒤집는 경우 대응)
+      # trader LIVE step에서 GITHUB_EVENT_NAME을 schedule로 오버라이드 해줌
+      ALLOW_LIVE_ON_PUSH: "1"
+
     steps:
       # 어떤 이벤트든 "실제 실행할 코드 브랜치"를 checkout
       - name: Checkout code
@@ -189,7 +193,7 @@ jobs:
         run: |
           python - << 'PY'
           import os
-          from datetime import datetime, time, timedelta
+          from datetime import datetime, time
           try:
             from zoneinfo import ZoneInfo
             tz = ZoneInfo("Asia/Seoul")
@@ -224,7 +228,7 @@ jobs:
           sleep_seconds = 0
           reason = ""
 
-          # PR은 안전상 거래/대기 모두 금지(원하면 여기 바꾸면 됨)
+          # PR은 안전상 거래/대기 모두 금지
           if event == "pull_request":
             mode = "NONE"
             reason = "pull_request => NO TRADING"
@@ -323,7 +327,6 @@ jobs:
         run: |
           echo "Waiting ${SLEEP}s until market open..."
           SLEEP="${{ steps.decide.outputs.sleep_seconds }}"
-          # 안전 출력
           echo "sleep_seconds=$SLEEP reason=${{ steps.decide.outputs.reason }}"
           sleep "$SLEEP"
 
@@ -347,6 +350,11 @@ jobs:
 
           DISABLE_KOSDAQ_LOOP: "false"
           DISABLE_KOSPI_ENGINE: "true"
+
+          # ✅ 핵심: push 이벤트면 trader 코드가 dry_run=True로 뒤집는 경우가 있어
+          # push일 때만 event name을 schedule로 오버라이드하여 LIVE 차단을 해제
+          ORIG_GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name == 'push' && 'schedule' || github.event_name }}
         run: |
           python - << 'PY'
           import os, sys
@@ -356,6 +364,8 @@ jobs:
             print("FATAL missing secrets:", miss)
             sys.exit(2)
           print("[LIVE PRECHECK] OK secrets present")
+          print("ORIG_GITHUB_EVENT_NAME=", os.getenv("ORIG_GITHUB_EVENT_NAME"))
+          print("GITHUB_EVENT_NAME(override)=", os.getenv("GITHUB_EVENT_NAME"))
           print("KIS_ENV=", os.getenv("KIS_ENV"))
           print("API_BASE_URL=", os.getenv("API_BASE_URL"))
           print("DRY_RUN=", os.getenv("DRY_RUN"),
@@ -406,8 +416,9 @@ jobs:
         run: |
           test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
 
-      - name: Save state cache (schedule/dispatch only)
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      # ✅ push도 실행이므로 캐시 저장 대상에 포함(원하면 유지)
+      - name: Save state cache
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
         uses: actions/cache/save@v4
         with:
           path: |
@@ -460,6 +471,7 @@ jobs:
           path: fastapi.log
           if-no-files-found: ignore
           retention-days: 14
+
 
 
   
