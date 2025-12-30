@@ -9,7 +9,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 282428.571,
       "qty": 49,
-      "remaining_qty": 49,
+      "remaining_qty": 43,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -37,7 +37,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 1311375.0,
       "qty": 8,
-      "remaining_qty": 8,
+      "remaining_qty": 0,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -51,7 +51,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 354792.899,
       "qty": 39,
-      "remaining_qty": 39,
+      "remaining_qty": 0,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -65,7 +65,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 865340.0,
       "qty": 15,
-      "remaining_qty": 15,
+      "remaining_qty": 1,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -93,7 +93,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 169528.83,
       "qty": 85,
-      "remaining_qty": 85,
+      "remaining_qty": 0,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -121,7 +121,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 57440.962,
       "qty": 250,
-      "remaining_qty": 250,
+      "remaining_qty": 25,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -135,7 +135,7 @@
       "entry_ts": "2025-12-19T13:47:14.758854+09:00",
       "entry_price": 27447.338,
       "qty": 542,
-      "remaining_qty": 542,
+      "remaining_qty": 210,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -149,7 +149,7 @@
       "entry_ts": "2025-12-19T13:47:58.270809+09:00",
       "entry_price": 464948.275,
       "qty": 7,
-      "remaining_qty": 7,
+      "remaining_qty": 5,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
@@ -163,10 +163,304 @@
       "entry_ts": "2025-12-19T13:47:58.270809+09:00",
       "entry_price": 1311000.0,
       "qty": 1,
-      "remaining_qty": 1,
+      "remaining_qty": 0,
       "meta": {
         "reconciled": true,
         "sell_blocked": true
+      }
+    },
+    {
+      "lot_id": "000660-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "000660",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 591517.857,
+      "qty": 1,
+      "remaining_qty": 1,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "005290-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "005290",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 37600.0,
+      "qty": 523,
+      "remaining_qty": 523,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "006800-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "006800",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 23403.171,
+      "qty": 420,
+      "remaining_qty": 420,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "009540-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "009540",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 414703.488,
+      "qty": 61,
+      "remaining_qty": 61,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "015760-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "015760",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 48278.588,
+      "qty": 226,
+      "remaining_qty": 226,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "028260-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "028260",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 242082.417,
+      "qty": 64,
+      "remaining_qty": 64,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "030200-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "030200",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 53751.084,
+      "qty": 291,
+      "remaining_qty": 291,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "035420-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "035420",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 233720.707,
+      "qty": 3,
+      "remaining_qty": 3,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "064760-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "064760",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 143934.02,
+      "qty": 136,
+      "remaining_qty": 136,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "065350-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "065350",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 58019.047,
+      "qty": 339,
+      "remaining_qty": 339,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "066570-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "066570",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 93458.762,
+      "qty": 272,
+      "remaining_qty": 272,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "108490-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "108490",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 264500.0,
+      "qty": 19,
+      "remaining_qty": 19,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "145020-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "145020",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 233500.0,
+      "qty": 42,
+      "remaining_qty": 42,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "222800-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "222800",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 49756.967,
+      "qty": 128,
+      "remaining_qty": 128,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "267250-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "267250",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 193446.491,
+      "qty": 80,
+      "remaining_qty": 80,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "290650-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "290650",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 62500.0,
+      "qty": 157,
+      "remaining_qty": 157,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "347850-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "347850",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 95850.0,
+      "qty": 205,
+      "remaining_qty": 205,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "352820-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "352820",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 310500.0,
+      "qty": 2,
+      "remaining_qty": 2,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "357780-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "357780",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 259436.915,
+      "qty": 75,
+      "remaining_qty": 75,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "373220-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "373220",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 390027.173,
+      "qty": 65,
+      "remaining_qty": 65,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
+      }
+    },
+    {
+      "lot_id": "445680-RECON-2025-12-30T11:28:40.875200+09:00",
+      "pdno": "445680",
+      "strategy_id": "ORPHAN",
+      "engine": "reconcile",
+      "entry_ts": "2025-12-30T11:28:40.875200+09:00",
+      "entry_price": 101202.898,
+      "qty": 23,
+      "remaining_qty": 23,
+      "meta": {
+        "reconciled": true,
+        "orphan": true
       }
     }
   ],

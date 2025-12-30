@@ -1,6 +1,6 @@
 {
-  "schema_version": 3,
-  "updated_at": "2025-12-29T19:56:25.727033+09:00",
+  "schema_version": 2,
+  "updated_at": "2025-12-30T14:40:35.335959+09:00",
   "positions": {
     "000660": {
       "code": "000660",
@@ -14,14 +14,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 6,
+      "qty": 1,
       "avg_price": 591517.857,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 1,
+          "avg_price": 591517.857,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876288+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 591517.857
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "005290": {
       "code": "005290",
@@ -35,14 +64,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 746,
+      "qty": 523,
       "avg_price": 37600.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 523,
+          "avg_price": 37600.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876297+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 37600.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "005380": {
       "code": "005380",
@@ -56,14 +114,40 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 61,
+      "qty": 43,
       "avg_price": 290975.409,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 43,
+          "avg_price": 290975.409,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876455+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 290975.409
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "006800": {
       "code": "006800",
@@ -77,14 +161,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 599,
+      "qty": 420,
       "avg_price": 23403.171,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 420,
+          "avg_price": 23403.171,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876278+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 23403.171
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "009540": {
       "code": "009540",
@@ -98,14 +211,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 86,
+      "qty": 61,
       "avg_price": 414703.488,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 61,
+          "avg_price": 414703.488,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876398+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 414703.488
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "010120": {
       "code": "010120",
@@ -119,52 +261,40 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 77,
+      "qty": 27,
       "avg_price": 461340.573,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "010130": {
-      "code": "010130",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "010130:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 0,
-      "avg_price": 1321769.23,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "012330": {
-      "code": "012330",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "012330:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 49,
-      "avg_price": 365096.365,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 27,
+          "avg_price": 461340.573,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876353+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 461340.573
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "012450": {
       "code": "012450",
@@ -178,14 +308,40 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 4,
+      "qty": 1,
       "avg_price": 884613.333,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 1,
+          "avg_price": 884613.333,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876185+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 884613.333
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "015760": {
       "code": "015760",
@@ -199,14 +355,66 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 752,
+      "qty": 527,
       "avg_price": 48278.588,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 301,
+          "avg_price": 48278.588,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876161+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 48278.588
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        },
+        "ORPHAN": {
+          "qty": 226,
+          "avg_price": 48278.588,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876166+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 48278.588
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "028260": {
       "code": "028260",
@@ -220,14 +428,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 91,
+      "qty": 64,
       "avg_price": 242082.417,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 64,
+          "avg_price": 242082.417,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876245+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 242082.417
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "030200": {
       "code": "030200",
@@ -241,14 +478,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 415,
+      "qty": 291,
       "avg_price": 53751.084,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 291,
+          "avg_price": 53751.084,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876176+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 53751.084
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "035420": {
       "code": "035420",
@@ -262,14 +528,66 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 107,
+      "qty": 64,
       "avg_price": 233720.707,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 61,
+          "avg_price": 233720.707,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876219+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 233720.707
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        },
+        "ORPHAN": {
+          "qty": 3,
+          "avg_price": 233720.707,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876227+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 233720.707
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "035720": {
       "code": "035720",
@@ -283,14 +601,40 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 121,
+      "qty": 25,
       "avg_price": 58100.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 25,
+          "avg_price": 58100.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876372+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 58100.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "064760": {
       "code": "064760",
@@ -304,14 +648,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 194,
+      "qty": 136,
       "avg_price": 143934.02,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 136,
+          "avg_price": 143934.02,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876431+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 143934.02
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "065350": {
       "code": "065350",
@@ -325,14 +698,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 483,
+      "qty": 339,
       "avg_price": 58019.047,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 339,
+          "avg_price": 58019.047,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876390+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 58019.047
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "066570": {
       "code": "066570",
@@ -346,31 +748,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 388,
+      "qty": 272,
       "avg_price": 93458.762,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "098460": {
-      "code": "098460",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "098460:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 0,
-      "avg_price": 23324.75,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 272,
+          "avg_price": 93458.762,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876306+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 93458.762
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "108490": {
       "code": "108490",
@@ -384,14 +798,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 27,
+      "qty": 19,
       "avg_price": 264500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 19,
+          "avg_price": 264500.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876407+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 264500.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "145020": {
       "code": "145020",
@@ -405,31 +848,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 60,
+      "qty": 42,
       "avg_price": 233500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "160190": {
-      "code": "160190",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "160190:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 0,
-      "avg_price": 58478.521,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 42,
+          "avg_price": 233500.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876130+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 233500.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "222800": {
       "code": "222800",
@@ -443,73 +898,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 366,
+      "qty": 128,
       "avg_price": 49756.967,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "226950": {
-      "code": "226950",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "226950:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 0,
-      "avg_price": 134541.826,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "237690": {
-      "code": "237690",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "237690:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 112,
-      "avg_price": 125100.892,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
-    },
-    "247540": {
-      "code": "247540",
-      "strategy_id": 0,
-      "managed": false,
-      "position_key": "247540:0",
-      "meta": {
-        "created_by": "reconcile_unmanaged",
-        "notes": [
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING",
-          "UNMANAGED_HOLDING"
-        ]
-      },
-      "qty": 265,
-      "avg_price": 157924.528,
-      "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 128,
+          "avg_price": 49756.967,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876363+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 49756.967
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "267250": {
       "code": "267250",
@@ -523,14 +948,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 114,
+      "qty": 80,
       "avg_price": 193446.491,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 80,
+          "avg_price": 193446.491,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876149+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 193446.491
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "290650": {
       "code": "290650",
@@ -544,14 +998,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 224,
+      "qty": 157,
       "avg_price": 62500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 157,
+          "avg_price": 62500.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876336+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 62500.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "316140": {
       "code": "316140",
@@ -565,14 +1048,40 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 300,
+      "qty": 210,
       "avg_price": 27963.169,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "UNKNOWN": {
+          "qty": 210,
+          "avg_price": 27963.169,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876422+09:00",
+            "strategy_id": "UNKNOWN",
+            "engine": "reconcile",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "high": 27963.169
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "347850": {
       "code": "347850",
@@ -586,14 +1095,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 292,
+      "qty": 205,
       "avg_price": 95850.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 205,
+          "avg_price": 95850.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876440+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 95850.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "352820": {
       "code": "352820",
@@ -607,14 +1145,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 7,
+      "qty": 2,
       "avg_price": 310500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 2,
+          "avg_price": 310500.0,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876380+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 310500.0
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "357780": {
       "code": "357780",
@@ -628,14 +1195,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 107,
+      "qty": 75,
       "avg_price": 259436.915,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 75,
+          "avg_price": 259436.915,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876327+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 259436.915
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "373220": {
       "code": "373220",
@@ -649,14 +1245,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 92,
+      "qty": 65,
       "avg_price": 390027.173,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 65,
+          "avg_price": 390027.173,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876344+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 390027.173
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     },
     "445680": {
       "code": "445680",
@@ -670,14 +1295,43 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
-      "qty": 51,
+      "qty": 23,
       "avg_price": 101202.898,
       "last_action": "RECONCILE",
-      "updated_at": "2025-12-29T19:56:25.726155+09:00",
-      "opened_at": "2025-12-29T09:23:22.996027+09:00"
+      "updated_at": "2025-12-30T11:25:40.436003+09:00",
+      "opened_at": "2025-12-29T09:23:22.996027+09:00",
+      "strategies": {
+        "ORPHAN": {
+          "qty": 23,
+          "avg_price": 101202.898,
+          "entry": {
+            "time": "2025-12-30T11:28:40.876255+09:00",
+            "strategy_id": "ORPHAN",
+            "engine": "unknown",
+            "entry_reason": "RECONCILE",
+            "order_type": "unknown",
+            "best_k": null,
+            "tgt_px": null,
+            "gap_pct_at_entry": null
+          },
+          "meta": {
+            "pullback_peak_price": null,
+            "pullback_reversal_price": null,
+            "pullback_reason": null,
+            "high": 101202.898
+          },
+          "flags": {
+            "bear_s1_done": false,
+            "bear_s2_done": false,
+            "sold_p1": false,
+            "sold_p2": false
+          }
+        }
+      }
     }
   },
   "orders": {},
@@ -1344,8 +1998,18 @@
     }
   ],
   "memory": {
-    "last_price": {},
-    "last_seen": {},
+    "last_price": {
+      "298380": 200500.0,
+      "277810": 470500.0,
+      "310210": 216500.0,
+      "030530": 49275.0
+    },
+    "last_seen": {
+      "298380": "2025-12-30T14:40:09.020512+09:00",
+      "277810": "2025-12-30T14:40:09.020512+09:00",
+      "310210": "2025-12-30T14:40:09.020512+09:00",
+      "030530": "2025-12-30T14:40:09.020512+09:00"
+    },
     "last_strategy_id": {}
   }
 }
