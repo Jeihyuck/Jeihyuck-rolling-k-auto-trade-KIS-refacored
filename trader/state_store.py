@@ -13,11 +13,20 @@ from .config import ACTIVE_STRATEGIES, KST, STATE_PATH, UNMANAGED_STRATEGY_ID
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 3
-STATE_PRIMARY_PATH = Path(os.getenv("STATE_PATH") or STATE_PATH)
-RUNTIME_STATE_DIR = STATE_PRIMARY_PATH.parent
-RUNTIME_STATE_PATH = STATE_PRIMARY_PATH
 LEGACY_RUNTIME_DIR = Path(".runtime")
 LEGACY_RUNTIME_PATH = LEGACY_RUNTIME_DIR / "state.json"
+
+
+def get_state_path() -> Path:
+    env_path = os.getenv("STATE_PATH")
+    if env_path:
+        return Path(env_path)
+    return Path(STATE_PATH)
+
+
+def get_runtime_paths() -> tuple[Path, Path]:
+    primary = get_state_path()
+    return primary, primary.parent
 _LOT_ID_PREFIX = "LOT"
 
 
@@ -99,21 +108,23 @@ def _load_from_path(path: Path) -> Dict[str, Any] | None:
 
 
 def load_state() -> Dict[str, Any]:
-    primary = _load_from_path(RUNTIME_STATE_PATH)
+    primary_path, _ = get_runtime_paths()
+    primary = _load_from_path(primary_path)
     if primary is not None:
-        logger.info("[STATE][LOAD] path=%s source=primary", RUNTIME_STATE_PATH)
+        logger.info("[STATE][LOAD] path=%s source=primary", primary_path)
         return primary
     legacy = _load_from_path(LEGACY_RUNTIME_PATH)
     if legacy is not None:
         logger.info("[STATE][LOAD] path=%s source=legacy_runtime", LEGACY_RUNTIME_PATH)
         return legacy
-    logger.info("[STATE][LOAD] path=%s source=default", RUNTIME_STATE_PATH)
+    logger.info("[STATE][LOAD] path=%s source=default", primary_path)
     return _default_runtime_state()
 
 
 def save_state(state: Dict[str, Any]) -> None:
+    primary_path, primary_dir = get_runtime_paths()
     try:
-        RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        primary_dir.mkdir(parents=True, exist_ok=True)
         payload = dict(state)
         payload.setdefault("schema_version", SCHEMA_VERSION)
         payload.setdefault("positions", {})
@@ -121,18 +132,18 @@ def save_state(state: Dict[str, Any]) -> None:
         payload.setdefault("lots", [])
         payload.setdefault("memory", {"last_price": {}, "last_seen": {}, "last_strategy_id": {}})
         payload["updated_at"] = datetime.now(KST).isoformat()
-        tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
+        tmp_path = primary_path.with_name(f"{primary_path.name}.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, RUNTIME_STATE_PATH)
+        os.replace(tmp_path, primary_path)
         try:
-            size = RUNTIME_STATE_PATH.stat().st_size
-            logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
+            size = primary_path.stat().st_size
+            logger.info("[STATE][SAVE] path=%s bytes=%d", primary_path, size)
         except Exception:
-            logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
-        if LEGACY_RUNTIME_PATH != RUNTIME_STATE_PATH:
+            logger.info("[STATE][SAVE] path=%s", primary_path)
+        if LEGACY_RUNTIME_PATH != primary_path:
             try:
                 LEGACY_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
                 tmp_legacy_path = LEGACY_RUNTIME_PATH.with_name(f"{LEGACY_RUNTIME_PATH.name}.tmp")

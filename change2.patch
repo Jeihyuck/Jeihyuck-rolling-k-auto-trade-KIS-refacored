@@ -1,0 +1,1357 @@
+diff --git a/.github/workflows/pb1-runner.yml b/.github/workflows/pb1-runner.yml
+deleted file mode 100644
+index c0c2735295d41555ea881c2fe3c77ca521823bc2..0000000000000000000000000000000000000000
+--- a/.github/workflows/pb1-runner.yml
++++ /dev/null
+@@ -1,66 +0,0 @@
+-name: PB1 Close Pullback Runner
+-
+-permissions:
+-  contents: write
+-
+-concurrency:
+-  group: pb1-close-runner
+-  cancel-in-progress: true
+-
+-on:
+-  workflow_dispatch:
+-  schedule:
+-    - cron: "*/5 23 * * *"
+-    - cron: "*/5 0-2 * * *"
+-    - cron: "*/5 5-6 * * *"
+-
+-jobs:
+-  pb1-run:
+-    if: github.ref != 'refs/heads/bot-state'
+-    runs-on: ubuntu-latest
+-    timeout-minutes: 25
+-    env:
+-      BOTSTATE_BRANCH: bot-state
+-      MORNING_WINDOW_START: "08:50"
+-      MORNING_WINDOW_END: "11:00"
+-      MORNING_EXIT_START: "09:00"
+-      MORNING_EXIT_END: "09:20"
+-      AFTERNOON_WINDOW_START: "14:00"
+-      AFTERNOON_WINDOW_END: "15:30"
+-      CLOSE_AUCTION_START: "15:20"
+-      CLOSE_AUCTION_END: "15:30"
+-      ENABLE_BREAKOUT: "false"
+-      LEDGER_BASE_DIR: "bot_state/trader_ledger"
+-      LEDGER_LOOKBACK_DAYS: "120"
+-      BOTSTATE_LOCK_TTL_SEC: "900"
+-      STRATEGY_MODE: "INTENT_ONLY"
+-      DRY_RUN: "1"
+-      EXPECT_LIVE_TRADING: "0"
+-    steps:
+-      - uses: actions/checkout@v4
+-        with:
+-          fetch-depth: 0
+-
+-      - name: Set git identity
+-        run: |
+-          git config user.name "trade-bot"
+-          git config user.email "trade-bot@users.noreply.github.com"
+-
+-      - uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: Compile modules
+-        run: |
+-          python -m compileall trader
+-
+-      - name: Run PB1 window router
+-        env:
+-          PYTHONPATH: ${{ github.workspace }}
+-        run: |
+-          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f779e64b603d98117f5d33d61f43bf8120c18ee
+--- /dev/null
++++ b/.github/workflows/trade-runner.yml
+@@ -0,0 +1,111 @@
++name: PB1 Trade Runner
++
++permissions:
++  contents: write
++
++concurrency:
++  group: trade-bot-state
++  cancel-in-progress: false
++
++on:
++  push:
++    branches: [ main ]
++    paths-ignore:
++      - "bot_state/**"
++  workflow_dispatch:
++  schedule:
++    # ⏰ UTC cron (KST = UTC+9)
++    - cron: "50-59/5 23 * * *"   # 08:50-08:59 KST
++    - cron: "*/5 0-1 * * *"       # 09:00-10:59 KST
++    - cron: "0 2 * * *"           # 11:00 KST boundary
++    - cron: "*/5 5 * * *"         # 14:00-14:59 KST
++    - cron: "0-30/5 6 * * *"      # 15:00-15:30 KST
++
++jobs:
++  run-trade:
++    if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
++    runs-on: ubuntu-latest
++    # Note: cancel-in-progress=false relies on lock file; timeout increased to allow pre-open waits.
++    timeout-minutes: 180
++    env:
++      BOTSTATE_BRANCH: bot-state
++      STRATEGY_MODE: "LIVE"
++      LIVE_TRADING_ENABLED: "1"
++      DISABLE_LIVE_TRADING: "0"
++      DRY_RUN: "0"
++      EXPECT_LIVE_TRADING: "1"
++      EXPECT_KIS_ENV: "practice"
++      PB1_ENTRY_ENABLED: "1"
++      KIS_ENV: "practice"
++      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
++      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
++      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
++      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
++      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
++      CANO: ${{ secrets.CANO }}
++      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
++      MORNING_WINDOW_START: "08:50"
++      MORNING_WINDOW_END: "11:00"
++      MORNING_EXIT_START: "09:00"
++      MORNING_EXIT_END: "09:20"
++      AFTERNOON_WINDOW_START: "14:00"
++      AFTERNOON_WINDOW_END: "15:30"
++      CLOSE_AUCTION_START: "15:20"
++      CLOSE_AUCTION_END: "15:30"
++      LEDGER_BASE_DIR: "bot_state/trader_ledger"
++      LEDGER_LOOKBACK_DAYS: "120"
++      BOTSTATE_LOCK_TTL_SEC: "1800"
++      PYTHONUNBUFFERED: "1"
++      MAX_WAIT_BEFORE_MORNING_MIN: "120"
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          persist-credentials: true
++          token: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Set git identity
++        run: |
++          git config user.name "trade-bot"
++          git config user.email "trade-bot@users.noreply.github.com"
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r requirements.txt
++
++      - name: Resolve trading day and safety flags
++        env:
++          PYTHONPATH: ${{ github.workspace }}
++        run: |
++          python - <<'PY'
++          import os
++          from trader.time_utils import is_trading_day, now_kst
++
++          today_trading = is_trading_day(now_kst())
++          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
++              if today_trading:
++                  f.write("PB1_ENTRY_ENABLED=1\n")
++                  f.write("DISABLE_LIVE_TRADING=0\n")
++                  f.write("DRY_RUN=0\n")
++              else:
++                  f.write("PB1_ENTRY_ENABLED=0\n")
++                  f.write("DISABLE_LIVE_TRADING=1\n")
++                  f.write("DRY_RUN=1\n")
++                  f.write("DIAGNOSTIC_FORCE_RUN=1\n")
++          print(f"trading_day={today_trading}")
++          PY
++
++      - name: Compile modules
++        run: |
++          python -m compileall trader
++
++      - name: Run PB1 only
++        env:
++          PYTHONPATH: ${{ github.workspace }}
++        run: |
++          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+diff --git a/.github/workflows/trader-monitor.yml b/.github/workflows/trader-monitor.yml
+deleted file mode 100644
+index 64da815e3b6ac78d66dfbc2fff3bfa9013695e21..0000000000000000000000000000000000000000
+--- a/.github/workflows/trader-monitor.yml
++++ /dev/null
+@@ -1,369 +0,0 @@
+-name: Trade Monitor (trader_refactor branch)
+-
+-permissions:
+-  contents: write
+-
+-concurrency:
+-  group: trade-bot-state
+-  cancel-in-progress: false
+-
+-on:
+-  push:
+-    branches: [ main, nullim ]
+-    paths-ignore:
+-      - "bot_state/**"
+-  pull_request:
+-    branches: [ main, nullim ]
+-  schedule:
+-    - cron: "57 23 * * 0-6"
+-  workflow_dispatch:
+-
+-
+-jobs:
+-  monitor-trade:
+-    # 🔒 안전장치: main 브랜치에서만 모니터링/자동매매 실행
+-    # if: github.ref == 'refs/heads/main'
+-    if: github.ref != 'refs/heads/bot-state'
+-    runs-on: ubuntu-latest
+-
+-    env:
+-      #FORCE_TRADING_DAY: "1"   # 👈 테스트 시에만
+-      #ALLOW_NON_TRADING_ORDER: "1"
+-      # === KIS 인증키(두 이름 모두 대응: 먼저 KIS_*가 있으면 그걸, 없으면 APP_* 사용) ===
+-      KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      # (일부 모듈이 APP_*를 읽을 수도 있으므로 동일 값 동시 주입)
+-      APP_KEY:        ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      APP_SECRET:     ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-
+-      CANO:           ${{ secrets.CANO }}
+-      ACNT_PRDT_CD:   ${{ secrets.ACNT_PRDT_CD }}
+-      KIS_ENV:        ${{ secrets.KIS_ENV }}          # practice / real
+-
+-      # settings.py가 KIS_ENV로 자동판단하므로 API_BASE_URL은 보통 불필요
+-      API_BASE_URL:   ${{ secrets.API_BASE_URL }}
+-
+-      # === trader.py 운영 파라미터 ===
+-      PARTIAL1: "0.5"
+-      PARTIAL2: "0.3"
+-      TRAIL_PCT: "0.02"
+-      FAST_STOP: "0.01"
+-      ATR_STOP: "1.5"
+-
+-      TIME_STOP_HHMM: "13:00"
+-      SELL_FORCE_TIME: "14:40"
+-      SELL_ALL_BALANCES_AT_CUTOFF: "false"
+-      FORCE_SELL_PASSES_CUTOFF: "2"
+-      FORCE_SELL_PASSES_CLOSE: "4"
+-
+-      DEFAULT_PROFIT_PCT: "3.0"
+-      DEFAULT_LOSS_PCT: "5.0"
+-
+-      SLIPPAGE_LIMIT_PCT: "0.25"
+-      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+-
+-      # 🔸 VWAP 전략용 허용 오차 (코드 CONFIG의 VWAP_TOL과 연결)
+-      # 0.003 = 0.3% / 필요하면 branch-level로 쉽게 조정 가능
+-      VWAP_TOL: "0.003"
+-
+-      W_MAX_ONE: "0.25"
+-      W_MIN_ONE: "0.03"
+-
+-      REBALANCE_ANCHOR: "weekly"
+-      FORCE_WEEKLY_REBALANCE: "0"
+-      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+-
+-      # 레짐/지수
+-      KOSDAQ_INDEX_CODE: "KOSDAQ"
+-      KOSDAQ_ETF_FALLBACK: "229200"
+-
+-      REG_BULL_MIN_UP_PCT: "0.5"
+-      REG_BULL_MIN_MINUTES: "10"
+-      REG_BEAR_VWAP_MINUTES: "10"
+-      REG_BEAR_DROP_FROM_HIGH: "0.7"
+-      REG_BEAR_STAGE1_MINUTES: "20"
+-      REG_BEAR_STAGE2_ADD_DROP: "0.5"
+-
+-      REG_PARTIAL_S1: "0.30"
+-      REG_PARTIAL_S2: "0.30"
+-
+-      TRAIL_PCT_BULL: "0.025"
+-      TRAIL_PCT_BEAR: "0.012"
+-      TP_PROFIT_PCT_BULL: "3.5"
+-
+-      MARKET_DATA_WHEN_CLOSED: "false"
+-
+-      # 배분/속도
+-      DAILY_CAPITAL: "250000000"
+-      API_RATE_SLEEP_SEC: "0.3"
+-
+-      # === VWAP 분봉 TR (선택: 코드에 기본값 이미 있으므로 생략해도 동작) ===
+-      # 한국투자증권 엑셀 기준 주식당일분봉조회 TR_ID (FHKST03010200)
+-      KIS_TR_ID_INTRADAY_CHART: "FHKST03010200"
+-      KIS_TR_ID_INTRADAY_CHART_REAL: "FHKST03010200"
+-
+-      # === FastAPI 리밸런싱 서버(선정 필터) ===
+-      MIN_TRADES: "5"
+-      MAX_MDD_PCT: "30"
+-      MIN_WINRATE: "50"
+-      MIN_CUMRET: "2"
+-      TOP_K_LIMIT: "20"
+-      TOTAL_CAPITAL: "10000000"
+-      MIN_QTY_PER_TICKET: "1"
+-      K_MIN: "0.1"
+-      K_MAX: "0.9"
+-      K_STEP: "0.1"
+-      ALLOW_AFTER_HOURS: "0"
+-      REBALANCE_OUT_DIR: "rebalance_results"
+-
+-    steps:
+-      - uses: actions/checkout@v4
+-        with:
+-          fetch-depth: 0
+-          persist-credentials: true
+-          token: ${{ secrets.GITHUB_TOKEN }}
+-
+-      - name: Restore state cache (fallback only)
+-        uses: actions/cache/restore@v4
+-        with:
+-          path: |
+-            bot_state/state.json
+-            trader/state/state.json
+-          key: trader-state-${{ github.ref_name }}
+-          restore-keys: |
+-            trader-state-${{ github.ref_name }}-
+-      - name: Save state cache (dispatch only)
+-        if: github.event_name == 'workflow_dispatch'
+-        uses: actions/cache/save@v4
+-        with:
+-          path: |
+-            bot_state/state.json
+-            trader/state/state.json
+-          key: trader-state-${{ github.ref_name }}
+-
+-      - name: Set git identity
+-        run: |
+-          git config user.name "trade-bot"
+-          git config user.email "trade-bot@users.noreply.github.com"
+-
+-      - uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Ensure state scripts executable
+-        if: github.event_name != 'pull_request'
+-        run: |
+-          chmod +x scripts/state_pull_plain.sh scripts/state_push_plain.sh || true
+-
+-      - name: Pull state (plain)
+-        if: github.event_name != 'pull_request'
+-        run: |
+-          bash scripts/state_pull_plain.sh
+-
+-      - name: Dependencies 설치
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: Ledger smoke test
+-        run: |
+-          python -m trader.ledger_test
+-
+-      - name: Decide trading mode/env
+-        id: decide-mode
+-        run: |
+-          ALLOW="${{ vars.ALLOW_LIVE_ON_PUSH || '0' }}"
+-          EVENT="${{ github.event_name }}"
+-          RUN_LIVE="1"
+-          if [ "$EVENT" = "pull_request" ]; then
+-            RUN_LIVE="0"
+-          elif [ "$EVENT" = "push" ] && [ "$ALLOW" != "1" ]; then
+-            RUN_LIVE="0"
+-          fi
+-
+-          ALLOW_FOR_ENV="$ALLOW"
+-
+-          if [ "$RUN_LIVE" = "1" ]; then
+-            DRY_RUN="0"
+-            EXPECT_LIVE="1"
+-            DISABLE_LIVE="0"
+-            LIVE_ENABLED="1"
+-            STRATEGY_MODE="LIVE"
+-            ALLOW_FOR_ENV="1"
+-          else
+-            DRY_RUN="1"
+-            EXPECT_LIVE="0"
+-            DISABLE_LIVE="0"
+-            LIVE_ENABLED="1"
+-            STRATEGY_MODE="INTENT_ONLY"
+-          fi
+-
+-          {
+-            echo "allow_live_on_push=$ALLOW_FOR_ENV"
+-            echo "run_live=$RUN_LIVE"
+-            echo "dry_run=$DRY_RUN"
+-            echo "expect_live=$EXPECT_LIVE"
+-            echo "disable_live=$DISABLE_LIVE"
+-            echo "live_enabled=$LIVE_ENABLED"
+-            echo "strategy_mode=$STRATEGY_MODE"
+-          } >> "$GITHUB_OUTPUT"
+-
+-      - name: (CI) Trading mode summary
+-        env:
+-          GITHUB_EVENT_NAME: ${{ github.event_name }}
+-          ALLOW_LIVE_ON_PUSH: ${{ steps.decide-mode.outputs.allow_live_on_push }}
+-          EXPECT_LIVE_TRADING: ${{ steps.decide-mode.outputs.expect_live }}
+-          DRY_RUN: ${{ steps.decide-mode.outputs.dry_run }}
+-          DISABLE_LIVE_TRADING: ${{ steps.decide-mode.outputs.disable_live }}
+-          LIVE_TRADING_ENABLED: ${{ steps.decide-mode.outputs.live_enabled }}
+-          STRATEGY_MODE: ${{ steps.decide-mode.outputs.strategy_mode }}
+-        run: |
+-          python - <<'PY'
+-          import os
+-          event = os.getenv("GITHUB_EVENT_NAME")
+-          allow = os.getenv("ALLOW_LIVE_ON_PUSH")
+-          expect = os.getenv("EXPECT_LIVE_TRADING")
+-          dry_run = os.getenv("DRY_RUN")
+-          disable = os.getenv("DISABLE_LIVE_TRADING")
+-          live_enabled = os.getenv("LIVE_TRADING_ENABLED")
+-          mode = os.getenv("STRATEGY_MODE")
+-          print(f"event={event}")
+-          print(f"ALLOW_LIVE_ON_PUSH={allow}")
+-          print(f"EXPECT_LIVE_TRADING={expect}")
+-          print(f"DRY_RUN={dry_run}")
+-          print(f"DISABLE_LIVE_TRADING={disable}")
+-          print(f"LIVE_TRADING_ENABLED={live_enabled}")
+-          print(f"STRATEGY_MODE={mode}")
+-          if dry_run == "1":
+-            print("Trading mode: DRY_RUN (no live trades).")
+-          else:
+-            print("Trading mode: LIVE enabled.")
+-          PY
+-
+-      - name: (진단) 핵심 환경변수 주입 여부만 확인
+-        run: |
+-          python - << 'PY'
+-          import os
+-          def chk(k):
+-              v = os.getenv(k) or ''
+-              print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
+-          for k in [
+-              'KIS_APP_KEY','KIS_APP_SECRET','APP_KEY','APP_SECRET',
+-              'CANO','ACNT_PRDT_CD','KIS_ENV'
+-          ]:
+-              chk(k)
+-          PY
+-
+-      # 🔍 여기 추가: 실제로 어떤 trader.trader 파일을 읽는지 확인
+-      - name: (디버그) trader 모듈 경로 및 내용 확인
+-        env:
+-          PYTHONPATH: ${{ github.workspace }}
+-        run: |
+-          python - << 'PY'
+-          import trader
+-          from trader import trader as t
+-          print("trader package path:", trader.__file__)
+-          print("trader.trader module path:", t.__file__)
+-          print("=== HEAD OF trader.trader ===")
+-          try:
+-              with open(t.__file__, 'r', encoding='utf-8') as f:
+-                  for i in range(1, 80):
+-                      line = f.readline()
+-                      if not line:
+-                          break
+-                      print(f"{i:03}: {line.rstrip()}")
+-          except Exception as e:
+-              print("ERROR while reading trader.trader:", e)
+-          PY
+-
+-      - name: 리밸런싱 API 서버 실행 (FastAPI, 백그라운드, 로그파일)
+-        run: |
+-          nohup uvicorn rolling_k_auto_trade_api.main:app --host 0.0.0.0 --port 8000 > fastapi.log 2>&1 &
+-          sleep 30  # 서버 기동 대기
+-
+-      - name: Compile modules
+-        run: |
+-          python -m compileall trader rolling_k_auto_trade_api
+-      - name: trader 자동매매 로직 실행
+-        env:
+-          EXPECT_LIVE_TRADING: ${{ steps.decide-mode.outputs.expect_live }}
+-          DRY_RUN: ${{ steps.decide-mode.outputs.dry_run }}
+-          DISABLE_LIVE_TRADING: ${{ steps.decide-mode.outputs.disable_live }}
+-          LIVE_TRADING_ENABLED: ${{ steps.decide-mode.outputs.live_enabled }}
+-          STRATEGY_MODE: ${{ steps.decide-mode.outputs.strategy_mode }}
+-          ALLOW_LIVE_ON_PUSH: ${{ steps.decide-mode.outputs.allow_live_on_push }}
+-          PYTHONPATH: ${{ github.workspace }}
+-        run: |
+-          python -m trader.trader
+-
+-      - name: CEO 리포트 자동 생성
+-        if: always()
+-        env:
+-          PYTHONPATH: ${{ github.workspace }}
+-        run: |
+-          python -m trader.report_ceo || true
+-
+-      - name: Verify CEO report exists
+-        if: always()
+-        run: |
+-          ls -al trader/logs || true
+-
+-      - name: Push state (plain)
+-        if: github.event_name != 'pull_request'
+-        run: |
+-          test -f scripts/state_push_plain.sh && bash scripts/state_push_plain.sh || true
+-
+-      - name: Save state snapshot as artifact (audit only)
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: trader-state-${{ github.run_id }}
+-          path: |
+-            trader/state/state.json
+-            bot_state/state.json
+-            trader/logs/CEO_Report_*.md
+-            trader/logs/ledger.jsonl
+-          retention-days: 30
+-
+-      - name: Rebalance JSON artifact 업로드
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: rebalance-results
+-          path: rebalance_results/*.json
+-          if-no-files-found: warn
+-          retention-days: 60
+-
+-      - name: Trades 로그 업로드
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: trade-logs
+-          path: trader/logs/*.json
+-          if-no-files-found: ignore
+-          retention-days: 14
+-
+-      - name: FastAPI 로그 출력 (cat)
+-        if: always()
+-        run: |
+-          echo "::group::FastAPI Server Log"
+-          cat fastapi.log || true
+-          echo "::endgroup::"
+-
+-      - name: FastAPI 로그 업로드 (artifact)
+-        if: always()
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: fastapi-log
+-          path: fastapi.log
+-          if-no-files-found: ignore
+-          retention-days: 14
+-
+-      
+-
+-
+-
+-
+-
+-
+-  
+diff --git a/trader/config.py b/trader/config.py
+index 0601565bd306d8ca210a62ada56011650850a549..04dc770c5ec0d43425bcf7549fbcf0bc071ef691 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -97,52 +97,53 @@ CONFIG = {
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "trader/state/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+-    "BOTSTATE_LOCK_TTL_SEC": "900",
++    "BOTSTATE_LOCK_TTL_SEC": "1800",
+     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
++    "PB1_ENTRY_ENABLED": "true",
+     "MORNING_WINDOW_START": "08:50",
+     "MORNING_WINDOW_END": "11:00",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+     "AFTERNOON_WINDOW_START": "14:00",
+     "AFTERNOON_WINDOW_END": "15:30",
+     "CLOSE_AUCTION_START": "15:20",
+     "CLOSE_AUCTION_END": "15:30",
+     "PB1_PULLBACK_BAND_KOSPI": "3,8",
+     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
+     "PB1_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_SWING_TREND_MIN": "1.05",
+     "PB1_SWING_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_SWING_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_R_FLOOR_PCT": "2.0",
+     "PB1_DAY_TP_R": "0.8",
+     "PB1_DAY_SL_R": "0.6",
+     "KOSPI_HARD_STOP_PCT": "7.0",
+     "KOSDAQ_HARD_STOP_PCT": "8.0",
+     "PB1_SWING_TRAIL_MA": "20",
+     "PB1_TIME_STOP_DAYS": "10",
+ }
+ 
+ 
+@@ -392,50 +393,51 @@ def resolve_active_strategies(raw: str | None = None) -> set[int]:
+     if parsed:
+         return parsed
+     return ACTIVE_STRATEGIES
+ 
+ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+ BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+ NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
+ 
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+ DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
++PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
+ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+ BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "900")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "11:00"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "14:00"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+ PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
+ PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
+ PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
+ KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
+ KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
+ PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
+ PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 23da1281cbf80b4c337ecdc2b5d589894b91f307..17ea3b67ef29f271422dd3cec179bd61f5671911 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -1,139 +1,147 @@
+ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import dataclass
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Dict, Iterable, List, Tuple
+ 
+ import pandas as pd
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+-    ENABLE_BREAKOUT,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
++    PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
+ )
++from trader.utils.env import env_bool
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
+ from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+ from trader.time_utils import now_kst
+ from trader.window_router import WindowDecision, resolve_phase
+ from trader.botstate_sync import persist_run_files
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @dataclass
+ class CandidateFeature:
+     code: str
+     market: str
+     features: Dict[str, float]
+     setup_ok: bool
+     reasons: List[str]
+     mode: int
+     mode_reasons: List[str]
+     client_order_key: str | None = None
+     planned_qty: int = 0
+ 
+ 
+ class PB1Engine:
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+         worktree_dir: Path,
+         window: WindowDecision,
+         phase_override: str,
+         dry_run: bool,
+         env: str,
+         run_id: str,
+     ) -> None:
+         self.kis = kis
+         self.worktree_dir = worktree_dir
+         self.window = window
+         self.phase = resolve_phase(window, phase_override)
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+-        self.ledger = LedgerStore(worktree_dir / LEDGER_BASE_DIR, env=env, run_id=run_id)
++        base_dir = LEDGER_BASE_DIR
++        if not Path(base_dir).is_absolute():
++            base_dir = worktree_dir / base_dir
++        self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
+         self.worktree_dir = worktree_dir
+         self._today = now_kst().date().isoformat()
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+         )
+ 
+     def _fetch_daily(self, code: str, count: int = 120) -> pd.DataFrame:
+         if not self.kis:
+             return pd.DataFrame()
+         try:
+             candles = self.kis.safe_get_daily_candles(code, count=count)
+         except Exception:
+             logger.exception("[PB1][DATA][FAIL] code=%s", code)
+             return pd.DataFrame()
+         if not candles:
+             return pd.DataFrame()
+         df = pd.DataFrame(candles)
+         rename_map = {
+             "stck_clpr": "close",
+             "stck_hgpr": "high",
+             "stck_lwpr": "low",
+             "stck_trqu": "volume",
+             "stck_bsop_date": "date",
+         }
+         for src, dst in rename_map.items():
+             if src in df.columns:
+                 df.rename(columns={src: dst}, inplace=True)
+         df["close"] = df["close"].astype(float)
+         df["high"] = df["high"].astype(float)
+         df["low"] = df["low"].astype(float)
+         df["volume"] = df["volume"].astype(float)
+         return df
+ 
+     def _build_universe(self) -> Dict[str, List[Dict]]:
++        """
++        Build selection universe for PB1 without triggering any legacy order flows.
++        run_rebalance() in best_k_meta_strategy is selection-only and returns weights.
++        """
+         try:
+             rebalance_payload = run_rebalance(str(now_kst().date()), return_by_market=True)
+             return rebalance_payload.get("selected_by_market") or {}
+         except Exception:
+             logger.exception("[PB1][UNIVERSE][FAIL]")
+             return {}
+ 
+     def _code_market_map(self, selected_by_market: Dict[str, List[Dict]]) -> Dict[str, str]:
+         mapping: Dict[str, str] = {}
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 mapping[code] = market
+         return mapping
+ 
+     def _compute_candidates(self, selected_by_market: Dict[str, List[Dict]]) -> List[CandidateFeature]:
+         candidates: List[CandidateFeature] = []
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 df = self._fetch_daily(code, count=120)
+                 if df.empty:
+                     cf = CandidateFeature(
+                         code=code,
+                         market=market,
+@@ -423,79 +431,78 @@ class PB1Engine:
+                 sid=1,
+                 mode=mode,
+                 env=self.env,
+                 run_id=self.run_id,
+                 side="SELL",
+                 qty=qty,
+                 price=mark,
+                 odno=odno,
+                 client_order_key=client_key,
+                 stage=stage,
+             )
+             fill_path = self.ledger.append_event("fills", fill)
+             persist_run_files(self.worktree_dir, [fill_path], message=f"pb1 fill {self.run_id}")
+         else:
+             err = new_unfilled(
+                 code=code,
+                 market=market,
+                 sid=1,
+                 mode=mode,
+                 env=self.env,
+                 run_id=self.run_id,
+                 side="SELL",
+                 qty=qty,
+                 price=mark,
+                 client_order_key=client_key,
+-                reasons=[ack.reasons] if ack.reasons else ["order_failed"],
++                reasons=ack.reasons if ack.reasons else ["order_failed"],
+                 stage=stage,
+             )
+             self.ledger.append_event("errors", err)
+ 
+     def _positions_with_meta(self, positions: Dict[Tuple[str, int, int], Dict]) -> List[Dict]:
+         enriched: List[Dict] = []
+         for (code, sid, mode), state in positions.items():
+             if sid != 1:
+                 continue
+             enriched.append(
+                 {
+                     "code": code,
+                     "sid": sid,
+                     "mode": mode,
+                     "total_qty": state.get("total_qty") or 0,
+                     "avg_buy_price": state.get("avg_buy_price"),
+                     "market": state.get("market"),
+                     "holding_days": state.get("holding_days") or 0,
+                     "first_buy_ts": state.get("first_buy_ts"),
+                 }
+             )
+         return enriched
+ 
+     def run(self) -> List[Path]:
+-        entry_allowed = True
+-        if ENABLE_BREAKOUT:
+-            logger.warning("[PB1][BREAKOUT_DISABLED] ENABLE_BREAKOUT=%s -> skip new entries", ENABLE_BREAKOUT)
+-            entry_allowed = False
++        entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
++        if not entry_allowed:
++            logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s", self.window.name, self.phase, self.dry_run)
+         run_files = self.ledger.open_run_files()
+         touched: List[Path] = list(run_files.values())
+         logger.info("[LEDGER][APPEND] kind=touch path=%s", run_files)
+         persist_run_files(self.worktree_dir, touched, message=f"pb1 touch run_id={self.run_id}")
+         positions = self.ledger.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+         selected = self._build_universe()
+         code_market = self._code_market_map(selected)
+         marks_fallback: Dict[str, float] = {}
+         if self.phase in {"prep", "entry"}:
+             candidates = self._compute_candidates(selected)
+             candidates = self._size_positions(candidates)
+             if self.phase == "entry" and self.window.name == "afternoon":
+                 for cf in candidates:
+                     if not cf.setup_ok:
+                         continue
+                     if self._should_block_order(cf.client_order_key):
+                         continue
+                     if not entry_allowed:
+                         continue
+                     paths = self._place_entry(cf)
+                     touched.extend(paths)
+         elif self.phase in {"exit", "verify"}:
+             pos_list = self._positions_with_meta(positions)
+             for pos in pos_list:
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index cb2b24585cf01e089b3eb298e078920078529be7..26f7cdf4e2bb919f475abeab4962eeb8c31904ce 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -1,185 +1,253 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import logging
+ import os
++import time
++from datetime import datetime, timedelta
+ from pathlib import Path
+ 
+ from trader.kis_wrapper import KisAPI
+-from trader import state_store as runtime_state_store
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.config import (
+     BOTSTATE_LOCK_TTL_SEC,
+-    DIAG_ENABLED,
+-    DIAGNOSTIC_FORCE_RUN,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     MORNING_WINDOW_START,
+     MORNING_WINDOW_END,
+     MORNING_EXIT_START,
+     MORNING_EXIT_END,
+     AFTERNOON_WINDOW_START,
+     AFTERNOON_WINDOW_END,
+     CLOSE_AUCTION_START,
+     CLOSE_AUCTION_END,
+ )
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.botstate_sync import acquire_lock, release_lock, setup_worktree, persist_run_files
+ from trader.pb1_engine import PB1Engine
+ from trader.window_router import decide_window
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def truthy(value: object) -> bool:
+     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
+     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
+     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
+     parser.add_argument("--target-branch", default=os.getenv("BOTSTATE_BRANCH", "bot-state"), help="Bot-state target branch")
+     return parser.parse_args()
+ 
+ 
+ def main() -> None:
+     args = parse_args()
+     now = now_kst()
+     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
+     event_name_lower = event_name.lower()
+     trading_day = is_trading_day(now)
++    non_trading_day = not trading_day
+     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
+     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
+     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
+     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+-    allow_live_on_push = truthy(os.getenv("ALLOW_LIVE_ON_PUSH", "0"))
+     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+-    diag_enabled = bool(DIAG_ENABLED or DIAGNOSTIC_FORCE_RUN)
+-
+     dry_run_reasons: list[str] = []
++    if non_trading_day:
++        dry_run_reasons.append("non_trading_day")
++        os.environ["PB1_ENTRY_ENABLED"] = "0"
++        os.environ["DIAGNOSTIC_FORCE_RUN"] = "1"
++        os.environ["DISABLE_LIVE_TRADING"] = "1"
++        os.environ["DRY_RUN"] = "1"
++        os.environ["LIVE_TRADING_ENABLED"] = "0"
++    diag_enabled = (
++        env_bool("DIAGNOSTIC_FORCE_RUN", False)
++        or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
++        or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
++    )
++    if diag_enabled:
++        dry_run_reasons.append("diagnostic_mode")
+     if mode == "INTENT_ONLY":
+         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+-    if disable_live_flag.value:
++    if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
+         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+-    if diag_enabled:
+-        dry_run_reasons.append("diagnostic_mode")
++    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
++    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
++    dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
+     if not live_trading_flag.value and mode == "LIVE":
+         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+     if dry_run_flag.value:
+         dry_run_reasons.append("DRY_RUN=1")
+-    if mode == "LIVE":
+-        if event_name_lower == "pull_request":
+-            dry_run_reasons.append("event=pull_request")
+-        elif event_name_lower == "push" and not allow_live_on_push:
+-            dry_run_reasons.append("event=push")
+     for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
+         if not flag.valid:
+             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+ 
+     dry_run = bool(dry_run_reasons)
+     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+ 
+     logger.info(
+         "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
+         event_name_lower or "unknown",
+         dry_run,
+         dry_run_reasons or ["live"],
+     )
+ 
+     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
+     kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
+     kis_env = kis_env_raw.lower()
+     api_base_url = (os.getenv("API_BASE_URL") or "").lower()
+-    if expect_live_flag:
++    guard_live = expect_live_flag and trading_day and not diag_enabled and not dry_run
++    if guard_live:
+         guard_failures: list[str] = []
+         if dry_run:
+             guard_failures.append("dry_run")
+         if not live_trading_flag.value or not live_trading_flag.valid:
+             guard_failures.append("LIVE_TRADING_ENABLED!=1")
+         if disable_live_flag.value or not disable_live_flag.valid:
+             guard_failures.append("DISABLE_LIVE_TRADING!=0")
+         if mode != "LIVE":
+             guard_failures.append("STRATEGY_MODE!=LIVE")
+         if kis_env != "practice":
+             guard_failures.append("KIS_ENV!=practice")
+         if "openapivts" not in api_base_url:
+             guard_failures.append("API_BASE_URL missing openapivts")
+         if expect_kis_env and kis_env_raw != expect_kis_env:
+             guard_failures.append("EXPECT_KIS_ENV mismatch")
+         if guard_failures:
+             raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
+ 
+-    os.environ["DRY_RUN"] = "1" if dry_run else "0"
+-    os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry_run or disable_live_flag.value) else "0"
+-    os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
+-    os.environ["STRATEGY_MODE"] = mode
+-
+-    if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
+-        logger.warning("[PB1] 비거래일(%s) → 즉시 종료 dry_run=%s reason=%s", now.date(), dry_run, dry_run_reason)
++    def _apply_env_flags(dry: bool) -> None:
++        os.environ["DRY_RUN"] = "1" if dry else "0"
++        os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry or disable_live_flag.value or non_trading_day) else "0"
++        os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not non_trading_day) else "0"
++        os.environ["STRATEGY_MODE"] = mode
++
++    _apply_env_flags(dry_run)
++
++    def _sleep_until_morning_window() -> bool:
++        try:
++            hh, mm = MORNING_WINDOW_START.split(":")
++            start_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
++        except Exception:
++            return True
++        delta = start_dt - now
++        if delta.total_seconds() <= 0:
++            return True
++        if not trading_day or event_name_lower not in {"push", "workflow_dispatch"}:
++            return True
++        max_wait_min = int(os.getenv("MAX_WAIT_BEFORE_MORNING_MIN", "120") or "120")
++        if delta > timedelta(minutes=max_wait_min):
++            logger.info("[PB1][WAIT-SKIP] delta_min=%.1f max_wait_min=%s -> exit early", delta.total_seconds() / 60, max_wait_min)
++            return False
++        logger.info("[PB1][WAIT] waiting until morning window start delta_sec=%.0f", delta.total_seconds())
++        time.sleep(delta.total_seconds())
++        return True
++
++    if not _sleep_until_morning_window():
+         return
+-    if (not trading_day) and diag_enabled:
+-        logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
++    now = now_kst()
+ 
+     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
+     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
+     os.environ.setdefault("MORNING_EXIT_START", MORNING_EXIT_START)
+     os.environ.setdefault("MORNING_EXIT_END", MORNING_EXIT_END)
+     os.environ.setdefault("AFTERNOON_WINDOW_START", AFTERNOON_WINDOW_START)
+     os.environ.setdefault("AFTERNOON_WINDOW_END", AFTERNOON_WINDOW_END)
+     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
+     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
+ 
++    worktree_dir = Path("_botstate")
++    setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
++
++    os.environ["STATE_PATH"] = str(worktree_dir / "trader" / "state" / "state.json")
++    from trader import state_store as runtime_state_store
++    state_dir = Path(os.environ["STATE_PATH"]).parent
++    state_dir.mkdir(parents=True, exist_ok=True)
++    state_target_path = Path(os.environ["STATE_PATH"])
++
+     runtime_state = {}
+     kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+         kis = KisAPI()
+         balance = kis.get_balance()
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
+         runtime_state_store.save_state(runtime_state)
+     except Exception:
+         logger.exception("[PB1] runtime state reconcile failed")
+         runtime_state = runtime_state or runtime_state_store.load_state()
++        dry_run_reasons.append("kis_init_failed")
++        dry_run_reason = ",".join(dry_run_reasons)
++        dry_run = True
++        _apply_env_flags(dry_run)
+ 
+     if DIAGNOSTIC_ONLY:
+         logger.info("[PB1][DIAG] diagnostic_only mode -> exit")
+         return
+ 
+     window = decide_window(now=now, override=args.window)
+-    if window is None:
++    if window is None and diag_enabled:
++        window_name_for_log = "diagnostic"
++        phase_for_log = "verify"
++    else:
++        phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
++        window_name_for_log = window.name if window else "none"
++    logger.info(
++        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
++        event_name_lower or "unknown",
++        now.isoformat(),
++        trading_day,
++        window_name_for_log,
++        phase_for_log,
++        dry_run,
++        os.getenv("DISABLE_LIVE_TRADING"),
++        os.getenv("LIVE_TRADING_ENABLED"),
++        os.getenv("STRATEGY_MODE"),
++        os.getenv("PB1_ENTRY_ENABLED"),
++        dry_run_reasons or ["live"],
++    )
++    if window is None and not diag_enabled:
+         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+         return
++    if window is None and diag_enabled:
++        window = window  # keep None, but allow diagnostic flow below
++
++    if non_trading_day:
++        logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
++        if diag_enabled:
++            logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
+ 
+-    worktree_dir = Path("_botstate")
+-    setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     run_id = os.getenv("GITHUB_RUN_ID", "local")
+     if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC):
+         logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s", owner, run_id)
+         return
+ 
+     touched: list[Path] = []
+     try:
+         engine = PB1Engine(
+             kis=kis,
+             worktree_dir=worktree_dir,
+             window=window,
+             phase_override=args.phase,
+             dry_run=dry_run,
+             env="paper" if dry_run else kis.env if kis else "paper",
+             run_id=run_id,
+         )
+         touched = engine.run()
++        if state_target_path.exists():
++            touched.append(state_target_path)
+         logger.info("[PB1] run complete touched=%s", touched)
+         persist_run_files(
+             worktree_dir,
+             touched,
+             message=f"pb1 ledger run_id={run_id} window={window.name} phase={engine.phase}",
+         )
+     finally:
+         release_lock(worktree_dir, run_id=run_id)
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 904d2a05a96fd815901e1f8184130f9f3e4e78ba..26a27c706da668cf8a640722a1c6c35e14e907a1 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -1,45 +1,54 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ import uuid
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict
+ 
+ from .config import ACTIVE_STRATEGIES, KST, STATE_PATH, UNMANAGED_STRATEGY_ID
+ 
+ logger = logging.getLogger(__name__)
+ 
+ SCHEMA_VERSION = 3
+-STATE_PRIMARY_PATH = Path(os.getenv("STATE_PATH") or STATE_PATH)
+-RUNTIME_STATE_DIR = STATE_PRIMARY_PATH.parent
+-RUNTIME_STATE_PATH = STATE_PRIMARY_PATH
+ LEGACY_RUNTIME_DIR = Path(".runtime")
+ LEGACY_RUNTIME_PATH = LEGACY_RUNTIME_DIR / "state.json"
++
++
++def get_state_path() -> Path:
++    env_path = os.getenv("STATE_PATH")
++    if env_path:
++        return Path(env_path)
++    return Path(STATE_PATH)
++
++
++def get_runtime_paths() -> tuple[Path, Path]:
++    primary = get_state_path()
++    return primary, primary.parent
+ _LOT_ID_PREFIX = "LOT"
+ 
+ 
+ def _normalize_code(symbol: str | int | None) -> str:
+     return str(symbol or "").zfill(6)
+ 
+ 
+ def _normalize_strategy_id(value: Any) -> Any:
+     if value is None:
+         return None
+     try:
+         return int(value)
+     except Exception:
+         return value
+ 
+ 
+ def _is_managed(strategy_id: Any, active_strategies: set[int] | None = None) -> bool:
+     try:
+         sid_int = int(strategy_id)
+     except Exception:
+         return False
+     return sid_int in (active_strategies or ACTIVE_STRATEGIES)
+ 
+ 
+ def _default_runtime_state() -> Dict[str, Any]:
+@@ -77,84 +86,86 @@ def _load_from_path(path: Path) -> Dict[str, Any] | None:
+         if not isinstance(lots, list):
+             lots = []
+             state["lots"] = lots
+         positions = state.get("positions")
+         if isinstance(positions, dict):
+             for sym, payload in list(positions.items()):
+                 if not isinstance(payload, dict):
+                     positions[sym] = {}
+                     payload = positions[sym]
+                 code_norm = _normalize_code(sym)
+                 payload.setdefault("code", code_norm)
+                 sid = _normalize_strategy_id(payload.get("strategy_id"))
+                 payload["strategy_id"] = sid if sid is not None else UNMANAGED_STRATEGY_ID
+                 payload["managed"] = _is_managed(payload.get("strategy_id"))
+                 payload.setdefault("opened_at", payload.get("opened_at") or None)
+                 payload.setdefault("updated_at", payload.get("updated_at") or None)
+                 payload.setdefault("meta", {})
+                 payload["position_key"] = f"{code_norm}:{payload.get('strategy_id')}"
+         return state
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to load %s", path)
+         return None
+ 
+ 
+ def load_state() -> Dict[str, Any]:
+-    primary = _load_from_path(RUNTIME_STATE_PATH)
++    primary_path, _ = get_runtime_paths()
++    primary = _load_from_path(primary_path)
+     if primary is not None:
+-        logger.info("[STATE][LOAD] path=%s source=primary", RUNTIME_STATE_PATH)
++        logger.info("[STATE][LOAD] path=%s source=primary", primary_path)
+         return primary
+     legacy = _load_from_path(LEGACY_RUNTIME_PATH)
+     if legacy is not None:
+         logger.info("[STATE][LOAD] path=%s source=legacy_runtime", LEGACY_RUNTIME_PATH)
+         return legacy
+-    logger.info("[STATE][LOAD] path=%s source=default", RUNTIME_STATE_PATH)
++    logger.info("[STATE][LOAD] path=%s source=default", primary_path)
+     return _default_runtime_state()
+ 
+ 
+ def save_state(state: Dict[str, Any]) -> None:
++    primary_path, primary_dir = get_runtime_paths()
+     try:
+-        RUNTIME_STATE_DIR.mkdir(parents=True, exist_ok=True)
++        primary_dir.mkdir(parents=True, exist_ok=True)
+         payload = dict(state)
+         payload.setdefault("schema_version", SCHEMA_VERSION)
+         payload.setdefault("positions", {})
+         payload.setdefault("orders", {})
+         payload.setdefault("lots", [])
+         payload.setdefault("memory", {"last_price": {}, "last_seen": {}, "last_strategy_id": {}})
+         payload["updated_at"] = datetime.now(KST).isoformat()
+-        tmp_path = RUNTIME_STATE_PATH.with_name(f"{RUNTIME_STATE_PATH.name}.tmp")
++        tmp_path = primary_path.with_name(f"{primary_path.name}.tmp")
+         with open(tmp_path, "w", encoding="utf-8") as f:
+             json.dump(payload, f, ensure_ascii=False, indent=2)
+             f.flush()
+             os.fsync(f.fileno())
+-        os.replace(tmp_path, RUNTIME_STATE_PATH)
++        os.replace(tmp_path, primary_path)
+         try:
+-            size = RUNTIME_STATE_PATH.stat().st_size
+-            logger.info("[STATE][SAVE] path=%s bytes=%d", RUNTIME_STATE_PATH, size)
++            size = primary_path.stat().st_size
++            logger.info("[STATE][SAVE] path=%s bytes=%d", primary_path, size)
+         except Exception:
+-            logger.info("[STATE][SAVE] path=%s", RUNTIME_STATE_PATH)
+-        if LEGACY_RUNTIME_PATH != RUNTIME_STATE_PATH:
++            logger.info("[STATE][SAVE] path=%s", primary_path)
++        if LEGACY_RUNTIME_PATH != primary_path:
+             try:
+                 LEGACY_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                 tmp_legacy_path = LEGACY_RUNTIME_PATH.with_name(f"{LEGACY_RUNTIME_PATH.name}.tmp")
+                 with open(tmp_legacy_path, "w", encoding="utf-8") as f:
+                     json.dump(payload, f, ensure_ascii=False, indent=2)
+                     f.flush()
+                     os.fsync(f.fileno())
+                 os.replace(tmp_legacy_path, LEGACY_RUNTIME_PATH)
+                 logger.info("[STATE][SAVE] path=%s bytes=%d (legacy_mirror)", LEGACY_RUNTIME_PATH, LEGACY_RUNTIME_PATH.stat().st_size)
+             except Exception:
+                 logger.exception("[STATE][SAVE] failed to mirror legacy path %s", LEGACY_RUNTIME_PATH)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
+ 
+ 
+ def _ensure_lots(state: Dict[str, Any]) -> list[dict[str, Any]]:
+     lots = state.get("lots")
+     if isinstance(lots, dict):
+         combined: list[dict[str, Any]] = []
+         for bucket in lots.values():
+             if isinstance(bucket, list):
+                 combined.extend([lot for lot in bucket if isinstance(lot, dict)])
+         lots = combined
+         state["lots"] = lots
+     if not isinstance(lots, list):

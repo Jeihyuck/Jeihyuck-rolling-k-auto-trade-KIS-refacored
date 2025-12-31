@@ -12,16 +12,17 @@ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.config import (
     CAP_CAP,
     DAILY_CAPITAL,
-    ENABLE_BREAKOUT,
     KOSDAQ_HARD_STOP_PCT,
     KOSPI_HARD_STOP_PCT,
     LEDGER_BASE_DIR,
     LEDGER_LOOKBACK_DAYS,
+    PB1_ENTRY_ENABLED,
     PB1_DAY_SL_R,
     PB1_DAY_TP_R,
     PB1_R_FLOOR_PCT,
     PB1_TIME_STOP_DAYS,
 )
+from trader.utils.env import env_bool
 from trader.kis_wrapper import KisAPI
 from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
 from trader.ledger.store import LedgerStore
@@ -65,7 +66,10 @@ class PB1Engine:
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
-        self.ledger = LedgerStore(worktree_dir / LEDGER_BASE_DIR, env=env, run_id=run_id)
+        base_dir = LEDGER_BASE_DIR
+        if not Path(base_dir).is_absolute():
+            base_dir = worktree_dir / base_dir
+        self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
         self.worktree_dir = worktree_dir
         self._today = now_kst().date().isoformat()
 
@@ -112,6 +116,10 @@ class PB1Engine:
         return df
 
     def _build_universe(self) -> Dict[str, List[Dict]]:
+        """
+        Build selection universe for PB1 without triggering any legacy order flows.
+        run_rebalance() in best_k_meta_strategy is selection-only and returns weights.
+        """
         try:
             rebalance_payload = run_rebalance(str(now_kst().date()), return_by_market=True)
             return rebalance_payload.get("selected_by_market") or {}
@@ -445,7 +453,7 @@ class PB1Engine:
                 qty=qty,
                 price=mark,
                 client_order_key=client_key,
-                reasons=[ack.reasons] if ack.reasons else ["order_failed"],
+                reasons=ack.reasons if ack.reasons else ["order_failed"],
                 stage=stage,
             )
             self.ledger.append_event("errors", err)
@@ -470,10 +478,9 @@ class PB1Engine:
         return enriched
 
     def run(self) -> List[Path]:
-        entry_allowed = True
-        if ENABLE_BREAKOUT:
-            logger.warning("[PB1][BREAKOUT_DISABLED] ENABLE_BREAKOUT=%s -> skip new entries", ENABLE_BREAKOUT)
-            entry_allowed = False
+        entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+        if not entry_allowed:
+            logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s", self.window.name, self.phase, self.dry_run)
         run_files = self.ledger.open_run_files()
         touched: List[Path] = list(run_files.values())

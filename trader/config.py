@@ -119,8 +119,9 @@ CONFIG = {
     # PB1 close-pullback defaults
     "ENABLE_BREAKOUT": "false",
     "LEDGER_LOOKBACK_DAYS": "120",
-    "BOTSTATE_LOCK_TTL_SEC": "900",
+    "BOTSTATE_LOCK_TTL_SEC": "1800",
     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+    "PB1_ENTRY_ENABLED": "true",
     "MORNING_WINDOW_START": "08:50",
     "MORNING_WINDOW_END": "11:00",
     "MORNING_EXIT_START": "09:00",
@@ -414,6 +415,7 @@ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
 DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
 DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
 ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
+PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
 LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
 BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "900")
 LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
