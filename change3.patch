@@ -1,0 +1,27 @@
+diff --git a/trader/ledger/__init__.py b/trader/ledger/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b18ec6912621df9d2900242977f3fdcf39a27bf5
+--- /dev/null
++++ b/trader/ledger/__init__.py
+@@ -0,0 +1,17 @@
++# Make trader.ledger a regular package (avoid namespace ambiguity)
++from .event_types import (
++    LedgerEvent,
++    new_order_intent,
++    new_order_ack,
++    new_fill,
++    new_exit_intent,
++    new_error,
++    new_unfilled,
++)
++from .store import LedgerStore
++
++# Backward-compat shim: if legacy module existed, keep old API accessible.
++try:
++    from trader.ledger_legacy import *  # noqa: F401,F403
++except Exception:
++    pass
+diff --git a/trader/ledger.py b/trader/ledger_legacy.py
+similarity index 100%
+rename from trader/ledger.py
+rename to trader/ledger_legacy.py
