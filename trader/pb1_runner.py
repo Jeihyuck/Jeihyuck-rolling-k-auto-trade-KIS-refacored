@@ -23,7 +23,13 @@ from trader.config import (
     CLOSE_AUCTION_END,
 )
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
-from trader.botstate_sync import acquire_lock, release_lock, setup_worktree, persist_run_files
+from trader.botstate_sync import (
+    acquire_lock,
+    release_lock,
+    setup_worktree,
+    persist_run_files,
+    resolve_botstate_worktree_dir,
+)
 from trader.pb1_engine import PB1Engine
 from trader.window_router import decide_window
 
@@ -158,7 +164,7 @@ def main() -> None:
     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
 
-    worktree_dir = Path("_botstate")
+    worktree_dir = resolve_botstate_worktree_dir()
     setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
 
     os.environ["STATE_PATH"] = str(worktree_dir / "trader" / "state" / "state.json")
