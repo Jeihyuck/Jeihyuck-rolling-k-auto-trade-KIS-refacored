@@ -7,7 +7,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Iterable
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,9 @@ def resolve_botstate_worktree_dir() -> Path:
     return Path(os.getenv(BOTSTATE_WORKTREE_DIR_ENV, DEFAULT_BOTSTATE_WORKTREE_DIR)).resolve()
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
+        return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
         logger.error(
             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
@@ -37,8 +37,36 @@ def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess
         raise
 
 
-def _git(worktree_dir: Path, *args: str) -> subprocess.CompletedProcess:
-    return _run(["git", "-C", str(worktree_dir), *args])
+def git_porcelain(worktree_dir: Path) -> str:
+    return _git(worktree_dir, "status", "--porcelain").stdout
+
+
+def stage_all(worktree_dir: Path) -> None:
+    _git(worktree_dir, "add", "-A")
+
+
+def commit_if_staged(worktree_dir: Path, message: str) -> bool:
+    diff_proc = _git(worktree_dir, "diff", "--cached", "--quiet", check=False)
+    if diff_proc.returncode == 0:
+        return False
+    _git(worktree_dir, "commit", "-m", message)
+    return True
+
+
+def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
+    status = git_porcelain(worktree_dir)
+    files = [line.strip() for line in status.splitlines() if line.strip()]
+    dirty = bool(files)
+    logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
+    if not dirty:
+        return
+    stage_all(worktree_dir)
+    committed = commit_if_staged(worktree_dir, message_for_autosave)
+    logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
+
+
+def _git(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return _run(["git", "-C", str(worktree_dir), *args], check=check)
 
 
 def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
@@ -131,19 +159,69 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
 
 
+def _pull_with_autostash(worktree_dir: Path, branch: str) -> bool:
+    try:
+        _git(worktree_dir, "pull", "--rebase", "--autostash", "origin", branch)
+        return True
+    except subprocess.CalledProcessError as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if "--autostash" in stderr or "unknown option" in stderr or "unknown option" in stdout:
+            logger.warning("[BOTSTATE][GIT] --autostash unsupported fallback -> manual stash")
+            _git(worktree_dir, "stash", "push", "-u", "-m", "autostash botstate")
+            try:
+                _git(worktree_dir, "pull", "--rebase", "origin", branch)
+                return True
+            finally:
+                try:
+                    _git(worktree_dir, "stash", "pop")
+                except subprocess.CalledProcessError:
+                    logger.warning("[BOTSTATE][GIT] stash pop failed after manual autostash")
+                    raise
+        raise
+
+
 def push_retry(worktree_dir: Path, message: str, retries: int = 3) -> None:
     worktree_dir = worktree_dir.resolve()
+    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     for attempt in range(1, retries + 1):
+        pull_ok = False
+        push_ok = False
+        retry_reason = ""
         try:
-            _git(worktree_dir, "commit", "-m", message)
-        except subprocess.CalledProcessError:
-            pass
-        try:
-            _git(worktree_dir, "pull", "--rebase")
-            _git(worktree_dir, "push")
-            logger.info("[BOTSTATE][PUSH] message=%s attempt=%s", message, attempt)
+            _git(worktree_dir, "fetch", "origin", branch)
+            committed = commit_if_staged(worktree_dir, message)
+            logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message)
+            ensure_clean_before_rebase(worktree_dir, message_for_autosave=f"autosave before {message}")
+            rev_list = _git(worktree_dir, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD").stdout.strip()
+            try:
+                behind, ahead = (int(x) for x in rev_list.split())
+            except Exception:
+                behind, ahead = 0, 0
+            logger.info("[BOTSTATE][GIT] behind=%s ahead=%s", behind, ahead)
+
+            if behind == 0 and ahead > 0:
+                _git(worktree_dir, "push")
+                push_ok = True
+            elif behind > 0:
+                pull_ok = _pull_with_autostash(worktree_dir, branch)
+                _git(worktree_dir, "push")
+                push_ok = True
+            else:
+                _git(worktree_dir, "push")
+                push_ok = True
+
+            logger.info("[BOTSTATE][GIT] push_ok=%s pull_ok=%s attempt=%s", push_ok, pull_ok, attempt)
             return
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError as exc:
+            retry_reason = (exc.stderr or "").strip() or (exc.stdout or "").strip() or str(exc)
+            logger.warning("[BOTSTATE][GIT] push_ok=%s pull_ok=%s retry_reason=%s attempt=%s", push_ok, pull_ok, retry_reason, attempt)
+            if "non-fast-forward" in retry_reason or "fetch first" in retry_reason.lower():
+                ensure_clean_before_rebase(worktree_dir, message_for_autosave=f"autosave before {message}")
+                try:
+                    pull_ok = _pull_with_autostash(worktree_dir, branch)
+                except subprocess.CalledProcessError as pull_exc:
+                    retry_reason = (pull_exc.stderr or "").strip() or (pull_exc.stdout or "").strip() or str(pull_exc)
             if attempt == retries:
                 raise
             time.sleep(2 * attempt)

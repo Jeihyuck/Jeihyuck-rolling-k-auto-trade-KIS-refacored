@@ -167,6 +167,13 @@ def main() -> None:
     worktree_dir = resolve_botstate_worktree_dir()
     setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
 
+    owner = os.getenv("GITHUB_ACTOR", "local")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    lock_acquired = acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
+    if not lock_acquired:
+        logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s", owner, run_id)
+        return
+
     os.environ["STATE_PATH"] = str(worktree_dir / "trader" / "state" / "state.json")
     from trader import state_store as runtime_state_store
     state_dir = Path(os.environ["STATE_PATH"]).parent
@@ -191,6 +198,7 @@ def main() -> None:
 
     if DIAGNOSTIC_ONLY:
         logger.info("[PB1][DIAG] diagnostic_only mode -> exit")
+        release_lock(worktree_dir, run_id=run_id)
         return
 
     window = decide_window(now=now, override=args.window)
@@ -216,6 +224,7 @@ def main() -> None:
     )
     if window is None and not diag_enabled:
         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+        release_lock(worktree_dir, run_id=run_id)
         return
     if window is None and diag_enabled:
         window = window  # keep None, but allow diagnostic flow below
@@ -224,12 +233,6 @@ def main() -> None:
         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
         if diag_enabled:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
-
-    owner = os.getenv("GITHUB_ACTOR", "local")
-    run_id = os.getenv("GITHUB_RUN_ID", "local")
-    if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC):
-        logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s", owner, run_id)
-        return
 
     touched: list[Path] = []
     try:
