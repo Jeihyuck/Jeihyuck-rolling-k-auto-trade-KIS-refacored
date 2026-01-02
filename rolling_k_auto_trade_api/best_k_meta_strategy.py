@@ -17,15 +17,26 @@ import math
 import os
 from datetime import datetime, timedelta, date
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+import json
 
 import numpy as np
 import pandas as pd
 import FinanceDataReader as fdr
+import requests
 from pykrx.stock import (
     get_market_cap_by_ticker,
     get_nearest_business_day_in_a_week,
 )
+try:  # pykrx wrapper의 잘못된 logging 포맷으로 인한 로그 폭주 방지
+    from pykrx.website import comm as _pykrx_comm  # type: ignore
+
+    if hasattr(_pykrx_comm, "logging") and hasattr(_pykrx_comm.logging, "info"):
+        _pykrx_comm.logging.info = lambda *_, **__: None  # type: ignore
+except Exception:
+    # pykrx가 없거나 내부 구조 변경 시에도 런이 계속되도록 무시
+    pass
 
 from trader.rkmax_utils import get_best_k_meta, assign_weights, _enforce_min_weight_for_forced
 from .simulate_with_k_and_get_metrics import simulate_with_k_and_get_metrics
@@ -56,6 +67,8 @@ ALWAYS_INCLUDE_CODES = {
 }
 KEEP_HELD_BYPASS_FILTERS = os.getenv("KEEP_HELD_BYPASS_FILTERS", "true").lower() == "true"
 HELD_MIN_WEIGHT = float(os.getenv("HELD_MIN_WEIGHT", "0.01"))
+UNIVERSE_CACHE_ENV = "UNIVERSE_CACHE_DIR"
+UNIVERSE_CACHE_SUBDIR = "universe_cache"
 
 # -----------------------------
 # 유틸
@@ -104,8 +117,56 @@ def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
     normalized_markets = tuple(dict.fromkeys(markets))
     return _get_listing_df_cached(normalized_markets).copy()
 
+
+def _universe_cache_base() -> Path:
+    explicit = os.getenv(UNIVERSE_CACHE_ENV)
+    if explicit:
+        return Path(explicit)
+    base_dir = Path(os.getenv("LEDGER_BASE_DIR", "bot_state/trader_ledger"))
+    if not base_dir.is_absolute():
+        base_dir = Path.cwd() / base_dir
+    return base_dir / UNIVERSE_CACHE_SUBDIR
+
+
+def _universe_cache_path(market: str) -> Path:
+    return _universe_cache_base() / market / "latest.json"
+
+
+def _load_cached_universe(market: str) -> pd.DataFrame:
+    path = _universe_cache_path(market)
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text())
+            df = pd.DataFrame(payload)
+            if not df.empty:
+                df["Code"] = df["Code"].astype(str).str.zfill(6)
+            return df
+    except Exception:
+        logger.warning("⚠️  %s 캐시 로드 실패 → 빈 DF 사용", market, exc_info=logger.isEnabledFor(logging.DEBUG))
+    return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+
+
+def _save_cached_universe(df: pd.DataFrame, market: str) -> None:
+    if df is None or df.empty:
+        return
+    path = _universe_cache_path(market)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(df.to_json(orient="records", force_ascii=False))
+        tmp_path.replace(path)
+        logger.info("💾 %s 유니버스 캐시 저장 %s", market, path)
+    except Exception:
+        logger.warning("⚠️  %s 캐시 저장 실패", market, exc_info=logger.isEnabledFor(logging.DEBUG))
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
 def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.DataFrame:
     """주어진 시장의 시가총액 상위 n개 종목 반환."""
+    cached = _load_cached_universe(market)
     try:
         target_dt = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
         from_date = get_nearest_business_day_in_a_week(target_dt.strftime("%Y%m%d"))
@@ -114,14 +175,14 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
         mktcap_df = get_market_cap_by_ticker(from_date, market=market)
         if mktcap_df is None or len(mktcap_df) == 0:
             logger.warning("⚠️  pykrx 시총 DF(%s)가 비었습니다 → 빈 DF 반환", market)
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return cached if not cached.empty else pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         mktcap_df = mktcap_df.reset_index()
         capcol = _find_column(mktcap_df, "시가총액")
         ticcol = _find_column(mktcap_df, "티커") or _find_column(mktcap_df, "코드")
         if capcol is None or ticcol is None:
             logger.error("❌  %s 시총/티커 컬럼 탐색 실패 → 빈 DF 반환", market)
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return cached if not cached.empty else pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         mktcap_df = mktcap_df.rename(columns={capcol: "Marcap", ticcol: "Code"})
         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
@@ -140,18 +201,35 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
                     break
         if "Marcap" not in merged.columns:
             logger.error("❌  병합 후에도 'Marcap' 없음(%s) → 빈 DF 반환", market)
-            return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+            return cached if not cached.empty else pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         topn = merged.dropna(subset=["Marcap"])
         # 6자리 숫자 코드만 사용 (우선주/ETN 등 특수코드, 0009K0 같은 것 제거)
         topn = topn[topn["Code"].astype(str).str.match(r"^\d{6}$")]
         topn = topn.sort_values("Marcap", ascending=False).head(n)
         logger.info(f"✅  {market} 시총 Top{n} 추출 완료 → {len(topn)} 종목")
-        return topn[["Code", "Name", "Marcap"]]
+        result = topn[["Code", "Name", "Marcap"]]
+        if result.empty and not cached.empty:
+            logger.warning("⚠️  %s TopN 결과가 비어 캐시 사용(%d rows)", market, len(cached))
+            return cached
+        _save_cached_universe(result, market)
+        return result
 
+    except (
+        requests.exceptions.JSONDecodeError,
+        json.decoder.JSONDecodeError,
+        IndexError,
+        ValueError,
+    ) as exc:
+        logger.warning("⚠️  %s pykrx 조회 실패 → 캐시 폴백 시도: %s", market, exc)
     except Exception:
-        logger.exception("❌  get_top_n_for_market(%s) 예외:", market)
-        return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+        logger.warning("⚠️  get_top_n_for_market(%s) 예외 발생 → 캐시 폴백", market, exc_info=logger.isEnabledFor(logging.DEBUG))
+
+    if not cached.empty:
+        logger.info("↩️  %s 유니버스 캐시 사용 (%d rows)", market, len(cached))
+        return cached
+    logger.warning("⚠️  %s 캐시 없음 → 빈 DF 반환", market)
+    return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
 def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
     return _get_top_n_for_market(date_str, n, market="KOSDAQ")

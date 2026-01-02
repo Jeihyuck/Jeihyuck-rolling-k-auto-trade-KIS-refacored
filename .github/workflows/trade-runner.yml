@@ -48,6 +48,7 @@ jobs:
       EXPECT_LIVE_TRADING: "1"
       EXPECT_KIS_ENV: "practice"
       PB1_ENTRY_ENABLED: "1"
+      PB1_SKIP_UNIVERSE_IN_DIAG: "1"
       KIS_ENV: "practice"
       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}

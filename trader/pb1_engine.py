@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -481,6 +482,33 @@ class PB1Engine:
             )
         return enriched
 
+    def _is_diagnostic_guard_enabled(self) -> bool:
+        skip_env = os.getenv("PB1_SKIP_UNIVERSE_IN_DIAG") == "1"
+        return bool(
+            (self.window and self.window.name == "diagnostic")
+            or (self.dry_run and skip_env)
+            or (self.phase == "verify")
+        )
+
+    def _run_verify_only(self, positions: Dict[Tuple[str, int, int], Dict], touched: List[Path]) -> List[Path]:
+        logger.info(
+            "[PB1][DIAG-MODE] universe/rebalance skipped window=%s phase=%s dry_run=%s",
+            self.window.name,
+            self.phase,
+            self.dry_run,
+        )
+        marks = self._fetch_marks([p["code"] for p in self._positions_with_meta(positions)], {})
+        snapshot = self.ledger.generate_pnl_snapshot(positions, marks=marks)
+        logger.info(
+            "[PNL][SNAPSHOT] portfolio_return_pct=%.2f%% unrealized=%.2f realized=%.2f",
+            snapshot["totals"]["portfolio_return_pct"],
+            snapshot["totals"]["unrealized"],
+            snapshot["totals"]["realized"],
+        )
+        snap_path = self.ledger.write_snapshot(snapshot, self.run_id)
+        touched.append(snap_path)
+        return touched
+
     def run(self) -> List[Path]:
         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
         if not entry_allowed:
@@ -491,6 +519,8 @@ class PB1Engine:
         logger.info("[LEDGER][APPEND] kind=touch path=%s", run_files)
         persist_run_files(self.worktree_dir, touched, message=f"pb1 touch run_id={self.run_id}")
         positions = self.ledger.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+        if self._is_diagnostic_guard_enabled():
+            return self._run_verify_only(positions, touched)
         selected = self._build_universe()
         code_market = self._code_market_map(selected)
         marks_fallback: Dict[str, float] = {}
