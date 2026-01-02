@@ -1,0 +1,543 @@
+diff --git a/trader/state_store.py b/trader/state_store.py
+index 26a27c706da668cf8a640722a1c6c35e14e907a1..aa07a84a2cc9089571471a9e3199e0e67733ae2b 100644
+--- a/trader/state_store.py
++++ b/trader/state_store.py
+@@ -157,50 +157,84 @@ def save_state(state: Dict[str, Any]) -> None:
+                 logger.exception("[STATE][SAVE] failed to mirror legacy path %s", LEGACY_RUNTIME_PATH)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to save %s", RUNTIME_STATE_PATH)
+ 
+ 
+ def _ensure_lots(state: Dict[str, Any]) -> list[dict[str, Any]]:
+     lots = state.get("lots")
+     if isinstance(lots, dict):
+         combined: list[dict[str, Any]] = []
+         for bucket in lots.values():
+             if isinstance(bucket, list):
+                 combined.extend([lot for lot in bucket if isinstance(lot, dict)])
+         lots = combined
+         state["lots"] = lots
+     if not isinstance(lots, list):
+         lots = []
+         state["lots"] = lots
+     return lots
+ 
+ 
+ def _generate_lot_id(code: str, ts: str | None = None) -> str:
+     suffix = ts or datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+     return f"{_LOT_ID_PREFIX}-{_normalize_code(code)}-{suffix}-{uuid.uuid4().hex[:6]}"
+ 
+ 
++def _env_flag(name: str, default: str = "0") -> bool:
++    value = os.getenv(name, default)
++    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
++
++
++def _lot_qty(lot: dict[str, Any]) -> int:
++    try:
++        return int(lot.get("remaining_qty") or lot.get("qty") or 0)
++    except Exception:
++        return 0
++
++
++def _set_lot_qty(lot: dict[str, Any], qty: int) -> None:
++    lot["qty"] = qty
++    lot["remaining_qty"] = qty
++
++
++def _lot_timestamp(lot: dict[str, Any]) -> float | None:
++    ts_str = (
++        lot.get("updated_at")
++        or lot.get("entry_ts")
++        or lot.get("created_at")
++        or lot.get("entry")
++    )
++    if isinstance(ts_str, dict):
++        ts_str = ts_str.get("time")
++    if not ts_str:
++        return None
++    try:
++        return datetime.fromisoformat(ts_str).timestamp()
++    except Exception:
++        return None
++
++
+ def _norm_sid(value: Any) -> Any:
+     if value is None:
+         return None
+     try:
+         return int(value)
+     except Exception:
+         return str(value)
+ 
+ 
+ def record_lot_open(
+     state: Dict[str, Any],
+     *,
+     code: str,
+     sid: Any,
+     strategy: str,
+     engine: str,
+     qty: int,
+     entry_price: float,
+     entry_ts: str | None = None,
+     order_id: str | None = None,
+     lot_id: str | None = None,
+ ) -> Dict[str, Any]:
+     lots = _ensure_lots(state)
+     ts = entry_ts or datetime.now(KST).isoformat()
+     lot_identifier = lot_id or _generate_lot_id(code, ts)
+@@ -433,201 +467,413 @@ def mark_fill(
+             else 0.0
+         )
+         pos.update({"qty": total_qty, "avg_price": avg_price, "last_buy_ts": ts})
+     else:
+         pos.update({"qty": max(0, cur_qty - int(qty)), "last_sell_ts": ts})
+     pos["last_order_id"] = order_id
+     pos["last_action"] = side.upper()
+     pos["last_action_ts"] = ts
+     pos["last_order_status"] = status
+     pos["updated_at"] = ts
+     update_position_fields(state, symbol, pos)
+     try:
+         save_state(state)
+     except Exception:
+         logger.exception("[RUNTIME_STATE] failed to persist after lot update for %s", symbol)
+ 
+ 
+ def reconcile_with_kis_balance(
+     state: Dict[str, Any],
+     balance: Dict[str, Any],
+     *,
+     preferred_strategy: Dict[str, Any] | None = None,
+     active_strategies: set[int] | None = None,
+     unmanaged_strategy_id: int = 0,
+ ) -> Dict[str, Any]:
++    apply_reconcile = _env_flag("STATE_RECONCILE_APPLY", "0")
+     preferred_strategy = preferred_strategy or {}
+     active_strategies = active_strategies or set()
+     positions = state.setdefault("positions", {})
+     lots = _ensure_lots(state)
+     state_lots_by_code: Dict[str, list[dict[str, Any]]] = {}
+     for lot in lots:
+         code_key = _normalize_code(lot.get("code") or lot.get("pdno"))
+         if not code_key:
+             continue
+         bucket = state_lots_by_code.setdefault(code_key, [])
+         bucket.append(lot)
+ 
+     balance_positions = balance.get("positions") if isinstance(balance, dict) else None
+     if not isinstance(balance_positions, list):
+         logger.warning("[STATE][RECONCILE] balance.positions missing or invalid")
+         return state
+ 
+     now_iso = datetime.now(KST).isoformat()
+     holdings = []
+     for row in balance_positions:
+         symbol = _normalize_code(row.get("code") or row.get("pdno"))
+         qty = int(float(row.get("qty") or row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
+         if not symbol or qty <= 0:
+             continue
+         holdings.append(
+             {
+                 "code": symbol,
+                 "qty": qty,
+                 "avg": float(row.get("avg_price") or row.get("pchs_avg_pric") or 0.0),
+                 "cur": float(row.get("prpr") or 0.0) if row.get("prpr") not in (None, "") else None,
+             }
+         )
+     logger.info("[STATE][RECONCILE] kis_holdings=%d", len(holdings))
+ 
+     created_orphans = 0
+     qty_adjusted = 0
+     updated_codes = 0
++    holdings_codes: set[str] = set()
+ 
+     for holding in holdings:
+         code = holding["code"]
+         qty = holding["qty"]
+         avg = holding["avg"] if holding["avg"] != 0.0 else None
+         cur = holding["cur"]
++        holdings_codes.add(code)
+         pos = upsert_position(state, code)
+         pos_meta = pos.setdefault("meta", {})
+         raw_strategy_id = pos.get("strategy_id") or preferred_strategy.get(code)
+         strategy_id = raw_strategy_id if raw_strategy_id not in (None, "") else unmanaged_strategy_id
+         managed = _is_managed(strategy_id, active_strategies)
+         if not managed and raw_strategy_id not in (None, "", unmanaged_strategy_id):
+             strategy_id = unmanaged_strategy_id
+         pos.update(
+             {
+                 "strategy_id": strategy_id,
+                 "managed": managed,
+                 "qty": qty,
+                 "avg_price": float(holding["avg"] or 0.0),
+                 "last_action": "RECONCILE",
+                 "updated_at": now_iso,
+                 "opened_at": pos.get("opened_at") or now_iso,
+                 "position_key": f"{code}:{strategy_id}",
+             }
+         )
+         if not managed:
+             pos_meta.setdefault("created_by", "reconcile_unmanaged")
+             notes = pos_meta.setdefault("notes", [])
+             if isinstance(notes, list):
+                 notes.append("UNMANAGED_HOLDING")
+-        state_lots = state_lots_by_code.get(code, [])
+-        state_sum = sum(int(l.get("remaining_qty") or l.get("qty") or 0) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN")
++        state_lots = state_lots_by_code.setdefault(code, [])
++        open_lots = [l for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"]
++        state_sum = sum(_lot_qty(l) for l in open_lots)
++        code_updated = False
++        state_after = state_sum
+         if not state_lots:
+             lot = {
+                 "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
+                 "code": code,
+                 "pdno": code,
+                 "sid": "ORPHAN",
+                 "strategy_id": "ORPHAN",
+                 "strategy": "ORPHAN",
+                 "engine": "reconcile_kis_balance",
+                 "qty": qty,
+                 "remaining_qty": qty,
+                 "entry_price": avg if avg is not None else None,
+                 "entry_ts": now_iso,
+                 "status": "OPEN",
+                 "source": "reconcile_kis_balance",
+                 "created_at": now_iso,
+                 "updated_at": now_iso,
+                 "notes": ["MISSING_IN_STATE"],
+             }
+             lots.append(lot)
++            state_lots.append(lot)
+             created_orphans += 1
+-            updated_codes += 1
++            code_updated = True
++            state_sum = qty
++            state_after = qty
+             logger.warning(
+                 "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s",
+                 code,
+                 qty,
+                 avg,
+                 cur,
+             )
+-            continue
+         if state_sum != qty:
+             delta = qty - state_sum
+             notes = [
+                 "QTY_MISMATCH_STATE_TO_KIS",
+                 f"state_sum={state_sum}",
+                 f"kis={qty}",
+             ]
++            state_before = state_sum
+             if delta > 0:
+-                lot = {
+-                    "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
+-                    "code": code,
+-                    "pdno": code,
+-                    "sid": "ORPHAN",
+-                    "strategy_id": "ORPHAN",
+-                    "strategy": "ORPHAN",
+-                    "engine": "reconcile_kis_balance",
+-                    "qty": delta,
+-                    "remaining_qty": delta,
+-                    "entry_price": avg if avg is not None else None,
+-                    "entry_ts": now_iso,
+-                    "status": "OPEN",
+-                    "source": "reconcile_kis_balance",
+-                    "created_at": now_iso,
+-                    "updated_at": now_iso,
+-                    "notes": notes,
+-                }
+-                lots.append(lot)
+-                qty_adjusted += 1
+-                updated_codes += 1
+-                logger.warning(
+-                    "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s notes=%s",
+-                    code,
+-                    delta,
+-                    avg,
+-                    cur,
+-                    notes,
+-                )
++                if apply_reconcile:
++                    lot = {
++                        "lot_id": f"MANUAL-{code}-{now_iso.replace(':', '').replace('-', '')}",
++                        "code": code,
++                        "pdno": code,
++                        "sid": "MANUAL",
++                        "strategy_id": "MANUAL",
++                        "strategy": "MANUAL",
++                        "engine": "reconcile_kis_balance",
++                        "qty": delta,
++                        "remaining_qty": delta,
++                        "entry_price": avg if avg is not None else None,
++                        "entry_ts": now_iso,
++                        "status": "OPEN",
++                        "source": "reconcile_kis_balance",
++                        "created_at": now_iso,
++                        "updated_at": now_iso,
++                        "notes": notes,
++                    }
++                    lots.append(lot)
++                    state_lots.append(lot)
++                    qty_adjusted += delta
++                    state_after = state_before + delta
++                    code_updated = True
++                    logger.info(
++                        "[STATE][RECONCILE][LOT-ADD] code=%s sid=%s qty_add=%d",
++                        code,
++                        lot.get("sid"),
++                        delta,
++                    )
++                    logger.info(
++                        "[STATE][RECONCILE][APPLY] code=%s kis=%d state_before=%d state_after=%d adjusted=%d",
++                        code,
++                        qty,
++                        state_before,
++                        state_after,
++                        delta,
++                    )
++                else:
++                    lot = {
++                        "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
++                        "code": code,
++                        "pdno": code,
++                        "sid": "ORPHAN",
++                        "strategy_id": "ORPHAN",
++                        "strategy": "ORPHAN",
++                        "engine": "reconcile_kis_balance",
++                        "qty": delta,
++                        "remaining_qty": delta,
++                        "entry_price": avg if avg is not None else None,
++                        "entry_ts": now_iso,
++                        "status": "OPEN",
++                        "source": "reconcile_kis_balance",
++                        "created_at": now_iso,
++                        "updated_at": now_iso,
++                        "notes": notes,
++                    }
++                    lots.append(lot)
++                    state_lots.append(lot)
++                    qty_adjusted += delta
++                    code_updated = True
++                    logger.warning(
++                        "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s notes=%s",
++                        code,
++                        delta,
++                        avg,
++                        cur,
++                        notes,
++                    )
+             else:
+-                logger.warning(
+-                    "[STATE][RECONCILE][STATE_GT_KIS] code=%s state_sum=%d kis=%d notes=%s",
+-                    code,
+-                    state_sum,
+-                    qty,
+-                    notes,
+-                )
++                if apply_reconcile:
++                    diff = abs(delta)
++                    adjusted_qty = 0
++                    priority_lots = []
++                    for lot in open_lots:
++                        ts_val = _lot_timestamp(lot)
++                        priority = (
++                            0
++                            if str(lot.get("sid") or lot.get("strategy_id") or "").upper()
++                            in {"UNKNOWN", "ORPHAN", "MANUAL"}
++                            else 1
++                        )
++                        priority_lots.append(
++                            (
++                                priority,
++                                ts_val if ts_val is not None else float("inf"),
++                                -_lot_qty(lot),
++                                lot,
++                            )
++                        )
++                    priority_lots = [item[3] for item in sorted(priority_lots, key=lambda t: (t[0], t[1], t[2]))]
++                    for lot in priority_lots:
++                        if diff <= 0:
++                            break
++                        current_qty = _lot_qty(lot)
++                        if current_qty <= 0:
++                            continue
++                        dec = min(current_qty, diff)
++                        new_qty = current_qty - dec
++                        _set_lot_qty(lot, new_qty)
++                        adjusted_qty += dec
++                        diff -= dec
++                        logger.info(
++                            "[STATE][RECONCILE][LOT-DEC] code=%s sid=%s qty_before=%d qty_after=%d dec=%d",
++                            code,
++                            lot.get("sid") or lot.get("strategy_id"),
++                            current_qty,
++                            new_qty,
++                            dec,
++                        )
++                        if new_qty <= 0:
++                            try:
++                                lots.remove(lot)
++                            except ValueError:
++                                pass
++                            try:
++                                state_lots.remove(lot)
++                            except ValueError:
++                                pass
++                    if diff > 0:
++                        logger.error(
++                            "[STATE][RECONCILE][STATE_GT_KIS][INCOMPLETE] code=%s remaining_diff=%d applying snapshot",
++                            code,
++                            diff,
++                        )
++                        for lot in list(priority_lots):
++                            try:
++                                lots.remove(lot)
++                            except ValueError:
++                                pass
++                            try:
++                                state_lots.remove(lot)
++                            except ValueError:
++                                pass
++                        snapshot_lot = {
++                            "lot_id": f"MANUAL-{code}-{now_iso.replace(':', '').replace('-', '')}",
++                            "code": code,
++                            "pdno": code,
++                            "sid": "MANUAL",
++                            "strategy_id": "MANUAL",
++                            "strategy": "MANUAL",
++                            "engine": "reconcile_kis_balance",
++                            "qty": qty,
++                            "remaining_qty": qty,
++                            "entry_price": avg if avg is not None else None,
++                            "entry_ts": now_iso,
++                            "status": "OPEN",
++                            "source": "reconcile_kis_balance",
++                            "created_at": now_iso,
++                            "updated_at": now_iso,
++                            "notes": notes + ["SNAPSHOT_REBUILD"],
++                        }
++                        lots.append(snapshot_lot)
++                        state_lots.append(snapshot_lot)
++                        adjusted_qty = state_before
++                        diff = 0
++                        logger.info(
++                            "[STATE][RECONCILE][LOT-ADD] code=%s sid=%s qty_add=%d",
++                            code,
++                            snapshot_lot.get("sid"),
++                            qty,
++                        )
++                    state_after = sum(
++                        _lot_qty(l) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"
++                    )
++                    qty_adjusted += adjusted_qty
++                    if adjusted_qty > 0:
++                        code_updated = True
++                    logger.info(
++                        "[STATE][RECONCILE][APPLY] code=%s kis=%d state_before=%d state_after=%d adjusted=%d",
++                        code,
++                        qty,
++                        state_before,
++                        state_after,
++                        adjusted_qty,
++                    )
++                else:
++                    logger.warning(
++                        "[STATE][RECONCILE][STATE_GT_KIS] code=%s state_sum=%d kis=%d notes=%s",
++                        code,
++                        state_sum,
++                        qty,
++                        notes,
++                    )
+         else:
++            code_updated = True
++        state_after = sum(
++            _lot_qty(l) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"
++        )
++        logger.info(
++            "[STATE][RECONCILE][ASSERT] code=%s kis=%d state=%d ok=%s",
++            code,
++            qty,
++            state_after,
++            state_after == qty,
++        )
++        if code_updated:
+             updated_codes += 1
+     for symbol, pos in list(positions.items()):
+         if symbol not in {h["code"] for h in holdings}:
+             pos["qty"] = 0
+             pos["last_action"] = "RECONCILE"
+             positions[symbol] = pos
++
++    if apply_reconcile:
++        for code, code_lots in list(state_lots_by_code.items()):
++            if code in holdings_codes:
++                continue
++            open_lots = [l for l in code_lots if str(l.get("status") or "OPEN").upper() == "OPEN"]
++            state_sum = sum(_lot_qty(l) for l in open_lots)
++            if state_sum <= 0:
++                continue
++            for lot in list(open_lots):
++                qty_before = _lot_qty(lot)
++                _set_lot_qty(lot, 0)
++                try:
++                    lots.remove(lot)
++                except ValueError:
++                    pass
++                try:
++                    code_lots.remove(lot)
++                except ValueError:
++                    pass
++                logger.info(
++                    "[STATE][RECONCILE][LOT-DEC] code=%s sid=%s qty_before=%d qty_after=%d dec=%d reason=NO_KIS_HOLDING",
++                    code,
++                    lot.get("sid") or lot.get("strategy_id"),
++                    qty_before,
++                    0,
++                    qty_before,
++                )
++            qty_adjusted += state_sum
++            updated_codes += 1
++            logger.info(
++                "[STATE][RECONCILE][APPLY] code=%s kis=0 state_before=%d state_after=%d adjusted=%d reason=NO_KIS_HOLDING",
++                code,
++                state_sum,
++                0,
++                state_sum,
++            )
++            logger.info(
++                "[STATE][RECONCILE][ASSERT] code=%s kis=%d state=%d ok=%s",
++                code,
++                0,
++                0,
++                True,
++            )
+     logger.info(
+         "[STATE][RECONCILE] created_orphans=%d qty_adjusted=%d updated_codes=%d",
+         created_orphans,
+         qty_adjusted,
+         updated_codes,
+     )
+     return state
+ 
+ 
+ def _default_lot_state() -> Dict[str, Any]:
+     return {"version": SCHEMA_VERSION, "lots": [], "updated_at": None}
+ 
+ 
+ def load_lot_state(path_json: str) -> Dict[str, Any]:
+     path = Path(path_json)
+     if not path.exists():
+         return _default_lot_state()
+     try:
+         with open(path, "r", encoding="utf-8") as f:
+             state = json.load(f)
+         if not isinstance(state, dict):
+             logger.warning("[STATE_STORE] invalid state format: %s", type(state))
+             return _default_lot_state()
+         state.setdefault("version", SCHEMA_VERSION)
+         state.setdefault("lots", [])

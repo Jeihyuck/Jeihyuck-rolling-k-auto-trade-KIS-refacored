@@ -179,6 +179,40 @@ def _generate_lot_id(code: str, ts: str | None = None) -> str:
     return f"{_LOT_ID_PREFIX}-{_normalize_code(code)}-{suffix}-{uuid.uuid4().hex[:6]}"
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _lot_qty(lot: dict[str, Any]) -> int:
+    try:
+        return int(lot.get("remaining_qty") or lot.get("qty") or 0)
+    except Exception:
+        return 0
+
+
+def _set_lot_qty(lot: dict[str, Any], qty: int) -> None:
+    lot["qty"] = qty
+    lot["remaining_qty"] = qty
+
+
+def _lot_timestamp(lot: dict[str, Any]) -> float | None:
+    ts_str = (
+        lot.get("updated_at")
+        or lot.get("entry_ts")
+        or lot.get("created_at")
+        or lot.get("entry")
+    )
+    if isinstance(ts_str, dict):
+        ts_str = ts_str.get("time")
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str).timestamp()
+    except Exception:
+        return None
+
+
 def _norm_sid(value: Any) -> Any:
     if value is None:
         return None
@@ -455,6 +489,7 @@ def reconcile_with_kis_balance(
     active_strategies: set[int] | None = None,
     unmanaged_strategy_id: int = 0,
 ) -> Dict[str, Any]:
+    apply_reconcile = _env_flag("STATE_RECONCILE_APPLY", "0")
     preferred_strategy = preferred_strategy or {}
     active_strategies = active_strategies or set()
     positions = state.setdefault("positions", {})
@@ -492,12 +527,14 @@ def reconcile_with_kis_balance(
     created_orphans = 0
     qty_adjusted = 0
     updated_codes = 0
+    holdings_codes: set[str] = set()
 
     for holding in holdings:
         code = holding["code"]
         qty = holding["qty"]
         avg = holding["avg"] if holding["avg"] != 0.0 else None
         cur = holding["cur"]
+        holdings_codes.add(code)
         pos = upsert_position(state, code)
         pos_meta = pos.setdefault("meta", {})
         raw_strategy_id = pos.get("strategy_id") or preferred_strategy.get(code)
@@ -522,8 +559,11 @@ def reconcile_with_kis_balance(
             notes = pos_meta.setdefault("notes", [])
             if isinstance(notes, list):
                 notes.append("UNMANAGED_HOLDING")
-        state_lots = state_lots_by_code.get(code, [])
-        state_sum = sum(int(l.get("remaining_qty") or l.get("qty") or 0) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN")
+        state_lots = state_lots_by_code.setdefault(code, [])
+        open_lots = [l for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"]
+        state_sum = sum(_lot_qty(l) for l in open_lots)
+        code_updated = False
+        state_after = state_sum
         if not state_lots:
             lot = {
                 "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
@@ -544,8 +584,11 @@ def reconcile_with_kis_balance(
                 "notes": ["MISSING_IN_STATE"],
             }
             lots.append(lot)
+            state_lots.append(lot)
             created_orphans += 1
-            updated_codes += 1
+            code_updated = True
+            state_sum = qty
+            state_after = qty
             logger.warning(
                 "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s",
                 code,
@@ -553,7 +596,6 @@ def reconcile_with_kis_balance(
                 avg,
                 cur,
             )
-            continue
         if state_sum != qty:
             delta = qty - state_sum
             notes = [
@@ -561,51 +603,255 @@ def reconcile_with_kis_balance(
                 f"state_sum={state_sum}",
                 f"kis={qty}",
             ]
+            state_before = state_sum
             if delta > 0:
-                lot = {
-                    "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
-                    "code": code,
-                    "pdno": code,
-                    "sid": "ORPHAN",
-                    "strategy_id": "ORPHAN",
-                    "strategy": "ORPHAN",
-                    "engine": "reconcile_kis_balance",
-                    "qty": delta,
-                    "remaining_qty": delta,
-                    "entry_price": avg if avg is not None else None,
-                    "entry_ts": now_iso,
-                    "status": "OPEN",
-                    "source": "reconcile_kis_balance",
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
-                    "notes": notes,
-                }
-                lots.append(lot)
-                qty_adjusted += 1
-                updated_codes += 1
-                logger.warning(
-                    "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s notes=%s",
-                    code,
-                    delta,
-                    avg,
-                    cur,
-                    notes,
-                )
+                if apply_reconcile:
+                    lot = {
+                        "lot_id": f"MANUAL-{code}-{now_iso.replace(':', '').replace('-', '')}",
+                        "code": code,
+                        "pdno": code,
+                        "sid": "MANUAL",
+                        "strategy_id": "MANUAL",
+                        "strategy": "MANUAL",
+                        "engine": "reconcile_kis_balance",
+                        "qty": delta,
+                        "remaining_qty": delta,
+                        "entry_price": avg if avg is not None else None,
+                        "entry_ts": now_iso,
+                        "status": "OPEN",
+                        "source": "reconcile_kis_balance",
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
+                        "notes": notes,
+                    }
+                    lots.append(lot)
+                    state_lots.append(lot)
+                    qty_adjusted += delta
+                    state_after = state_before + delta
+                    code_updated = True
+                    logger.info(
+                        "[STATE][RECONCILE][LOT-ADD] code=%s sid=%s qty_add=%d",
+                        code,
+                        lot.get("sid"),
+                        delta,
+                    )
+                    logger.info(
+                        "[STATE][RECONCILE][APPLY] code=%s kis=%d state_before=%d state_after=%d adjusted=%d",
+                        code,
+                        qty,
+                        state_before,
+                        state_after,
+                        delta,
+                    )
+                else:
+                    lot = {
+                        "lot_id": f"ORPHAN-{code}-{now_iso.replace(':', '').replace('-', '')}",
+                        "code": code,
+                        "pdno": code,
+                        "sid": "ORPHAN",
+                        "strategy_id": "ORPHAN",
+                        "strategy": "ORPHAN",
+                        "engine": "reconcile_kis_balance",
+                        "qty": delta,
+                        "remaining_qty": delta,
+                        "entry_price": avg if avg is not None else None,
+                        "entry_ts": now_iso,
+                        "status": "OPEN",
+                        "source": "reconcile_kis_balance",
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
+                        "notes": notes,
+                    }
+                    lots.append(lot)
+                    state_lots.append(lot)
+                    qty_adjusted += delta
+                    code_updated = True
+                    logger.warning(
+                        "[STATE][RECONCILE][ORPHAN-CREATED] code=%s qty=%d avg=%s cur=%s notes=%s",
+                        code,
+                        delta,
+                        avg,
+                        cur,
+                        notes,
+                    )
             else:
-                logger.warning(
-                    "[STATE][RECONCILE][STATE_GT_KIS] code=%s state_sum=%d kis=%d notes=%s",
-                    code,
-                    state_sum,
-                    qty,
-                    notes,
-                )
+                if apply_reconcile:
+                    diff = abs(delta)
+                    adjusted_qty = 0
+                    priority_lots = []
+                    for lot in open_lots:
+                        ts_val = _lot_timestamp(lot)
+                        priority = (
+                            0
+                            if str(lot.get("sid") or lot.get("strategy_id") or "").upper()
+                            in {"UNKNOWN", "ORPHAN", "MANUAL"}
+                            else 1
+                        )
+                        priority_lots.append(
+                            (
+                                priority,
+                                ts_val if ts_val is not None else float("inf"),
+                                -_lot_qty(lot),
+                                lot,
+                            )
+                        )
+                    priority_lots = [item[3] for item in sorted(priority_lots, key=lambda t: (t[0], t[1], t[2]))]
+                    for lot in priority_lots:
+                        if diff <= 0:
+                            break
+                        current_qty = _lot_qty(lot)
+                        if current_qty <= 0:
+                            continue
+                        dec = min(current_qty, diff)
+                        new_qty = current_qty - dec
+                        _set_lot_qty(lot, new_qty)
+                        adjusted_qty += dec
+                        diff -= dec
+                        logger.info(
+                            "[STATE][RECONCILE][LOT-DEC] code=%s sid=%s qty_before=%d qty_after=%d dec=%d",
+                            code,
+                            lot.get("sid") or lot.get("strategy_id"),
+                            current_qty,
+                            new_qty,
+                            dec,
+                        )
+                        if new_qty <= 0:
+                            try:
+                                lots.remove(lot)
+                            except ValueError:
+                                pass
+                            try:
+                                state_lots.remove(lot)
+                            except ValueError:
+                                pass
+                    if diff > 0:
+                        logger.error(
+                            "[STATE][RECONCILE][STATE_GT_KIS][INCOMPLETE] code=%s remaining_diff=%d applying snapshot",
+                            code,
+                            diff,
+                        )
+                        for lot in list(priority_lots):
+                            try:
+                                lots.remove(lot)
+                            except ValueError:
+                                pass
+                            try:
+                                state_lots.remove(lot)
+                            except ValueError:
+                                pass
+                        snapshot_lot = {
+                            "lot_id": f"MANUAL-{code}-{now_iso.replace(':', '').replace('-', '')}",
+                            "code": code,
+                            "pdno": code,
+                            "sid": "MANUAL",
+                            "strategy_id": "MANUAL",
+                            "strategy": "MANUAL",
+                            "engine": "reconcile_kis_balance",
+                            "qty": qty,
+                            "remaining_qty": qty,
+                            "entry_price": avg if avg is not None else None,
+                            "entry_ts": now_iso,
+                            "status": "OPEN",
+                            "source": "reconcile_kis_balance",
+                            "created_at": now_iso,
+                            "updated_at": now_iso,
+                            "notes": notes + ["SNAPSHOT_REBUILD"],
+                        }
+                        lots.append(snapshot_lot)
+                        state_lots.append(snapshot_lot)
+                        adjusted_qty = state_before
+                        diff = 0
+                        logger.info(
+                            "[STATE][RECONCILE][LOT-ADD] code=%s sid=%s qty_add=%d",
+                            code,
+                            snapshot_lot.get("sid"),
+                            qty,
+                        )
+                    state_after = sum(
+                        _lot_qty(l) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"
+                    )
+                    qty_adjusted += adjusted_qty
+                    if adjusted_qty > 0:
+                        code_updated = True
+                    logger.info(
+                        "[STATE][RECONCILE][APPLY] code=%s kis=%d state_before=%d state_after=%d adjusted=%d",
+                        code,
+                        qty,
+                        state_before,
+                        state_after,
+                        adjusted_qty,
+                    )
+                else:
+                    logger.warning(
+                        "[STATE][RECONCILE][STATE_GT_KIS] code=%s state_sum=%d kis=%d notes=%s",
+                        code,
+                        state_sum,
+                        qty,
+                        notes,
+                    )
         else:
+            code_updated = True
+        state_after = sum(
+            _lot_qty(l) for l in state_lots if str(l.get("status") or "OPEN").upper() == "OPEN"
+        )
+        logger.info(
+            "[STATE][RECONCILE][ASSERT] code=%s kis=%d state=%d ok=%s",
+            code,
+            qty,
+            state_after,
+            state_after == qty,
+        )
+        if code_updated:
             updated_codes += 1
     for symbol, pos in list(positions.items()):
         if symbol not in {h["code"] for h in holdings}:
             pos["qty"] = 0
             pos["last_action"] = "RECONCILE"
             positions[symbol] = pos
+
+    if apply_reconcile:
+        for code, code_lots in list(state_lots_by_code.items()):
+            if code in holdings_codes:
+                continue
+            open_lots = [l for l in code_lots if str(l.get("status") or "OPEN").upper() == "OPEN"]
+            state_sum = sum(_lot_qty(l) for l in open_lots)
+            if state_sum <= 0:
+                continue
+            for lot in list(open_lots):
+                qty_before = _lot_qty(lot)
+                _set_lot_qty(lot, 0)
+                try:
+                    lots.remove(lot)
+                except ValueError:
+                    pass
+                try:
+                    code_lots.remove(lot)
+                except ValueError:
+                    pass
+                logger.info(
+                    "[STATE][RECONCILE][LOT-DEC] code=%s sid=%s qty_before=%d qty_after=%d dec=%d reason=NO_KIS_HOLDING",
+                    code,
+                    lot.get("sid") or lot.get("strategy_id"),
+                    qty_before,
+                    0,
+                    qty_before,
+                )
+            qty_adjusted += state_sum
+            updated_codes += 1
+            logger.info(
+                "[STATE][RECONCILE][APPLY] code=%s kis=0 state_before=%d state_after=%d adjusted=%d reason=NO_KIS_HOLDING",
+                code,
+                state_sum,
+                0,
+                state_sum,
+            )
+            logger.info(
+                "[STATE][RECONCILE][ASSERT] code=%s kis=%d state=%d ok=%s",
+                code,
+                0,
+                0,
+                True,
+            )
     logger.info(
         "[STATE][RECONCILE] created_orphans=%d qty_adjusted=%d updated_codes=%d",
         created_orphans,
