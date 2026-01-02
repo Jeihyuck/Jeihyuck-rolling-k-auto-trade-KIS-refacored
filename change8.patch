@@ -1,0 +1,275 @@
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index ec6797348b581bbd8eb681feaf6458c7d5790ba8..81b05fb5b0d90f6a0b8f90075182b5c0c760851d 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -22,90 +22,94 @@ on:
+     - cron: "0-30/5 6 * * *"      # 15:00-15:30 KST
+ 
+ jobs:
+   run-trade:
+     if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
+     runs-on: ubuntu-latest
+     # Note: cancel-in-progress=false relies on lock file; timeout increased to allow pre-open waits.
+     timeout-minutes: 180
+     env:
+       BOTSTATE_BRANCH: bot-state
+       STRATEGY_MODE: "LIVE"
+       LIVE_TRADING_ENABLED: "1"
+       DISABLE_LIVE_TRADING: "0"
+       DRY_RUN: "0"
+       EXPECT_LIVE_TRADING: "1"
+       EXPECT_KIS_ENV: "practice"
+       PB1_ENTRY_ENABLED: "1"
+       KIS_ENV: "practice"
+       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
++      STATE_RECONCILE_APPLY: "1"
+       MORNING_WINDOW_START: "08:50"
+       MORNING_WINDOW_END: "11:00"
+       MORNING_EXIT_START: "09:00"
+       MORNING_EXIT_END: "09:20"
+       AFTERNOON_WINDOW_START: "14:00"
+       AFTERNOON_WINDOW_END: "15:30"
+       CLOSE_AUCTION_START: "15:20"
+       CLOSE_AUCTION_END: "15:30"
+       LEDGER_BASE_DIR: "bot_state/trader_ledger"
+       LEDGER_LOOKBACK_DAYS: "120"
+       BOTSTATE_LOCK_TTL_SEC: "1800"
+       PYTHONUNBUFFERED: "1"
+       MAX_WAIT_BEFORE_MORNING_MIN: "120"
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+       - name: Set git identity
+         run: |
+           git config user.name "trade-bot"
+           git config user.email "trade-bot@users.noreply.github.com"
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
+       - name: Resolve trading day and safety flags
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python - <<'PY'
+           import os
+           from trader.time_utils import is_trading_day, now_kst
+ 
+           today_trading = is_trading_day(now_kst())
++          kis_env = os.environ.get("KIS_ENV", "")
++          reconcile_apply = "1" if kis_env == "practice" else "0"
+           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+               if today_trading:
+                   f.write("PB1_ENTRY_ENABLED=1\n")
+                   f.write("DISABLE_LIVE_TRADING=0\n")
+                   f.write("DRY_RUN=0\n")
+               else:
+                   f.write("PB1_ENTRY_ENABLED=0\n")
+                   f.write("DISABLE_LIVE_TRADING=1\n")
+                   f.write("DRY_RUN=1\n")
+                   f.write("DIAGNOSTIC_FORCE_RUN=1\n")
++              f.write(f"STATE_RECONCILE_APPLY={reconcile_apply}\n")
+           print(f"trading_day={today_trading}")
+           PY
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader
+ 
+       - name: Run PB1 only
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 17ea3b67ef29f271422dd3cec179bd61f5671911..400101360fbdd46747b0aa8733d0b3cd79bad29e 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -76,123 +76,139 @@ class PB1Engine:
+     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+         )
+ 
+     def _fetch_daily(self, code: str, count: int = 120) -> pd.DataFrame:
+         if not self.kis:
+             return pd.DataFrame()
+         try:
+             candles = self.kis.safe_get_daily_candles(code, count=count)
+         except Exception:
+             logger.exception("[PB1][DATA][FAIL] code=%s", code)
+             return pd.DataFrame()
+         if not candles:
+             return pd.DataFrame()
+-        df = pd.DataFrame(candles)
++        df = pd.DataFrame(candles).copy()
++        if df.empty:
++            return df
++
++        df.columns = [str(c).strip().lower() for c in df.columns]
+         rename_map = {
+             "stck_clpr": "close",
+             "stck_hgpr": "high",
+             "stck_lwpr": "low",
+             "stck_trqu": "volume",
+             "stck_bsop_date": "date",
++            "거래량": "volume",
++            "acml_vol": "volume",
++            "acc_vol": "volume",
++            "vol": "volume",
++            "volume(주)": "volume",
++            "volume ": "volume",
+         }
+-        for src, dst in rename_map.items():
+-            if src in df.columns:
+-                df.rename(columns={src: dst}, inplace=True)
+-        df["close"] = df["close"].astype(float)
+-        df["high"] = df["high"].astype(float)
+-        df["low"] = df["low"].astype(float)
+-        df["volume"] = df["volume"].astype(float)
++        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
++
++        if "volume" not in df.columns:
++            logger.warning("[PB1][DAILY] missing volume code=%s cols=%s -> fill 0", code, list(df.columns))
++            df["volume"] = 0.0
++
++        for col in ["close", "high", "low", "volume"]:
++            if col in df.columns:
++                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+         return df
+ 
+     def _build_universe(self) -> Dict[str, List[Dict]]:
+         """
+         Build selection universe for PB1 without triggering any legacy order flows.
+         run_rebalance() in best_k_meta_strategy is selection-only and returns weights.
+         """
+         try:
+             rebalance_payload = run_rebalance(str(now_kst().date()), return_by_market=True)
+             return rebalance_payload.get("selected_by_market") or {}
+         except Exception:
+             logger.exception("[PB1][UNIVERSE][FAIL]")
+             return {}
+ 
+     def _code_market_map(self, selected_by_market: Dict[str, List[Dict]]) -> Dict[str, str]:
+         mapping: Dict[str, str] = {}
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 mapping[code] = market
+         return mapping
+ 
+     def _compute_candidates(self, selected_by_market: Dict[str, List[Dict]]) -> List[CandidateFeature]:
+         candidates: List[CandidateFeature] = []
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+-                df = self._fetch_daily(code, count=120)
+-                if df.empty:
++                try:
++                    df = self._fetch_daily(code, count=120)
++                    if df.empty:
++                        cf = CandidateFeature(
++                            code=code,
++                            market=market,
++                            features={"reasons": ["data_empty"]},
++                            setup_ok=False,
++                            reasons=["data_empty"],
++                            mode=1,
++                            mode_reasons=["default_day_mode"],
++                        )
++                        self._log_setup(cf)
++                        candidates.append(cf)
++                        continue
++                    features = compute_features(df)
++                    features["market"] = market
++                    ok, reasons = evaluate_setup(features, market)
++                    if not reasons:
++                        reasons = ["missing_reason"]
++                    mode, mode_reasons = choose_mode(features)
+                     cf = CandidateFeature(
+                         code=code,
+                         market=market,
+-                        features={"reasons": ["data_empty"]},
+-                        setup_ok=False,
+-                        reasons=["data_empty"],
+-                        mode=1,
+-                        mode_reasons=["default_day_mode"],
++                        features=features,
++                        setup_ok=ok,
++                        reasons=reasons,
++                        mode=mode,
++                        mode_reasons=mode_reasons,
+                     )
+                     self._log_setup(cf)
+                     candidates.append(cf)
++                except Exception:
++                    logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                     continue
+-                features = compute_features(df)
+-                features["market"] = market
+-                ok, reasons = evaluate_setup(features, market)
+-                if not reasons:
+-                    reasons = ["missing_reason"]
+-                mode, mode_reasons = choose_mode(features)
+-                cf = CandidateFeature(
+-                    code=code,
+-                    market=market,
+-                    features=features,
+-                    setup_ok=ok,
+-                    reasons=reasons,
+-                    mode=mode,
+-                    mode_reasons=mode_reasons,
+-                )
+-                self._log_setup(cf)
+-                candidates.append(cf)
+         return candidates
+ 
+     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
+         ok_list = [c for c in candidates if c.setup_ok]
+         total = len(ok_list)
+         if total <= 0:
+             return candidates
+         capital_per = DAILY_CAPITAL * CAP_CAP / total
+         for cf in ok_list:
+             close_px = cf.features.get("close") or 0
+             qty = int(capital_per // close_px) if close_px > 0 else 0
+             cf.planned_qty = max(qty, 0)
+             cf.client_order_key = self._client_order_key(
+                 cf.code, cf.mode, "BUY", "PB1", "close"
+             )
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero")
+                 self._log_setup(cf)
+         return candidates
+ 
+     def _should_block_order(self, client_order_key: str) -> bool:
+         if not client_order_key:
+             return True
+         return self.ledger.has_client_order_key(client_order_key)

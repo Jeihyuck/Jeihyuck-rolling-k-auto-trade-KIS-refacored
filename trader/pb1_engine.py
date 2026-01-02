@@ -98,21 +98,33 @@ class PB1Engine:
             return pd.DataFrame()
         if not candles:
             return pd.DataFrame()
-        df = pd.DataFrame(candles)
+        df = pd.DataFrame(candles).copy()
+        if df.empty:
+            return df
+
+        df.columns = [str(c).strip().lower() for c in df.columns]
         rename_map = {
             "stck_clpr": "close",
             "stck_hgpr": "high",
             "stck_lwpr": "low",
             "stck_trqu": "volume",
             "stck_bsop_date": "date",
+            "거래량": "volume",
+            "acml_vol": "volume",
+            "acc_vol": "volume",
+            "vol": "volume",
+            "volume(주)": "volume",
+            "volume ": "volume",
         }
-        for src, dst in rename_map.items():
-            if src in df.columns:
-                df.rename(columns={src: dst}, inplace=True)
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["volume"] = df["volume"].astype(float)
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        if "volume" not in df.columns:
+            logger.warning("[PB1][DAILY] missing volume code=%s cols=%s -> fill 0", code, list(df.columns))
+            df["volume"] = 0.0
+
+        for col in ["close", "high", "low", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         return df
 
     def _build_universe(self) -> Dict[str, List[Dict]]:
@@ -140,37 +152,41 @@ class PB1Engine:
         for market, rows in (selected_by_market or {}).items():
             for row in rows or []:
                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-                df = self._fetch_daily(code, count=120)
-                if df.empty:
+                try:
+                    df = self._fetch_daily(code, count=120)
+                    if df.empty:
+                        cf = CandidateFeature(
+                            code=code,
+                            market=market,
+                            features={"reasons": ["data_empty"]},
+                            setup_ok=False,
+                            reasons=["data_empty"],
+                            mode=1,
+                            mode_reasons=["default_day_mode"],
+                        )
+                        self._log_setup(cf)
+                        candidates.append(cf)
+                        continue
+                    features = compute_features(df)
+                    features["market"] = market
+                    ok, reasons = evaluate_setup(features, market)
+                    if not reasons:
+                        reasons = ["missing_reason"]
+                    mode, mode_reasons = choose_mode(features)
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": ["data_empty"]},
-                        setup_ok=False,
-                        reasons=["data_empty"],
-                        mode=1,
-                        mode_reasons=["default_day_mode"],
+                        features=features,
+                        setup_ok=ok,
+                        reasons=reasons,
+                        mode=mode,
+                        mode_reasons=mode_reasons,
                     )
                     self._log_setup(cf)
                     candidates.append(cf)
+                except Exception:
+                    logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                     continue
-                features = compute_features(df)
-                features["market"] = market
-                ok, reasons = evaluate_setup(features, market)
-                if not reasons:
-                    reasons = ["missing_reason"]
-                mode, mode_reasons = choose_mode(features)
-                cf = CandidateFeature(
-                    code=code,
-                    market=market,
-                    features=features,
-                    setup_ok=ok,
-                    reasons=reasons,
-                    mode=mode,
-                    mode_reasons=mode_reasons,
-                )
-                self._log_setup(cf)
-                candidates.append(cf)
         return candidates
 
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:

@@ -44,6 +44,7 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      STATE_RECONCILE_APPLY: "1"
       MORNING_WINDOW_START: "08:50"
       MORNING_WINDOW_END: "11:00"
       MORNING_EXIT_START: "09:00"
@@ -87,6 +88,8 @@ jobs:
           from trader.time_utils import is_trading_day, now_kst
 
           today_trading = is_trading_day(now_kst())
+          kis_env = os.environ.get("KIS_ENV", "")
+          reconcile_apply = "1" if kis_env == "practice" else "0"
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               if today_trading:
                   f.write("PB1_ENTRY_ENABLED=1\n")
@@ -97,6 +100,7 @@ jobs:
                   f.write("DISABLE_LIVE_TRADING=1\n")
                   f.write("DRY_RUN=1\n")
                   f.write("DIAGNOSTIC_FORCE_RUN=1\n")
+              f.write(f"STATE_RECONCILE_APPLY={reconcile_apply}\n")
           print(f"trading_day={today_trading}")
           PY
 
