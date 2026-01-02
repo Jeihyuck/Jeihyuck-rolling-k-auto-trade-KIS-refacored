@@ -1,0 +1,1225 @@
+diff --git a/tests/test_cash_orderable.py b/tests/test_cash_orderable.py
+index 810e75a2a2701337eceebd79bcdde62dab7c1314..b4ef1717342aeec2571eb2e69939e1035591479d 100644
+--- a/tests/test_cash_orderable.py
++++ b/tests/test_cash_orderable.py
+@@ -1,22 +1,62 @@
+ from trader.kis_wrapper import KisAPI
+ 
+ 
+ def _parse(out2):
+     api = KisAPI.__new__(KisAPI)
+     return api._parse_cash_from_output2(out2)
+ 
+ 
+ def test_negative_dnca_tot_amt_is_clamped_to_zero():
+     cash, meta = _parse({"dnca_tot_amt": "-1000"})
+ 
+     assert cash == 0
+     assert meta["clamp_applied"] is True
+     assert meta["selected_key"] == "dnca_tot_amt"
+ 
+ 
+ def test_ord_psbl_cash_is_preferred_over_dnca_tot_amt():
+     cash, meta = _parse({"ord_psbl_cash": "5000", "dnca_tot_amt": "-9999"})
+ 
+     assert cash == 5000
+     assert meta["clamp_applied"] is False
+     assert meta["selected_key"] == "ord_psbl_cash"
++
++
++def test_negative_values_with_commas_are_clamped_to_zero():
++    cash, meta = _parse({"dnca_tot_amt": "-1,000"})
++
++    assert cash == 0
++    assert meta["clamp_applied"] is True
++    assert meta["selected_key"] == "dnca_tot_amt"
++
++
++def test_psbl_order_parser_prefers_ord_psbl_cash():
++    api = KisAPI.__new__(KisAPI)
++    cash, meta = api._parse_cash_from_psbl_order({"output": {"ord_psbl_cash": "10,000", "ord_psbl_amt": "9000"}})
++
++    assert cash == 10000
++    assert meta["selected_key"] == "ord_psbl_cash"
++    assert meta["clamp_applied"] is False
++
++
++def test_get_orderable_cash_prefers_psbl_order(monkeypatch):
++    api = KisAPI.__new__(KisAPI)
++    api._last_cash = None
++    api.CANO = ""
++    api.ACNT_PRDT_CD = ""
++    api.env = "practice"
++
++    def fake_psbl(code, price):
++        return {"output": {"ord_psbl_cash": "7,000", "dnca_tot_amt": "100"}}
++
++    def fake_balance():
++        return {"output2": {"dnca_tot_amt": "123"}}
++
++    api._inquire_psbl_order = fake_psbl  # type: ignore[method-assign]
++    api.inquire_balance_all = fake_balance  # type: ignore[method-assign]
++
++    cash, meta = api.get_orderable_cash(code_hint="000001", price_hint=100.0)
++
++    assert cash == 7000
++    assert meta["source"] == "psbl_order"
++    assert meta["selected_key"] == "ord_psbl_cash"
+diff --git a/tests/test_pb1_daily_normalize.py b/tests/test_pb1_daily_normalize.py
+index b148f07e1422ac821b95b728ac5fec812f1c0b5c..15a8f728ce484120590e4ecf6fb68884ae15fd56 100644
+--- a/tests/test_pb1_daily_normalize.py
++++ b/tests/test_pb1_daily_normalize.py
+@@ -7,35 +7,55 @@ from trader.utils.ohlcv import normalize_ohlcv
+ def test_normalize_adds_volume_nan_when_missing():
+     df = pd.DataFrame(
+         {
+             "date": pd.date_range("2024-01-01", periods=3, freq="D"),
+             "open": [1, 2, 3],
+             "high": [2, 3, 4],
+             "low": [0.5, 1.5, 2.5],
+             "close": [1.5, 2.5, 3.5],
+         }
+     )
+ 
+     norm, meta = normalize_ohlcv(df)
+ 
+     assert "volume" in norm.columns
+     assert np.isnan(norm["volume"]).all()
+     assert meta["volume_missing"] is True
+ 
+ 
+ def test_normalize_maps_alternative_volume_column():
+     df = pd.DataFrame(
+         {
+             "날짜": pd.date_range("2024-01-01", periods=2, freq="D"),
+             "시가": [10, 11],
+             "고가": [12, 13],
+             "저가": [9, 10],
+-            "종가": [11, 12],
+-            "거래량": [1000, 2000],
++            "종가": ["11", "12"],
++            "거래량": ["1,000", "2,345,678"],
+         }
+     )
+ 
+     norm, meta = normalize_ohlcv(df)
+ 
+     assert "volume" in norm.columns
++    assert meta["volume_missing"] is False
++    assert norm["volume"].tolist() == [1000, 2345678]
++    assert norm["close"].tolist() == [11.0, 12.0]
++
++
++def test_normalize_handles_comma_separated_numeric_columns():
++    df = pd.DataFrame(
++        {
++            "date": pd.date_range("2024-01-01", periods=2, freq="D"),
++            "open": ["1,000", "2,000"],
++            "high": ["1,500", "2,500"],
++            "low": ["900", "1,900"],
++            "close": ["1,250", "2,200"],
++            "volume": ["1,000", "2,000"],
++        }
++    )
++
++    norm, meta = normalize_ohlcv(df)
++
+     assert meta["volume_missing"] is False
+     assert norm["volume"].tolist() == [1000, 2000]
++    assert norm["close"].tolist() == [1250.0, 2200.0]
+diff --git a/trader/config.py b/trader/config.py
+index 04dc770c5ec0d43425bcf7549fbcf0bc071ef691..58ab7201fcb9da3117a1b0dcbdb867f4d321c75f 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -108,50 +108,52 @@ CONFIG = {
+     "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "trader/state/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "1800",
+     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+     "PB1_ENTRY_ENABLED": "true",
+     "MORNING_WINDOW_START": "08:50",
+     "MORNING_WINDOW_END": "11:00",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+     "AFTERNOON_WINDOW_START": "14:00",
+     "AFTERNOON_WINDOW_END": "15:30",
+     "CLOSE_AUCTION_START": "15:20",
+     "CLOSE_AUCTION_END": "15:30",
++    "PB1_REQUIRE_VOLUME": "0",
++    "PB1_FORCE_ENTRY_ON_PUSH": "1",
+     "PB1_PULLBACK_BAND_KOSPI": "3,8",
+     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
+     "PB1_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_SWING_TREND_MIN": "1.05",
+     "PB1_SWING_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_SWING_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_R_FLOOR_PCT": "2.0",
+     "PB1_DAY_TP_R": "0.8",
+     "PB1_DAY_SL_R": "0.6",
+     "KOSPI_HARD_STOP_PCT": "7.0",
+     "KOSDAQ_HARD_STOP_PCT": "8.0",
+     "PB1_SWING_TRAIL_MA": "20",
+     "PB1_TIME_STOP_DAYS": "10",
+ }
+ 
+ 
+ def _cfg(key: str) -> str:
+     """환경변수 > CONFIG 기본값"""
+     return os.getenv(key, CONFIG.get(key, ""))
+ 
+ 
+ def _default_bool(key: str, fallback: bool = False) -> bool:
+     raw_default = str(CONFIG.get(key, "")).strip().lower()
+     if raw_default in TRUE_VALUES:
+@@ -405,46 +407,48 @@ def _parse_hhmm(hhmm: str) -> dtime:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+ DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
+ PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
+ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+ BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "900")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "11:00"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "14:00"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
++PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
++PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+ PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
+ PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
+ PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
+ KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
+ KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
+ PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
+ PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+ 
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+ 
+ def _this_iso_week_key(now=None):
+     now = now or datetime.now(KST)
+     return f"{now.year}-W{now.isocalendar().week:02d}"
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 5961bfb8b5c78601ff279e2c593f6aa301416ac6..a173307d02a12987125cb48968bd05ed6eba5757 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -136,60 +136,62 @@ def _is_order_disallowed(resp: Any) -> Optional[str]:
+ class _RateLimiter:
+     def __init__(self, min_interval_sec: float = 0.20):
+         self.min_interval = float(min_interval_sec)
+         self.last_at: Dict[str, float] = {}
+         self._lock = threading.Lock()
+ 
+     def wait(self, key: str):
+         with self._lock:
+             now = time.time()
+             last = self.last_at.get(key, 0.0)
+             delta = now - last
+             if delta < self.min_interval:
+                 time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
+             self.last_at[key] = time.time()
+ 
+ 
+ TR_MAP = {
+     "practice": {
+         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY", "VTTC0012U"), "VTTC0802U"],
+         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL", "VTTC0011U"), "VTTC0801U"],
+         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE", "VTTC8434R")],
+         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
+         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
+         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
+         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
++        "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER", "VTTC8908R")],
+         "TOKEN": "/oauth2/tokenP",
+     },
+     "real": {
+         "ORDER_BUY": [os.getenv("KIS_TR_ID_ORDER_BUY_REAL", "TTTC0012U")],
+         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL_REAL", "TTTC0011U")],
+         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE_REAL", "TTTC8434R")],
+         "PRICE": [os.getenv("KIS_TR_ID_PRICE_REAL", "FHKST01010100")],
+         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
+         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
+         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART_REAL", "FHKST03010200")],
++        "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER_REAL", "TTTC8908R")],
+         "TOKEN": "/oauth2/token",
+     },
+ }
+ 
+ 
+ def _pick_tr(env: str, key: str) -> List[str]:
+     try:
+         return TR_MAP[env][key]
+     except Exception:
+         return []
+ 
+ 
+ # --- KisAPI 이하 실전 전체 로직 ---
+ class KisAPI:
+     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
+     _cache_path = "kis_token_cache.json"
+     _token_lock = threading.Lock()
+ 
+     def should_cooldown(self, now_kst: datetime | None = None) -> bool:
+         """
+         VWAP / 롤링K 메인 루프에서 '잠깐 쉬어야 하는 구간'을 체크하는 헬퍼.
+ 
+         지금은 최소 구현 버전:
+         - 항상 False를 리턴해서 쿨다운을 사용하지 않는다.
+         - 나중에 점심시간 / 장 마감 직전 / 과열 구간 등 세부 로직을 여기로 옮기면 된다.
+@@ -354,58 +356,112 @@ class KisAPI:
+             logger.error(f"[토큰 재발급 실패] {e}")
+ 
+     # HashKey
+     def _create_hashkey(self, body_dict: dict) -> str:
+         url = f"{API_BASE_URL}/uapi/hashkey"
+         headers = {
+             "content-type": "application/json; charset=utf-8",
+             "appkey": APP_KEY,
+             "appsecret": APP_SECRET,
+         }
+         body_str = _json_dumps(body_dict)
+         try:
+             # [CHG] 안전요청 사용
+             r = self._safe_request("POST", url, headers=headers, data=body_str.encode("utf-8"))
+             j = r.json()
+         except Exception as e:
+             logger.error(f"[HASHKEY 예외] {e}")
+             raise
+         hk = j.get("HASH") or j.get("hash") or j.get("hashkey")
+         if not hk:
+             logger.error(f"[HASHKEY 실패] resp={j}")
+             raise Exception(f"HashKey 생성 실패: {j}")
+         return hk
+ 
+     # ===== 신규: 예수금/과매수 방지 유틸 =====
++    def get_orderable_cash(self, code_hint: str | None = None, price_hint: float | None = None) -> tuple[int, dict]:
++        code = safe_strip(code_hint) or "005930"
++        cash_meta: dict = {"source": "psbl_order", "raw_fields": {}, "selected_key": None, "clamp_applied": False}
++        cash = 0
++        try:
++            resp = self._inquire_psbl_order(code, price_hint)
++            cash, meta = self._parse_cash_from_psbl_order(resp)
++            cash_meta.update(meta)
++            cash_meta["source"] = "psbl_order"
++            raw_fields = cash_meta.get("raw_fields") or {}
++            logger.info(
++                "[CASH][PSBL] ord_psbl_cash=%s ord_psbl_amt=%s",
++                raw_fields.get("ord_psbl_cash"),
++                raw_fields.get("ord_psbl_amt"),
++            )
++        except Exception as e:
++            logger.warning("[CASH][PSBL][FAIL] code=%s err=%s", code, e)
++        if cash <= 0:
++            try:
++                j = self.inquire_balance_all()
++                out2 = j.get("output2")
++                bal_cash, bal_meta = self._parse_cash_from_output2(out2)
++                cash = bal_cash
++                cash_meta = {"source": "balance_out2", **bal_meta}
++                raw_fields = cash_meta.get("raw_fields") or {}
++                logger.info(
++                    "[CASH][FALLBACK_BALANCE] ord_psbl_cash=%s ord_psbl_amt=%s nrcvb_buy_amt=%s dnca_tot_amt=%s",
++                    raw_fields.get("ord_psbl_cash"),
++                    raw_fields.get("ord_psbl_amt"),
++                    raw_fields.get("nrcvb_buy_amt"),
++                    raw_fields.get("dnca_tot_amt"),
++                )
++            except Exception as e:
++                logger.warning("[CASH][FALLBACK_BALANCE][FAIL] %s", e)
++        clamp_applied = bool(cash_meta.get("clamp_applied"))
++        if cash < 0:
++            cash = 0
++            clamp_applied = True
++        if cash <= 0 and self._last_cash:
++            logger.warning("[CASH][ORDERABLE][FALLBACK_LAST] live=%s → use last=%s", cash, self._last_cash)
++            cash = self._last_cash
++            cash_meta["source"] = f"{cash_meta.get('source', 'unknown')}_cache"
++        cash_meta["clamp_applied"] = clamp_applied
++        cash_meta.setdefault("raw_fields", {})
++        if cash > 0:
++            self._last_cash = cash
++        logger.info(
++            "[CASH][ORDERABLE] value=%s source=%s clamp=%s",
++            cash,
++            cash_meta.get("source", "unknown"),
++            cash_meta.get("clamp_applied"),
++        )
++        return cash, cash_meta
++
+     def get_cash_available_today(self) -> int:
+         """
+         당일 매수 가능 예수금(가용현금) 반환.
+-        ✅ output2.ord_psbl_cash → nrcvb_buy_amt → dnca_tot_amt 순으로 파싱.
++        ✅ 주문가능조회 → 잔고조회 순으로 파싱.
+         실패/0원 시 최근 조회값 캐시 사용.
+         """
+         try:
+-            cash = self.get_cash_balance()
++            cash, _meta = self.get_orderable_cash()
+             if cash < 0:
+                 logger.warning("[CASH_GUARD] 예수금 음수 감지(%s) → 0으로 처리", cash)
+                 return 0
+             return cash
+         except Exception as e:
+             logger.error(f"[CASH_QUERY_FAIL] 예수금 조회 실패: {e}")
+             return int(self._last_cash or 0)
+ 
+     def _estimate_buy_cost(self, price: float, qty: int,
+                            fee_pct: float = 0.00015, tax_pct: float = 0.0) -> int:
+         """매수 예상금액(수수료/세금 포함, 반올림)."""
+         try:
+             price = float(price)
+         except Exception:
+             price = 0.0
+         try:
+             qty = int(qty)
+         except Exception:
+             qty = 0
+         gross = price * qty
+         fee = gross * max(0.0, float(fee_pct))
+         tax = gross * max(0.0, float(tax_pct))
+         return int(round(gross + fee + tax))
+ 
+     def affordable_qty(self, code: str, price: float, req_qty: int,
+@@ -1032,94 +1088,163 @@ class KisAPI:
+             c = code.strip()
+             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+             for market_div in markets:
+                 for code_fmt in codes:
+                     params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                     try:
+                         # [CHG] 안전요청 사용
+                         resp = self._safe_request(
+                             "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
+                         )
+                         data = resp.json()
+                     except Exception:
+                         continue
+                     if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                         try:
+                             return float(data["output"].get("bidp1"))
+                         except Exception:
+                             return None
+         return None
+ 
+     def get_index_quote(self, index_code: str) -> Dict[str, Optional[float]]:
+         """(간이) 지수 스냅샷 placeholder."""
+         return {"price": None, "prev_close": None, "vwap": None}
+ 
+     # ----- 잔고/포지션 -----
++    def _normalize_cash_value(self, x: Any) -> str:
++        s = safe_strip(x)
++        lower = s.lower()
++        if lower in {"", "none", "null", "nan"}:
++            return ""
++        for ch in (",", " ", "_", "+"):
++            s = s.replace(ch, "")
++        return s
++
++    def _cash_to_int(self, x: Any) -> int:
++        try:
++            normalized = self._normalize_cash_value(x)
++            if normalized == "":
++                return 0
++            return int(float(normalized))
++        except Exception:
++            return 0
++
+     def _parse_cash_from_output2(self, out2: Any) -> tuple[int, dict]:
+         """
+         ✅ 예수금 파싱 규칙:
+         1) ord_psbl_cash (주문가능현금)
+         2) nrcvb_buy_amt (매수가능금액)
+         3) dnca_tot_amt  (예수금 총액; 결제미수 포함 가능)
+         """
+ 
+-        def _to_int(x) -> int:
+-            try:
+-                s = safe_strip(x)
+-                if s == "":
+-                    return 0
+-                return int(float(s))
+-            except Exception:
+-                return 0
+-
+         row = None
+         if isinstance(out2, list) and out2:
+             row = out2[0]
+         elif isinstance(out2, dict):
+             row = out2
+         else:
+             return 0, {}
+ 
+         raw_fields = {
+             "ord_psbl_cash": row.get("ord_psbl_cash"),
+             "ord_psbl_amt": row.get("ord_psbl_amt"),
+             "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+             "dnca_tot_amt": row.get("dnca_tot_amt"),
+         }
+         selected_key = None
+         cash = 0
+         for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
+             if key in row:
+                 selected_key = key
+-                cash = _to_int(row.get(key))
++                cash = self._cash_to_int(row.get(key))
+                 break
+         clamp_applied = False
+         if cash < 0:
+             cash = 0
+             clamp_applied = True
+         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+ 
++    def _parse_cash_from_psbl_order(self, resp: Any) -> tuple[int, dict]:
++        row = None
++        if isinstance(resp, dict):
++            if isinstance(resp.get("output"), dict):
++                row = resp.get("output")
++            elif isinstance(resp.get("output1"), list) and resp.get("output1"):
++                row = resp.get("output1")[0]
++            else:
++                row = resp
++        elif isinstance(resp, list) and resp:
++            row = resp[0]
++        else:
++            return 0, {"raw_fields": {}, "selected_key": None, "clamp_applied": False}
++
++        raw_fields = {
++            "ord_psbl_cash": row.get("ord_psbl_cash"),
++            "ord_psbl_amt": row.get("ord_psbl_amt"),
++            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
++            "dnca_tot_amt": row.get("dnca_tot_amt"),
++        }
++        selected_key = None
++        cash = 0
++        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
++            if key in row:
++                selected_key = key
++                cash = self._cash_to_int(row.get(key))
++                break
++        clamp_applied = False
++        if cash < 0:
++            cash = 0
++            clamp_applied = True
++        return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
++
++    def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
++        """주문가능조회 호출."""
++        tr_list = _pick_tr(self.env, "PSBL_ORDER")
++        if not tr_list:
++            raise RuntimeError("PSBL_ORDER TR 미구성")
++        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
++        tr = tr_list[0]
++        headers = self._headers(tr)
++        try:
++            ord_unpr = int(float(price_hint)) if price_hint is not None else 1
++        except Exception:
++            ord_unpr = 1
++        params = {
++            "CANO": self.CANO,
++            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
++            "PDNO": safe_strip(code_hint) or "005930",
++            "ORD_UNPR": str(max(ord_unpr, 1)),
++            "ORD_DVSN": "00",
++            "ORD_DVSN_CD": "00",
++            "CMA_EVLU_AMT_ICLD_YN": "N",
++            "OVRS_ICLD_YN": "N",
++        }
++        self._limiter.wait("psbl-order")
++        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
++        data = resp.json()
++        return data
++
+     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
+         """잔고 1페이지 호출(예외는 상위에서 처리)."""
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+         tr_list = _pick_tr(self.env, "BALANCE")
+         if not tr_list:
+             raise RuntimeError("BALANCE TR 미구성")
+         tr = tr_list[0]
+         headers = self._headers(tr)
+         params = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "AFHR_FLPR_YN": "N",
+             "UNPR_YN": "N",
+             "UNPR_DVSN": "01",
+             "FUND_STTL_ICLD_YN": "N",
+             "FNCG_AMT_AUTO_RDPT_YN": "N",
+             "PRCS_DVSN": "01",
+             "OFL_YN": "N",
+             "INQR_DVSN": "02",
+             "CTX_AREA_FK100": fk,
+             "CTX_AREA_NK100": nk,
+         }
+         logger.info(f"[잔고조회 요청파라미터] {params}")
+         # [CHG] 안전요청 사용
+         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+@@ -1153,75 +1278,52 @@ class KisAPI:
+                 if empty_cnt <= max_empty_retry:
+                     time.sleep(0.6)
+                     continue
+                 else:
+                     break
+             empty_cnt = 0
+             all_rows.extend(rows)
+ 
+             # ✅ '처음 나온' output2만 요약으로 사용 (마지막 페이지 값으로 덮어쓰지 않음)
+             out2 = j.get("output2")
+             if out2 is not None and out2_last is None:
+                 out2_last = out2
+ 
+             fk = (j.get("ctx_area_fk100") or "").strip()
+             nk = (j.get("ctx_area_nk100") or "").strip()
+             if not fk and not nk:
+                 break
+ 
+         return {"output1": all_rows, "output2": out2_last, "ctx_area_fk100": fk, "ctx_area_nk100": nk}
+ 
+     def get_cash_balance(self) -> int:
+         """
+         ✅ 예수금: output2.ord_psbl_cash 우선.
+         실패/0원 시 최근 캐시(self._last_cash) 폴백.
+         """
+-        try:
+-            j = self.inquire_balance_all()
+-            out2 = j.get("output2")
+-            cash, meta = self._parse_cash_from_output2(out2)
+-            logger.info(
+-                "[CASH] raw=%s orderable=%s source_fields=%s clamp_applied=%s",
+-                meta.get("raw_fields"),
+-                cash,
+-                meta.get("selected_key"),
+-                meta.get("clamp_applied"),
+-            )
+-            if cash > 0:
+-                self._last_cash = cash
+-                logger.info("[CASH_BALANCE_OK] ord_psbl_cash≈%s원", f"{cash:,}")
+-                return cash
+-            # 0원이면 캐시 폴백
+-            if self._last_cash is not None and self._last_cash > 0:
+-                logger.warning("[CASH_FALLBACK] live=0 → use last=%s", f"{self._last_cash:,}")
+-                return self._last_cash
+-        except Exception as e:
+-            logger.error(f"[CASH_BALANCE_FAIL] {e}")
+-            if self._last_cash is not None and self._last_cash > 0:
+-                logger.warning("[CASH_FALLBACK] netfail → use last=%s", f"{self._last_cash:,}")
+-                return self._last_cash
+-        return 0
++        cash, _meta = self.get_orderable_cash()
++        return cash
+ 
+     def get_positions(self) -> List[Dict]:
+         """보유 종목 전체(페이징 병합)."""
+         try:
+             j = self.inquire_balance_all()
+             return j.get("output1") or []
+         except Exception as e:
+             logger.error("[GET_POSITIONS_FAIL] %s", e)
+             return []
+ 
+     def get_balance_map(self) -> Dict[str, int]:
+         pos = self.get_positions()
+         mp: Dict[str, int] = {}
+         for row in pos or []:
+             try:
+                 pdno = safe_strip(row.get("pdno"))
+                 hldg = int(float(row.get("hldg_qty", "0")))
+                 ord_psbl = int(float(row.get("ord_psbl_qty", "0")))
+                 qty = hldg if hldg > 0 else ord_psbl
+                 if pdno and qty > 0:
+                     mp[pdno] = qty
+             except Exception:
+                 continue
+         logger.info(f"[보유수량맵] {len(mp)}종목")
+         return mp
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 754806bf8a15d9f6a10f42108d2044ecd2f23900..43c67c16534fb2a44f1cd7ef46b447ec0b7aa518 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -1,48 +1,49 @@
+ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import dataclass
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Dict, Iterable, List, Tuple
+ 
+ import pandas as pd
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
+     PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
++    PB1_REQUIRE_VOLUME,
+ )
+ from trader.utils.env import env_bool
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
+ from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+ from trader.utils.ohlcv import normalize_ohlcv
+ from trader.time_utils import now_kst
+ from trader.window_router import WindowDecision, resolve_phase
+ from trader.botstate_sync import persist_run_files
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @dataclass
+ class CandidateFeature:
+     code: str
+     market: str
+     features: Dict[str, float]
+     setup_ok: bool
+     reasons: List[str]
+     mode: int
+     mode_reasons: List[str]
+     client_order_key: str | None = None
+     planned_qty: int = 0
+@@ -51,50 +52,51 @@ class CandidateFeature:
+ class PB1Engine:
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+         worktree_dir: Path,
+         window: WindowDecision,
+         phase_override: str,
+         dry_run: bool,
+         env: str,
+         run_id: str,
+     ) -> None:
+         self.kis = kis
+         self.worktree_dir = worktree_dir
+         self.window = window
+         self.phase = resolve_phase(window, phase_override)
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+         base_dir = LEDGER_BASE_DIR
+         if not Path(base_dir).is_absolute():
+             base_dir = worktree_dir / base_dir
+         self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
+         self.worktree_dir = worktree_dir
+         self._today = now_kst().date().isoformat()
++        self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+         )
+ 
+     def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
+         if not self.kis:
+             return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         try:
+             candles = self.kis.safe_get_daily_candles(code, count=count)
+         except Exception:
+             logger.exception("[PB1][DATA][FAIL] code=%s", code)
+             return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         if not candles:
+@@ -129,54 +131,53 @@ class PB1Engine:
+     def _compute_candidates(self, selected_by_market: Dict[str, List[Dict]]) -> List[CandidateFeature]:
+         candidates: List[CandidateFeature] = []
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 try:
+                     df, meta = self._fetch_daily(code, count=120)
+                     if df.empty:
+                         cf = CandidateFeature(
+                             code=code,
+                             market=market,
+                             features={"reasons": ["data_empty"]},
+                             setup_ok=False,
+                             reasons=["data_empty"],
+                             mode=1,
+                             mode_reasons=["default_day_mode"],
+                         )
+                         self._log_setup(cf)
+                         candidates.append(cf)
+                         continue
+                     features = compute_features(df)
+                     features["market"] = market
+                     features["volume_missing"] = bool(meta.get("volume_missing"))
+                     if features.get("volume_missing"):
+                         features["volu_contraction"] = None
+-                    ok, reasons = evaluate_setup(features, market)
++                    ok, reasons = evaluate_setup(features, market, require_volume=self.require_volume)
+                     if features.get("volume_missing") and "volume_missing" not in reasons:
+                         reasons.append("volume_missing")
+-                        ok = False
+                     if ok:
+                         reasons = []
+                     elif not reasons:
+                         reasons = ["unspecified_fail"]
+                     mode, mode_reasons = choose_mode(features)
+                     cf = CandidateFeature(
+                         code=code,
+                         market=market,
+                         features=features,
+                         setup_ok=ok,
+                         reasons=reasons,
+                         mode=mode,
+                         mode_reasons=mode_reasons,
+                     )
+                     self._log_setup(cf)
+                     candidates.append(cf)
+                 except Exception:
+                     logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                     continue
+         return candidates
+ 
+     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
+         ok_list = [c for c in candidates if c.setup_ok]
+         total = len(ok_list)
+         if total <= 0:
+@@ -475,62 +476,88 @@ class PB1Engine:
+                     "avg_buy_price": state.get("avg_buy_price"),
+                     "market": state.get("market"),
+                     "holding_days": state.get("holding_days") or 0,
+                     "first_buy_ts": state.get("first_buy_ts"),
+                 }
+             )
+         return enriched
+ 
+     def run(self) -> List[Path]:
+         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+         if not entry_allowed:
+             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s", self.window.name, self.phase, self.dry_run)
+         run_files = self.ledger.open_run_files()
+         touched: List[Path] = list(run_files.values())
+         logger.info("[LEDGER][APPEND] kind=touch path=%s", run_files)
+         persist_run_files(self.worktree_dir, touched, message=f"pb1 touch run_id={self.run_id}")
+         positions = self.ledger.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+         selected = self._build_universe()
+         code_market = self._code_market_map(selected)
+         marks_fallback: Dict[str, float] = {}
+         if self.phase in {"prep", "entry"}:
+             candidates = self._compute_candidates(selected)
+             candidates = self._size_positions(candidates)
+             if self.phase == "entry" and self.window.name == "afternoon":
+-                orderable_cash = self.kis.get_cash_balance() if self.kis else 0
++                code_hint = candidates[0].code if candidates else next(iter(code_market), "005930")
++                price_hint = candidates[0].features.get("close") if candidates else None
++                orderable_cash = 0
++                cash_meta: Dict[str, object] = {"source": "none", "raw_fields": {}, "clamp_applied": False}
++                if self.kis:
++                    orderable_cash, cash_meta = self.kis.get_orderable_cash(code_hint, price_hint)
+                 if orderable_cash < 0:
+                     orderable_cash = 0
++                logger.info(
++                    "[PB1][CASH][ORDERABLE] value=%s source=%s clamp=%s raw_fields=%s",
++                    orderable_cash,
++                    cash_meta.get("source"),
++                    cash_meta.get("clamp_applied"),
++                    {
++                        k: (cash_meta.get("raw_fields") or {}).get(k)
++                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
++                    },
++                )
+                 cash_block_logged = False
+                 for cf in candidates:
+                     if not cf.setup_ok:
+                         continue
+                     if self._should_block_order(cf.client_order_key):
+                         continue
+                     if orderable_cash <= 0:
+                         if not cash_block_logged:
+-                            logger.info("[PB1][CASH-BLOCK] orderable=%s reason=insufficient_cash", orderable_cash)
++                            logger.info(
++                                "[PB1][CASH-BLOCK] orderable=%s meta=%s reason=insufficient_cash",
++                                orderable_cash,
++                                {
++                                    "source": cash_meta.get("source"),
++                                    "raw_fields": {
++                                        k: (cash_meta.get("raw_fields") or {}).get(k)
++                                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
++                                    },
++                                    "clamp_applied": cash_meta.get("clamp_applied"),
++                                },
++                            )
+                             cash_block_logged = True
+                         continue
+                     if not entry_allowed:
+                         continue
+                     paths = self._place_entry(cf)
+                     touched.extend(paths)
+         elif self.phase in {"exit", "verify"}:
+             pos_list = self._positions_with_meta(positions)
+             for pos in pos_list:
+                 df, _ = self._fetch_daily(pos["code"], count=120)
+                 if df.empty:
+                     err = new_error(
+                         code=pos["code"],
+                         market=pos.get("market") or "",
+                         sid=1,
+                         mode=pos["mode"],
+                         env=self.env,
+                         run_id=self.run_id,
+                         reasons=["daily_data_missing"],
+                     )
+                     self.ledger.append_event("errors", err)
+                     continue
+                 features = compute_features(df)
+                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
+                 marks_fallback[pos["code"]] = features.get("close")
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index ee5183dcb00329d3ea267557caf6c57633e5a0ca..321da9d529d8449ea3af5983fbc87a317450336f 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -1,48 +1,49 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import logging
+ import os
+ import time
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ 
+ from trader.kis_wrapper import KisAPI
+ from trader.time_utils import is_trading_day, now_kst
+ from trader.config import (
+     BOTSTATE_LOCK_TTL_SEC,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     MORNING_WINDOW_START,
+     MORNING_WINDOW_END,
+     MORNING_EXIT_START,
+     MORNING_EXIT_END,
+     AFTERNOON_WINDOW_START,
+     AFTERNOON_WINDOW_END,
+     CLOSE_AUCTION_START,
+     CLOSE_AUCTION_END,
++    PB1_FORCE_ENTRY_ON_PUSH,
+ )
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.botstate_sync import (
+     acquire_lock,
+     release_lock,
+     setup_worktree,
+     persist_run_files,
+     resolve_botstate_worktree_dir,
+ )
+ from trader.pb1_engine import PB1Engine
+ from trader.window_router import decide_window
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def truthy(value: object) -> bool:
+     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
+     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
+     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
+     parser.add_argument("--target-branch", default=os.getenv("BOTSTATE_BRANCH", "bot-state"), help="Bot-state target branch")
+     return parser.parse_args()
+@@ -212,51 +213,69 @@ def main() -> None:
+         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
+         event_name_lower or "unknown",
+         now.isoformat(),
+         trading_day,
+         window_name_for_log,
+         phase_for_log,
+         dry_run,
+         os.getenv("DISABLE_LIVE_TRADING"),
+         os.getenv("LIVE_TRADING_ENABLED"),
+         os.getenv("STRATEGY_MODE"),
+         os.getenv("PB1_ENTRY_ENABLED"),
+         dry_run_reasons or ["live"],
+     )
+     if window is None and not diag_enabled:
+         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+         release_lock(worktree_dir, run_id=run_id)
+         return
+     if window is None and diag_enabled:
+         window = window  # keep None, but allow diagnostic flow below
+ 
+     if non_trading_day:
+         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
+         if diag_enabled:
+             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
+ 
++    phase_override_arg = args.phase
++    if (
++        window
++        and event_name_lower == "push"
++        and phase_override_arg == "auto"
++        and window.name == "afternoon"
++        and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
++    ):
++        try:
++            start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
++            end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
++            in_afternoon = start.time() <= now.time() < end.time()
++        except Exception:
++            in_afternoon = False
++        if trading_day and in_afternoon and window.phase == "prep":
++            logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
++            phase_override_arg = "entry"
++
+     touched: list[Path] = []
+     try:
+         engine = PB1Engine(
+             kis=kis,
+             worktree_dir=worktree_dir,
+             window=window,
+-            phase_override=args.phase,
++            phase_override=phase_override_arg,
+             dry_run=dry_run,
+             env="paper" if dry_run else kis.env if kis else "paper",
+             run_id=run_id,
+         )
+         touched = engine.run()
+         if state_target_path.exists():
+             touched.append(state_target_path)
+         logger.info("[PB1] run complete touched=%s", touched)
+         persist_run_files(
+             worktree_dir,
+             touched,
+             message=f"pb1 ledger run_id={run_id} window={window.name} phase={engine.phase}",
+         )
+     finally:
+         release_lock(worktree_dir, run_id=run_id)
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/trader/strategies/pb1_pullback_close.py b/trader/strategies/pb1_pullback_close.py
+index b057bb1d96ce9b86a2fe75210ed89f6d30fd6b73..4f02f8add57f06ba5c9fb4f267a9b01a9d73927b 100644
+--- a/trader/strategies/pb1_pullback_close.py
++++ b/trader/strategies/pb1_pullback_close.py
+@@ -58,62 +58,62 @@ def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
+ 
+     last = df.iloc[-1]
+     high20 = df["high"].tail(20).max()
+     features = {
+         "close": float(last["close"]),
+         "ma20": float(last["ma20"]),
+         "ma50": float(last["ma50"]),
+         "ma10": float(last["ma10"]),
+         "atr14": float(last["atr14"]),
+         "vol_contraction": float(last["vol_contraction"]),
+         "volu_contraction": float(last["volu_contraction"]),
+         "ma20_slope": slope,
+         "high20": float(high20),
+         "pullback_pct": _pct(high20 - last["close"], high20),
+         "tr_range_pct": float(last["tr_range_pct"]),
+         "trend_strength": float(last["close"] / last["ma50"] if last["ma50"] else math.inf),
+         "volume_missing": volume_missing,
+     }
+     return features
+ 
+ 
+ def _is_missing(value: float | None) -> bool:
+     return value is None or (isinstance(value, float) and math.isnan(value))
+ 
+ 
+-def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[str]]:
++def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool = True) -> Tuple[bool, List[str]]:
+     reasons: List[str] = []
+     close = features.get("close")
+     ma20 = features.get("ma20")
+     ma50 = features.get("ma50")
+     pullback = features.get("pullback_pct")
+     vol_c = features.get("vol_contraction")
+     volu_c = features.get("volu_contraction")
+     slope = features.get("ma20_slope")
+     volume_missing = bool(features.get("volume_missing"))
+ 
+-    if volume_missing:
++    if volume_missing and require_volume:
+         reasons.append("volume_missing")
+     if close is None or ma20 is None or ma50 is None:
+         reasons.append("missing_ma")
+     else:
+         if not (close > ma20 and close > ma50):
+             reasons.append("close_below_ma")
+     if slope is None or slope <= 0:
+         reasons.append("ma20_slope_nonpos")
+ 
+     if pullback is None:
+         reasons.append("pullback_missing")
+     else:
+         low, high = (PB1_PULLBACK_BAND_KOSPI if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ)
+         if not (low <= pullback <= high):
+             reasons.append("pullback_out_of_band")
+ 
+     if _is_missing(vol_c) or vol_c > PB1_VOL_CONTRACTION_MAX:
+         reasons.append("vol_contraction_fail")
+     if not volume_missing and (_is_missing(volu_c) or volu_c > PB1_VOLU_CONTRACTION_MAX):
+         reasons.append("volu_contraction_fail")
+ 
+     return (len(reasons) == 0, reasons)
+ 
+ 
+ def choose_mode(features: Dict[str, float]) -> Tuple[int, List[str]]:
+diff --git a/trader/utils/ohlcv.py b/trader/utils/ohlcv.py
+index 53eea523162352012f3d66a7f0fdd53cd760bad1..129c72a371bded90177d9d686f4f848d4743d838 100644
+--- a/trader/utils/ohlcv.py
++++ b/trader/utils/ohlcv.py
+@@ -1,40 +1,60 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Dict, List, Tuple
+ 
+ import numpy as np
+ import pandas as pd
+ 
+ 
+ def _match_column(columns_lower: List[str], candidates: List[str]) -> str | None:
+     for cand in candidates:
+         if cand.lower() in columns_lower:
+             return cand.lower()
+     return None
+ 
+ 
++def _to_numeric_series(s: pd.Series) -> pd.Series:
++    def _clean(val: object) -> object:
++        if isinstance(val, str):
++            stripped = val.strip()
++            lower = stripped.lower()
++            if lower in {"", "null", "none"}:
++                return np.nan
++            cleaned = (
++                stripped.replace(",", "")
++                .replace(" ", "")
++                .replace("_", "")
++                .replace("+", "")
++            )
++            return cleaned
++        return val
++
++    cleaned = s.apply(_clean)
++    return pd.to_numeric(cleaned, errors="coerce")
++
++
+ def normalize_ohlcv(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+     """
+     Normalize OHLCV columns to a standard schema.
+ 
+     Standard columns: date, open, high, low, close, volume
+     - volume is kept as NaN when missing (never filled with 0)
+     - numeric columns are coerced with errors='coerce'
+     - rows are sorted by date and de-duplicated on date (keep last)
+ 
+     Returns (df_norm, meta) where meta contains:
+       - volume_missing: bool
+       - source_cols: list of original columns
+       - mapped: mapping of detected source -> target
+     """
+ 
+     if df is None:
+         return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+ 
+     df_copy = df.copy()
+     original_columns = [str(c) for c in df_copy.columns]
+     columns_lower = [c.strip().lower() for c in original_columns]
+     col_map: Dict[str, str] = {}
+ 
+     candidates: Dict[str, List[str]] = {
+         "date": [
+@@ -56,42 +76,42 @@ def normalize_ohlcv(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+             "trade_volume",
+             "거래량",
+             "stck_vol",
+             "acml_tr_pbmn",
+             "stck_trqu",
+             "volume(주)",
+             "volume ",
+         ],
+     }
+ 
+     for target, cand_list in candidates.items():
+         matched = _match_column(columns_lower, cand_list)
+         if matched:
+             col_map[matched] = target
+ 
+     df_copy.columns = columns_lower
+     mapped: Dict[str, str] = {}
+     for src, dst in col_map.items():
+         if src in df_copy.columns:
+             mapped[src] = dst
+     df_norm = df_copy.rename(columns=mapped)
+ 
+     for col in ["open", "high", "low", "close", "volume"]:
+         if col not in df_norm.columns:
+             df_norm[col] = np.nan
+-        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
++        df_norm[col] = _to_numeric_series(df_norm[col])
+ 
+     if "date" in df_norm.columns:
+         df_norm["date"] = pd.to_datetime(df_norm["date"], errors="coerce")
+         df_norm = df_norm.dropna(subset=["date"])
+ 
+     df_norm = df_norm.sort_values("date").drop_duplicates("date", keep="last")
+ 
+     mapped_targets = set(mapped.values())
+     volume_missing = bool("volume" not in mapped_targets or df_norm["volume"].isna().all())
+     meta = {
+         "volume_missing": volume_missing,
+         "source_cols": original_columns,
+         "mapped": {dst: src for src, dst in mapped.items()},
+     }
+ 
+     return df_norm, meta

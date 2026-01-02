@@ -21,6 +21,7 @@ from trader.config import (
     PB1_DAY_TP_R,
     PB1_R_FLOOR_PCT,
     PB1_TIME_STOP_DAYS,
+    PB1_REQUIRE_VOLUME,
 )
 from trader.utils.env import env_bool
 from trader.kis_wrapper import KisAPI
@@ -73,6 +74,7 @@ class PB1Engine:
         self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
         self.worktree_dir = worktree_dir
         self._today = now_kst().date().isoformat()
+        self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
 
     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
@@ -151,10 +153,9 @@ class PB1Engine:
                     features["volume_missing"] = bool(meta.get("volume_missing"))
                     if features.get("volume_missing"):
                         features["volu_contraction"] = None
-                    ok, reasons = evaluate_setup(features, market)
+                    ok, reasons = evaluate_setup(features, market, require_volume=self.require_volume)
                     if features.get("volume_missing") and "volume_missing" not in reasons:
                         reasons.append("volume_missing")
-                        ok = False
                     if ok:
                         reasons = []
                     elif not reasons:
@@ -497,9 +498,24 @@ class PB1Engine:
             candidates = self._compute_candidates(selected)
             candidates = self._size_positions(candidates)
             if self.phase == "entry" and self.window.name == "afternoon":
-                orderable_cash = self.kis.get_cash_balance() if self.kis else 0
+                code_hint = candidates[0].code if candidates else next(iter(code_market), "005930")
+                price_hint = candidates[0].features.get("close") if candidates else None
+                orderable_cash = 0
+                cash_meta: Dict[str, object] = {"source": "none", "raw_fields": {}, "clamp_applied": False}
+                if self.kis:
+                    orderable_cash, cash_meta = self.kis.get_orderable_cash(code_hint, price_hint)
                 if orderable_cash < 0:
                     orderable_cash = 0
+                logger.info(
+                    "[PB1][CASH][ORDERABLE] value=%s source=%s clamp=%s raw_fields=%s",
+                    orderable_cash,
+                    cash_meta.get("source"),
+                    cash_meta.get("clamp_applied"),
+                    {
+                        k: (cash_meta.get("raw_fields") or {}).get(k)
+                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
+                    },
+                )
                 cash_block_logged = False
                 for cf in candidates:
                     if not cf.setup_ok:
@@ -508,7 +524,18 @@ class PB1Engine:
                         continue
                     if orderable_cash <= 0:
                         if not cash_block_logged:
-                            logger.info("[PB1][CASH-BLOCK] orderable=%s reason=insufficient_cash", orderable_cash)
+                            logger.info(
+                                "[PB1][CASH-BLOCK] orderable=%s meta=%s reason=insufficient_cash",
+                                orderable_cash,
+                                {
+                                    "source": cash_meta.get("source"),
+                                    "raw_fields": {
+                                        k: (cash_meta.get("raw_fields") or {}).get(k)
+                                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
+                                    },
+                                    "clamp_applied": cash_meta.get("clamp_applied"),
+                                },
+                            )
                             cash_block_logged = True
                         continue
                     if not entry_allowed:

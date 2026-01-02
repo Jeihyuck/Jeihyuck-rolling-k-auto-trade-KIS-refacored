@@ -13,6 +13,26 @@ def _match_column(columns_lower: List[str], candidates: List[str]) -> str | None
     return None
 
 
+def _to_numeric_series(s: pd.Series) -> pd.Series:
+    def _clean(val: object) -> object:
+        if isinstance(val, str):
+            stripped = val.strip()
+            lower = stripped.lower()
+            if lower in {"", "null", "none"}:
+                return np.nan
+            cleaned = (
+                stripped.replace(",", "")
+                .replace(" ", "")
+                .replace("_", "")
+                .replace("+", "")
+            )
+            return cleaned
+        return val
+
+    cleaned = s.apply(_clean)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 def normalize_ohlcv(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Normalize OHLCV columns to a standard schema.
@@ -78,7 +98,7 @@ def normalize_ohlcv(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     for col in ["open", "high", "low", "close", "volume"]:
         if col not in df_norm.columns:
             df_norm[col] = np.nan
-        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
+        df_norm[col] = _to_numeric_series(df_norm[col])
 
     if "date" in df_norm.columns:
         df_norm["date"] = pd.to_datetime(df_norm["date"], errors="coerce")

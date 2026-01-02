@@ -158,6 +158,7 @@ TR_MAP = {
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
+        "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER", "VTTC8908R")],
         "TOKEN": "/oauth2/tokenP",
     },
     "real": {
@@ -168,6 +169,7 @@ TR_MAP = {
         "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK_REAL", "FHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART_REAL", "FHKST03010200")],
+        "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER_REAL", "TTTC8908R")],
         "TOKEN": "/oauth2/token",
     },
 }
@@ -376,14 +378,68 @@ class KisAPI:
         return hk
 
     # ===== 신규: 예수금/과매수 방지 유틸 =====
+    def get_orderable_cash(self, code_hint: str | None = None, price_hint: float | None = None) -> tuple[int, dict]:
+        code = safe_strip(code_hint) or "005930"
+        cash_meta: dict = {"source": "psbl_order", "raw_fields": {}, "selected_key": None, "clamp_applied": False}
+        cash = 0
+        try:
+            resp = self._inquire_psbl_order(code, price_hint)
+            cash, meta = self._parse_cash_from_psbl_order(resp)
+            cash_meta.update(meta)
+            cash_meta["source"] = "psbl_order"
+            raw_fields = cash_meta.get("raw_fields") or {}
+            logger.info(
+                "[CASH][PSBL] ord_psbl_cash=%s ord_psbl_amt=%s",
+                raw_fields.get("ord_psbl_cash"),
+                raw_fields.get("ord_psbl_amt"),
+            )
+        except Exception as e:
+            logger.warning("[CASH][PSBL][FAIL] code=%s err=%s", code, e)
+        if cash <= 0:
+            try:
+                j = self.inquire_balance_all()
+                out2 = j.get("output2")
+                bal_cash, bal_meta = self._parse_cash_from_output2(out2)
+                cash = bal_cash
+                cash_meta = {"source": "balance_out2", **bal_meta}
+                raw_fields = cash_meta.get("raw_fields") or {}
+                logger.info(
+                    "[CASH][FALLBACK_BALANCE] ord_psbl_cash=%s ord_psbl_amt=%s nrcvb_buy_amt=%s dnca_tot_amt=%s",
+                    raw_fields.get("ord_psbl_cash"),
+                    raw_fields.get("ord_psbl_amt"),
+                    raw_fields.get("nrcvb_buy_amt"),
+                    raw_fields.get("dnca_tot_amt"),
+                )
+            except Exception as e:
+                logger.warning("[CASH][FALLBACK_BALANCE][FAIL] %s", e)
+        clamp_applied = bool(cash_meta.get("clamp_applied"))
+        if cash < 0:
+            cash = 0
+            clamp_applied = True
+        if cash <= 0 and self._last_cash:
+            logger.warning("[CASH][ORDERABLE][FALLBACK_LAST] live=%s → use last=%s", cash, self._last_cash)
+            cash = self._last_cash
+            cash_meta["source"] = f"{cash_meta.get('source', 'unknown')}_cache"
+        cash_meta["clamp_applied"] = clamp_applied
+        cash_meta.setdefault("raw_fields", {})
+        if cash > 0:
+            self._last_cash = cash
+        logger.info(
+            "[CASH][ORDERABLE] value=%s source=%s clamp=%s",
+            cash,
+            cash_meta.get("source", "unknown"),
+            cash_meta.get("clamp_applied"),
+        )
+        return cash, cash_meta
+
     def get_cash_available_today(self) -> int:
         """
         당일 매수 가능 예수금(가용현금) 반환.
-        ✅ output2.ord_psbl_cash → nrcvb_buy_amt → dnca_tot_amt 순으로 파싱.
+        ✅ 주문가능조회 → 잔고조회 순으로 파싱.
         실패/0원 시 최근 조회값 캐시 사용.
         """
         try:
-            cash = self.get_cash_balance()
+            cash, _meta = self.get_orderable_cash()
             if cash < 0:
                 logger.warning("[CASH_GUARD] 예수금 음수 감지(%s) → 0으로 처리", cash)
                 return 0
@@ -1054,6 +1110,24 @@ class KisAPI:
         return {"price": None, "prev_close": None, "vwap": None}
 
     # ----- 잔고/포지션 -----
+    def _normalize_cash_value(self, x: Any) -> str:
+        s = safe_strip(x)
+        lower = s.lower()
+        if lower in {"", "none", "null", "nan"}:
+            return ""
+        for ch in (",", " ", "_", "+"):
+            s = s.replace(ch, "")
+        return s
+
+    def _cash_to_int(self, x: Any) -> int:
+        try:
+            normalized = self._normalize_cash_value(x)
+            if normalized == "":
+                return 0
+            return int(float(normalized))
+        except Exception:
+            return 0
+
     def _parse_cash_from_output2(self, out2: Any) -> tuple[int, dict]:
         """
         ✅ 예수금 파싱 규칙:
@@ -1061,15 +1135,6 @@ class KisAPI:
         2) nrcvb_buy_amt (매수가능금액)
         3) dnca_tot_amt  (예수금 총액; 결제미수 포함 가능)
         """
-
-        def _to_int(x) -> int:
-            try:
-                s = safe_strip(x)
-                if s == "":
-                    return 0
-                return int(float(s))
-            except Exception:
-                return 0
 
         row = None
         if isinstance(out2, list) and out2:
@@ -1090,13 +1155,73 @@ class KisAPI:
         for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
             if key in row:
                 selected_key = key
-                cash = _to_int(row.get(key))
+                cash = self._cash_to_int(row.get(key))
                 break
         clamp_applied = False
         if cash < 0:
             cash = 0
             clamp_applied = True
         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+
+    def _parse_cash_from_psbl_order(self, resp: Any) -> tuple[int, dict]:
+        row = None
+        if isinstance(resp, dict):
+            if isinstance(resp.get("output"), dict):
+                row = resp.get("output")
+            elif isinstance(resp.get("output1"), list) and resp.get("output1"):
+                row = resp.get("output1")[0]
+            else:
+                row = resp
+        elif isinstance(resp, list) and resp:
+            row = resp[0]
+        else:
+            return 0, {"raw_fields": {}, "selected_key": None, "clamp_applied": False}
+
+        raw_fields = {
+            "ord_psbl_cash": row.get("ord_psbl_cash"),
+            "ord_psbl_amt": row.get("ord_psbl_amt"),
+            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+            "dnca_tot_amt": row.get("dnca_tot_amt"),
+        }
+        selected_key = None
+        cash = 0
+        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
+            if key in row:
+                selected_key = key
+                cash = self._cash_to_int(row.get(key))
+                break
+        clamp_applied = False
+        if cash < 0:
+            cash = 0
+            clamp_applied = True
+        return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+
+    def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
+        """주문가능조회 호출."""
+        tr_list = _pick_tr(self.env, "PSBL_ORDER")
+        if not tr_list:
+            raise RuntimeError("PSBL_ORDER TR 미구성")
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        tr = tr_list[0]
+        headers = self._headers(tr)
+        try:
+            ord_unpr = int(float(price_hint)) if price_hint is not None else 1
+        except Exception:
+            ord_unpr = 1
+        params = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "PDNO": safe_strip(code_hint) or "005930",
+            "ORD_UNPR": str(max(ord_unpr, 1)),
+            "ORD_DVSN": "00",
+            "ORD_DVSN_CD": "00",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        self._limiter.wait("psbl-order")
+        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+        data = resp.json()
+        return data
 
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
         """잔고 1페이지 호출(예외는 상위에서 처리)."""
@@ -1175,31 +1300,8 @@ class KisAPI:
         ✅ 예수금: output2.ord_psbl_cash 우선.
         실패/0원 시 최근 캐시(self._last_cash) 폴백.
         """
-        try:
-            j = self.inquire_balance_all()
-            out2 = j.get("output2")
-            cash, meta = self._parse_cash_from_output2(out2)
-            logger.info(
-                "[CASH] raw=%s orderable=%s source_fields=%s clamp_applied=%s",
-                meta.get("raw_fields"),
-                cash,
-                meta.get("selected_key"),
-                meta.get("clamp_applied"),
-            )
-            if cash > 0:
-                self._last_cash = cash
-                logger.info("[CASH_BALANCE_OK] ord_psbl_cash≈%s원", f"{cash:,}")
-                return cash
-            # 0원이면 캐시 폴백
-            if self._last_cash is not None and self._last_cash > 0:
-                logger.warning("[CASH_FALLBACK] live=0 → use last=%s", f"{self._last_cash:,}")
-                return self._last_cash
-        except Exception as e:
-            logger.error(f"[CASH_BALANCE_FAIL] {e}")
-            if self._last_cash is not None and self._last_cash > 0:
-                logger.warning("[CASH_FALLBACK] netfail → use last=%s", f"{self._last_cash:,}")
-                return self._last_cash
-        return 0
+        cash, _meta = self.get_orderable_cash()
+        return cash
 
     def get_positions(self) -> List[Dict]:
         """보유 종목 전체(페이징 병합)."""

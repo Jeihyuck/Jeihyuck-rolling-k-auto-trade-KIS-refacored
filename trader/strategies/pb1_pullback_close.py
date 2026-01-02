@@ -80,7 +80,7 @@ def _is_missing(value: float | None) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
-def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[str]]:
+def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool = True) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     close = features.get("close")
     ma20 = features.get("ma20")
@@ -91,7 +91,7 @@ def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[
     slope = features.get("ma20_slope")
     volume_missing = bool(features.get("volume_missing"))
 
-    if volume_missing:
+    if volume_missing and require_volume:
         reasons.append("volume_missing")
     if close is None or ma20 is None or ma50 is None:
         reasons.append("missing_ma")

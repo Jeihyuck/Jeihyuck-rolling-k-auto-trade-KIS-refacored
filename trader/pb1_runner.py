@@ -21,6 +21,7 @@ from trader.config import (
     AFTERNOON_WINDOW_END,
     CLOSE_AUCTION_START,
     CLOSE_AUCTION_END,
+    PB1_FORCE_ENTRY_ON_PUSH,
 )
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.botstate_sync import (
@@ -234,13 +235,31 @@ def main() -> None:
         if diag_enabled:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
 
+    phase_override_arg = args.phase
+    if (
+        window
+        and event_name_lower == "push"
+        and phase_override_arg == "auto"
+        and window.name == "afternoon"
+        and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
+    ):
+        try:
+            start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
+            end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
+            in_afternoon = start.time() <= now.time() < end.time()
+        except Exception:
+            in_afternoon = False
+        if trading_day and in_afternoon and window.phase == "prep":
+            logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
+            phase_override_arg = "entry"
+
     touched: list[Path] = []
     try:
         engine = PB1Engine(
             kis=kis,
             worktree_dir=worktree_dir,
             window=window,
-            phase_override=args.phase,
+            phase_override=phase_override_arg,
             dry_run=dry_run,
             env="paper" if dry_run else kis.env if kis else "paper",
             run_id=run_id,

@@ -29,8 +29,8 @@ def test_normalize_maps_alternative_volume_column():
             "시가": [10, 11],
             "고가": [12, 13],
             "저가": [9, 10],
-            "종가": [11, 12],
-            "거래량": [1000, 2000],
+            "종가": ["11", "12"],
+            "거래량": ["1,000", "2,345,678"],
         }
     )
 
@@ -38,4 +38,24 @@ def test_normalize_maps_alternative_volume_column():
 
     assert "volume" in norm.columns
     assert meta["volume_missing"] is False
+    assert norm["volume"].tolist() == [1000, 2345678]
+    assert norm["close"].tolist() == [11.0, 12.0]
+
+
+def test_normalize_handles_comma_separated_numeric_columns():
+    df = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=2, freq="D"),
+            "open": ["1,000", "2,000"],
+            "high": ["1,500", "2,500"],
+            "low": ["900", "1,900"],
+            "close": ["1,250", "2,200"],
+            "volume": ["1,000", "2,000"],
+        }
+    )
+
+    norm, meta = normalize_ohlcv(df)
+
+    assert meta["volume_missing"] is False
     assert norm["volume"].tolist() == [1000, 2000]
+    assert norm["close"].tolist() == [1250.0, 2200.0]
