@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-01-02T15:03:21.491999+09:00",
+  "updated_at": "2026-01-02T15:38:11.425620+09:00",
   "positions": {
     "000660": {
       "code": "000660",
@@ -21,13 +21,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 1,
       "avg_price": 591517.857,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -77,13 +78,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 262,
       "avg_price": 37600.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -181,13 +183,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 210,
       "avg_price": 23403.171,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -290,13 +293,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 10,
       "avg_price": 461340.573,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -465,13 +469,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 64,
       "avg_price": 242082.417,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -521,13 +526,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 291,
       "avg_price": 53751.084,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -577,13 +583,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 32,
       "avg_price": 233720.707,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -656,13 +663,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 22,
       "avg_price": 58100.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -709,13 +717,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 136,
       "avg_price": 143934.02,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -765,13 +774,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 339,
       "avg_price": 58019.047,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -821,13 +831,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 272,
       "avg_price": 93458.762,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -928,13 +939,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 42,
       "avg_price": 233500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -984,13 +996,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 128,
       "avg_price": 49756.967,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1091,13 +1104,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 157,
       "avg_price": 62500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1147,13 +1161,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 210,
       "avg_price": 27963.169,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -1251,13 +1266,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 1,
       "avg_price": 310500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1360,13 +1376,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 65,
       "avg_price": 390027.173,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1416,13 +1433,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 14,
       "avg_price": 101202.898,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T15:03:21.490724+09:00",
+      "updated_at": "2026-01-02T15:38:11.424488+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
