@@ -36,6 +36,7 @@ def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
     df = df.sort_values("date")
     if len(df) < 60:
         return {"setup_ok": False, "reasons": ["insufficient_candles"], "count": len(df)}
+    volume_missing = df["volume"].isna().all()
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma50"] = df["close"].rolling(50).mean()
     df["ma10"] = df["close"].rolling(10).mean()
@@ -43,7 +44,8 @@ def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
     df["atr14"] = df["tr"].rolling(14).mean()
     df["tr_range_pct"] = (df["high"] - df["low"]) / df["close"] * 100
     df["vol_contraction"] = df["tr_range_pct"].rolling(5).mean() / df["tr_range_pct"].rolling(20).mean()
-    df["volu_contraction"] = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
+    volu_contraction = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
+    df["volu_contraction"] = volu_contraction if not volume_missing else np.nan
 
     ma20_tail = df["ma20"].tail(5)
     slope = None
@@ -69,8 +71,13 @@ def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
         "pullback_pct": _pct(high20 - last["close"], high20),
         "tr_range_pct": float(last["tr_range_pct"]),
         "trend_strength": float(last["close"] / last["ma50"] if last["ma50"] else math.inf),
+        "volume_missing": volume_missing,
     }
     return features
+
+
+def _is_missing(value: float | None) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
 
 
 def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[str]]:
@@ -82,7 +89,10 @@ def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[
     vol_c = features.get("vol_contraction")
     volu_c = features.get("volu_contraction")
     slope = features.get("ma20_slope")
+    volume_missing = bool(features.get("volume_missing"))
 
+    if volume_missing:
+        reasons.append("volume_missing")
     if close is None or ma20 is None or ma50 is None:
         reasons.append("missing_ma")
     else:
@@ -98,9 +108,9 @@ def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[
         if not (low <= pullback <= high):
             reasons.append("pullback_out_of_band")
 
-    if vol_c is None or vol_c > PB1_VOL_CONTRACTION_MAX:
+    if _is_missing(vol_c) or vol_c > PB1_VOL_CONTRACTION_MAX:
         reasons.append("vol_contraction_fail")
-    if volu_c is None or volu_c > PB1_VOLU_CONTRACTION_MAX:
+    if not volume_missing and (_is_missing(volu_c) or volu_c > PB1_VOLU_CONTRACTION_MAX):
         reasons.append("volu_contraction_fail")
 
     return (len(reasons) == 0, reasons)

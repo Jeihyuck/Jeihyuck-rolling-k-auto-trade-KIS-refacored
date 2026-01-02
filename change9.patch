@@ -1,0 +1,679 @@
+diff --git a/tests/test_cash_orderable.py b/tests/test_cash_orderable.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..810e75a2a2701337eceebd79bcdde62dab7c1314
+--- /dev/null
++++ b/tests/test_cash_orderable.py
+@@ -0,0 +1,22 @@
++from trader.kis_wrapper import KisAPI
++
++
++def _parse(out2):
++    api = KisAPI.__new__(KisAPI)
++    return api._parse_cash_from_output2(out2)
++
++
++def test_negative_dnca_tot_amt_is_clamped_to_zero():
++    cash, meta = _parse({"dnca_tot_amt": "-1000"})
++
++    assert cash == 0
++    assert meta["clamp_applied"] is True
++    assert meta["selected_key"] == "dnca_tot_amt"
++
++
++def test_ord_psbl_cash_is_preferred_over_dnca_tot_amt():
++    cash, meta = _parse({"ord_psbl_cash": "5000", "dnca_tot_amt": "-9999"})
++
++    assert cash == 5000
++    assert meta["clamp_applied"] is False
++    assert meta["selected_key"] == "ord_psbl_cash"
+diff --git a/tests/test_pb1_daily_normalize.py b/tests/test_pb1_daily_normalize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b148f07e1422ac821b95b728ac5fec812f1c0b5c
+--- /dev/null
++++ b/tests/test_pb1_daily_normalize.py
+@@ -0,0 +1,41 @@
++import numpy as np
++import pandas as pd
++
++from trader.utils.ohlcv import normalize_ohlcv
++
++
++def test_normalize_adds_volume_nan_when_missing():
++    df = pd.DataFrame(
++        {
++            "date": pd.date_range("2024-01-01", periods=3, freq="D"),
++            "open": [1, 2, 3],
++            "high": [2, 3, 4],
++            "low": [0.5, 1.5, 2.5],
++            "close": [1.5, 2.5, 3.5],
++        }
++    )
++
++    norm, meta = normalize_ohlcv(df)
++
++    assert "volume" in norm.columns
++    assert np.isnan(norm["volume"]).all()
++    assert meta["volume_missing"] is True
++
++
++def test_normalize_maps_alternative_volume_column():
++    df = pd.DataFrame(
++        {
++            "날짜": pd.date_range("2024-01-01", periods=2, freq="D"),
++            "시가": [10, 11],
++            "고가": [12, 13],
++            "저가": [9, 10],
++            "종가": [11, 12],
++            "거래량": [1000, 2000],
++        }
++    )
++
++    norm, meta = normalize_ohlcv(df)
++
++    assert "volume" in norm.columns
++    assert meta["volume_missing"] is False
++    assert norm["volume"].tolist() == [1000, 2000]
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index b52f0e9537175553f043e4e03298ce86a9da4559..5961bfb8b5c78601ff279e2c593f6aa301416ac6 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -1059,61 +1059,65 @@ class KisAPI:
+         ✅ 예수금 파싱 규칙:
+         1) ord_psbl_cash (주문가능현금)
+         2) nrcvb_buy_amt (매수가능금액)
+         3) dnca_tot_amt  (예수금 총액; 결제미수 포함 가능)
+         """
+ 
+         def _to_int(x) -> int:
+             try:
+                 s = safe_strip(x)
+                 if s == "":
+                     return 0
+                 return int(float(s))
+             except Exception:
+                 return 0
+ 
+         row = None
+         if isinstance(out2, list) and out2:
+             row = out2[0]
+         elif isinstance(out2, dict):
+             row = out2
+         else:
+             return 0, {}
+ 
+         raw_fields = {
+             "ord_psbl_cash": row.get("ord_psbl_cash"),
++            "ord_psbl_amt": row.get("ord_psbl_amt"),
+             "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+             "dnca_tot_amt": row.get("dnca_tot_amt"),
+         }
+         selected_key = None
+         cash = 0
+-        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
++        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
+             if key in row:
+                 selected_key = key
+                 cash = _to_int(row.get(key))
+                 break
+         clamp_applied = False
++        if cash < 0:
++            cash = 0
++            clamp_applied = True
+         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+ 
+     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
+         """잔고 1페이지 호출(예외는 상위에서 처리)."""
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+         tr_list = _pick_tr(self.env, "BALANCE")
+         if not tr_list:
+             raise RuntimeError("BALANCE TR 미구성")
+         tr = tr_list[0]
+         headers = self._headers(tr)
+         params = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "AFHR_FLPR_YN": "N",
+             "UNPR_YN": "N",
+             "UNPR_DVSN": "01",
+             "FUND_STTL_ICLD_YN": "N",
+             "FNCG_AMT_AUTO_RDPT_YN": "N",
+             "PRCS_DVSN": "01",
+             "OFL_YN": "N",
+             "INQR_DVSN": "02",
+             "CTX_AREA_FK100": fk,
+             "CTX_AREA_NK100": nk,
+         }
+         logger.info(f"[잔고조회 요청파라미터] {params}")
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 400101360fbdd46747b0aa8733d0b3cd79bad29e..754806bf8a15d9f6a10f42108d2044ecd2f23900 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -5,50 +5,51 @@ from dataclasses import dataclass
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Dict, Iterable, List, Tuple
+ 
+ import pandas as pd
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
+     PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
+ )
+ from trader.utils.env import env_bool
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
+ from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
++from trader.utils.ohlcv import normalize_ohlcv
+ from trader.time_utils import now_kst
+ from trader.window_router import WindowDecision, resolve_phase
+ from trader.botstate_sync import persist_run_files
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @dataclass
+ class CandidateFeature:
+     code: str
+     market: str
+     features: Dict[str, float]
+     setup_ok: bool
+     reasons: List[str]
+     mode: int
+     mode_reasons: List[str]
+     client_order_key: str | None = None
+     planned_qty: int = 0
+ 
+ 
+ class PB1Engine:
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+@@ -66,134 +67,120 @@ class PB1Engine:
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+         base_dir = LEDGER_BASE_DIR
+         if not Path(base_dir).is_absolute():
+             base_dir = worktree_dir / base_dir
+         self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
+         self.worktree_dir = worktree_dir
+         self._today = now_kst().date().isoformat()
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+         )
+ 
+-    def _fetch_daily(self, code: str, count: int = 120) -> pd.DataFrame:
++    def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
+         if not self.kis:
+-            return pd.DataFrame()
++            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         try:
+             candles = self.kis.safe_get_daily_candles(code, count=count)
+         except Exception:
+             logger.exception("[PB1][DATA][FAIL] code=%s", code)
+-            return pd.DataFrame()
++            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         if not candles:
+-            return pd.DataFrame()
++            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         df = pd.DataFrame(candles).copy()
+         if df.empty:
+-            return df
++            return df, {"volume_missing": True, "source_cols": [], "mapped": {}}
+ 
+-        df.columns = [str(c).strip().lower() for c in df.columns]
+-        rename_map = {
+-            "stck_clpr": "close",
+-            "stck_hgpr": "high",
+-            "stck_lwpr": "low",
+-            "stck_trqu": "volume",
+-            "stck_bsop_date": "date",
+-            "거래량": "volume",
+-            "acml_vol": "volume",
+-            "acc_vol": "volume",
+-            "vol": "volume",
+-            "volume(주)": "volume",
+-            "volume ": "volume",
+-        }
+-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+-
+-        if "volume" not in df.columns:
+-            logger.warning("[PB1][DAILY] missing volume code=%s cols=%s -> fill 0", code, list(df.columns))
+-            df["volume"] = 0.0
+-
+-        for col in ["close", "high", "low", "volume"]:
+-            if col in df.columns:
+-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+-        return df
++        df_norm, meta = normalize_ohlcv(df)
++        return df_norm, meta
+ 
+     def _build_universe(self) -> Dict[str, List[Dict]]:
+         """
+         Build selection universe for PB1 without triggering any legacy order flows.
+         run_rebalance() in best_k_meta_strategy is selection-only and returns weights.
+         """
+         try:
+             rebalance_payload = run_rebalance(str(now_kst().date()), return_by_market=True)
+             return rebalance_payload.get("selected_by_market") or {}
+         except Exception:
+             logger.exception("[PB1][UNIVERSE][FAIL]")
+             return {}
+ 
+     def _code_market_map(self, selected_by_market: Dict[str, List[Dict]]) -> Dict[str, str]:
+         mapping: Dict[str, str] = {}
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 mapping[code] = market
+         return mapping
+ 
+     def _compute_candidates(self, selected_by_market: Dict[str, List[Dict]]) -> List[CandidateFeature]:
+         candidates: List[CandidateFeature] = []
+         for market, rows in (selected_by_market or {}).items():
+             for row in rows or []:
+                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+                 try:
+-                    df = self._fetch_daily(code, count=120)
++                    df, meta = self._fetch_daily(code, count=120)
+                     if df.empty:
+                         cf = CandidateFeature(
+                             code=code,
+                             market=market,
+                             features={"reasons": ["data_empty"]},
+                             setup_ok=False,
+                             reasons=["data_empty"],
+                             mode=1,
+                             mode_reasons=["default_day_mode"],
+                         )
+                         self._log_setup(cf)
+                         candidates.append(cf)
+                         continue
+                     features = compute_features(df)
+                     features["market"] = market
++                    features["volume_missing"] = bool(meta.get("volume_missing"))
++                    if features.get("volume_missing"):
++                        features["volu_contraction"] = None
+                     ok, reasons = evaluate_setup(features, market)
+-                    if not reasons:
+-                        reasons = ["missing_reason"]
++                    if features.get("volume_missing") and "volume_missing" not in reasons:
++                        reasons.append("volume_missing")
++                        ok = False
++                    if ok:
++                        reasons = []
++                    elif not reasons:
++                        reasons = ["unspecified_fail"]
+                     mode, mode_reasons = choose_mode(features)
+                     cf = CandidateFeature(
+                         code=code,
+                         market=market,
+                         features=features,
+                         setup_ok=ok,
+                         reasons=reasons,
+                         mode=mode,
+                         mode_reasons=mode_reasons,
+                     )
+                     self._log_setup(cf)
+                     candidates.append(cf)
+                 except Exception:
+                     logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                     continue
+         return candidates
+ 
+     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
+         ok_list = [c for c in candidates if c.setup_ok]
+         total = len(ok_list)
+         if total <= 0:
+             return candidates
+         capital_per = DAILY_CAPITAL * CAP_CAP / total
+         for cf in ok_list:
+             close_px = cf.features.get("close") or 0
+@@ -488,76 +475,85 @@ class PB1Engine:
+                     "avg_buy_price": state.get("avg_buy_price"),
+                     "market": state.get("market"),
+                     "holding_days": state.get("holding_days") or 0,
+                     "first_buy_ts": state.get("first_buy_ts"),
+                 }
+             )
+         return enriched
+ 
+     def run(self) -> List[Path]:
+         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+         if not entry_allowed:
+             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s", self.window.name, self.phase, self.dry_run)
+         run_files = self.ledger.open_run_files()
+         touched: List[Path] = list(run_files.values())
+         logger.info("[LEDGER][APPEND] kind=touch path=%s", run_files)
+         persist_run_files(self.worktree_dir, touched, message=f"pb1 touch run_id={self.run_id}")
+         positions = self.ledger.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+         selected = self._build_universe()
+         code_market = self._code_market_map(selected)
+         marks_fallback: Dict[str, float] = {}
+         if self.phase in {"prep", "entry"}:
+             candidates = self._compute_candidates(selected)
+             candidates = self._size_positions(candidates)
+             if self.phase == "entry" and self.window.name == "afternoon":
++                orderable_cash = self.kis.get_cash_balance() if self.kis else 0
++                if orderable_cash < 0:
++                    orderable_cash = 0
++                cash_block_logged = False
+                 for cf in candidates:
+                     if not cf.setup_ok:
+                         continue
+                     if self._should_block_order(cf.client_order_key):
+                         continue
++                    if orderable_cash <= 0:
++                        if not cash_block_logged:
++                            logger.info("[PB1][CASH-BLOCK] orderable=%s reason=insufficient_cash", orderable_cash)
++                            cash_block_logged = True
++                        continue
+                     if not entry_allowed:
+                         continue
+                     paths = self._place_entry(cf)
+                     touched.extend(paths)
+         elif self.phase in {"exit", "verify"}:
+             pos_list = self._positions_with_meta(positions)
+             for pos in pos_list:
+-                df = self._fetch_daily(pos["code"], count=120)
++                df, _ = self._fetch_daily(pos["code"], count=120)
+                 if df.empty:
+                     err = new_error(
+                         code=pos["code"],
+                         market=pos.get("market") or "",
+                         sid=1,
+                         mode=pos["mode"],
+                         env=self.env,
+                         run_id=self.run_id,
+                         reasons=["daily_data_missing"],
+                     )
+                     self.ledger.append_event("errors", err)
+                     continue
+                 features = compute_features(df)
+                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
+                 marks_fallback[pos["code"]] = features.get("close")
+                 if self.phase == "exit":
+                     self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
+         if self.phase == "entry" and self.window.name == "afternoon":
+             pos_list = self._positions_with_meta(positions)
+             for pos in pos_list:
+-                df = self._fetch_daily(pos["code"], count=120)
++                df, _ = self._fetch_daily(pos["code"], count=120)
+                 if df.empty:
+                     continue
+                 features = compute_features(df)
+                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
+                 marks_fallback[pos["code"]] = features.get("close")
+                 self._plan_exit_event(pos, features, "close")
+         marks = self._fetch_marks([p["code"] for p in self._positions_with_meta(positions)], marks_fallback)
+         snapshot = self.ledger.generate_pnl_snapshot(positions, marks=marks)
+         logger.info(
+             "[PNL][SNAPSHOT] portfolio_return_pct=%.2f%% unrealized=%.2f realized=%.2f",
+             snapshot["totals"]["portfolio_return_pct"],
+             snapshot["totals"]["unrealized"],
+             snapshot["totals"]["realized"],
+         )
+         snap_path = self.ledger.write_snapshot(snapshot, self.run_id)
+         touched.append(snap_path)
+         return touched
+diff --git a/trader/strategies/pb1_pullback_close.py b/trader/strategies/pb1_pullback_close.py
+index 03730c02b27d7d41427bfe8e93be523b34ccf48d..b057bb1d96ce9b86a2fe75210ed89f6d30fd6b73 100644
+--- a/trader/strategies/pb1_pullback_close.py
++++ b/trader/strategies/pb1_pullback_close.py
+@@ -14,115 +14,125 @@ from trader.config import (
+     PB1_PULLBACK_BAND_KOSDAQ,
+     PB1_PULLBACK_BAND_KOSPI,
+     PB1_R_FLOOR_PCT,
+     PB1_SWING_TREND_MIN,
+     PB1_SWING_VOL_CONTRACTION_MAX,
+     PB1_SWING_VOLU_CONTRACTION_MAX,
+     PB1_VOL_CONTRACTION_MAX,
+     PB1_VOLU_CONTRACTION_MAX,
+     PB1_TIME_STOP_DAYS,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+ )
+ 
+ 
+ def _pct(a: float, b: float) -> float:
+     if b == 0:
+         return 0.0
+     return (a / b) * 100.0
+ 
+ 
+ def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
+     df = daily_df.copy()
+     df = df.sort_values("date")
+     if len(df) < 60:
+         return {"setup_ok": False, "reasons": ["insufficient_candles"], "count": len(df)}
++    volume_missing = df["volume"].isna().all()
+     df["ma20"] = df["close"].rolling(20).mean()
+     df["ma50"] = df["close"].rolling(50).mean()
+     df["ma10"] = df["close"].rolling(10).mean()
+     df["tr"] = np.maximum(df["high"], df["close"].shift(1)) - np.minimum(df["low"], df["close"].shift(1))
+     df["atr14"] = df["tr"].rolling(14).mean()
+     df["tr_range_pct"] = (df["high"] - df["low"]) / df["close"] * 100
+     df["vol_contraction"] = df["tr_range_pct"].rolling(5).mean() / df["tr_range_pct"].rolling(20).mean()
+-    df["volu_contraction"] = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
++    volu_contraction = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
++    df["volu_contraction"] = volu_contraction if not volume_missing else np.nan
+ 
+     ma20_tail = df["ma20"].tail(5)
+     slope = None
+     if len(ma20_tail.dropna()) >= 5:
+         x = np.arange(len(ma20_tail))
+         try:
+             slope = float(np.polyfit(x, ma20_tail.values, 1)[0])
+         except Exception:
+             slope = None
+ 
+     last = df.iloc[-1]
+     high20 = df["high"].tail(20).max()
+     features = {
+         "close": float(last["close"]),
+         "ma20": float(last["ma20"]),
+         "ma50": float(last["ma50"]),
+         "ma10": float(last["ma10"]),
+         "atr14": float(last["atr14"]),
+         "vol_contraction": float(last["vol_contraction"]),
+         "volu_contraction": float(last["volu_contraction"]),
+         "ma20_slope": slope,
+         "high20": float(high20),
+         "pullback_pct": _pct(high20 - last["close"], high20),
+         "tr_range_pct": float(last["tr_range_pct"]),
+         "trend_strength": float(last["close"] / last["ma50"] if last["ma50"] else math.inf),
++        "volume_missing": volume_missing,
+     }
+     return features
+ 
+ 
++def _is_missing(value: float | None) -> bool:
++    return value is None or (isinstance(value, float) and math.isnan(value))
++
++
+ def evaluate_setup(features: Dict[str, float], market: str) -> Tuple[bool, List[str]]:
+     reasons: List[str] = []
+     close = features.get("close")
+     ma20 = features.get("ma20")
+     ma50 = features.get("ma50")
+     pullback = features.get("pullback_pct")
+     vol_c = features.get("vol_contraction")
+     volu_c = features.get("volu_contraction")
+     slope = features.get("ma20_slope")
++    volume_missing = bool(features.get("volume_missing"))
+ 
++    if volume_missing:
++        reasons.append("volume_missing")
+     if close is None or ma20 is None or ma50 is None:
+         reasons.append("missing_ma")
+     else:
+         if not (close > ma20 and close > ma50):
+             reasons.append("close_below_ma")
+     if slope is None or slope <= 0:
+         reasons.append("ma20_slope_nonpos")
+ 
+     if pullback is None:
+         reasons.append("pullback_missing")
+     else:
+         low, high = (PB1_PULLBACK_BAND_KOSPI if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ)
+         if not (low <= pullback <= high):
+             reasons.append("pullback_out_of_band")
+ 
+-    if vol_c is None or vol_c > PB1_VOL_CONTRACTION_MAX:
++    if _is_missing(vol_c) or vol_c > PB1_VOL_CONTRACTION_MAX:
+         reasons.append("vol_contraction_fail")
+-    if volu_c is None or volu_c > PB1_VOLU_CONTRACTION_MAX:
++    if not volume_missing and (_is_missing(volu_c) or volu_c > PB1_VOLU_CONTRACTION_MAX):
+         reasons.append("volu_contraction_fail")
+ 
+     return (len(reasons) == 0, reasons)
+ 
+ 
+ def choose_mode(features: Dict[str, float]) -> Tuple[int, List[str]]:
+     reasons: List[str] = []
+     trend = features.get("trend_strength") or 0
+     vol_c = features.get("vol_contraction") or 0
+     volu_c = features.get("volu_contraction") or 0
+     if trend >= PB1_SWING_TREND_MIN and vol_c <= PB1_SWING_VOL_CONTRACTION_MAX and volu_c <= PB1_SWING_VOLU_CONTRACTION_MAX:
+         reasons.append("swing_conditions_met")
+         return 2, reasons
+     reasons.append("default_day_mode")
+     return 1, reasons
+ 
+ 
+ @dataclass
+ class OrderIntent:
+     code: str
+     market: str
+     sid: int
+     mode: int
+     qty: int
+     price: float
+diff --git a/trader/utils/ohlcv.py b/trader/utils/ohlcv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..53eea523162352012f3d66a7f0fdd53cd760bad1
+--- /dev/null
++++ b/trader/utils/ohlcv.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++from typing import Any, Dict, List, Tuple
++
++import numpy as np
++import pandas as pd
++
++
++def _match_column(columns_lower: List[str], candidates: List[str]) -> str | None:
++    for cand in candidates:
++        if cand.lower() in columns_lower:
++            return cand.lower()
++    return None
++
++
++def normalize_ohlcv(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
++    """
++    Normalize OHLCV columns to a standard schema.
++
++    Standard columns: date, open, high, low, close, volume
++    - volume is kept as NaN when missing (never filled with 0)
++    - numeric columns are coerced with errors='coerce'
++    - rows are sorted by date and de-duplicated on date (keep last)
++
++    Returns (df_norm, meta) where meta contains:
++      - volume_missing: bool
++      - source_cols: list of original columns
++      - mapped: mapping of detected source -> target
++    """
++
++    if df is None:
++        return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
++
++    df_copy = df.copy()
++    original_columns = [str(c) for c in df_copy.columns]
++    columns_lower = [c.strip().lower() for c in original_columns]
++    col_map: Dict[str, str] = {}
++
++    candidates: Dict[str, List[str]] = {
++        "date": [
++            "date",
++            "stck_bsop_date",
++            "tdd_clsp",
++            "bas_dt",
++            "날짜",
++        ],
++        "open": ["open", "stck_oprc", "oprc", "시가", "opn_prc"],
++        "high": ["high", "stck_hgpr", "hgpr", "고가"],
++        "low": ["low", "stck_lwpr", "lwpr", "저가"],
++        "close": ["close", "stck_clpr", "clpr", "tp", "종가"],
++        "volume": [
++            "volume",
++            "vol",
++            "acml_vol",
++            "acc_vol",
++            "trade_volume",
++            "거래량",
++            "stck_vol",
++            "acml_tr_pbmn",
++            "stck_trqu",
++            "volume(주)",
++            "volume ",
++        ],
++    }
++
++    for target, cand_list in candidates.items():
++        matched = _match_column(columns_lower, cand_list)
++        if matched:
++            col_map[matched] = target
++
++    df_copy.columns = columns_lower
++    mapped: Dict[str, str] = {}
++    for src, dst in col_map.items():
++        if src in df_copy.columns:
++            mapped[src] = dst
++    df_norm = df_copy.rename(columns=mapped)
++
++    for col in ["open", "high", "low", "close", "volume"]:
++        if col not in df_norm.columns:
++            df_norm[col] = np.nan
++        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
++
++    if "date" in df_norm.columns:
++        df_norm["date"] = pd.to_datetime(df_norm["date"], errors="coerce")
++        df_norm = df_norm.dropna(subset=["date"])
++
++    df_norm = df_norm.sort_values("date").drop_duplicates("date", keep="last")
++
++    mapped_targets = set(mapped.values())
++    volume_missing = bool("volume" not in mapped_targets or df_norm["volume"].isna().all())
++    meta = {
++        "volume_missing": volume_missing,
++        "source_cols": original_columns,
++        "mapped": {dst: src for src, dst in mapped.items()},
++    }
++
++    return df_norm, meta

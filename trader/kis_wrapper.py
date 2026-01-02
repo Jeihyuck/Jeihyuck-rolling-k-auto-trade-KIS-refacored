@@ -1081,17 +1081,21 @@ class KisAPI:
 
         raw_fields = {
             "ord_psbl_cash": row.get("ord_psbl_cash"),
+            "ord_psbl_amt": row.get("ord_psbl_amt"),
             "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
             "dnca_tot_amt": row.get("dnca_tot_amt"),
         }
         selected_key = None
         cash = 0
-        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
+        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
             if key in row:
                 selected_key = key
                 cash = _to_int(row.get(key))
                 break
         clamp_applied = False
+        if cash < 0:
+            cash = 0
+            clamp_applied = True
         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
 
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:

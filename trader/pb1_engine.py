@@ -27,6 +27,7 @@ from trader.kis_wrapper import KisAPI
 from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
 from trader.ledger.store import LedgerStore
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+from trader.utils.ohlcv import normalize_ohlcv
 from trader.time_utils import now_kst
 from trader.window_router import WindowDecision, resolve_phase
 from trader.botstate_sync import persist_run_files
@@ -88,44 +89,22 @@ class PB1Engine:
             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
         )
 
-    def _fetch_daily(self, code: str, count: int = 120) -> pd.DataFrame:
+    def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
         if not self.kis:
-            return pd.DataFrame()
+            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
         try:
             candles = self.kis.safe_get_daily_candles(code, count=count)
         except Exception:
             logger.exception("[PB1][DATA][FAIL] code=%s", code)
-            return pd.DataFrame()
+            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
         if not candles:
-            return pd.DataFrame()
+            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
         df = pd.DataFrame(candles).copy()
         if df.empty:
-            return df
+            return df, {"volume_missing": True, "source_cols": [], "mapped": {}}
 
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        rename_map = {
-            "stck_clpr": "close",
-            "stck_hgpr": "high",
-            "stck_lwpr": "low",
-            "stck_trqu": "volume",
-            "stck_bsop_date": "date",
-            "거래량": "volume",
-            "acml_vol": "volume",
-            "acc_vol": "volume",
-            "vol": "volume",
-            "volume(주)": "volume",
-            "volume ": "volume",
-        }
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-        if "volume" not in df.columns:
-            logger.warning("[PB1][DAILY] missing volume code=%s cols=%s -> fill 0", code, list(df.columns))
-            df["volume"] = 0.0
-
-        for col in ["close", "high", "low", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        return df
+        df_norm, meta = normalize_ohlcv(df)
+        return df_norm, meta
 
     def _build_universe(self) -> Dict[str, List[Dict]]:
         """
@@ -153,7 +132,7 @@ class PB1Engine:
             for row in rows or []:
                 code = str(row.get("code") or row.get("pdno") or "").zfill(6)
                 try:
-                    df = self._fetch_daily(code, count=120)
+                    df, meta = self._fetch_daily(code, count=120)
                     if df.empty:
                         cf = CandidateFeature(
                             code=code,
@@ -169,9 +148,17 @@ class PB1Engine:
                         continue
                     features = compute_features(df)
                     features["market"] = market
+                    features["volume_missing"] = bool(meta.get("volume_missing"))
+                    if features.get("volume_missing"):
+                        features["volu_contraction"] = None
                     ok, reasons = evaluate_setup(features, market)
-                    if not reasons:
-                        reasons = ["missing_reason"]
+                    if features.get("volume_missing") and "volume_missing" not in reasons:
+                        reasons.append("volume_missing")
+                        ok = False
+                    if ok:
+                        reasons = []
+                    elif not reasons:
+                        reasons = ["unspecified_fail"]
                     mode, mode_reasons = choose_mode(features)
                     cf = CandidateFeature(
                         code=code,
@@ -510,10 +497,19 @@ class PB1Engine:
             candidates = self._compute_candidates(selected)
             candidates = self._size_positions(candidates)
             if self.phase == "entry" and self.window.name == "afternoon":
+                orderable_cash = self.kis.get_cash_balance() if self.kis else 0
+                if orderable_cash < 0:
+                    orderable_cash = 0
+                cash_block_logged = False
                 for cf in candidates:
                     if not cf.setup_ok:
                         continue
                     if self._should_block_order(cf.client_order_key):
+                        continue
+                    if orderable_cash <= 0:
+                        if not cash_block_logged:
+                            logger.info("[PB1][CASH-BLOCK] orderable=%s reason=insufficient_cash", orderable_cash)
+                            cash_block_logged = True
                         continue
                     if not entry_allowed:
                         continue
@@ -522,7 +518,7 @@ class PB1Engine:
         elif self.phase in {"exit", "verify"}:
             pos_list = self._positions_with_meta(positions)
             for pos in pos_list:
-                df = self._fetch_daily(pos["code"], count=120)
+                df, _ = self._fetch_daily(pos["code"], count=120)
                 if df.empty:
                     err = new_error(
                         code=pos["code"],
@@ -543,7 +539,7 @@ class PB1Engine:
         if self.phase == "entry" and self.window.name == "afternoon":
             pos_list = self._positions_with_meta(positions)
             for pos in pos_list:
-                df = self._fetch_daily(pos["code"], count=120)
+                df, _ = self._fetch_daily(pos["code"], count=120)
                 if df.empty:
                     continue
                 features = compute_features(df)
