@@ -26,6 +26,8 @@ def test_diagnostic_window_skips_universe(monkeypatch, tmp_path):
         dry_run=True,
         env="paper",
         run_id="test-run",
+        order_mode="dry_run",
+        diag_level=1,
     )
 
     called = {"build": False}

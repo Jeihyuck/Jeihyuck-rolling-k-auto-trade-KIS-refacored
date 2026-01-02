@@ -498,6 +498,62 @@ class KisAPI:
                 hi = mid - 1
         return lo
 
+    def get_orderable_qty(self, code: str) -> int:
+        """보유/주문가능 수량 조회 (음수 방지)."""
+        try:
+            balance_map = self.get_balance_map()
+            qty = int(balance_map.get(safe_strip(code), 0))
+            return max(0, qty)
+        except Exception:
+            logger.exception("[ORDERABLE_QTY][FAIL] code=%s", code)
+            return 0
+
+    def validate_buy(self, code: str, qty: int, price: float | None) -> Tuple[bool, str]:
+        """섀도우 모드용 매수 사전검증."""
+        try:
+            qty_int = int(qty)
+        except Exception:
+            qty_int = 0
+        if qty_int <= 0:
+            return False, "qty_invalid"
+        try:
+            if price is None or float(price) <= 0:
+                return False, "price_invalid"
+        except Exception:
+            return False, "price_invalid"
+        try:
+            cash, _meta = self.get_orderable_cash(code, price)
+        except Exception:
+            cash = 0
+        est_cost = self._estimate_buy_cost(price or 0.0, qty_int)
+        if est_cost <= 0:
+            return False, "cost_invalid"
+        if cash <= 0:
+            return False, "cash_empty"
+        if est_cost > cash:
+            return False, "insufficient_cash"
+        return True, "ok"
+
+    def validate_sell(self, code: str, qty: int, price: float | None) -> Tuple[bool, str]:
+        """섀도우 모드용 매도 사전검증."""
+        try:
+            qty_int = int(qty)
+        except Exception:
+            qty_int = 0
+        if qty_int <= 0:
+            return False, "qty_invalid"
+        try:
+            if price is None or float(price) <= 0:
+                return False, "price_invalid"
+        except Exception:
+            return False, "price_invalid"
+        orderable_qty = self.get_orderable_qty(code)
+        if orderable_qty <= 0:
+            return False, "orderable_qty_zero"
+        if qty_int > orderable_qty:
+            return False, "qty_exceeds_available"
+        return True, "ok"
+
     # === 시세 ===
     def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Optional[float]:
         """단일 TR/마켓/코드 조합으로 현재가 1회 조회(성공시 float 반환, 실패/0원시 None)."""
