@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-01-02T14:10:24.762627+09:00",
+  "updated_at": "2026-01-02T14:37:07.650247+09:00",
   "positions": {
     "000660": {
       "code": "000660",
@@ -19,13 +19,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 1,
       "avg_price": 591517.857,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -73,13 +74,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 262,
       "avg_price": 37600.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -175,13 +177,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 210,
       "avg_price": 23403.171,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -282,13 +285,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 10,
       "avg_price": 461340.573,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -455,13 +459,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 64,
       "avg_price": 242082.417,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -509,13 +514,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 291,
       "avg_price": 53751.084,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -563,13 +569,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 32,
       "avg_price": 233720.707,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -640,13 +647,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 22,
       "avg_price": 58100.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -691,13 +699,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 136,
       "avg_price": 143934.02,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -745,13 +754,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 339,
       "avg_price": 58019.047,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -799,13 +809,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 272,
       "avg_price": 93458.762,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -904,13 +915,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 42,
       "avg_price": 233500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -958,13 +970,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 128,
       "avg_price": 49756.967,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1063,13 +1076,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 157,
       "avg_price": 62500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1117,13 +1131,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 210,
       "avg_price": 27963.169,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "UNKNOWN": {
@@ -1219,13 +1234,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 1,
       "avg_price": 310500.0,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1326,13 +1342,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 65,
       "avg_price": 390027.173,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1380,13 +1397,14 @@
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING",
+          "UNMANAGED_HOLDING",
           "UNMANAGED_HOLDING"
         ]
       },
       "qty": 14,
       "avg_price": 101202.898,
       "last_action": "RECONCILE",
-      "updated_at": "2026-01-02T14:10:24.761052+09:00",
+      "updated_at": "2026-01-02T14:37:07.645829+09:00",
       "opened_at": "2025-12-29T09:23:22.996027+09:00",
       "strategies": {
         "ORPHAN": {
@@ -1428,8 +1446,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 15,
-      "remaining_qty": 15,
+      "qty": 1,
+      "remaining_qty": 1,
       "entry_price": 591517.857,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1448,29 +1466,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 746,
-      "remaining_qty": 746,
+      "qty": 262,
+      "remaining_qty": 262,
       "entry_price": 37600.0,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-005380-20251229T092322.996027+0900",
-      "code": "005380",
-      "pdno": "005380",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 61,
-      "remaining_qty": 61,
-      "entry_price": 290975.409,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1488,29 +1486,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 599,
-      "remaining_qty": 599,
+      "qty": 210,
+      "remaining_qty": 210,
       "entry_price": 23403.171,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-009540-20251229T092322.996027+0900",
-      "code": "009540",
-      "pdno": "009540",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 86,
-      "remaining_qty": 86,
-      "entry_price": 414703.488,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1528,89 +1506,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 77,
-      "remaining_qty": 77,
+      "qty": 10,
+      "remaining_qty": 10,
       "entry_price": 461340.573,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-010130-20251229T092322.996027+0900",
-      "code": "010130",
-      "pdno": "010130",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 26,
-      "remaining_qty": 26,
-      "entry_price": 1321769.23,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-012330-20251229T092322.996027+0900",
-      "code": "012330",
-      "pdno": "012330",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 49,
-      "remaining_qty": 49,
-      "entry_price": 365096.365,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-012450-20251229T092322.996027+0900",
-      "code": "012450",
-      "pdno": "012450",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 9,
-      "remaining_qty": 9,
-      "entry_price": 884613.333,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-015760-20251229T092322.996027+0900",
-      "code": "015760",
-      "pdno": "015760",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 752,
-      "remaining_qty": 752,
-      "entry_price": 48278.588,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1628,8 +1526,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 91,
-      "remaining_qty": 91,
+      "qty": 64,
+      "remaining_qty": 64,
       "entry_price": 242082.417,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1648,8 +1546,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 415,
-      "remaining_qty": 415,
+      "qty": 291,
+      "remaining_qty": 291,
       "entry_price": 53751.084,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1668,8 +1566,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 213,
-      "remaining_qty": 213,
+      "qty": 32,
+      "remaining_qty": 32,
       "entry_price": 233720.707,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1688,8 +1586,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 241,
-      "remaining_qty": 241,
+      "qty": 22,
+      "remaining_qty": 22,
       "entry_price": 58100.0,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1708,8 +1606,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 194,
-      "remaining_qty": 194,
+      "qty": 136,
+      "remaining_qty": 136,
       "entry_price": 143934.02,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1728,8 +1626,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 483,
-      "remaining_qty": 483,
+      "qty": 339,
+      "remaining_qty": 339,
       "entry_price": 58019.047,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1748,49 +1646,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 388,
-      "remaining_qty": 388,
+      "qty": 272,
+      "remaining_qty": 272,
       "entry_price": 93458.762,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-098460-20251229T092322.996027+0900",
-      "code": "098460",
-      "pdno": "098460",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 1204,
-      "remaining_qty": 1204,
-      "entry_price": 23324.75,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-108490-20251229T092322.996027+0900",
-      "code": "108490",
-      "pdno": "108490",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 53,
-      "remaining_qty": 53,
-      "entry_price": 264500.0,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1808,29 +1666,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 60,
-      "remaining_qty": 60,
+      "qty": 42,
+      "remaining_qty": 42,
       "entry_price": 233500.0,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-160190-20251229T092322.996027+0900",
-      "code": "160190",
-      "pdno": "160190",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 717,
-      "remaining_qty": 717,
-      "entry_price": 58478.521,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1848,89 +1686,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 366,
-      "remaining_qty": 366,
+      "qty": 128,
+      "remaining_qty": 128,
       "entry_price": 49756.967,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-226950-20251229T092322.996027+0900",
-      "code": "226950",
-      "pdno": "226950",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 52,
-      "remaining_qty": 52,
-      "entry_price": 134541.826,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-237690-20251229T092322.996027+0900",
-      "code": "237690",
-      "pdno": "237690",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 112,
-      "remaining_qty": 112,
-      "entry_price": 125100.892,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-247540-20251229T092322.996027+0900",
-      "code": "247540",
-      "pdno": "247540",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 265,
-      "remaining_qty": 265,
-      "entry_price": 157924.528,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-267250-20251229T092322.996027+0900",
-      "code": "267250",
-      "pdno": "267250",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 114,
-      "remaining_qty": 114,
-      "entry_price": 193446.491,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -1948,8 +1706,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 224,
-      "remaining_qty": 224,
+      "qty": 157,
+      "remaining_qty": 157,
       "entry_price": 62500.0,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -1968,29 +1726,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 300,
-      "remaining_qty": 300,
+      "qty": 210,
+      "remaining_qty": 210,
       "entry_price": 27963.169,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-347850-20251229T092322.996027+0900",
-      "code": "347850",
-      "pdno": "347850",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 292,
-      "remaining_qty": 292,
-      "entry_price": 95850.0,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -2008,29 +1746,9 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 13,
-      "remaining_qty": 13,
+      "qty": 1,
+      "remaining_qty": 1,
       "entry_price": 310500.0,
-      "entry_ts": "2025-12-29T09:23:22.996027+09:00",
-      "status": "OPEN",
-      "source": "reconcile_kis_balance",
-      "created_at": "2025-12-29T09:23:22.996027+09:00",
-      "updated_at": "2025-12-29T09:23:22.996027+09:00",
-      "notes": [
-        "MISSING_IN_STATE"
-      ]
-    },
-    {
-      "lot_id": "ORPHAN-357780-20251229T092322.996027+0900",
-      "code": "357780",
-      "pdno": "357780",
-      "sid": "ORPHAN",
-      "strategy_id": "ORPHAN",
-      "strategy": "ORPHAN",
-      "engine": "reconcile_kis_balance",
-      "qty": 107,
-      "remaining_qty": 107,
-      "entry_price": 259436.915,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
       "source": "reconcile_kis_balance",
@@ -2048,8 +1766,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 92,
-      "remaining_qty": 92,
+      "qty": 65,
+      "remaining_qty": 65,
       "entry_price": 390027.173,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
@@ -2068,8 +1786,8 @@
       "strategy_id": "ORPHAN",
       "strategy": "ORPHAN",
       "engine": "reconcile_kis_balance",
-      "qty": 145,
-      "remaining_qty": 145,
+      "qty": 14,
+      "remaining_qty": 14,
       "entry_price": 101202.898,
       "entry_ts": "2025-12-29T09:23:22.996027+09:00",
       "status": "OPEN",
