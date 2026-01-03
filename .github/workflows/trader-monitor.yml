@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [ main ]
   schedule:
-    # KST 08:57 = UTC 23:57 (daily)
     - cron: "57 23 * * 0-6"
   workflow_dispatch:
 
@@ -19,77 +18,39 @@ permissions:
 
 jobs:
   pb1:
-    # 절대 PR에서는 거래/상태커밋 돌리지 않음 (secrets 미주입/권한 제한 케이스 방지)
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}"
     runs-on: ubuntu-latest
 
     env:
-      # --- Secrets mapping ---
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
-      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+      # --- Secrets mapping (QUOTE IMPORTANT) ---
+      KIS_APP_KEY: "${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}"
+      KIS_APP_SECRET: "${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}"
+      APP_KEY: "${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}"
+      APP_SECRET: "${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}"
+      CANO: "${{ secrets.CANO }}"
+      ACNT_PRDT_CD: "${{ secrets.ACNT_PRDT_CD }}"
+      KIS_ENV: "${{ secrets.KIS_ENV }}"
+      API_BASE_URL: "${{ secrets.API_BASE_URL }}"
 
-      # --- Bot-state / ledger ---
+      # --- PB1 live controls ---
       BOTSTATE_BRANCH: "bot-state"
       BOTSTATE_WORKTREE_DIR: "_botstate"
-      BOTSTATE_LOCK_TTL_SEC: "1800"
-      LEDGER_BASE_DIR: "bot_state/trader_ledger"
-      LEDGER_LOOKBACK_DAYS: "120"
-      STATE_RECONCILE_APPLY: "1"
-
-      # --- Market windows / waiting ---
-      MORNING_WINDOW_START: "08:50"
-      MORNING_WINDOW_END: "11:00"
-      MORNING_EXIT_START: "09:00"
-      MORNING_EXIT_END: "09:20"
-      AFTERNOON_WINDOW_START: "14:00"
-      AFTERNOON_WINDOW_END: "15:30"
-      CLOSE_AUCTION_START: "15:20"
-      CLOSE_AUCTION_END: "15:30"
-      MARKET_OPEN_HHMM: "08:50"
-      MARKET_CLOSE_HHMM: "15:30"
-      PB1_WAIT_FOR_WINDOW: "1"
-      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-
-      # --- PB1 live controls (one-shot decides diag vs live automatically) ---
       DISABLE_LIVE_TRADING: "0"
       LIVE_TRADING_ENABLED: "1"
       DRY_RUN: "0"
       STRATEGY_MODE: "LIVE"
       PB1_ENTRY_ENABLED: "1"
-
-      # (원하면 켜서 “장중엔 shadow-live로 점검” 가능; 비거래일엔 어차피 diag로 내려감)
       PB1_DIAG_LEVEL: "2"
       PB1_SHADOW_LIVE: "1"
 
-      # --- Strategy parameters (visibility 유지) ---
-      PARTIAL1: "0.5"
-      PARTIAL2: "0.3"
-      TRAIL_PCT: "0.02"
-      FAST_STOP: "0.01"
-      ATR_STOP: "1.5"
-      TIME_STOP_HHMM: "13:00"
-      SELL_FORCE_TIME: "14:40"
-      SELL_ALL_BALANCES_AT_CUTOFF: "false"
-      FORCE_SELL_PASSES_CUTOFF: "2"
-      FORCE_SELL_PASSES_CLOSE: "4"
-      DEFAULT_PROFIT_PCT: "3.0"
-      DEFAULT_LOSS_PCT: "5.0"
-      SLIPPAGE_LIMIT_PCT: "0.25"
-      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+      # --- Windows / wait ---
+      PB1_WAIT_FOR_WINDOW: "1"
+      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+      MARKET_OPEN_HHMM: "08:50"
+      MARKET_CLOSE_HHMM: "15:30"
+
+      # --- Strategy params (optional) ---
       VWAP_TOL: "0.003"
-      W_MAX_ONE: "0.25"
-      W_MIN_ONE: "0.03"
-      REBALANCE_ANCHOR: "weekly"
-      FORCE_WEEKLY_REBALANCE: "0"
-      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
-      KOSDAQ_INDEX_CODE: "KOSDAQ"
-      KOSDAQ_ETF_FALLBACK: "229200"
       DAILY_CAPITAL: "250000000"
       API_RATE_SLEEP_SEC: "0.3"
 
@@ -144,3 +105,4 @@ jobs:
             _botstate/trader/state/state.json
           if-no-files-found: warn
           retention-days: 30
+
