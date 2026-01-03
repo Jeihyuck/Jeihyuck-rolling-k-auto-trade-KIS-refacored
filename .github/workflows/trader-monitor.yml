@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   pb1:
+    # 절대 PR에서는 거래/상태커밋 돌리지 않음 (secrets 미주입/권한 제한 케이스 방지)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     env:
@@ -32,18 +34,40 @@ jobs:
       KIS_ENV: ${{ secrets.KIS_ENV }}
       API_BASE_URL: ${{ secrets.API_BASE_URL }}
 
-      # --- PB1 live controls ---
+      # --- Bot-state / ledger ---
       BOTSTATE_BRANCH: "bot-state"
       BOTSTATE_WORKTREE_DIR: "_botstate"
+      BOTSTATE_LOCK_TTL_SEC: "1800"
+      LEDGER_BASE_DIR: "bot_state/trader_ledger"
+      LEDGER_LOOKBACK_DAYS: "120"
+      STATE_RECONCILE_APPLY: "1"
+
+      # --- Market windows / waiting ---
+      MORNING_WINDOW_START: "08:50"
+      MORNING_WINDOW_END: "11:00"
+      MORNING_EXIT_START: "09:00"
+      MORNING_EXIT_END: "09:20"
+      AFTERNOON_WINDOW_START: "14:00"
+      AFTERNOON_WINDOW_END: "15:30"
+      CLOSE_AUCTION_START: "15:20"
+      CLOSE_AUCTION_END: "15:30"
+      MARKET_OPEN_HHMM: "08:50"
+      MARKET_CLOSE_HHMM: "15:30"
+      PB1_WAIT_FOR_WINDOW: "1"
+      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+
+      # --- PB1 live controls (one-shot decides diag vs live automatically) ---
       DISABLE_LIVE_TRADING: "0"
       LIVE_TRADING_ENABLED: "1"
       DRY_RUN: "0"
       STRATEGY_MODE: "LIVE"
       PB1_ENTRY_ENABLED: "1"
+
+      # (원하면 켜서 “장중엔 shadow-live로 점검” 가능; 비거래일엔 어차피 diag로 내려감)
       PB1_DIAG_LEVEL: "2"
       PB1_SHADOW_LIVE: "1"
 
-      # --- Strategy parameters (kept for visibility) ---
+      # --- Strategy parameters (visibility 유지) ---
       PARTIAL1: "0.5"
       PARTIAL2: "0.3"
       TRAIL_PCT: "0.02"
@@ -84,48 +108,33 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: (Guard) enforce safe events and required secrets
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "Pull request event detected - trading steps are skipped."
-            exit 0
-          fi
-
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "Non-main ref (${GITHUB_REF}) - trading is limited to main."
-            exit 0
-          fi
-
-          missing=()
-          for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
-            val="${!key}"
-            if [ -z "${val}" ]; then
-              missing+=("$key")
-            fi
-          done
-
-          if [ ${#missing[@]} -gt 0 ]; then
-            echo "Missing required secrets/env for main: ${missing[*]}"
-            exit 1
-          fi
-
-          echo "Event and secrets validated for trading run."
-
       - name: Install dependencies
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: PB1 one-shot run (auto: diag or live)
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - name: (Guard) required secrets present
+        run: |
+          missing=()
+          for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
+            if [ -z "${!key}" ]; then
+              missing+=("$key")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "Secrets OK. Continue."
+
+      - name: PB1 one-shot run (auto: wait -> live, or diag)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+          python -m trader.pb1_runner --window auto --phase auto --target-branch "${BOTSTATE_BRANCH}"
 
-      - name: Upload PB1 logs & ledger & state
-        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - name: Upload PB1 artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pb1-artifacts
@@ -133,6 +142,5 @@ jobs:
             trader/logs/**
             _botstate/bot_state/trader_ledger/**
             _botstate/trader/state/state.json
-            fastapi.log
           if-no-files-found: warn
           retention-days: 30

@@ -1,357 +1,181 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-deleted file mode 100644
-index 2b55af49a0d032fd9dbdc2edf1855e504df6d33c..0000000000000000000000000000000000000000
---- a/.github/workflows/trade-runner.yml
-+++ /dev/null
-@@ -1,207 +0,0 @@
--name: PB1 Trade Runner
--
--permissions:
--  contents: write
--
--concurrency:
--  group: trade-bot-state
--  cancel-in-progress: false
--
--on:
--  push:
--    branches: [ main, nullim, trader_r1 ]
--    paths-ignore:
--      - "bot_state/**"
--  workflow_dispatch:
--  schedule:
--    # =========================
--    # Weekdays (KST Mon-Fri) : run only during market hours (08:50~15:30 KST), every 5 min
--    # KST 08:50~08:55  => UTC 23:50~23:55 (previous UTC day)  [Sun~Thu UTC]
--    - cron: "50-59/5 23 * * 0-4"
--    # KST 09:00~14:55  => UTC 00:00~05:55 (same UTC day)      [Mon~Fri UTC]
--    - cron: "*/5 0-5 * * 1-5"
--    # KST 15:00~15:30  => UTC 06:00~06:30 (same UTC day)      [Mon~Fri UTC]
--    - cron: "0-30/5 6 * * 1-5"
--
--    # =========================
--    # Weekend (KST Sat-Sun) : DIAG every 5 min for the entire weekend day (00:00~23:55 KST)
--    # KST Sat 00:00~08:55 => UTC Fri 15:00~23:55
--    - cron: "*/5 15-23 * * 5"
--    # KST Sat 09:00~Sun 08:55 => UTC Sat 00:00~23:55 (covers full UTC Saturday)
--    - cron: "*/5 * * * 6"
--    # KST Sun 09:00~23:55 => UTC Sun 00:00~14:55
--    - cron: "*/5 0-14 * * 0"
--
--jobs:
--  run-trade:
--    if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
--    runs-on: ubuntu-latest
--    # Note: cancel-in-progress=false relies on lock file; timeout increased to allow pre-open waits.
--    timeout-minutes: 360
--    env:
--      BOTSTATE_BRANCH: bot-state
--      BOTSTATE_WORKTREE_DIR: "_botstate"
--      STRATEGY_MODE: "LIVE"
--      LIVE_TRADING_ENABLED: "1"
--      DISABLE_LIVE_TRADING: "0"
--      DRY_RUN: "0"
--      EXPECT_LIVE_TRADING: "1"
--      EXPECT_KIS_ENV: "practice"
--      PB1_ENTRY_ENABLED: "1"
--      PB1_SKIP_UNIVERSE_IN_DIAG: "1"
--      KIS_ENV: "practice"
--      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
--      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
--      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
--      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
--      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
--      CANO: ${{ secrets.CANO }}
--      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
--      STATE_RECONCILE_APPLY: "1"
--      MORNING_WINDOW_START: "08:50"
--      MORNING_WINDOW_END: "11:00"
--      MORNING_EXIT_START: "09:00"
--      MORNING_EXIT_END: "09:20"
--      AFTERNOON_WINDOW_START: "14:00"
--      AFTERNOON_WINDOW_END: "15:30"
--      CLOSE_AUCTION_START: "15:20"
--      CLOSE_AUCTION_END: "15:30"
--      MARKET_OPEN_HHMM: "08:50"
--      MARKET_CLOSE_HHMM: "15:30"
--      PB1_WAIT_FOR_WINDOW: "1"
--      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
--      LEDGER_BASE_DIR: "bot_state/trader_ledger"
--      LEDGER_LOOKBACK_DAYS: "120"
--      BOTSTATE_LOCK_TTL_SEC: "1800"
--      PYTHONUNBUFFERED: "1"
--    steps:
--      - uses: actions/checkout@v4
--        with:
--          fetch-depth: 0
--          persist-credentials: true
--          token: ${{ secrets.GITHUB_TOKEN }}
--
--      - name: Configure git identity for bot-state
--        run: |
--          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
--          git config --global user.name "${ACTOR}"
--          git config --global user.email "${ACTOR}@users.noreply.github.com"
--          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--
--      - uses: actions/setup-python@v5
--        with:
--          python-version: "3.11"
--
--      - name: Install dependencies
--        run: |
--          python -m pip install --upgrade pip
--          pip install -r requirements.txt
--
--      - name: Compile modules
--        run: |
--          python -m compileall trader
--
--      - name: Run PB1 only
--        env:
--          PYTHONPATH: ${{ github.workspace }}
--        run: |
--          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
--
--  diag-level1:
--    if: github.event_name == 'push'
--    runs-on: ubuntu-latest
--    timeout-minutes: 60
--    env:
--      PB1_DIAG_LEVEL: "1"
--      PB1_SHADOW_LIVE: "0"
--      BOTSTATE_BRANCH: bot-state
--      BOTSTATE_WORKTREE_DIR: "_botstate"
--      STRATEGY_MODE: "INTENT_ONLY"
--      LIVE_TRADING_ENABLED: "0"
--      DISABLE_LIVE_TRADING: "1"
--      DRY_RUN: "1"
--      PB1_ENTRY_ENABLED: "0"
--      PB1_SKIP_UNIVERSE_IN_DIAG: "1"
--      KIS_ENV: "practice"
--      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
--      APP_KEY: "dummy"
--      APP_SECRET: "dummy"
--      CANO: "00000000"
--      ACNT_PRDT_CD: "00"
--      PYTHONUNBUFFERED: "1"
--    steps:
--      - uses: actions/checkout@v4
--        with:
--          fetch-depth: 0
--      - name: Configure git identity for bot-state
--        run: |
--          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
--          git config --global user.name "${ACTOR}"
--          git config --global user.email "${ACTOR}@users.noreply.github.com"
--          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--      - uses: actions/setup-python@v5
--        with:
--          python-version: "3.11"
--      - name: Install dependencies
--        run: |
--          python -m pip install --upgrade pip
--          pip install -r requirements.txt
--      - name: Run PB1 diag level1
--        env:
--          PYTHONPATH: ${{ github.workspace }}
--        run: |
--          PB1_DIAG_LEVEL=1 PB1_SHADOW_LIVE=0 python -m trader.pb1_runner --window diagnostic --phase verify --target-branch ${BOTSTATE_BRANCH}
--
--  diag-level2-shadow:
--    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
--    runs-on: ubuntu-latest
--    timeout-minutes: 120
--    env:
--      PB1_DIAG_LEVEL: "2"
--      PB1_SHADOW_LIVE: "1"
--      BOTSTATE_BRANCH: bot-state
--      BOTSTATE_WORKTREE_DIR: "_botstate"
--      STRATEGY_MODE: "INTENT_ONLY"
--      LIVE_TRADING_ENABLED: "0"
--      DISABLE_LIVE_TRADING: "0"
--      DRY_RUN: "0"
--      PB1_ENTRY_ENABLED: "1"
--      PB1_SKIP_UNIVERSE_IN_DIAG: "0"
--      KIS_ENV: "practice"
--      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
--      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
--      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
--      CANO: ${{ secrets.CANO }}
--      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
--      PYTHONUNBUFFERED: "1"
--    steps:
--      - uses: actions/checkout@v4
--        with:
--          fetch-depth: 0
--      - name: Configure git identity for bot-state
--        run: |
--          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
--          git config --global user.name "${ACTOR}"
--          git config --global user.email "${ACTOR}@users.noreply.github.com"
--          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
--          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
--      - uses: actions/setup-python@v5
--        with:
--          python-version: "3.11"
--      - name: Install dependencies
--        run: |
--          python -m pip install --upgrade pip
--          pip install -r requirements.txt
--      - name: Run PB1 diag level2 shadow
--        env:
--          PYTHONPATH: ${{ github.workspace }}
--        run: |
--          PB1_DIAG_LEVEL=2 PB1_SHADOW_LIVE=1 python -m trader.pb1_runner --window diagnostic --phase verify --target-branch ${BOTSTATE_BRANCH}
 diff --git a/.github/workflows/trader-monitor.yml b/.github/workflows/trader-monitor.yml
-new file mode 100644
-index 0000000000000000000000000000000000000000..ff3df1d57fe67b386ba2086e6d46209cd6bff85d
---- /dev/null
+index ff3df1d57fe67b386ba2086e6d46209cd6bff85d..12c252808670c45345104f2a69dd819e71114c39 100644
+--- a/.github/workflows/trader-monitor.yml
 +++ b/.github/workflows/trader-monitor.yml
-@@ -0,0 +1,138 @@
-+name: Trade Monitor (PB1 One-Shot)
+@@ -1,138 +1,146 @@
+ name: Trade Monitor (PB1 One-Shot)
+ 
+ on:
+   push:
+     branches: [ main ]
+   pull_request:
+     branches: [ main ]
+   schedule:
+     # KST 08:57 = UTC 23:57 (daily)
+     - cron: "57 23 * * 0-6"
+   workflow_dispatch:
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: false
+ 
+ permissions:
+   contents: write
+ 
+ jobs:
+   pb1:
++    # 절대 PR에서는 거래/상태커밋 돌리지 않음 (secrets 미주입/권한 제한 케이스 방지)
++    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+     runs-on: ubuntu-latest
+ 
+     env:
+       # --- Secrets mapping ---
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       API_BASE_URL: ${{ secrets.API_BASE_URL }}
+ 
+-      # --- PB1 live controls ---
++      # --- Bot-state / ledger ---
+       BOTSTATE_BRANCH: "bot-state"
+       BOTSTATE_WORKTREE_DIR: "_botstate"
++      BOTSTATE_LOCK_TTL_SEC: "1800"
++      LEDGER_BASE_DIR: "bot_state/trader_ledger"
++      LEDGER_LOOKBACK_DAYS: "120"
++      STATE_RECONCILE_APPLY: "1"
 +
-+on:
-+  push:
-+    branches: [ main ]
-+  pull_request:
-+    branches: [ main ]
-+  schedule:
-+    # KST 08:57 = UTC 23:57 (daily)
-+    - cron: "57 23 * * 0-6"
-+  workflow_dispatch:
++      # --- Market windows / waiting ---
++      MORNING_WINDOW_START: "08:50"
++      MORNING_WINDOW_END: "11:00"
++      MORNING_EXIT_START: "09:00"
++      MORNING_EXIT_END: "09:20"
++      AFTERNOON_WINDOW_START: "14:00"
++      AFTERNOON_WINDOW_END: "15:30"
++      CLOSE_AUCTION_START: "15:20"
++      CLOSE_AUCTION_END: "15:30"
++      MARKET_OPEN_HHMM: "08:50"
++      MARKET_CLOSE_HHMM: "15:30"
++      PB1_WAIT_FOR_WINDOW: "1"
++      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
 +
-+concurrency:
-+  group: trade-bot-state
-+  cancel-in-progress: false
++      # --- PB1 live controls (one-shot decides diag vs live automatically) ---
+       DISABLE_LIVE_TRADING: "0"
+       LIVE_TRADING_ENABLED: "1"
+       DRY_RUN: "0"
+       STRATEGY_MODE: "LIVE"
+       PB1_ENTRY_ENABLED: "1"
 +
-+permissions:
-+  contents: write
-+
-+jobs:
-+  pb1:
-+    runs-on: ubuntu-latest
-+
-+    env:
-+      # --- Secrets mapping ---
-+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      CANO: ${{ secrets.CANO }}
-+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-+      KIS_ENV: ${{ secrets.KIS_ENV }}
-+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
-+
-+      # --- PB1 live controls ---
-+      BOTSTATE_BRANCH: "bot-state"
-+      BOTSTATE_WORKTREE_DIR: "_botstate"
-+      DISABLE_LIVE_TRADING: "0"
-+      LIVE_TRADING_ENABLED: "1"
-+      DRY_RUN: "0"
-+      STRATEGY_MODE: "LIVE"
-+      PB1_ENTRY_ENABLED: "1"
-+      PB1_DIAG_LEVEL: "2"
-+      PB1_SHADOW_LIVE: "1"
-+
-+      # --- Strategy parameters (kept for visibility) ---
-+      PARTIAL1: "0.5"
-+      PARTIAL2: "0.3"
-+      TRAIL_PCT: "0.02"
-+      FAST_STOP: "0.01"
-+      ATR_STOP: "1.5"
-+      TIME_STOP_HHMM: "13:00"
-+      SELL_FORCE_TIME: "14:40"
-+      SELL_ALL_BALANCES_AT_CUTOFF: "false"
-+      FORCE_SELL_PASSES_CUTOFF: "2"
-+      FORCE_SELL_PASSES_CLOSE: "4"
-+      DEFAULT_PROFIT_PCT: "3.0"
-+      DEFAULT_LOSS_PCT: "5.0"
-+      SLIPPAGE_LIMIT_PCT: "0.25"
-+      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
-+      VWAP_TOL: "0.003"
-+      W_MAX_ONE: "0.25"
-+      W_MIN_ONE: "0.03"
-+      REBALANCE_ANCHOR: "weekly"
-+      FORCE_WEEKLY_REBALANCE: "0"
-+      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
-+      KOSDAQ_INDEX_CODE: "KOSDAQ"
-+      KOSDAQ_ETF_FALLBACK: "229200"
-+      DAILY_CAPITAL: "250000000"
-+      API_RATE_SLEEP_SEC: "0.3"
-+
-+    steps:
-+      - uses: actions/checkout@v4
-+        with:
-+          fetch-depth: 0
-+          persist-credentials: true
-+
-+      - uses: actions/setup-python@v5
-+        with:
-+          python-version: "3.11"
-+
-+      - name: Configure git identity (required for botstate commits)
-+        run: |
-+          git config --global user.name "github-actions[bot]"
-+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-+
-+      - name: (Guard) enforce safe events and required secrets
-+        run: |
-+          if [ "${{ github.event_name }}" = "pull_request" ]; then
-+            echo "Pull request event detected - trading steps are skipped."
-+            exit 0
-+          fi
-+
-+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-+            echo "Non-main ref (${GITHUB_REF}) - trading is limited to main."
-+            exit 0
-+          fi
-+
-+          missing=()
-+          for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
-+            val="${!key}"
-+            if [ -z "${val}" ]; then
-+              missing+=("$key")
-+            fi
-+          done
-+
-+          if [ ${#missing[@]} -gt 0 ]; then
-+            echo "Missing required secrets/env for main: ${missing[*]}"
-+            exit 1
-+          fi
-+
-+          echo "Event and secrets validated for trading run."
-+
++      # (원하면 켜서 “장중엔 shadow-live로 점검” 가능; 비거래일엔 어차피 diag로 내려감)
+       PB1_DIAG_LEVEL: "2"
+       PB1_SHADOW_LIVE: "1"
+ 
+-      # --- Strategy parameters (kept for visibility) ---
++      # --- Strategy parameters (visibility 유지) ---
+       PARTIAL1: "0.5"
+       PARTIAL2: "0.3"
+       TRAIL_PCT: "0.02"
+       FAST_STOP: "0.01"
+       ATR_STOP: "1.5"
+       TIME_STOP_HHMM: "13:00"
+       SELL_FORCE_TIME: "14:40"
+       SELL_ALL_BALANCES_AT_CUTOFF: "false"
+       FORCE_SELL_PASSES_CUTOFF: "2"
+       FORCE_SELL_PASSES_CLOSE: "4"
+       DEFAULT_PROFIT_PCT: "3.0"
+       DEFAULT_LOSS_PCT: "5.0"
+       SLIPPAGE_LIMIT_PCT: "0.25"
+       SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+       VWAP_TOL: "0.003"
+       W_MAX_ONE: "0.25"
+       W_MIN_ONE: "0.03"
+       REBALANCE_ANCHOR: "weekly"
+       FORCE_WEEKLY_REBALANCE: "0"
+       MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+       KOSDAQ_INDEX_CODE: "KOSDAQ"
+       KOSDAQ_ETF_FALLBACK: "229200"
+       DAILY_CAPITAL: "250000000"
+       API_RATE_SLEEP_SEC: "0.3"
+ 
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Configure git identity (required for botstate commits)
+         run: |
+           git config --global user.name "github-actions[bot]"
+           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+ 
+-      - name: (Guard) enforce safe events and required secrets
 +      - name: Install dependencies
-+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-+        run: |
+         run: |
+-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+-            echo "Pull request event detected - trading steps are skipped."
+-            exit 0
+-          fi
+-
+-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+-            echo "Non-main ref (${GITHUB_REF}) - trading is limited to main."
+-            exit 0
+-          fi
 +          python -m pip install --upgrade pip
 +          pip install -r requirements.txt
-+
-+      - name: PB1 one-shot run (auto: diag or live)
-+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
+ 
++      - name: (Guard) required secrets present
 +        run: |
-+          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
-+
-+      - name: Upload PB1 logs & ledger & state
-+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-+        uses: actions/upload-artifact@v4
-+        with:
-+          name: pb1-artifacts
-+          path: |
-+            trader/logs/**
-+            _botstate/bot_state/trader_ledger/**
-+            _botstate/trader/state/state.json
-+            fastapi.log
-+          if-no-files-found: warn
-+          retention-days: 30
+           missing=()
+           for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
+-            val="${!key}"
+-            if [ -z "${val}" ]; then
++            if [ -z "${!key}" ]; then
+               missing+=("$key")
+             fi
+           done
+-
+           if [ ${#missing[@]} -gt 0 ]; then
+-            echo "Missing required secrets/env for main: ${missing[*]}"
++            echo "Missing required secrets: ${missing[*]}"
+             exit 1
+           fi
++          echo "Secrets OK. Continue."
+ 
+-          echo "Event and secrets validated for trading run."
+-
+-      - name: Install dependencies
+-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: PB1 one-shot run (auto: diag or live)
+-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
++      - name: PB1 one-shot run (auto: wait -> live, or diag)
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+-          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
++          python -m trader.pb1_runner --window auto --phase auto --target-branch "${BOTSTATE_BRANCH}"
+ 
+-      - name: Upload PB1 logs & ledger & state
+-        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
++      - name: Upload PB1 artifacts
++        if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: pb1-artifacts
+           path: |
+             trader/logs/**
+             _botstate/bot_state/trader_ledger/**
+             _botstate/trader/state/state.json
+-            fastapi.log
+           if-no-files-found: warn
+           retention-days: 30
