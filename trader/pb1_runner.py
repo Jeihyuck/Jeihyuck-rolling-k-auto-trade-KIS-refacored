@@ -43,6 +43,23 @@ from trader.window_router import WindowDecision, decide_window
 logger = logging.getLogger(__name__)
 
 
+def _coerce_diag_level(raw: str | int | None) -> int:
+    try:
+        return max(0, int(raw))  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def _resolve_order_mode(diag_level: int, shadow_live_flag: bool, action: str) -> str:
+    if diag_level >= 2:
+        return "shadow" if shadow_live_flag else "intent_only"
+    if diag_level == 1:
+        return "intent_only"
+    if action == "diag":
+        return "dry_run"
+    return "live"
+
+
 def truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -90,12 +107,7 @@ def main() -> None:
         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
     )
     diag_level_raw = os.getenv("PB1_DIAG_LEVEL", str(PB1_DIAG_LEVEL))
-    try:
-        diag_level = int(diag_level_raw)
-    except Exception:
-        diag_level = 1
-    if diag_level not in (1, 2):
-        diag_level = 1
+    diag_level = _coerce_diag_level(diag_level_raw)
     shadow_live_flag = env_bool("PB1_SHADOW_LIVE", PB1_SHADOW_LIVE)
     _, market_close_dt = _market_session(now)
     market_close_time = market_close_dt.time()
@@ -207,12 +219,14 @@ def main() -> None:
         if window is None and not force_diag:
             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
             return
+        if force_diag:
+            diag_level = max(1, diag_level)
         action = "diag" if force_diag else "run"
 
-    if shadow_live_flag and action in {"run", "wait"}:
+    if shadow_live_flag and action in {"run", "wait"} and diag_level >= 2:
         action = "shadow_live"
-    if action == "diag":
-        action = "diag_deep" if diag_level == 2 else "diag_verify"
+    if force_diag:
+        diag_level = max(1, diag_level)
 
     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
@@ -220,11 +234,9 @@ def main() -> None:
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     dry_run_reasons: list[str] = []
-    order_mode = "live"
-    if action == "diag_verify":
-        order_mode = "dry_run"
-    elif action in {"diag_deep", "shadow_live"}:
-        order_mode = "shadow"
+    dry_run_reason = "live"
+    dry_run = False
+    order_mode = _resolve_order_mode(diag_level, shadow_live_flag, action)
     if non_trading_day:
         dry_run_reasons.append("non_trading_day")
         os.environ["PB1_ENTRY_ENABLED"] = "0"
@@ -233,11 +245,11 @@ def main() -> None:
             os.environ["DISABLE_LIVE_TRADING"] = "1"
             os.environ["DRY_RUN"] = "1"
             os.environ["LIVE_TRADING_ENABLED"] = "0"
-            order_mode = "dry_run"
-    diag_enabled = force_diag or diag_env_flag or action.startswith("diag")
+            order_mode = "intent_only"
+    diag_enabled = force_diag or diag_env_flag or diag_level > 0
     if force_diag and not non_trading_day and now.time() >= market_close_time:
         dry_run_reasons.append("market_closed")
-    if diag_enabled and order_mode == "dry_run":
+    if diag_enabled and order_mode in {"dry_run", "intent_only", "shadow"}:
         dry_run_reasons.append("diagnostic_mode")
     if mode == "INTENT_ONLY":
         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
@@ -254,10 +266,64 @@ def main() -> None:
         if not flag.valid:
             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
 
-    dry_run = bool(dry_run_reasons) or order_mode == "dry_run"
-    if order_mode == "shadow":
+    shadow_skip_reason = None
+    def _is_dummy_secret(val: str | None) -> bool:
+        s = (val or "").strip().lower()
+        return (not s) or s in {"dummy", "none", "null"} or all(ch == "0" for ch in s)
+
+    kis_credentials_missing = _is_dummy_secret(os.getenv("KIS_APP_KEY") or os.getenv("APP_KEY")) or _is_dummy_secret(os.getenv("KIS_APP_SECRET") or os.getenv("APP_SECRET")) or _is_dummy_secret(os.getenv("CANO")) or _is_dummy_secret(os.getenv("ACNT_PRDT_CD"))
+    if kis_credentials_missing and diag_enabled:
+        dry_run_reasons.append("missing_kis_secrets")
+        shadow_skip_reason = "missing_kis_secrets"
+        if order_mode == "live":
+            order_mode = "intent_only"
+
+    def _apply_env_flags(order_mode_value: str) -> None:
+        os.environ["DRY_RUN"] = "1" if order_mode_value in {"dry_run", "intent_only"} else "0"
+        if order_mode_value == "shadow":
+            os.environ["DISABLE_LIVE_TRADING"] = "1"
+            os.environ["LIVE_TRADING_ENABLED"] = "0"
+        else:
+            os.environ["DISABLE_LIVE_TRADING"] = "1" if (order_mode_value in {"dry_run", "intent_only"} or disable_live_flag.value or non_trading_day) else "0"
+            os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not non_trading_day and order_mode_value == "live") else "0"
+        os.environ["STRATEGY_MODE"] = mode
+        os.environ["ORDER_MODE"] = order_mode_value
+
+    phase_override_arg = args.phase
+    if (
+        window
+        and event_name_lower == "push"
+        and phase_override_arg == "auto"
+        and window.name == "afternoon"
+        and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
+    ):
+        try:
+            start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
+            end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
+            in_afternoon = start.time() <= now.time() < end.time()
+        except Exception:
+            in_afternoon = False
+        if trading_day and in_afternoon and window.phase == "prep":
+            logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
+            phase_override_arg = "entry"
+
+    if diag_enabled:
+        if diag_level >= 2 and action in {"shadow_live", "diag"}:
+            order_mode = "shadow" if shadow_live_flag else order_mode
+        if order_mode == "intent_only":
+            dry_run = True
+        dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
+        dry_run_reasons = dry_run_reasons or ["diagnostic"]
+        if args.phase == "auto":
+            phase_override_arg = "verify"
+        window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
+        _apply_env_flags(order_mode)
+
+    dry_run = bool(dry_run_reasons) or order_mode in {"dry_run", "intent_only"}
+    if order_mode == "shadow" and not shadow_skip_reason:
         dry_run = False
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+    _apply_env_flags(order_mode)
 
     logger.info(
         "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
@@ -290,68 +356,24 @@ def main() -> None:
         if guard_failures:
             raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
 
-    def _apply_env_flags(order_mode_value: str) -> None:
-        os.environ["DRY_RUN"] = "1" if order_mode_value == "dry_run" else "0"
-        if order_mode_value == "shadow":
-            os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
-            os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not disable_live_flag.value) else "0"
-        else:
-            os.environ["DISABLE_LIVE_TRADING"] = "1" if (order_mode_value == "dry_run" or disable_live_flag.value or non_trading_day) else "0"
-            os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not non_trading_day and order_mode_value == "live") else "0"
-        os.environ["STRATEGY_MODE"] = mode
-        os.environ["ORDER_MODE"] = order_mode_value
-
-    _apply_env_flags(order_mode)
-
-    phase_override_arg = args.phase
-    if (
-        window
-        and event_name_lower == "push"
-        and phase_override_arg == "auto"
-        and window.name == "afternoon"
-        and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
-    ):
-        try:
-            start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
-            end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
-            in_afternoon = start.time() <= now.time() < end.time()
-        except Exception:
-            in_afternoon = False
-        if trading_day and in_afternoon and window.phase == "prep":
-            logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
-            phase_override_arg = "entry"
-
-    if action in {"diag_verify", "diag_deep"}:
-        if action == "diag_verify":
-            dry_run = True
-            order_mode = "dry_run"
-        else:
-            dry_run = False
-            order_mode = "shadow"
-        dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
-        dry_run_reasons = dry_run_reasons or ["diagnostic"]
-        diag_enabled = True
-        if args.phase == "auto":
-            phase_override_arg = "verify"
-        window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
-        _apply_env_flags(order_mode)
-
     window_name_for_log = window.name if window else "none"
     phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
 
     logger.info(
-        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s ORDER_MODE=%s reasons=%s",
+        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s diag_level=%s shadow_live=%s order_mode=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
         event_name_lower or "unknown",
         now.isoformat(),
         trading_day,
         window_name_for_log,
         phase_for_log,
+        diag_level,
+        shadow_live_flag,
+        order_mode,
         dry_run,
         os.getenv("DISABLE_LIVE_TRADING"),
         os.getenv("LIVE_TRADING_ENABLED"),
         os.getenv("STRATEGY_MODE"),
         os.getenv("PB1_ENTRY_ENABLED"),
-        order_mode,
         dry_run_reasons or ["live"],
     )
 
@@ -377,17 +399,22 @@ def main() -> None:
     kis: KisAPI | None = None
     try:
         runtime_state = runtime_state_store.load_state()
-        kis = KisAPI()
-        balance = kis.get_balance()
-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
-        runtime_state_store.save_state(runtime_state)
+        if kis_credentials_missing:
+            logger.warning("[PB1][KIS] credentials missing -> skip balance reconcile")
+        else:
+            kis = KisAPI()
+            balance = kis.get_balance()
+            runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
+            runtime_state_store.save_state(runtime_state)
     except Exception:
         logger.exception("[PB1] runtime state reconcile failed")
         runtime_state = runtime_state or runtime_state_store.load_state()
         dry_run_reasons.append("kis_init_failed")
         dry_run_reason = ",".join(dry_run_reasons)
         dry_run = True
-        _apply_env_flags(dry_run)
+        if order_mode == "shadow":
+            order_mode = "intent_only"
+        _apply_env_flags(order_mode)
 
     if DIAGNOSTIC_ONLY:
         logger.info("[PB1][DIAG] diagnostic_only mode -> exit")
@@ -406,6 +433,7 @@ def main() -> None:
             run_id=run_id,
             order_mode=order_mode,
             diag_level=diag_level,
+            shadow_skip_reason=shadow_skip_reason,
         )
         touched = engine.run()
         if state_target_path.exists():

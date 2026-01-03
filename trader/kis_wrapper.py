@@ -204,6 +204,7 @@ class KisAPI:
         self.env = safe_strip(KIS_ENV or "practice").lower()
         if self.env not in ("practice", "real"):
             self.env = "practice"
+        self._has_credentials = bool(APP_KEY and APP_SECRET and self.CANO and self.ACNT_PRDT_CD)
 
         # [CHG] 세션 생성 → 멤버로 보관
         self.session = _build_session()
@@ -224,6 +225,9 @@ class KisAPI:
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
+
+    def has_credentials(self) -> bool:
+        return self._has_credentials
 
     # ===== [NEW] 안전요청 & 세션리셋 =====
     def _reset_session(self):
@@ -553,6 +557,38 @@ class KisAPI:
         if qty_int > orderable_qty:
             return False, "qty_exceeds_available"
         return True, "ok"
+
+    def check_orderable(self, code: str, qty: int, price: float | None, side: str = "BUY", order_type: str = "market") -> Dict[str, Any]:
+        """주문가능조회 기반 형식/인증/응답 파싱 검증 (실제 주문 없음)."""
+        result: Dict[str, Any] = {
+            "ok": False,
+            "reason": "unknown",
+            "status": None,
+            "side": side,
+            "order_type": order_type,
+        }
+        if not self._has_credentials:
+            result["reason"] = "missing_credentials"
+            return result
+        try:
+            resp = self._inquire_psbl_order(code, price)
+            status = resp.get("_status")
+            msg_cd = safe_strip(resp.get("msg_cd"))
+            msg1 = safe_strip(resp.get("msg1"))
+            ok = str(resp.get("rt_cd")) == "0"
+            result.update(
+                {
+                    "ok": ok,
+                    "reason": "ok" if ok else msg1 or msg_cd or "psbl_order_failed",
+                    "status": status,
+                    "msg_cd": msg_cd,
+                    "msg1": msg1,
+                    "raw": resp,
+                }
+            )
+        except Exception as exc:
+            result.update({"ok": False, "reason": f"exception:{exc.__class__.__name__}", "raw": {"error": str(exc)}})
+        return result
 
     # === 시세 ===
     def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Optional[float]:
@@ -1277,6 +1313,7 @@ class KisAPI:
         self._limiter.wait("psbl-order")
         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
         data = resp.json()
+        data["_status"] = resp.status_code
         return data
 
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:

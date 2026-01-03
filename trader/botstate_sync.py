@@ -45,7 +45,34 @@ def stage_all(worktree_dir: Path) -> None:
     _git(worktree_dir, "add", "-A")
 
 
+def ensure_git_identity(worktree_dir: Path) -> None:
+    def _get_config(key: str) -> str:
+        proc = _git(worktree_dir, "config", "--get", key, check=False)
+        if proc.returncode != 0:
+            return ""
+        return (proc.stdout or "").strip()
+
+    def _resolve_identity() -> tuple[str, str]:
+        env_name = os.getenv("BOTSTATE_GIT_NAME") or os.getenv("GITHUB_ACTOR") or "github-actions[bot]"
+        env_email = os.getenv("BOTSTATE_GIT_EMAIL") or ""
+        actor = os.getenv("GITHUB_ACTOR") or "github-actions[bot]"
+        if not env_email:
+            handle = actor if actor else "github-actions[bot]"
+            env_email = f"{handle}@users.noreply.github.com"
+        return env_name, env_email
+
+    current_name = _get_config("user.name")
+    current_email = _get_config("user.email")
+    if current_name and current_email:
+        return
+    name, email = _resolve_identity()
+    _git(worktree_dir, "config", "user.name", name)
+    _git(worktree_dir, "config", "user.email", email)
+    logger.info("[BOTSTATE][GIT-ID] configured name=%s email=%s", name, email)
+
+
 def commit_if_staged(worktree_dir: Path, message: str) -> bool:
+    ensure_git_identity(worktree_dir)
     diff_proc = _git(worktree_dir, "diff", "--cached", "--quiet", check=False)
     if diff_proc.returncode == 0:
         return False
@@ -118,6 +145,7 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int = 900
     temp_path.write_text(json.dumps(lock_payload))
     temp_path.replace(lock_path)
     lock_rel_path = lock_path.relative_to(worktree_dir)
+    ensure_git_identity(worktree_dir)
     _git(worktree_dir, "add", str(lock_rel_path))
     push_retry(worktree_dir, message=f"lock run_id={run_id}")
     logger.info("[BOTSTATE][LOCK-ACQUIRED] owner=%s run_id=%s", owner, run_id)

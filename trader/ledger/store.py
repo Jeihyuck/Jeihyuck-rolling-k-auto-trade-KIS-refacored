@@ -39,6 +39,7 @@ class LedgerStore:
         for kind in [
             "orders_intent",
             "orders_ack",
+            "orders_shadow_check",
             "fills",
             "exits_intent",
             "errors",

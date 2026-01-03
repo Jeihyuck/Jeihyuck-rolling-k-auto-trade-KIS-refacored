@@ -81,10 +81,15 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set git identity
+      - name: Configure git identity for bot-state
         run: |
-          git config user.name "trade-bot"
-          git config user.email "trade-bot@users.noreply.github.com"
+          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
+          git config --global user.name "${ACTOR}"
+          git config --global user.email "${ACTOR}@users.noreply.github.com"
+          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -131,6 +136,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Configure git identity for bot-state
+        run: |
+          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
+          git config --global user.name "${ACTOR}"
+          git config --global user.email "${ACTOR}@users.noreply.github.com"
+          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -170,6 +184,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Configure git identity for bot-state
+        run: |
+          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
+          git config --global user.name "${ACTOR}"
+          git config --global user.email "${ACTOR}@users.noreply.github.com"
+          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
+          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

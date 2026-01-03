@@ -92,3 +92,6 @@ def new_error(**kwargs: Any) -> LedgerEvent:
 def new_unfilled(**kwargs: Any) -> LedgerEvent:
     return LedgerEvent(event_type="UNFILLED", ok=False, **kwargs)
 
+
+def new_shadow_check(**kwargs: Any) -> LedgerEvent:
+    return LedgerEvent(event_type="SHADOW_CHECK", **kwargs)

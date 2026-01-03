@@ -8,12 +8,17 @@ from trader.window_router import WindowDecision
 class DummyKis:
     def __init__(self):
         self.buy_called = False
+        self.shadow_checks = 0
 
     def validate_buy(self, code, qty, price):
         return True, "ok"
 
     def validate_sell(self, code, qty, price):
         return True, "ok"
+
+    def check_orderable(self, **_kwargs):
+        self.shadow_checks += 1
+        return {"ok": True, "reason": "ok", "rt_cd": "0"}
 
     def buy_stock_market(self, *_args, **_kwargs):
         self.buy_called = True
@@ -60,3 +65,8 @@ def test_shadow_executor_never_places_orders(monkeypatch, tmp_path):
     assert last_row["payload"]["mode"] == "shadow"
     assert last_row["ok"] is True
     assert dummy_kis.buy_called is False
+    shadow_file = ledger_dir / "orders_shadow_check" / engine._today / f"run_{engine.run_id}.jsonl"
+    assert shadow_file.exists()
+    shadow_rows = shadow_file.read_text(encoding="utf-8").strip().splitlines()
+    assert json.loads(shadow_rows[-1])["ok"] is True
+    assert dummy_kis.shadow_checks == 1

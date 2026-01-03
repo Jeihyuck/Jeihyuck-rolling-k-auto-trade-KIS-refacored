@@ -1,0 +1,1766 @@
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index a35276d8902702c49984fe4b334b0b10f8633adf..2b55af49a0d032fd9dbdc2edf1855e504df6d33c 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -59,126 +59,149 @@ jobs:
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       STATE_RECONCILE_APPLY: "1"
+       MORNING_WINDOW_START: "08:50"
+       MORNING_WINDOW_END: "11:00"
+       MORNING_EXIT_START: "09:00"
+       MORNING_EXIT_END: "09:20"
+       AFTERNOON_WINDOW_START: "14:00"
+       AFTERNOON_WINDOW_END: "15:30"
+       CLOSE_AUCTION_START: "15:20"
+       CLOSE_AUCTION_END: "15:30"
+       MARKET_OPEN_HHMM: "08:50"
+       MARKET_CLOSE_HHMM: "15:30"
+       PB1_WAIT_FOR_WINDOW: "1"
+       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+       LEDGER_BASE_DIR: "bot_state/trader_ledger"
+       LEDGER_LOOKBACK_DAYS: "120"
+       BOTSTATE_LOCK_TTL_SEC: "1800"
+       PYTHONUNBUFFERED: "1"
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+-      - name: Set git identity
++      - name: Configure git identity for bot-state
+         run: |
+-          git config user.name "trade-bot"
+-          git config user.email "trade-bot@users.noreply.github.com"
++          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
++          git config --global user.name "${ACTOR}"
++          git config --global user.email "${ACTOR}@users.noreply.github.com"
++          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
+       - name: Compile modules
+         run: |
+           python -m compileall trader
+ 
+       - name: Run PB1 only
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+ 
+   diag-level1:
+     if: github.event_name == 'push'
+     runs-on: ubuntu-latest
+     timeout-minutes: 60
+     env:
+       PB1_DIAG_LEVEL: "1"
+       PB1_SHADOW_LIVE: "0"
+       BOTSTATE_BRANCH: bot-state
+       BOTSTATE_WORKTREE_DIR: "_botstate"
+       STRATEGY_MODE: "INTENT_ONLY"
+       LIVE_TRADING_ENABLED: "0"
+       DISABLE_LIVE_TRADING: "1"
+       DRY_RUN: "1"
+       PB1_ENTRY_ENABLED: "0"
+       PB1_SKIP_UNIVERSE_IN_DIAG: "1"
+       KIS_ENV: "practice"
+       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+       APP_KEY: "dummy"
+       APP_SECRET: "dummy"
+       CANO: "00000000"
+       ACNT_PRDT_CD: "00"
+       PYTHONUNBUFFERED: "1"
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
++      - name: Configure git identity for bot-state
++        run: |
++          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
++          git config --global user.name "${ACTOR}"
++          git config --global user.email "${ACTOR}@users.noreply.github.com"
++          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+       - name: Run PB1 diag level1
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           PB1_DIAG_LEVEL=1 PB1_SHADOW_LIVE=0 python -m trader.pb1_runner --window diagnostic --phase verify --target-branch ${BOTSTATE_BRANCH}
+ 
+   diag-level2-shadow:
+     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+     runs-on: ubuntu-latest
+     timeout-minutes: 120
+     env:
+       PB1_DIAG_LEVEL: "2"
+       PB1_SHADOW_LIVE: "1"
+       BOTSTATE_BRANCH: bot-state
+       BOTSTATE_WORKTREE_DIR: "_botstate"
+       STRATEGY_MODE: "INTENT_ONLY"
+       LIVE_TRADING_ENABLED: "0"
+       DISABLE_LIVE_TRADING: "0"
+       DRY_RUN: "0"
+       PB1_ENTRY_ENABLED: "1"
+       PB1_SKIP_UNIVERSE_IN_DIAG: "0"
+       KIS_ENV: "practice"
+       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       PYTHONUNBUFFERED: "1"
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
++      - name: Configure git identity for bot-state
++        run: |
++          ACTOR="${GITHUB_ACTOR:-github-actions[bot]}"
++          git config --global user.name "${ACTOR}"
++          git config --global user.email "${ACTOR}@users.noreply.github.com"
++          echo "GIT_AUTHOR_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_AUTHOR_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_NAME=${ACTOR}" >> $GITHUB_ENV
++          echo "GIT_COMMITTER_EMAIL=${ACTOR}@users.noreply.github.com" >> $GITHUB_ENV
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+       - name: Run PB1 diag level2 shadow
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+           PB1_DIAG_LEVEL=2 PB1_SHADOW_LIVE=1 python -m trader.pb1_runner --window diagnostic --phase verify --target-branch ${BOTSTATE_BRANCH}
+diff --git a/tests/test_botstate_git_identity.py b/tests/test_botstate_git_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1756b00e22e52b366871795b3cbb220d10b176aa
+--- /dev/null
++++ b/tests/test_botstate_git_identity.py
+@@ -0,0 +1,21 @@
++import subprocess
++
++from trader.botstate_sync import ensure_git_identity
++
++
++def test_ensure_git_identity_sets_defaults(tmp_path, monkeypatch):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    subprocess.run(["git", "init"], cwd=repo, check=True)
++    subprocess.run(["git", "-C", str(repo), "config", "user.name", ""], check=True)
++    subprocess.run(["git", "-C", str(repo), "config", "user.email", ""], check=True)
++    monkeypatch.setenv("GITHUB_ACTOR", "ci-actor")
++    monkeypatch.delenv("BOTSTATE_GIT_NAME", raising=False)
++    monkeypatch.delenv("BOTSTATE_GIT_EMAIL", raising=False)
++
++    ensure_git_identity(repo)
++
++    name = subprocess.run(["git", "-C", str(repo), "config", "user.name"], capture_output=True, text=True, check=True).stdout.strip()
++    email = subprocess.run(["git", "-C", str(repo), "config", "user.email"], capture_output=True, text=True, check=True).stdout.strip()
++    assert name == "ci-actor"
++    assert email == "ci-actor@users.noreply.github.com"
+diff --git a/tests/test_pb1_diag_modes.py b/tests/test_pb1_diag_modes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f8702098bd74036b4512ac8ac0d2a546e81afcc
+--- /dev/null
++++ b/tests/test_pb1_diag_modes.py
+@@ -0,0 +1,90 @@
++from trader.pb1_engine import PB1Engine, CandidateFeature
++from trader.window_router import WindowDecision
++import trader.pb1_runner as pb1_runner
++
++
++def test_resolve_order_mode_prefers_shadow_for_diag_level_2() -> None:
++    assert pb1_runner._resolve_order_mode(1, False, "run") == "intent_only"
++    assert pb1_runner._resolve_order_mode(2, False, "run") == "intent_only"
++    assert pb1_runner._resolve_order_mode(2, True, "run") == "shadow"
++
++
++class DummyKis:
++    def __init__(self):
++        self.shadow_checks = 0
++
++    def check_orderable(self, **_kwargs):
++        self.shadow_checks += 1
++        return {"ok": True, "reason": "ok", "rt_cd": "0"}
++
++
++def test_diag_level1_intent_only_does_not_call_kis(monkeypatch, tmp_path):
++    ledger_dir = tmp_path / "ledger"
++    monkeypatch.setattr("trader.pb1_engine.LEDGER_BASE_DIR", ledger_dir)
++    monkeypatch.setattr("trader.pb1_engine.persist_run_files", lambda *args, **kwargs: None)
++
++    window = WindowDecision(name="afternoon", phase="entry")
++    dummy_kis = DummyKis()
++    engine = PB1Engine(
++        kis=dummy_kis,
++        worktree_dir=tmp_path,
++        window=window,
++        phase_override="auto",
++        dry_run=True,
++        env="paper",
++        run_id="diag1",
++        order_mode="intent_only",
++        diag_level=1,
++    )
++
++    cf = CandidateFeature(
++        code="123456",
++        market="KOSPI",
++        features={"close": 1000},
++        setup_ok=True,
++        reasons=[],
++        mode=1,
++        mode_reasons=[],
++        client_order_key="intent-key",
++        planned_qty=10,
++    )
++
++    engine._place_entry(cf)
++    assert dummy_kis.shadow_checks == 0
++
++
++def test_diag_level2_shadow_adds_shadow_check(monkeypatch, tmp_path):
++    ledger_dir = tmp_path / "ledger"
++    monkeypatch.setattr("trader.pb1_engine.LEDGER_BASE_DIR", ledger_dir)
++    monkeypatch.setattr("trader.pb1_engine.persist_run_files", lambda *args, **kwargs: None)
++
++    window = WindowDecision(name="afternoon", phase="entry")
++    dummy_kis = DummyKis()
++    engine = PB1Engine(
++        kis=dummy_kis,
++        worktree_dir=tmp_path,
++        window=window,
++        phase_override="auto",
++        dry_run=False,
++        env="shadow",
++        run_id="diag2",
++        order_mode="shadow",
++        diag_level=2,
++    )
++
++    cf = CandidateFeature(
++        code="654321",
++        market="KOSPI",
++        features={"close": 2000},
++        setup_ok=True,
++        reasons=[],
++        mode=1,
++        mode_reasons=[],
++        client_order_key="shadow-key",
++        planned_qty=5,
++    )
++
++    engine._place_entry(cf)
++    assert dummy_kis.shadow_checks == 1
++    shadow_file = ledger_dir / "orders_shadow_check" / engine._today / f"run_{engine.run_id}.jsonl"
++    assert shadow_file.exists()
+diff --git a/tests/test_shadow_executor_never_places_orders.py b/tests/test_shadow_executor_never_places_orders.py
+index 6f2a98f3b2bc8ff1fcd7c2d0ea4486f5b4f503aa..0149ec1c3e1f98264e7f7c6f2565f643de134b30 100644
+--- a/tests/test_shadow_executor_never_places_orders.py
++++ b/tests/test_shadow_executor_never_places_orders.py
+@@ -1,62 +1,72 @@
+ import json
+ from pathlib import Path
+ 
+ from trader.pb1_engine import PB1Engine, CandidateFeature
+ from trader.window_router import WindowDecision
+ 
+ 
+ class DummyKis:
+     def __init__(self):
+         self.buy_called = False
++        self.shadow_checks = 0
+ 
+     def validate_buy(self, code, qty, price):
+         return True, "ok"
+ 
+     def validate_sell(self, code, qty, price):
+         return True, "ok"
+ 
++    def check_orderable(self, **_kwargs):
++        self.shadow_checks += 1
++        return {"ok": True, "reason": "ok", "rt_cd": "0"}
++
+     def buy_stock_market(self, *_args, **_kwargs):
+         self.buy_called = True
+         raise AssertionError("buy_stock_market should not be called in shadow mode")
+ 
+ 
+ def test_shadow_executor_never_places_orders(monkeypatch, tmp_path):
+     ledger_dir = tmp_path / "ledger"
+     monkeypatch.setattr("trader.pb1_engine.LEDGER_BASE_DIR", ledger_dir)
+     monkeypatch.setattr("trader.pb1_engine.persist_run_files", lambda *args, **kwargs: None)
+ 
+     window = WindowDecision(name="afternoon", phase="entry")
+     dummy_kis = DummyKis()
+ 
+     engine = PB1Engine(
+         kis=dummy_kis,
+         worktree_dir=tmp_path,
+         window=window,
+         phase_override="auto",
+         dry_run=False,
+         env="shadow",
+         run_id="test-run",
+         order_mode="shadow",
+         diag_level=2,
+     )
+ 
+     cf = CandidateFeature(
+         code="123456",
+         market="KOSPI",
+         features={"close": 1000},
+         setup_ok=True,
+         reasons=[],
+         mode=1,
+         mode_reasons=[],
+         client_order_key="test-key",
+         planned_qty=10,
+     )
+ 
+     paths = engine._place_entry(cf)
+     ack_file = ledger_dir / "orders_ack" / engine._today / f"run_{engine.run_id}.jsonl"
+     assert ack_file.exists()
+     content = ack_file.read_text(encoding="utf-8").strip().splitlines()
+     last_row = json.loads(content[-1])
+     assert last_row["payload"]["mode"] == "shadow"
+     assert last_row["ok"] is True
+     assert dummy_kis.buy_called is False
++    shadow_file = ledger_dir / "orders_shadow_check" / engine._today / f"run_{engine.run_id}.jsonl"
++    assert shadow_file.exists()
++    shadow_rows = shadow_file.read_text(encoding="utf-8").strip().splitlines()
++    assert json.loads(shadow_rows[-1])["ok"] is True
++    assert dummy_kis.shadow_checks == 1
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index 442fc1e727fa4c08aa35260bf7f64f26978caeae..da89da8754c8e942049ec9c66da0fd58b61878b4 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -23,51 +23,78 @@ def resolve_botstate_worktree_dir() -> Path:
+ 
+ 
+ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
+     try:
+         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+     except subprocess.CalledProcessError as exc:
+         logger.error(
+             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
+             exc.cmd,
+             cwd,
+             exc.returncode,
+             exc.stdout,
+             exc.stderr,
+         )
+         raise
+ 
+ 
+ def git_porcelain(worktree_dir: Path) -> str:
+     return _git(worktree_dir, "status", "--porcelain").stdout
+ 
+ 
+ def stage_all(worktree_dir: Path) -> None:
+     _git(worktree_dir, "add", "-A")
+ 
+ 
++def ensure_git_identity(worktree_dir: Path) -> None:
++    def _get_config(key: str) -> str:
++        proc = _git(worktree_dir, "config", "--get", key, check=False)
++        if proc.returncode != 0:
++            return ""
++        return (proc.stdout or "").strip()
++
++    def _resolve_identity() -> tuple[str, str]:
++        env_name = os.getenv("BOTSTATE_GIT_NAME") or os.getenv("GITHUB_ACTOR") or "github-actions[bot]"
++        env_email = os.getenv("BOTSTATE_GIT_EMAIL") or ""
++        actor = os.getenv("GITHUB_ACTOR") or "github-actions[bot]"
++        if not env_email:
++            handle = actor if actor else "github-actions[bot]"
++            env_email = f"{handle}@users.noreply.github.com"
++        return env_name, env_email
++
++    current_name = _get_config("user.name")
++    current_email = _get_config("user.email")
++    if current_name and current_email:
++        return
++    name, email = _resolve_identity()
++    _git(worktree_dir, "config", "user.name", name)
++    _git(worktree_dir, "config", "user.email", email)
++    logger.info("[BOTSTATE][GIT-ID] configured name=%s email=%s", name, email)
++
++
+ def commit_if_staged(worktree_dir: Path, message: str) -> bool:
++    ensure_git_identity(worktree_dir)
+     diff_proc = _git(worktree_dir, "diff", "--cached", "--quiet", check=False)
+     if diff_proc.returncode == 0:
+         return False
+     _git(worktree_dir, "commit", "-m", message)
+     return True
+ 
+ 
+ def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
+     status = git_porcelain(worktree_dir)
+     files = [line.strip() for line in status.splitlines() if line.strip()]
+     dirty = bool(files)
+     logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
+     if not dirty:
+         return
+     stage_all(worktree_dir)
+     committed = commit_if_staged(worktree_dir, message_for_autosave)
+     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
+ 
+ 
+ def _git(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+     return _run(["git", "-C", str(worktree_dir), *args], check=check)
+ 
+ 
+ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+     base_dir_resolved = base_dir.resolve()
+@@ -96,50 +123,51 @@ def _lock_path(worktree_dir: Path) -> Path:
+ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int = 900) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+     now = datetime.now(tz=KST)
+     if lock_path.exists():
+         try:
+             payload = json.loads(lock_path.read_text())
+             ts = datetime.fromisoformat(payload.get("ts"))
+             ttl = int(payload.get("ttl_sec") or ttl_sec)
+             if ts + timedelta(seconds=ttl) > now:
+                 logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s", payload.get("owner"), payload.get("run_id"), ts + timedelta(seconds=ttl))
+                 return False
+         except Exception:
+             pass
+     lock_payload = {
+         "owner": owner,
+         "run_id": run_id,
+         "ts": now.isoformat(),
+         "ttl_sec": ttl_sec,
+     }
+     temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
+     temp_path.write_text(json.dumps(lock_payload))
+     temp_path.replace(lock_path)
+     lock_rel_path = lock_path.relative_to(worktree_dir)
++    ensure_git_identity(worktree_dir)
+     _git(worktree_dir, "add", str(lock_rel_path))
+     push_retry(worktree_dir, message=f"lock run_id={run_id}")
+     logger.info("[BOTSTATE][LOCK-ACQUIRED] owner=%s run_id=%s", owner, run_id)
+     return True
+ 
+ 
+ def release_lock(worktree_dir: Path, run_id: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     if lock_path.exists():
+         lock_path.unlink()
+         lock_rel_path = lock_path.relative_to(worktree_dir)
+         _git(worktree_dir, "add", "-u", str(lock_rel_path))
+         push_retry(worktree_dir, message=f"unlock run_id={run_id}")
+         logger.info("[BOTSTATE][LOCK-RELEASED] run_id=%s", run_id)
+ 
+ 
+ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     files = list(new_files)
+     for path in files:
+         try:
+             if path.resolve().is_relative_to(worktree_dir.resolve()):
+                 target = path.resolve()
+             else:
+diff --git a/trader/config.py b/trader/config.py
+index eb1fc12708a0e76e90daf9ab37bb40329a325c16..bfc7960dfde9daa0ed4cb9512f46ec53e4fdd499 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -79,51 +79,51 @@ CONFIG = {
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+-    "PB1_DIAG_LEVEL": "1",  # 1=fast verify, 2=deep shadow
++    "PB1_DIAG_LEVEL": "0",  # 0=live, 1=intent-only diag, 2=shadow diag
+     "PB1_SHADOW_LIVE": "0",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "trader/state/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "1800",
+     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+     "PB1_ENTRY_ENABLED": "true",
+     "MORNING_WINDOW_START": "08:50",
+     "MORNING_WINDOW_END": "11:00",
+     "MORNING_EXIT_START": "09:00",
+@@ -419,48 +419,48 @@ def _parse_hhmm(hhmm: str) -> dtime:
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+ DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
+ PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
+ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+ BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "900")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "11:00"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "14:00"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+ PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
+ PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
+ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
+ PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
+ MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
+ MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
+-PB1_DIAG_LEVEL = int(_cfg("PB1_DIAG_LEVEL") or "1")
++PB1_DIAG_LEVEL = int(_cfg("PB1_DIAG_LEVEL") or "0")
+ PB1_SHADOW_LIVE = _cfg_bool("PB1_SHADOW_LIVE", fallback=False)
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+ PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
+ PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
+ PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
+ KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
+ KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
+ PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
+ PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+ 
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+ 
+ def _this_iso_week_key(now=None):
+     now = now or datetime.now(KST)
+     return f"{now.year}-W{now.isocalendar().week:02d}"
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 87d747cd3801f26a66cd11691a0931ecf9ca3805..a8e43f90f4120812e51d9653c5fa9b84fd717a21 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -182,71 +182,75 @@ def _pick_tr(env: str, key: str) -> List[str]:
+         return []
+ 
+ 
+ # --- KisAPI 이하 실전 전체 로직 ---
+ class KisAPI:
+     _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
+     _cache_path = "kis_token_cache.json"
+     _token_lock = threading.Lock()
+ 
+     def should_cooldown(self, now_kst: datetime | None = None) -> bool:
+         """
+         VWAP / 롤링K 메인 루프에서 '잠깐 쉬어야 하는 구간'을 체크하는 헬퍼.
+ 
+         지금은 최소 구현 버전:
+         - 항상 False를 리턴해서 쿨다운을 사용하지 않는다.
+         - 나중에 점심시간 / 장 마감 직전 / 과열 구간 등 세부 로직을 여기로 옮기면 된다.
+         """
+         return False
+ 
+     def __init__(self):
+         self.CANO = safe_strip(CANO)
+         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
+         self.env = safe_strip(KIS_ENV or "practice").lower()
+         if self.env not in ("practice", "real"):
+             self.env = "practice"
++        self._has_credentials = bool(APP_KEY and APP_SECRET and self.CANO and self.ACNT_PRDT_CD)
+ 
+         # [CHG] 세션 생성 → 멤버로 보관
+         self.session = _build_session()
+ 
+         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
+         self._safe_attempts = 5
+         self._safe_backoff_base = 0.2
+ 
+         self._limiter = _RateLimiter(min_interval_sec=0.20)
+         self._recent_sells: Dict[str, float] = {}
+         self._recent_sells_lock = threading.Lock()
+         self._recent_sells_cooldown = 60.0
+ 
+         self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
+ 
+         self.token = self.get_valid_token()
+         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
+ 
+         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
+         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
+ 
++    def has_credentials(self) -> bool:
++        return self._has_credentials
++
+     # ===== [NEW] 안전요청 & 세션리셋 =====
+     def _reset_session(self):
+         try:
+             old = self.session
+             self.session = _build_session()
+             try:
+                 old.close()
+             except Exception:
+                 pass
+             logger.warning("[NET] session reset")
+         except Exception as e:
+             logger.warning("[NET] session reset failed: %s", e)
+ 
+     def _safe_request(self, method: str, url: str, **kwargs) -> requests.Response:
+         """
+         공통 안전요청 래퍼:
+         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
+         - 기본 시도 self._safe_attempts
+         """
+         attempts = self._safe_attempts
+         for i in range(1, attempts + 1):
+             try:
+                 return self.session.request(
+                     method,
+                     url,
+@@ -532,50 +536,82 @@ class KisAPI:
+             return False, "cash_empty"
+         if est_cost > cash:
+             return False, "insufficient_cash"
+         return True, "ok"
+ 
+     def validate_sell(self, code: str, qty: int, price: float | None) -> Tuple[bool, str]:
+         """섀도우 모드용 매도 사전검증."""
+         try:
+             qty_int = int(qty)
+         except Exception:
+             qty_int = 0
+         if qty_int <= 0:
+             return False, "qty_invalid"
+         try:
+             if price is None or float(price) <= 0:
+                 return False, "price_invalid"
+         except Exception:
+             return False, "price_invalid"
+         orderable_qty = self.get_orderable_qty(code)
+         if orderable_qty <= 0:
+             return False, "orderable_qty_zero"
+         if qty_int > orderable_qty:
+             return False, "qty_exceeds_available"
+         return True, "ok"
+ 
++    def check_orderable(self, code: str, qty: int, price: float | None, side: str = "BUY", order_type: str = "market") -> Dict[str, Any]:
++        """주문가능조회 기반 형식/인증/응답 파싱 검증 (실제 주문 없음)."""
++        result: Dict[str, Any] = {
++            "ok": False,
++            "reason": "unknown",
++            "status": None,
++            "side": side,
++            "order_type": order_type,
++        }
++        if not self._has_credentials:
++            result["reason"] = "missing_credentials"
++            return result
++        try:
++            resp = self._inquire_psbl_order(code, price)
++            status = resp.get("_status")
++            msg_cd = safe_strip(resp.get("msg_cd"))
++            msg1 = safe_strip(resp.get("msg1"))
++            ok = str(resp.get("rt_cd")) == "0"
++            result.update(
++                {
++                    "ok": ok,
++                    "reason": "ok" if ok else msg1 or msg_cd or "psbl_order_failed",
++                    "status": status,
++                    "msg_cd": msg_cd,
++                    "msg1": msg1,
++                    "raw": resp,
++                }
++            )
++        except Exception as exc:
++            result.update({"ok": False, "reason": f"exception:{exc.__class__.__name__}", "raw": {"error": str(exc)}})
++        return result
++
+     # === 시세 ===
+     def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Optional[float]:
+         """단일 TR/마켓/코드 조합으로 현재가 1회 조회(성공시 float 반환, 실패/0원시 None)."""
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+         headers = self._headers(tr_id)
+         params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+         try:
+             # [CHG] 안전요청 사용
+             resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+             data = resp.json()
+         except Exception as e:
+             logger.debug("[PRICE_ONCE_EX] %s/%s %s → %s", market_div, code_fmt, tr_id, e)
+             return None
+ 
+         if "초당 거래건수" in (data.get("msg1") or ""):
+             return None
+         if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+             try:
+                 px = float(data["output"].get("stck_prpr") or 0)
+                 return px if px > 0 else None
+             except Exception:
+                 return None
+         return None
+ 
+     def get_last_price(self, code: str, *, attempts: int = 2) -> float:
+@@ -1255,50 +1291,51 @@ class KisAPI:
+     def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
+         """주문가능조회 호출."""
+         tr_list = _pick_tr(self.env, "PSBL_ORDER")
+         if not tr_list:
+             raise RuntimeError("PSBL_ORDER TR 미구성")
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+         tr = tr_list[0]
+         headers = self._headers(tr)
+         try:
+             ord_unpr = int(float(price_hint)) if price_hint is not None else 1
+         except Exception:
+             ord_unpr = 1
+         params = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "PDNO": safe_strip(code_hint) or "005930",
+             "ORD_UNPR": str(max(ord_unpr, 1)),
+             "ORD_DVSN": "00",
+             "ORD_DVSN_CD": "00",
+             "CMA_EVLU_AMT_ICLD_YN": "N",
+             "OVRS_ICLD_YN": "N",
+         }
+         self._limiter.wait("psbl-order")
+         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+         data = resp.json()
++        data["_status"] = resp.status_code
+         return data
+ 
+     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
+         """잔고 1페이지 호출(예외는 상위에서 처리)."""
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+         tr_list = _pick_tr(self.env, "BALANCE")
+         if not tr_list:
+             raise RuntimeError("BALANCE TR 미구성")
+         tr = tr_list[0]
+         headers = self._headers(tr)
+         params = {
+             "CANO": self.CANO,
+             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+             "AFHR_FLPR_YN": "N",
+             "UNPR_YN": "N",
+             "UNPR_DVSN": "01",
+             "FUND_STTL_ICLD_YN": "N",
+             "FNCG_AMT_AUTO_RDPT_YN": "N",
+             "PRCS_DVSN": "01",
+             "OFL_YN": "N",
+             "INQR_DVSN": "02",
+             "CTX_AREA_FK100": fk,
+             "CTX_AREA_NK100": nk,
+         }
+         logger.info(f"[잔고조회 요청파라미터] {params}")
+diff --git a/trader/ledger/event_types.py b/trader/ledger/event_types.py
+index 6a11e116732eeb2cb37e9fcfc85948dd93c7c3e1..33a36673cc3e5603a43e2ac277afe11ce3162cdb 100644
+--- a/trader/ledger/event_types.py
++++ b/trader/ledger/event_types.py
+@@ -70,25 +70,28 @@ class LedgerEvent:
+ 
+ 
+ def new_order_intent(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ORDER_INTENT", **kwargs)
+ 
+ 
+ def new_order_ack(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ORDER_ACK", **kwargs)
+ 
+ 
+ def new_fill(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="FILL", **kwargs)
+ 
+ 
+ def new_exit_intent(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="EXIT_INTENT", **kwargs)
+ 
+ 
+ def new_error(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ERROR", ok=False, **kwargs)
+ 
+ 
+ def new_unfilled(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="UNFILLED", ok=False, **kwargs)
+ 
++
++def new_shadow_check(**kwargs: Any) -> LedgerEvent:
++    return LedgerEvent(event_type="SHADOW_CHECK", **kwargs)
+diff --git a/trader/ledger/store.py b/trader/ledger/store.py
+index 898f5935521ec75d2417954e8d2ae3b9016aa3a6..2b4f84a962ce86e2256d1c1a8c0d34a9ea94701d 100644
+--- a/trader/ledger/store.py
++++ b/trader/ledger/store.py
+@@ -17,50 +17,51 @@ KST = now_kst().tzinfo  # reuse timezone
+ 
+ 
+ def _today_str() -> str:
+     return now_kst().date().isoformat()
+ 
+ 
+ def _ensure_dir(path: Path) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+ 
+ 
+ class LedgerStore:
+     def __init__(self, base_dir: Path, env: str = "paper", run_id: str | None = None) -> None:
+         self.base_dir = Path(base_dir)
+         self.env = env
+         self.run_id = run_id or os.getenv("GITHUB_RUN_ID", str(uuid.uuid4()))
+         self.today = _today_str()
+ 
+     def _run_file(self, kind: str) -> Path:
+         return self.base_dir / kind / self.today / f"run_{self.run_id}.jsonl"
+ 
+     def open_run_files(self) -> Dict[str, Path]:
+         files = {}
+         for kind in [
+             "orders_intent",
+             "orders_ack",
++            "orders_shadow_check",
+             "fills",
+             "exits_intent",
+             "errors",
+         ]:
+             path = self._run_file(kind)
+             _ensure_dir(path)
+             if not path.exists():
+                 path.touch()
+             files[kind] = path
+         return files
+ 
+     def append_event(self, kind: str, event: LedgerEvent) -> Path:
+         path = self._run_file(kind)
+         _ensure_dir(path)
+         line = event.to_jsonl()
+         with open(path, "a", encoding="utf-8") as f:
+             f.write(line + "\n")
+             f.flush()
+             os.fsync(f.fileno())
+         logger.info("[LEDGER][APPEND] kind=%s path=%s", kind, path)
+         return path
+ 
+     def _iter_jsonl(self, paths: Iterable[Path]) -> Iterable[Dict]:
+         for path in paths:
+             if not path.exists():
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 8a5a56fc37a862dc6deb54841792eb0651cd1422..2f73a65ef088893436c1180bba440e82bc6621fb 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -5,126 +5,129 @@ import json
+ from dataclasses import dataclass
+ import os
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Dict, Iterable, List, Tuple
+ 
+ import pandas as pd
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
+     PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
+     PB1_REQUIRE_VOLUME,
+ )
+ from trader.utils.env import env_bool
+ from trader.kis_wrapper import KisAPI
+-from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
++from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled, new_shadow_check
+ from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+ from trader.utils.ohlcv import normalize_ohlcv
+ from trader.time_utils import now_kst
+ from trader.window_router import WindowDecision, resolve_phase
+ from trader.botstate_sync import persist_run_files
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @dataclass
+ class CandidateFeature:
+     code: str
+     market: str
+     features: Dict[str, float]
+     setup_ok: bool
+     reasons: List[str]
+     mode: int
+     mode_reasons: List[str]
+     client_order_key: str | None = None
+     planned_qty: int = 0
+ 
+ 
+ class PB1Engine:
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+         worktree_dir: Path,
+         window: WindowDecision,
+         phase_override: str,
+         dry_run: bool,
+         env: str,
+         run_id: str,
+         order_mode: str = "live",
+         diag_level: int = 1,
++        shadow_skip_reason: str | None = None,
+     ) -> None:
+         self.kis = kis
+         self.worktree_dir = worktree_dir
+         self.window = window
+         self.phase = resolve_phase(window, phase_override)
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+         self.order_mode = order_mode
+         self.diag_level = diag_level
+         base_dir = LEDGER_BASE_DIR
+         if not Path(base_dir).is_absolute():
+             base_dir = worktree_dir / base_dir
+         self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
+         self.worktree_dir = worktree_dir
+         self._today = now_kst().date().isoformat()
+         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+         self.diag_counters: Dict[str, object] = {
+             "universe_size": 0,
+             "candidates": 0,
+             "entry_orders": 0,
+             "exit_orders": 0,
+             "preflight_ok": 0,
+             "preflight_fail": 0,
+             "fail_reasons": [],
+         }
++        self.shadow_skip_reason = shadow_skip_reason
+         self.executor = self._build_executor()
+ 
+     def _build_executor(self):
+         if self.order_mode == "shadow":
+             return ShadowExecutor(
+                 kis=self.kis,
+                 ledger=self.ledger,
+                 env=self.env,
+                 run_id=self.run_id,
+                 worktree_dir=self.worktree_dir,
+                 diag_counters=self.diag_counters,
++                shadow_skip_reason=self.shadow_skip_reason,
+             )
+-        if self.order_mode == "dry_run":
++        if self.order_mode in {"dry_run", "intent_only"}:
+             return DryRunExecutor(
+                 ledger=self.ledger,
+                 env=self.env,
+                 run_id=self.run_id,
+                 diag_counters=self.diag_counters,
+             )
+         return LiveExecutor(
+             kis=self.kis,
+             ledger=self.ledger,
+             env=self.env,
+             run_id=self.run_id,
+             worktree_dir=self.worktree_dir,
+             diag_counters=self.diag_counters,
+         )
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+@@ -263,51 +266,51 @@ class PB1Engine:
+             )
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero")
+                 self._log_setup(cf)
+         return candidates
+ 
+     def _should_block_order(self, client_order_key: str) -> bool:
+         if not client_order_key:
+             return True
+         return self.ledger.has_client_order_key(client_order_key)
+ 
+     def _append_intent(self, cf: CandidateFeature) -> None:
+         event = new_order_intent(
+             code=cf.code,
+             market=cf.market,
+             sid=1,
+             mode=cf.mode,
+             env=self.env,
+             run_id=self.run_id,
+             side="BUY",
+             qty=cf.planned_qty,
+             price=cf.features.get("close"),
+             client_order_key=cf.client_order_key,
+             ok=self.order_mode == "live",
+-            reasons=["dry_run"] if self.order_mode == "dry_run" else ["shadow_mode"] if self.order_mode == "shadow" else ["pb1_close_entry"],
++            reasons=["dry_run"] if self.order_mode == "dry_run" else ["shadow_mode"] if self.order_mode == "shadow" else ["intent_only"] if self.order_mode == "intent_only" else ["pb1_close_entry"],
+             stage="PB1-CLOSE",
+             payload={"order_mode": self.order_mode},
+         )
+         path = self.ledger.append_event("orders_intent", event)
+         self.diag_counters["entry_orders"] = int(self.diag_counters.get("entry_orders", 0)) + 1
+         logger.info("[PB1][ENTRY-INTENT] code=%s mode=%s qty=%s key=%s path=%s", cf.code, cf.mode, cf.planned_qty, cf.client_order_key, path)
+ 
+     def _place_entry(self, cf: CandidateFeature) -> List[Path]:
+         paths: List[Path] = []
+         self._append_intent(cf)
+         paths.append(self.ledger._run_file("orders_intent"))
+         exec_paths, _ok, _reason = self.executor.submit_order(
+             code=cf.code,
+             market=cf.market,
+             mode=cf.mode,
+             qty=cf.planned_qty,
+             price=cf.features.get("close"),
+             client_order_key=cf.client_order_key,
+             stage="PB1-CLOSE",
+             side="BUY",
+         )
+         paths.extend(exec_paths)
+         return paths
+ 
+     def _mark_price(self, code: str) -> float | None:
+@@ -567,51 +570,51 @@ class PB1Engine:
+                     self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
+         if self.phase == "entry" and self.window.name == "afternoon":
+             pos_list = self._positions_with_meta(positions)
+             for pos in pos_list:
+                 df, _ = self._fetch_daily(pos["code"], count=120)
+                 if df.empty:
+                     continue
+                 features = compute_features(df)
+                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
+                 marks_fallback[pos["code"]] = features.get("close")
+                 self._plan_exit_event(pos, features, "close")
+         marks = self._fetch_marks([p["code"] for p in self._positions_with_meta(positions)], marks_fallback)
+         snapshot = self.ledger.generate_pnl_snapshot(positions, marks=marks)
+         logger.info(
+             "[PNL][SNAPSHOT] portfolio_return_pct=%.2f%% unrealized=%.2f realized=%.2f",
+             snapshot["totals"]["portfolio_return_pct"],
+             snapshot["totals"]["unrealized"],
+             snapshot["totals"]["realized"],
+         )
+         snap_path = self.ledger.write_snapshot(snapshot, self.run_id)
+         touched.append(snap_path)
+         touched = self._emit_diag_summary(touched)
+         return touched
+ 
+     def _emit_diag_summary(self, touched: List[Path]) -> List[Path]:
+-        if self.order_mode != "shadow":
++        if self.diag_level <= 0:
+             return touched
+         fail_reasons = list(self.diag_counters.get("fail_reasons") or [])
+         if not fail_reasons:
+             fail_reasons = ["none"]
+         summary = {
+             "level": self.diag_level,
+             "order_mode": self.order_mode,
+             "universe": int(self.diag_counters.get("universe_size", 0)),
+             "candidates": int(self.diag_counters.get("candidates", 0)),
+             "entry_intents": int(self.diag_counters.get("entry_orders", 0)),
+             "exit_intents": int(self.diag_counters.get("exit_orders", 0)),
+             "preflight_ok": int(self.diag_counters.get("preflight_ok", 0)),
+             "preflight_fail": int(self.diag_counters.get("preflight_fail", 0)),
+             "fail_reasons": fail_reasons,
+             "ts": now_kst().isoformat(),
+         }
+         logger.info(
+             "[PB1][DIAG-SUMMARY] level=%s mode=%s universe=%s candidates=%s entry_intents=%s exit_intents=%s preflight_ok=%s preflight_fail=%s reasons=%s",
+             summary["level"],
+             summary["order_mode"],
+             summary["universe"],
+             summary["candidates"],
+             summary["entry_intents"],
+             summary["exit_intents"],
+             summary["preflight_ok"],
+@@ -671,139 +674,152 @@ class OrderExecutor:
+ 
+ 
+ class DryRunExecutor(OrderExecutor):
+     def __init__(self, *, ledger: LedgerStore, env: str, run_id: str, diag_counters: Dict[str, object]) -> None:
+         super().__init__(ledger=ledger, env=env, run_id=run_id, diag_counters=diag_counters)
+ 
+     def submit_order(self, **kwargs) -> tuple[List[Path], bool, str | None]:
+         self._bump_preflight(True, None)
+         return [], True, None
+ 
+     def submit_exit(self, **kwargs) -> tuple[List[Path], bool, str | None]:
+         self._bump_preflight(True, None)
+         return [], True, None
+ 
+ 
+ class ShadowExecutor(OrderExecutor):
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+         ledger: LedgerStore,
+         env: str,
+         run_id: str,
+         worktree_dir: Path,
+         diag_counters: Dict[str, object],
++        shadow_skip_reason: str | None = None,
+     ) -> None:
+         super().__init__(ledger=ledger, env=env, run_id=run_id, diag_counters=diag_counters)
+         self.kis = kis
+         self.worktree_dir = worktree_dir
++        self.shadow_skip_reason = shadow_skip_reason
+ 
+     def _shadow_ack(
+         self,
+         *,
+         code: str,
+         market: str,
+         mode: int,
+         qty: int,
+         price: float | None,
+         client_order_key: str,
+         stage: str,
+         side: str,
+         ok: bool,
+         reason: str | None,
+     ) -> Path:
+         ack = new_order_ack(
+             code=code,
+             market=market,
+             sid=1,
+             mode=mode,
+             env=self.env,
+             run_id=self.run_id,
+             side=side,
+             qty=qty,
+             price=price,
+             odno="",
+             client_order_key=client_order_key,
+             ok=ok,
+             reasons=[] if ok else [reason or "shadow_fail"],
+             stage=stage,
+             payload={
+                 "mode": "shadow",
+                 "preflight_ok": ok,
+                 "reason": reason,
+             },
+         )
+         return self.ledger.append_event("orders_ack", ack)
+ 
+     def submit_order(self, **kwargs) -> tuple[List[Path], bool, str | None]:
+         code = kwargs.get("code")
+         qty = kwargs.get("qty")
+         price = kwargs.get("price")
+         market = kwargs.get("market")
+         mode = kwargs.get("mode")
+         client_order_key = kwargs.get("client_order_key")
+         stage = kwargs.get("stage")
+         side = kwargs.get("side", "BUY")
+         paths: List[Path] = []
+-        if not self.kis:
++        if self.shadow_skip_reason:
++            ok = False
++            reason = self.shadow_skip_reason
++            payload: Dict[str, object] = {"skipped": True, "reason": reason}
++        elif not self.kis:
++            ok = False
+             reason = "kis_missing"
+-            self._bump_preflight(False, reason)
+-            paths.append(
+-                self._shadow_ack(
+-                    code=code,
+-                    market=market,
+-                    mode=mode,
+-                    qty=qty,
+-                    price=price,
+-                    client_order_key=client_order_key,
+-                    stage=stage,
+-                    side=side,
+-                    ok=False,
+-                    reason=reason,
+-                )
+-            )
+-            return paths, False, reason
+-        if side == "BUY":
+-            ok, reason = self.kis.validate_buy(code, qty, price)
++            payload = {"skipped": True, "reason": reason}
+         else:
+-            ok, reason = self.kis.validate_sell(code, qty, price)
++            try:
++                result = self.kis.check_orderable(code=code, qty=qty, price=price, side=side, order_type="market")
++            except Exception as exc:
++                result = {"ok": False, "reason": f"exception:{exc.__class__.__name__}", "error": str(exc)}
++            ok = bool(result.get("ok"))
++            reason = str(result.get("reason") or ("ok" if ok else "shadow_check_failed"))
++            payload = {"result": result}
+         self._bump_preflight(ok, reason)
+         paths.append(
+             self._shadow_ack(
+                 code=code,
+                 market=market,
+                 mode=mode,
+                 qty=qty,
+                 price=price,
+                 client_order_key=client_order_key,
+                 stage=stage,
+                 side=side,
+                 ok=ok,
+                 reason=reason,
+             )
+         )
++        check_event = new_shadow_check(
++            code=code,
++            market=market,
++            sid=1,
++            mode=mode,
++            env=self.env,
++            run_id=self.run_id,
++            side=side,
++            qty=qty,
++            price=price,
++            client_order_key=client_order_key,
++            ok=ok,
++            reasons=[] if ok else [reason],
++            stage=stage,
++            payload=payload,
++        )
++        paths.append(self.ledger.append_event("orders_shadow_check", check_event))
+         return paths, ok, reason
+ 
+     def submit_exit(self, **kwargs) -> tuple[List[Path], bool, str | None]:
+         return self.submit_order(**kwargs)
+ 
+ 
+ class LiveExecutor(OrderExecutor):
+     def __init__(
+         self,
+         *,
+         kis: KisAPI | None,
+         ledger: LedgerStore,
+         env: str,
+         run_id: str,
+         worktree_dir: Path,
+         diag_counters: Dict[str, object],
+     ) -> None:
+         super().__init__(ledger=ledger, env=env, run_id=run_id, diag_counters=diag_counters)
+         self.kis = kis
+         self.worktree_dir = worktree_dir
+ 
+     def _handle_order(
+         self,
+         *,
+         code: str,
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index d53f236959386be40b3ad0f84e30226ffd441912..ab98a1968caed728dcacc0e946eef103f7ab7959 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -21,103 +21,115 @@ from trader.config import (
+     MORNING_EXIT_END,
+     AFTERNOON_WINDOW_START,
+     AFTERNOON_WINDOW_END,
+     CLOSE_AUCTION_START,
+     CLOSE_AUCTION_END,
+     PB1_FORCE_ENTRY_ON_PUSH,
+     PB1_WAIT_FOR_WINDOW,
+     PB1_MAX_WAIT_FOR_WINDOW_MIN,
+     MARKET_OPEN_HHMM,
+     MARKET_CLOSE_HHMM,
+ )
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.botstate_sync import (
+     acquire_lock,
+     release_lock,
+     setup_worktree,
+     persist_run_files,
+     resolve_botstate_worktree_dir,
+ )
+ from trader.pb1_engine import PB1Engine
+ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _coerce_diag_level(raw: str | int | None) -> int:
++    try:
++        return max(0, int(raw))  # type: ignore[arg-type]
++    except Exception:
++        return 0
++
++
++def _resolve_order_mode(diag_level: int, shadow_live_flag: bool, action: str) -> str:
++    if diag_level >= 2:
++        return "shadow" if shadow_live_flag else "intent_only"
++    if diag_level == 1:
++        return "intent_only"
++    if action == "diag":
++        return "dry_run"
++    return "live"
++
++
+ def truthy(value: object) -> bool:
+     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+ 
+ 
+ def _parse_hhmm_to_time(hhmm: str) -> time:
+     hh, mm = hhmm.split(":")
+     return dtime(hour=int(hh), minute=int(mm))
+ 
+ 
+ def _next_window_start(now: datetime, window_starts: list[dtime]) -> datetime | None:
+     sorted_starts = sorted(window_starts)
+     for start in sorted_starts:
+         if now.time() < start:
+             return now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+     return None
+ 
+ 
+ def _market_session(now: datetime) -> tuple[datetime, datetime]:
+     open_t = _parse_hhmm_to_time(MARKET_OPEN_HHMM)
+     close_t = _parse_hhmm_to_time(MARKET_CLOSE_HHMM)
+     return (
+         now.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0),
+         now.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0),
+     )
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
+     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon", "diagnostic"], help="Execution window override")
+     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
+     parser.add_argument("--target-branch", default=os.getenv("BOTSTATE_BRANCH", "bot-state"), help="Bot-state target branch")
+     return parser.parse_args()
+ 
+ 
+ def main() -> None:
+     args = parse_args()
+     now = now_kst()
+     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
+     event_name_lower = event_name.lower()
+     trading_day = is_trading_day(now)
+     non_trading_day = not trading_day
+     diag_env_flag = (
+         env_bool("DIAGNOSTIC_FORCE_RUN", False)
+         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
+         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
+     )
+     diag_level_raw = os.getenv("PB1_DIAG_LEVEL", str(PB1_DIAG_LEVEL))
+-    try:
+-        diag_level = int(diag_level_raw)
+-    except Exception:
+-        diag_level = 1
+-    if diag_level not in (1, 2):
+-        diag_level = 1
++    diag_level = _coerce_diag_level(diag_level_raw)
+     shadow_live_flag = env_bool("PB1_SHADOW_LIVE", PB1_SHADOW_LIVE)
+     _, market_close_dt = _market_session(now)
+     market_close_time = market_close_dt.time()
+     wait_enabled = env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW)
+     if event_name_lower == "schedule":
+         wait_enabled = False
+     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
+     window = decide_window(now=now, override=args.window if args.window != "diagnostic" else "auto")
+     if args.window == "diagnostic":
+         window = WindowDecision(name="diagnostic", phase=args.phase if args.phase != "auto" else "verify")
+     window_name_for_log = window.name if window else "none"
+     phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+     target_start = None
+ 
+     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
+     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
+     os.environ.setdefault("MORNING_EXIT_START", MORNING_EXIT_START)
+     os.environ.setdefault("MORNING_EXIT_END", MORNING_EXIT_END)
+     os.environ.setdefault("AFTERNOON_WINDOW_START", AFTERNOON_WINDOW_START)
+     os.environ.setdefault("AFTERNOON_WINDOW_END", AFTERNOON_WINDOW_END)
+     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
+     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
+ 
+     worktree_dir = resolve_botstate_worktree_dir()
+     setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
+@@ -185,240 +197,256 @@ def main() -> None:
+             now = now_kst()
+             remaining = (target_start - now).total_seconds()
+             if remaining <= 0:
+                 break
+             if remaining > max_wait_s:
+                 logger.info(
+                     "[PB1][RUN-PLAN] action=skip reason=wait_exceeds_max target_start=%s remaining_s=%.0f max_wait_s=%s",
+                     target_start.isoformat(),
+                     remaining,
+                     max_wait_s,
+                 )
+                 return
+             sleep_for = min(30, remaining)
+             logger.info("[PB1][WAIT] until=%s remaining_s=%.0f sleep=%.0f", target_start.isoformat(), remaining, sleep_for)
+             time_mod.sleep(sleep_for)
+         now = now_kst()
+         trading_day = is_trading_day(now)
+         non_trading_day = not trading_day
+         force_diag = diag_env_flag or not trading_day or now.time() >= market_close_time
+         window = decide_window(now=now, override=args.window)
+         window_name_for_log = window.name if window else "none"
+         phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+         if window is None and not force_diag:
+             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+             return
++        if force_diag:
++            diag_level = max(1, diag_level)
+         action = "diag" if force_diag else "run"
+ 
+-    if shadow_live_flag and action in {"run", "wait"}:
++    if shadow_live_flag and action in {"run", "wait"} and diag_level >= 2:
+         action = "shadow_live"
+-    if action == "diag":
+-        action = "diag_deep" if diag_level == 2 else "diag_verify"
++    if force_diag:
++        diag_level = max(1, diag_level)
+ 
+     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
+     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
+     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
+     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+     dry_run_reasons: list[str] = []
+-    order_mode = "live"
+-    if action == "diag_verify":
+-        order_mode = "dry_run"
+-    elif action in {"diag_deep", "shadow_live"}:
+-        order_mode = "shadow"
++    dry_run_reason = "live"
++    dry_run = False
++    order_mode = _resolve_order_mode(diag_level, shadow_live_flag, action)
+     if non_trading_day:
+         dry_run_reasons.append("non_trading_day")
+         os.environ["PB1_ENTRY_ENABLED"] = "0"
+         os.environ["DIAGNOSTIC_FORCE_RUN"] = "1"
+         if order_mode != "shadow":
+             os.environ["DISABLE_LIVE_TRADING"] = "1"
+             os.environ["DRY_RUN"] = "1"
+             os.environ["LIVE_TRADING_ENABLED"] = "0"
+-            order_mode = "dry_run"
+-    diag_enabled = force_diag or diag_env_flag or action.startswith("diag")
++            order_mode = "intent_only"
++    diag_enabled = force_diag or diag_env_flag or diag_level > 0
+     if force_diag and not non_trading_day and now.time() >= market_close_time:
+         dry_run_reasons.append("market_closed")
+-    if diag_enabled and order_mode == "dry_run":
++    if diag_enabled and order_mode in {"dry_run", "intent_only", "shadow"}:
+         dry_run_reasons.append("diagnostic_mode")
+     if mode == "INTENT_ONLY":
+         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
+         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
+     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
+     dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
+     if not live_trading_flag.value and mode == "LIVE":
+         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+     if dry_run_flag.value:
+         dry_run_reasons.append("DRY_RUN=1")
+     for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
+         if not flag.valid:
+             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+ 
+-    dry_run = bool(dry_run_reasons) or order_mode == "dry_run"
+-    if order_mode == "shadow":
+-        dry_run = False
+-    dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
++    shadow_skip_reason = None
++    def _is_dummy_secret(val: str | None) -> bool:
++        s = (val or "").strip().lower()
++        return (not s) or s in {"dummy", "none", "null"} or all(ch == "0" for ch in s)
+ 
+-    logger.info(
+-        "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
+-        event_name_lower or "unknown",
+-        dry_run,
+-        dry_run_reasons or ["live"],
+-    )
+-
+-    expect_kis_env = os.getenv("EXPECT_KIS_ENV")
+-    kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
+-    kis_env = kis_env_raw.lower()
+-    api_base_url = (os.getenv("API_BASE_URL") or "").lower()
+-    guard_live = expect_live_flag and not diag_enabled and trading_day and not dry_run
+-    if guard_live:
+-        guard_failures: list[str] = []
+-        if dry_run:
+-            guard_failures.append("dry_run")
+-        if not live_trading_flag.value or not live_trading_flag.valid:
+-            guard_failures.append("LIVE_TRADING_ENABLED!=1")
+-        if disable_live_flag.value or not disable_live_flag.valid:
+-            guard_failures.append("DISABLE_LIVE_TRADING!=0")
+-        if mode != "LIVE":
+-            guard_failures.append("STRATEGY_MODE!=LIVE")
+-        if kis_env != "practice":
+-            guard_failures.append("KIS_ENV!=practice")
+-        if "openapivts" not in api_base_url:
+-            guard_failures.append("API_BASE_URL missing openapivts")
+-        if expect_kis_env and kis_env_raw != expect_kis_env:
+-            guard_failures.append("EXPECT_KIS_ENV mismatch")
+-        if guard_failures:
+-            raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
++    kis_credentials_missing = _is_dummy_secret(os.getenv("KIS_APP_KEY") or os.getenv("APP_KEY")) or _is_dummy_secret(os.getenv("KIS_APP_SECRET") or os.getenv("APP_SECRET")) or _is_dummy_secret(os.getenv("CANO")) or _is_dummy_secret(os.getenv("ACNT_PRDT_CD"))
++    if kis_credentials_missing and diag_enabled:
++        dry_run_reasons.append("missing_kis_secrets")
++        shadow_skip_reason = "missing_kis_secrets"
++        if order_mode == "live":
++            order_mode = "intent_only"
+ 
+     def _apply_env_flags(order_mode_value: str) -> None:
+-        os.environ["DRY_RUN"] = "1" if order_mode_value == "dry_run" else "0"
++        os.environ["DRY_RUN"] = "1" if order_mode_value in {"dry_run", "intent_only"} else "0"
+         if order_mode_value == "shadow":
+-            os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
+-            os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not disable_live_flag.value) else "0"
++            os.environ["DISABLE_LIVE_TRADING"] = "1"
++            os.environ["LIVE_TRADING_ENABLED"] = "0"
+         else:
+-            os.environ["DISABLE_LIVE_TRADING"] = "1" if (order_mode_value == "dry_run" or disable_live_flag.value or non_trading_day) else "0"
++            os.environ["DISABLE_LIVE_TRADING"] = "1" if (order_mode_value in {"dry_run", "intent_only"} or disable_live_flag.value or non_trading_day) else "0"
+             os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not non_trading_day and order_mode_value == "live") else "0"
+         os.environ["STRATEGY_MODE"] = mode
+         os.environ["ORDER_MODE"] = order_mode_value
+ 
+-    _apply_env_flags(order_mode)
+-
+     phase_override_arg = args.phase
+     if (
+         window
+         and event_name_lower == "push"
+         and phase_override_arg == "auto"
+         and window.name == "afternoon"
+         and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
+     ):
+         try:
+             start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
+             end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
+             in_afternoon = start.time() <= now.time() < end.time()
+         except Exception:
+             in_afternoon = False
+         if trading_day and in_afternoon and window.phase == "prep":
+             logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
+             phase_override_arg = "entry"
+ 
+-    if action in {"diag_verify", "diag_deep"}:
+-        if action == "diag_verify":
++    if diag_enabled:
++        if diag_level >= 2 and action in {"shadow_live", "diag"}:
++            order_mode = "shadow" if shadow_live_flag else order_mode
++        if order_mode == "intent_only":
+             dry_run = True
+-            order_mode = "dry_run"
+-        else:
+-            dry_run = False
+-            order_mode = "shadow"
+         dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
+         dry_run_reasons = dry_run_reasons or ["diagnostic"]
+-        diag_enabled = True
+         if args.phase == "auto":
+             phase_override_arg = "verify"
+         window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
+         _apply_env_flags(order_mode)
+ 
++    dry_run = bool(dry_run_reasons) or order_mode in {"dry_run", "intent_only"}
++    if order_mode == "shadow" and not shadow_skip_reason:
++        dry_run = False
++    dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
++    _apply_env_flags(order_mode)
++
++    logger.info(
++        "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
++        event_name_lower or "unknown",
++        dry_run,
++        dry_run_reasons or ["live"],
++    )
++
++    expect_kis_env = os.getenv("EXPECT_KIS_ENV")
++    kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
++    kis_env = kis_env_raw.lower()
++    api_base_url = (os.getenv("API_BASE_URL") or "").lower()
++    guard_live = expect_live_flag and not diag_enabled and trading_day and not dry_run
++    if guard_live:
++        guard_failures: list[str] = []
++        if dry_run:
++            guard_failures.append("dry_run")
++        if not live_trading_flag.value or not live_trading_flag.valid:
++            guard_failures.append("LIVE_TRADING_ENABLED!=1")
++        if disable_live_flag.value or not disable_live_flag.valid:
++            guard_failures.append("DISABLE_LIVE_TRADING!=0")
++        if mode != "LIVE":
++            guard_failures.append("STRATEGY_MODE!=LIVE")
++        if kis_env != "practice":
++            guard_failures.append("KIS_ENV!=practice")
++        if "openapivts" not in api_base_url:
++            guard_failures.append("API_BASE_URL missing openapivts")
++        if expect_kis_env and kis_env_raw != expect_kis_env:
++            guard_failures.append("EXPECT_KIS_ENV mismatch")
++        if guard_failures:
++            raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
++
+     window_name_for_log = window.name if window else "none"
+     phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+ 
+     logger.info(
+-        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s ORDER_MODE=%s reasons=%s",
++        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s diag_level=%s shadow_live=%s order_mode=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
+         event_name_lower or "unknown",
+         now.isoformat(),
+         trading_day,
+         window_name_for_log,
+         phase_for_log,
++        diag_level,
++        shadow_live_flag,
++        order_mode,
+         dry_run,
+         os.getenv("DISABLE_LIVE_TRADING"),
+         os.getenv("LIVE_TRADING_ENABLED"),
+         os.getenv("STRATEGY_MODE"),
+         os.getenv("PB1_ENTRY_ENABLED"),
+-        order_mode,
+         dry_run_reasons or ["live"],
+     )
+ 
+     if non_trading_day:
+         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
+         if diag_enabled:
+             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     run_id = os.getenv("GITHUB_RUN_ID", "local")
+     lock_acquired = acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
+     if not lock_acquired:
+         logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s", owner, run_id)
+         return
+ 
+     os.environ["STATE_PATH"] = str(worktree_dir / "trader" / "state" / "state.json")
+     from trader import state_store as runtime_state_store
+     state_dir = Path(os.environ["STATE_PATH"]).parent
+     state_dir.mkdir(parents=True, exist_ok=True)
+     state_target_path = Path(os.environ["STATE_PATH"])
+ 
+     runtime_state = {}
+     kis: KisAPI | None = None
+     try:
+         runtime_state = runtime_state_store.load_state()
+-        kis = KisAPI()
+-        balance = kis.get_balance()
+-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
+-        runtime_state_store.save_state(runtime_state)
++        if kis_credentials_missing:
++            logger.warning("[PB1][KIS] credentials missing -> skip balance reconcile")
++        else:
++            kis = KisAPI()
++            balance = kis.get_balance()
++            runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
++            runtime_state_store.save_state(runtime_state)
+     except Exception:
+         logger.exception("[PB1] runtime state reconcile failed")
+         runtime_state = runtime_state or runtime_state_store.load_state()
+         dry_run_reasons.append("kis_init_failed")
+         dry_run_reason = ",".join(dry_run_reasons)
+         dry_run = True
+-        _apply_env_flags(dry_run)
++        if order_mode == "shadow":
++            order_mode = "intent_only"
++        _apply_env_flags(order_mode)
+ 
+     if DIAGNOSTIC_ONLY:
+         logger.info("[PB1][DIAG] diagnostic_only mode -> exit")
+         release_lock(worktree_dir, run_id=run_id)
+         return
+ 
+     touched: list[Path] = []
+     try:
+         engine = PB1Engine(
+             kis=kis,
+             worktree_dir=worktree_dir,
+             window=window,
+             phase_override=phase_override_arg,
+             dry_run=dry_run,
+             env="shadow" if order_mode == "shadow" else "paper" if dry_run else kis.env if kis else "paper",
+             run_id=run_id,
+             order_mode=order_mode,
+             diag_level=diag_level,
++            shadow_skip_reason=shadow_skip_reason,
+         )
+         touched = engine.run()
+         if state_target_path.exists():
+             touched.append(state_target_path)
+         logger.info("[PB1] run complete touched=%s", touched)
+         persist_run_files(
+             worktree_dir,
+             touched,
+             message=f"pb1 ledger run_id={run_id} window={window.name} phase={engine.phase}",
+         )
+     finally:
+         release_lock(worktree_dir, run_id=run_id)
+ 
+ 
+ if __name__ == "__main__":
+     main()

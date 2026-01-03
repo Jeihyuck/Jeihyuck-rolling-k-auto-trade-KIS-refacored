@@ -27,7 +27,7 @@ from trader.config import (
 )
 from trader.utils.env import env_bool
 from trader.kis_wrapper import KisAPI
-from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
+from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled, new_shadow_check
 from trader.ledger.store import LedgerStore
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
 from trader.utils.ohlcv import normalize_ohlcv
@@ -64,6 +64,7 @@ class PB1Engine:
         run_id: str,
         order_mode: str = "live",
         diag_level: int = 1,
+        shadow_skip_reason: str | None = None,
     ) -> None:
         self.kis = kis
         self.worktree_dir = worktree_dir
@@ -90,6 +91,7 @@ class PB1Engine:
             "preflight_fail": 0,
             "fail_reasons": [],
         }
+        self.shadow_skip_reason = shadow_skip_reason
         self.executor = self._build_executor()
 
     def _build_executor(self):
@@ -101,8 +103,9 @@ class PB1Engine:
                 run_id=self.run_id,
                 worktree_dir=self.worktree_dir,
                 diag_counters=self.diag_counters,
+                shadow_skip_reason=self.shadow_skip_reason,
             )
-        if self.order_mode == "dry_run":
+        if self.order_mode in {"dry_run", "intent_only"}:
             return DryRunExecutor(
                 ledger=self.ledger,
                 env=self.env,
@@ -285,7 +288,7 @@ class PB1Engine:
             price=cf.features.get("close"),
             client_order_key=cf.client_order_key,
             ok=self.order_mode == "live",
-            reasons=["dry_run"] if self.order_mode == "dry_run" else ["shadow_mode"] if self.order_mode == "shadow" else ["pb1_close_entry"],
+            reasons=["dry_run"] if self.order_mode == "dry_run" else ["shadow_mode"] if self.order_mode == "shadow" else ["intent_only"] if self.order_mode == "intent_only" else ["pb1_close_entry"],
             stage="PB1-CLOSE",
             payload={"order_mode": self.order_mode},
         )
@@ -589,7 +592,7 @@ class PB1Engine:
         return touched
 
     def _emit_diag_summary(self, touched: List[Path]) -> List[Path]:
-        if self.order_mode != "shadow":
+        if self.diag_level <= 0:
             return touched
         fail_reasons = list(self.diag_counters.get("fail_reasons") or [])
         if not fail_reasons:
@@ -693,10 +696,12 @@ class ShadowExecutor(OrderExecutor):
         run_id: str,
         worktree_dir: Path,
         diag_counters: Dict[str, object],
+        shadow_skip_reason: str | None = None,
     ) -> None:
         super().__init__(ledger=ledger, env=env, run_id=run_id, diag_counters=diag_counters)
         self.kis = kis
         self.worktree_dir = worktree_dir
+        self.shadow_skip_reason = shadow_skip_reason
 
     def _shadow_ack(
         self,
@@ -745,28 +750,22 @@ class ShadowExecutor(OrderExecutor):
         stage = kwargs.get("stage")
         side = kwargs.get("side", "BUY")
         paths: List[Path] = []
-        if not self.kis:
+        if self.shadow_skip_reason:
+            ok = False
+            reason = self.shadow_skip_reason
+            payload: Dict[str, object] = {"skipped": True, "reason": reason}
+        elif not self.kis:
+            ok = False
             reason = "kis_missing"
-            self._bump_preflight(False, reason)
-            paths.append(
-                self._shadow_ack(
-                    code=code,
-                    market=market,
-                    mode=mode,
-                    qty=qty,
-                    price=price,
-                    client_order_key=client_order_key,
-                    stage=stage,
-                    side=side,
-                    ok=False,
-                    reason=reason,
-                )
-            )
-            return paths, False, reason
-        if side == "BUY":
-            ok, reason = self.kis.validate_buy(code, qty, price)
+            payload = {"skipped": True, "reason": reason}
         else:
-            ok, reason = self.kis.validate_sell(code, qty, price)
+            try:
+                result = self.kis.check_orderable(code=code, qty=qty, price=price, side=side, order_type="market")
+            except Exception as exc:
+                result = {"ok": False, "reason": f"exception:{exc.__class__.__name__}", "error": str(exc)}
+            ok = bool(result.get("ok"))
+            reason = str(result.get("reason") or ("ok" if ok else "shadow_check_failed"))
+            payload = {"result": result}
         self._bump_preflight(ok, reason)
         paths.append(
             self._shadow_ack(
@@ -782,6 +781,23 @@ class ShadowExecutor(OrderExecutor):
                 reason=reason,
             )
         )
+        check_event = new_shadow_check(
+            code=code,
+            market=market,
+            sid=1,
+            mode=mode,
+            env=self.env,
+            run_id=self.run_id,
+            side=side,
+            qty=qty,
+            price=price,
+            client_order_key=client_order_key,
+            ok=ok,
+            reasons=[] if ok else [reason],
+            stage=stage,
+            payload=payload,
+        )
+        paths.append(self.ledger.append_event("orders_shadow_check", check_event))
         return paths, ok, reason
 
     def submit_exit(self, **kwargs) -> tuple[List[Path], bool, str | None]:

@@ -101,7 +101,7 @@ CONFIG = {
     "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
     "DIAGNOSTIC_TARGET_MARKETS": "",
     "DIAGNOSTIC_MAX_SYMBOLS": "200",
-    "PB1_DIAG_LEVEL": "1",  # 1=fast verify, 2=deep shadow
+    "PB1_DIAG_LEVEL": "0",  # 0=live, 1=intent-only diag, 2=shadow diag
     "PB1_SHADOW_LIVE": "0",
     # === Strategy intent/exec defaults ===
     "ENABLED_STRATEGIES": "",
@@ -441,7 +441,7 @@ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
 PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
 MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
 MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
-PB1_DIAG_LEVEL = int(_cfg("PB1_DIAG_LEVEL") or "1")
+PB1_DIAG_LEVEL = int(_cfg("PB1_DIAG_LEVEL") or "0")
 PB1_SHADOW_LIVE = _cfg_bool("PB1_SHADOW_LIVE", fallback=False)
 PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
 PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
