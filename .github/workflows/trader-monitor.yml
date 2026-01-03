@@ -1,0 +1,138 @@
+name: Trade Monitor (PB1 One-Shot)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # KST 08:57 = UTC 23:57 (daily)
+    - cron: "57 23 * * 0-6"
+  workflow_dispatch:
+
+concurrency:
+  group: trade-bot-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  pb1:
+    runs-on: ubuntu-latest
+
+    env:
+      # --- Secrets mapping ---
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+
+      # --- PB1 live controls ---
+      BOTSTATE_BRANCH: "bot-state"
+      BOTSTATE_WORKTREE_DIR: "_botstate"
+      DISABLE_LIVE_TRADING: "0"
+      LIVE_TRADING_ENABLED: "1"
+      DRY_RUN: "0"
+      STRATEGY_MODE: "LIVE"
+      PB1_ENTRY_ENABLED: "1"
+      PB1_DIAG_LEVEL: "2"
+      PB1_SHADOW_LIVE: "1"
+
+      # --- Strategy parameters (kept for visibility) ---
+      PARTIAL1: "0.5"
+      PARTIAL2: "0.3"
+      TRAIL_PCT: "0.02"
+      FAST_STOP: "0.01"
+      ATR_STOP: "1.5"
+      TIME_STOP_HHMM: "13:00"
+      SELL_FORCE_TIME: "14:40"
+      SELL_ALL_BALANCES_AT_CUTOFF: "false"
+      FORCE_SELL_PASSES_CUTOFF: "2"
+      FORCE_SELL_PASSES_CLOSE: "4"
+      DEFAULT_PROFIT_PCT: "3.0"
+      DEFAULT_LOSS_PCT: "5.0"
+      SLIPPAGE_LIMIT_PCT: "0.25"
+      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
+      VWAP_TOL: "0.003"
+      W_MAX_ONE: "0.25"
+      W_MIN_ONE: "0.03"
+      REBALANCE_ANCHOR: "weekly"
+      FORCE_WEEKLY_REBALANCE: "0"
+      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
+      KOSDAQ_INDEX_CODE: "KOSDAQ"
+      KOSDAQ_ETF_FALLBACK: "229200"
+      DAILY_CAPITAL: "250000000"
+      API_RATE_SLEEP_SEC: "0.3"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure git identity (required for botstate commits)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: (Guard) enforce safe events and required secrets
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Pull request event detected - trading steps are skipped."
+            exit 0
+          fi
+
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Non-main ref (${GITHUB_REF}) - trading is limited to main."
+            exit 0
+          fi
+
+          missing=()
+          for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
+            val="${!key}"
+            if [ -z "${val}" ]; then
+              missing+=("$key")
+            fi
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing required secrets/env for main: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Event and secrets validated for trading run."
+
+      - name: Install dependencies
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: PB1 one-shot run (auto: diag or live)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+
+      - name: Upload PB1 logs & ledger & state
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pb1-artifacts
+          path: |
+            trader/logs/**
+            _botstate/bot_state/trader_ledger/**
+            _botstate/trader/state/state.json
+            fastapi.log
+          if-no-files-found: warn
+          retention-days: 30
