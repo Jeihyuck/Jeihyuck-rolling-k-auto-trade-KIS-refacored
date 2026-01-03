@@ -2,9 +2,9 @@ name: Trade Monitor (PB1 One-Shot)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, nullim ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, nullim ]
   schedule:
     # KST 08:57 = UTC 23:57 (daily)
     - cron: "57 23 * * 0-6"
