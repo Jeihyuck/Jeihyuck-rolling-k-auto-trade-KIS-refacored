@@ -1,0 +1,66 @@
+# Jeihyuck-rolling-k-auto-trade-KIS-refacored
+
+## Portfolio split architecture
+This refactor promotes KOSPI and KOSDAQ trading into parallel engines under a shared portfolio manager while preserving the existing KOSDAQ intraday behavior.
+
+```
+portfolio/
+  base_engine.py
+  kospi_core_engine.py
+  kosdaq_alpha_engine.py
+  portfolio_manager.py
+strategy/
+  kospi/{universe.py, rebalance.py, signals.py}
+  kosdaq/{universe.py, rolling_entry.py, pullback.py}
+trader/
+  trader.py (entrypoint)
+  state_manager.py
+  legacy_kosdaq_runner.py (previous KOSDAQ loop kept intact)
+```
+
+## Engine responsibilities
+- **KOSPI core engine**: KOSPI market-cap Top-N universe, equal-weight targets, periodic rebalance with market orders and KIS quotes.
+- **KOSDAQ alpha engine**: delegates to the legacy rolling-K/VWAP/pullback loop unchanged, using its original state file for backward compatibility.
+- **Capital split**: `PortfolioManager` divides `DAILY_CAPITAL` (or supplied total) into KOSPI and KOSDAQ ratios (default 60/40) and runs each engine independently.
+- **Performance**: portfolio-level PnL snapshots combine KIS cash/positions with engine allocation ratios for unified reporting without coupling the two engines.
+  - Engine-level PnL is an attribution estimate based on capital split ratios because positions are pooled at the account level.
+
+## How to run
+```
+python -m trader.trader
+```
+This initializes the portfolio manager, runs KOSPI rebalance if due, then executes the existing KOSDAQ intraday loop without interrupting either engine on errors. The KOSDAQ loop is blocking, so the entrypoint runs a single orchestrated cycle via `run_once()` rather than a repeating scheduler.
+
+Workflow는 bot-state 브랜치에 bot_state/state.json을 커밋하여 런 간 상태를 유지합니다.
+
+## Diagnostic mode (no-order safety)
+Run a diagnostics-only pass (no KIS orders) even on non-trading days:
+```
+DIAGNOSTIC_MODE=true DIAGNOSTIC_ONLY=true python -m trader.trader
+```
+Key log markers for grep:
+- `[DIAG][TRADER] forcing DISABLE_LIVE_TRADING=true ...`
+- `[DIAG][STATE] reconciled positions=...`
+- `[DIAG][REBALANCE] kospi=... kosdaq=...`
+- `[DATA-HEALTH] code=... reasons=[...]`
+- `[SETUP-BAD] ... reasons=['...']` (never empty on failures)
+- `[ORPHAN]` / `[UNKNOWN]` aggregates
+- `[DIAG][DUMP] path=...`
+
+## Strategy intent mode (single-account multi-strategy)
+- A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
+- All five strategies (`breakout`~`volatility`) are present but **disabled by default**: `ENABLED_STRATEGIES=""` means no strategies run, and missing weights are treated as zero even when listed.
+- Enable a subset for testing, e.g. `ENABLED_STRATEGIES="momentum"` with optional weights `STRATEGY_WEIGHTS="momentum=0.10"`. Keep `STRATEGY_MODE=INTENT_ONLY` and `STRATEGY_DRY_RUN=true` (defaults) to avoid any KIS orders.
+- PortfolioManager order: strategies → KOSPI → KOSDAQ. During isolated testing use `DISABLE_KOSPI_ENGINE=true` or `DISABLE_KOSDAQ_LOOP=true` to skip respective engines.
+- State sync scripts in `scripts/state_pull_plain.sh` and `scripts/state_push_plain.sh` now copy the intent log/cursor alongside `trader/state/state.json` into the `bot-state` branch.
+
+## CI and live-trading safeguards
+- CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
+- The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.
+
+## PB1 운영 가이드 (종가 눌림목 클로즈 매수)
+- **윈도우**: 오전 08:50~11:00 KST(09:00~09:20 청산 전용), 오후 14:00~15:30 KST(15:20~15:30 신규 진입 전용). 윈도우 밖에서는 즉시 종료한다.
+- **모드**: 매수 시 `mode=1`(DAY) 또는 `mode=2`(SWING)으로 고정해 원장에 남긴다. DAY는 다음날 09:00~09:20에 시간청산(+R 기반 익절/손절), SWING은 -7%/-8% 하드스톱, MA20 트레일, 10거래일 타임스톱을 따른다.
+- **원장 경로**: 모든 이벤트는 `bot_state/trader_ledger/<kind>/<YYYY-MM-DD>/run_<run_id>.jsonl`(orders_intent/orders_ack/fills/exits_intent/errors)과 `bot_state/trader_ledger/reports/<YYYY-MM-DD>/pnl_snapshot.json`에 append-only로 남는다. 평균원가(가중평균)로 평단/수익률%를 재구성한다.
+- **DRY_RUN/LIVE**: `STRATEGY_MODE=INTENT_ONLY`+`DRY_RUN=1`이면 주문 호출 없이 ledger에 intent만 적재하며, LIVE(모의/실전)는 동일 로직으로 주문 수행 후 fill을 기록한다. `ENABLE_BREAKOUT=false`가 기본이며 돌파 신규 진입 경로는 차단된다.
+- **실행 방법**: `python -m trader.trader --window auto --phase auto --target-branch bot-state` (GitHub Actions `pb1-runner.yml`는 5분 간격으로 오전/오후 윈도우를 모두 커버).

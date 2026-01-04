@@ -1,0 +1,14 @@
+__pycache__/
+.runtime/
+**/__pycache__/
+.venv/
+.vscode/
+.idea/
+logs/
+watchlists/
+*.log
+*.json
+.env
+bot_state/state.json
+kis_token_cache.json
+fastapi.log
