@@ -5,47 +5,38 @@ import logging
 import os
 import time as time_mod
 from datetime import datetime, time as dtime
-from pathlib import Path
 
-from trader.kis_wrapper import KisAPI
-from trader.time_utils import is_trading_day, now_kst
 from trader.config import (
-    BOTSTATE_LOCK_TTL_SEC,
+    AFTERNOON_WINDOW_END,
+    AFTERNOON_WINDOW_START,
+    CLOSE_AUCTION_END,
+    CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
     DIAGNOSTIC_ONLY,
-    MORNING_WINDOW_START,
-    MORNING_WINDOW_END,
-    MORNING_EXIT_START,
-    MORNING_EXIT_END,
-    AFTERNOON_WINDOW_START,
-    AFTERNOON_WINDOW_END,
-    CLOSE_AUCTION_START,
-    CLOSE_AUCTION_END,
-    PB1_FORCE_ENTRY_ON_PUSH,
-    PB1_WAIT_FOR_WINDOW,
-    PB1_MAX_WAIT_FOR_WINDOW_MIN,
-    MARKET_OPEN_HHMM,
     MARKET_CLOSE_HHMM,
+    MARKET_OPEN_HHMM,
+    MORNING_EXIT_END,
+    MORNING_EXIT_START,
+    MORNING_WINDOW_END,
+    MORNING_WINDOW_START,
+    PB1_FORCE_ENTRY_ON_PUSH,
+    PB1_MAX_WAIT_FOR_WINDOW_MIN,
+    PB1_WAIT_FOR_WINDOW,
 )
-from trader.utils.env import env_bool, parse_env_flag, resolve_mode
-from trader.botstate_sync import (
-    acquire_lock,
-    release_lock,
-    setup_worktree,
-    persist_run_files,
-    resolve_botstate_worktree_dir,
-)
+from trader.db.engine import make_engine
+from trader.db.lock import release_lock, try_acquire_lock
+from trader.db.migrate import run_migrations
+from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
+from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine
+from trader.time_utils import is_trading_day, now_kst
+from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
 
 
-def truthy(value: object) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _parse_hhmm_to_time(hhmm: str) -> time:
+def _parse_hhmm_to_time(hhmm: str) -> dtime:
     hh, mm = hhmm.split(":")
     return dtime(hour=int(hh), minute=int(mm))
 
@@ -71,12 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
-    parser.add_argument("--target-branch", default=os.getenv("BOTSTATE_BRANCH", "bot-state"), help="Bot-state target branch")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    engine = make_engine()
+    run_migrations(engine)
+
     now = now_kst()
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
     event_name_lower = event_name.lower()
@@ -106,9 +99,6 @@ def main() -> None:
     os.environ.setdefault("AFTERNOON_WINDOW_END", AFTERNOON_WINDOW_END)
     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
-
-    worktree_dir = resolve_botstate_worktree_dir()
-    setup_worktree(Path.cwd(), worktree_dir, target_branch=args.target_branch)
 
     force_diag = diag_env_flag or not trading_day or now.time() >= market_close_time
     if not force_diag and window is None and trading_day and now.time() < market_close_time:
@@ -322,61 +312,69 @@ def main() -> None:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
 
     owner = os.getenv("GITHUB_ACTOR", "local")
-    run_id = os.getenv("GITHUB_RUN_ID", "local")
-    lock_acquired = acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
+    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+    lock_key = f"PB1:{kis_env_raw or 'practice'}"
+    lock_acquired = try_acquire_lock(engine, lock_key)
     if not lock_acquired:
-        logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s", owner, run_id)
+        logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, owner, workflow_run_id)
         return
 
-    os.environ["STATE_PATH"] = str(worktree_dir / "trader" / "state" / "state.json")
-    from trader import state_store as runtime_state_store
-    state_dir = Path(os.environ["STATE_PATH"]).parent
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_target_path = Path(os.environ["STATE_PATH"])
+    runs_repo = RunsRepo(engine)
+    universe_repo = UniverseRepo(engine)
+    orders_repo = OrdersRepo(engine)
+    fills_repo = FillsRepo(engine)
+    positions_repo = PositionsRepo(engine)
 
-    runtime_state = {}
-    kis: KisAPI | None = None
+    run_record_id = None
     try:
-        runtime_state = runtime_state_store.load_state()
-        kis = KisAPI()
-        balance = kis.get_balance()
-        runtime_state = runtime_state_store.reconcile_with_kis_balance(runtime_state, balance, active_strategies={1})
-        runtime_state_store.save_state(runtime_state)
-    except Exception:
-        logger.exception("[PB1] runtime state reconcile failed")
-        runtime_state = runtime_state or runtime_state_store.load_state()
-        dry_run_reasons.append("kis_init_failed")
-        dry_run_reason = ",".join(dry_run_reasons)
-        dry_run = True
-        _apply_env_flags(dry_run)
+        kis: KisAPI | None = None
+        try:
+            kis = KisAPI()
+            if kis.env != kis_env:
+                dry_run_reasons.append("kis_env_mismatch")
+                dry_run = True
+                _apply_env_flags(dry_run)
+        except Exception:
+            logger.exception("[PB1] KIS init failed, forcing dry-run")
+            dry_run_reasons.append("kis_init_failed")
+            dry_run = True
+            _apply_env_flags(dry_run)
 
-    if DIAGNOSTIC_ONLY:
-        logger.info("[PB1][DIAG] diagnostic_only mode -> exit")
-        release_lock(worktree_dir, run_id=run_id)
-        return
+        run_record_id = runs_repo.start_run(
+            env=kis_env or "practice",
+            strategy="pb1_pullback_close",
+            window=window_name_for_log,
+            phase=phase_override_arg,
+            event_name=event_name_lower,
+            dry_run=dry_run,
+            git_sha=os.getenv("GITHUB_SHA"),
+            workflow=os.getenv("GITHUB_WORKFLOW"),
+            workflow_run_id=workflow_run_id,
+            workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
+            config_json={"dry_run_reasons": dry_run_reasons, "window": window_name_for_log, "phase": phase_for_log},
+        )
 
-    touched: list[Path] = []
-    try:
-        engine = PB1Engine(
+        engine_runner = PB1Engine(
+            universe_repo=universe_repo,
+            orders_repo=orders_repo,
+            fills_repo=fills_repo,
+            positions_repo=positions_repo,
             kis=kis,
-            worktree_dir=worktree_dir,
             window=window,
             phase_override=phase_override_arg,
             dry_run=dry_run,
-            env="paper" if dry_run else kis.env if kis else "paper",
-            run_id=run_id,
+            env=kis_env or "practice",
+            run_id=run_record_id,
         )
-        touched = engine.run()
-        if state_target_path.exists():
-            touched.append(state_target_path)
-        logger.info("[PB1] run complete touched=%s", touched)
-        persist_run_files(
-            worktree_dir,
-            touched,
-            message=f"pb1 ledger run_id={run_id} window={window.name} phase={engine.phase}",
-        )
+        result = engine_runner.run()
+        runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+    except Exception as exc:
+        logger.exception("[PB1][FAIL] unexpected error")
+        if run_record_id:
+            runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+        raise
     finally:
-        release_lock(worktree_dir, run_id=run_id)
+        release_lock(engine, lock_key)
 
 
 if __name__ == "__main__":

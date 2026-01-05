@@ -2,20 +2,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from datetime import datetime
+from typing import Dict, Iterable, List
 
 import pandas as pd
 
-from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.config import (
     CAP_CAP,
     DAILY_CAPITAL,
     KOSDAQ_HARD_STOP_PCT,
     KOSPI_HARD_STOP_PCT,
-    LEDGER_BASE_DIR,
-    LEDGER_LOOKBACK_DAYS,
     PB1_ENTRY_ENABLED,
     PB1_DAY_SL_R,
     PB1_DAY_TP_R,
@@ -23,15 +19,13 @@ from trader.config import (
     PB1_TIME_STOP_DAYS,
     PB1_REQUIRE_VOLUME,
 )
-from trader.utils.env import env_bool
+from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.kis_wrapper import KisAPI
-from trader.ledger.event_types import new_error, new_exit_intent, new_order_intent, new_fill, new_order_ack, new_unfilled
-from trader.ledger.store import LedgerStore
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
-from trader.utils.ohlcv import normalize_ohlcv
 from trader.time_utils import now_kst
+from trader.utils.env import env_bool
+from trader.utils.ohlcv import normalize_ohlcv
 from trader.window_router import WindowDecision, resolve_phase
-from trader.botstate_sync import persist_run_files
 
 logger = logging.getLogger(__name__)
 
@@ -49,34 +43,45 @@ class CandidateFeature:
     planned_qty: int = 0
 
 
+@dataclass
+class RunResult:
+    status: str
+    notes: str | None = None
+
+
 class PB1Engine:
+    STRATEGY_NAME = "pb1_pullback_close"
+    UNIVERSE_STRATEGY = "best_k_meta"
+
     def __init__(
         self,
         *,
+        universe_repo: UniverseRepo,
+        orders_repo: OrdersRepo,
+        fills_repo: FillsRepo,
+        positions_repo: PositionsRepo,
         kis: KisAPI | None,
-        worktree_dir: Path,
         window: WindowDecision,
         phase_override: str,
         dry_run: bool,
         env: str,
         run_id: str,
     ) -> None:
+        self.universe_repo = universe_repo
+        self.orders_repo = orders_repo
+        self.fills_repo = fills_repo
+        self.positions_repo = positions_repo
         self.kis = kis
-        self.worktree_dir = worktree_dir
         self.window = window
         self.phase = resolve_phase(window, phase_override)
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
-        base_dir = LEDGER_BASE_DIR
-        if not Path(base_dir).is_absolute():
-            base_dir = worktree_dir / base_dir
-        self.ledger = LedgerStore(Path(base_dir), env=env, run_id=run_id)
-        self.worktree_dir = worktree_dir
-        self._today = now_kst().date().isoformat()
         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+        self._today = now_kst().date().isoformat()
+        self._universe_as_of = None
 
-    def _client_order_key(self, code: str, mode: int, side: str, stage: str, window_tag: str) -> str:
+    def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
 
     def _log_setup(self, cf: CandidateFeature) -> None:
@@ -108,73 +113,53 @@ class PB1Engine:
         df_norm, meta = normalize_ohlcv(df)
         return df_norm, meta
 
-    def _build_universe(self) -> Dict[str, List[Dict]]:
-        """
-        Build selection universe for PB1 without triggering any legacy order flows.
-        run_rebalance() in best_k_meta_strategy is selection-only and returns weights.
-        """
-        try:
-            rebalance_payload = run_rebalance(str(now_kst().date()), return_by_market=True)
-            return rebalance_payload.get("selected_by_market") or {}
-        except Exception:
-            logger.exception("[PB1][UNIVERSE][FAIL]")
-            return {}
-
-    def _code_market_map(self, selected_by_market: Dict[str, List[Dict]]) -> Dict[str, str]:
-        mapping: Dict[str, str] = {}
-        for market, rows in (selected_by_market or {}).items():
-            for row in rows or []:
-                code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-                mapping[code] = market
-        return mapping
-
-    def _compute_candidates(self, selected_by_market: Dict[str, List[Dict]]) -> List[CandidateFeature]:
+    def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
         candidates: List[CandidateFeature] = []
-        for market, rows in (selected_by_market or {}).items():
-            for row in rows or []:
-                code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-                try:
-                    df, meta = self._fetch_daily(code, count=120)
-                    if df.empty:
-                        cf = CandidateFeature(
-                            code=code,
-                            market=market,
-                            features={"reasons": ["data_empty"]},
-                            setup_ok=False,
-                            reasons=["data_empty"],
-                            mode=1,
-                            mode_reasons=["default_day_mode"],
-                        )
-                        self._log_setup(cf)
-                        candidates.append(cf)
-                        continue
-                    features = compute_features(df)
-                    features["market"] = market
-                    features["volume_missing"] = bool(meta.get("volume_missing"))
-                    if features.get("volume_missing"):
-                        features["volu_contraction"] = None
-                    ok, reasons = evaluate_setup(features, market, require_volume=self.require_volume)
-                    if features.get("volume_missing") and "volume_missing" not in reasons:
-                        reasons.append("volume_missing")
-                    if ok:
-                        reasons = []
-                    elif not reasons:
-                        reasons = ["unspecified_fail"]
-                    mode, mode_reasons = choose_mode(features)
+        for m in members:
+            code = str(m.get("code") or "").zfill(6)
+            market = m.get("market") or ""
+            try:
+                df, meta = self._fetch_daily(code, count=120)
+                if df.empty:
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features=features,
-                        setup_ok=ok,
-                        reasons=reasons,
-                        mode=mode,
-                        mode_reasons=mode_reasons,
+                        features={"reasons": ["data_empty"]},
+                        setup_ok=False,
+                        reasons=["data_empty"],
+                        mode=1,
+                        mode_reasons=["default_day_mode"],
                     )
                     self._log_setup(cf)
                     candidates.append(cf)
-                except Exception:
-                    logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                     continue
+                features = compute_features(df)
+                features["market"] = market
+                features["volume_missing"] = bool(meta.get("volume_missing"))
+                if features.get("volume_missing"):
+                    features["volu_contraction"] = None
+                ok, reasons = evaluate_setup(features, market, require_volume=self.require_volume)
+                if features.get("volume_missing") and "volume_missing" not in reasons:
+                    reasons.append("volume_missing")
+                if ok:
+                    reasons = []
+                elif not reasons:
+                    reasons = ["unspecified_fail"]
+                mode, mode_reasons = choose_mode(features)
+                cf = CandidateFeature(
+                    code=code,
+                    market=market,
+                    features=features,
+                    setup_ok=ok,
+                    reasons=reasons,
+                    mode=mode,
+                    mode_reasons=mode_reasons,
+                )
+                self._log_setup(cf)
+                candidates.append(cf)
+            except Exception:
+                logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                continue
         return candidates
 
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
@@ -188,121 +173,13 @@ class PB1Engine:
             qty = int(capital_per // close_px) if close_px > 0 else 0
             cf.planned_qty = max(qty, 0)
             cf.client_order_key = self._client_order_key(
-                cf.code, cf.mode, "BUY", "PB1", "close"
+                cf.code, cf.mode, "BUY", "close", "PB1"
             )
             if cf.planned_qty <= 0:
                 cf.setup_ok = False
                 cf.reasons.append("planned_qty_zero")
                 self._log_setup(cf)
         return candidates
-
-    def _should_block_order(self, client_order_key: str) -> bool:
-        if not client_order_key:
-            return True
-        return self.ledger.has_client_order_key(client_order_key)
-
-    def _append_intent(self, cf: CandidateFeature) -> None:
-        event = new_order_intent(
-            code=cf.code,
-            market=cf.market,
-            sid=1,
-            mode=cf.mode,
-            env="paper" if self.dry_run else self.kis.env if self.kis else "paper",
-            run_id=self.run_id,
-            side="BUY",
-            qty=cf.planned_qty,
-            price=cf.features.get("close"),
-            client_order_key=cf.client_order_key,
-            ok=not self.dry_run,
-            reasons=["dry_run"] if self.dry_run else ["pb1_close_entry"],
-            stage="PB1-CLOSE",
-        )
-        path = self.ledger.append_event("orders_intent", event)
-        logger.info("[PB1][ENTRY-INTENT] code=%s mode=%s qty=%s key=%s path=%s", cf.code, cf.mode, cf.planned_qty, cf.client_order_key, path)
-
-    def _place_entry(self, cf: CandidateFeature) -> List[Path]:
-        paths: List[Path] = []
-        self._append_intent(cf)
-        paths.append(self.ledger._run_file("orders_intent"))
-        if self.dry_run:
-            return paths
-        if not self.kis:
-            err = new_unfilled(
-                code=cf.code,
-                market=cf.market,
-                sid=1,
-                mode=cf.mode,
-                env=self.env,
-                run_id=self.run_id,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=cf.features.get("close"),
-                client_order_key=cf.client_order_key,
-                reasons=["kis_missing"],
-                stage="PB1-CLOSE",
-            )
-            paths.append(self.ledger.append_event("errors", err))
-            return paths
-        resp = None
-        try:
-            resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
-        except Exception:
-            logger.exception("[PB1][ENTRY][FAIL] code=%s", cf.code)
-        odno = ""
-        if isinstance(resp, dict):
-            odno = (resp.get("output") or {}).get("ODNO") or ""
-        ack = new_order_ack(
-            code=cf.code,
-            market=cf.market,
-            sid=1,
-            mode=cf.mode,
-            env=self.env,
-            run_id=self.run_id,
-            side="BUY",
-            qty=cf.planned_qty,
-            price=cf.features.get("close"),
-            odno=odno,
-            client_order_key=cf.client_order_key,
-            ok=bool(resp and resp.get("rt_cd") == "0"),
-            reasons=[] if resp and resp.get("rt_cd") == "0" else [resp.get("msg1", "order_failed")] if isinstance(resp, dict) else ["order_failed"],
-            stage="PB1-CLOSE",
-        )
-        paths.append(self.ledger.append_event("orders_ack", ack))
-        if resp and resp.get("rt_cd") == "0":
-            fill_price = cf.features.get("close")
-            fill = new_fill(
-                code=cf.code,
-                market=cf.market,
-                sid=1,
-                mode=cf.mode,
-                env=self.env,
-                run_id=self.run_id,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=fill_price,
-                odno=odno,
-                client_order_key=cf.client_order_key,
-                stage="PB1-CLOSE",
-            )
-            paths.append(self.ledger.append_event("fills", fill))
-            persist_run_files(self.worktree_dir, [paths[-1]], message=f"pb1 fill {self.run_id}")
-        else:
-            unfilled = new_unfilled(
-                code=cf.code,
-                market=cf.market,
-                sid=1,
-                mode=cf.mode,
-                env=self.env,
-                run_id=self.run_id,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=cf.features.get("close"),
-                client_order_key=cf.client_order_key,
-                reasons=ack.reasons if ack.reasons else ["order_failed"],
-                stage="PB1-CLOSE",
-            )
-            paths.append(self.ledger.append_event("errors", unfilled))
-        return paths
 
     def _mark_price(self, code: str) -> float | None:
         if self.kis:
@@ -325,6 +202,78 @@ class PB1Engine:
                 marks[code] = px
         return marks
 
+    def _should_block_order(self, client_order_key: str) -> bool:
+        if not client_order_key:
+            return True
+        return self.orders_repo.has_client_order_key(self.env, client_order_key)
+
+    def _place_entry(self, cf: CandidateFeature) -> None:
+        order_id = self.orders_repo.create_intent_idempotent(
+            env=self.env,
+            run_id=self.run_id,
+            strategy=self.STRATEGY_NAME,
+            sid=1,
+            mode=cf.mode,
+            code=cf.code,
+            market=cf.market,
+            side="BUY",
+            ord_type="MARKET",
+            qty=cf.planned_qty,
+            limit_price=cf.features.get("close"),
+            stage="PB1-CLOSE",
+            client_order_key=cf.client_order_key or "",
+            request_json={"features": cf.features, "reasons": cf.reasons},
+        )
+        if self.dry_run:
+            logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", cf.code, cf.planned_qty, cf.client_order_key, order_id)
+            return
+        if not self.kis:
+            logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", cf.code)
+            return
+        resp = None
+        kis_odno = None
+        try:
+            resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
+            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+        except Exception:
+            logger.exception("[PB1][ENTRY][FAIL] code=%s", cf.code)
+        self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            filled_at = now_kst()
+            self.fills_repo.upsert_fill(
+                env=self.env,
+                run_id=self.run_id,
+                order_id=order_id,
+                kis_odno=kis_odno,
+                trade_id=None,
+                code=cf.code,
+                market=cf.market,
+                side="BUY",
+                qty=cf.planned_qty,
+                price=cf.features.get("close") or 0.0,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+                raw_json=resp,
+            )
+            self.positions_repo.apply_fill(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=cf.mode,
+                code=cf.code,
+                market=cf.market,
+                side="BUY",
+                qty=cf.planned_qty,
+                price=cf.features.get("close") or 0.0,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+            )
+        else:
+            self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
         avg = pos.get("avg_buy_price")
         if not avg:
@@ -334,13 +283,11 @@ class PB1Engine:
         mode = pos.get("mode")
         if pos.get("sid") != 1:
             return
-        qty = pos.get("total_qty") or 0
+        qty = pos.get("qty") or 0
         if qty <= 0:
             return
-        mark = self._mark_price(code) or features.get("close")
-        if not mark:
-            return
-        ret_pct = ((mark - avg) / avg) * 100
+        mark = self._mark_price(code) or features.get("close") or avg
+        ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
         if self._should_block_order(client_key):
             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", code, mode, client_key)
@@ -351,13 +298,13 @@ class PB1Engine:
             r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
             take_profit = PB1_DAY_TP_R * r_pct
             stop_loss = PB1_DAY_SL_R * r_pct
-            trigger_tp = ret_pct >= take_profit
-            trigger_sl = ret_pct <= -stop_loss
             if window_tag != "morning":
                 return
             stage = "DAY-EXIT"
-            reasons = ["take_profit"] if trigger_tp else []
-            if trigger_sl:
+            reasons: list[str] = []
+            if ret_pct >= take_profit:
+                reasons.append("take_profit")
+            if ret_pct <= -stop_loss:
                 reasons.append("stop_loss")
             if not reasons:
                 reasons.append("time_exit")
@@ -380,189 +327,190 @@ class PB1Engine:
                 else:
                     return
             reasons = ["pb1_exit"]
-        event = new_exit_intent(
-            code=code,
-            market=market,
-            sid=1,
-            mode=mode,
+
+        order_id = self.orders_repo.create_intent_idempotent(
             env=self.env,
             run_id=self.run_id,
+            strategy=self.STRATEGY_NAME,
+            sid=1,
+            mode=mode,
+            code=code,
+            market=market,
             side="SELL",
+            ord_type="MARKET",
             qty=qty,
-            price=mark,
-            client_order_key=client_key,
-            ok=not self.dry_run,
-            reasons=["dry_run"] if self.dry_run else reasons,
+            limit_price=mark,
             stage=stage,
+            client_order_key=client_key,
+            request_json={"reasons": reasons, "ret_pct": ret_pct},
         )
-        path = self.ledger.append_event("exits_intent", event)
-        logger.info("[PB1][EXIT-INTENT] code=%s mode=%s stage=%s ret_pct=%.2f key=%s path=%s", code, mode, stage, ret_pct, client_key, path)
-        # execute sell when allowed
         if self.dry_run:
+            logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", code, qty, client_key, order_id)
             return
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", code)
             return
         resp = None
+        kis_odno = None
         try:
             resp = self.kis.sell_stock_market(code, qty)
+            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
             logger.exception("[PB1][EXIT][FAIL] code=%s", code)
-        odno = ""
-        if isinstance(resp, dict):
-            odno = (resp.get("output") or {}).get("ODNO") or ""
-        ack = new_order_ack(
-            code=code,
-            market=market,
-            sid=1,
-            mode=mode,
-            env=self.env,
-            run_id=self.run_id,
-            side="SELL",
-            qty=qty,
-            price=mark,
-            odno=odno,
-            client_order_key=client_key,
-            ok=bool(resp and resp.get("rt_cd") == "0"),
-            reasons=[] if resp and resp.get("rt_cd") == "0" else [resp.get("msg1", "order_failed")] if isinstance(resp, dict) else ["order_failed"],
-            stage=stage,
-        )
-        self.ledger.append_event("orders_ack", ack)
-        if resp and resp.get("rt_cd") == "0":
-            fill = new_fill(
-                code=code,
-                market=market,
-                sid=1,
-                mode=mode,
+        self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            filled_at = now_kst()
+            self.fills_repo.upsert_fill(
                 env=self.env,
                 run_id=self.run_id,
+                order_id=order_id,
+                kis_odno=kis_odno,
+                trade_id=None,
+                code=code,
+                market=market,
                 side="SELL",
                 qty=qty,
                 price=mark,
-                odno=odno,
-                client_order_key=client_key,
-                stage=stage,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+                raw_json=resp,
             )
-            fill_path = self.ledger.append_event("fills", fill)
-            persist_run_files(self.worktree_dir, [fill_path], message=f"pb1 fill {self.run_id}")
+            self.positions_repo.apply_fill(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=mode,
+                code=code,
+                market=market,
+                side="SELL",
+                qty=qty,
+                price=mark,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+            )
         else:
-            err = new_unfilled(
-                code=code,
-                market=market,
-                sid=1,
-                mode=mode,
-                env=self.env,
-                run_id=self.run_id,
-                side="SELL",
-                qty=qty,
-                price=mark,
-                client_order_key=client_key,
-                reasons=ack.reasons if ack.reasons else ["order_failed"],
-                stage=stage,
-            )
-            self.ledger.append_event("errors", err)
+            self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
 
-    def _positions_with_meta(self, positions: Dict[Tuple[str, int, int], Dict]) -> List[Dict]:
+    def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:
         enriched: List[Dict] = []
-        for (code, sid, mode), state in positions.items():
-            if sid != 1:
+        for state in positions:
+            if state.get("sid") != 1:
                 continue
             enriched.append(
                 {
-                    "code": code,
-                    "sid": sid,
-                    "mode": mode,
-                    "total_qty": state.get("total_qty") or 0,
+                    "code": state.get("code"),
+                    "sid": state.get("sid"),
+                    "mode": state.get("mode"),
+                    "qty": state.get("qty") or 0,
                     "avg_buy_price": state.get("avg_buy_price"),
                     "market": state.get("market"),
                     "holding_days": state.get("holding_days") or 0,
                     "first_buy_ts": state.get("first_buy_ts"),
+                    "total_cost": state.get("total_cost") or 0.0,
+                    "realized_pnl": state.get("realized_pnl") or 0.0,
                 }
             )
         return enriched
 
-    def run(self) -> List[Path]:
+    def _load_universe(self) -> list[dict]:
+        today = now_kst().date().isoformat()
+        members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
+        self._universe_as_of = today if members else None
+        if not members:
+            members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
+            if members:
+                self._universe_as_of = members[0].get("as_of_date")
+        return members
+
+    def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
+        fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
+        marks = self._fetch_marks([p["code"] for p in positions], fallback)
+        totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+        for pos in positions:
+            qty = pos.get("qty") or 0
+            mark = marks.get(pos["code"], pos.get("avg_buy_price") or 0.0)
+            market_value = float(mark) * qty
+            cost = float(pos.get("total_cost") or 0.0)
+            totals["market_value"] += market_value
+            totals["cost"] += cost
+            totals["realized"] += float(pos.get("realized_pnl") or 0.0)
+            totals["unrealized"] += market_value - cost
+        portfolio_return_pct = 0.0
+        if totals["cost"] > 0:
+            portfolio_return_pct = (totals["market_value"] - totals["cost"] + totals["realized"]) / totals["cost"] * 100
+        logger.info(
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f unrealized=%.2f realized=%.2f return_pct=%.2f",
+            self._universe_as_of or "none",
+            totals["market_value"],
+            totals["cost"],
+            totals["unrealized"],
+            totals["realized"],
+            portfolio_return_pct,
+        )
+        return totals
+
+    def run(self) -> RunResult:
         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
-        logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s", self.window.name, self.phase, self.dry_run)
-        run_files = self.ledger.open_run_files()
-        touched: List[Path] = list(run_files.values())
-        logger.info("[LEDGER][APPEND] kind=touch path=%s", run_files)
-        persist_run_files(self.worktree_dir, touched, message=f"pb1 touch run_id={self.run_id}")
-        positions = self.ledger.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-        selected = self._build_universe()
-        code_market = self._code_market_map(selected)
+        logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s env=%s", self.window.name, self.phase, self.dry_run, self.env)
+
+        members = self._load_universe()
+        if not members:
+            note = "universe_empty"
+            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+            return RunResult(status="SKIPPED", notes=note)
+
+        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        if self.phase in {"verify", "exit"}:
+            holdings = []
+            if self.kis:
+                try:
+                    holdings = self.kis.get_positions()
+                except Exception:
+                    logger.exception("[PB1][HOLDINGS][FAIL]")
+            if not positions and holdings:
+                bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=1,
+                    mode=1,
+                    holdings=holdings,
+                )
+                logger.info("[PB1][BOOTSTRAP] positions_inserted=%s", bootstrapped)
+                positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+            open_orders = self.orders_repo.get_open_orders(self.env)
+            if open_orders:
+                logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
+            self._pnl_snapshot(self._positions_with_meta(positions))
+            if self.phase == "verify":
+                return RunResult(status="OK", notes="verify_only")
+
+        code_market = {m.get("code"): m.get("market") for m in members}
         marks_fallback: Dict[str, float] = {}
         if self.phase in {"prep", "entry"}:
-            candidates = self._compute_candidates(selected)
+            candidates = self._compute_candidates(members)
             candidates = self._size_positions(candidates)
             if self.phase == "entry" and self.window.name == "afternoon":
-                code_hint = candidates[0].code if candidates else next(iter(code_market), "005930")
-                price_hint = candidates[0].features.get("close") if candidates else None
-                orderable_cash = 0
-                cash_meta: Dict[str, object] = {"source": "none", "raw_fields": {}, "clamp_applied": False}
-                if self.kis:
-                    orderable_cash, cash_meta = self.kis.get_orderable_cash(code_hint, price_hint)
-                if orderable_cash < 0:
-                    orderable_cash = 0
-                logger.info(
-                    "[PB1][CASH][ORDERABLE] value=%s source=%s clamp=%s raw_fields=%s",
-                    orderable_cash,
-                    cash_meta.get("source"),
-                    cash_meta.get("clamp_applied"),
-                    {
-                        k: (cash_meta.get("raw_fields") or {}).get(k)
-                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
-                    },
-                )
-                cash_block_logged = False
                 for cf in candidates:
-                    if not cf.setup_ok:
-                        continue
-                    if self._should_block_order(cf.client_order_key):
-                        continue
-                    if orderable_cash <= 0:
-                        if not cash_block_logged:
-                            logger.info(
-                                "[PB1][CASH-BLOCK] orderable=%s meta=%s reason=insufficient_cash",
-                                orderable_cash,
-                                {
-                                    "source": cash_meta.get("source"),
-                                    "raw_fields": {
-                                        k: (cash_meta.get("raw_fields") or {}).get(k)
-                                        for k in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt")
-                                    },
-                                    "clamp_applied": cash_meta.get("clamp_applied"),
-                                },
-                            )
-                            cash_block_logged = True
+                    if not cf.setup_ok or self._should_block_order(cf.client_order_key or ""):
                         continue
                     if not entry_allowed:
                         continue
-                    paths = self._place_entry(cf)
-                    touched.extend(paths)
-        elif self.phase in {"exit", "verify"}:
+                    self._place_entry(cf)
+        if self.phase in {"exit", "verify"}:
             pos_list = self._positions_with_meta(positions)
             for pos in pos_list:
                 df, _ = self._fetch_daily(pos["code"], count=120)
                 if df.empty:
-                    err = new_error(
-                        code=pos["code"],
-                        market=pos.get("market") or "",
-                        sid=1,
-                        mode=pos["mode"],
-                        env=self.env,
-                        run_id=self.run_id,
-                        reasons=["daily_data_missing"],
-                    )
-                    self.ledger.append_event("errors", err)
                     continue
                 features = compute_features(df)
                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
-                marks_fallback[pos["code"]] = features.get("close")
-                if self.phase == "exit":
-                    self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
+                marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
+                self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
         if self.phase == "entry" and self.window.name == "afternoon":
             pos_list = self._positions_with_meta(positions)
             for pos in pos_list:
@@ -571,16 +519,7 @@ class PB1Engine:
                     continue
                 features = compute_features(df)
                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
-                marks_fallback[pos["code"]] = features.get("close")
+                marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
                 self._plan_exit_event(pos, features, "close")
-        marks = self._fetch_marks([p["code"] for p in self._positions_with_meta(positions)], marks_fallback)
-        snapshot = self.ledger.generate_pnl_snapshot(positions, marks=marks)
-        logger.info(
-            "[PNL][SNAPSHOT] portfolio_return_pct=%.2f%% unrealized=%.2f realized=%.2f",
-            snapshot["totals"]["portfolio_return_pct"],
-            snapshot["totals"]["unrealized"],
-            snapshot["totals"]["realized"],
-        )
-        snap_path = self.ledger.write_snapshot(snapshot, self.run_id)
-        touched.append(snap_path)
-        return touched
+        self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
+        return RunResult(status="OK", notes=self._universe_as_of or "ok")
