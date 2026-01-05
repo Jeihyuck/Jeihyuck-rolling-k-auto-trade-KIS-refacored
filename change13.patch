@@ -1,47 +1,424 @@
-diff --git a/config/universe_seed_kosdaq50.csv b/config/universe_seed_kosdaq50.csv
-new file mode 100644
-index 0000000000000000000000000000000000000000..50470d710d6f97b9fa6b25af9a3a4073288e8bc9
---- /dev/null
-+++ b/config/universe_seed_kosdaq50.csv
-@@ -0,0 +1,17 @@
-+code,market,name
-+091990,KOSDAQ,셀트리온헬스케어
-+066970,KOSDAQ,엘앤에프
-+086520,KOSDAQ,에코프로
-+247540,KOSDAQ,에코프로비엠
-+214150,KOSDAQ,클래시스
-+196170,KOSDAQ,알테오젠
-+028300,KOSDAQ,HLB
-+035900,KOSDAQ,JYP Ent.
-+263750,KOSDAQ,펄어비스
-+036930,KOSDAQ,주성엔지니어링
-+200130,KOSDAQ,콜마비앤에이치
-+318660,KOSDAQ,셀리드
-+078520,KOSDAQ,에이블씨엔씨
-+138080,KOSDAQ,오이솔루션
-+141080,KOSDAQ,레고켐바이오
-+186230,KOSDAQ,그린플러스
-diff --git a/trader/db/repos.py b/trader/db/repos.py
-index e24df6d0d612205020846f68453c7f9805c07c59..381d0d430e10707dcfa0f6b13e07478e072393e0 100644
---- a/trader/db/repos.py
-+++ b/trader/db/repos.py
-@@ -1,28 +1,28 @@
- from __future__ import annotations
+diff --git a/migrations/0001_pbcore.sql b/migrations/0001_pbcore.sql
+index 707617f442be4a2e7c3f6dfce797fade83f7fc8e..d0264dff4084f6aded20c759f5944c6446b09556 100644
+--- a/migrations/0001_pbcore.sql
++++ b/migrations/0001_pbcore.sql
+@@ -1,137 +1,137 @@
+ -- PB-Core v2 base schema
+ CREATE EXTENSION IF NOT EXISTS pgcrypto;
  
--from datetime import datetime
-+from datetime import datetime, timedelta
- import logging
+ -- Enum placeholders as TEXT to keep compatibility with sqlite tests.
+ 
+ CREATE TABLE IF NOT EXISTS runs (
+-    run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    run_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+     strategy text NOT NULL,
+     run_window text,
+     phase text,
+     event_name text,
+     dry_run boolean NOT NULL DEFAULT false,
+     git_sha text,
+     workflow text,
+     workflow_run_id text,
+     workflow_attempt int,
+     config_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     status text NOT NULL DEFAULT 'STARTED',
+     started_at timestamptz DEFAULT now(),
+     finished_at timestamptz,
+     notes text
+ );
+ 
+ CREATE TABLE IF NOT EXISTS universe (
+-    universe_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    universe_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+     strategy text NOT NULL,
+     as_of_date text NOT NULL,
+     source text NOT NULL,
+     params_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     created_at timestamptz DEFAULT now(),
+     CONSTRAINT uq_universe_env_strategy_as_of UNIQUE (env, strategy, as_of_date)
+ );
+ 
+ CREATE TABLE IF NOT EXISTS universe_members (
+-    universe_member_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+-    universe_id uuid NOT NULL REFERENCES universe(universe_id),
++    universe_member_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
++    universe_id text NOT NULL REFERENCES universe(universe_id),
+     code text NOT NULL,
+     market text,
+     weight double precision,
+     rank int,
+     meta_json jsonb NOT NULL DEFAULT '{}'::jsonb
+ );
+ 
+ CREATE TABLE IF NOT EXISTS orders (
+-    order_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    order_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+-    run_id uuid REFERENCES runs(run_id),
++    run_id text REFERENCES runs(run_id),
+     strategy text NOT NULL,
+     sid int NOT NULL,
+     mode int NOT NULL,
+     code text NOT NULL,
+     market text,
+     side text NOT NULL,
+     ord_type text NOT NULL,
+     qty int NOT NULL,
+     limit_price double precision,
+     stage text,
+     client_order_key text NOT NULL,
+     status text NOT NULL DEFAULT 'INTENT',
+     kis_odno text,
+     request_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     response_json jsonb,
+     submitted_at timestamptz,
+     acked_at timestamptz,
+     created_at timestamptz DEFAULT now(),
+     updated_at timestamptz DEFAULT now(),
+     CONSTRAINT uq_orders_env_client_order_key UNIQUE (env, client_order_key)
+ );
+ 
+ CREATE TABLE IF NOT EXISTS fills (
+-    fill_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    fill_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+-    run_id uuid REFERENCES runs(run_id),
+-    order_id uuid REFERENCES orders(order_id),
++    run_id text REFERENCES runs(run_id),
++    order_id text REFERENCES orders(order_id),
+     kis_odno text,
+     trade_id text,
+     code text NOT NULL,
+     market text,
+     side text NOT NULL,
+     qty int NOT NULL,
+     price double precision NOT NULL,
+     fee double precision NOT NULL DEFAULT 0.0,
+     tax double precision NOT NULL DEFAULT 0.0,
+     filled_at timestamptz NOT NULL,
+     raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     created_at timestamptz DEFAULT now(),
+     CONSTRAINT uq_fills_env_trade_id UNIQUE (env, trade_id),
+     CONSTRAINT uq_fills_fallback UNIQUE (env, kis_odno, code, side, qty, price, filled_at)
+ );
+ 
+ CREATE TABLE IF NOT EXISTS positions (
+-    position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    position_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+     strategy text NOT NULL,
+     sid int NOT NULL,
+     mode int NOT NULL,
+     code text NOT NULL,
+     market text,
+     qty int NOT NULL DEFAULT 0,
+     avg_buy_price double precision,
+     total_cost double precision NOT NULL DEFAULT 0.0,
+     realized_pnl double precision NOT NULL DEFAULT 0.0,
+     last_trade_at timestamptz,
+     updated_at timestamptz DEFAULT now(),
+     CONSTRAINT uq_positions_identity UNIQUE (env, strategy, sid, mode, code)
+ );
+ 
+ CREATE TABLE IF NOT EXISTS ledger_events (
+-    ledger_event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    ledger_event_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+     env text NOT NULL,
+-    run_id uuid REFERENCES runs(run_id),
++    run_id text REFERENCES runs(run_id),
+     event_type text NOT NULL,
+     ts timestamptz NOT NULL,
+     code text,
+     market text,
+     sid int,
+     mode int,
+     side text,
+     qty int,
+     price double precision,
+     kis_odno text,
+     client_order_key text,
+     ok boolean NOT NULL DEFAULT true,
+     reasons jsonb NOT NULL DEFAULT '[]'::jsonb,
+     stage text,
+     payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+     created_at timestamptz DEFAULT now()
+ );
+ 
+ -- Indexes
+ CREATE INDEX IF NOT EXISTS idx_runs_strategy_started_at ON runs (strategy, started_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_orders_env_code_status ON orders (env, code, status);
+ CREATE INDEX IF NOT EXISTS idx_fills_env_code_filled_at ON fills (env, code, filled_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_positions_env_updated_at ON positions (env, updated_at DESC);
+diff --git a/migrations/0003_uuid_to_text.sql b/migrations/0003_uuid_to_text.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..94addf9ec8bd3b797a5490d500036a5404bab07d
+--- /dev/null
++++ b/migrations/0003_uuid_to_text.sql
+@@ -0,0 +1,87 @@
++DO $$
++BEGIN
++  -- runs.run_id and related FKs
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'runs' AND column_name = 'run_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE fills DROP CONSTRAINT IF EXISTS fills_run_id_fkey';
++    EXECUTE 'ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_run_id_fkey';
++    EXECUTE 'ALTER TABLE ledger_events DROP CONSTRAINT IF EXISTS ledger_events_run_id_fkey';
++    EXECUTE 'ALTER TABLE runs ALTER COLUMN run_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE runs ALTER COLUMN run_id TYPE text USING run_id::text';
++    EXECUTE 'ALTER TABLE runs ALTER COLUMN run_id SET DEFAULT gen_random_uuid()::text';
++    EXECUTE 'ALTER TABLE orders ALTER COLUMN run_id TYPE text USING run_id::text';
++    EXECUTE 'ALTER TABLE fills ALTER COLUMN run_id TYPE text USING run_id::text';
++    EXECUTE 'ALTER TABLE ledger_events ALTER COLUMN run_id TYPE text USING run_id::text';
++    EXECUTE 'ALTER TABLE orders ADD CONSTRAINT orders_run_id_fkey FOREIGN KEY (run_id) REFERENCES runs(run_id)';
++    EXECUTE 'ALTER TABLE fills ADD CONSTRAINT fills_run_id_fkey FOREIGN KEY (run_id) REFERENCES runs(run_id)';
++    EXECUTE 'ALTER TABLE ledger_events ADD CONSTRAINT ledger_events_run_id_fkey FOREIGN KEY (run_id) REFERENCES runs(run_id)';
++  END IF;
++
++  -- universe.universe_id and related FKs
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'universe' AND column_name = 'universe_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE universe_members DROP CONSTRAINT IF EXISTS universe_members_universe_id_fkey';
++    EXECUTE 'ALTER TABLE universe ALTER COLUMN universe_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE universe ALTER COLUMN universe_id TYPE text USING universe_id::text';
++    EXECUTE 'ALTER TABLE universe ALTER COLUMN universe_id SET DEFAULT gen_random_uuid()::text';
++    EXECUTE 'ALTER TABLE universe_members ALTER COLUMN universe_id TYPE text USING universe_id::text';
++    EXECUTE 'ALTER TABLE universe_members ADD CONSTRAINT universe_members_universe_id_fkey FOREIGN KEY (universe_id) REFERENCES universe(universe_id)';
++  END IF;
++
++  -- orders.order_id and dependent FK
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'orders' AND column_name = 'order_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE fills DROP CONSTRAINT IF EXISTS fills_order_id_fkey';
++    EXECUTE 'ALTER TABLE orders ALTER COLUMN order_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE orders ALTER COLUMN order_id TYPE text USING order_id::text';
++    EXECUTE 'ALTER TABLE orders ALTER COLUMN order_id SET DEFAULT gen_random_uuid()::text';
++    EXECUTE 'ALTER TABLE fills ALTER COLUMN order_id TYPE text USING order_id::text';
++    EXECUTE 'ALTER TABLE fills ADD CONSTRAINT fills_order_id_fkey FOREIGN KEY (order_id) REFERENCES orders(order_id)';
++  END IF;
++
++  -- universe_members PK
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'universe_members' AND column_name = 'universe_member_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE universe_members ALTER COLUMN universe_member_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE universe_members ALTER COLUMN universe_member_id TYPE text USING universe_member_id::text';
++    EXECUTE 'ALTER TABLE universe_members ALTER COLUMN universe_member_id SET DEFAULT gen_random_uuid()::text';
++  END IF;
++
++  -- fills PK
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'fills' AND column_name = 'fill_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE fills ALTER COLUMN fill_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE fills ALTER COLUMN fill_id TYPE text USING fill_id::text';
++    EXECUTE 'ALTER TABLE fills ALTER COLUMN fill_id SET DEFAULT gen_random_uuid()::text';
++  END IF;
++
++  -- positions PK
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'positions' AND column_name = 'position_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE positions ALTER COLUMN position_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE positions ALTER COLUMN position_id TYPE text USING position_id::text';
++    EXECUTE 'ALTER TABLE positions ALTER COLUMN position_id SET DEFAULT gen_random_uuid()::text';
++  END IF;
++
++  -- ledger_events PK
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'ledger_events' AND column_name = 'ledger_event_id' AND data_type = 'uuid'
++  ) THEN
++    EXECUTE 'ALTER TABLE ledger_events ALTER COLUMN ledger_event_id DROP DEFAULT';
++    EXECUTE 'ALTER TABLE ledger_events ALTER COLUMN ledger_event_id TYPE text USING ledger_event_id::text';
++    EXECUTE 'ALTER TABLE ledger_events ALTER COLUMN ledger_event_id SET DEFAULT gen_random_uuid()::text';
++  END IF;
++END $$;
+diff --git a/rolling_k_auto_trade_api/best_k_meta_strategy.py b/rolling_k_auto_trade_api/best_k_meta_strategy.py
+index 215a6db7b8e66c145c3c2acb05323a29f8bba100..37bb0e964a3d982dd3fc1f67385fdd2537517765 100644
+--- a/rolling_k_auto_trade_api/best_k_meta_strategy.py
++++ b/rolling_k_auto_trade_api/best_k_meta_strategy.py
+@@ -125,52 +125,52 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
+         mktcap_df["Code"] = mktcap_df["Code"].astype(str).str.zfill(6)
+ 
+         fdr_df = _get_listing_df([market])
+         merged = pd.merge(
+             fdr_df[["Code", "Name"]],
+             mktcap_df[["Code", "Marcap"]],
+             on="Code",
+             how="inner",
+         )
+         if "Marcap" not in merged.columns:
+             for cand in ("Marcap_x", "Marcap_y", "MarketCap", "MarketCap_x", "MarketCap_y"):
+                 if cand in merged.columns:
+                     merged = merged.rename(columns={cand: "Marcap"})
+                     break
+         if "Marcap" not in merged.columns:
+             logger.error("❌  병합 후에도 'Marcap' 없음(%s) → 빈 DF 반환", market)
+             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+ 
+         topn = merged.dropna(subset=["Marcap"])
+         # 6자리 숫자 코드만 사용 (우선주/ETN 등 특수코드, 0009K0 같은 것 제거)
+         topn = topn[topn["Code"].astype(str).str.match(r"^\d{6}$")]
+         topn = topn.sort_values("Marcap", ascending=False).head(n)
+         logger.info(f"✅  {market} 시총 Top{n} 추출 완료 → {len(topn)} 종목")
+         return topn[["Code", "Name", "Marcap"]]
+ 
+-    except Exception:
+-        logger.exception("❌  get_top_n_for_market(%s) 예외:", market)
++    except Exception as exc:
++        logger.warning("⚠️  get_top_n_for_market(%s) 실패: %s → 빈 DF 반환", market, repr(exc))
+         return pd.DataFrame(columns=["Code", "Name", "Marcap"])
+ 
+ def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
+     return _get_top_n_for_market(date_str, n, market="KOSDAQ")
+ 
+ def get_kospi_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:
+     return _get_top_n_for_market(date_str, n, market="KOSPI")
+ 
+ # -----------------------------
+ # ATR 계산(월 데이터 레코드에서)
+ # -----------------------------
+ def _compute_atr_from_records(records: List[Dict[str, Any]], window: int = 14) -> Optional[float]:
+     """월 구간 레코드([{open,high,low,close}...])에서 ATR 계산."""
+     if not records or len(records) < window + 1:
+         return None
+     df = pd.DataFrame(records).copy()
+     need = {"open", "high", "low", "close"}
+     if not need.issubset(set(df.columns)):
+         return None
+     df = df[["open", "high", "low", "close"]].astype(float)
+     prev_close = df["close"].shift(1)
+     tr = pd.concat(
+         [
+             (df["high"] - df["low"]).abs(),
+             (df["high"] - prev_close).abs(),
+diff --git a/tests/test_db_uuid_types.py b/tests/test_db_uuid_types.py
+index cff1a7b135982be23486d2ca0509767f9e1b66a8..52a1ca15e747e4c02ae84cd5890fccb7d202a3a5 100644
+--- a/tests/test_db_uuid_types.py
++++ b/tests/test_db_uuid_types.py
+@@ -1,19 +1,17 @@
+ import sqlalchemy as sa
+-from sqlalchemy.dialects import postgresql
+ 
+ from trader.db.schema import schema_for_url
+ 
+ 
+-def test_universe_id_uses_uuid_for_postgres():
++def test_universe_id_uses_string_for_postgres():
+     url = "postgresql+psycopg://user:pass@localhost:5432/db"
+     schema = schema_for_url(url)
+     col_type = schema.universe.c.universe_id.type
+-    assert isinstance(col_type, postgresql.UUID)
+-    assert getattr(col_type, "as_uuid", False) is True
++    assert isinstance(col_type, sa.String)
+ 
+ 
+ def test_universe_id_uses_string_for_sqlite():
+     url = "sqlite:///./dev.db"
+     schema = schema_for_url(url)
+     col_type = schema.universe.c.universe_id.type
+     assert isinstance(col_type, sa.String)
+diff --git a/trader/db/migrate.py b/trader/db/migrate.py
+index ac2e1fd2270c94baa433618cb8c094b9daf9c326..2a70f94e1ad6a17e3868da730564da95eb545a13 100644
+--- a/trader/db/migrate.py
++++ b/trader/db/migrate.py
+@@ -1,62 +1,73 @@
+ import glob
++import logging
  import os
- from typing import Any, Dict, Iterable, List, Optional
- from uuid import UUID, uuid4
+ from pathlib import Path
  
  import sqlalchemy as sa
- from sqlalchemy import Engine, and_, func, select
+ from sqlalchemy import Engine, text
  
- from .schema import (
-     FILLS,
-     LEDGER_EVENTS,
-     ORDERS,
+ from . import config
+ from .schema import schema_for_engine
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
+     conn.execute(
+         text(
+             """
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                 version text primary key,
+                 applied_at timestamptz default now()
+             )
+             """
+         )
+     )
+ 
+ 
+ def _list_applied_versions(conn: sa.Connection) -> set[str]:
+     result = conn.execute(text("SELECT version FROM schema_migrations"))
+     return {row[0] for row in result}
+ 
+ 
+ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
+     with engine.begin() as conn:
+         url = str(engine.url)
+         if config.is_sqlite_url(url):
+             schema_for_engine(engine).metadata.create_all(engine)
+             return
+-
++        # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
++        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
+         _ensure_schema_migrations_table(conn)
+         applied = _list_applied_versions(conn)
+ 
+         migration_files = sorted(
+             [
+                 Path(path)
+                 for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+                 if Path(path).is_file()
+             ]
+         )
+         for path in migration_files:
+             version = path.name
+             if version in applied:
+                 continue
+             sql = path.read_text()
+-            conn.execute(text(sql))
+-            conn.execute(
+-                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+-                {"version": version},
+-            )
++            logger.info("[DB][MIGRATE] applying %s", version)
++            try:
++                conn.execute(text(sql))
++                conn.execute(
++                    text("INSERT INTO schema_migrations(version) VALUES (:version)"),
++                    {"version": version},
++                )
++            except Exception as exc:
++                snippet = " ".join(sql.split())[:2000]
++                logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
++                raise
+ 
+ 
+ if __name__ == "__main__":
+     from .engine import make_engine
+ 
+     run_migrations(make_engine())
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 381d0d430e10707dcfa0f6b13e07478e072393e0..ab3a4ff3fdcb8b1e5ef2e141ffa2c749867c0d00 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -16,76 +16,74 @@ from .schema import (
      POSITIONS,
      RUNS,
      UNIVERSE,
@@ -55,413 +432,446 @@ index e24df6d0d612205020846f68453c7f9805c07c59..381d0d430e10707dcfa0f6b13e07478e
  
  
  def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
-@@ -122,50 +122,73 @@ class UniverseRepo:
-                     self._schema.universe.c.as_of_date == as_of_date,
-                 )
-             )
-             .order_by(self._schema.universe.c.created_at.desc())
-             .limit(1)
-         )
-         with self.engine.begin() as conn:
-             universe_id = conn.execute(stmt).scalar()
-         if not universe_id:
-             return []
-         return self._fetch_members_for_universe(str(universe_id))
+     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
  
-     def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
-         stmt = (
-             select(self._schema.universe.c.universe_id)
-             .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
-             .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
-             .limit(1)
-         )
-         with self.engine.begin() as conn:
-             universe_id = conn.execute(stmt).scalar()
-         if not universe_id:
-             return []
-         return self._fetch_members_for_universe(str(universe_id))
  
-+    def get_latest_universe(
-+        self, env: str, strategy: str, *, max_age_days: int = 10
-+    ) -> tuple[dict, list[dict]] | None:
-+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-+        stmt = (
-+            select(self._schema.universe)
-+            .where(
-+                and_(
-+                    self._schema.universe.c.env == env,
-+                    self._schema.universe.c.strategy == strategy,
-+                    self._schema.universe.c.created_at >= cutoff,
-+                )
-+            )
-+            .order_by(self._schema.universe.c.created_at.desc())
-+            .limit(1)
-+        )
-+        with self.engine.begin() as conn:
-+            row = conn.execute(stmt).mappings().first()
-+        if not row:
-+            return None
-+        universe_id = str(row.get("universe_id"))
-+        return dict(row), self._fetch_members_for_universe(universe_id)
-+
-     def store_universe(
+ class RunsRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def start_run(
          self,
          env: str,
          strategy: str,
-         as_of_date: str,
-         source: str,
-         params_json: dict,
-         payload_json: dict,
-         members: Iterable[dict],
-     ) -> str | None:
-         members_list = list(members)
-         db_url = str(self.engine.url)
+-        window: str | None,
++        run_window: str | None,
+         phase: str,
+         event_name: str,
+         dry_run: bool,
+         git_sha: str | None,
+         workflow: str | None,
+         workflow_run_id: str | None,
+         workflow_attempt: int | None,
+         config_json: dict | None,
+     ) -> str:
          values = {
-             "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
              "env": env,
              "strategy": strategy,
-             "as_of_date": as_of_date,
-             "source": source,
-             "params_json": params_json or {},
-             "payload_json": payload_json or {},
+-            "run_window": window,
++            "run_window": run_window,
+             "phase": phase,
+             "event_name": event_name,
+             "dry_run": dry_run,
+             "git_sha": git_sha,
+             "workflow": workflow,
+             "workflow_run_id": workflow_run_id,
+             "workflow_attempt": workflow_attempt,
+             "config_json": config_json or {},
          }
-         try:
-             with self.engine.begin() as conn:
-                 existing = conn.execute(
-                     select(self._schema.universe.c.universe_id).where(
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 526c5a5458ea9d056eb75bf2e8928b4a22a8731e..de3c450079cf4952b2d05b01b71f7ed559f81cf5 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -1,92 +1,190 @@
+-        if "window" in values:
+-            values["run_window"] = values.pop("window")
+         stmt = sa.insert(self._schema.runs).values(**values)
+         run_id = values["run_id"]
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
+                 run_id = res.scalar() or run_id
+             except Exception:
+                 conn.execute(stmt)
+         return str(run_id)
+ 
+     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.runs)
+                 .where(self._schema.runs.c.run_id == run_id)
+                 .values(status=status, finished_at=func.now(), notes=notes),
+             )
+ 
+ 
+ class UniverseRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
+diff --git a/trader/db/schema.py b/trader/db/schema.py
+index 7349bb45e731208f28a22639f38876896a03367b..b5492e7665168f08881b4f4b5097cd021904a4c2 100644
+--- a/trader/db/schema.py
++++ b/trader/db/schema.py
+@@ -1,87 +1,76 @@
  from __future__ import annotations
  
- import argparse
- import logging
  import os
--from datetime import datetime
-+import csv
-+from pathlib import Path
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from typing import Any
+ from uuid import UUID, uuid4
  
- from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ import sqlalchemy as sa
+ from sqlalchemy import Engine
  
- from trader.db.engine import make_engine
- from trader.db.migrate import run_migrations
- from trader.db.repos import UniverseRepo
- from trader.time_utils import now_kst
-+from trader.universe.krx_safe import patch_pykrx_logging
- 
- logger = logging.getLogger(__name__)
--ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
-+FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-+STATIC_SEED_PATH = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq50.csv"
+ from . import config
  
  
- def parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Build and persist universe members")
-     parser.add_argument("--env", required=True, help="Environment (practice/real)")
-     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
-     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
-     return parser.parse_args()
- 
- 
- def _normalize_payload(payload: dict | None) -> dict:
-     payload = payload or {}
-     selected = payload.get("selected") or []
-     selected_stocks = payload.get("selected_stocks") or selected
-     selected_by_market = payload.get("selected_by_market") or {}
-     normalized = {
-         "selected": list(selected),
-         "selected_stocks": list(selected_stocks),
-         "selected_by_market": dict(selected_by_market),
-     }
-     if "weight_scope" in payload:
-         normalized["weight_scope"] = payload.get("weight_scope")
-     return normalized
- 
- 
--def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
--    engine = make_engine()
--    run_migrations(engine)
--    repo = UniverseRepo(engine)
+ def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
+-    if config.is_sqlite_url(database_url):
+-        return sa.String()
+-    try:
+-        from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 -
--    payload = _normalize_payload(run_rebalance(as_of_date, return_by_market=True))
--    members = []
--    selected_by_market = payload.get("selected_by_market") or {}
--    for market, rows in selected_by_market.items():
-+def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
-+    members: list[dict] = []
-+    for market, rows in (selected_by_market or {}).items():
-         for idx, row in enumerate(rows or []):
-             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-             members.append(
-                 {
-                     "code": code,
-                     "market": market,
-                     "weight": row.get("weight") or row.get("target_weight") or row.get("weight_pct"),
--                    "rank": idx + 1,
-+                    "rank": row.get("rank") or idx + 1,
-                     "meta_json": row,
-                 }
+-        return PG_UUID(as_uuid=True)
+-    except Exception:
+-        return sa.String()
++    # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
++    return sa.String()
+ 
+ 
+ def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
+-    if config.is_sqlite_url(database_url):
+-        try:
+-            return str(value) if value is not None else str(uuid4())
+-        except Exception:
+-            return str(uuid4())
+     try:
+         if value is None:
+-            return uuid4()
++            return str(uuid4())
+         if isinstance(value, UUID):
+-            return value
+-        return UUID(str(value))
++            return str(value)
++        return str(UUID(str(value)))
+     except Exception:
+-        return uuid4()
++        return str(uuid4())
+ 
+ 
+ @dataclass(frozen=True)
+ class SchemaTables:
+     database_url: str
+     metadata: sa.MetaData
+     runs: sa.Table
+     universe: sa.Table
+     universe_members: sa.Table
+     orders: sa.Table
+     fills: sa.Table
+     positions: sa.Table
+     ledger_events: sa.Table
+     uses_native_uuid: bool
+ 
+ 
+ def _build_schema(database_url: str) -> SchemaTables:
+     metadata = sa.MetaData()
+     uuid_type = _uuid_type_for_url(database_url)
+-    uses_native_uuid = not config.is_sqlite_url(database_url)
++    uses_native_uuid = False
+ 
+     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
+-        return sa.Column(name, uuid_type, **kwargs)
++        return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
+ 
+     runs = sa.Table(
+         "runs",
+         metadata,
+         uuid_col("run_id", primary_key=True),
+         sa.Column("env", sa.String, nullable=False),
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("run_window", sa.String),
+         sa.Column("phase", sa.String),
+         sa.Column("event_name", sa.String),
+         sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
+         sa.Column("git_sha", sa.String),
+         sa.Column("workflow", sa.String),
+         sa.Column("workflow_run_id", sa.String),
+         sa.Column("workflow_attempt", sa.Integer),
+         sa.Column("config_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("status", sa.String, nullable=False, default="STARTED"),
+         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+         sa.Column("finished_at", sa.DateTime(timezone=True)),
+         sa.Column("notes", sa.Text),
+     )
+ 
+     universe = sa.Table(
+         "universe",
+         metadata,
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index a173307d02a12987125cb48968bd05ed6eba5757..aaa977e255af2a5abdb65b99edea3be2fc1faf6e 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -521,50 +521,102 @@ class KisAPI:
+             except Exception:
+                 return None
+         return None
+ 
+     def get_last_price(self, code: str, *, attempts: int = 2) -> float:
+         """
+         견고한 현재가 조회:
+         - J/U 교차 + 'A' 접두/무접두 교차
+         - 0원/실패 시 지수 백오프 후 재시도
+         """
+         c = safe_strip(code)
+         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+         markets = ("J", "U")
+         tr_list = _pick_tr(self.env, "PRICE")
+         for round_i in range(attempts):
+             for tr in tr_list:
+                 for m in markets:
+                     for cf in code_variants:
+                         px = self._inquire_price_once(tr, m, cf)
+                         if px and px > 0:
+                             return px
+             # 백오프 후 재시도
+             time.sleep(0.6 * (1.5 ** round_i) + random.uniform(0, 0.2))
+         raise RuntimeError(f"invalid last price 0 for {code}")
+ 
++    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
++        """
++        inquire-price 래퍼: 현재가 전체 응답을 dict로 반환.
++
++        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환,
++        그 외에는 지정된 횟수 재시도 후 예외를 던진다.
++        """
++        c = safe_strip(code)
++        if not c:
++            return {}
++        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
++        markets = ("J", "U")
++        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
++        last_error: Exception | None = None
++        for attempt in range(1, attempts + 1):
++            self._limiter.wait("price-quote")
++            for tr in _pick_tr(self.env, "PRICE"):
++                headers = self._headers(tr)
++                for market_div in markets:
++                    for code_fmt in code_variants:
++                        params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
++                        try:
++                            resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
++                            data = resp.json()
++                        except Exception as exc:
++                            last_error = exc
++                            if diag_mode:
++                                logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
++                                return {}
++                            continue
++                        if "초당 거래건수" in (data.get("msg1") or ""):
++                            time.sleep(0.35 + random.uniform(0, 0.15))
++                            continue
++                        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
++                            output = dict(data["output"])
++                            pr = output.get("stck_prpr") or output.get("prpr")
++                            try:
++                                pr_val = float(pr) if pr is not None else None
++                            except Exception:
++                                pr_val = pr
++                            output["stck_prpr"] = pr_val
++                            output.setdefault("prpr", pr_val)
++                            return output
++            if diag_mode:
++                break
++            time.sleep(0.6 * attempt + random.uniform(0, 0.2))
++        if diag_mode:
++            return {}
++        if last_error:
++            raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
++        raise RuntimeError(f"get_price_quote failed for {code}")
++
+     def get_current_price(self, code: str) -> float:
+         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
+         return self.get_last_price(code)
+ 
+     # --- 시초가 캐시 ---
+     def _get_cached_today_open(self, code: str) -> Optional[float]:
+         try:
+             op, ts = self._today_open_cache.get(code, (None, 0.0))
+             if op and (time.time() - ts) < self._today_open_ttl:
+                 return op
+         except Exception:
+             pass
+         return None
+ 
+     def _set_cached_today_open(self, code: str, price: float):
+         try:
+             if price and price > 0:
+                 self._today_open_cache[code] = (float(price), time.time())
+         except Exception:
+             pass
+ 
+     def get_today_open(self, code: str) -> Optional[float]:
+         """
+         오늘 시초가(09:00 기준).
+         1순위: inquire-price stck_oprc
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 832fb6810fa731e9be6d491d7ddb9f727fa53a5d..ca11b8670c44f46f1129cdff9fbc654bac3f47be 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -162,51 +162,52 @@ class PB1Engine:
+                 continue
+         return candidates
+ 
+     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
+         ok_list = [c for c in candidates if c.setup_ok]
+         total = len(ok_list)
+         if total <= 0:
+             return candidates
+         capital_per = DAILY_CAPITAL * CAP_CAP / total
+         for cf in ok_list:
+             close_px = cf.features.get("close") or 0
+             qty = int(capital_per // close_px) if close_px > 0 else 0
+             cf.planned_qty = max(qty, 0)
+             cf.client_order_key = self._client_order_key(
+                 cf.code, cf.mode, "BUY", "close", "PB1"
              )
-+    return members
-+
-+
-+def _load_static_seed() -> dict | None:
-+    if not STATIC_SEED_PATH.exists():
-+        return None
-+    try:
-+        with STATIC_SEED_PATH.open(newline="", encoding="utf-8") as f:
-+            reader = csv.DictReader(f)
-+            rows = [row for row in reader]
-+    except Exception:
-+        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", STATIC_SEED_PATH)
-+        return None
-+    members: list[dict] = []
-+    markets: dict[str, list[dict]] = {}
-+    for idx, row in enumerate(rows, start=1):
-+        code = str(row.get("code") or row.get("Code") or "").zfill(6)
-+        if not code.strip():
-+            continue
-+        market = (row.get("market") or row.get("Market") or "KOSDAQ").strip()
-+        name = (row.get("name") or row.get("Name") or "").strip() or None
-+        meta_json = {}
-+        if name:
-+            meta_json["name"] = name
-+        member = {"code": code, "market": market, "weight": None, "rank": idx, "meta_json": meta_json}
-+        members.append(member)
-+        markets.setdefault(market, []).append({"code": code, "weight": None, "rank": idx, "name": name})
-+    if not members:
-+        return None
-+    payload = _normalize_payload(
-+        {
-+            "selected": [m["code"] for m in members],
-+            "selected_by_market": markets,
-+        }
-+    )
-+    return {"payload": payload, "members": members, "source": "fallback:static", "params": {"seed_path": str(STATIC_SEED_PATH)}}
-+
-+
-+def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
-+    latest = repo.get_latest_universe(env=env, strategy=strategy, max_age_days=FALLBACK_MAX_AGE_DAYS)
-+    if not latest:
-+        return None
-+    universe_row, member_rows = latest
-+    payload = _normalize_payload(universe_row.get("payload_json"))
-+    return {
-+        "payload": payload,
-+        "members": member_rows,
-+        "source": "fallback:db",
-+        "params": {
-+            "fallback_from": universe_row.get("as_of_date"),
-+            "source_universe_id": str(universe_row.get("universe_id")),
-+        },
-+    }
-+
-+
-+def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
-+    db_fallback = _fallback_from_db(repo, env, strategy)
-+    if db_fallback:
-+        logger.info(
-+            "[UNIVERSE][FALLBACK][DB] env=%s strategy=%s reuse_universe_id=%s members=%s",
-+            env,
-+            strategy,
-+            db_fallback["params"].get("source_universe_id"),
-+            len(db_fallback["members"]),
-+        )
-+        return db_fallback
-+    static_fallback = _load_static_seed()
-+    if static_fallback:
-+        logger.info(
-+            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s path=%s",
-+            env,
-+            strategy,
-+            len(static_fallback["members"]),
-+            STATIC_SEED_PATH,
-+        )
-+        return static_fallback
-+    return None
-+
-+
-+def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
-+    engine = make_engine()
-+    run_migrations(engine)
-+    repo = UniverseRepo(engine)
-+
-+    patch_pykrx_logging()
-+
-+    raw_payload: dict | None = None
-+    try:
-+        raw_payload = run_rebalance(as_of_date, return_by_market=True)
-+    except Exception as exc:
-+        logger.warning("[UNIVERSE][KRX_FAIL] %s", repr(exc))
-+    payload = _normalize_payload(raw_payload)
-+    members = _build_members_from_payload(payload.get("selected_by_market"))
-+
-+    fallback = None
-+    if len(members) == 0:
-+        fallback = _select_fallback(repo, env=env, strategy=strategy)
-+        if fallback:
-+            payload = fallback["payload"]
-+            members = fallback["members"]
-+
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero")
+                 self._log_setup(cf)
+         return candidates
+ 
+     def _mark_price(self, code: str) -> float | None:
+         if self.kis:
+             try:
+-                quote = self.kis.get_price_quote(code)
++                diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
++                quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
+                 if isinstance(quote, dict):
+                     pr = quote.get("stck_prpr") or quote.get("prpr")
+                     return float(pr) if pr is not None else None
+             except Exception:
+                 logger.exception("[PB1][PRICE][FAIL] code=%s", code)
+         return None
+ 
+     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
+         marks: Dict[str, float] = {}
+         for code in codes:
+             px = self._mark_price(code)
+             if px is None:
+                 px = fallback.get(code)
+             if px is not None:
+                 marks[code] = px
+         return marks
+ 
+     def _should_block_order(self, client_order_key: str) -> bool:
+         if not client_order_key:
+             return True
+         return self.orders_repo.has_client_order_key(self.env, client_order_key)
+ 
+     def _place_entry(self, cf: CandidateFeature) -> None:
+         order_id = self.orders_repo.create_intent_idempotent(
+             env=self.env,
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 4ae0086d32cbd7496cf66b720dd7d88fa9a5bd36..c0e79248879d17b8ee59b249b0234006301d9b0c 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -321,51 +321,51 @@ def main() -> None:
+ 
+     runs_repo = RunsRepo(engine)
+     universe_repo = UniverseRepo(engine)
+     orders_repo = OrdersRepo(engine)
+     fills_repo = FillsRepo(engine)
+     positions_repo = PositionsRepo(engine)
+ 
+     run_record_id = None
+     try:
+         kis: KisAPI | None = None
+         try:
+             kis = KisAPI()
+             if kis.env != kis_env:
+                 dry_run_reasons.append("kis_env_mismatch")
+                 dry_run = True
+                 _apply_env_flags(dry_run)
+         except Exception:
+             logger.exception("[PB1] KIS init failed, forcing dry-run")
+             dry_run_reasons.append("kis_init_failed")
+             dry_run = True
+             _apply_env_flags(dry_run)
+ 
+         run_record_id = runs_repo.start_run(
+             env=kis_env or "practice",
+             strategy="pb1_pullback_close",
+-            window=window_name_for_log,
++            run_window=window_name_for_log,
+             phase=phase_override_arg,
+             event_name=event_name_lower,
+             dry_run=dry_run,
+             git_sha=os.getenv("GITHUB_SHA"),
+             workflow=os.getenv("GITHUB_WORKFLOW"),
+             workflow_run_id=workflow_run_id,
+             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
+             config_json={"dry_run_reasons": dry_run_reasons, "window": window_name_for_log, "phase": phase_for_log},
+         )
+ 
+         engine_runner = PB1Engine(
+             universe_repo=universe_repo,
+             orders_repo=orders_repo,
+             fills_repo=fills_repo,
+             positions_repo=positions_repo,
+             kis=kis,
+             window=window,
+             phase_override=phase_override_arg,
+             dry_run=dry_run,
+             env=kis_env or "practice",
+             run_id=run_record_id,
+         )
+         result = engine_runner.run()
+         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+     except Exception as exc:
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index de3c450079cf4952b2d05b01b71f7ed559f81cf5..07e68636a9f78b04d9522980fcff04b23777f7a8 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -118,50 +118,51 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
+             "[UNIVERSE][FALLBACK][DB] env=%s strategy=%s reuse_universe_id=%s members=%s",
+             env,
+             strategy,
+             db_fallback["params"].get("source_universe_id"),
+             len(db_fallback["members"]),
+         )
+         return db_fallback
+     static_fallback = _load_static_seed()
+     if static_fallback:
+         logger.info(
+             "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s path=%s",
+             env,
+             strategy,
+             len(static_fallback["members"]),
+             STATIC_SEED_PATH,
+         )
+         return static_fallback
+     return None
+ 
+ 
+ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+     engine = make_engine()
+     run_migrations(engine)
+     repo = UniverseRepo(engine)
+ 
++    logging.getLogger("pykrx").setLevel(logging.WARNING)
+     patch_pykrx_logging()
+ 
+     raw_payload: dict | None = None
+     try:
+         raw_payload = run_rebalance(as_of_date, return_by_market=True)
+     except Exception as exc:
+         logger.warning("[UNIVERSE][KRX_FAIL] %s", repr(exc))
+     payload = _normalize_payload(raw_payload)
+     members = _build_members_from_payload(payload.get("selected_by_market"))
+ 
+     fallback = None
+     if len(members) == 0:
+         fallback = _select_fallback(repo, env=env, strategy=strategy)
+         if fallback:
+             payload = fallback["payload"]
+             members = fallback["members"]
+ 
      universe_id = repo.store_universe(
          env=env,
          strategy=strategy,
          as_of_date=as_of_date,
--        source="best_k_meta_strategy",
--        params_json={"as_of": as_of_date},
-+        source=fallback["source"] if fallback else "best_k_meta_strategy",
-+        params_json={"as_of": as_of_date, **(fallback.get("params") if fallback else {})},
+         source=fallback["source"] if fallback else "best_k_meta_strategy",
+         params_json={"as_of": as_of_date, **(fallback.get("params") if fallback else {})},
          payload_json=payload,
          members=members,
-     )
-     if universe_id:
-         logger.info(
-             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s",
-             env,
-             strategy,
-             as_of_date,
-             universe_id,
-             len(members),
-         )
-     else:
-         logger.warning(
-             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
-         )
-     return universe_id
- 
- 
- def main() -> None:
-     logging.basicConfig(level=logging.INFO)
-     args = parse_args()
-     as_of = args.date or now_kst().date().isoformat()
-     build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
- 
-diff --git a/trader/universe/krx_safe.py b/trader/universe/krx_safe.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..fe87fdf8f4bd768d6464002df6a13bbfbe26f7d2
---- /dev/null
-+++ b/trader/universe/krx_safe.py
-@@ -0,0 +1,84 @@
-+from __future__ import annotations
-+
-+import json
-+import logging
-+import time
-+
-+import pandas as pd
-+import requests
-+from pykrx.stock import get_market_cap_by_ticker
-+
-+logger = logging.getLogger(__name__)
-+
-+
-+class KRXTemporaryError(Exception):
-+    """Raised when KRX endpoints fail temporarily after retries."""
-+
-+
-+def _safe_pykrx_info(*args: object, **kwargs: object) -> None:
-+    """
-+    Replace pykrx util.logging.info to avoid TypeError on tuple formatting.
-+
-+    pykrx occasionally calls logging.info(args, kwargs) which breaks the stdlib logger.
-+    We coerce arguments to strings and forward them to a dedicated logger.
-+    """
-+    message_parts = [str(a) for a in args if a is not None]
-+    if kwargs:
-+        message_parts.append(str(kwargs))
-+    message = " ".join(message_parts) if message_parts else ""
-+    logging.getLogger("pykrx").info("%s", message)
-+
-+
-+def patch_pykrx_logging() -> None:
-+    """Monkey-patch pykrx logging wrappers to avoid noisy formatting errors."""
-+    try:
-+        import pykrx.website.comm.util as util
-+    except Exception as exc:  # pragma: no cover - defensive import guard
-+        logger.debug("pykrx util import failed; skip logging patch: %s", exc)
-+        return
-+    try:
-+        util.logging.info = _safe_pykrx_info
-+    except Exception as exc:  # pragma: no cover - defensive assignment guard
-+        logger.debug("pykrx logging patch failed: %s", exc)
-+
-+
-+def safe_get_topn(market: str, date_str: str, n: int) -> pd.DataFrame:
-+    """
-+    Fetch market cap DataFrame with retries and safe logging.
-+
-+    Raises:
-+        KRXTemporaryError: when pykrx repeatedly fails with transient errors.
-+    """
-+    patch_pykrx_logging()
-+    last_exc: Exception | None = None
-+    delay = 1.0
-+    for attempt in range(3):
-+        try:
-+            df = get_market_cap_by_ticker(date_str, market=market)
-+            if df is None:
-+                raise ValueError("pykrx returned None for market cap data")
-+            df = df.copy()
-+            if df.index.name is None:
-+                df.index.name = "code"
-+            df.index = df.index.astype(str).str.zfill(6)
-+            if df.empty:
-+                return df
-+            first_col = df.columns[0] if len(df.columns) else None
-+            if first_col:
-+                df = df.sort_values(first_col, ascending=False)
-+            return df.head(n)
-+        except (
-+            requests.exceptions.JSONDecodeError,
-+            json.JSONDecodeError,
-+            IndexError,
-+            KeyError,
-+            ValueError,
-+            requests.RequestException,
-+        ) as exc:
-+            last_exc = exc
-+        except Exception as exc:  # pragma: no cover - unexpected edge cases
-+            last_exc = exc
-+        if attempt < 2:
-+            time.sleep(delay)
-+            delay *= 2
-+    raise KRXTemporaryError(f"pykrx market cap fetch failed for {market} {date_str}") from last_exc
-diff --git a/trader/universe/providers/krx_provider.py b/trader/universe/providers/krx_provider.py
-index 163b85ff1bff305598bc452ccc055825660b3e5e..e76f8b3d43dfbc25b5a807692528e0c134b21732 100644
---- a/trader/universe/providers/krx_provider.py
-+++ b/trader/universe/providers/krx_provider.py
-@@ -1,29 +1,32 @@
- from __future__ import annotations
- 
- import json
- import logging
- from typing import Any
- 
- import pandas as pd
- import requests
- from pykrx.stock import get_market_cap_by_ticker
- 
-+from trader.universe.krx_safe import patch_pykrx_logging
-+
- logger = logging.getLogger(__name__)
- 
- 
- def safe_get_market_cap_by_ticker(date_str: str, market: str) -> pd.DataFrame:
-+    patch_pykrx_logging()
-     try:
-         return get_market_cap_by_ticker(date_str, market=market)
-     except (
-         requests.exceptions.JSONDecodeError,
-         json.JSONDecodeError,
-         IndexError,
-         KeyError,
-         ValueError,
-         requests.RequestException,
-     ) as e:
-         logger.warning("KRX fetch failed for %s %s: %s", market, date_str, repr(e))
-         return pd.DataFrame()
-     except Exception as e:  # pragma: no cover - unexpected edge cases
-         logger.warning("KRX fetch failed for %s %s (unexpected): %s", market, date_str, repr(e))
-         return pd.DataFrame()

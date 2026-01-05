@@ -13,30 +13,19 @@ from . import config
 
 
 def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
-    if config.is_sqlite_url(database_url):
-        return sa.String()
-    try:
-        from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-
-        return PG_UUID(as_uuid=True)
-    except Exception:
-        return sa.String()
+    # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
+    return sa.String()
 
 
 def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
-    if config.is_sqlite_url(database_url):
-        try:
-            return str(value) if value is not None else str(uuid4())
-        except Exception:
-            return str(uuid4())
     try:
         if value is None:
-            return uuid4()
+            return str(uuid4())
         if isinstance(value, UUID):
-            return value
-        return UUID(str(value))
+            return str(value)
+        return str(UUID(str(value)))
     except Exception:
-        return uuid4()
+        return str(uuid4())
 
 
 @dataclass(frozen=True)
@@ -56,10 +45,10 @@ class SchemaTables:
 def _build_schema(database_url: str) -> SchemaTables:
     metadata = sa.MetaData()
     uuid_type = _uuid_type_for_url(database_url)
-    uses_native_uuid = not config.is_sqlite_url(database_url)
+    uses_native_uuid = False
 
     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
-        return sa.Column(name, uuid_type, **kwargs)
+        return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
 
     runs = sa.Table(
         "runs",

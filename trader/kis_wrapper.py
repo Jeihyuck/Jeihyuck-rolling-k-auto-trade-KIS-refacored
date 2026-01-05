@@ -543,6 +543,58 @@ class KisAPI:
             time.sleep(0.6 * (1.5 ** round_i) + random.uniform(0, 0.2))
         raise RuntimeError(f"invalid last price 0 for {code}")
 
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
+        """
+        inquire-price 래퍼: 현재가 전체 응답을 dict로 반환.
+
+        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환,
+        그 외에는 지정된 횟수 재시도 후 예외를 던진다.
+        """
+        c = safe_strip(code)
+        if not c:
+            return {}
+        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
+        markets = ("J", "U")
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            self._limiter.wait("price-quote")
+            for tr in _pick_tr(self.env, "PRICE"):
+                headers = self._headers(tr)
+                for market_div in markets:
+                    for code_fmt in code_variants:
+                        params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                        try:
+                            resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                            data = resp.json()
+                        except Exception as exc:
+                            last_error = exc
+                            if diag_mode:
+                                logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
+                                return {}
+                            continue
+                        if "초당 거래건수" in (data.get("msg1") or ""):
+                            time.sleep(0.35 + random.uniform(0, 0.15))
+                            continue
+                        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                            output = dict(data["output"])
+                            pr = output.get("stck_prpr") or output.get("prpr")
+                            try:
+                                pr_val = float(pr) if pr is not None else None
+                            except Exception:
+                                pr_val = pr
+                            output["stck_prpr"] = pr_val
+                            output.setdefault("prpr", pr_val)
+                            return output
+            if diag_mode:
+                break
+            time.sleep(0.6 * attempt + random.uniform(0, 0.2))
+        if diag_mode:
+            return {}
+        if last_error:
+            raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
+        raise RuntimeError(f"get_price_quote failed for {code}")
+
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
         return self.get_last_price(code)

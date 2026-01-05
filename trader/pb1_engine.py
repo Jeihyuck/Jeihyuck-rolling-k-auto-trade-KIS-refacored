@@ -184,7 +184,8 @@ class PB1Engine:
     def _mark_price(self, code: str) -> float | None:
         if self.kis:
             try:
-                quote = self.kis.get_price_quote(code)
+                diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
+                quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
                 if isinstance(quote, dict):
                     pr = quote.get("stck_prpr") or quote.get("prpr")
                     return float(pr) if pr is not None else None

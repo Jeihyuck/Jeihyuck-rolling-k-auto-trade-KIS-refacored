@@ -38,7 +38,7 @@ class RunsRepo:
         self,
         env: str,
         strategy: str,
-        window: str | None,
+        run_window: str | None,
         phase: str,
         event_name: str,
         dry_run: bool,
@@ -52,7 +52,7 @@ class RunsRepo:
             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
             "env": env,
             "strategy": strategy,
-            "run_window": window,
+            "run_window": run_window,
             "phase": phase,
             "event_name": event_name,
             "dry_run": dry_run,
@@ -62,8 +62,6 @@ class RunsRepo:
             "workflow_attempt": workflow_attempt,
             "config_json": config_json or {},
         }
-        if "window" in values:
-            values["run_window"] = values.pop("window")
         stmt = sa.insert(self._schema.runs).values(**values)
         run_id = values["run_id"]
         with self.engine.begin() as conn:

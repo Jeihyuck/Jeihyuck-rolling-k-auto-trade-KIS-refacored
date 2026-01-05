@@ -1,4 +1,5 @@
 import glob
+import logging
 import os
 from pathlib import Path
 
@@ -7,6 +8,9 @@ from sqlalchemy import Engine, text
 
 from . import config
 from .schema import schema_for_engine
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
@@ -33,7 +37,8 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
         if config.is_sqlite_url(url):
             schema_for_engine(engine).metadata.create_all(engine)
             return
-
+        # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
         _ensure_schema_migrations_table(conn)
         applied = _list_applied_versions(conn)
 
@@ -49,11 +54,17 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             if version in applied:
                 continue
             sql = path.read_text()
-            conn.execute(text(sql))
-            conn.execute(
-                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
-                {"version": version},
-            )
+            logger.info("[DB][MIGRATE] applying %s", version)
+            try:
+                conn.execute(text(sql))
+                conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                    {"version": version},
+                )
+            except Exception as exc:
+                snippet = " ".join(sql.split())[:2000]
+                logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
+                raise
 
 
 if __name__ == "__main__":

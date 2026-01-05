@@ -140,6 +140,7 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     run_migrations(engine)
     repo = UniverseRepo(engine)
 
+    logging.getLogger("pykrx").setLevel(logging.WARNING)
     patch_pykrx_logging()
 
     raw_payload: dict | None = None

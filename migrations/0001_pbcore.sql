@@ -4,7 +4,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Enum placeholders as TEXT to keep compatibility with sqlite tests.
 
 CREATE TABLE IF NOT EXISTS runs (
-    run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
     strategy text NOT NULL,
     run_window text,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS universe (
-    universe_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    universe_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
     strategy text NOT NULL,
     as_of_date text NOT NULL,
@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS universe (
 );
 
 CREATE TABLE IF NOT EXISTS universe_members (
-    universe_member_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    universe_id uuid NOT NULL REFERENCES universe(universe_id),
+    universe_member_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    universe_id text NOT NULL REFERENCES universe(universe_id),
     code text NOT NULL,
     market text,
     weight double precision,
@@ -45,9 +45,9 @@ CREATE TABLE IF NOT EXISTS universe_members (
 );
 
 CREATE TABLE IF NOT EXISTS orders (
-    order_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
-    run_id uuid REFERENCES runs(run_id),
+    run_id text REFERENCES runs(run_id),
     strategy text NOT NULL,
     sid int NOT NULL,
     mode int NOT NULL,
@@ -71,10 +71,10 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 CREATE TABLE IF NOT EXISTS fills (
-    fill_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    fill_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
-    run_id uuid REFERENCES runs(run_id),
-    order_id uuid REFERENCES orders(order_id),
+    run_id text REFERENCES runs(run_id),
+    order_id text REFERENCES orders(order_id),
     kis_odno text,
     trade_id text,
     code text NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS fills (
 );
 
 CREATE TABLE IF NOT EXISTS positions (
-    position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    position_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
     strategy text NOT NULL,
     sid int NOT NULL,
@@ -109,9 +109,9 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 
 CREATE TABLE IF NOT EXISTS ledger_events (
-    ledger_event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    ledger_event_id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
     env text NOT NULL,
-    run_id uuid REFERENCES runs(run_id),
+    run_id text REFERENCES runs(run_id),
     event_type text NOT NULL,
     ts timestamptz NOT NULL,
     code text,

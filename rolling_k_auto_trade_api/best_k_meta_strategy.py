@@ -147,8 +147,8 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
         logger.info(f"✅  {market} 시총 Top{n} 추출 완료 → {len(topn)} 종목")
         return topn[["Code", "Name", "Marcap"]]
 
-    except Exception:
-        logger.exception("❌  get_top_n_for_market(%s) 예외:", market)
+    except Exception as exc:
+        logger.warning("⚠️  get_top_n_for_market(%s) 실패: %s → 빈 DF 반환", market, repr(exc))
         return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
 def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:

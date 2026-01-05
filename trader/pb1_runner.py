@@ -343,7 +343,7 @@ def main() -> None:
         run_record_id = runs_repo.start_run(
             env=kis_env or "practice",
             strategy="pb1_pullback_close",
-            window=window_name_for_log,
+            run_window=window_name_for_log,
             phase=phase_override_arg,
             event_name=event_name_lower,
             dry_run=dry_run,
