@@ -8,10 +8,13 @@ import pandas as pd
 import requests
 from pykrx.stock import get_market_cap_by_ticker
 
+from trader.universe.krx_safe import patch_pykrx_logging
+
 logger = logging.getLogger(__name__)
 
 
 def safe_get_market_cap_by_ticker(date_str: str, market: str) -> pd.DataFrame:
+    patch_pykrx_logging()
     try:
         return get_market_cap_by_ticker(date_str, market=market)
     except (

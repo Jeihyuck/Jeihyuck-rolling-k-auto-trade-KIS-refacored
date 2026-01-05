@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import os
 from typing import Any, Dict, Iterable, List, Optional
@@ -143,6 +143,29 @@ class UniverseRepo:
         if not universe_id:
             return []
         return self._fetch_members_for_universe(str(universe_id))
+
+    def get_latest_universe(
+        self, env: str, strategy: str, *, max_age_days: int = 10
+    ) -> tuple[dict, list[dict]] | None:
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        stmt = (
+            select(self._schema.universe)
+            .where(
+                and_(
+                    self._schema.universe.c.env == env,
+                    self._schema.universe.c.strategy == strategy,
+                    self._schema.universe.c.created_at >= cutoff,
+                )
+            )
+            .order_by(self._schema.universe.c.created_at.desc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        if not row:
+            return None
+        universe_id = str(row.get("universe_id"))
+        return dict(row), self._fetch_members_for_universe(universe_id)
 
     def store_universe(
         self,

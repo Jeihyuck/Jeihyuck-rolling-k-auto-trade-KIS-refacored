@@ -1,28 +1,47 @@
-diff --git a/migrations/0002_runs_window_rename.sql b/migrations/0002_runs_window_rename.sql
+diff --git a/config/universe_seed_kosdaq50.csv b/config/universe_seed_kosdaq50.csv
 new file mode 100644
-index 0000000000000000000000000000000000000000..ca1d7f842973abb5982a7f9219ce555c306e2287
+index 0000000000000000000000000000000000000000..50470d710d6f97b9fa6b25af9a3a4073288e8bc9
 --- /dev/null
-+++ b/migrations/0002_runs_window_rename.sql
-@@ -0,0 +1,14 @@
-+DO $$
-+BEGIN
-+  IF EXISTS (
-+    SELECT 1 FROM information_schema.columns
-+    WHERE table_name='runs' AND column_name='window'
-+  ) THEN
-+    EXECUTE 'ALTER TABLE runs RENAME COLUMN "window" TO run_window';
-+  ELSIF NOT EXISTS (
-+    SELECT 1 FROM information_schema.columns
-+    WHERE table_name='runs' AND column_name='run_window'
-+  ) THEN
-+    EXECUTE 'ALTER TABLE runs ADD COLUMN run_window text';
-+  END IF;
-+END $$;
++++ b/config/universe_seed_kosdaq50.csv
+@@ -0,0 +1,17 @@
++code,market,name
++091990,KOSDAQ,셀트리온헬스케어
++066970,KOSDAQ,엘앤에프
++086520,KOSDAQ,에코프로
++247540,KOSDAQ,에코프로비엠
++214150,KOSDAQ,클래시스
++196170,KOSDAQ,알테오젠
++028300,KOSDAQ,HLB
++035900,KOSDAQ,JYP Ent.
++263750,KOSDAQ,펄어비스
++036930,KOSDAQ,주성엔지니어링
++200130,KOSDAQ,콜마비앤에이치
++318660,KOSDAQ,셀리드
++078520,KOSDAQ,에이블씨엔씨
++138080,KOSDAQ,오이솔루션
++141080,KOSDAQ,레고켐바이오
++186230,KOSDAQ,그린플러스
 diff --git a/trader/db/repos.py b/trader/db/repos.py
-index e6cdaa4a4c10bc90d60f484e9907eb85cd84c194..e24df6d0d612205020846f68453c7f9805c07c59 100644
+index e24df6d0d612205020846f68453c7f9805c07c59..381d0d430e10707dcfa0f6b13e07478e072393e0 100644
 --- a/trader/db/repos.py
 +++ b/trader/db/repos.py
-@@ -16,74 +16,76 @@ from .schema import (
+@@ -1,28 +1,28 @@
+ from __future__ import annotations
+ 
+-from datetime import datetime
++from datetime import datetime, timedelta
+ import logging
+ import os
+ from typing import Any, Dict, Iterable, List, Optional
+ from uuid import UUID, uuid4
+ 
+ import sqlalchemy as sa
+ from sqlalchemy import Engine, and_, func, select
+ 
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
      POSITIONS,
      RUNS,
      UNIVERSE,
@@ -36,69 +55,413 @@ index e6cdaa4a4c10bc90d60f484e9907eb85cd84c194..e24df6d0d612205020846f68453c7f98
  
  
  def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
-     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+@@ -122,50 +122,73 @@ class UniverseRepo:
+                     self._schema.universe.c.as_of_date == as_of_date,
+                 )
+             )
+             .order_by(self._schema.universe.c.created_at.desc())
+             .limit(1)
+         )
+         with self.engine.begin() as conn:
+             universe_id = conn.execute(stmt).scalar()
+         if not universe_id:
+             return []
+         return self._fetch_members_for_universe(str(universe_id))
  
+     def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
+         stmt = (
+             select(self._schema.universe.c.universe_id)
+             .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
+             .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
+             .limit(1)
+         )
+         with self.engine.begin() as conn:
+             universe_id = conn.execute(stmt).scalar()
+         if not universe_id:
+             return []
+         return self._fetch_members_for_universe(str(universe_id))
  
- class RunsRepo:
-     def __init__(self, engine: Engine):
-         self.engine = engine
-         self._schema = schema_for_engine(engine)
- 
-     def start_run(
++    def get_latest_universe(
++        self, env: str, strategy: str, *, max_age_days: int = 10
++    ) -> tuple[dict, list[dict]] | None:
++        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
++        stmt = (
++            select(self._schema.universe)
++            .where(
++                and_(
++                    self._schema.universe.c.env == env,
++                    self._schema.universe.c.strategy == strategy,
++                    self._schema.universe.c.created_at >= cutoff,
++                )
++            )
++            .order_by(self._schema.universe.c.created_at.desc())
++            .limit(1)
++        )
++        with self.engine.begin() as conn:
++            row = conn.execute(stmt).mappings().first()
++        if not row:
++            return None
++        universe_id = str(row.get("universe_id"))
++        return dict(row), self._fetch_members_for_universe(universe_id)
++
+     def store_universe(
          self,
          env: str,
          strategy: str,
--        window: str,
-+        window: str | None,
-         phase: str,
-         event_name: str,
-         dry_run: bool,
-         git_sha: str | None,
-         workflow: str | None,
-         workflow_run_id: str | None,
-         workflow_attempt: int | None,
-         config_json: dict | None,
-     ) -> str:
+         as_of_date: str,
+         source: str,
+         params_json: dict,
+         payload_json: dict,
+         members: Iterable[dict],
+     ) -> str | None:
+         members_list = list(members)
+         db_url = str(self.engine.url)
          values = {
-             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+             "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
              "env": env,
              "strategy": strategy,
--            "window": window,
-+            "run_window": window,
-             "phase": phase,
-             "event_name": event_name,
-             "dry_run": dry_run,
-             "git_sha": git_sha,
-             "workflow": workflow,
-             "workflow_run_id": workflow_run_id,
-             "workflow_attempt": workflow_attempt,
-             "config_json": config_json or {},
+             "as_of_date": as_of_date,
+             "source": source,
+             "params_json": params_json or {},
+             "payload_json": payload_json or {},
          }
-+        if "window" in values:
-+            values["run_window"] = values.pop("window")
-         stmt = sa.insert(self._schema.runs).values(**values)
-         run_id = values["run_id"]
-         with self.engine.begin() as conn:
-             try:
-                 res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
-                 run_id = res.scalar() or run_id
-             except Exception:
-                 conn.execute(stmt)
-         return str(run_id)
+         try:
+             with self.engine.begin() as conn:
+                 existing = conn.execute(
+                     select(self._schema.universe.c.universe_id).where(
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index 526c5a5458ea9d056eb75bf2e8928b4a22a8731e..de3c450079cf4952b2d05b01b71f7ed559f81cf5 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -1,92 +1,190 @@
+ from __future__ import annotations
  
-     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.runs)
-                 .where(self._schema.runs.c.run_id == run_id)
-                 .values(status=status, finished_at=func.now(), notes=notes),
+ import argparse
+ import logging
+ import os
+-from datetime import datetime
++import csv
++from pathlib import Path
+ 
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ 
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
+ from trader.time_utils import now_kst
++from trader.universe.krx_safe import patch_pykrx_logging
+ 
+ logger = logging.getLogger(__name__)
+-ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
++FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
++STATIC_SEED_PATH = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq50.csv"
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Build and persist universe members")
+     parser.add_argument("--env", required=True, help="Environment (practice/real)")
+     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
+     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
+     return parser.parse_args()
+ 
+ 
+ def _normalize_payload(payload: dict | None) -> dict:
+     payload = payload or {}
+     selected = payload.get("selected") or []
+     selected_stocks = payload.get("selected_stocks") or selected
+     selected_by_market = payload.get("selected_by_market") or {}
+     normalized = {
+         "selected": list(selected),
+         "selected_stocks": list(selected_stocks),
+         "selected_by_market": dict(selected_by_market),
+     }
+     if "weight_scope" in payload:
+         normalized["weight_scope"] = payload.get("weight_scope")
+     return normalized
+ 
+ 
+-def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+-    engine = make_engine()
+-    run_migrations(engine)
+-    repo = UniverseRepo(engine)
+-
+-    payload = _normalize_payload(run_rebalance(as_of_date, return_by_market=True))
+-    members = []
+-    selected_by_market = payload.get("selected_by_market") or {}
+-    for market, rows in selected_by_market.items():
++def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
++    members: list[dict] = []
++    for market, rows in (selected_by_market or {}).items():
+         for idx, row in enumerate(rows or []):
+             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+             members.append(
+                 {
+                     "code": code,
+                     "market": market,
+                     "weight": row.get("weight") or row.get("target_weight") or row.get("weight_pct"),
+-                    "rank": idx + 1,
++                    "rank": row.get("rank") or idx + 1,
+                     "meta_json": row,
+                 }
              )
++    return members
++
++
++def _load_static_seed() -> dict | None:
++    if not STATIC_SEED_PATH.exists():
++        return None
++    try:
++        with STATIC_SEED_PATH.open(newline="", encoding="utf-8") as f:
++            reader = csv.DictReader(f)
++            rows = [row for row in reader]
++    except Exception:
++        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", STATIC_SEED_PATH)
++        return None
++    members: list[dict] = []
++    markets: dict[str, list[dict]] = {}
++    for idx, row in enumerate(rows, start=1):
++        code = str(row.get("code") or row.get("Code") or "").zfill(6)
++        if not code.strip():
++            continue
++        market = (row.get("market") or row.get("Market") or "KOSDAQ").strip()
++        name = (row.get("name") or row.get("Name") or "").strip() or None
++        meta_json = {}
++        if name:
++            meta_json["name"] = name
++        member = {"code": code, "market": market, "weight": None, "rank": idx, "meta_json": meta_json}
++        members.append(member)
++        markets.setdefault(market, []).append({"code": code, "weight": None, "rank": idx, "name": name})
++    if not members:
++        return None
++    payload = _normalize_payload(
++        {
++            "selected": [m["code"] for m in members],
++            "selected_by_market": markets,
++        }
++    )
++    return {"payload": payload, "members": members, "source": "fallback:static", "params": {"seed_path": str(STATIC_SEED_PATH)}}
++
++
++def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
++    latest = repo.get_latest_universe(env=env, strategy=strategy, max_age_days=FALLBACK_MAX_AGE_DAYS)
++    if not latest:
++        return None
++    universe_row, member_rows = latest
++    payload = _normalize_payload(universe_row.get("payload_json"))
++    return {
++        "payload": payload,
++        "members": member_rows,
++        "source": "fallback:db",
++        "params": {
++            "fallback_from": universe_row.get("as_of_date"),
++            "source_universe_id": str(universe_row.get("universe_id")),
++        },
++    }
++
++
++def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
++    db_fallback = _fallback_from_db(repo, env, strategy)
++    if db_fallback:
++        logger.info(
++            "[UNIVERSE][FALLBACK][DB] env=%s strategy=%s reuse_universe_id=%s members=%s",
++            env,
++            strategy,
++            db_fallback["params"].get("source_universe_id"),
++            len(db_fallback["members"]),
++        )
++        return db_fallback
++    static_fallback = _load_static_seed()
++    if static_fallback:
++        logger.info(
++            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s path=%s",
++            env,
++            strategy,
++            len(static_fallback["members"]),
++            STATIC_SEED_PATH,
++        )
++        return static_fallback
++    return None
++
++
++def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
++    engine = make_engine()
++    run_migrations(engine)
++    repo = UniverseRepo(engine)
++
++    patch_pykrx_logging()
++
++    raw_payload: dict | None = None
++    try:
++        raw_payload = run_rebalance(as_of_date, return_by_market=True)
++    except Exception as exc:
++        logger.warning("[UNIVERSE][KRX_FAIL] %s", repr(exc))
++    payload = _normalize_payload(raw_payload)
++    members = _build_members_from_payload(payload.get("selected_by_market"))
++
++    fallback = None
++    if len(members) == 0:
++        fallback = _select_fallback(repo, env=env, strategy=strategy)
++        if fallback:
++            payload = fallback["payload"]
++            members = fallback["members"]
++
+     universe_id = repo.store_universe(
+         env=env,
+         strategy=strategy,
+         as_of_date=as_of_date,
+-        source="best_k_meta_strategy",
+-        params_json={"as_of": as_of_date},
++        source=fallback["source"] if fallback else "best_k_meta_strategy",
++        params_json={"as_of": as_of_date, **(fallback.get("params") if fallback else {})},
+         payload_json=payload,
+         members=members,
+     )
+     if universe_id:
+         logger.info(
+             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s",
+             env,
+             strategy,
+             as_of_date,
+             universe_id,
+             len(members),
+         )
+     else:
+         logger.warning(
+             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
+         )
+     return universe_id
  
  
- class UniverseRepo:
-     def __init__(self, engine: Engine):
-         self.engine = engine
-         self._schema = schema_for_engine(engine)
+ def main() -> None:
+     logging.basicConfig(level=logging.INFO)
+     args = parse_args()
+     as_of = args.date or now_kst().date().isoformat()
+     build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
  
-     def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
-
+diff --git a/trader/universe/krx_safe.py b/trader/universe/krx_safe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe87fdf8f4bd768d6464002df6a13bbfbe26f7d2
+--- /dev/null
++++ b/trader/universe/krx_safe.py
+@@ -0,0 +1,84 @@
++from __future__ import annotations
++
++import json
++import logging
++import time
++
++import pandas as pd
++import requests
++from pykrx.stock import get_market_cap_by_ticker
++
++logger = logging.getLogger(__name__)
++
++
++class KRXTemporaryError(Exception):
++    """Raised when KRX endpoints fail temporarily after retries."""
++
++
++def _safe_pykrx_info(*args: object, **kwargs: object) -> None:
++    """
++    Replace pykrx util.logging.info to avoid TypeError on tuple formatting.
++
++    pykrx occasionally calls logging.info(args, kwargs) which breaks the stdlib logger.
++    We coerce arguments to strings and forward them to a dedicated logger.
++    """
++    message_parts = [str(a) for a in args if a is not None]
++    if kwargs:
++        message_parts.append(str(kwargs))
++    message = " ".join(message_parts) if message_parts else ""
++    logging.getLogger("pykrx").info("%s", message)
++
++
++def patch_pykrx_logging() -> None:
++    """Monkey-patch pykrx logging wrappers to avoid noisy formatting errors."""
++    try:
++        import pykrx.website.comm.util as util
++    except Exception as exc:  # pragma: no cover - defensive import guard
++        logger.debug("pykrx util import failed; skip logging patch: %s", exc)
++        return
++    try:
++        util.logging.info = _safe_pykrx_info
++    except Exception as exc:  # pragma: no cover - defensive assignment guard
++        logger.debug("pykrx logging patch failed: %s", exc)
++
++
++def safe_get_topn(market: str, date_str: str, n: int) -> pd.DataFrame:
++    """
++    Fetch market cap DataFrame with retries and safe logging.
++
++    Raises:
++        KRXTemporaryError: when pykrx repeatedly fails with transient errors.
++    """
++    patch_pykrx_logging()
++    last_exc: Exception | None = None
++    delay = 1.0
++    for attempt in range(3):
++        try:
++            df = get_market_cap_by_ticker(date_str, market=market)
++            if df is None:
++                raise ValueError("pykrx returned None for market cap data")
++            df = df.copy()
++            if df.index.name is None:
++                df.index.name = "code"
++            df.index = df.index.astype(str).str.zfill(6)
++            if df.empty:
++                return df
++            first_col = df.columns[0] if len(df.columns) else None
++            if first_col:
++                df = df.sort_values(first_col, ascending=False)
++            return df.head(n)
++        except (
++            requests.exceptions.JSONDecodeError,
++            json.JSONDecodeError,
++            IndexError,
++            KeyError,
++            ValueError,
++            requests.RequestException,
++        ) as exc:
++            last_exc = exc
++        except Exception as exc:  # pragma: no cover - unexpected edge cases
++            last_exc = exc
++        if attempt < 2:
++            time.sleep(delay)
++            delay *= 2
++    raise KRXTemporaryError(f"pykrx market cap fetch failed for {market} {date_str}") from last_exc
+diff --git a/trader/universe/providers/krx_provider.py b/trader/universe/providers/krx_provider.py
+index 163b85ff1bff305598bc452ccc055825660b3e5e..e76f8b3d43dfbc25b5a807692528e0c134b21732 100644
+--- a/trader/universe/providers/krx_provider.py
++++ b/trader/universe/providers/krx_provider.py
+@@ -1,29 +1,32 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ from typing import Any
+ 
+ import pandas as pd
+ import requests
+ from pykrx.stock import get_market_cap_by_ticker
+ 
++from trader.universe.krx_safe import patch_pykrx_logging
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def safe_get_market_cap_by_ticker(date_str: str, market: str) -> pd.DataFrame:
++    patch_pykrx_logging()
+     try:
+         return get_market_cap_by_ticker(date_str, market=market)
+     except (
+         requests.exceptions.JSONDecodeError,
+         json.JSONDecodeError,
+         IndexError,
+         KeyError,
+         ValueError,
+         requests.RequestException,
+     ) as e:
+         logger.warning("KRX fetch failed for %s %s: %s", market, date_str, repr(e))
+         return pd.DataFrame()
+     except Exception as e:  # pragma: no cover - unexpected edge cases
+         logger.warning("KRX fetch failed for %s %s (unexpected): %s", market, date_str, repr(e))
+         return pd.DataFrame()
