@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS runs (
     run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     env text NOT NULL,
     strategy text NOT NULL,
-    window text,
+    run_window text,
     phase text,
     event_name text,
     dry_run boolean NOT NULL DEFAULT false,

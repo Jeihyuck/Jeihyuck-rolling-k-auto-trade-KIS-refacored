@@ -8,7 +8,7 @@ RUNS = sa.Table(
     sa.Column("run_id", sa.String, primary_key=True),
     sa.Column("env", sa.String, nullable=False),
     sa.Column("strategy", sa.String, nullable=False),
-    sa.Column("window", sa.String),
+    sa.Column("run_window", sa.String),
     sa.Column("phase", sa.String),
     sa.Column("event_name", sa.String),
     sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
