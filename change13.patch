@@ -1,466 +1,118 @@
-diff --git a/migrations/0001_pbcore.sql b/migrations/0001_pbcore.sql
-new file mode 100644
-index 0000000000000000000000000000000000000000..d464f51d75f6a7d7e5dfe2f6f7b0e9477e8fe9bd
---- /dev/null
-+++ b/migrations/0001_pbcore.sql
-@@ -0,0 +1,137 @@
-+-- PB-Core v2 base schema
-+CREATE EXTENSION IF NOT EXISTS pgcrypto;
-+
-+-- Enum placeholders as TEXT to keep compatibility with sqlite tests.
-+
-+CREATE TABLE IF NOT EXISTS runs (
-+    run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    strategy text NOT NULL,
-+    window text,
-+    phase text,
-+    event_name text,
-+    dry_run boolean NOT NULL DEFAULT false,
-+    git_sha text,
-+    workflow text,
-+    workflow_run_id text,
-+    workflow_attempt int,
-+    config_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    status text NOT NULL DEFAULT 'STARTED',
-+    started_at timestamptz DEFAULT now(),
-+    finished_at timestamptz,
-+    notes text
-+);
-+
-+CREATE TABLE IF NOT EXISTS universe (
-+    universe_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    strategy text NOT NULL,
-+    as_of_date text NOT NULL,
-+    source text NOT NULL,
-+    params_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    created_at timestamptz DEFAULT now(),
-+    CONSTRAINT uq_universe_env_strategy_as_of UNIQUE (env, strategy, as_of_date)
-+);
-+
-+CREATE TABLE IF NOT EXISTS universe_members (
-+    universe_member_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    universe_id uuid NOT NULL REFERENCES universe(universe_id),
-+    code text NOT NULL,
-+    market text,
-+    weight double precision,
-+    rank int,
-+    meta_json jsonb NOT NULL DEFAULT '{}'::jsonb
-+);
-+
-+CREATE TABLE IF NOT EXISTS orders (
-+    order_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    run_id uuid REFERENCES runs(run_id),
-+    strategy text NOT NULL,
-+    sid int NOT NULL,
-+    mode int NOT NULL,
-+    code text NOT NULL,
-+    market text,
-+    side text NOT NULL,
-+    ord_type text NOT NULL,
-+    qty int NOT NULL,
-+    limit_price double precision,
-+    stage text,
-+    client_order_key text NOT NULL,
-+    status text NOT NULL DEFAULT 'INTENT',
-+    kis_odno text,
-+    request_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    response_json jsonb,
-+    submitted_at timestamptz,
-+    acked_at timestamptz,
-+    created_at timestamptz DEFAULT now(),
-+    updated_at timestamptz DEFAULT now(),
-+    CONSTRAINT uq_orders_env_client_order_key UNIQUE (env, client_order_key)
-+);
-+
-+CREATE TABLE IF NOT EXISTS fills (
-+    fill_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    run_id uuid REFERENCES runs(run_id),
-+    order_id uuid REFERENCES orders(order_id),
-+    kis_odno text,
-+    trade_id text,
-+    code text NOT NULL,
-+    market text,
-+    side text NOT NULL,
-+    qty int NOT NULL,
-+    price double precision NOT NULL,
-+    fee double precision NOT NULL DEFAULT 0.0,
-+    tax double precision NOT NULL DEFAULT 0.0,
-+    filled_at timestamptz NOT NULL,
-+    raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    created_at timestamptz DEFAULT now(),
-+    CONSTRAINT uq_fills_env_trade_id UNIQUE (env, trade_id),
-+    CONSTRAINT uq_fills_fallback UNIQUE (env, kis_odno, code, side, qty, price, filled_at)
-+);
-+
-+CREATE TABLE IF NOT EXISTS positions (
-+    position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    strategy text NOT NULL,
-+    sid int NOT NULL,
-+    mode int NOT NULL,
-+    code text NOT NULL,
-+    market text,
-+    qty int NOT NULL DEFAULT 0,
-+    avg_buy_price double precision,
-+    total_cost double precision NOT NULL DEFAULT 0.0,
-+    realized_pnl double precision NOT NULL DEFAULT 0.0,
-+    last_trade_at timestamptz,
-+    updated_at timestamptz DEFAULT now(),
-+    CONSTRAINT uq_positions_identity UNIQUE (env, strategy, sid, mode, code)
-+);
-+
-+CREATE TABLE IF NOT EXISTS ledger_events (
-+    ledger_event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-+    env text NOT NULL,
-+    run_id uuid REFERENCES runs(run_id),
-+    event_type text NOT NULL,
-+    ts timestamptz NOT NULL,
-+    code text,
-+    market text,
-+    sid int,
-+    mode int,
-+    side text,
-+    qty int,
-+    price double precision,
-+    kis_odno text,
-+    client_order_key text,
-+    ok boolean NOT NULL DEFAULT true,
-+    reasons jsonb NOT NULL DEFAULT '[]'::jsonb,
-+    stage text,
-+    payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-+    created_at timestamptz DEFAULT now()
-+);
-+
-+-- Indexes
-+CREATE INDEX IF NOT EXISTS idx_runs_strategy_started_at ON runs (strategy, started_at DESC);
-+CREATE INDEX IF NOT EXISTS idx_orders_env_code_status ON orders (env, code, status);
-+CREATE INDEX IF NOT EXISTS idx_fills_env_code_filled_at ON fills (env, code, filled_at DESC);
-+CREATE INDEX IF NOT EXISTS idx_positions_env_updated_at ON positions (env, updated_at DESC);
-diff --git a/requirements.txt b/requirements.txt
-index 05b5f93a703267da5011fbec76118e73906f8836..3550d16d73b2ff793ad7b41482baab55fe4981d6 100644
---- a/requirements.txt
-+++ b/requirements.txt
-@@ -1,10 +1,12 @@
- fastapi>=0.110,<1.0
- uvicorn[standard]>=0.29,<1.0
--python-dotenv
- pandas>=2.2
- numpy>=1.26
- pykrx>=1.0.51
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index 83459b39d81aff2f56af14995eec047ccf528478..5718f9add367b67abed6c96dd45780d4a147794f 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -17,93 +17,105 @@ on:
+     # =========================
+     # Weekdays (KST Mon-Fri) : run only during market hours (08:50~15:30 KST), every 5 min
+     # KST 08:50~08:55  => UTC 23:50~23:55 (previous UTC day)  [Sun~Thu UTC]
+     - cron: "50-59/5 23 * * 0-4"
+     # KST 09:00~14:55  => UTC 00:00~05:55 (same UTC day)      [Mon~Fri UTC]
+     - cron: "*/5 0-5 * * 1-5"
+     # KST 15:00~15:30  => UTC 06:00~06:30 (same UTC day)      [Mon~Fri UTC]
+     - cron: "0-30/5 6 * * 1-5"
  
+     # =========================
+     # Weekend (KST Sat-Sun) : DIAG every 5 min for the entire weekend day (00:00~23:55 KST)
+     # KST Sat 00:00~08:55 => UTC Fri 15:00~23:55
+     - cron: "*/5 15-23 * * 5"
+     # KST Sat 09:00~Sun 08:55 => UTC Sat 00:00~23:55 (covers full UTC Saturday)
+     - cron: "*/5 * * * 6"
+     # KST Sun 09:00~23:55 => UTC Sun 00:00~14:55
+     - cron: "*/5 0-14 * * 0"
  
- finance-datareader>=0.9
- python-dotenv>=0.21.0
-+sqlalchemy>=2.0
-+psycopg[binary]>=3.1
-+pytest
-diff --git a/trader/db/__init__.py b/trader/db/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..ab84761657acdbf03b8328b898c43baee3728a0c
---- /dev/null
-+++ b/trader/db/__init__.py
-@@ -0,0 +1,33 @@
-+"""
-+Database utilities for the PB-Core v2 backend.
-+"""
+ jobs:
+   run-trade:
+     if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
+     runs-on: ubuntu-latest
+     # Note: cancel-in-progress=false relies on lock file; timeout increased to allow pre-open waits.
+     timeout-minutes: 360
+     env:
+-      BOTSTATE_BRANCH: bot-state
+-      BOTSTATE_WORKTREE_DIR: "_botstate"
+       STRATEGY_MODE: "LIVE"
+       LIVE_TRADING_ENABLED: "1"
+       DISABLE_LIVE_TRADING: "0"
+       DRY_RUN: "0"
+       EXPECT_LIVE_TRADING: "1"
+       EXPECT_KIS_ENV: "practice"
+       PB1_ENTRY_ENABLED: "1"
+       KIS_ENV: "practice"
+       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       STATE_RECONCILE_APPLY: "1"
+       MORNING_WINDOW_START: "08:50"
+       MORNING_WINDOW_END: "11:00"
+       MORNING_EXIT_START: "09:00"
+       MORNING_EXIT_END: "09:20"
+       AFTERNOON_WINDOW_START: "14:00"
+       AFTERNOON_WINDOW_END: "15:30"
+       CLOSE_AUCTION_START: "15:20"
+       CLOSE_AUCTION_END: "15:30"
+       MARKET_OPEN_HHMM: "08:50"
+       MARKET_CLOSE_HHMM: "15:30"
+       PB1_WAIT_FOR_WINDOW: "1"
+       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+-      LEDGER_BASE_DIR: "bot_state/trader_ledger"
+-      LEDGER_LOOKBACK_DAYS: "120"
+-      BOTSTATE_LOCK_TTL_SEC: "1800"
+       PYTHONUNBUFFERED: "1"
++      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+     steps:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           persist-credentials: true
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+       - name: Set git identity
+         run: |
+           git config user.name "trade-bot"
+           git config user.email "trade-bot@users.noreply.github.com"
+ 
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt
+ 
++      - name: Verify DB dependencies
++        run: |
++          python -c "import sqlalchemy; import psycopg; print('deps ok')"
 +
-+from .config import get_database_url, get_db_echo, is_sqlite_url
-+from .engine import make_engine
-+from .migrate import run_migrations
-+from .schema import (
-+    FILLS,
-+    LEDGER_EVENTS,
-+    ORDERS,
-+    POSITIONS,
-+    RUNS,
-+    UNIVERSE,
-+    UNIVERSE_MEMBERS,
-+    METADATA,
-+)
++      - name: Run DB migrations
++        env:
++          DATABASE_URL: ${{ env.DATABASE_URL }}
++        run: |
++          python -m trader.db.migrate
 +
-+__all__ = [
-+    "get_database_url",
-+    "get_db_echo",
-+    "is_sqlite_url",
-+    "make_engine",
-+    "run_migrations",
-+    "FILLS",
-+    "LEDGER_EVENTS",
-+    "ORDERS",
-+    "POSITIONS",
-+    "RUNS",
-+    "UNIVERSE",
-+    "UNIVERSE_MEMBERS",
-+    "METADATA",
-+]
-diff --git a/trader/db/config.py b/trader/db/config.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..074da6c716e58ea929885bd3be18d345d64c700f
---- /dev/null
-+++ b/trader/db/config.py
-@@ -0,0 +1,16 @@
-+import os
++      - name: Build Universe (best-effort)
++        env:
++          DATABASE_URL: ${{ env.DATABASE_URL }}
++        run: |
++          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
 +
-+
-+def get_database_url() -> str:
-+    url = os.getenv("DATABASE_URL")
-+    if not url:
-+        raise RuntimeError("DATABASE_URL environment variable must be set")
-+    return url
-+
-+
-+def get_db_echo() -> bool:
-+    return os.getenv("DB_ECHO", "false").lower() in ("1", "true", "yes", "on")
-+
-+
-+def is_sqlite_url(url: str) -> bool:
-+    return url.startswith("sqlite:")
-diff --git a/trader/db/engine.py b/trader/db/engine.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..281516ecbdee1964f92a5173a74cc9ba90957626
---- /dev/null
-+++ b/trader/db/engine.py
-@@ -0,0 +1,12 @@
-+from sqlalchemy import Engine, create_engine
-+
-+from . import config
-+
-+
-+def make_engine(database_url: str | None = None) -> Engine:
-+    url = database_url or config.get_database_url()
-+    kwargs = {}
-+    if not config.is_sqlite_url(url):
-+        kwargs["pool_pre_ping"] = True
-+    engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
-+    return engine
-diff --git a/trader/db/migrate.py b/trader/db/migrate.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..492c29f38b7a740106937b727defc72f9d5fbdd6
---- /dev/null
-+++ b/trader/db/migrate.py
-@@ -0,0 +1,62 @@
-+import glob
-+import os
-+from pathlib import Path
-+
-+import sqlalchemy as sa
-+from sqlalchemy import Engine, text
-+
-+from . import config
-+from .schema import METADATA
-+
-+
-+def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
-+    conn.execute(
-+        text(
-+            """
-+            CREATE TABLE IF NOT EXISTS schema_migrations (
-+                version text primary key,
-+                applied_at timestamptz default now()
-+            )
-+            """
-+        )
-+    )
-+
-+
-+def _list_applied_versions(conn: sa.Connection) -> set[str]:
-+    result = conn.execute(text("SELECT version FROM schema_migrations"))
-+    return {row[0] for row in result}
-+
-+
-+def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
-+    with engine.begin() as conn:
-+        url = str(engine.url)
-+        if config.is_sqlite_url(url):
-+            METADATA.create_all(engine)
-+            return
-+
-+        _ensure_schema_migrations_table(conn)
-+        applied = _list_applied_versions(conn)
-+
-+        migration_files = sorted(
-+            [
-+                Path(path)
-+                for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
-+                if Path(path).is_file()
-+            ]
-+        )
-+        for path in migration_files:
-+            version = path.name
-+            if version in applied:
-+                continue
-+            sql = path.read_text()
-+            conn.execute(text(sql))
-+            conn.execute(
-+                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
-+                {"version": version},
-+            )
-+
-+
-+if __name__ == "__main__":
-+    from .engine import make_engine
-+
-+    run_migrations(make_engine())
-diff --git a/trader/db/schema.py b/trader/db/schema.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..8bd9f0bd74323845424694d0f3b6f894835471cf
---- /dev/null
-+++ b/trader/db/schema.py
-@@ -0,0 +1,152 @@
-+import sqlalchemy as sa
-+
-+METADATA = sa.MetaData()
-+
-+RUNS = sa.Table(
-+    "runs",
-+    METADATA,
-+    sa.Column("run_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("strategy", sa.String, nullable=False),
-+    sa.Column("window", sa.String),
-+    sa.Column("phase", sa.String),
-+    sa.Column("event_name", sa.String),
-+    sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
-+    sa.Column("git_sha", sa.String),
-+    sa.Column("workflow", sa.String),
-+    sa.Column("workflow_run_id", sa.String),
-+    sa.Column("workflow_attempt", sa.Integer),
-+    sa.Column("config_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("status", sa.String, nullable=False, default="STARTED"),
-+    sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+    sa.Column("finished_at", sa.DateTime(timezone=True)),
-+    sa.Column("notes", sa.Text),
-+)
-+
-+UNIVERSE = sa.Table(
-+    "universe",
-+    METADATA,
-+    sa.Column("universe_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("strategy", sa.String, nullable=False),
-+    sa.Column("as_of_date", sa.String, nullable=False),
-+    sa.Column("source", sa.String, nullable=False),
-+    sa.Column("params_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+)
-+
-+UNIVERSE_MEMBERS = sa.Table(
-+    "universe_members",
-+    METADATA,
-+    sa.Column("universe_member_id", sa.String, primary_key=True),
-+    sa.Column("universe_id", sa.String, sa.ForeignKey("universe.universe_id"), nullable=False),
-+    sa.Column("code", sa.String, nullable=False),
-+    sa.Column("market", sa.String),
-+    sa.Column("weight", sa.Float),
-+    sa.Column("rank", sa.Integer),
-+    sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
-+)
-+
-+ORDERS = sa.Table(
-+    "orders",
-+    METADATA,
-+    sa.Column("order_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
-+    sa.Column("strategy", sa.String, nullable=False),
-+    sa.Column("sid", sa.Integer, nullable=False),
-+    sa.Column("mode", sa.Integer, nullable=False),
-+    sa.Column("code", sa.String, nullable=False),
-+    sa.Column("market", sa.String),
-+    sa.Column("side", sa.String, nullable=False),
-+    sa.Column("ord_type", sa.String, nullable=False),
-+    sa.Column("qty", sa.Integer, nullable=False),
-+    sa.Column("limit_price", sa.Float),
-+    sa.Column("stage", sa.String),
-+    sa.Column("client_order_key", sa.String, nullable=False),
-+    sa.Column("status", sa.String, nullable=False, default="INTENT"),
-+    sa.Column("kis_odno", sa.String),
-+    sa.Column("request_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("response_json", sa.JSON),
-+    sa.Column("submitted_at", sa.DateTime(timezone=True)),
-+    sa.Column("acked_at", sa.DateTime(timezone=True)),
-+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+    sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-+    sa.UniqueConstraint("env", "client_order_key", name="uq_orders_env_client_order_key"),
-+)
-+
-+FILLS = sa.Table(
-+    "fills",
-+    METADATA,
-+    sa.Column("fill_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
-+    sa.Column("order_id", sa.String, sa.ForeignKey("orders.order_id")),
-+    sa.Column("kis_odno", sa.String),
-+    sa.Column("trade_id", sa.String),
-+    sa.Column("code", sa.String, nullable=False),
-+    sa.Column("market", sa.String),
-+    sa.Column("side", sa.String, nullable=False),
-+    sa.Column("qty", sa.Integer, nullable=False),
-+    sa.Column("price", sa.Float, nullable=False),
-+    sa.Column("fee", sa.Float, nullable=False, default=0.0),
-+    sa.Column("tax", sa.Float, nullable=False, default=0.0),
-+    sa.Column("filled_at", sa.DateTime(timezone=True), nullable=False),
-+    sa.Column("raw_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+    sa.UniqueConstraint("env", "trade_id", name="uq_fills_env_trade_id"),
-+    sa.UniqueConstraint(
-+        "env",
-+        "kis_odno",
-+        "code",
-+        "side",
-+        "qty",
-+        "price",
-+        "filled_at",
-+        name="uq_fills_fallback",
-+    ),
-+)
-+
-+POSITIONS = sa.Table(
-+    "positions",
-+    METADATA,
-+    sa.Column("position_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("strategy", sa.String, nullable=False),
-+    sa.Column("sid", sa.Integer, nullable=False),
-+    sa.Column("mode", sa.Integer, nullable=False),
-+    sa.Column("code", sa.String, nullable=False),
-+    sa.Column("market", sa.String),
-+    sa.Column("qty", sa.Integer, nullable=False, default=0),
-+    sa.Column("avg_buy_price", sa.Float),
-+    sa.Column("total_cost", sa.Float, nullable=False, default=0.0),
-+    sa.Column("realized_pnl", sa.Float, nullable=False, default=0.0),
-+    sa.Column("last_trade_at", sa.DateTime(timezone=True)),
-+    sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-+    sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
-+)
-+
-+LEDGER_EVENTS = sa.Table(
-+    "ledger_events",
-+    METADATA,
-+    sa.Column("ledger_event_id", sa.String, primary_key=True),
-+    sa.Column("env", sa.String, nullable=False),
-+    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
-+    sa.Column("event_type", sa.String, nullable=False),
-+    sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
-+    sa.Column("code", sa.String),
-+    sa.Column("market", sa.String),
-+    sa.Column("sid", sa.Integer),
-+    sa.Column("mode", sa.Integer),
-+    sa.Column("side", sa.String),
-+    sa.Column("qty", sa.Integer),
-+    sa.Column("price", sa.Float),
-+    sa.Column("kis_odno", sa.String),
-+    sa.Column("client_order_key", sa.String),
-+    sa.Column("ok", sa.Boolean, nullable=False, default=True),
-+    sa.Column("reasons", sa.JSON, nullable=False, default=list),
-+    sa.Column("stage", sa.String),
-+    sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
-+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+)
+       - name: Compile modules
+         run: |
+           python -m compileall trader
+ 
+       - name: Run PB1 only
+         env:
+           PYTHONPATH: ${{ github.workspace }}
+         run: |
+-          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
++          python -m trader.pb1_runner --window auto --phase auto
+ 
+           
+ 
+-          
+\ No newline at end of file
++          

@@ -39,8 +39,6 @@ jobs:
     # Note: cancel-in-progress=false relies on lock file; timeout increased to allow pre-open waits.
     timeout-minutes: 360
     env:
-      BOTSTATE_BRANCH: bot-state
-      BOTSTATE_WORKTREE_DIR: "_botstate"
       STRATEGY_MODE: "LIVE"
       LIVE_TRADING_ENABLED: "1"
       DISABLE_LIVE_TRADING: "0"
@@ -69,10 +67,8 @@ jobs:
       MARKET_CLOSE_HHMM: "15:30"
       PB1_WAIT_FOR_WINDOW: "1"
       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-      LEDGER_BASE_DIR: "bot_state/trader_ledger"
-      LEDGER_LOOKBACK_DAYS: "120"
-      BOTSTATE_LOCK_TTL_SEC: "1800"
       PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,6 +90,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verify DB dependencies
+        run: |
+          python -c "import sqlalchemy; import psycopg; print('deps ok')"
+
+      - name: Run DB migrations
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          python -m trader.db.migrate
+
+      - name: Build Universe (best-effort)
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
+
       - name: Compile modules
         run: |
           python -m compileall trader
@@ -102,7 +114,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.pb1_runner --window auto --phase auto --target-branch ${BOTSTATE_BRANCH}
+          python -m trader.pb1_runner --window auto --phase auto
 
           
 
