@@ -1,1622 +1,466 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+diff --git a/migrations/0001_pbcore.sql b/migrations/0001_pbcore.sql
 new file mode 100644
-index 0000000000000000000000000000000000000000..a03bfd1ae662a9b3da2d2bf4ab88f5dc068a55a9
+index 0000000000000000000000000000000000000000..d464f51d75f6a7d7e5dfe2f6f7b0e9477e8fe9bd
 --- /dev/null
-+++ b/.github/workflows/trade-runner.yml
-@@ -0,0 +1,181 @@
-+name: Trade Tick Runner (Nullim)
++++ b/migrations/0001_pbcore.sql
+@@ -0,0 +1,137 @@
++-- PB-Core v2 base schema
++CREATE EXTENSION IF NOT EXISTS pgcrypto;
 +
-+on:
-+  push:
-+    branches: [ main ]
-+  pull_request:
-+    branches: [ main ]
-+  schedule:
-+    # KST 08:57 = UTC 23:57 (daily)
-+    - cron: "57 23 * * 0-6"
-+  workflow_dispatch:
++-- Enum placeholders as TEXT to keep compatibility with sqlite tests.
 +
-+concurrency:
-+  group: trade-bot-state
-+  cancel-in-progress: false
++CREATE TABLE IF NOT EXISTS runs (
++    run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    strategy text NOT NULL,
++    window text,
++    phase text,
++    event_name text,
++    dry_run boolean NOT NULL DEFAULT false,
++    git_sha text,
++    workflow text,
++    workflow_run_id text,
++    workflow_attempt int,
++    config_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    status text NOT NULL DEFAULT 'STARTED',
++    started_at timestamptz DEFAULT now(),
++    finished_at timestamptz,
++    notes text
++);
 +
-+permissions:
-+  contents: write
++CREATE TABLE IF NOT EXISTS universe (
++    universe_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    strategy text NOT NULL,
++    as_of_date text NOT NULL,
++    source text NOT NULL,
++    params_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    created_at timestamptz DEFAULT now(),
++    CONSTRAINT uq_universe_env_strategy_as_of UNIQUE (env, strategy, as_of_date)
++);
 +
-+jobs:
-+  tick:
-+    # 절대 PR에서는 거래/상태커밋 돌리지 않음 (secrets 미주입/권한 제한 케이스 방지)
-+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-+    runs-on: ubuntu-latest
-+    timeout-minutes: 6
++CREATE TABLE IF NOT EXISTS universe_members (
++    universe_member_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    universe_id uuid NOT NULL REFERENCES universe(universe_id),
++    code text NOT NULL,
++    market text,
++    weight double precision,
++    rank int,
++    meta_json jsonb NOT NULL DEFAULT '{}'::jsonb
++);
 +
-+    env:
-+      # --- Secrets mapping ---
-+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      CANO: ${{ secrets.CANO }}
-+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-+      KIS_ENV: ${{ secrets.KIS_ENV }}
-+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
++CREATE TABLE IF NOT EXISTS orders (
++    order_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    run_id uuid REFERENCES runs(run_id),
++    strategy text NOT NULL,
++    sid int NOT NULL,
++    mode int NOT NULL,
++    code text NOT NULL,
++    market text,
++    side text NOT NULL,
++    ord_type text NOT NULL,
++    qty int NOT NULL,
++    limit_price double precision,
++    stage text,
++    client_order_key text NOT NULL,
++    status text NOT NULL DEFAULT 'INTENT',
++    kis_odno text,
++    request_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    response_json jsonb,
++    submitted_at timestamptz,
++    acked_at timestamptz,
++    created_at timestamptz DEFAULT now(),
++    updated_at timestamptz DEFAULT now(),
++    CONSTRAINT uq_orders_env_client_order_key UNIQUE (env, client_order_key)
++);
 +
-+      # --- Bot-state / ledger ---
-+      BOTSTATE_BRANCH: "bot-state"
-+      BOTSTATE_WORKTREE_DIR: "_botstate"
-+      BOTSTATE_LOCK_TTL_SEC: "1800"
-+      BOTSTATE_DIR: "_botstate"
-+      LEDGER_BACKEND: "db"
-+      LEDGER_BASE_DIR: "bot_state/trader_ledger"
-+      LEDGER_LOOKBACK_DAYS: "120"
-+      LEDGER_DB_PATH: "runtime/ledger/ledger.sqlite"
-+      RUN_MODE: "TICK"
-+      LEDGER_SNAPSHOT_DAILY: "0"
-+      STATE_RECONCILE_APPLY: "1"
++CREATE TABLE IF NOT EXISTS fills (
++    fill_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    run_id uuid REFERENCES runs(run_id),
++    order_id uuid REFERENCES orders(order_id),
++    kis_odno text,
++    trade_id text,
++    code text NOT NULL,
++    market text,
++    side text NOT NULL,
++    qty int NOT NULL,
++    price double precision NOT NULL,
++    fee double precision NOT NULL DEFAULT 0.0,
++    tax double precision NOT NULL DEFAULT 0.0,
++    filled_at timestamptz NOT NULL,
++    raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    created_at timestamptz DEFAULT now(),
++    CONSTRAINT uq_fills_env_trade_id UNIQUE (env, trade_id),
++    CONSTRAINT uq_fills_fallback UNIQUE (env, kis_odno, code, side, qty, price, filled_at)
++);
 +
-+      # --- Market windows / waiting ---
-+      MORNING_WINDOW_START: "08:50"
-+      MORNING_WINDOW_END: "11:00"
-+      MORNING_EXIT_START: "09:00"
-+      MORNING_EXIT_END: "09:20"
-+      AFTERNOON_WINDOW_START: "14:00"
-+      AFTERNOON_WINDOW_END: "15:30"
-+      CLOSE_AUCTION_START: "15:20"
-+      CLOSE_AUCTION_END: "15:30"
-+      MARKET_OPEN_HHMM: "08:50"
-+      MARKET_CLOSE_HHMM: "15:30"
-+      PB1_WAIT_FOR_WINDOW: "1"
-+      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
++CREATE TABLE IF NOT EXISTS positions (
++    position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    strategy text NOT NULL,
++    sid int NOT NULL,
++    mode int NOT NULL,
++    code text NOT NULL,
++    market text,
++    qty int NOT NULL DEFAULT 0,
++    avg_buy_price double precision,
++    total_cost double precision NOT NULL DEFAULT 0.0,
++    realized_pnl double precision NOT NULL DEFAULT 0.0,
++    last_trade_at timestamptz,
++    updated_at timestamptz DEFAULT now(),
++    CONSTRAINT uq_positions_identity UNIQUE (env, strategy, sid, mode, code)
++);
 +
-+      # --- PB1 live controls (one-shot decides diag vs live automatically) ---
-+      DISABLE_LIVE_TRADING: "0"
-+      LIVE_TRADING_ENABLED: "1"
-+      DRY_RUN: "0"
-+      STRATEGY_MODE: "LIVE"
-+      PB1_ENTRY_ENABLED: "1"
++CREATE TABLE IF NOT EXISTS ledger_events (
++    ledger_event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    env text NOT NULL,
++    run_id uuid REFERENCES runs(run_id),
++    event_type text NOT NULL,
++    ts timestamptz NOT NULL,
++    code text,
++    market text,
++    sid int,
++    mode int,
++    side text,
++    qty int,
++    price double precision,
++    kis_odno text,
++    client_order_key text,
++    ok boolean NOT NULL DEFAULT true,
++    reasons jsonb NOT NULL DEFAULT '[]'::jsonb,
++    stage text,
++    payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
++    created_at timestamptz DEFAULT now()
++);
 +
-+      # (원하면 켜서 “장중엔 shadow-live로 점검” 가능; 비거래일엔 어차피 diag로 내려감)
-+      PB1_DIAG_LEVEL: "2"
-+      PB1_SHADOW_LIVE: "1"
-+
-+      # --- Strategy parameters (visibility 유지) ---
-+      PARTIAL1: "0.5"
-+      PARTIAL2: "0.3"
-+      TRAIL_PCT: "0.02"
-+      FAST_STOP: "0.01"
-+      ATR_STOP: "1.5"
-+      TIME_STOP_HHMM: "13:00"
-+      SELL_FORCE_TIME: "14:40"
-+      SELL_ALL_BALANCES_AT_CUTOFF: "false"
-+      FORCE_SELL_PASSES_CUTOFF: "2"
-+      FORCE_SELL_PASSES_CLOSE: "4"
-+      DEFAULT_PROFIT_PCT: "3.0"
-+      DEFAULT_LOSS_PCT: "5.0"
-+      SLIPPAGE_LIMIT_PCT: "0.25"
-+      SLIPPAGE_ENTER_GUARD_PCT: "2.5"
-+      VWAP_TOL: "0.003"
-+      W_MAX_ONE: "0.25"
-+      W_MIN_ONE: "0.03"
-+      REBALANCE_ANCHOR: "weekly"
-+      FORCE_WEEKLY_REBALANCE: "0"
-+      MOMENTUM_OVERRIDES_FORCE_SELL: "true"
-+      KOSDAQ_INDEX_CODE: "KOSDAQ"
-+      KOSDAQ_ETF_FALLBACK: "229200"
-+      DAILY_CAPITAL: "250000000"
-+      API_RATE_SLEEP_SEC: "0.3"
-+
-+    steps:
-+      - uses: actions/checkout@v4
-+        with:
-+          fetch-depth: 0
-+          persist-credentials: true
-+
-+      - uses: actions/setup-python@v5
-+        with:
-+          python-version: "3.11"
-+
-+      - name: Configure git identity (required for botstate commits)
-+        run: |
-+          git config --global user.name "github-actions[bot]"
-+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-+
-+      - name: Install dependencies
-+        run: |
-+          python -m pip install --upgrade pip
-+          pip install -r requirements.txt
-+
-+      - name: (Guard) required secrets present
-+        run: |
-+          missing=()
-+          for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
-+            if [ -z "${!key}" ]; then
-+              missing+=("$key")
-+            fi
-+          done
-+          if [ ${#missing[@]} -gt 0 ]; then
-+            echo "Missing required secrets: ${missing[*]}"
-+            exit 1
-+          fi
-+          echo "Secrets OK. Continue."
-+
-+      - name: Setup bot-state worktree
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python - <<'PY'
-+          import os
-+          from pathlib import Path
-+          from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
-+
-+          base_dir = Path.cwd()
-+          worktree_dir = resolve_botstate_worktree_dir()
-+          setup_worktree(base_dir, worktree_dir, target_branch=os.getenv("BOTSTATE_BRANCH", "bot-state"))
-+          PY
-+
-+      - name: Run tick runner
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python -m trader.tick_runner --botstate "${BOTSTATE_DIR}"
-+
-+      - name: Sync bot_state changes
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python - <<'PY'
-+          from trader.botstate_sync import resolve_botstate_worktree_dir, stage_all, commit_if_staged, push_retry
-+
-+          worktree_dir = resolve_botstate_worktree_dir()
-+          stage_all(worktree_dir)
-+          committed = commit_if_staged(worktree_dir, message="tick update")
-+          if committed:
-+              push_retry(worktree_dir, message="tick update")
-+          PY
-+
-+      - name: Upload tick artifacts
-+        if: always()
-+        uses: actions/upload-artifact@v4
-+        with:
-+          name: pb1-artifacts
-+          path: |
-+            trader/logs/**
-+            _botstate/bot_state/ledger/**
-+            _botstate/bot_state/trader_ledger/**
-+            _botstate/trader/state/state.json
-+          if-no-files-found: warn
-+          retention-days: 30
-diff --git a/.github/workflows/trader-monitor.yml b/.github/workflows/trader-monitor.yml
-index 7d4a73ca2489f4c17b71287c2a1f2efb1dc00388..a03bfd1ae662a9b3da2d2bf4ab88f5dc068a55a9 100644
---- a/.github/workflows/trader-monitor.yml
-+++ b/.github/workflows/trader-monitor.yml
-@@ -1,67 +1,73 @@
--name: Trade Monitor (PB1 One-Shot)
-+name: Trade Tick Runner (Nullim)
++-- Indexes
++CREATE INDEX IF NOT EXISTS idx_runs_strategy_started_at ON runs (strategy, started_at DESC);
++CREATE INDEX IF NOT EXISTS idx_orders_env_code_status ON orders (env, code, status);
++CREATE INDEX IF NOT EXISTS idx_fills_env_code_filled_at ON fills (env, code, filled_at DESC);
++CREATE INDEX IF NOT EXISTS idx_positions_env_updated_at ON positions (env, updated_at DESC);
+diff --git a/requirements.txt b/requirements.txt
+index 05b5f93a703267da5011fbec76118e73906f8836..3550d16d73b2ff793ad7b41482baab55fe4981d6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,10 +1,12 @@
+ fastapi>=0.110,<1.0
+ uvicorn[standard]>=0.29,<1.0
+-python-dotenv
+ pandas>=2.2
+ numpy>=1.26
+ pykrx>=1.0.51
  
- on:
-   push:
--    branches: [ main, nullim ]
-+    branches: [ main ]
-   pull_request:
--    branches: [ main, nullim ]
-+    branches: [ main ]
-   schedule:
-     # KST 08:57 = UTC 23:57 (daily)
-     - cron: "57 23 * * 0-6"
-   workflow_dispatch:
  
- concurrency:
-   group: trade-bot-state
-   cancel-in-progress: false
- 
- permissions:
-   contents: write
- 
- jobs:
--  pb1:
-+  tick:
-     # 절대 PR에서는 거래/상태커밋 돌리지 않음 (secrets 미주입/권한 제한 케이스 방지)
-     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-     runs-on: ubuntu-latest
-+    timeout-minutes: 6
- 
-     env:
-       # --- Secrets mapping ---
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       API_BASE_URL: ${{ secrets.API_BASE_URL }}
- 
-       # --- Bot-state / ledger ---
-       BOTSTATE_BRANCH: "bot-state"
-       BOTSTATE_WORKTREE_DIR: "_botstate"
-       BOTSTATE_LOCK_TTL_SEC: "1800"
-+      BOTSTATE_DIR: "_botstate"
-+      LEDGER_BACKEND: "db"
-       LEDGER_BASE_DIR: "bot_state/trader_ledger"
-       LEDGER_LOOKBACK_DAYS: "120"
-+      LEDGER_DB_PATH: "runtime/ledger/ledger.sqlite"
-+      RUN_MODE: "TICK"
-+      LEDGER_SNAPSHOT_DAILY: "0"
-       STATE_RECONCILE_APPLY: "1"
- 
-       # --- Market windows / waiting ---
-       MORNING_WINDOW_START: "08:50"
-       MORNING_WINDOW_END: "11:00"
-       MORNING_EXIT_START: "09:00"
-       MORNING_EXIT_END: "09:20"
-       AFTERNOON_WINDOW_START: "14:00"
-       AFTERNOON_WINDOW_END: "15:30"
-       CLOSE_AUCTION_START: "15:20"
-       CLOSE_AUCTION_END: "15:30"
-       MARKET_OPEN_HHMM: "08:50"
-       MARKET_CLOSE_HHMM: "15:30"
-       PB1_WAIT_FOR_WINDOW: "1"
-       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
- 
-       # --- PB1 live controls (one-shot decides diag vs live automatically) ---
-       DISABLE_LIVE_TRADING: "0"
-       LIVE_TRADING_ENABLED: "1"
-       DRY_RUN: "0"
-       STRATEGY_MODE: "LIVE"
-       PB1_ENTRY_ENABLED: "1"
- 
-       # (원하면 켜서 “장중엔 shadow-live로 점검” 가능; 비거래일엔 어차피 diag로 내려감)
-       PB1_DIAG_LEVEL: "2"
-@@ -105,42 +111,71 @@ jobs:
- 
-       - name: Configure git identity (required for botstate commits)
-         run: |
-           git config --global user.name "github-actions[bot]"
-           git config --global user.email "github-actions[bot]@users.noreply.github.com"
- 
-       - name: Install dependencies
-         run: |
-           python -m pip install --upgrade pip
-           pip install -r requirements.txt
- 
-       - name: (Guard) required secrets present
-         run: |
-           missing=()
-           for key in KIS_APP_KEY KIS_APP_SECRET CANO ACNT_PRDT_CD; do
-             if [ -z "${!key}" ]; then
-               missing+=("$key")
-             fi
-           done
-           if [ ${#missing[@]} -gt 0 ]; then
-             echo "Missing required secrets: ${missing[*]}"
-             exit 1
-           fi
-           echo "Secrets OK. Continue."
- 
--      - name: "PB1 one-shot run (auto: wait -> live, or diag)"
-+      - name: Setup bot-state worktree
-         env:
-           PYTHONPATH: ${{ github.workspace }}
-         run: |
--          python -m trader.pb1_runner --window auto --phase auto --target-branch "${BOTSTATE_BRANCH}"
-+          python - <<'PY'
-+          import os
-+          from pathlib import Path
-+          from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
- 
--      - name: Upload PB1 artifacts
-+          base_dir = Path.cwd()
-+          worktree_dir = resolve_botstate_worktree_dir()
-+          setup_worktree(base_dir, worktree_dir, target_branch=os.getenv("BOTSTATE_BRANCH", "bot-state"))
-+          PY
-+
-+      - name: Run tick runner
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python -m trader.tick_runner --botstate "${BOTSTATE_DIR}"
-+
-+      - name: Sync bot_state changes
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python - <<'PY'
-+          from trader.botstate_sync import resolve_botstate_worktree_dir, stage_all, commit_if_staged, push_retry
-+
-+          worktree_dir = resolve_botstate_worktree_dir()
-+          stage_all(worktree_dir)
-+          committed = commit_if_staged(worktree_dir, message="tick update")
-+          if committed:
-+              push_retry(worktree_dir, message="tick update")
-+          PY
-+
-+      - name: Upload tick artifacts
-         if: always()
-         uses: actions/upload-artifact@v4
-         with:
-           name: pb1-artifacts
-           path: |
-             trader/logs/**
-+            _botstate/bot_state/ledger/**
-             _botstate/bot_state/trader_ledger/**
-             _botstate/trader/state/state.json
-           if-no-files-found: warn
-           retention-days: 30
-diff --git a/tests/test_tick_runner_idempotency.py b/tests/test_tick_runner_idempotency.py
+ finance-datareader>=0.9
+ python-dotenv>=0.21.0
++sqlalchemy>=2.0
++psycopg[binary]>=3.1
++pytest
+diff --git a/trader/db/__init__.py b/trader/db/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..23f27941aa3a143a87ca57e5282c3c727157a456
+index 0000000000000000000000000000000000000000..ab84761657acdbf03b8328b898c43baee3728a0c
 --- /dev/null
-+++ b/tests/test_tick_runner_idempotency.py
-@@ -0,0 +1,127 @@
-+import json
-+import sys
-+from pathlib import Path
++++ b/trader/db/__init__.py
+@@ -0,0 +1,33 @@
++"""
++Database utilities for the PB-Core v2 backend.
++"""
 +
-+ROOT = Path(__file__).resolve().parents[1]
-+if str(ROOT) not in sys.path:
-+    sys.path.insert(0, str(ROOT))
++from .config import get_database_url, get_db_echo, is_sqlite_url
++from .engine import make_engine
++from .migrate import run_migrations
++from .schema import (
++    FILLS,
++    LEDGER_EVENTS,
++    ORDERS,
++    POSITIONS,
++    RUNS,
++    UNIVERSE,
++    UNIVERSE_MEMBERS,
++    METADATA,
++)
 +
-+from trader import tick_runner
-+from trader.persist.ledger_db import FillPayload, init_db
-+
-+
-+class StubKis:
-+    def __init__(self, positions=None):
-+        self.positions = positions or []
-+        self.orders: list[dict] = []
-+
-+    def get_open_orders(self):
-+        return []
-+
-+    def get_recent_fills(self, since=None):
-+        return []
-+
-+    def get_positions(self):
-+        return list(self.positions)
-+
-+    def buy_stock_market(self, symbol, qty):
-+        odno = f"ORD{len(self.orders)+1}"
-+        resp = {"rt_cd": "0", "output": {"ODNO": odno}, "symbol": symbol, "qty": qty}
-+        self.orders.append(resp)
-+        return resp
-+
-+    def sell_stock_market(self, symbol, qty):
-+        odno = f"ORD{len(self.orders)+1}"
-+        resp = {"rt_cd": "0", "output": {"ODNO": odno}, "symbol": symbol, "qty": qty}
-+        self.orders.append(resp)
-+        return resp
-+
-+
-+def _write_candidates(path: Path, *, signal_key: str = "sig-1"):
-+    payload = [
-+        {
-+            "sid": 1,
-+            "symbol": "005930",
-+            "side": "BUY",
-+            "qty": 10,
-+            "price": None,
-+            "order_type": "market",
-+            "signal_key": signal_key,
-+        }
-+    ]
-+    path.write_text(json.dumps(payload))
-+
-+
-+def test_tick_runner_idempotent_orders(monkeypatch, tmp_path):
-+    botstate_dir = tmp_path / "botstate"
-+    candidates_path = tmp_path / "candidates.json"
-+    db_path = tmp_path / "runtime" / "ledger.sqlite"
-+    _write_candidates(candidates_path)
-+    db_path.parent.mkdir(parents=True, exist_ok=True)
-+
-+    stub_first = StubKis()
-+    monkeypatch.setattr(tick_runner, "KisAPI", lambda: stub_first)
-+    monkeypatch.setenv("LEDGER_DB_PATH", str(db_path))
-+    monkeypatch.setenv("BOTSTATE_DIR", str(botstate_dir))
-+    monkeypatch.setenv("RUN_MODE", "TICK")
-+    monkeypatch.setenv("LEDGER_BACKEND", "db")
-+    monkeypatch.setattr(
-+        sys,
-+        "argv",
-+        ["tick_runner", "--botstate", str(botstate_dir), "--candidates-path", str(candidates_path)],
-+    )
-+    tick_runner.main()
-+    assert len(stub_first.orders) == 1
-+
-+    stub_second = StubKis()
-+    monkeypatch.setattr(tick_runner, "KisAPI", lambda: stub_second)
-+    monkeypatch.setattr(
-+        sys,
-+        "argv",
-+        ["tick_runner", "--botstate", str(botstate_dir), "--candidates-path", str(candidates_path)],
-+    )
-+    tick_runner.main()
-+    assert len(stub_second.orders) == 0
-+
-+
-+def test_tick_runner_safe_mode_blocks_buy(monkeypatch, tmp_path):
-+    botstate_dir = tmp_path / "botstate"
-+    candidates_path = tmp_path / "candidates.json"
-+    db_path = tmp_path / "runtime" / "ledger.sqlite"
-+    _write_candidates(candidates_path, signal_key="safe-mode")
-+    db_path.parent.mkdir(parents=True, exist_ok=True)
-+
-+    db = init_db(db_path)
-+    db.apply_fill_to_lots(
-+        FillPayload(
-+            fill_uid="fill-1",
-+            odno="ORD-1",
-+            symbol="005930",
-+            side="BUY",
-+            qty=10,
-+            price=70000,
-+            ccld_dt="20240101",
-+            ccld_tm="090000",
-+            raw_json={"source": "test"},
-+            sid=1,
-+        )
-+    )
-+
-+    stub = StubKis(positions=[{"pdno": "005930", "hldg_qty": 5, "sid": 1}])
-+    monkeypatch.setattr(tick_runner, "KisAPI", lambda: stub)
-+    monkeypatch.setenv("LEDGER_DB_PATH", str(db_path))
-+    monkeypatch.setenv("BOTSTATE_DIR", str(botstate_dir))
-+    monkeypatch.setenv("RUN_MODE", "TICK")
-+    monkeypatch.setenv("LEDGER_BACKEND", "db")
-+    monkeypatch.setattr(
-+        sys,
-+        "argv",
-+        ["tick_runner", "--botstate", str(botstate_dir), "--candidates-path", str(candidates_path)],
-+    )
-+    tick_runner.main()
-+    assert len(stub.orders) == 0
-+
-+    checkpoint_path = botstate_dir / "bot_state" / "ledger" / "checkpoints.json"
-+    assert checkpoint_path.exists()
-+    checkpoints = json.loads(checkpoint_path.read_text())
-+    assert checkpoints.get("tick", {}).get("safe_mode") is True
-diff --git a/trader/engine/__init__.py b/trader/engine/__init__.py
++__all__ = [
++    "get_database_url",
++    "get_db_echo",
++    "is_sqlite_url",
++    "make_engine",
++    "run_migrations",
++    "FILLS",
++    "LEDGER_EVENTS",
++    "ORDERS",
++    "POSITIONS",
++    "RUNS",
++    "UNIVERSE",
++    "UNIVERSE_MEMBERS",
++    "METADATA",
++]
+diff --git a/trader/db/config.py b/trader/db/config.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..55ea23c1d7e7130bca87a056dc91f5c589bc3fa8
+index 0000000000000000000000000000000000000000..074da6c716e58ea929885bd3be18d345d64c700f
 --- /dev/null
-+++ b/trader/engine/__init__.py
-@@ -0,0 +1,2 @@
-+"""Trading engine helpers."""
-+
-diff --git a/trader/engine/reconcile.py b/trader/engine/reconcile.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..fe4c44ecb018c70f95bfe2303a6174ddf293db65
---- /dev/null
-+++ b/trader/engine/reconcile.py
-@@ -0,0 +1,180 @@
-+from __future__ import annotations
-+
-+import hashlib
-+import logging
-+from collections import defaultdict
-+from datetime import datetime
-+from typing import Any, Dict, Iterable, List, Tuple
-+
-+from trader.persist.ledger_db import FillPayload, LedgerDB
-+
-+logger = logging.getLogger(__name__)
-+
-+
-+def _safe_str(value: Any) -> str:
-+    return "" if value is None else str(value)
-+
-+
-+def _build_fill_uid(fill: dict[str, Any]) -> str:
-+    odno = _safe_str(fill.get("odno") or fill.get("order_no"))
-+    fill_no = _safe_str(fill.get("ccld_no") or fill.get("fill_no"))
-+    if odno and fill_no:
-+        return f"{odno}-{fill_no}"
-+    payload = f"{odno}|{_safe_str(fill.get('ccld_dt'))}|{_safe_str(fill.get('ccld_tm'))}|{_safe_str(fill.get('qty'))}|{_safe_str(fill.get('price'))}"
-+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-+
-+
-+def reconcile_open_orders(kis: Any, db: LedgerDB, checkpoint: Dict[str, Any] | None) -> Dict[str, Any]:
-+    orders: List[dict[str, Any]] = []
-+    try:
-+        orders = list(kis.get_open_orders()) if hasattr(kis, "get_open_orders") else []
-+    except Exception as exc:
-+        logger.exception("[RECONCILE-OPEN] failed reasons=[exception] detail=%s", exc)
-+        return {"count": 0, "new": 0}
-+
-+    new = 0
-+    for order in orders:
-+        odno = _safe_str(order.get("odno") or order.get("order_no"))
-+        symbol = _safe_str(order.get("symbol") or order.get("pdno"))
-+        side = _safe_str(order.get("side") or order.get("ord_dvsn") or order.get("sll_buy_dvsn_cd")).upper()
-+        qty = int(order.get("qty") or order.get("ord_qty") or order.get("qty_remain") or 0)
-+        status = _safe_str(order.get("status") or order.get("ord_sts")).upper() or "OPEN"
-+        intent_id = order.get("intent_id")
-+        price_raw = order.get("price") or order.get("ord_unpr")
-+        try:
-+            price = float(price_raw) if price_raw is not None else None
-+        except Exception:
-+            price = None
-+        db.upsert_order(
-+            odno,
-+            intent_id=intent_id,
-+            symbol=symbol,
-+            side=side,
-+            qty=qty,
-+            price=price,
-+            status=status,
-+            raw_json=order,
-+        )
-+        if intent_id:
-+            db.set_intent_odno(intent_id, odno)
-+        new += 1
-+    logger.info("[RECONCILE-OPEN] count=%s new=%s", len(orders), new)
-+    return {"count": len(orders), "new": new}
-+
-+
-+def reconcile_fills(kis: Any, db: LedgerDB, checkpoint: Dict[str, Any] | None) -> Dict[str, Any]:
-+    fills: List[dict[str, Any]] = []
-+    since = None
-+    if checkpoint:
-+        since = checkpoint.get("last_fill_ts") or checkpoint.get("last_fill_dt")
-+    try:
-+        if hasattr(kis, "get_recent_fills"):
-+            fills = list(kis.get_recent_fills(since=since))
-+    except Exception as exc:
-+        logger.exception("[RECONCILE-FILL] failed reasons=[exception] detail=%s", exc)
-+        return {"total": 0, "applied": 0, "dup": 0}
-+
-+    applied = 0
-+    dup = 0
-+    last_ts: str | None = None
-+    for fill in fills:
-+        fill_uid = _build_fill_uid(fill)
-+        odno = _safe_str(fill.get("odno") or fill.get("order_no"))
-+        symbol = _safe_str(fill.get("symbol") or fill.get("pdno"))
-+        side = _safe_str(fill.get("side") or fill.get("sll_buy_dvsn_cd")).upper()
-+        try:
-+            qty = int(fill.get("qty") or fill.get("ccld_qty") or fill.get("ord_qty") or 0)
-+        except Exception:
-+            qty = 0
-+        try:
-+            price = float(fill.get("price") or fill.get("ccld_unpr") or 0.0)
-+        except Exception:
-+            price = 0.0
-+        ccld_dt = _safe_str(fill.get("ccld_dt") or fill.get("ccld_date") or datetime.utcnow().strftime("%Y%m%d"))
-+        ccld_tm = _safe_str(fill.get("ccld_tm") or fill.get("ccld_time") or datetime.utcnow().strftime("%H%M%S"))
-+        if db.insert_fill_once(
-+            fill_uid,
-+            odno=odno,
-+            symbol=symbol,
-+            side=side,
-+            qty=qty,
-+            price=price,
-+            ccld_dt=ccld_dt,
-+            ccld_tm=ccld_tm,
-+            raw_json=fill,
-+        ):
-+            applied += 1
-+            db.apply_fill_to_lots(
-+                FillPayload(
-+                    fill_uid=fill_uid,
-+                    odno=odno,
-+                    symbol=symbol,
-+                    side=side,
-+                    qty=qty,
-+                    price=price,
-+                    ccld_dt=ccld_dt,
-+                    ccld_tm=ccld_tm,
-+                    raw_json=fill,
-+                    sid=fill.get("sid"),
-+                )
-+            )
-+        else:
-+            dup += 1
-+        last_ts = fill.get("ts") or fill.get("ccld_ts") or ccld_dt + ccld_tm
-+    if last_ts:
-+        db.set_checkpoint("fills", {"last_fill_ts": last_ts})
-+    logger.info("[RECONCILE-FILL] total=%s applied=%s dup=%s", len(fills), applied, dup)
-+    return {"total": len(fills), "applied": applied, "dup": dup, "last_ts": last_ts}
-+
-+
-+def reconcile_positions(kis: Any, db: LedgerDB) -> Dict[str, Any]:
-+    positions: List[dict[str, Any]] = []
-+    try:
-+        positions = list(kis.get_positions()) if hasattr(kis, "get_positions") else []
-+    except Exception as exc:
-+        logger.exception("[RECONCILE-POS] failed reasons=[exception] detail=%s", exc)
-+        return {"safe_mode": True, "mismatches": [{"reason": "positions_unavailable", "detail": str(exc)}]}
-+
-+    ledger_qty: Dict[Tuple[str, Any], int] = defaultdict(int)
-+    try:
-+        cur = db.conn.execute(
-+            "SELECT symbol, sid, SUM(qty_remain) as qty FROM lots GROUP BY symbol, sid;"
-+        )
-+        for row in cur.fetchall():
-+            ledger_qty[(row["symbol"], row["sid"])] = int(row["qty"] or 0)
-+    except Exception:
-+        logger.exception("[RECONCILE-POS] failed to aggregate lots reasons=[exception]")
-+
-+    mismatches: List[dict[str, Any]] = []
-+    for pos in positions:
-+        symbol = _safe_str(pos.get("symbol") or pos.get("pdno"))
-+        sid = pos.get("sid")
-+        try:
-+            qty = int(pos.get("qty") or pos.get("hldg_qty") or pos.get("ord_psbl_qty") or 0)
-+        except Exception:
-+            qty = 0
-+        ledger_q = ledger_qty.get((symbol, sid), 0)
-+        if qty != ledger_q:
-+            mismatches.append(
-+                {
-+                    "symbol": symbol,
-+                    "sid": sid,
-+                    "ledger_qty": ledger_q,
-+                    "broker_qty": qty,
-+                }
-+            )
-+    safe_mode = bool(mismatches)
-+    if safe_mode:
-+        for mismatch in mismatches:
-+            logger.warning(
-+                "[RECONCILE-POS] mismatch symbol=%s sid=%s ledger_qty=%s broker_qty=%s",
-+                mismatch.get("symbol"),
-+                mismatch.get("sid"),
-+                mismatch.get("ledger_qty"),
-+                mismatch.get("broker_qty"),
-+            )
-+        logger.error("[SAFE_MODE] activated reasons=%s", mismatches)
-+    else:
-+        logger.info("[RECONCILE-POS] ok positions=%s", len(positions))
-+    return {"safe_mode": safe_mode, "mismatches": mismatches}
-+
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index a8e43f90f4120812e51d9653c5fa9b84fd717a21..65890ee095689a6a054344b3dc4e57e1ecc50a53 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -1871,25 +1871,48 @@ class KisAPI:
-         체결 직후 잔고/현금 재조회 (네트워크/지연 내성).
-         - 여러 번(기본 5회) 짧게 시도하여 output1/2가 채워진 시점에 반환
-         - 실패 시 마지막 성공 스냅샷 또는 빈 dict
-         """
-         snap: dict = {}
-         tries = max(1, int(max_tries))
-         delay = max(0.2, float(wait_sec) / tries)
-         for i in range(tries):
-             try:
-                 j = self.inquire_balance_all()
-                 if j and (j.get("output1") or j.get("output2")):
-                     snap = j
-                     logger.info("[SYNC] balance refreshed (try=%s)", i + 1)
-                     break
-             except Exception as e:
-                 logger.warning("[SYNC] balance refresh failed: %s", e)
-             time.sleep(delay)
-         return snap
- 
-     def check_filled(self, order_resp: Optional[dict]) -> bool:
-         """간이 체결 확인: 응답 rt_cd == '0'이면 성공으로 간주."""
-         try:
-             return bool(order_resp and isinstance(order_resp, dict) and order_resp.get("rt_cd") == "0")
-         except Exception:
-             return False
-+
-+    # ===== [NEW] 리컨실 보조 =====
-+    def get_open_orders(self):
-+        override = getattr(self, "_open_orders_override", None)
-+        if override is not None:
-+            return list(override)
-+        logger.info("[OPEN-ORDERS] no override configured -> returning empty list")
-+        return []
-+
-+    def get_recent_fills(self, since: str | None = None):
-+        override = getattr(self, "_recent_fills_override", None)
-+        if override is not None:
-+            return list(override)
-+        logger.info("[RECENT-FILLS] since=%s no override configured -> returning empty list", since)
-+        return []
-+
-+    def set_open_orders_override(self, orders):
-+        self._open_orders_override = list(orders or [])
-+        logger.info("[OPEN-ORDERS] override set count=%s", len(self._open_orders_override))
-+
-+    def set_recent_fills_override(self, fills):
-+        self._recent_fills_override = list(fills or [])
-+        logger.info("[RECENT-FILLS] override set count=%s", len(self._recent_fills_override))
-diff --git a/trader/persist/__init__.py b/trader/persist/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..c3a68e71f576449c0880fbfbab703aee3efb9ddd
---- /dev/null
-+++ b/trader/persist/__init__.py
-@@ -0,0 +1,2 @@
-+"""Persistence helpers for database-backed ledger and event storage."""
-+
-diff --git a/trader/persist/event_store.py b/trader/persist/event_store.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..6da0820fad15cf36cde8a6a3da0b0d9843087135
---- /dev/null
-+++ b/trader/persist/event_store.py
-@@ -0,0 +1,117 @@
-+from __future__ import annotations
-+
-+import json
-+import logging
++++ b/trader/db/config.py
+@@ -0,0 +1,16 @@
 +import os
-+from datetime import date, datetime
++
++
++def get_database_url() -> str:
++    url = os.getenv("DATABASE_URL")
++    if not url:
++        raise RuntimeError("DATABASE_URL environment variable must be set")
++    return url
++
++
++def get_db_echo() -> bool:
++    return os.getenv("DB_ECHO", "false").lower() in ("1", "true", "yes", "on")
++
++
++def is_sqlite_url(url: str) -> bool:
++    return url.startswith("sqlite:")
+diff --git a/trader/db/engine.py b/trader/db/engine.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..281516ecbdee1964f92a5173a74cc9ba90957626
+--- /dev/null
++++ b/trader/db/engine.py
+@@ -0,0 +1,12 @@
++from sqlalchemy import Engine, create_engine
++
++from . import config
++
++
++def make_engine(database_url: str | None = None) -> Engine:
++    url = database_url or config.get_database_url()
++    kwargs = {}
++    if not config.is_sqlite_url(url):
++        kwargs["pool_pre_ping"] = True
++    engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
++    return engine
+diff --git a/trader/db/migrate.py b/trader/db/migrate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..492c29f38b7a740106937b727defc72f9d5fbdd6
+--- /dev/null
++++ b/trader/db/migrate.py
+@@ -0,0 +1,62 @@
++import glob
++import os
 +from pathlib import Path
-+from typing import Dict, Iterable, Iterator, List, Tuple
 +
-+logger = logging.getLogger(__name__)
++import sqlalchemy as sa
++from sqlalchemy import Engine, text
 +
-+DEFAULT_LEDGER_DIR = Path("bot_state/ledger")
-+
-+
-+def _today() -> date:
-+    return datetime.utcnow().date()
++from . import config
++from .schema import METADATA
 +
 +
-+def _event_path(base_dir: Path, kind: str, day: date) -> Path:
-+    ymd = day.strftime("%Y%m%d")
-+    return base_dir / "events" / f"{kind}_{ymd}.jsonl"
-+
-+
-+def _ensure_dir(path: Path) -> None:
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+
-+
-+class EventStore:
-+    def __init__(self, base_dir: Path = DEFAULT_LEDGER_DIR) -> None:
-+        self.base_dir = Path(base_dir)
-+
-+    def append_event(self, kind: str, payload: Dict) -> Path:
-+        day = _today()
-+        path = _event_path(self.base_dir, kind, day)
-+        _ensure_dir(path)
-+        record = dict(payload)
-+        record.setdefault("ts", datetime.utcnow().isoformat())
-+        record.setdefault("type", kind.upper())
-+        line = json.dumps(record, ensure_ascii=False)
-+        reasons: List[str] = []
-+        try:
-+            with open(path, "a", encoding="utf-8") as f:
-+                f.write(line + "\n")
-+                f.flush()
-+                os.fsync(f.fileno())
-+            logger.info(
-+                "[EVENT-STORE] append kind=%s path=%s type=%s",
-+                kind,
-+                path,
-+                record.get("type"),
++def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
++    conn.execute(
++        text(
++            """
++            CREATE TABLE IF NOT EXISTS schema_migrations (
++                version text primary key,
++                applied_at timestamptz default now()
 +            )
-+        except Exception as exc:
-+            reasons.append(str(exc))
-+            logger.exception(
-+                "[EVENT-STORE] append failed kind=%s path=%s reasons=%s", kind, path, reasons
-+            )
-+        return path
++            """
++        )
++    )
 +
-+    def load_events(
-+        self,
-+        kind: str | None = None,
-+        *,
-+        date_range: Tuple[date | None, date | None] | None = None,
-+    ) -> Iterator[Dict]:
-+        kinds = [kind] if kind else self._available_kinds()
-+        start, end = date_range or (None, None)
-+        for k in kinds:
-+            for path in self._iter_paths(k, start=start, end=end):
-+                yield from self._iter_file(path)
 +
-+    def _available_kinds(self) -> List[str]:
-+        events_dir = self.base_dir / "events"
-+        kinds: set[str] = set()
-+        if not events_dir.exists():
-+            return []
-+        for path in events_dir.glob("*.jsonl"):
-+            name = path.stem
-+            if "_" in name:
-+                kinds.add(name.split("_", 1)[0])
-+        return sorted(kinds)
++def _list_applied_versions(conn: sa.Connection) -> set[str]:
++    result = conn.execute(text("SELECT version FROM schema_migrations"))
++    return {row[0] for row in result}
 +
-+    def _iter_paths(
-+        self, kind: str, *, start: date | None, end: date | None
-+    ) -> Iterable[Path]:
-+        events_dir = self.base_dir / "events"
-+        if not events_dir.exists():
-+            return []
-+        for path in sorted(events_dir.glob(f"{kind}_*.jsonl")):
-+            try:
-+                ymd = path.stem.split("_", 1)[1]
-+                path_date = datetime.strptime(ymd, "%Y%m%d").date()
-+            except Exception:
-+                continue
-+            if start and path_date < start:
-+                continue
-+            if end and path_date > end:
-+                continue
-+            yield path
 +
-+    def _iter_file(self, path: Path) -> Iterator[Dict]:
-+        if not path.exists():
++def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
++    with engine.begin() as conn:
++        url = str(engine.url)
++        if config.is_sqlite_url(url):
++            METADATA.create_all(engine)
 +            return
-+        try:
-+            with open(path, "r", encoding="utf-8") as f:
-+                for line in f:
-+                    if not line.strip():
-+                        continue
-+                    try:
-+                        yield json.loads(line)
-+                    except json.JSONDecodeError:
-+                        logger.warning(
-+                            "[EVENT-STORE] skip invalid json path=%s line=%s",
-+                            path,
-+                            line.strip()[:200],
-+                        )
-+        except Exception:
-+            logger.exception("[EVENT-STORE] load failed path=%s", path)
-diff --git a/trader/persist/ledger_db.py b/trader/persist/ledger_db.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..81b66b5718d50acd206b121a15d424bd9aa51e7a
---- /dev/null
-+++ b/trader/persist/ledger_db.py
-@@ -0,0 +1,442 @@
-+from __future__ import annotations
 +
-+import hashlib
-+import json
-+import logging
-+import sqlite3
-+from contextlib import contextmanager
-+from dataclasses import dataclass
-+from datetime import datetime
-+from pathlib import Path
-+from typing import Any, Callable, Iterable, Tuple
++        _ensure_schema_migrations_table(conn)
++        applied = _list_applied_versions(conn)
 +
-+logger = logging.getLogger(__name__)
-+
-+DEFAULT_DB_PATH = Path("runtime/ledger/ledger.sqlite")
-+
-+
-+def _utcnow_str() -> str:
-+    return datetime.utcnow().isoformat()
-+
-+
-+@dataclass
-+class FillPayload:
-+    fill_uid: str
-+    odno: str
-+    symbol: str
-+    side: str
-+    qty: int
-+    price: float
-+    ccld_dt: str
-+    ccld_tm: str
-+    raw_json: dict[str, Any]
-+    sid: int | None = None
-+
-+
-+class LedgerDB:
-+    def __init__(self, db_path: Path) -> None:
-+        self.db_path = Path(db_path)
-+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-+        self.conn = sqlite3.connect(self.db_path, isolation_level=None)
-+        self.conn.row_factory = sqlite3.Row
-+        self._configure()
-+        self._init_schema()
-+
-+    def _configure(self) -> None:
-+        try:
-+            self.conn.execute("PRAGMA journal_mode=WAL;")
-+            self.conn.execute("PRAGMA foreign_keys=ON;")
-+        except Exception:
-+            logger.exception("[LEDGER-DB] pragma configure failed path=%s", self.db_path)
-+
-+    def _init_schema(self) -> None:
-+        try:
-+            self.conn.executescript(
-+                """
-+                CREATE TABLE IF NOT EXISTS fills (
-+                    fill_uid TEXT PRIMARY KEY,
-+                    odno TEXT,
-+                    symbol TEXT,
-+                    side TEXT,
-+                    qty INTEGER,
-+                    price REAL,
-+                    ccld_dt TEXT,
-+                    ccld_tm TEXT,
-+                    raw_json TEXT,
-+                    created_at TEXT
-+                );
-+                CREATE TABLE IF NOT EXISTS intents (
-+                    intent_id TEXT PRIMARY KEY,
-+                    sid INTEGER,
-+                    symbol TEXT,
-+                    side TEXT,
-+                    signal_key TEXT,
-+                    status TEXT,
-+                    odno TEXT,
-+                    created_at TEXT,
-+                    updated_at TEXT
-+                );
-+                CREATE TABLE IF NOT EXISTS orders (
-+                    odno TEXT PRIMARY KEY,
-+                    intent_id TEXT,
-+                    symbol TEXT,
-+                    side TEXT,
-+                    qty INTEGER,
-+                    price REAL,
-+                    status TEXT,
-+                    raw_json TEXT,
-+                    created_at TEXT,
-+                    updated_at TEXT
-+                );
-+                CREATE TABLE IF NOT EXISTS lots (
-+                    lot_id TEXT PRIMARY KEY,
-+                    sid INTEGER,
-+                    symbol TEXT,
-+                    entry_dt TEXT,
-+                    entry_tm TEXT,
-+                    entry_px REAL,
-+                    qty_open INTEGER,
-+                    qty_remain INTEGER,
-+                    meta_json TEXT,
-+                    created_at TEXT,
-+                    updated_at TEXT
-+                );
-+                CREATE TABLE IF NOT EXISTS checkpoints (
-+                    key TEXT PRIMARY KEY,
-+                    value_json TEXT,
-+                    updated_at TEXT
-+                );
-+                """
-+            )
-+            logger.info("[LEDGER-DB] schema initialized path=%s", self.db_path)
-+        except Exception:
-+            logger.exception("[LEDGER-DB] schema init failed path=%s", self.db_path)
-+            raise
-+
-+    @contextmanager
-+    def tx(self):
-+        cursor = self.conn.cursor()
-+        try:
-+            cursor.execute("BEGIN IMMEDIATE;")
-+            yield cursor
-+            self.conn.commit()
-+        except Exception:
-+            self.conn.rollback()
-+            raise
-+        finally:
-+            cursor.close()
-+
-+    def with_tx(self, fn: Callable[[sqlite3.Cursor], Any]) -> Any:
-+        with self.tx() as cur:
-+            return fn(cur)
-+
-+    def upsert_intent(self, intent: dict[str, Any]) -> None:
-+        payload = dict(intent)
-+        now = _utcnow_str()
-+        payload.setdefault("created_at", now)
-+        payload["updated_at"] = now
-+        try:
-+            with self.tx() as cur:
-+                cur.execute(
-+                    """
-+                    INSERT INTO intents (intent_id, sid, symbol, side, signal_key, status, odno, created_at, updated_at)
-+                    VALUES (:intent_id, :sid, :symbol, :side, :signal_key, :status, :odno, :created_at, :updated_at)
-+                    ON CONFLICT(intent_id) DO UPDATE SET
-+                        sid=excluded.sid,
-+                        symbol=excluded.symbol,
-+                        side=excluded.side,
-+                        signal_key=excluded.signal_key,
-+                        status=excluded.status,
-+                        odno=COALESCE(excluded.odno, intents.odno),
-+                        updated_at=excluded.updated_at
-+                    """,
-+                    payload,
-+                )
-+            logger.info(
-+                "[LEDGER-DB] upsert_intent ok intent_id=%s status=%s odno=%s",
-+                payload.get("intent_id"),
-+                payload.get("status"),
-+                payload.get("odno"),
-+            )
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] upsert_intent failed intent_id=%s reasons=[exception]",
-+                payload.get("intent_id"),
-+            )
-+            raise
-+
-+    def set_intent_odno(self, intent_id: str, odno: str) -> None:
-+        now = _utcnow_str()
-+        try:
-+            with self.tx() as cur:
-+                cur.execute(
-+                    """
-+                    UPDATE intents
-+                    SET odno=?, updated_at=?
-+                    WHERE intent_id=?
-+                    """,
-+                    (odno, now, intent_id),
-+                )
-+            logger.info("[LEDGER-DB] set_intent_odno intent_id=%s odno=%s", intent_id, odno)
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] set_intent_odno failed intent_id=%s reasons=[exception]", intent_id
-+            )
-+            raise
-+
-+    def has_intent(self, intent_id: str) -> bool:
-+        try:
-+            cur = self.conn.execute("SELECT 1 FROM intents WHERE intent_id=? LIMIT 1;", (intent_id,))
-+            exists = cur.fetchone() is not None
-+            logger.info("[LEDGER-DB] has_intent intent_id=%s exists=%s", intent_id, exists)
-+            return exists
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] has_intent failed intent_id=%s reasons=[exception]", intent_id
-+            )
-+            return False
-+
-+    def upsert_order(self, odno: str, *, intent_id: str | None, symbol: str, side: str, qty: int, price: float | None, status: str, raw_json: dict[str, Any] | None = None) -> None:
-+        now = _utcnow_str()
-+        payload = {
-+            "odno": odno,
-+            "intent_id": intent_id,
-+            "symbol": symbol,
-+            "side": side,
-+            "qty": qty,
-+            "price": price,
-+            "status": status,
-+            "raw_json": json.dumps(raw_json or {}, ensure_ascii=False),
-+            "created_at": now,
-+            "updated_at": now,
-+        }
-+        try:
-+            with self.tx() as cur:
-+                cur.execute(
-+                    """
-+                    INSERT INTO orders (odno, intent_id, symbol, side, qty, price, status, raw_json, created_at, updated_at)
-+                    VALUES (:odno, :intent_id, :symbol, :side, :qty, :price, :status, :raw_json, :created_at, :updated_at)
-+                    ON CONFLICT(odno) DO UPDATE SET
-+                        intent_id=COALESCE(excluded.intent_id, orders.intent_id),
-+                        symbol=excluded.symbol,
-+                        side=excluded.side,
-+                        qty=excluded.qty,
-+                        price=COALESCE(excluded.price, orders.price),
-+                        status=excluded.status,
-+                        raw_json=excluded.raw_json,
-+                        updated_at=excluded.updated_at
-+                    """,
-+                    payload,
-+                )
-+            logger.info(
-+                "[LEDGER-DB] upsert_order ok odno=%s intent_id=%s status=%s", odno, intent_id, status
-+            )
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] upsert_order failed odno=%s reasons=[exception]", odno
-+            )
-+            raise
-+
-+    def insert_fill_once(self, fill_uid: str, *, odno: str, symbol: str, side: str, qty: int, price: float, ccld_dt: str, ccld_tm: str, raw_json: dict[str, Any]) -> bool:
-+        payload = {
-+            "fill_uid": fill_uid,
-+            "odno": odno,
-+            "symbol": symbol,
-+            "side": side,
-+            "qty": qty,
-+            "price": price,
-+            "ccld_dt": ccld_dt,
-+            "ccld_tm": ccld_tm,
-+            "raw_json": json.dumps(raw_json or {}, ensure_ascii=False),
-+            "created_at": _utcnow_str(),
-+        }
-+        try:
-+            with self.tx() as cur:
-+                cur.execute(
-+                    """
-+                    INSERT OR IGNORE INTO fills (fill_uid, odno, symbol, side, qty, price, ccld_dt, ccld_tm, raw_json, created_at)
-+                    VALUES (:fill_uid, :odno, :symbol, :side, :qty, :price, :ccld_dt, :ccld_tm, :raw_json, :created_at)
-+                    """,
-+                    payload,
-+                )
-+                inserted = cur.rowcount > 0
-+            logger.info(
-+                "[LEDGER-DB] insert_fill_once %s fill_uid=%s odno=%s symbol=%s qty=%s price=%s",
-+                "ok" if inserted else "dup",
-+                fill_uid,
-+                odno,
-+                symbol,
-+                qty,
-+                price,
-+            )
-+            return inserted
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] insert_fill_once failed fill_uid=%s reasons=[exception]", fill_uid
-+            )
-+            return False
-+
-+    def _generate_lot_id(self, fill_uid: str, symbol: str, sid: int | None) -> str:
-+        base = f"{fill_uid}|{symbol}|{sid or 0}"
-+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
-+
-+    def _existing_lots(self, symbol: str, sid: int | None) -> list[sqlite3.Row]:
-+        try:
-+            cur = self.conn.execute(
-+                "SELECT * FROM lots WHERE symbol=? AND (sid=? OR (? IS NULL AND sid IS NULL)) ORDER BY entry_dt, entry_tm;",
-+                (symbol, sid, sid),
-+            )
-+            return list(cur.fetchall())
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] load lots failed symbol=%s sid=%s reasons=[exception]", symbol, sid
-+            )
-+            return []
-+
-+    def apply_fill_to_lots(self, fill: FillPayload) -> None:
-+        side = (fill.side or "").upper()
-+        symbol = fill.symbol
-+        sid = fill.sid
-+        reasons: list[str] = []
-+        try:
-+            if side == "BUY":
-+                lot_id = self._generate_lot_id(fill.fill_uid, symbol, sid)
-+                meta = {"source_fill": fill.raw_json, "fill_uid": fill.fill_uid}
-+                payload = {
-+                    "lot_id": lot_id,
-+                    "sid": sid,
-+                    "symbol": symbol,
-+                    "entry_dt": fill.ccld_dt,
-+                    "entry_tm": fill.ccld_tm,
-+                    "entry_px": float(fill.price),
-+                    "qty_open": int(fill.qty),
-+                    "qty_remain": int(fill.qty),
-+                    "meta_json": json.dumps(meta, ensure_ascii=False),
-+                    "created_at": _utcnow_str(),
-+                    "updated_at": _utcnow_str(),
-+                }
-+                with self.tx() as cur:
-+                    cur.execute(
-+                        """
-+                        INSERT INTO lots (lot_id, sid, symbol, entry_dt, entry_tm, entry_px, qty_open, qty_remain, meta_json, created_at, updated_at)
-+                        VALUES (:lot_id, :sid, :symbol, :entry_dt, :entry_tm, :entry_px, :qty_open, :qty_remain, :meta_json, :created_at, :updated_at)
-+                        ON CONFLICT(lot_id) DO UPDATE SET
-+                            qty_open=lots.qty_open + excluded.qty_open,
-+                            qty_remain=lots.qty_remain + excluded.qty_remain,
-+                            updated_at=excluded.updated_at
-+                        """,
-+                        payload,
-+                    )
-+                logger.info(
-+                    "[LEDGER-DB] apply_fill_to_lots buy lot_id=%s qty=%s symbol=%s sid=%s",
-+                    payload["lot_id"],
-+                    payload["qty_open"],
-+                    symbol,
-+                    sid,
-+                )
-+                return
-+
-+            if side == "SELL":
-+                remaining_to_close = int(fill.qty)
-+                lots = self._existing_lots(symbol, sid)
-+                with self.tx() as cur:
-+                    for lot in lots:
-+                        if remaining_to_close <= 0:
-+                            break
-+                        lot_qty = int(lot["qty_remain"] or 0)
-+                        if lot_qty <= 0:
-+                            continue
-+                        consume = min(lot_qty, remaining_to_close)
-+                        new_qty = lot_qty - consume
-+                        cur.execute(
-+                            "UPDATE lots SET qty_remain=?, updated_at=? WHERE lot_id=?",
-+                            (new_qty, _utcnow_str(), lot["lot_id"]),
-+                        )
-+                        remaining_to_close -= consume
-+                    if remaining_to_close > 0:
-+                        reasons.append(f"remaining_unclosed={remaining_to_close}")
-+                logger.info(
-+                    "[LEDGER-DB] apply_fill_to_lots sell symbol=%s sid=%s filled=%s remaining=%s reasons=%s",
-+                    symbol,
-+                    sid,
-+                    fill.qty - max(remaining_to_close, 0),
-+                    remaining_to_close,
-+                    reasons or ["ok"],
-+                )
-+                return
-+
-+            reasons.append(f"unsupported_side={side}")
-+            logger.warning(
-+                "[LEDGER-DB] apply_fill_to_lots skip fill_uid=%s symbol=%s side=%s reasons=%s",
-+                fill.fill_uid,
-+                symbol,
-+                side,
-+                reasons,
-+            )
-+        except Exception:
-+            logger.exception(
-+                "[LEDGER-DB] apply_fill_to_lots error fill_uid=%s symbol=%s side=%s reasons=[exception]",
-+                fill.fill_uid,
-+                symbol,
-+                side,
-+            )
-+
-+    def set_checkpoint(self, key: str, value_dict: dict[str, Any]) -> None:
-+        now = _utcnow_str()
-+        try:
-+            with self.tx() as cur:
-+                cur.execute(
-+                    """
-+                    INSERT INTO checkpoints (key, value_json, updated_at)
-+                    VALUES (?, ?, ?)
-+                    ON CONFLICT(key) DO UPDATE SET
-+                        value_json=excluded.value_json,
-+                        updated_at=excluded.updated_at
-+                    """,
-+                    (key, json.dumps(value_dict, ensure_ascii=False), now),
-+                )
-+            logger.info("[LEDGER-DB] checkpoint set key=%s", key)
-+        except Exception:
-+            logger.exception("[LEDGER-DB] checkpoint set failed key=%s reasons=[exception]", key)
-+            raise
-+
-+    def get_checkpoint(self, key: str) -> dict[str, Any] | None:
-+        try:
-+            cur = self.conn.execute("SELECT value_json FROM checkpoints WHERE key=?;", (key,))
-+            row = cur.fetchone()
-+            if not row:
-+                logger.info("[LEDGER-DB] checkpoint miss key=%s", key)
-+                return None
-+            raw = row["value_json"]
-+            try:
-+                value = json.loads(raw) if raw else None
-+            except Exception:
-+                value = None
-+            logger.info("[LEDGER-DB] checkpoint hit key=%s", key)
-+            return value if isinstance(value, dict) else None
-+        except Exception:
-+            logger.exception("[LEDGER-DB] checkpoint get failed key=%s reasons=[exception]", key)
-+            return None
-+
-+    def dump_checkpoints(self) -> dict[str, Any]:
-+        payload: dict[str, Any] = {}
-+        try:
-+            cur = self.conn.execute("SELECT key, value_json FROM checkpoints;")
-+            for row in cur.fetchall():
-+                raw = row["value_json"]
-+                try:
-+                    payload[row["key"]] = json.loads(raw) if raw else {}
-+                except Exception:
-+                    payload[row["key"]] = {}
-+            logger.info("[LEDGER-DB] dump_checkpoints count=%s", len(payload))
-+        except Exception:
-+            logger.exception("[LEDGER-DB] dump_checkpoints failed reasons=[exception]")
-+        return payload
-+
-+
-+def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> LedgerDB:
-+    return LedgerDB(Path(db_path))
-+
-+
-+def with_tx(db: LedgerDB, fn: Callable[[sqlite3.Cursor], Any]) -> Any:
-+    return db.with_tx(fn)
-diff --git a/trader/tick_runner.py b/trader/tick_runner.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..5f4ace9e06e2eb83d805211a890aaddaec0bfb72
---- /dev/null
-+++ b/trader/tick_runner.py
-@@ -0,0 +1,313 @@
-+from __future__ import annotations
-+
-+import argparse
-+import hashlib
-+import json
-+import logging
-+import os
-+from dataclasses import dataclass
-+from pathlib import Path
-+from typing import Any, Dict, Iterable, List
-+
-+from trader.engine.reconcile import reconcile_fills, reconcile_open_orders, reconcile_positions
-+from trader.kis_wrapper import KisAPI
-+from trader.persist.event_store import EventStore
-+from trader.persist.ledger_db import LedgerDB, init_db
-+from trader.time_utils import now_kst
-+
-+logger = logging.getLogger(__name__)
-+logging.basicConfig(level=logging.INFO)
-+
-+
-+@dataclass
-+class Candidate:
-+    sid: int
-+    symbol: str
-+    side: str
-+    qty: int
-+    price: float | None
-+    order_type: str
-+    signal_key: str
-+
-+
-+def _intent_id(trade_date: str, candidate: Candidate) -> str:
-+    raw = f"{trade_date}{candidate.sid}{candidate.symbol}{candidate.side.upper()}{candidate.signal_key}"
-+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-+
-+
-+def _load_candidates(path: str | None) -> List[Candidate]:
-+    if not path:
-+        return []
-+    fp = Path(path)
-+    if not fp.exists():
-+        logger.warning("[SETUP-BAD] candidate path missing path=%s reasons=%s", fp, ["file_missing"])
-+        return []
-+    try:
-+        data = json.loads(fp.read_text())
-+    except Exception:
-+        logger.exception("[SETUP-BAD] failed to load candidates path=%s reasons=%s", fp, ["json_error"])
-+        return []
-+    items: List[Candidate] = []
-+    for idx, row in enumerate(data if isinstance(data, list) else []):
-+        try:
-+            cand = Candidate(
-+                sid=int(row.get("sid")),
-+                symbol=str(row.get("symbol") or "").zfill(6),
-+                side=str(row.get("side") or "").upper(),
-+                qty=int(row.get("qty") or 0),
-+                price=float(row["price"]) if row.get("price") is not None else None,
-+                order_type=str(row.get("order_type") or "market"),
-+                signal_key=str(row.get("signal_key") or ""),
-+            )
-+            items.append(cand)
-+        except Exception as exc:
-+            logger.warning(
-+                "[SETUP-BAD] skip candidate idx=%s reasons=%s", idx, [f"parse_error:{exc}"]
-+            )
-+    return items
-+
-+
-+def _resolve_botstate_dir(path: str | None) -> Path:
-+    resolved = Path(path or os.getenv("BOTSTATE_DIR", "_botstate")).resolve()
-+    resolved.mkdir(parents=True, exist_ok=True)
-+    target = resolved / "bot_state"
-+    target.mkdir(parents=True, exist_ok=True)
-+    return target
-+
-+
-+def _write_checkpoints_file(base_dir: Path, db: LedgerDB) -> Path:
-+    checkpoints = db.dump_checkpoints()
-+    path = base_dir / "ledger" / "checkpoints.json"
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    tmp = path.with_suffix(".json.tmp")
-+    tmp.write_text(json.dumps(checkpoints, ensure_ascii=False, indent=2))
-+    tmp.replace(path)
-+    logger.info("[TICK] checkpoints persisted path=%s", path)
-+    return path
-+
-+
-+def _extract_odno(resp: Dict[str, Any] | None) -> str:
-+    if not isinstance(resp, dict):
-+        return ""
-+    output = resp.get("output") or resp.get("output1") or {}
-+    if isinstance(output, dict):
-+        return str(output.get("ODNO") or output.get("ord_no") or output.get("odno") or "")
-+    return ""
-+
-+
-+def _order_ok(resp: Dict[str, Any] | None) -> bool:
-+    if not isinstance(resp, dict):
-+        return False
-+    if str(resp.get("rt_cd") or "").strip() == "0":
-+        return True
-+    status = str(resp.get("status") or "").upper()
-+    return status == "OK"
-+
-+
-+def _send_order(kis: KisAPI, candidate: Candidate) -> Dict[str, Any] | None:
-+    try:
-+        if candidate.side == "BUY":
-+            if candidate.order_type == "limit" and candidate.price:
-+                return kis.buy_stock_limit(candidate.symbol, candidate.qty, int(candidate.price))
-+            return kis.buy_stock_market(candidate.symbol, candidate.qty)
-+        if candidate.side == "SELL":
-+            if candidate.order_type == "limit" and candidate.price:
-+                return kis.sell_stock_limit(candidate.symbol, candidate.qty, int(candidate.price))
-+            return kis.sell_stock_market(candidate.symbol, candidate.qty)
-+    except Exception as exc:
-+        logger.exception("[ORDER] send failed symbol=%s side=%s reasons=%s", candidate.symbol, candidate.side, [str(exc)])
-+        return {"status": "ERROR", "reason": str(exc)}
-+    return None
-+
-+
-+def _append_order_event(
-+    store: EventStore,
-+    *,
-+    event_type: str,
-+    intent_id: str,
-+    odno: str,
-+    candidate: Candidate,
-+    resp: Dict[str, Any] | None,
-+    reasons: Iterable[str],
-+) -> None:
-+    store.append_event(
-+        "orders",
-+        {
-+            "type": event_type,
-+            "intent_id": intent_id,
-+            "odno": odno,
-+            "symbol": candidate.symbol,
-+            "side": candidate.side,
-+            "qty": candidate.qty,
-+            "signal_key": candidate.signal_key,
-+            "reasons": list(reasons),
-+            "payload": resp or {},
-+        },
-+    )
-+
-+
-+def _process_candidates(
-+    *,
-+    candidates: List[Candidate],
-+    db: LedgerDB,
-+    kis: KisAPI,
-+    event_store: EventStore,
-+    trade_date: str,
-+    safe_mode: bool,
-+) -> None:
-+    for cand in candidates:
-+        reasons: List[str] = []
-+        cand.side = cand.side.upper()
-+        if not cand.signal_key:
-+            reasons.append("signal_key_missing")
-+        if cand.qty <= 0:
-+            reasons.append("qty_invalid")
-+        if cand.side not in {"BUY", "SELL"}:
-+            reasons.append("side_invalid")
-+        if safe_mode and cand.side == "BUY":
-+            reasons.append("safe_mode_active")
-+        intent_id = _intent_id(trade_date, cand)
-+        if db.has_intent(intent_id):
-+            logger.info(
-+                "[INTENT] skip exists intent_id=%s symbol=%s side=%s", intent_id, cand.symbol, cand.side
-+            )
-+            continue
-+        if reasons:
-+            logger.error("[SETUP-BAD] intent_id=%s reasons=%s", intent_id, reasons)
-+            continue
-+
-+        db.upsert_intent(
-+            {
-+                "intent_id": intent_id,
-+                "sid": cand.sid,
-+                "symbol": cand.symbol,
-+                "side": cand.side,
-+                "signal_key": cand.signal_key,
-+                "status": "NEW",
-+                "odno": None,
-+            }
++        migration_files = sorted(
++            [
++                Path(path)
++                for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
++                if Path(path).is_file()
++            ]
 +        )
-+
-+        resp = _send_order(kis, cand)
-+        if _order_ok(resp):
-+            odno = _extract_odno(resp)
-+            db.upsert_intent(
-+                {
-+                    "intent_id": intent_id,
-+                    "sid": cand.sid,
-+                    "symbol": cand.symbol,
-+                    "side": cand.side,
-+                    "signal_key": cand.signal_key,
-+                    "status": "SENT",
-+                    "odno": odno,
-+                }
++        for path in migration_files:
++            version = path.name
++            if version in applied:
++                continue
++            sql = path.read_text()
++            conn.execute(text(sql))
++            conn.execute(
++                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
++                {"version": version},
 +            )
-+            db.upsert_order(
-+                odno or intent_id,
-+                intent_id=intent_id,
-+                symbol=cand.symbol,
-+                side=cand.side,
-+                qty=cand.qty,
-+                price=cand.price,
-+                status="SENT",
-+                raw_json=resp or {},
-+            )
-+            _append_order_event(
-+                event_store,
-+                event_type="ORDER",
-+                intent_id=intent_id,
-+                odno=odno,
-+                candidate=cand,
-+                resp=resp,
-+                reasons=["ok"],
-+            )
-+            logger.info("[ORDER] sent intent_id=%s odno=%s", intent_id, odno)
-+        else:
-+            reason = resp.get("reason") if isinstance(resp, dict) else "unknown"
-+            db.upsert_intent(
-+                {
-+                    "intent_id": intent_id,
-+                    "sid": cand.sid,
-+                    "symbol": cand.symbol,
-+                    "side": cand.side,
-+                    "signal_key": cand.signal_key,
-+                    "status": "REJECTED",
-+                    "odno": None,
-+                }
-+            )
-+            _append_order_event(
-+                event_store,
-+                event_type="ORDER_REJECT",
-+                intent_id=intent_id,
-+                odno="",
-+                candidate=cand,
-+                resp=resp,
-+                reasons=[str(reason or "order_rejected")],
-+            )
-+            logger.error(
-+                "[ORDER] reject intent_id=%s symbol=%s reasons=%s", intent_id, cand.symbol, [reason or "order_rejected"]
-+            )
-+
-+
-+def main() -> None:
-+    parser = argparse.ArgumentParser(description="Nullim tick runner (db-backed ledger)")
-+    parser.add_argument("--botstate", default=os.getenv("BOTSTATE_DIR", "_botstate"), help="Bot-state worktree directory")
-+    parser.add_argument("--candidates-path", help="Optional JSON file containing candidate orders")
-+    args = parser.parse_args()
-+
-+    os.environ.setdefault("LEDGER_BACKEND", "db")
-+    os.environ.setdefault("RUN_MODE", "TICK")
-+    os.environ.setdefault("BOTSTATE_DIR", args.botstate)
-+
-+    logger.info("[TICK] start botstate=%s run_mode=%s", args.botstate, os.getenv("RUN_MODE"))
-+    bot_state_dir = _resolve_botstate_dir(args.botstate)
-+    event_store = EventStore(bot_state_dir / "ledger")
-+
-+    db_path = Path(os.getenv("LEDGER_DB_PATH", "runtime/ledger/ledger.sqlite"))
-+    db = init_db(db_path)
-+    kis = KisAPI()
-+
-+    fill_checkpoint = db.get_checkpoint("fills") or {}
-+    open_result = reconcile_open_orders(kis, db, fill_checkpoint)
-+    fill_result = reconcile_fills(kis, db, fill_checkpoint)
-+    pos_result = reconcile_positions(kis, db)
-+    safe_mode = bool(pos_result.get("safe_mode"))
-+
-+    event_store.append_event(
-+        "health",
-+        {
-+            "type": "HEALTH",
-+            "payload": {
-+                "open_orders": open_result,
-+                "fills": fill_result,
-+                "positions": pos_result,
-+            },
-+            "reasons": ["tick_start"],
-+        },
-+    )
-+
-+    candidates = _load_candidates(args.candidates_path)
-+    trade_date = now_kst().strftime("%Y%m%d")
-+    _process_candidates(
-+        candidates=candidates,
-+        db=db,
-+        kis=kis,
-+        event_store=event_store,
-+        trade_date=trade_date,
-+        safe_mode=safe_mode,
-+    )
-+
-+    db.set_checkpoint(
-+        "tick",
-+        {
-+            "ts": now_kst().isoformat(),
-+            "safe_mode": safe_mode,
-+            "candidates": len(candidates),
-+        },
-+    )
-+    _write_checkpoints_file(bot_state_dir, db)
-+    logger.info("[TICK] end safe_mode=%s", safe_mode)
 +
 +
 +if __name__ == "__main__":
-+    main()
++    from .engine import make_engine
++
++    run_migrations(make_engine())
+diff --git a/trader/db/schema.py b/trader/db/schema.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bd9f0bd74323845424694d0f3b6f894835471cf
+--- /dev/null
++++ b/trader/db/schema.py
+@@ -0,0 +1,152 @@
++import sqlalchemy as sa
++
++METADATA = sa.MetaData()
++
++RUNS = sa.Table(
++    "runs",
++    METADATA,
++    sa.Column("run_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("strategy", sa.String, nullable=False),
++    sa.Column("window", sa.String),
++    sa.Column("phase", sa.String),
++    sa.Column("event_name", sa.String),
++    sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
++    sa.Column("git_sha", sa.String),
++    sa.Column("workflow", sa.String),
++    sa.Column("workflow_run_id", sa.String),
++    sa.Column("workflow_attempt", sa.Integer),
++    sa.Column("config_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("status", sa.String, nullable=False, default="STARTED"),
++    sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++    sa.Column("finished_at", sa.DateTime(timezone=True)),
++    sa.Column("notes", sa.Text),
++)
++
++UNIVERSE = sa.Table(
++    "universe",
++    METADATA,
++    sa.Column("universe_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("strategy", sa.String, nullable=False),
++    sa.Column("as_of_date", sa.String, nullable=False),
++    sa.Column("source", sa.String, nullable=False),
++    sa.Column("params_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++)
++
++UNIVERSE_MEMBERS = sa.Table(
++    "universe_members",
++    METADATA,
++    sa.Column("universe_member_id", sa.String, primary_key=True),
++    sa.Column("universe_id", sa.String, sa.ForeignKey("universe.universe_id"), nullable=False),
++    sa.Column("code", sa.String, nullable=False),
++    sa.Column("market", sa.String),
++    sa.Column("weight", sa.Float),
++    sa.Column("rank", sa.Integer),
++    sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
++)
++
++ORDERS = sa.Table(
++    "orders",
++    METADATA,
++    sa.Column("order_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
++    sa.Column("strategy", sa.String, nullable=False),
++    sa.Column("sid", sa.Integer, nullable=False),
++    sa.Column("mode", sa.Integer, nullable=False),
++    sa.Column("code", sa.String, nullable=False),
++    sa.Column("market", sa.String),
++    sa.Column("side", sa.String, nullable=False),
++    sa.Column("ord_type", sa.String, nullable=False),
++    sa.Column("qty", sa.Integer, nullable=False),
++    sa.Column("limit_price", sa.Float),
++    sa.Column("stage", sa.String),
++    sa.Column("client_order_key", sa.String, nullable=False),
++    sa.Column("status", sa.String, nullable=False, default="INTENT"),
++    sa.Column("kis_odno", sa.String),
++    sa.Column("request_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("response_json", sa.JSON),
++    sa.Column("submitted_at", sa.DateTime(timezone=True)),
++    sa.Column("acked_at", sa.DateTime(timezone=True)),
++    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++    sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
++    sa.UniqueConstraint("env", "client_order_key", name="uq_orders_env_client_order_key"),
++)
++
++FILLS = sa.Table(
++    "fills",
++    METADATA,
++    sa.Column("fill_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
++    sa.Column("order_id", sa.String, sa.ForeignKey("orders.order_id")),
++    sa.Column("kis_odno", sa.String),
++    sa.Column("trade_id", sa.String),
++    sa.Column("code", sa.String, nullable=False),
++    sa.Column("market", sa.String),
++    sa.Column("side", sa.String, nullable=False),
++    sa.Column("qty", sa.Integer, nullable=False),
++    sa.Column("price", sa.Float, nullable=False),
++    sa.Column("fee", sa.Float, nullable=False, default=0.0),
++    sa.Column("tax", sa.Float, nullable=False, default=0.0),
++    sa.Column("filled_at", sa.DateTime(timezone=True), nullable=False),
++    sa.Column("raw_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++    sa.UniqueConstraint("env", "trade_id", name="uq_fills_env_trade_id"),
++    sa.UniqueConstraint(
++        "env",
++        "kis_odno",
++        "code",
++        "side",
++        "qty",
++        "price",
++        "filled_at",
++        name="uq_fills_fallback",
++    ),
++)
++
++POSITIONS = sa.Table(
++    "positions",
++    METADATA,
++    sa.Column("position_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("strategy", sa.String, nullable=False),
++    sa.Column("sid", sa.Integer, nullable=False),
++    sa.Column("mode", sa.Integer, nullable=False),
++    sa.Column("code", sa.String, nullable=False),
++    sa.Column("market", sa.String),
++    sa.Column("qty", sa.Integer, nullable=False, default=0),
++    sa.Column("avg_buy_price", sa.Float),
++    sa.Column("total_cost", sa.Float, nullable=False, default=0.0),
++    sa.Column("realized_pnl", sa.Float, nullable=False, default=0.0),
++    sa.Column("last_trade_at", sa.DateTime(timezone=True)),
++    sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
++    sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
++)
++
++LEDGER_EVENTS = sa.Table(
++    "ledger_events",
++    METADATA,
++    sa.Column("ledger_event_id", sa.String, primary_key=True),
++    sa.Column("env", sa.String, nullable=False),
++    sa.Column("run_id", sa.String, sa.ForeignKey("runs.run_id")),
++    sa.Column("event_type", sa.String, nullable=False),
++    sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
++    sa.Column("code", sa.String),
++    sa.Column("market", sa.String),
++    sa.Column("sid", sa.Integer),
++    sa.Column("mode", sa.Integer),
++    sa.Column("side", sa.String),
++    sa.Column("qty", sa.Integer),
++    sa.Column("price", sa.Float),
++    sa.Column("kis_odno", sa.String),
++    sa.Column("client_order_key", sa.String),
++    sa.Column("ok", sa.Boolean, nullable=False, default=True),
++    sa.Column("reasons", sa.JSON, nullable=False, default=list),
++    sa.Column("stage", sa.String),
++    sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
++    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++)
