@@ -64,3 +64,9 @@ Key log markers for grep:
 - **원장 경로**: 모든 이벤트는 `bot_state/trader_ledger/<kind>/<YYYY-MM-DD>/run_<run_id>.jsonl`(orders_intent/orders_ack/fills/exits_intent/errors)과 `bot_state/trader_ledger/reports/<YYYY-MM-DD>/pnl_snapshot.json`에 append-only로 남는다. 평균원가(가중평균)로 평단/수익률%를 재구성한다.
 - **DRY_RUN/LIVE**: `STRATEGY_MODE=INTENT_ONLY`+`DRY_RUN=1`이면 주문 호출 없이 ledger에 intent만 적재하며, LIVE(모의/실전)는 동일 로직으로 주문 수행 후 fill을 기록한다. `ENABLE_BREAKOUT=false`가 기본이며 돌파 신규 진입 경로는 차단된다.
 - **실행 방법**: `python -m trader.trader --window auto --phase auto --target-branch bot-state` (GitHub Actions `pb1-runner.yml`는 5분 간격으로 오전/오후 윈도우를 모두 커버).
+
+## Smoke commands
+```
+DATABASE_URL=sqlite:///./dev.db python -m trader.db.migrate
+DATABASE_URL=sqlite:///./dev.db python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
+```

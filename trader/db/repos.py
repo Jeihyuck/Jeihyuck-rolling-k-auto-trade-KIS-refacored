@@ -1,27 +1,38 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, and_, func, select
 
-from .schema import FILLS, ORDERS, POSITIONS, RUNS, UNIVERSE, UNIVERSE_MEMBERS
+from .schema import (
+    FILLS,
+    LEDGER_EVENTS,
+    ORDERS,
+    POSITIONS,
+    RUNS,
+    UNIVERSE,
+    UNIVERSE_MEMBERS,
+    schema_for_engine,
+    uuid_value_for_url,
+)
+
+logger = logging.getLogger(__name__)
+ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
 
 
-def _coerce_uuid(value: Any) -> str:
-    try:
-        if value is None:
-            return str(uuid4())
-        return str(value)
-    except Exception:
-        return str(uuid4())
+def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
+    return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
 
 
 class RunsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self._schema = schema_for_engine(engine)
 
     def start_run(
         self,
@@ -38,7 +49,7 @@ class RunsRepo:
         config_json: dict | None,
     ) -> str:
         values = {
-            "run_id": _coerce_uuid(None),
+            "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
             "env": env,
             "strategy": strategy,
             "window": window,
@@ -51,11 +62,11 @@ class RunsRepo:
             "workflow_attempt": workflow_attempt,
             "config_json": config_json or {},
         }
-        stmt = sa.insert(RUNS).values(**values)
+        stmt = sa.insert(self._schema.runs).values(**values)
         run_id = values["run_id"]
         with self.engine.begin() as conn:
             try:
-                res = conn.execute(stmt.returning(RUNS.c.run_id))
+                res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
                 run_id = res.scalar() or run_id
             except Exception:
                 conn.execute(stmt)
@@ -64,8 +75,8 @@ class RunsRepo:
     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                sa.update(RUNS)
-                .where(RUNS.c.run_id == run_id)
+                sa.update(self._schema.runs)
+                .where(self._schema.runs.c.run_id == run_id)
                 .values(status=status, finished_at=func.now(), notes=notes),
             )
 
@@ -73,22 +84,27 @@ class RunsRepo:
 class UniverseRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self._schema = schema_for_engine(engine)
 
     def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
         stmt = (
             select(
-                UNIVERSE_MEMBERS.c.code,
-                UNIVERSE_MEMBERS.c.market,
-                UNIVERSE_MEMBERS.c.weight,
-                UNIVERSE_MEMBERS.c.rank,
-                UNIVERSE_MEMBERS.c.meta_json,
-                UNIVERSE.c.as_of_date,
-                UNIVERSE.c.strategy,
-                UNIVERSE.c.env,
+                self._schema.universe_members.c.code,
+                self._schema.universe_members.c.market,
+                self._schema.universe_members.c.weight,
+                self._schema.universe_members.c.rank,
+                self._schema.universe_members.c.meta_json,
+                self._schema.universe.c.as_of_date,
+                self._schema.universe.c.strategy,
+                self._schema.universe.c.env,
             )
-            .select_from(UNIVERSE_MEMBERS.join(UNIVERSE, UNIVERSE_MEMBERS.c.universe_id == UNIVERSE.c.universe_id))
-            .where(UNIVERSE_MEMBERS.c.universe_id == universe_id)
-            .order_by(UNIVERSE_MEMBERS.c.rank.nullsfirst(), UNIVERSE_MEMBERS.c.universe_member_id)
+            .select_from(
+                self._schema.universe_members.join(
+                    self._schema.universe, self._schema.universe_members.c.universe_id == self._schema.universe.c.universe_id
+                )
+            )
+            .where(self._schema.universe_members.c.universe_id == universe_id)
+            .order_by(self._schema.universe_members.c.rank.nullsfirst(), self._schema.universe_members.c.universe_member_id)
         )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
@@ -96,9 +112,15 @@ class UniverseRepo:
 
     def get_universe_members(self, env: str, strategy: str, as_of_date: str) -> list[dict]:
         stmt = (
-            select(UNIVERSE.c.universe_id)
-            .where(and_(UNIVERSE.c.env == env, UNIVERSE.c.strategy == strategy, UNIVERSE.c.as_of_date == as_of_date))
-            .order_by(UNIVERSE.c.created_at.desc())
+            select(self._schema.universe.c.universe_id)
+            .where(
+                and_(
+                    self._schema.universe.c.env == env,
+                    self._schema.universe.c.strategy == strategy,
+                    self._schema.universe.c.as_of_date == as_of_date,
+                )
+            )
+            .order_by(self._schema.universe.c.created_at.desc())
             .limit(1)
         )
         with self.engine.begin() as conn:
@@ -109,9 +131,9 @@ class UniverseRepo:
 
     def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
         stmt = (
-            select(UNIVERSE.c.universe_id)
-            .where(and_(UNIVERSE.c.env == env, UNIVERSE.c.strategy == strategy))
-            .order_by(UNIVERSE.c.as_of_date.desc(), UNIVERSE.c.created_at.desc())
+            select(self._schema.universe.c.universe_id)
+            .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
+            .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
             .limit(1)
         )
         with self.engine.begin() as conn:
@@ -129,10 +151,11 @@ class UniverseRepo:
         params_json: dict,
         payload_json: dict,
         members: Iterable[dict],
-    ) -> str:
+    ) -> str | None:
         members_list = list(members)
+        db_url = str(self.engine.url)
         values = {
-            "universe_id": _coerce_uuid(None),
+            "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
             "strategy": strategy,
             "as_of_date": as_of_date,
@@ -140,48 +163,59 @@ class UniverseRepo:
             "params_json": params_json or {},
             "payload_json": payload_json or {},
         }
-        with self.engine.begin() as conn:
-            existing = conn.execute(
-                select(UNIVERSE.c.universe_id).where(
-                    and_(UNIVERSE.c.env == env, UNIVERSE.c.strategy == strategy, UNIVERSE.c.as_of_date == as_of_date)
-                )
-            ).scalar()
-            universe_id = str(existing) if existing else values["universe_id"]
-            if existing:
-                conn.execute(
-                    sa.update(UNIVERSE)
-                    .where(UNIVERSE.c.universe_id == existing)
-                    .values(source=source, params_json=params_json or {}, payload_json=payload_json or {}, created_at=func.now()),
-                )
-                conn.execute(sa.delete(UNIVERSE_MEMBERS).where(UNIVERSE_MEMBERS.c.universe_id == existing))
-            else:
-                try:
+        try:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    select(self._schema.universe.c.universe_id).where(
+                        and_(
+                            self._schema.universe.c.env == env,
+                            self._schema.universe.c.strategy == strategy,
+                            self._schema.universe.c.as_of_date == as_of_date,
+                        )
+                    )
+                ).scalar()
+                universe_id = existing or values["universe_id"]
+                if existing:
+                    conn.execute(
+                        sa.update(self._schema.universe)
+                        .where(self._schema.universe.c.universe_id == existing)
+                        .values(source=source, params_json=params_json or {}, payload_json=payload_json or {}, created_at=func.now()),
+                    )
+                    conn.execute(
+                        sa.delete(self._schema.universe_members).where(self._schema.universe_members.c.universe_id == existing)
+                    )
+                else:
                     res = conn.execute(
-                        sa.insert(UNIVERSE)
+                        sa.insert(self._schema.universe)
                         .values(**values)
-                        .returning(UNIVERSE.c.universe_id)
+                        .returning(self._schema.universe.c.universe_id)
                     )
                     universe_id = res.scalar() or universe_id
-                except Exception:
-                    conn.execute(sa.insert(UNIVERSE).values(**values))
-            for rank, m in enumerate(members_list, start=1):
-                conn.execute(
-                    sa.insert(UNIVERSE_MEMBERS).values(
-                        universe_member_id=_coerce_uuid(None),
-                        universe_id=universe_id,
-                        code=str(m.get("code") or "").zfill(6),
-                        market=m.get("market"),
-                        weight=m.get("weight"),
-                        rank=m.get("rank") if m.get("rank") is not None else rank,
-                        meta_json=m.get("meta_json") or {},
+                fk_universe_id = uuid_value_for_url(db_url, universe_id)
+                for rank, m in enumerate(members_list, start=1):
+                    conn.execute(
+                        sa.insert(self._schema.universe_members).values(
+                            universe_member_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+                            universe_id=fk_universe_id,
+                            code=str(m.get("code") or "").zfill(6),
+                            market=m.get("market"),
+                            weight=m.get("weight"),
+                            rank=m.get("rank") if m.get("rank") is not None else rank,
+                            meta_json=m.get("meta_json") or {},
+                        )
                     )
-                )
-        return str(universe_id)
+            return str(universe_id)
+        except Exception:
+            logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+            if ALLOW_UNIVERSE_DB_FAIL:
+                return None
+            raise
 
 
 class OrdersRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self._schema = schema_for_engine(engine)
 
     def create_intent_idempotent(
         self,
@@ -200,10 +234,11 @@ class OrdersRepo:
         client_order_key: str,
         request_json: dict | None,
     ) -> str:
+        db_url = str(self.engine.url)
         payload = {
-            "order_id": _coerce_uuid(None),
+            "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
-            "run_id": run_id,
+            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
             "strategy": strategy,
             "sid": sid,
             "mode": mode,
@@ -219,25 +254,25 @@ class OrdersRepo:
         }
         with self.engine.begin() as conn:
             existing = conn.execute(
-                select(ORDERS.c.order_id).where(
-                    and_(ORDERS.c.env == env, ORDERS.c.client_order_key == client_order_key)
+                select(self._schema.orders.c.order_id).where(
+                    and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                 )
             ).scalar()
             if existing:
                 return str(existing)
-            stmt = sa.insert(ORDERS).values(**payload).returning(ORDERS.c.order_id)
+            stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
             try:
                 res = conn.execute(stmt)
                 return str(res.scalar())
             except Exception:
-                conn.execute(sa.insert(ORDERS).values(**payload))
+                conn.execute(sa.insert(self._schema.orders).values(**payload))
                 return str(payload["order_id"])
 
     def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                sa.update(ORDERS)
-                .where(and_(ORDERS.c.env == env, ORDERS.c.client_order_key == client_order_key))
+                sa.update(self._schema.orders)
+                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
                 .values(
                     status="SUBMITTED",
                     kis_odno=kis_odno,
@@ -250,8 +285,8 @@ class OrdersRepo:
     def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                sa.update(ORDERS)
-                .where(and_(ORDERS.c.env == env, ORDERS.c.kis_odno == kis_odno))
+                sa.update(self._schema.orders)
+                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
                 .values(
                     status="ACKED",
                     response_json=response_json,
@@ -263,19 +298,23 @@ class OrdersRepo:
     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                sa.update(ORDERS)
-                .where(and_(ORDERS.c.env == env, ORDERS.c.client_order_key == client_order_key))
+                sa.update(self._schema.orders)
+                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
                 .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
             )
 
     def get_open_orders(self, env: str) -> list[dict]:
-        stmt = select(ORDERS).where(and_(ORDERS.c.env == env, ORDERS.c.status.in_(["INTENT", "SUBMITTED"])))
+        stmt = select(self._schema.orders).where(
+            and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
             return [dict(r) for r in rows]
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
-        stmt = select(ORDERS.c.order_id).where(and_(ORDERS.c.env == env, ORDERS.c.client_order_key == client_order_key))
+        stmt = select(self._schema.orders.c.order_id).where(
+            and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+        )
         with self.engine.begin() as conn:
             return conn.execute(stmt).scalar() is not None
 
@@ -283,6 +322,7 @@ class OrdersRepo:
 class FillsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self._schema = schema_for_engine(engine)
 
     def upsert_fill(
         self,
@@ -302,39 +342,42 @@ class FillsRepo:
         filled_at: datetime,
         raw_json: dict | None,
     ) -> str:
+        db_url = str(self.engine.url)
         with self.engine.begin() as conn:
             fill_id = None
             if trade_id:
                 fill_id = conn.execute(
-                    select(FILLS.c.fill_id).where(and_(FILLS.c.env == env, FILLS.c.trade_id == trade_id))
+                    select(self._schema.fills.c.fill_id).where(
+                        and_(self._schema.fills.c.env == env, self._schema.fills.c.trade_id == trade_id)
+                    )
                 ).scalar()
             if not fill_id and kis_odno:
                 fill_id = conn.execute(
-                    select(FILLS.c.fill_id).where(
+                    select(self._schema.fills.c.fill_id).where(
                         and_(
-                            FILLS.c.env == env,
-                            FILLS.c.kis_odno == kis_odno,
-                            FILLS.c.code == code,
-                            FILLS.c.side == side,
-                            FILLS.c.qty == qty,
-                            FILLS.c.price == price,
-                            FILLS.c.filled_at == filled_at,
+                            self._schema.fills.c.env == env,
+                            self._schema.fills.c.kis_odno == kis_odno,
+                            self._schema.fills.c.code == code,
+                            self._schema.fills.c.side == side,
+                            self._schema.fills.c.qty == qty,
+                            self._schema.fills.c.price == price,
+                            self._schema.fills.c.filled_at == filled_at,
                         )
                     )
                 ).scalar()
             if fill_id:
                 conn.execute(
-                    sa.update(FILLS)
-                    .where(FILLS.c.fill_id == fill_id)
+                    sa.update(self._schema.fills)
+                    .where(self._schema.fills.c.fill_id == fill_id)
                     .values(raw_json=raw_json or {}),
                 )
                 return str(fill_id)
 
             payload = {
-                "fill_id": _coerce_uuid(None),
+                "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
                 "env": env,
-                "run_id": run_id,
-                "order_id": order_id,
+                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+                "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
                 "kis_odno": kis_odno,
                 "trade_id": trade_id,
                 "code": code,
@@ -347,29 +390,38 @@ class FillsRepo:
                 "filled_at": filled_at,
                 "raw_json": raw_json or {},
             }
-            stmt = sa.insert(FILLS).values(**payload).returning(FILLS.c.fill_id)
+            stmt = sa.insert(self._schema.fills).values(**payload).returning(self._schema.fills.c.fill_id)
             try:
                 res = conn.execute(stmt)
                 return str(res.scalar())
             except Exception:
-                conn.execute(sa.insert(FILLS).values(**payload))
+                conn.execute(sa.insert(self._schema.fills).values(**payload))
                 return str(payload["fill_id"])
 
 
 class PositionsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self._schema = schema_for_engine(engine)
 
     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
-        stmt = select(POSITIONS).where(
-            and_(POSITIONS.c.env == env, POSITIONS.c.strategy == strategy, POSITIONS.c.sid == sid, POSITIONS.c.mode == mode, POSITIONS.c.code == code)
+        stmt = select(self._schema.positions).where(
+            and_(
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+            )
         )
         with self.engine.begin() as conn:
             row = conn.execute(stmt).mappings().first()
             return dict(row) if row else None
 
     def list_positions(self, env: str, strategy: str) -> list[dict]:
-        stmt = select(POSITIONS).where(and_(POSITIONS.c.env == env, POSITIONS.c.strategy == strategy))
+        stmt = select(self._schema.positions).where(
+            and_(self._schema.positions.c.env == env, self._schema.positions.c.strategy == strategy)
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
             return [dict(r) for r in rows]
@@ -391,13 +443,13 @@ class PositionsRepo:
         filled_at: datetime,
     ) -> None:
         with self.engine.begin() as conn:
-            stmt = select(POSITIONS).where(
+            stmt = select(self._schema.positions).where(
                 and_(
-                    POSITIONS.c.env == env,
-                    POSITIONS.c.strategy == strategy,
-                    POSITIONS.c.sid == sid,
-                    POSITIONS.c.mode == mode,
-                    POSITIONS.c.code == code,
+                    self._schema.positions.c.env == env,
+                    self._schema.positions.c.strategy == strategy,
+                    self._schema.positions.c.sid == sid,
+                    self._schema.positions.c.mode == mode,
+                    self._schema.positions.c.code == code,
                 )
             )
             row = conn.execute(stmt).mappings().first()
@@ -447,14 +499,14 @@ class PositionsRepo:
 
             if row:
                 conn.execute(
-                    sa.update(POSITIONS)
-                    .where(POSITIONS.c.position_id == row["position_id"])
+                    sa.update(self._schema.positions)
+                    .where(self._schema.positions.c.position_id == row["position_id"])
                     .values(**values, updated_at=func.now()),
                 )
             else:
                 conn.execute(
-                    sa.insert(POSITIONS).values(
-                        position_id=_coerce_uuid(None),
+                    sa.insert(self._schema.positions).values(
+                        position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         env=env,
                         strategy=strategy,
                         sid=sid,
@@ -486,21 +538,21 @@ class PositionsRepo:
                 except Exception:
                     continue
                 existing = conn.execute(
-                    select(POSITIONS.c.position_id).where(
+                    select(self._schema.positions.c.position_id).where(
                         and_(
-                            POSITIONS.c.env == env,
-                            POSITIONS.c.strategy == strategy,
-                            POSITIONS.c.sid == sid,
-                            POSITIONS.c.mode == mode,
-                            POSITIONS.c.code == code,
+                            self._schema.positions.c.env == env,
+                            self._schema.positions.c.strategy == strategy,
+                            self._schema.positions.c.sid == sid,
+                            self._schema.positions.c.mode == mode,
+                            self._schema.positions.c.code == code,
                         )
                     )
                 ).scalar()
                 if existing:
                     continue
                 conn.execute(
-                    sa.insert(POSITIONS).values(
-                        position_id=_coerce_uuid(None),
+                    sa.insert(self._schema.positions).values(
+                        position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         env=env,
                         strategy=strategy,
                         sid=sid,

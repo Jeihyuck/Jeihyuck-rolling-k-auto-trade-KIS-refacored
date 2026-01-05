@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy import Engine, text
 
 from . import config
-from .schema import METADATA
+from .schema import schema_for_engine
 
 
 def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
@@ -31,7 +31,7 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     with engine.begin() as conn:
         url = str(engine.url)
         if config.is_sqlite_url(url):
-            METADATA.create_all(engine)
+            schema_for_engine(engine).metadata.create_all(engine)
             return
 
         _ensure_schema_migrations_table(conn)

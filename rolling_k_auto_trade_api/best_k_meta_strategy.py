@@ -22,14 +22,12 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import pandas as pd
 import FinanceDataReader as fdr
-from pykrx.stock import (
-    get_market_cap_by_ticker,
-    get_nearest_business_day_in_a_week,
-)
+from pykrx.stock import get_nearest_business_day_in_a_week
 
 from trader.rkmax_utils import get_best_k_meta, assign_weights, _enforce_min_weight_for_forced
 from .simulate_with_k_and_get_metrics import simulate_with_k_and_get_metrics
 from rolling_k_auto_trade_api.adjust_price_to_tick import adjust_price_to_tick
+from trader.universe.providers.krx_provider import safe_get_market_cap_by_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +109,7 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
         from_date = get_nearest_business_day_in_a_week(target_dt.strftime("%Y%m%d"))
         logger.info(f"📅 pykrx 시총 조회일({market}) → {from_date}")
 
-        mktcap_df = get_market_cap_by_ticker(from_date, market=market)
+        mktcap_df = safe_get_market_cap_by_ticker(from_date, market=market)
         if mktcap_df is None or len(mktcap_df) == 0:
             logger.warning("⚠️  pykrx 시총 DF(%s)가 비었습니다 → 빈 DF 반환", market)
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
