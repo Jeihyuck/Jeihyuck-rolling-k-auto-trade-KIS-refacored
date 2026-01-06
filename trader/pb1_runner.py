@@ -351,7 +351,7 @@ def main() -> None:
             workflow=os.getenv("GITHUB_WORKFLOW"),
             workflow_run_id=workflow_run_id,
             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-            config_json={"dry_run_reasons": dry_run_reasons, "window": window_name_for_log, "phase": phase_for_log},
+            config_json={"dry_run_reasons": dry_run_reasons, "run_window": window_name_for_log, "phase": phase_for_log},
         )
 
         engine_runner = PB1Engine(

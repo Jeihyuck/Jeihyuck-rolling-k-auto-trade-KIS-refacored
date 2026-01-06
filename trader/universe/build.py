@@ -3,20 +3,22 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import csv
 from pathlib import Path
-
-from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+from typing import Iterable
 
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
+from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
-from trader.universe.krx_safe import patch_pykrx_logging
+from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 
 logger = logging.getLogger(__name__)
+
 FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-STATIC_SEED_PATH = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq50.csv"
+SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
+SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
+TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +49,8 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
     for market, rows in (selected_by_market or {}).items():
         for idx, row in enumerate(rows or []):
             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+            if not code:
+                continue
             members.append(
                 {
                     "code": code,
@@ -59,39 +63,77 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
     return members
 
 
-def _load_static_seed() -> dict | None:
-    if not STATIC_SEED_PATH.exists():
-        return None
+def _dedup(seq: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for val in seq:
+        if val not in seen:
+            seen.add(val)
+            uniq.append(val)
+    return uniq
+
+
+def _load_seed_codes(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    codes: list[str] = []
     try:
-        with STATIC_SEED_PATH.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = [row for row in reader]
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                code = line.strip()
+                if code:
+                    codes.append(code.zfill(6))
     except Exception:
-        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", STATIC_SEED_PATH)
-        return None
+        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
+        return []
+    return _dedup(codes)
+
+
+def _load_static_seed() -> dict | None:
+    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
+    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
+
     members: list[dict] = []
     markets: dict[str, list[dict]] = {}
-    for idx, row in enumerate(rows, start=1):
-        code = str(row.get("code") or row.get("Code") or "").zfill(6)
-        if not code.strip():
+
+    seen: set[str] = set()
+
+    for code in kospi_codes:
+        if code in seen:
             continue
-        market = (row.get("market") or row.get("Market") or "KOSDAQ").strip()
-        name = (row.get("name") or row.get("Name") or "").strip() or None
-        meta_json = {}
-        if name:
-            meta_json["name"] = name
-        member = {"code": code, "market": market, "weight": None, "rank": idx, "meta_json": meta_json}
+        seen.add(code)
+        rank = len(markets.get("KOSPI", [])) + 1
+        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
         members.append(member)
-        markets.setdefault(market, []).append({"code": code, "weight": None, "rank": idx, "name": name})
+        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
+
+    for code in kosdaq_codes:
+        if code in seen:
+            continue
+        seen.add(code)
+        rank = len(markets.get("KOSDAQ", [])) + 1
+        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
+        members.append(member)
+        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
+
     if not members:
         return None
+
     payload = _normalize_payload(
         {
             "selected": [m["code"] for m in members],
             "selected_by_market": markets,
         }
     )
-    return {"payload": payload, "members": members, "source": "fallback:static", "params": {"seed_path": str(STATIC_SEED_PATH)}}
+    return {
+        "payload": payload,
+        "members": members,
+        "source": "fallback:static",
+        "params": {
+            "seed_path_kospi": str(SEED_PATH_KOSPI),
+            "seed_path_kosdaq": str(SEED_PATH_KOSDAQ),
+        },
+    }
 
 
 def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
@@ -124,15 +166,47 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
         return db_fallback
     static_fallback = _load_static_seed()
     if static_fallback:
-        logger.info(
-            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s path=%s",
+        logger.warning(
+            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s kospi_seed=%s kosdaq_seed=%s",
             env,
             strategy,
             len(static_fallback["members"]),
-            STATIC_SEED_PATH,
+            SEED_PATH_KOSPI,
+            SEED_PATH_KOSDAQ,
         )
         return static_fallback
     return None
+
+
+def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
+    try:
+        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
+        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
+        return None
+
+    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
+        logger.warning(
+            "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
+            len(kospi),
+            len(kosdaq),
+            TARGETS,
+        )
+        return None
+
+    selected_by_market = {
+        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
+        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
+    }
+    payload = _normalize_payload(
+        {
+            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
+            "selected_by_market": selected_by_market,
+        }
+    )
+    members = _build_members_from_payload(selected_by_market)
+    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
 
 
 def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
@@ -140,31 +214,40 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     run_migrations(engine)
     repo = UniverseRepo(engine)
 
-    logging.getLogger("pykrx").setLevel(logging.WARNING)
-    patch_pykrx_logging()
+    payload: dict | None = None
+    members: list[dict] = []
+    source = "kis_marketcap_top"
+    params: dict = {"as_of": as_of_date}
 
-    raw_payload: dict | None = None
+    kis_provider: KISMarketcapTopProvider | None = None
     try:
-        raw_payload = run_rebalance(as_of_date, return_by_market=True)
+        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
     except Exception as exc:
-        logger.warning("[UNIVERSE][KRX_FAIL] %s", repr(exc))
-    payload = _normalize_payload(raw_payload)
-    members = _build_members_from_payload(payload.get("selected_by_market"))
+        logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 
-    fallback = None
+    if kis_provider:
+        kis_result = _build_from_kis(kis_provider)
+        if kis_result:
+            payload = kis_result["payload"]
+            members = kis_result["members"]
+            params.update(kis_result.get("params") or {})
+            source = kis_result["source"]
+
     if len(members) == 0:
         fallback = _select_fallback(repo, env=env, strategy=strategy)
         if fallback:
             payload = fallback["payload"]
             members = fallback["members"]
+            source = fallback["source"]
+            params.update(fallback.get("params") or {})
 
     universe_id = repo.store_universe(
         env=env,
         strategy=strategy,
         as_of_date=as_of_date,
-        source=fallback["source"] if fallback else "best_k_meta_strategy",
-        params_json={"as_of": as_of_date, **(fallback.get("params") if fallback else {})},
-        payload_json=payload,
+        source=source,
+        params_json=params,
+        payload_json=payload or {},
         members=members,
     )
     if universe_id:

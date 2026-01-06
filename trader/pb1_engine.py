@@ -186,9 +186,28 @@ class PB1Engine:
             try:
                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
                 quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
-                if isinstance(quote, dict):
-                    pr = quote.get("stck_prpr") or quote.get("prpr")
-                    return float(pr) if pr is not None else None
+                if not isinstance(quote, dict):
+                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
+                    return None
+                price = quote.get("last")
+                if price is None:
+                    price = quote.get("stck_prpr") or quote.get("prpr")
+                    if price is None:
+                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
+                        return None
+                try:
+                    price_val = float(price)
+                except Exception:
+                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
+                    return None
+                if quote.get("ask") is None or quote.get("bid") is None:
+                    logger.warning(
+                        "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
+                        code,
+                        quote.get("ask"),
+                        quote.get("bid"),
+                    )
+                return price_val
             except Exception:
                 logger.exception("[PB1][PRICE][FAIL] code=%s", code)
         return None

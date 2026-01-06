@@ -545,10 +545,10 @@ class KisAPI:
 
     def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
         """
-        inquire-price 래퍼: 현재가 전체 응답을 dict로 반환.
+        inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
-        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환,
-        그 외에는 지정된 횟수 재시도 후 예외를 던진다.
+        반환 예: {"last": 12345.0, "bid": 12340.0, "ask": 12350.0, "raw": {...}, ...}
+        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
         """
         c = safe_strip(code)
         if not c:
@@ -557,6 +557,17 @@ class KisAPI:
         markets = ("J", "U")
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
+        raw_output: dict | None = None
+
+        def _to_float(val: Any) -> float | None:
+            try:
+                if val is None:
+                    return None
+                f = float(val)
+                return f if f == f else None  # NaN guard
+            except Exception:
+                return None
+
         for attempt in range(1, attempts + 1):
             self._limiter.wait("price-quote")
             for tr in _pick_tr(self.env, "PRICE"):
@@ -577,23 +588,46 @@ class KisAPI:
                             time.sleep(0.35 + random.uniform(0, 0.15))
                             continue
                         if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                            output = dict(data["output"])
-                            pr = output.get("stck_prpr") or output.get("prpr")
-                            try:
-                                pr_val = float(pr) if pr is not None else None
-                            except Exception:
-                                pr_val = pr
-                            output["stck_prpr"] = pr_val
-                            output.setdefault("prpr", pr_val)
-                            return output
+                            raw_output = dict(data["output"])
+                            break
+                    if raw_output is not None:
+                        break
+                if raw_output is not None:
+                    break
+            if raw_output is not None:
+                break
             if diag_mode:
                 break
             time.sleep(0.6 * attempt + random.uniform(0, 0.2))
-        if diag_mode:
-            return {}
-        if last_error:
-            raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
-        raise RuntimeError(f"get_price_quote failed for {code}")
+
+        if raw_output is None:
+            if diag_mode:
+                return {}
+            if last_error:
+                raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
+            raise RuntimeError(f"get_price_quote failed for {code}")
+
+        last_price = _to_float(raw_output.get("stck_prpr") or raw_output.get("prpr"))
+        bid_price = _to_float(raw_output.get("bidp1") or raw_output.get("bidp") or raw_output.get("bid"))
+        ask_price = _to_float(raw_output.get("askp1") or raw_output.get("askp") or raw_output.get("ask"))
+
+        # 호가가 없으면 별도 조회로 보강(실패 무시)
+        if bid_price is None:
+            try:
+                bid_price = self.get_best_bid(c)
+            except Exception:
+                bid_price = None
+        if ask_price is None:
+            try:
+                ask_price = self.get_best_ask(c)
+            except Exception:
+                ask_price = None
+
+        quote: dict = {**raw_output}
+        quote.setdefault("stck_prpr", last_price)
+        quote.setdefault("prpr", last_price)
+        quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
+        return quote
 
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
