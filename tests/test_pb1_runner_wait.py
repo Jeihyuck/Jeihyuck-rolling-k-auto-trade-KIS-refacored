@@ -1,6 +1,93 @@
+import sys
+import types
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
+
+
+def _install_sa_stub() -> None:
+    if "sqlalchemy" in sys.modules:
+        return
+    sa = types.ModuleType("sqlalchemy")
+
+    class _DummyResult:
+        def scalar(self):
+            return None
+
+        def scalars(self):
+            return self
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+        def first(self):
+            return None
+
+        def __iter__(self):
+            return iter([])
+
+    class _DummyConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            return _DummyResult()
+
+    class _DummyEngine:
+        def __init__(self, url):
+            self.url = url
+
+        def begin(self):
+            return _DummyConn()
+
+    class _DummyStatement:
+        def values(self, *args, **kwargs):
+            return self
+
+        def where(self, *args, **kwargs):
+            return self
+
+        def returning(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+    sa.Engine = _DummyEngine
+    sa.create_engine = lambda url, **kwargs: _DummyEngine(url)
+    sa.text = lambda sql: sql
+    sa.MetaData = lambda *args, **kwargs: object()
+    sa.Column = lambda *args, **kwargs: object()
+    sa.Table = lambda *args, **kwargs: object()
+    sa.Connection = object
+    scalar_type = lambda *args, **kwargs: object()
+    sa.String = sa.Integer = sa.Float = sa.JSON = sa.Boolean = sa.DateTime = sa.Text = scalar_type
+    sa.ForeignKey = lambda *args, **kwargs: None
+    sa.func = types.SimpleNamespace(now=lambda: None)
+    sa.insert = lambda *args, **kwargs: _DummyStatement()
+    sa.update = lambda *args, **kwargs: _DummyStatement()
+    sa.select = lambda *args, **kwargs: _DummyStatement()
+    sa.and_ = lambda *args, **kwargs: None
+    sa.UniqueConstraint = lambda *args, **kwargs: None
+
+    sa_engine = types.ModuleType("sqlalchemy.engine")
+    sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
+    sa_engine.Engine = _DummyEngine
+    sys.modules["sqlalchemy.engine"] = sa_engine
+    sys.modules["sqlalchemy.engine.url"] = sa_engine.url
+    sys.modules["sqlalchemy"] = sa
+
+
+_install_sa_stub()
 
 import trader.pb1_runner as pb1_runner
 from trader.pb1_runner import _next_window_start, _parse_hhmm_to_time
@@ -41,13 +128,24 @@ def test_wait_branch_does_not_crash(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
     monkeypatch.setenv("STRATEGY_MODE", "LIVE")
     monkeypatch.delenv("EXPECT_LIVE_TRADING", raising=False)
-    monkeypatch.setattr(pb1_runner, "acquire_lock", lambda *_, **__: False)
-    monkeypatch.setattr(pb1_runner, "KisAPI", lambda *_, **__: SimpleNamespace(env="practice", get_balance=lambda: {}))
+    monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
     monkeypatch.setattr(
         pb1_runner,
         "parse_args",
         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
     )
+    monkeypatch.setattr(
+        pb1_runner,
+        "KisAPI",
+        lambda *_, **__: SimpleNamespace(
+            env="practice",
+            get_balance_cached=lambda **__: {},
+            get_price_quote=lambda *_, **__: {},
+        ),
+    )
+    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+    monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 
     slept = []
 
@@ -55,8 +153,6 @@ def test_wait_branch_does_not_crash(monkeypatch) -> None:
         slept.append(seconds)
 
     monkeypatch.setattr(pb1_runner.time_mod, "sleep", fake_sleep)
-    monkeypatch.setattr(pb1_runner, "setup_worktree", lambda *_, **__: None)
-    monkeypatch.setattr(pb1_runner, "resolve_botstate_worktree_dir", lambda: pb1_runner.Path("/tmp"))
     monkeypatch.setattr(pb1_runner, "is_trading_day", lambda _: True)
 
     # Act / Assert: should exit cleanly without raising
@@ -72,14 +168,24 @@ def test_expect_live_guard_skipped_in_diag(monkeypatch) -> None:
     monkeypatch.setenv("EXPECT_LIVE_TRADING", "1")
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
-    monkeypatch.setattr(pb1_runner, "acquire_lock", lambda *_, **__: False)
-    monkeypatch.setattr(pb1_runner, "setup_worktree", lambda *_, **__: None)
-    monkeypatch.setattr(pb1_runner, "resolve_botstate_worktree_dir", lambda: pb1_runner.Path("/tmp"))
+    monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
     monkeypatch.setattr(
         pb1_runner,
         "parse_args",
         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
     )
+    monkeypatch.setattr(
+        pb1_runner,
+        "KisAPI",
+        lambda *_, **__: SimpleNamespace(
+            env="practice",
+            get_balance_cached=lambda **__: {},
+            get_price_quote=lambda *_, **__: {},
+        ),
+    )
+    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+    monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 
     pb1_runner.main()  # should not raise even with EXPECT_LIVE_TRADING=1 in diag path
 
@@ -89,14 +195,25 @@ def test_schedule_event_does_not_wait(monkeypatch) -> None:
     monkeypatch.setattr(pb1_runner, "now_kst", lambda: now)
     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
     monkeypatch.setenv("STRATEGY_MODE", "LIVE")
-    monkeypatch.setattr(pb1_runner, "acquire_lock", lambda *_, **__: False)
-    monkeypatch.setattr(pb1_runner, "setup_worktree", lambda *_, **__: None)
-    monkeypatch.setattr(pb1_runner, "resolve_botstate_worktree_dir", lambda: pb1_runner.Path("/tmp"))
+    monkeypatch.setenv("PB1_ALLOW_WAIT", "0")
+    monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
     monkeypatch.setattr(
         pb1_runner,
         "parse_args",
         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
     )
+    monkeypatch.setattr(
+        pb1_runner,
+        "KisAPI",
+        lambda *_, **__: SimpleNamespace(
+            env="practice",
+            get_balance_cached=lambda **__: {},
+            get_price_quote=lambda *_, **__: {},
+        ),
+    )
+    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+    monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 
     def sleep_fail(_):
         raise AssertionError("schedule run should not sleep")
@@ -104,3 +221,21 @@ def test_schedule_event_does_not_wait(monkeypatch) -> None:
     monkeypatch.setattr(pb1_runner.time_mod, "sleep", sleep_fail)
 
     pb1_runner.main()
+
+
+def test_decide_action_smoke_after_close():
+    now = datetime(2024, 1, 2, 16, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+    open_dt, close_dt = pb1_runner._market_session(now)
+
+    action, target_start = pb1_runner._decide_action(
+        now=now,
+        trading_day=True,
+        open_dt=open_dt,
+        close_dt=close_dt,
+        allow_wait=True,
+        max_wait_s=3600,
+        smoke_enabled=False,
+    )
+
+    assert action == "smoke"
+    assert target_start is None

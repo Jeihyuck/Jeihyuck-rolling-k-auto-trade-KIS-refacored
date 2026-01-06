@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 
@@ -15,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
 NAME_COLUMNS = ("종목명", "Name", "name")
+MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "2"))
+
+
+class EmptyDataFrame(Exception):
+    """Raised when pykrx returns an empty dataframe."""
 
 
 def safe_get_market_cap_by_ticker(date_str: str, market: str) -> pd.DataFrame:
@@ -56,8 +62,31 @@ def _validate_krx_df(df: pd.DataFrame) -> bool:
     return True
 
 
+def _log_failure(market: str, requested_as_of: str, used_as_of: str, attempt_idx: int, total_attempts: int, exc: Exception, df: pd.DataFrame | None = None) -> None:
+    preview = ""
+    try:
+        if df is not None and not df.empty:
+            cols = list(df.columns)
+            preview = f"cols={cols[:10]}"
+    except Exception:
+        preview = ""
+    logger.warning(
+        "[KRX][FAIL] market=%s requested_as_of=%s used_as_of=%s attempt=%s/%s exc=%s msg=%s %s",
+        market,
+        requested_as_of,
+        used_as_of,
+        attempt_idx,
+        total_attempts,
+        exc.__class__.__name__,
+        exc,
+        preview,
+    )
+
+
 def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: int = 7) -> tuple[pd.DataFrame, date, str]:
     patch_pykrx_logging()
+    if os.getenv("KRX_DISABLE", "0") in {"1", "true", "TRUE"}:
+        raise RuntimeError("KRX_DISABLE=1")
     if isinstance(as_of_date, str):
         try:
             base_date = datetime.fromisoformat(as_of_date).date()
@@ -74,49 +103,48 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: 
 
     requested_as_of = base_date.isoformat()
     last_reason = "unknown"
+    failure_counts: dict[str, int] = {}
     for idx, attempt in enumerate(attempts, start=1):
+        used_as_of = attempt.isoformat()
         try:
             df = get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
-            if _validate_krx_df(df):
-                used_reason = "ok" if attempt == base_date else "rolled_back"
-                logger.info(
-                    "[KRX][ROLLBACK][OK] market=%s used_as_of=%s requested_as_of=%s rows=%s attempts=%s reason=%s",
-                    market,
-                    attempt.isoformat(),
-                    requested_as_of,
-                    len(df) if df is not None else 0,
-                    idx,
-                    used_reason,
-                )
-                return df, attempt, used_reason
-            last_reason = "empty_or_missing_cols"
-            logger.warning(
-                "[KRX][ROLLBACK][WARN] market=%s requested_as_of=%s used_as_of=%s attempt=%s/%s reason=%s",
+            if not _validate_krx_df(df):
+                raise EmptyDataFrame(f"empty_or_missing_cols cols={list(df.columns)}")
+            used_reason = "ok" if attempt == base_date else "rolled_back"
+            logger.info(
+                "[KRX][ROLLBACK][OK] market=%s used_as_of=%s requested_as_of=%s rows=%s attempts=%s reason=%s",
                 market,
+                used_as_of,
                 requested_as_of,
-                attempt.isoformat(),
+                len(df) if df is not None else 0,
                 idx,
                 len(attempts),
-                last_reason,
+                used_reason,
             )
+            return df, attempt, used_reason
         except (
             ValueError,
             KeyError,
             json.JSONDecodeError,
             requests.exceptions.JSONDecodeError,
             requests.RequestException,
-            Exception,
+            EmptyDataFrame,
         ) as exc:  # pragma: no cover - network/remote failure
             last_reason = exc.__class__.__name__
-            logger.warning(
-                "[KRX][ROLLBACK][WARN] market=%s requested_as_of=%s used_as_of=%s attempt=%s/%s reason=%s",
-                market,
-                requested_as_of,
-                attempt.isoformat(),
-                idx,
-                len(attempts),
-                last_reason,
-            )
+            failure_counts[last_reason] = failure_counts.get(last_reason, 0) + 1
+            _log_failure(market, requested_as_of, used_as_of, idx, len(attempts), exc)
+            if failure_counts[last_reason] >= MAX_REPEAT_FAIL:
+                logger.warning(
+                    "[KRX][FAIL][ABORT] market=%s requested_as_of=%s exc=%s repeat=%s limit=%s",
+                    market,
+                    requested_as_of,
+                    last_reason,
+                    failure_counts[last_reason],
+                    MAX_REPEAT_FAIL,
+                )
+                raise
             continue
 
-    raise RuntimeError(f"KRX fetch failed after rollback attempts for {market} requested_as_of={requested_as_of} last_reason={last_reason}")
+    raise RuntimeError(
+        f"KRX fetch failed after rollback attempts for {market} requested_as_of={requested_as_of} last_reason={last_reason}"
+    )

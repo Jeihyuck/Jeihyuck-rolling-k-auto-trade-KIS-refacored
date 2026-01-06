@@ -92,6 +92,8 @@ class PB1Engine:
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
         self._balance_cost: float | None = None
+        self._balance_snapshot: dict | None = None
+        self._holdings_summary: Dict[str, Any] = {}
 
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
@@ -144,7 +146,7 @@ class PB1Engine:
 
     def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
         summary = holdings_summary or {}
-        for key in ("pchs_amt_smtl_amt", "pchs_amt"):
+        for key in ("pchs_amt_smtl_amt", "pchs_amt", "prvs_tot_evlu_amt", "tot_evlu_amt", "nass_amt"):
             cost = self._to_float(summary.get(key))
             if cost and cost > 0:
                 return cost
@@ -156,9 +158,14 @@ class PB1Engine:
         return total if total > 0 else None
 
     def _fetch_holdings_snapshot(self) -> dict:
+        if self._balance_snapshot is not None:
+            logger.info("[BALANCE][CACHE] hit=True")
+            return self._balance_snapshot
         if not self.kis:
             return {}
-        return self.kis.get_balance_cached()
+        logger.info("[BALANCE][CACHE] hit=False")
+        self._balance_snapshot = self.kis.get_balance_cached()
+        return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
@@ -562,7 +569,7 @@ class PB1Engine:
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
         marks = self._fetch_marks([p["code"] for p in positions], fallback)
-        totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+        totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
         for pos in positions:
             qty = pos.get("qty") or 0
             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
@@ -573,30 +580,45 @@ class PB1Engine:
             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
             totals["unrealized"] += market_value - cost
 
+        summary_mv = self._to_float(self._holdings_summary.get("tot_evlu_amt") or self._holdings_summary.get("nass_amt"))
+        summary_cash = self._to_float(
+            self._holdings_summary.get("dnca_tot_amt")
+            or self._holdings_summary.get("ord_psbl_cash")
+            or self._holdings_summary.get("evlu_amt_sbst_amt")
+        )
+        if not positions and summary_mv is not None:
+            totals["market_value"] = summary_mv
+            totals["unrealized"] = 0.0
+        if summary_cash is not None:
+            totals["cash"] = summary_cash
+
         cost_source = "positions"
-        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"]
+        summary_cost = self._extract_holdings_cost([], self._holdings_summary)
+        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"] or summary_cost or summary_mv
         if self._balance_cost is not None:
             cost_source = "kis_balance"
             totals["cost"] = self._balance_cost
-        else:
-            totals["cost"] = totals["cost"]
+        elif summary_cost:
+            cost_source = "balance_summary"
+            totals["cost"] = summary_cost
 
-        portfolio_return_pct = 0.0
+        portfolio_return_pct = None
         if cost_base and cost_base > 0:
             portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
         else:
-            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=0")
+            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
 
         logger.info(
-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%.2f",
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%s",
             self._universe_as_of or "none",
             totals["market_value"],
             totals["cost"],
             cost_source,
             totals["unrealized"],
             totals["realized"],
-            portfolio_return_pct,
+            f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
         )
+        totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
         return totals
 
     def run(self) -> RunResult:
@@ -620,6 +642,7 @@ class PB1Engine:
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary = holdings_snapshot.get("output2") or {}
+        self._holdings_summary = holdings_summary or {}
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         if self.phase in {"verify", "exit"}:

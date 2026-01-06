@@ -35,8 +35,10 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     with engine.begin() as conn:
         url = str(engine.url)
         if config.is_sqlite_url(url):
+            logger.info("[DB][MIGRATE] sqlite url=%s", url)
             schema_for_engine(engine).metadata.create_all(engine)
             return
+        logger.info("[DB][MIGRATE] external url=%s", url)
         # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
         _ensure_schema_migrations_table(conn)

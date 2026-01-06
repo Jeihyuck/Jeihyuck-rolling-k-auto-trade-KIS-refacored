@@ -13,6 +13,19 @@ on:
     paths-ignore:
       - "bot_state/**"
   workflow_dispatch:
+    inputs:
+      phase:
+        description: "Runner phase (auto or smoke)"
+        default: "auto"
+        type: choice
+        options: [auto, smoke]
+        required: false
+      allow_wait:
+        description: "Allow wait before market open"
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+        required: false
   schedule:
     # =========================
     # Weekdays (KST Mon-Fri) : run only during market hours (08:50~15:30 KST), every 5 min
@@ -37,21 +50,6 @@ jobs:
     if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: pbcore
-          POSTGRES_PASSWORD: pbcore
-          POSTGRES_DB: pbcore
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U pbcore -d pbcore"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
 
     env:
       STRATEGY_MODE: "LIVE"
@@ -110,40 +108,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Resolve DATABASE_URL
-        env:
-          DB_URL_SECRET: ${{ secrets.DATABASE_URL }}
+      - name: Configure run mode
         run: |
-          if [ -n "$DB_URL_SECRET" ]; then
-            echo "DATABASE_URL=$DB_URL_SECRET" >> $GITHUB_ENV
-            echo "USING_EXTERNAL_DB=1" >> $GITHUB_ENV
-            echo "Using external DATABASE_URL (secret present)"
-          else
-            echo "DATABASE_URL=postgresql+psycopg://pbcore:pbcore@localhost:5432/pbcore" >> $GITHUB_ENV
-            echo "USING_EXTERNAL_DB=0" >> $GITHUB_ENV
-            echo "Using workflow local Postgres service (no secret)"
+          PHASE_INPUT="${{ github.event.inputs.phase || 'auto' }}"
+          ALLOW_WAIT="${{ github.event.inputs.allow_wait || '0' }}"
+          RUN_PHASE="$PHASE_INPUT"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ALLOW_WAIT="1"
           fi
-
-      - name: Wait for Postgres (local service)
-        run: |
-          if [ "${USING_EXTERNAL_DB}" = "1" ]; then
-            echo "Using external DB; skip local postgres wait"
-            exit 0
+          if [ "${{ github.event_name }}" = "push" ]; then
+            RUN_PHASE="auto"
+            ALLOW_WAIT="0"
+            echo "PB1_SMOKE_RUN=1" >> $GITHUB_ENV
           fi
-
-          for i in $(seq 1 30); do
-            if python -c "import socket; socket.create_connection(('127.0.0.1', 5432), timeout=1).close(); print('local postgres port open')"; then
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "local postgres not reachable"
-          exit 1
-
-      - name: Verify DB dependencies
-        run: |
-          python -c "import sqlalchemy; import psycopg; print('deps ok')"
+          if [ "$PHASE_INPUT" = "smoke" ]; then
+            RUN_PHASE="auto"
+            echo "PB1_SMOKE_RUN=1" >> $GITHUB_ENV
+          fi
+          echo "PB1_ALLOW_WAIT=$ALLOW_WAIT" >> $GITHUB_ENV
+          echo "RUN_PHASE=$RUN_PHASE" >> $GITHUB_ENV
+          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
 
       - name: Run DB migrations
         run: |
@@ -161,4 +145,4 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m trader.pb1_runner --window auto --phase auto
+          python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"

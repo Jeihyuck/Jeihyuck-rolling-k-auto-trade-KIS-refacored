@@ -74,6 +74,82 @@ def _get_now_kst() -> datetime:
     return now_kst()
 
 
+def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt: datetime, allow_wait: bool, max_wait_s: int, smoke_enabled: bool) -> tuple[str, datetime | None]:
+    if smoke_enabled:
+        return "smoke", None
+    if not trading_day:
+        return "smoke", None
+    if now < open_dt:
+        remaining = (open_dt - now).total_seconds()
+        if allow_wait and remaining <= max_wait_s:
+            return "wait", open_dt
+        return "smoke", open_dt
+    if now >= close_dt:
+        return "smoke", None
+    return "run", None
+
+
+def _log_balance_cache(force: bool) -> None:
+    logger.info("[BALANCE][CACHE] hit=%s", not force)
+
+
+def _run_smoke(engine, kis_env: str, now: datetime) -> None:
+    token_ok = balance_ok = universe_ok = pretrade_ok = False
+    kis: KisAPI | None = None
+    members: list[dict] = []
+    try:
+        kis = KisAPI()
+        token_ok = True
+    except Exception as exc:
+        logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
+
+    if kis:
+        try:
+            _log_balance_cache(force=True)
+            snap = kis.get_balance_cached(force=True)
+            balance_ok = bool(snap)
+        except Exception:
+            logger.exception("[SMOKE][FAIL] balance")
+
+    repo = UniverseRepo(engine)
+    try:
+        members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+        if not members:
+            from trader.universe import build as universe_build
+
+            universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
+            members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+        universe_ok = bool(members)
+    except Exception:
+        logger.exception("[SMOKE][FAIL] universe")
+
+    if kis:
+        try:
+            code = members[0]["code"] if members else "005930"
+            quote = kis.get_price_quote(code, diag_mode=True, attempts=1)
+            pretrade_ok = bool(quote)
+        except Exception:
+            logger.exception("[SMOKE][FAIL] pretrade")
+
+    status = token_ok and balance_ok and universe_ok and pretrade_ok
+    if status:
+        logger.info(
+            "[SMOKE][PASS] token=%s balance=%s universe=%s pretrade=%s",
+            token_ok,
+            balance_ok,
+            universe_ok,
+            pretrade_ok,
+        )
+    else:
+        logger.warning(
+            "[SMOKE][FAIL] token=%s balance=%s universe=%s pretrade=%s",
+            token_ok,
+            balance_ok,
+            universe_ok,
+            pretrade_ok,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
@@ -91,22 +167,17 @@ def main() -> None:
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
     event_name_lower = event_name.lower()
     trading_day = True if smoke_enabled else is_trading_day(now)
-    non_trading_day = not trading_day
     diag_env_flag = (
         env_bool("DIAGNOSTIC_FORCE_RUN", False)
         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
     )
-    _, market_close_dt = _market_session(now)
-    market_close_time = market_close_dt.time()
-    wait_enabled = env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW)
-    if event_name_lower == "schedule":
-        wait_enabled = False
+    open_dt, close_dt = _market_session(now)
+    allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
     window = decide_window(now=now, override=args.window)
     window_name_for_log = window.name if window else "none"
     phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
-    target_start = None
 
     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
@@ -117,100 +188,56 @@ def main() -> None:
     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
 
-    force_diag = diag_env_flag or not trading_day or now.time() >= market_close_time
-    if smoke_enabled:
-        force_diag = False
-        non_trading_day = False
-        trading_day = True
-    if not force_diag and window is None and trading_day and now.time() < market_close_time:
-        window_starts = [
-            _parse_hhmm_to_time(MORNING_WINDOW_START),
-            _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-            _parse_hhmm_to_time(CLOSE_AUCTION_START),
-        ]
-        target_start = _next_window_start(now, window_starts)
-        if target_start is None:
-            force_diag = True
-        elif not wait_enabled:
-            logger.info(
-                "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=skip target_start=%s max_wait_s=%s window=%s phase=%s",
-                event_name_lower or "unknown",
-                now.isoformat(),
-                trading_day,
-                target_start.isoformat(),
-                max_wait_s,
-                window_name_for_log,
-                phase_for_log,
-            )
-            return
-        else:
-            wait_seconds = int((target_start - now).total_seconds())
-            if wait_seconds > max_wait_s:
-                logger.info(
-                    "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=skip target_start=%s max_wait_s=%s window=%s phase=%s",
-                    event_name_lower or "unknown",
-                    now.isoformat(),
-                    trading_day,
-                    target_start.isoformat(),
-                    max_wait_s,
-                    window_name_for_log,
-                    phase_for_log,
-                )
-                return
-
-    plan_window_name = window_name_for_log
-    plan_phase_for_log = phase_for_log
-    if force_diag and window is None:
-        plan_window_name = "diagnostic"
-        plan_phase_for_log = "verify"
-
-    action = "diag" if force_diag else "run" if window else "wait"
+    action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
     logger.info(
-        "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=%s target_start=%s max_wait_s=%s window=%s phase=%s",
+        "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=%s target_start=%s max_wait_s=%s window=%s phase=%s allow_wait=%s",
         event_name_lower or "unknown",
         now.isoformat(),
         trading_day,
         action,
         target_start.isoformat() if target_start else "none",
         max_wait_s,
-        plan_window_name,
-        plan_phase_for_log,
+        window_name_for_log,
+        phase_for_log,
+        allow_wait,
     )
 
     if action == "wait" and target_start:
         while True:
-            now = now_kst()
+            now = _get_now_kst()
             remaining = (target_start - now).total_seconds()
             if remaining <= 0:
                 break
             if remaining > max_wait_s:
                 logger.info(
-                    "[PB1][RUN-PLAN] action=skip reason=wait_exceeds_max target_start=%s remaining_s=%.0f max_wait_s=%s",
+                    "[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=0 reason=exceeds_max",
+                    now.isoformat(),
                     target_start.isoformat(),
-                    remaining,
-                    max_wait_s,
                 )
-                return
-            sleep_for = min(30, remaining)
-            logger.info("[PB1][WAIT] until=%s remaining_s=%.0f sleep=%.0f", target_start.isoformat(), remaining, sleep_for)
+                action = "smoke"
+                break
+            sleep_for = remaining if remaining < 30 else min(60, remaining)
+            logger.info("[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=%.0f", now.isoformat(), target_start.isoformat(), sleep_for)
             time_mod.sleep(sleep_for)
-        now = now_kst()
-        trading_day = is_trading_day(now)
-        non_trading_day = not trading_day
-        force_diag = diag_env_flag or not trading_day or now.time() >= market_close_time
-        window = decide_window(now=now, override=args.window)
-        window_name_for_log = window.name if window else "none"
-        phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
-        if window is None and not force_diag:
-            logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-            return
-        action = "diag" if force_diag else "run"
-    if smoke_enabled and window is None:
-        window = WindowDecision(name="afternoon", phase="entry")
-        window_name_for_log = window.name
-        phase_for_log = window.phase
-        action = "run"
-        logger.info("[PB1][SMOKE] window_override=afternoon phase=entry reason=smoke_run_no_window")
+        if action == "wait":
+            now = _get_now_kst()
+            trading_day = True if smoke_enabled else is_trading_day(now)
+            window = decide_window(now=now, override=args.window)
+            window_name_for_log = window.name if window else "none"
+            phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+            action = "run" if trading_day else "smoke"
+            logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_name_for_log, phase_for_log)
+
+    if action == "smoke":
+        _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
+        return
+
+    if not window:
+        logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+        return
+
+    non_trading_day = not trading_day
+    force_diag = diag_env_flag
 
     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
@@ -218,16 +245,7 @@ def main() -> None:
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     dry_run_reasons: list[str] = []
-    if non_trading_day:
-        dry_run_reasons.append("non_trading_day")
-        os.environ["PB1_ENTRY_ENABLED"] = "0"
-        os.environ["DIAGNOSTIC_FORCE_RUN"] = "1"
-        os.environ["DISABLE_LIVE_TRADING"] = "1"
-        os.environ["DRY_RUN"] = "1"
-        os.environ["LIVE_TRADING_ENABLED"] = "0"
-    diag_enabled = force_diag or (diag_env_flag and not smoke_enabled)
-    if force_diag and not non_trading_day and now.time() >= market_close_time:
-        dry_run_reasons.append("market_closed")
+    diag_enabled = force_diag
     if diag_enabled:
         dry_run_reasons.append("diagnostic_mode")
     if mode == "INTENT_ONLY":
@@ -246,9 +264,6 @@ def main() -> None:
             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
 
     dry_run = bool(dry_run_reasons)
-    if smoke_enabled and "smoke_run" not in dry_run_reasons:
-        dry_run_reasons.append("smoke_run")
-        dry_run = True
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
 
     logger.info(
@@ -289,8 +304,8 @@ def main() -> None:
 
     def _apply_env_flags(dry: bool) -> None:
         os.environ["DRY_RUN"] = "1" if dry else "0"
-        os.environ["DISABLE_LIVE_TRADING"] = "1" if (dry or disable_live_flag.value or non_trading_day) else "0"
-        os.environ["LIVE_TRADING_ENABLED"] = "1" if (live_trading_flag.value and not non_trading_day) else "0"
+        os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
+        os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
         os.environ["STRATEGY_MODE"] = mode
 
     _apply_env_flags(dry_run)
@@ -313,11 +328,10 @@ def main() -> None:
             logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
             phase_override_arg = "entry"
 
-    if action == "diag":
+    if diag_enabled:
         dry_run = True
         dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
         dry_run_reasons = dry_run_reasons or ["diagnostic"]
-        diag_enabled = True
         if args.phase == "auto":
             phase_override_arg = "verify"
         window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")

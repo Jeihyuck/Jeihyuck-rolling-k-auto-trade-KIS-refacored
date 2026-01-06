@@ -15,6 +15,8 @@ from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.krx_provider import fetch_with_rollback
+from trader.universe.providers.lkg_provider import LKGProvider
+from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,8 @@ SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
 DEFAULT_PROVIDER = "kis_marketcap_top"
+ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
+ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,38 +181,35 @@ def _load_static_seed() -> dict | None:
     }
 
 
-def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
-    latest = repo.get_latest_universe(env=env, strategy=strategy, max_age_days=FALLBACK_MAX_AGE_DAYS)
-    if not latest:
+def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict | None:
+    payload = provider.load(env, strategy)
+    if not payload:
         return None
-    universe_row, member_rows = latest
-    payload = _normalize_payload(universe_row.get("payload_json"))
+    payload_norm = _normalize_payload(payload.get("payload"))
+    members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
     return {
-        "payload": payload,
-        "members": member_rows,
-        "source": "fallback:db",
-        "params": {
-            "fallback_from": universe_row.get("as_of_date"),
-            "source_universe_id": str(universe_row.get("universe_id")),
-        },
+        "payload": payload_norm,
+        "members": members,
+        "source": "fallback:lkg",
+        "params": payload.get("params") or {"as_of": payload.get("as_of")},
     }
 
 
-def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
-    db_fallback = _fallback_from_db(repo, env, strategy)
-    if db_fallback:
-        logger.info(
-            "[UNIVERSE][FALLBACK][DB] env=%s strategy=%s reuse_universe_id=%s members=%s",
-            env,
-            strategy,
-            db_fallback["params"].get("source_universe_id"),
-            len(db_fallback["members"]),
-        )
-        return db_fallback
-    return None
+def _fallback_from_sqlite(provider: SQLiteCacheProvider, env: str, strategy: str) -> dict | None:
+    payload = provider.load_latest_universe_cache(env, strategy)
+    if not payload:
+        return None
+    payload_norm = _normalize_payload(payload.get("payload"))
+    members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
+    return {
+        "payload": payload_norm,
+        "members": members,
+        "source": "fallback:sqlite_cache",
+        "params": payload.get("params") or {"as_of": payload.get("as_of")},
+    }
 
 
-def _build_from_kis(provider: KISMarketcapTopProvider) -> tuple[dict | None, str]:
+def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
     try:
         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
         kosdaq_rows = provider.get_marketcap_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
@@ -237,7 +238,15 @@ def _build_from_kis(provider: KISMarketcapTopProvider) -> tuple[dict | None, str
         }
     )
     members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}, "kis_marketcap_top"
+    return (
+        {
+            "payload": payload,
+            "members": members,
+            "source": "kis_marketcap_top",
+            "params": {"targets": TARGETS, "as_of": as_of_date},
+        },
+        "kis_marketcap_top",
+    )
 
 
 def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
@@ -313,6 +322,9 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
             last_reason = f"kis_init_fail:{exc}"
             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 
+    lkg_provider = LKGProvider(enabled=ENABLE_LKG)
+    sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
+
     for provider_name in allowed_chain:
         result: dict | None = None
         reason: str | None = None
@@ -321,12 +333,16 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
             else:
-                result, reason = _build_from_kis(kis_provider)
+                result, reason = _build_from_kis(kis_provider, as_of_date)
         elif provider_name == "krx_marketcap_top":
             result, reason = _build_from_krx(as_of_date, TARGETS)
-        elif provider_name == "fallback_db":
-            result = _select_fallback(repo, env=env, strategy=strategy)
-            reason = "db_fallback" if result else "db_missing"
+        elif provider_name == "lkg":
+            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy)
+            reason = "lkg_hit" if result else "lkg_miss"
+        elif provider_name == "sqlite_cache":
+            if sqlite_provider:
+                result = _fallback_from_sqlite(sqlite_provider, env=env, strategy=strategy)
+            reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
         elif provider_name == "seed_static":
             result = _load_static_seed()
             reason = "seed_static" if result else "seed_missing"
@@ -341,6 +357,14 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
             params.update(result.get("params") or {})
             last_reason = reason or provider_name
             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
+            if source in {"kis_marketcap_top", "krx_marketcap_top"}:
+                if ENABLE_LKG:
+                    try:
+                        lkg_provider.save(env, strategy, result)
+                    except Exception:
+                        logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
+                if ENABLE_SQLITE_CACHE and sqlite_provider:
+                    sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
             break
 
         last_reason = reason or provider_name

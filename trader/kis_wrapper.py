@@ -1419,8 +1419,9 @@ class KisAPI:
     def get_balance_cached(self, force: bool = False) -> Dict[str, object]:
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
-            logger.info("[잔고조회 캐시 HIT] age_s=%.1f", age_s)
+            logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
             return self._balance_cache
+        logger.info("[BALANCE][CACHE] hit=False force=%s", force)
         snap: dict = {}
         try:
             snap = self.inquire_balance_all()
