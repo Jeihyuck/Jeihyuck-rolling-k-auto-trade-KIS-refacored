@@ -812,6 +812,8 @@ class KisAPI:
                             h = r.get("stck_hgpr")
                             l = r.get("stck_lwpr")
                             c = r.get("stck_clpr")
+                            v = r.get("acml_vol") or r.get("stck_vol") or r.get("stck_trqu")
+                            vol_val = float(v) if v is not None else None
                             if d and o is not None and h is not None and l is not None and c is not None:
                                 rows.append({
                                     "date": d,
@@ -819,6 +821,7 @@ class KisAPI:
                                     "high": float(h),
                                     "low": float(l),
                                     "close": float(c),
+                                    "volume": vol_val,
                                 })
                         except Exception as e:
                             logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)

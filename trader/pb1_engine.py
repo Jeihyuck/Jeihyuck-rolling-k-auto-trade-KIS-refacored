@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List
@@ -18,13 +19,14 @@ from trader.config import (
     PB1_R_FLOOR_PCT,
     PB1_TIME_STOP_DAYS,
     PB1_REQUIRE_VOLUME,
+    PB1_MIN_CANDLES,
 )
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool
-from trader.utils.ohlcv import normalize_ohlcv
 from trader.window_router import WindowDecision, resolve_phase
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,13 @@ class PB1Engine:
         self.env = env
         self.run_id = run_id
         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+        self.min_candles = int(PB1_MIN_CANDLES)
+        providers = []
+        if kis:
+            providers.append(KISOHLCVProvider(kis))
+        providers.append(KRXOHLCVProvider())
+        self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
+        self._setup_reason_counter: Counter[str] = Counter()
         self._today = now_kst().date().isoformat()
         self._universe_as_of = None
         self._warned_keys: set[str] = set()
@@ -89,6 +98,23 @@ class PB1Engine:
             return
         self._warned_keys.add(key)
         logger.warning(message, *args)
+
+    def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
+        for reason in reasons:
+            if not reason:
+                continue
+            self._setup_reason_counter[reason] += 1
+
+    def _log_reason_summary(self, note: str | None = None) -> None:
+        if not self._setup_reason_counter:
+            return
+        top = self._setup_reason_counter.most_common(3)
+        logger.info(
+            "[PB1][SETUP-REASONS] total_bad=%s top3=%s%s",
+            sum(self._setup_reason_counter.values()),
+            top,
+            f" note={note}" if note else "",
+        )
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
@@ -143,6 +169,8 @@ class PB1Engine:
 
     def _log_setup(self, cf: CandidateFeature) -> None:
         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+        if not cf.setup_ok:
+            self._record_setup_reasons(cf.reasons or ["unspecified_fail"])
         logger.info(
             "%s code=%s market=%s mode=%s reasons=%s features=%s",
             prefix,
@@ -154,20 +182,16 @@ class PB1Engine:
         )
 
     def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
-        if not self.kis:
-            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
         try:
-            candles = self.kis.safe_get_daily_candles(code, count=count)
+            result = self.ohlcv_provider.get_ohlcv(code, count)
         except Exception:
             logger.exception("[PB1][DATA][FAIL] code=%s", code)
-            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
-        if not candles:
-            return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
-        df = pd.DataFrame(candles).copy()
-        if df.empty:
-            return df, {"volume_missing": True, "source_cols": [], "mapped": {}}
-
-        df_norm, meta = normalize_ohlcv(df)
+            return pd.DataFrame(), {"volume_missing": True, "source": "error", "mapped": {}}
+        if not result or result.df is None or result.df.empty:
+            return pd.DataFrame(), (result.meta if result else {"volume_missing": True, "source": "none"})
+        df_norm = result.df.sort_values("date").tail(count)
+        meta = result.meta or {}
+        meta.setdefault("volume_missing", df_norm["volume"].isna().all() if "volume" in df_norm.columns else True)
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
@@ -178,19 +202,49 @@ class PB1Engine:
             try:
                 df, meta = self._fetch_daily(code, count=120)
                 if df.empty:
+                    reasons = ["data_empty"]
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": ["data_empty"]},
+                        features={"reasons": reasons},
                         setup_ok=False,
-                        reasons=["data_empty"],
+                        reasons=reasons,
                         mode=1,
                         mode_reasons=["default_day_mode"],
                     )
                     self._log_setup(cf)
                     candidates.append(cf)
                     continue
-                features = compute_features(df)
+                if len(df) < self.min_candles:
+                    reasons = ["insufficient_candles"]
+                    cf = CandidateFeature(
+                        code=code,
+                        market=market,
+                        features={"reasons": reasons, "count": len(df)},
+                        setup_ok=False,
+                        reasons=reasons,
+                        mode=1,
+                        mode_reasons=["default_day_mode"],
+                    )
+                    self._log_setup(cf)
+                    candidates.append(cf)
+                    continue
+                try:
+                    features = compute_features(df, min_candles=self.min_candles)
+                except ValueError:
+                    reasons = ["insufficient_candles"]
+                    cf = CandidateFeature(
+                        code=code,
+                        market=market,
+                        features={"reasons": reasons, "count": len(df)},
+                        setup_ok=False,
+                        reasons=reasons,
+                        mode=1,
+                        mode_reasons=["default_day_mode"],
+                    )
+                    self._log_setup(cf)
+                    candidates.append(cf)
+                    continue
                 features["market"] = market
                 features["volume_missing"] = bool(meta.get("volume_missing"))
                 if features.get("volume_missing"):
@@ -551,6 +605,9 @@ class PB1Engine:
 
     def run(self) -> RunResult:
         self._warned_keys.clear()
+        self._setup_reason_counter.clear()
+        final_status = "OK"
+        final_notes: str | None = None
         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
@@ -560,6 +617,7 @@ class PB1Engine:
         if not members:
             note = "universe_empty"
             logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+            self._log_reason_summary("universe_empty")
             return RunResult(status="SKIPPED", notes=note)
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
@@ -592,13 +650,28 @@ class PB1Engine:
                 logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
             self._pnl_snapshot(self._positions_with_meta(positions))
             if self.phase == "verify":
-                return RunResult(status="OK", notes="verify_only")
+                final_status = "OK"
+                final_notes = "verify_only"
+                self._log_reason_summary(final_notes)
+                return RunResult(status=final_status, notes=final_notes)
 
         code_market = {m.get("code"): m.get("market") for m in members}
+        candidates: List[CandidateFeature] = []
         marks_fallback: Dict[str, float] = {}
         if self.phase in {"prep", "entry"}:
             candidates = self._compute_candidates(members)
             candidates = self._size_positions(candidates)
+            ok_count = len([c for c in candidates if c.setup_ok])
+            if candidates and ok_count == 0:
+                final_status = "NO_CANDIDATES"
+                top_reasons = self._setup_reason_counter.most_common(3)
+                final_notes = f"no_candidates:{top_reasons}"
+                logger.warning("[PB1][NO_CANDIDATES] total=%s top_reasons=%s", len(candidates), top_reasons)
+            if not candidates:
+                final_status = "NO_CANDIDATES"
+                top_reasons = self._setup_reason_counter.most_common(3)
+                final_notes = f"no_candidates:{top_reasons or 'none'}"
+                logger.warning("[PB1][NO_CANDIDATES] total=%s top_reasons=%s", len(candidates), top_reasons or "none")
             if self.phase == "entry" and self.window.name == "afternoon":
                 for cf in candidates:
                     if not cf.setup_ok or self._should_block_order(cf.client_order_key or ""):
@@ -612,7 +685,10 @@ class PB1Engine:
                 df, _ = self._fetch_daily(pos["code"], count=120)
                 if df.empty:
                     continue
-                features = compute_features(df)
+                try:
+                    features = compute_features(df, min_candles=self.min_candles)
+                except ValueError:
+                    continue
                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
                 marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
                 self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
@@ -622,9 +698,14 @@ class PB1Engine:
                 df, _ = self._fetch_daily(pos["code"], count=120)
                 if df.empty:
                     continue
-                features = compute_features(df)
+                try:
+                    features = compute_features(df, min_candles=self.min_candles)
+                except ValueError:
+                    continue
                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
                 marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
                 self._plan_exit_event(pos, features, "close")
         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
-        return RunResult(status="OK", notes=self._universe_as_of or "ok")
+        final_notes = final_notes or self._universe_as_of or "ok"
+        self._log_reason_summary(final_notes)
+        return RunResult(status=final_status, notes=final_notes)

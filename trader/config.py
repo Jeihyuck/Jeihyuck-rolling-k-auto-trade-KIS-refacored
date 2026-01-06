@@ -130,7 +130,7 @@ CONFIG = {
     "AFTERNOON_WINDOW_END": "15:30",
     "CLOSE_AUCTION_START": "15:20",
     "CLOSE_AUCTION_END": "15:30",
-    "PB1_REQUIRE_VOLUME": "0",
+    "PB1_REQUIRE_VOLUME": "1",
     "PB1_FORCE_ENTRY_ON_PUSH": "1",
     "PB1_WAIT_FOR_WINDOW": "1",
     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
@@ -150,6 +150,7 @@ CONFIG = {
     "KOSDAQ_HARD_STOP_PCT": "8.0",
     "PB1_SWING_TRAIL_MA": "20",
     "PB1_TIME_STOP_DAYS": "10",
+    "PB1_MIN_CANDLES": "60",
 }
 
 
@@ -453,6 +454,7 @@ KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
 KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
 PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
 PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
 
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"

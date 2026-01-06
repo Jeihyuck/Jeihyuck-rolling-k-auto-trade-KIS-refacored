@@ -45,6 +45,38 @@ class KISMarketcapTopProvider:
     def _market_code(self, market: str) -> str:
         return self.MARKET_CODE_MAP.get(market.upper(), "J")
 
+    def validate_params(self, market: str, n: int) -> None:
+        if market.upper() not in self.MARKET_CODE_MAP:
+            raise ValueError(f"unsupported market: {market}")
+        if n <= 0:
+            raise ValueError(f"n must be positive: {n}")
+        if not self._pick_tr_id():
+            raise ValueError(f"TR id missing for env={self.env}")
+
+    @staticmethod
+    def _normalize_rows(rows: Iterable[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for row in rows:
+            code = None
+            for key in ("stck_shrn_iscd", "mksc_shrn_iscd", "pdno", "code", "CODE"):
+                if key in row and row.get(key):
+                    code = str(row.get(key)).strip()
+                    break
+            if not code:
+                continue
+            name = row.get("hts_kor_isnm") or row.get("mksc_kor_isnm") or row.get("hname") or row.get("prdt_name") or row.get("name")
+            normalized.append({"code": code.zfill(6), "name": str(name).strip() if name else None})
+        # preserve order while removing duplicates
+        seen: set[str] = set()
+        uniq: list[dict] = []
+        for row in normalized:
+            code = row["code"]
+            if code in seen:
+                continue
+            seen.add(code)
+            uniq.append(row)
+        return uniq
+
     @staticmethod
     def _normalize_codes(rows: Iterable[dict]) -> list[str]:
         codes: list[str] = []
@@ -81,11 +113,13 @@ class KISMarketcapTopProvider:
         KIS "국내주식 시가총액 상위" 호출로 시장별 TopN 종목코드 반환.
         실패 시 예외 대신 빈 리스트를 반환하고 WARN 로그만 남긴다.
         """
-        tr_id = self._pick_tr_id()
-        if not tr_id:
-            logger.warning("[KIS][MKTCAP][TR_MISSING] env=%s market=%s", self.env, market)
+        try:
+            self.validate_params(market, n)
+        except Exception as exc:
+            logger.warning("[KIS][MKTCAP][VALIDATION_FAIL] env=%s market=%s err=%s", self.env, market, exc)
             return []
 
+        tr_id = self._pick_tr_id()
         market_code = self._market_code(market)
         params = {**self.params, "fid_cond_mrkt_div_code": market_code}
 
@@ -111,3 +145,27 @@ class KISMarketcapTopProvider:
             )
             return []
         return codes[: max(0, int(n))]
+
+    def get_marketcap_top_with_meta(self, market: str, n: int) -> list[dict]:
+        """
+        get_marketcap_top과 동일하지만 이름 메타를 포함한다.
+        실패/빈 응답 시 예외를 던져 상위 호출자가 사유를 명확히 기록하도록 한다.
+        """
+        self.validate_params(market, n)
+        tr_id = self._pick_tr_id()
+        market_code = self._market_code(market)
+        params = {**self.params, "fid_cond_mrkt_div_code": market_code}
+
+        headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
+        url = f"{API_BASE_URL}{self.endpoint}"
+        self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
+        resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
+        data = resp.json()
+        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
+        normalized = self._normalize_rows(output_rows)
+        if not normalized:
+            raise RuntimeError(
+                f"marketcap_top empty market={market} rt_cd={data.get('rt_cd') if isinstance(data, dict) else None} msg={data.get('msg1') if isinstance(data, dict) else None}"
+            )
+        limit = max(0, int(n))
+        return normalized[:limit]

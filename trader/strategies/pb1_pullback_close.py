@@ -22,6 +22,7 @@ from trader.config import (
     PB1_TIME_STOP_DAYS,
     KOSDAQ_HARD_STOP_PCT,
     KOSPI_HARD_STOP_PCT,
+    PB1_MIN_CANDLES,
 )
 
 
@@ -31,11 +32,11 @@ def _pct(a: float, b: float) -> float:
     return (a / b) * 100.0
 
 
-def compute_features(daily_df: pd.DataFrame) -> Dict[str, float]:
+def compute_features(daily_df: pd.DataFrame, *, min_candles: int = PB1_MIN_CANDLES) -> Dict[str, float]:
     df = daily_df.copy()
     df = df.sort_values("date")
-    if len(df) < 60:
-        return {"setup_ok": False, "reasons": ["insufficient_candles"], "count": len(df)}
+    if len(df) < min_candles:
+        raise ValueError(f"insufficient_candles:{len(df)}<{min_candles}")
     volume_missing = df["volume"].isna().all()
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma50"] = df["close"].rolling(50).mean()
@@ -105,6 +106,10 @@ def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool
         reasons.append("pullback_missing")
     else:
         low, high = (PB1_PULLBACK_BAND_KOSPI if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ)
+        if high <= 1.0:
+            # 호환성을 위해 0~1 구간으로 들어온 설정값은 %로 확장
+            low *= 100.0
+            high *= 100.0
         if not (low <= pullback <= high):
             reasons.append("pullback_out_of_band")
 

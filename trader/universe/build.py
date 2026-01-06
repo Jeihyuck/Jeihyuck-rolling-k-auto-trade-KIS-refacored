@@ -12,7 +12,9 @@ from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
-from trader.universe.providers.kis_mcap import KISMcapProvider
+from trader.universe.capabilities import providers_for_env
+from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+from trader.universe.providers.krx_provider import safe_get_market_cap_by_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ SEED_DIR = Path(__file__).resolve().parent / "seeds"
 SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
-DEFAULT_PROVIDER = "kis_mcap_200"
+DEFAULT_PROVIDER = "kis_marketcap_top"
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,36 +205,21 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
             len(db_fallback["members"]),
         )
         return db_fallback
-    static_fallback = _load_static_seed()
-    if static_fallback:
-        logger.warning(
-            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s kospi_seed=%s kosdaq_seed=%s",
-            env,
-            strategy,
-            len(static_fallback["members"]),
-            SEED_PATH_KOSPI,
-            SEED_PATH_KOSDAQ,
-        )
-        return static_fallback
     return None
 
 
-def _build_from_kis(provider: KISMcapProvider) -> dict | None:
+def _build_from_kis(provider: KISMarketcapTopProvider) -> tuple[dict | None, str]:
     try:
-        kospi_rows = provider.get_top_with_meta("KOSPI", TARGETS["KOSPI"])
-        kosdaq_rows = provider.get_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
-    except Exception as exc:  # pragma: no cover - defensive
+        kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
+        kosdaq_rows = provider.get_marketcap_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
+    except Exception as exc:  # pragma: no cover - network/remote failure
         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
-        return None
+        return None, str(exc)
 
     if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
-        logger.warning(
-            "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
-            len(kospi_rows),
-            len(kosdaq_rows),
-            TARGETS,
-        )
-        return None
+        reason = f"insufficient kospi={len(kospi_rows)} kosdaq={len(kosdaq_rows)}"
+        logger.warning("[UNIVERSE][KIS][INSUFFICIENT] %s target=%s", reason, TARGETS)
+        return None, reason
 
     kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
     kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
@@ -250,7 +237,46 @@ def _build_from_kis(provider: KISMcapProvider) -> dict | None:
         }
     )
     members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": DEFAULT_PROVIDER, "params": {"targets": TARGETS}}
+    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}, "kis_marketcap_top"
+
+
+def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
+    date_str = as_of_date.replace("-", "")
+    kospi_df = safe_get_market_cap_by_ticker(date_str, "KOSPI")
+    kosdaq_df = safe_get_market_cap_by_ticker(date_str, "KOSDAQ")
+    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
+        if df is None or df.empty:
+            return None, f"{market.lower()}_empty"
+    rows_by_market: dict[str, list[dict]] = {}
+    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
+        cap_col = None
+        for cand in ("시가총액", "시가 총액", "MKT_CAP"):
+            if cand in df.columns:
+                cap_col = cand
+                break
+        if cap_col is None:
+            return None, f"{market.lower()}_cap_missing"
+        df_sorted = df.sort_values(cap_col, ascending=False)
+        selected: list[dict] = []
+        for code, row in df_sorted.head(targets.get(market, 0)).iterrows():
+            code_str = str(code).zfill(6)
+            name = row.get("종목명") or row.get("Name") or row.get("name")
+            selected.append({"code": code_str, "name": str(name).strip() if name else None})
+        rows_by_market[market] = selected
+    if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
+        return None, "krx_rows_missing"
+    selected_by_market = {
+        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSPI"])],
+        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSDAQ"])],
+    }
+    payload = _normalize_payload(
+        {
+            "selected": [row["code"] for row in rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]],
+            "selected_by_market": selected_by_market,
+        }
+    )
+    members = _build_members_from_payload(selected_by_market)
+    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": {"as_of": as_of_date}}, "krx_marketcap_top"
 
 
 def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
@@ -262,28 +288,51 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     members: list[dict] = []
     source = DEFAULT_PROVIDER
     params: dict = {"as_of": as_of_date}
+    last_reason: str | None = None
 
-    kis_provider: KISMcapProvider | None = None
-    try:
-        kis_provider = KISMcapProvider(kis=KisAPI(), env=env)
-    except Exception as exc:
-        logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
+    allowed_chain = providers_for_env(env)
+    logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
 
-    if kis_provider:
-        kis_result = _build_from_kis(kis_provider)
-        if kis_result:
-            payload = kis_result["payload"]
-            members = kis_result["members"]
-            params.update(kis_result.get("params") or {})
-            source = kis_result["source"]
+    kis_provider: KISMarketcapTopProvider | None = None
+    if "kis_marketcap_top" in allowed_chain:
+        try:
+            kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+        except Exception as exc:
+            last_reason = f"kis_init_fail:{exc}"
+            logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 
-    if len(members) == 0:
-        fallback = _select_fallback(repo, env=env, strategy=strategy)
-        if fallback:
-            payload = fallback["payload"]
-            members = fallback["members"]
-            source = fallback["source"]
-            params.update(fallback.get("params") or {})
+    for provider_name in allowed_chain:
+        result: dict | None = None
+        reason: str | None = None
+
+        if provider_name == "kis_marketcap_top":
+            if not kis_provider:
+                reason = last_reason or "kis_provider_unavailable"
+            else:
+                result, reason = _build_from_kis(kis_provider)
+        elif provider_name == "krx_marketcap_top":
+            result, reason = _build_from_krx(as_of_date, TARGETS)
+        elif provider_name == "fallback_db":
+            result = _select_fallback(repo, env=env, strategy=strategy)
+            reason = "db_fallback" if result else "db_missing"
+        elif provider_name == "seed_static":
+            result = _load_static_seed()
+            reason = "seed_static" if result else "seed_missing"
+        else:
+            logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
+            continue
+
+        if result:
+            payload = result["payload"]
+            members = result["members"]
+            source = result.get("source", provider_name)
+            params.update(result.get("params") or {})
+            last_reason = reason or provider_name
+            logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
+            break
+
+        last_reason = reason or provider_name
+        logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
 
     universe_id = repo.store_universe(
         env=env,
@@ -296,12 +345,14 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     )
     if universe_id:
         logger.info(
-            "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s",
+            "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
             env,
             strategy,
             as_of_date,
             universe_id,
             len(members),
+            source,
+            last_reason or "n/a",
         )
     else:
         logger.warning(
