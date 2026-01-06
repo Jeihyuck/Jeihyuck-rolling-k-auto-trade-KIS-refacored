@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
@@ -80,6 +80,63 @@ class PB1Engine:
         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
         self._today = now_kst().date().isoformat()
         self._universe_as_of = None
+        self._warned_keys: set[str] = set()
+        self._balance_price_map: Dict[str, float] = {}
+        self._balance_cost: float | None = None
+
+    def _warn_once(self, key: str, message: str, *args: object) -> None:
+        if key in self._warned_keys:
+            return
+        self._warned_keys.add(key)
+        logger.warning(message, *args)
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                value = value.replace(",", "").strip()
+            fval = float(value)
+            if fval != fval:  # NaN guard
+                return None
+            return fval
+        except Exception:
+            return None
+
+    def _extract_holdings_prices(self, holdings_rows: Iterable[dict]) -> Dict[str, float]:
+        prices: Dict[str, float] = {}
+        for row in holdings_rows or []:
+            try:
+                code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+                px = self._to_float(row.get("prpr") or row.get("stck_prpr"))
+                if code and px is not None:
+                    prices[code] = px
+            except Exception:
+                continue
+        return prices
+
+    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
+        summary = holdings_summary or {}
+        for key in ("pchs_amt_smtl_amt", "pchs_amt"):
+            cost = self._to_float(summary.get(key))
+            if cost and cost > 0:
+                return cost
+        total = 0.0
+        for row in holdings_rows or []:
+            val = self._to_float(row.get("pchs_amt"))
+            if val:
+                total += val
+        return total if total > 0 else None
+
+    def _fetch_holdings_snapshot(self) -> dict:
+        if not self.kis:
+            return {}
+        try:
+            return self.kis.inquire_balance_all()
+        except Exception:
+            logger.exception("[PB1][HOLDINGS][FAIL]")
+            return {}
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
@@ -187,21 +244,24 @@ class PB1Engine:
                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
                 quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
                 if not isinstance(quote, dict):
-                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
+                    self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
                     return None
                 price = quote.get("last")
                 if price is None:
                     price = quote.get("stck_prpr") or quote.get("prpr")
                     if price is None:
-                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
+                        self._warn_once(
+                            f"quote_missing_last:{code}", "[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys())
+                        )
                         return None
                 try:
                     price_val = float(price)
                 except Exception:
-                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
+                    self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
                     return None
                 if quote.get("ask") is None or quote.get("bid") is None:
-                    logger.warning(
+                    self._warn_once(
+                        f"quote_missing_book:{code}",
                         "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
                         code,
                         quote.get("ask"),
@@ -209,7 +269,7 @@ class PB1Engine:
                     )
                 return price_val
             except Exception:
-                logger.exception("[PB1][PRICE][FAIL] code=%s", code)
+                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
         return None
 
     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
@@ -217,7 +277,7 @@ class PB1Engine:
         for code in codes:
             px = self._mark_price(code)
             if px is None:
-                px = fallback.get(code)
+                px = self._balance_price_map.get(code) or fallback.get(code)
             if px is not None:
                 marks[code] = px
         return marks
@@ -306,7 +366,11 @@ class PB1Engine:
         qty = pos.get("qty") or 0
         if qty <= 0:
             return
-        mark = self._mark_price(code) or features.get("close") or avg
+        mark = self._mark_price(code)
+        if mark is None:
+            mark = self._balance_price_map.get(code)
+        if mark is None:
+            mark = features.get("close") or avg
         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
         if self._should_block_order(client_key):
@@ -451,21 +515,34 @@ class PB1Engine:
         totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
         for pos in positions:
             qty = pos.get("qty") or 0
-            mark = marks.get(pos["code"], pos.get("avg_buy_price") or 0.0)
+            mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
             market_value = float(mark) * qty
             cost = float(pos.get("total_cost") or 0.0)
             totals["market_value"] += market_value
             totals["cost"] += cost
             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
             totals["unrealized"] += market_value - cost
+
+        cost_source = "positions"
+        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"]
+        if self._balance_cost is not None:
+            cost_source = "kis_balance"
+            totals["cost"] = self._balance_cost
+        else:
+            totals["cost"] = totals["cost"]
+
         portfolio_return_pct = 0.0
-        if totals["cost"] > 0:
-            portfolio_return_pct = (totals["market_value"] - totals["cost"] + totals["realized"]) / totals["cost"] * 100
+        if cost_base and cost_base > 0:
+            portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
+        else:
+            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=0")
+
         logger.info(
-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f unrealized=%.2f realized=%.2f return_pct=%.2f",
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%.2f",
             self._universe_as_of or "none",
             totals["market_value"],
             totals["cost"],
+            cost_source,
             totals["unrealized"],
             totals["realized"],
             portfolio_return_pct,
@@ -473,6 +550,7 @@ class PB1Engine:
         return totals
 
     def run(self) -> RunResult:
+        self._warned_keys.clear()
         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
@@ -485,9 +563,16 @@ class PB1Engine:
             return RunResult(status="SKIPPED", notes=note)
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        holdings_snapshot = self._fetch_holdings_snapshot()
+        holdings_rows = holdings_snapshot.get("output1") or []
+        holdings_summary = holdings_snapshot.get("output2") or {}
+        self._balance_price_map = self._extract_holdings_prices(holdings_rows)
+        self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         if self.phase in {"verify", "exit"}:
             holdings = []
-            if self.kis:
+            if holdings_rows:
+                holdings = holdings_rows
+            elif self.kis:
                 try:
                     holdings = self.kis.get_positions()
                 except Exception:

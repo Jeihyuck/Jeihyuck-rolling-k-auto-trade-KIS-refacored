@@ -26,11 +26,12 @@ from urllib3.util.retry import Retry
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
-from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+_DAILY_CAP_WARNED = False
 
 
 class NetTemporaryError(Exception):
@@ -725,13 +726,13 @@ class KisAPI:
         """
         # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
         try:
-            if not getattr(self, "_env_checked_daily_capital", False):
+            global _DAILY_CAP_WARNED
+            if not _DAILY_CAP_WARNED:
                 if os.getenv("DAILY_CAPITAL") in (None, ""):
                     logger.warning(
-                        "[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
-                        "settings의 기본값(10,000,000)이 사용될 수 있습니다."
+                        "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
                     )
-                self._env_checked_daily_capital = True
+                _DAILY_CAP_WARNED = True
         except Exception:
             pass
 

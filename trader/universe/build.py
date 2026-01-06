@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 from pathlib import Path
@@ -11,14 +12,16 @@ from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
-from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+from trader.universe.providers.kis_mcap import KISMcapProvider
 
 logger = logging.getLogger(__name__)
 
 FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
-SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
+SEED_DIR = Path(__file__).resolve().parent / "seeds"
+SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
+SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+DEFAULT_PROVIDER = "kis_mcap_200"
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,48 +76,84 @@ def _dedup(seq: Iterable[str]) -> list[str]:
     return uniq
 
 
-def _load_seed_codes(path: Path) -> list[str]:
+def _load_seed_rows(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    codes: list[str] = []
+    rows: list[dict] = []
     try:
         with path.open(encoding="utf-8") as f:
-            for line in f:
-                code = line.strip()
-                if code:
-                    codes.append(code.zfill(6))
+            # CSV with header: code,name
+            reader = csv.DictReader(f)
+            has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
+            if has_code_header:
+                for row in reader:
+                    code = str(row.get("code") or "").strip()
+                    if not code:
+                        continue
+                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+            else:
+                f.seek(0)
+                for line in f:
+                    code = line.strip()
+                    if code:
+                        rows.append({"code": code.zfill(6), "name": None})
     except Exception:
         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
         return []
-    return _dedup(codes)
+    seen: set[str] = set()
+    uniq_rows: list[dict] = []
+    for row in rows:
+        code = row.get("code")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        uniq_rows.append(row)
+    return uniq_rows
+
+
+def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["code", "name"])
+            writer.writeheader()
+            for row in rows:
+                code = str(row.get("code") or "").zfill(6)
+                if not code:
+                    continue
+                writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
+    except Exception:
+        logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
 
 
 def _load_static_seed() -> dict | None:
-    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
-    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
+    kospi_rows = _load_seed_rows(SEED_PATH_KOSPI)
+    kosdaq_rows = _load_seed_rows(SEED_PATH_KOSDAQ)
 
     members: list[dict] = []
     markets: dict[str, list[dict]] = {}
 
     seen: set[str] = set()
 
-    for code in kospi_codes:
-        if code in seen:
+    for row in kospi_rows[: TARGETS["KOSPI"]]:
+        code = row.get("code")
+        if not code or code in seen:
             continue
         seen.add(code)
         rank = len(markets.get("KOSPI", [])) + 1
-        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
+        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
         members.append(member)
-        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
+        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank, "name": row.get("name")})
 
-    for code in kosdaq_codes:
-        if code in seen:
+    for row in kosdaq_rows[: TARGETS["KOSDAQ"]]:
+        code = row.get("code")
+        if not code or code in seen:
             continue
         seen.add(code)
         rank = len(markets.get("KOSDAQ", [])) + 1
-        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
+        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
         members.append(member)
-        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
+        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank, "name": row.get("name")})
 
     if not members:
         return None
@@ -178,35 +217,40 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
     return None
 
 
-def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
+def _build_from_kis(provider: KISMcapProvider) -> dict | None:
     try:
-        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
-        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
+        kospi_rows = provider.get_top_with_meta("KOSPI", TARGETS["KOSPI"])
+        kosdaq_rows = provider.get_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
         return None
 
-    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
+    if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
         logger.warning(
             "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
-            len(kospi),
-            len(kosdaq),
+            len(kospi_rows),
+            len(kosdaq_rows),
             TARGETS,
         )
         return None
 
+    kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
+    kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
+    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+
     selected_by_market = {
-        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
-        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
+        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
     }
     payload = _normalize_payload(
         {
-            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
+            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
             "selected_by_market": selected_by_market,
         }
     )
     members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
+    return {"payload": payload, "members": members, "source": DEFAULT_PROVIDER, "params": {"targets": TARGETS}}
 
 
 def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
@@ -216,12 +260,12 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
 
     payload: dict | None = None
     members: list[dict] = []
-    source = "kis_marketcap_top"
+    source = DEFAULT_PROVIDER
     params: dict = {"as_of": as_of_date}
 
-    kis_provider: KISMarketcapTopProvider | None = None
+    kis_provider: KISMcapProvider | None = None
     try:
-        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+        kis_provider = KISMcapProvider(kis=KisAPI(), env=env)
     except Exception as exc:
         logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 

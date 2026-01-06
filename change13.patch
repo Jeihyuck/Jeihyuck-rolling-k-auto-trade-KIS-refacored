@@ -1,376 +1,1873 @@
-diff --git a/config/universe_seed_kosdaq100.csv b/config/universe_seed_kosdaq100.csv
+diff --git a/fix_pb1_universe_kis_pnl.patch b/fix_pb1_universe_kis_pnl.patch
 new file mode 100644
-index 0000000000000000000000000000000000000000..1cda3f48dcd27da910804104ca4926c7d309ac85
+index 0000000000000000000000000000000000000000..930627a4ede5e320468e7abf3348e221b2ce59dd
 --- /dev/null
-+++ b/config/universe_seed_kosdaq100.csv
-@@ -0,0 +1,100 @@
-+091990
-+066970
-+086520
-+247540
-+035900
-+035760
-+041510
-+263750
-+112040
-+095660
-+068760
-+214150
-+196170
-+028300
-+036930
-+200130
-+078520
-+141080
-+138080
-+067160
-+053800
-+039030
-+090460
-+095700
-+064550
-+092040
-+089980
-+240810
-+104830
-+074600
-+078340
-+078600
-+036540
-+096530
-+058470
-+091700
-+084370
-+079370
-+086890
-+052400
-+067310
-+079940
-+140860
-+235980
-+237690
-+086900
-+278280
-+357780
-+293490
-+115450
-+083310
-+088800
-+089970
-+095340
-+042700
-+066590
-+067630
-+086040
-+104460
-+145020
-+131970
-+318140
-+330860
-+115480
-+108230
-+174900
-+187270
-+263720
-+214270
-+031440
-+041930
-+119610
-+078070
-+089600
-+222080
-+039340
-+083450
-+246720
-+140070
-+178320
-+121600
-+050760
-+069510
-+298040
-+053580
-+217270
-+058400
-+039200
-+060250
-+067770
-+121800
-+106240
-+065450
-+042110
-+058820
-+093520
-+289220
-+060720
-+290650
-+067290
-diff --git a/config/universe_seed_kospi100.csv b/config/universe_seed_kospi100.csv
-new file mode 100644
-index 0000000000000000000000000000000000000000..975b72fae3fdde12d1a01d469be553eedee5aaeb
---- /dev/null
-+++ b/config/universe_seed_kospi100.csv
-@@ -0,0 +1,100 @@
-+005930
-+000660
-+207940
-+373220
-+005380
-+000270
-+035420
-+035720
-+051910
-+006400
-+028260
-+096770
-+003670
-+005490
-+018260
-+011170
-+010130
-+000810
-+003550
-+000100
-+000120
-+090430
-+066570
-+017670
-+034220
-+010950
-+012330
-+051900
-+034730
-+011200
-+030200
-+009150
-+015760
-+003410
-+086790
-+032640
-+161390
-+003620
-+006360
-+000990
-+009540
-+010140
-+011780
-+018880
-+003490
-+006800
-+009830
-+105560
-+055550
-+323410
-+377300
-+402340
-+078930
-+047050
-+004020
-+012450
-+000880
-+042660
-+023530
-+000070
-+000080
-+004000
-+008770
-+011790
-+033780
-+361610
-+079160
-+002790
-+010060
-+006120
-+028050
-+251270
-+005830
-+029780
-+016360
-+009240
-+018670
-+005940
-+010120
-+241560
-+086280
-+011070
-+002380
-+010620
-+006260
-+008560
-+007070
-+069260
-+271560
-+105630
-+001450
-+001040
-+005070
-+000240
-+036570
-+352820
-+259960
-+032830
-+003090
-+108320
++++ b/fix_pb1_universe_kis_pnl.patch
+@@ -0,0 +1,1594 @@
++diff --git a/fix_pb1_universe_kis_pnl.patch b/fix_pb1_universe_kis_pnl.patch
++new file mode 100644
++index 0000000..d3a0a5d
++--- /dev/null
+++++ b/fix_pb1_universe_kis_pnl.patch
++@@ -0,0 +1,794 @@
+++diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+++index c9da9af..62d9f7c 100644
+++--- a/trader/kis_wrapper.py
++++++ b/trader/kis_wrapper.py
+++@@ -26,11 +26,12 @@ from urllib3.util.retry import Retry
+++ 
+++ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+++ from trader.time_utils import is_trading_day, is_trading_window, now_kst
+++-from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
++++from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+++ from trader.fills import append_fill
+++ 
+++ logger = logging.getLogger(__name__)
+++ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
++++_DAILY_CAP_WARNED = False
+++ 
+++ 
+++ class NetTemporaryError(Exception):
+++@@ -725,13 +726,13 @@ class KisAPI:
+++         """
+++         # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
+++         try:
+++-            if not getattr(self, "_env_checked_daily_capital", False):
++++            global _DAILY_CAP_WARNED
++++            if not _DAILY_CAP_WARNED:
+++                 if os.getenv("DAILY_CAPITAL") in (None, ""):
+++                     logger.warning(
+++-                        "[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
+++-                        "settings의 기본값(10,000,000)이 사용될 수 있습니다."
++++                        "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
+++                     )
+++-                self._env_checked_daily_capital = True
++++                _DAILY_CAP_WARNED = True
+++         except Exception:
+++             pass
+++ 
+++diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+++index d395344..3e2836c 100644
+++--- a/trader/pb1_engine.py
++++++ b/trader/pb1_engine.py
+++@@ -3,7 +3,7 @@ from __future__ import annotations
+++ import logging
+++ from dataclasses import dataclass
+++ from datetime import datetime
+++-from typing import Dict, Iterable, List
++++from typing import Any, Dict, Iterable, List
+++ 
+++ import pandas as pd
+++ 
+++@@ -80,6 +80,63 @@ class PB1Engine:
+++         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+++         self._today = now_kst().date().isoformat()
+++         self._universe_as_of = None
++++        self._warned_keys: set[str] = set()
++++        self._balance_price_map: Dict[str, float] = {}
++++        self._balance_cost: float | None = None
++++
++++    def _warn_once(self, key: str, message: str, *args: object) -> None:
++++        if key in self._warned_keys:
++++            return
++++        self._warned_keys.add(key)
++++        logger.warning(message, *args)
++++
++++    @staticmethod
++++    def _to_float(value: Any) -> float | None:
++++        try:
++++            if value is None:
++++                return None
++++            if isinstance(value, str):
++++                value = value.replace(",", "").strip()
++++            fval = float(value)
++++            if fval != fval:  # NaN guard
++++                return None
++++            return fval
++++        except Exception:
++++            return None
++++
++++    def _extract_holdings_prices(self, holdings_rows: Iterable[dict]) -> Dict[str, float]:
++++        prices: Dict[str, float] = {}
++++        for row in holdings_rows or []:
++++            try:
++++                code = str(row.get("pdno") or row.get("code") or "").zfill(6)
++++                px = self._to_float(row.get("prpr") or row.get("stck_prpr"))
++++                if code and px is not None:
++++                    prices[code] = px
++++            except Exception:
++++                continue
++++        return prices
++++
++++    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
++++        summary = holdings_summary or {}
++++        for key in ("pchs_amt_smtl_amt", "pchs_amt"):
++++            cost = self._to_float(summary.get(key))
++++            if cost and cost > 0:
++++                return cost
++++        total = 0.0
++++        for row in holdings_rows or []:
++++            val = self._to_float(row.get("pchs_amt"))
++++            if val:
++++                total += val
++++        return total if total > 0 else None
++++
++++    def _fetch_holdings_snapshot(self) -> dict:
++++        if not self.kis:
++++            return {}
++++        try:
++++            return self.kis.inquire_balance_all()
++++        except Exception:
++++            logger.exception("[PB1][HOLDINGS][FAIL]")
++++            return {}
+++ 
+++     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
+++         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+++@@ -187,21 +244,24 @@ class PB1Engine:
+++                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
+++                 quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
+++                 if not isinstance(quote, dict):
+++-                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
++++                    self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
+++                     return None
+++                 price = quote.get("last")
+++                 if price is None:
+++                     price = quote.get("stck_prpr") or quote.get("prpr")
+++                     if price is None:
+++-                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
++++                        self._warn_once(
++++                            f"quote_missing_last:{code}", "[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys())
++++                        )
+++                         return None
+++                 try:
+++                     price_val = float(price)
+++                 except Exception:
+++-                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
++++                    self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
+++                     return None
+++                 if quote.get("ask") is None or quote.get("bid") is None:
+++-                    logger.warning(
++++                    self._warn_once(
++++                        f"quote_missing_book:{code}",
+++                         "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
+++                         code,
+++                         quote.get("ask"),
+++@@ -209,7 +269,7 @@ class PB1Engine:
+++                     )
+++                 return price_val
+++             except Exception:
+++-                logger.exception("[PB1][PRICE][FAIL] code=%s", code)
++++                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
+++         return None
+++ 
+++     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
+++@@ -217,7 +277,7 @@ class PB1Engine:
+++         for code in codes:
+++             px = self._mark_price(code)
+++             if px is None:
+++-                px = fallback.get(code)
++++                px = self._balance_price_map.get(code) or fallback.get(code)
+++             if px is not None:
+++                 marks[code] = px
+++         return marks
+++@@ -306,7 +366,11 @@ class PB1Engine:
+++         qty = pos.get("qty") or 0
+++         if qty <= 0:
+++             return
+++-        mark = self._mark_price(code) or features.get("close") or avg
++++        mark = self._mark_price(code)
++++        if mark is None:
++++            mark = self._balance_price_map.get(code)
++++        if mark is None:
++++            mark = features.get("close") or avg
+++         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
+++         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
+++         if self._should_block_order(client_key):
+++@@ -451,21 +515,34 @@ class PB1Engine:
+++         totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+++         for pos in positions:
+++             qty = pos.get("qty") or 0
+++-            mark = marks.get(pos["code"], pos.get("avg_buy_price") or 0.0)
++++            mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
+++             market_value = float(mark) * qty
+++             cost = float(pos.get("total_cost") or 0.0)
+++             totals["market_value"] += market_value
+++             totals["cost"] += cost
+++             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
+++             totals["unrealized"] += market_value - cost
++++
++++        cost_source = "positions"
++++        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"]
++++        if self._balance_cost is not None:
++++            cost_source = "kis_balance"
++++            totals["cost"] = self._balance_cost
++++        else:
++++            totals["cost"] = totals["cost"]
++++
+++         portfolio_return_pct = 0.0
+++-        if totals["cost"] > 0:
+++-            portfolio_return_pct = (totals["market_value"] - totals["cost"] + totals["realized"]) / totals["cost"] * 100
++++        if cost_base and cost_base > 0:
++++            portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
++++        else:
++++            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=0")
++++
+++         logger.info(
+++-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f unrealized=%.2f realized=%.2f return_pct=%.2f",
++++            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%.2f",
+++             self._universe_as_of or "none",
+++             totals["market_value"],
+++             totals["cost"],
++++            cost_source,
+++             totals["unrealized"],
+++             totals["realized"],
+++             portfolio_return_pct,
+++@@ -473,6 +550,7 @@ class PB1Engine:
+++         return totals
+++ 
+++     def run(self) -> RunResult:
++++        self._warned_keys.clear()
+++         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+++         if not entry_allowed:
+++             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+++@@ -485,9 +563,16 @@ class PB1Engine:
+++             return RunResult(status="SKIPPED", notes=note)
+++ 
+++         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
++++        holdings_snapshot = self._fetch_holdings_snapshot()
++++        holdings_rows = holdings_snapshot.get("output1") or []
++++        holdings_summary = holdings_snapshot.get("output2") or {}
++++        self._balance_price_map = self._extract_holdings_prices(holdings_rows)
++++        self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+++         if self.phase in {"verify", "exit"}:
+++             holdings = []
+++-            if self.kis:
++++            if holdings_rows:
++++                holdings = holdings_rows
++++            elif self.kis:
+++                 try:
+++                     holdings = self.kis.get_positions()
+++                 except Exception:
+++diff --git a/trader/universe/build.py b/trader/universe/build.py
+++index d66edd1..c658098 100644
+++--- a/trader/universe/build.py
++++++ b/trader/universe/build.py
+++@@ -1,6 +1,7 @@
+++ from __future__ import annotations
+++ 
+++ import argparse
++++import csv
+++ import logging
+++ import os
+++ from pathlib import Path
+++@@ -11,14 +12,16 @@ from trader.db.migrate import run_migrations
+++ from trader.db.repos import UniverseRepo
+++ from trader.kis_wrapper import KisAPI
+++ from trader.time_utils import now_kst
+++-from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
++++from trader.universe.providers.kis_mcap import KISMcapProvider
+++ 
+++ logger = logging.getLogger(__name__)
+++ 
+++ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
+++-SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
+++-SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
++++SEED_DIR = Path(__file__).resolve().parent / "seeds"
++++SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
++++SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
+++ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
++++DEFAULT_PROVIDER = "kis_mcap_200"
+++ 
+++ 
+++ def parse_args() -> argparse.Namespace:
+++@@ -73,48 +76,84 @@ def _dedup(seq: Iterable[str]) -> list[str]:
+++     return uniq
+++ 
+++ 
+++-def _load_seed_codes(path: Path) -> list[str]:
++++def _load_seed_rows(path: Path) -> list[dict]:
+++     if not path.exists():
+++         return []
+++-    codes: list[str] = []
++++    rows: list[dict] = []
+++     try:
+++         with path.open(encoding="utf-8") as f:
+++-            for line in f:
+++-                code = line.strip()
+++-                if code:
+++-                    codes.append(code.zfill(6))
++++            # CSV with header: code,name
++++            reader = csv.DictReader(f)
++++            has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
++++            if has_code_header:
++++                for row in reader:
++++                    code = str(row.get("code") or "").strip()
++++                    if not code:
++++                        continue
++++                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
++++            else:
++++                f.seek(0)
++++                for line in f:
++++                    code = line.strip()
++++                    if code:
++++                        rows.append({"code": code.zfill(6), "name": None})
+++     except Exception:
+++         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
+++         return []
+++-    return _dedup(codes)
++++    seen: set[str] = set()
++++    uniq_rows: list[dict] = []
++++    for row in rows:
++++        code = row.get("code")
++++        if not code or code in seen:
++++            continue
++++        seen.add(code)
++++        uniq_rows.append(row)
++++    return uniq_rows
++++
++++
++++def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
++++    try:
++++        path.parent.mkdir(parents=True, exist_ok=True)
++++        with path.open("w", encoding="utf-8", newline="") as f:
++++            writer = csv.DictWriter(f, fieldnames=["code", "name"])
++++            writer.writeheader()
++++            for row in rows:
++++                code = str(row.get("code") or "").zfill(6)
++++                if not code:
++++                    continue
++++                writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
++++    except Exception:
++++        logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
+++ 
+++ 
+++ def _load_static_seed() -> dict | None:
+++-    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
+++-    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
++++    kospi_rows = _load_seed_rows(SEED_PATH_KOSPI)
++++    kosdaq_rows = _load_seed_rows(SEED_PATH_KOSDAQ)
+++ 
+++     members: list[dict] = []
+++     markets: dict[str, list[dict]] = {}
+++ 
+++     seen: set[str] = set()
+++ 
+++-    for code in kospi_codes:
+++-        if code in seen:
++++    for row in kospi_rows[: TARGETS["KOSPI"]]:
++++        code = row.get("code")
++++        if not code or code in seen:
+++             continue
+++         seen.add(code)
+++         rank = len(markets.get("KOSPI", [])) + 1
+++-        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
++++        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
+++         members.append(member)
+++-        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
++++        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank, "name": row.get("name")})
+++ 
+++-    for code in kosdaq_codes:
+++-        if code in seen:
++++    for row in kosdaq_rows[: TARGETS["KOSDAQ"]]:
++++        code = row.get("code")
++++        if not code or code in seen:
+++             continue
+++         seen.add(code)
+++         rank = len(markets.get("KOSDAQ", [])) + 1
+++-        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
++++        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
+++         members.append(member)
+++-        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
++++        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank, "name": row.get("name")})
+++ 
+++     if not members:
+++         return None
+++@@ -178,35 +217,40 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
+++     return None
+++ 
+++ 
+++-def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
++++def _build_from_kis(provider: KISMcapProvider) -> dict | None:
+++     try:
+++-        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
+++-        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
++++        kospi_rows = provider.get_top_with_meta("KOSPI", TARGETS["KOSPI"])
++++        kosdaq_rows = provider.get_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
+++     except Exception as exc:  # pragma: no cover - defensive
+++         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
+++         return None
+++ 
+++-    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
++++    if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
+++         logger.warning(
+++             "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
+++-            len(kospi),
+++-            len(kosdaq),
++++            len(kospi_rows),
++++            len(kosdaq_rows),
+++             TARGETS,
+++         )
+++         return None
+++ 
++++    kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
++++    kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
++++    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
++++    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
++++
+++     selected_by_market = {
+++-        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
+++-        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
++++        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
++++        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+++     }
+++     payload = _normalize_payload(
+++         {
+++-            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
++++            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+++             "selected_by_market": selected_by_market,
+++         }
+++     )
+++     members = _build_members_from_payload(selected_by_market)
+++-    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
++++    return {"payload": payload, "members": members, "source": DEFAULT_PROVIDER, "params": {"targets": TARGETS}}
+++ 
+++ 
+++ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+++@@ -216,12 +260,12 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+++ 
+++     payload: dict | None = None
+++     members: list[dict] = []
+++-    source = "kis_marketcap_top"
++++    source = DEFAULT_PROVIDER
+++     params: dict = {"as_of": as_of_date}
+++ 
+++-    kis_provider: KISMarketcapTopProvider | None = None
++++    kis_provider: KISMcapProvider | None = None
+++     try:
+++-        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
++++        kis_provider = KISMcapProvider(kis=KisAPI(), env=env)
+++     except Exception as exc:
+++         logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
+++ 
+++diff --git a/trader/universe/providers/__init__.py b/trader/universe/providers/__init__.py
+++index b71686e..227b790 100644
+++--- a/trader/universe/providers/__init__.py
++++++ b/trader/universe/providers/__init__.py
+++@@ -1 +1,3 @@
+++ # Provider utilities for universe data sources.
++++
++++from .kis_mcap import KISMcapProvider, get_kosdaq_top_mcap, get_kospi_top_mcap  # noqa: F401
+++diff --git a/trader/universe/providers/kis_mcap.py b/trader/universe/providers/kis_mcap.py
+++new file mode 100644
+++index 0000000..fbd0ca3
+++--- /dev/null
++++++ b/trader/universe/providers/kis_mcap.py
+++@@ -0,0 +1,127 @@
++++from __future__ import annotations
++++
++++import logging
++++import os
++++from typing import Iterable
++++
++++from settings import API_BASE_URL
++++from trader.kis_wrapper import KisAPI
++++
++++logger = logging.getLogger(__name__)
++++
++++
++++class KISMcapProvider:
++++    """KIS 랭킹 API 기반 시가총액 상위 종목 제공자."""
++++
++++    DEFAULT_ENDPOINT = "/uapi/domestic-stock/v1/ranking/market-cap"
++++    DEFAULT_TR_IDS = {
++++        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
++++        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
++++    }
++++    DEFAULT_PARAMS = {
++++        "fid_rank_sort_cls_code": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
++++        "fid_cond_scr_div_code": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
++++        "fid_input_iscd": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
++++    }
++++    MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
++++
++++    def __init__(
++++        self,
++++        *,
++++        kis: KisAPI | None = None,
++++        env: str | None = None,
++++        endpoint: str | None = None,
++++        tr_ids: dict[str, str] | None = None,
++++    ) -> None:
++++        self.kis = kis or KisAPI()
++++        self.env = (env or self.kis.env or "practice").lower()
++++        self.endpoint = endpoint or self.DEFAULT_ENDPOINT
++++        self.tr_ids = tr_ids or dict(self.DEFAULT_TR_IDS)
++++        self.params = dict(self.DEFAULT_PARAMS)
++++
++++    def _pick_tr_id(self) -> str | None:
++++        return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
++++
++++    def _market_code(self, market: str) -> str:
++++        return self.MARKET_CODE_MAP.get(market.upper(), "J")
++++
++++    @staticmethod
++++    def _normalize_rows(rows: Iterable[dict]) -> list[dict]:
++++        normalized: list[dict] = []
++++        seen: set[str] = set()
++++        for row in rows:
++++            code = None
++++            for key in ("stck_shrn_iscd", "mksc_shrn_iscd", "pdno", "code", "CODE"):
++++                if key in row and row.get(key):
++++                    code = str(row.get(key)).strip()
++++                    break
++++            if not code:
++++                continue
++++            code = code.zfill(6)
++++            if code in seen:
++++                continue
++++            seen.add(code)
++++            name = row.get("hts_kor_isnm") or row.get("mksc_kor_isnm") or row.get("hname") or row.get("prdt_name") or row.get("name")
++++            normalized.append({"code": code, "name": str(name).strip() if name else None})
++++        return normalized
++++
++++    @staticmethod
++++    def _extract_rows(data: dict) -> list[dict]:
++++        buckets = []
++++        for key in ("output", "output1", "output2"):
++++            out = data.get(key)
++++            if isinstance(out, list):
++++                buckets.extend(out)
++++            elif isinstance(out, dict):
++++                buckets.append(out)
++++        return buckets
++++
++++    def get_top_with_meta(self, market: str, n: int) -> list[dict]:
++++        """
++++        시장별 시가총액 상위 목록을 코드/이름 메타와 함께 반환한다.
++++        실패 시 빈 리스트를 반환하고 WARN 로그만 남긴다.
++++        """
++++        tr_id = self._pick_tr_id()
++++        if not tr_id:
++++            logger.warning("[KIS][MCAP][TR_MISSING] env=%s market=%s", self.env, market)
++++            return []
++++
++++        market_code = self._market_code(market)
++++        params = {**self.params, "fid_cond_mrkt_div_code": market_code}
++++
++++        try:
++++            headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
++++            url = f"{API_BASE_URL}{self.endpoint}"
++++            self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
++++            resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
++++            data = resp.json()
++++        except Exception as exc:
++++            logger.warning("[KIS][MCAP][FAIL] env=%s market=%s err=%s", self.env, market, exc)
++++            return []
++++
++++        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
++++        normalized = self._normalize_rows(output_rows)
++++        if not normalized:
++++            logger.warning(
++++                "[KIS][MCAP][EMPTY] env=%s market=%s rt_cd=%s msg=%s",
++++                self.env,
++++                market,
++++                data.get("rt_cd") if isinstance(data, dict) else None,
++++                data.get("msg1") if isinstance(data, dict) else None,
++++            )
++++            return []
++++        limit = max(0, int(n))
++++        return normalized[:limit]
++++
++++    def get_top_codes(self, market: str, n: int) -> list[str]:
++++        return [row["code"] for row in self.get_top_with_meta(market, n)]
++++
++++
++++def get_kospi_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
++++    provider = KISMcapProvider(kis=kis, env=env)
++++    return provider.get_top_codes("KOSPI", n)
++++
++++
++++def get_kosdaq_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
++++    provider = KISMcapProvider(kis=kis, env=env)
++++    return provider.get_top_codes("KOSDAQ", n)
+++diff --git a/trader/universe/seeds/kosdaq_mcap_100.csv b/trader/universe/seeds/kosdaq_mcap_100.csv
+++new file mode 100644
+++index 0000000..a56983b
+++--- /dev/null
++++++ b/trader/universe/seeds/kosdaq_mcap_100.csv
+++@@ -0,0 +1,101 @@
++++code,name
++++091990,
++++066970,
++++086520,
++++247540,
++++035900,
++++035760,
++++041510,
++++263750,
++++112040,
++++095660,
++++068760,
++++214150,
++++196170,
++++028300,
++++036930,
++++200130,
++++078520,
++++141080,
++++138080,
++++067160,
++++053800,
++++039030,
++++090460,
++++095700,
++++064550,
++++092040,
++++089980,
++++240810,
++++104830,
++++074600,
++++078340,
++++078600,
++++036540,
++++096530,
++++058470,
++++091700,
++++084370,
++++079370,
++++086890,
++++052400,
++++067310,
++++079940,
++++140860,
++++235980,
++++237690,
++++086900,
++++278280,
++++357780,
++++293490,
++++115450,
++++083310,
++++088800,
++++089970,
++++095340,
++++042700,
++++066590,
++++067630,
++++086040,
++++104460,
++++145020,
++++131970,
++++318140,
++++330860,
++++115480,
++++108230,
++++174900,
++++187270,
++++263720,
++++214270,
++++031440,
++++041930,
++++119610,
++++078070,
++++089600,
++++222080,
++++039340,
++++083450,
++++246720,
++++140070,
++++178320,
++++121600,
++++050760,
++++069510,
++++298040,
++++053580,
++++217270,
++++058400,
++++039200,
++++060250,
++++067770,
++++121800,
++++106240,
++++065450,
++++042110,
++++058820,
++++093520,
++++289220,
++++060720,
++++290650,
++++067290,
+++diff --git a/trader/universe/seeds/kospi_mcap_100.csv b/trader/universe/seeds/kospi_mcap_100.csv
+++new file mode 100644
+++index 0000000..8323f52
+++--- /dev/null
++++++ b/trader/universe/seeds/kospi_mcap_100.csv
+++@@ -0,0 +1,101 @@
++++code,name
++++005930,
++++000660,
++++207940,
++++373220,
++++005380,
++++000270,
++++035420,
++++035720,
++++051910,
++++006400,
++++028260,
++++096770,
++++003670,
++++005490,
++++018260,
++++011170,
++++010130,
++++000810,
++++003550,
++++000100,
++++000120,
++++090430,
++++066570,
++++017670,
++++034220,
++++010950,
++++012330,
++++051900,
++++034730,
++++011200,
++++030200,
++++009150,
++++015760,
++++003410,
++++086790,
++++032640,
++++161390,
++++003620,
++++006360,
++++000990,
++++009540,
++++010140,
++++011780,
++++018880,
++++003490,
++++006800,
++++009830,
++++105560,
++++055550,
++++323410,
++++377300,
++++402340,
++++078930,
++++047050,
++++004020,
++++012450,
++++000880,
++++042660,
++++023530,
++++000070,
++++000080,
++++004000,
++++008770,
++++011790,
++++033780,
++++361610,
++++079160,
++++002790,
++++010060,
++++006120,
++++028050,
++++251270,
++++005830,
++++029780,
++++016360,
++++009240,
++++018670,
++++005940,
++++010120,
++++241560,
++++086280,
++++011070,
++++002380,
++++010620,
++++006260,
++++008560,
++++007070,
++++069260,
++++271560,
++++105630,
++++001450,
++++001040,
++++005070,
++++000240,
++++036570,
++++352820,
++++259960,
++++032830,
++++003090,
++++108320,
++diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
++index c9da9af..62d9f7c 100644
++--- a/trader/kis_wrapper.py
+++++ b/trader/kis_wrapper.py
++@@ -26,11 +26,12 @@ from urllib3.util.retry import Retry
++ 
++ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
++ from trader.time_utils import is_trading_day, is_trading_window, now_kst
++-from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+++from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
++ from trader.fills import append_fill
++ 
++ logger = logging.getLogger(__name__)
++ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
+++_DAILY_CAP_WARNED = False
++ 
++ 
++ class NetTemporaryError(Exception):
++@@ -725,13 +726,13 @@ class KisAPI:
++         """
++         # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
++         try:
++-            if not getattr(self, "_env_checked_daily_capital", False):
+++            global _DAILY_CAP_WARNED
+++            if not _DAILY_CAP_WARNED:
++                 if os.getenv("DAILY_CAPITAL") in (None, ""):
++                     logger.warning(
++-                        "[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
++-                        "settings의 기본값(10,000,000)이 사용될 수 있습니다."
+++                        "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
++                     )
++-                self._env_checked_daily_capital = True
+++                _DAILY_CAP_WARNED = True
++         except Exception:
++             pass
++ 
++diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
++index d395344..3e2836c 100644
++--- a/trader/pb1_engine.py
+++++ b/trader/pb1_engine.py
++@@ -3,7 +3,7 @@ from __future__ import annotations
++ import logging
++ from dataclasses import dataclass
++ from datetime import datetime
++-from typing import Dict, Iterable, List
+++from typing import Any, Dict, Iterable, List
++ 
++ import pandas as pd
++ 
++@@ -80,6 +80,63 @@ class PB1Engine:
++         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
++         self._today = now_kst().date().isoformat()
++         self._universe_as_of = None
+++        self._warned_keys: set[str] = set()
+++        self._balance_price_map: Dict[str, float] = {}
+++        self._balance_cost: float | None = None
+++
+++    def _warn_once(self, key: str, message: str, *args: object) -> None:
+++        if key in self._warned_keys:
+++            return
+++        self._warned_keys.add(key)
+++        logger.warning(message, *args)
+++
+++    @staticmethod
+++    def _to_float(value: Any) -> float | None:
+++        try:
+++            if value is None:
+++                return None
+++            if isinstance(value, str):
+++                value = value.replace(",", "").strip()
+++            fval = float(value)
+++            if fval != fval:  # NaN guard
+++                return None
+++            return fval
+++        except Exception:
+++            return None
+++
+++    def _extract_holdings_prices(self, holdings_rows: Iterable[dict]) -> Dict[str, float]:
+++        prices: Dict[str, float] = {}
+++        for row in holdings_rows or []:
+++            try:
+++                code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+++                px = self._to_float(row.get("prpr") or row.get("stck_prpr"))
+++                if code and px is not None:
+++                    prices[code] = px
+++            except Exception:
+++                continue
+++        return prices
+++
+++    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
+++        summary = holdings_summary or {}
+++        for key in ("pchs_amt_smtl_amt", "pchs_amt"):
+++            cost = self._to_float(summary.get(key))
+++            if cost and cost > 0:
+++                return cost
+++        total = 0.0
+++        for row in holdings_rows or []:
+++            val = self._to_float(row.get("pchs_amt"))
+++            if val:
+++                total += val
+++        return total if total > 0 else None
+++
+++    def _fetch_holdings_snapshot(self) -> dict:
+++        if not self.kis:
+++            return {}
+++        try:
+++            return self.kis.inquire_balance_all()
+++        except Exception:
+++            logger.exception("[PB1][HOLDINGS][FAIL]")
+++            return {}
++ 
++     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
++         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
++@@ -187,21 +244,24 @@ class PB1Engine:
++                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
++                 quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
++                 if not isinstance(quote, dict):
++-                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
+++                    self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
++                     return None
++                 price = quote.get("last")
++                 if price is None:
++                     price = quote.get("stck_prpr") or quote.get("prpr")
++                     if price is None:
++-                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
+++                        self._warn_once(
+++                            f"quote_missing_last:{code}", "[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys())
+++                        )
++                         return None
++                 try:
++                     price_val = float(price)
++                 except Exception:
++-                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
+++                    self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
++                     return None
++                 if quote.get("ask") is None or quote.get("bid") is None:
++-                    logger.warning(
+++                    self._warn_once(
+++                        f"quote_missing_book:{code}",
++                         "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
++                         code,
++                         quote.get("ask"),
++@@ -209,7 +269,7 @@ class PB1Engine:
++                     )
++                 return price_val
++             except Exception:
++-                logger.exception("[PB1][PRICE][FAIL] code=%s", code)
+++                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
++         return None
++ 
++     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
++@@ -217,7 +277,7 @@ class PB1Engine:
++         for code in codes:
++             px = self._mark_price(code)
++             if px is None:
++-                px = fallback.get(code)
+++                px = self._balance_price_map.get(code) or fallback.get(code)
++             if px is not None:
++                 marks[code] = px
++         return marks
++@@ -306,7 +366,11 @@ class PB1Engine:
++         qty = pos.get("qty") or 0
++         if qty <= 0:
++             return
++-        mark = self._mark_price(code) or features.get("close") or avg
+++        mark = self._mark_price(code)
+++        if mark is None:
+++            mark = self._balance_price_map.get(code)
+++        if mark is None:
+++            mark = features.get("close") or avg
++         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
++         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
++         if self._should_block_order(client_key):
++@@ -451,21 +515,34 @@ class PB1Engine:
++         totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
++         for pos in positions:
++             qty = pos.get("qty") or 0
++-            mark = marks.get(pos["code"], pos.get("avg_buy_price") or 0.0)
+++            mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
++             market_value = float(mark) * qty
++             cost = float(pos.get("total_cost") or 0.0)
++             totals["market_value"] += market_value
++             totals["cost"] += cost
++             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
++             totals["unrealized"] += market_value - cost
+++
+++        cost_source = "positions"
+++        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"]
+++        if self._balance_cost is not None:
+++            cost_source = "kis_balance"
+++            totals["cost"] = self._balance_cost
+++        else:
+++            totals["cost"] = totals["cost"]
+++
++         portfolio_return_pct = 0.0
++-        if totals["cost"] > 0:
++-            portfolio_return_pct = (totals["market_value"] - totals["cost"] + totals["realized"]) / totals["cost"] * 100
+++        if cost_base and cost_base > 0:
+++            portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
+++        else:
+++            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=0")
+++
++         logger.info(
++-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f unrealized=%.2f realized=%.2f return_pct=%.2f",
+++            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%.2f",
++             self._universe_as_of or "none",
++             totals["market_value"],
++             totals["cost"],
+++            cost_source,
++             totals["unrealized"],
++             totals["realized"],
++             portfolio_return_pct,
++@@ -473,6 +550,7 @@ class PB1Engine:
++         return totals
++ 
++     def run(self) -> RunResult:
+++        self._warned_keys.clear()
++         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
++         if not entry_allowed:
++             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
++@@ -485,9 +563,16 @@ class PB1Engine:
++             return RunResult(status="SKIPPED", notes=note)
++ 
++         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+++        holdings_snapshot = self._fetch_holdings_snapshot()
+++        holdings_rows = holdings_snapshot.get("output1") or []
+++        holdings_summary = holdings_snapshot.get("output2") or {}
+++        self._balance_price_map = self._extract_holdings_prices(holdings_rows)
+++        self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
++         if self.phase in {"verify", "exit"}:
++             holdings = []
++-            if self.kis:
+++            if holdings_rows:
+++                holdings = holdings_rows
+++            elif self.kis:
++                 try:
++                     holdings = self.kis.get_positions()
++                 except Exception:
++diff --git a/trader/universe/build.py b/trader/universe/build.py
++index d66edd1..c658098 100644
++--- a/trader/universe/build.py
+++++ b/trader/universe/build.py
++@@ -1,6 +1,7 @@
++ from __future__ import annotations
++ 
++ import argparse
+++import csv
++ import logging
++ import os
++ from pathlib import Path
++@@ -11,14 +12,16 @@ from trader.db.migrate import run_migrations
++ from trader.db.repos import UniverseRepo
++ from trader.kis_wrapper import KisAPI
++ from trader.time_utils import now_kst
++-from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+++from trader.universe.providers.kis_mcap import KISMcapProvider
++ 
++ logger = logging.getLogger(__name__)
++ 
++ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
++-SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
++-SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
+++SEED_DIR = Path(__file__).resolve().parent / "seeds"
+++SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
+++SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
++ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+++DEFAULT_PROVIDER = "kis_mcap_200"
++ 
++ 
++ def parse_args() -> argparse.Namespace:
++@@ -73,48 +76,84 @@ def _dedup(seq: Iterable[str]) -> list[str]:
++     return uniq
++ 
++ 
++-def _load_seed_codes(path: Path) -> list[str]:
+++def _load_seed_rows(path: Path) -> list[dict]:
++     if not path.exists():
++         return []
++-    codes: list[str] = []
+++    rows: list[dict] = []
++     try:
++         with path.open(encoding="utf-8") as f:
++-            for line in f:
++-                code = line.strip()
++-                if code:
++-                    codes.append(code.zfill(6))
+++            # CSV with header: code,name
+++            reader = csv.DictReader(f)
+++            has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
+++            if has_code_header:
+++                for row in reader:
+++                    code = str(row.get("code") or "").strip()
+++                    if not code:
+++                        continue
+++                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+++            else:
+++                f.seek(0)
+++                for line in f:
+++                    code = line.strip()
+++                    if code:
+++                        rows.append({"code": code.zfill(6), "name": None})
++     except Exception:
++         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
++         return []
++-    return _dedup(codes)
+++    seen: set[str] = set()
+++    uniq_rows: list[dict] = []
+++    for row in rows:
+++        code = row.get("code")
+++        if not code or code in seen:
+++            continue
+++        seen.add(code)
+++        uniq_rows.append(row)
+++    return uniq_rows
+++
+++
+++def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
+++    try:
+++        path.parent.mkdir(parents=True, exist_ok=True)
+++        with path.open("w", encoding="utf-8", newline="") as f:
+++            writer = csv.DictWriter(f, fieldnames=["code", "name"])
+++            writer.writeheader()
+++            for row in rows:
+++                code = str(row.get("code") or "").zfill(6)
+++                if not code:
+++                    continue
+++                writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
+++    except Exception:
+++        logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
++ 
++ 
++ def _load_static_seed() -> dict | None:
++-    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
++-    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
+++    kospi_rows = _load_seed_rows(SEED_PATH_KOSPI)
+++    kosdaq_rows = _load_seed_rows(SEED_PATH_KOSDAQ)
++ 
++     members: list[dict] = []
++     markets: dict[str, list[dict]] = {}
++ 
++     seen: set[str] = set()
++ 
++-    for code in kospi_codes:
++-        if code in seen:
+++    for row in kospi_rows[: TARGETS["KOSPI"]]:
+++        code = row.get("code")
+++        if not code or code in seen:
++             continue
++         seen.add(code)
++         rank = len(markets.get("KOSPI", [])) + 1
++-        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
+++        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
++         members.append(member)
++-        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
+++        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank, "name": row.get("name")})
++ 
++-    for code in kosdaq_codes:
++-        if code in seen:
+++    for row in kosdaq_rows[: TARGETS["KOSDAQ"]]:
+++        code = row.get("code")
+++        if not code or code in seen:
++             continue
++         seen.add(code)
++         rank = len(markets.get("KOSDAQ", [])) + 1
++-        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
+++        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
++         members.append(member)
++-        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
+++        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank, "name": row.get("name")})
++ 
++     if not members:
++         return None
++@@ -178,35 +217,40 @@ def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None
++     return None
++ 
++ 
++-def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
+++def _build_from_kis(provider: KISMcapProvider) -> dict | None:
++     try:
++-        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
++-        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
+++        kospi_rows = provider.get_top_with_meta("KOSPI", TARGETS["KOSPI"])
+++        kosdaq_rows = provider.get_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
++     except Exception as exc:  # pragma: no cover - defensive
++         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
++         return None
++ 
++-    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
+++    if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
++         logger.warning(
++             "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
++-            len(kospi),
++-            len(kosdaq),
+++            len(kospi_rows),
+++            len(kosdaq_rows),
++             TARGETS,
++         )
++         return None
++ 
+++    kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
+++    kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
+++    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+++    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+++
++     selected_by_market = {
++-        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
++-        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
+++        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+++        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
++     }
++     payload = _normalize_payload(
++         {
++-            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
+++            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
++             "selected_by_market": selected_by_market,
++         }
++     )
++     members = _build_members_from_payload(selected_by_market)
++-    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
+++    return {"payload": payload, "members": members, "source": DEFAULT_PROVIDER, "params": {"targets": TARGETS}}
++ 
++ 
++ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
++@@ -216,12 +260,12 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
++ 
++     payload: dict | None = None
++     members: list[dict] = []
++-    source = "kis_marketcap_top"
+++    source = DEFAULT_PROVIDER
++     params: dict = {"as_of": as_of_date}
++ 
++-    kis_provider: KISMarketcapTopProvider | None = None
+++    kis_provider: KISMcapProvider | None = None
++     try:
++-        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+++        kis_provider = KISMcapProvider(kis=KisAPI(), env=env)
++     except Exception as exc:
++         logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
++ 
++diff --git a/trader/universe/providers/__init__.py b/trader/universe/providers/__init__.py
++index b71686e..227b790 100644
++--- a/trader/universe/providers/__init__.py
+++++ b/trader/universe/providers/__init__.py
++@@ -1 +1,3 @@
++ # Provider utilities for universe data sources.
+++
+++from .kis_mcap import KISMcapProvider, get_kosdaq_top_mcap, get_kospi_top_mcap  # noqa: F401
++diff --git a/trader/universe/providers/kis_mcap.py b/trader/universe/providers/kis_mcap.py
++new file mode 100644
++index 0000000..fbd0ca3
++--- /dev/null
+++++ b/trader/universe/providers/kis_mcap.py
++@@ -0,0 +1,127 @@
+++from __future__ import annotations
+++
+++import logging
+++import os
+++from typing import Iterable
+++
+++from settings import API_BASE_URL
+++from trader.kis_wrapper import KisAPI
+++
+++logger = logging.getLogger(__name__)
+++
+++
+++class KISMcapProvider:
+++    """KIS 랭킹 API 기반 시가총액 상위 종목 제공자."""
+++
+++    DEFAULT_ENDPOINT = "/uapi/domestic-stock/v1/ranking/market-cap"
+++    DEFAULT_TR_IDS = {
+++        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
+++        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
+++    }
+++    DEFAULT_PARAMS = {
+++        "fid_rank_sort_cls_code": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
+++        "fid_cond_scr_div_code": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
+++        "fid_input_iscd": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
+++    }
+++    MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
+++
+++    def __init__(
+++        self,
+++        *,
+++        kis: KisAPI | None = None,
+++        env: str | None = None,
+++        endpoint: str | None = None,
+++        tr_ids: dict[str, str] | None = None,
+++    ) -> None:
+++        self.kis = kis or KisAPI()
+++        self.env = (env or self.kis.env or "practice").lower()
+++        self.endpoint = endpoint or self.DEFAULT_ENDPOINT
+++        self.tr_ids = tr_ids or dict(self.DEFAULT_TR_IDS)
+++        self.params = dict(self.DEFAULT_PARAMS)
+++
+++    def _pick_tr_id(self) -> str | None:
+++        return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
+++
+++    def _market_code(self, market: str) -> str:
+++        return self.MARKET_CODE_MAP.get(market.upper(), "J")
+++
+++    @staticmethod
+++    def _normalize_rows(rows: Iterable[dict]) -> list[dict]:
+++        normalized: list[dict] = []
+++        seen: set[str] = set()
+++        for row in rows:
+++            code = None
+++            for key in ("stck_shrn_iscd", "mksc_shrn_iscd", "pdno", "code", "CODE"):
+++                if key in row and row.get(key):
+++                    code = str(row.get(key)).strip()
+++                    break
+++            if not code:
+++                continue
+++            code = code.zfill(6)
+++            if code in seen:
+++                continue
+++            seen.add(code)
+++            name = row.get("hts_kor_isnm") or row.get("mksc_kor_isnm") or row.get("hname") or row.get("prdt_name") or row.get("name")
+++            normalized.append({"code": code, "name": str(name).strip() if name else None})
+++        return normalized
+++
+++    @staticmethod
+++    def _extract_rows(data: dict) -> list[dict]:
+++        buckets = []
+++        for key in ("output", "output1", "output2"):
+++            out = data.get(key)
+++            if isinstance(out, list):
+++                buckets.extend(out)
+++            elif isinstance(out, dict):
+++                buckets.append(out)
+++        return buckets
+++
+++    def get_top_with_meta(self, market: str, n: int) -> list[dict]:
+++        """
+++        시장별 시가총액 상위 목록을 코드/이름 메타와 함께 반환한다.
+++        실패 시 빈 리스트를 반환하고 WARN 로그만 남긴다.
+++        """
+++        tr_id = self._pick_tr_id()
+++        if not tr_id:
+++            logger.warning("[KIS][MCAP][TR_MISSING] env=%s market=%s", self.env, market)
+++            return []
+++
+++        market_code = self._market_code(market)
+++        params = {**self.params, "fid_cond_mrkt_div_code": market_code}
+++
+++        try:
+++            headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
+++            url = f"{API_BASE_URL}{self.endpoint}"
+++            self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
+++            resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
+++            data = resp.json()
+++        except Exception as exc:
+++            logger.warning("[KIS][MCAP][FAIL] env=%s market=%s err=%s", self.env, market, exc)
+++            return []
+++
+++        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
+++        normalized = self._normalize_rows(output_rows)
+++        if not normalized:
+++            logger.warning(
+++                "[KIS][MCAP][EMPTY] env=%s market=%s rt_cd=%s msg=%s",
+++                self.env,
+++                market,
+++                data.get("rt_cd") if isinstance(data, dict) else None,
+++                data.get("msg1") if isinstance(data, dict) else None,
+++            )
+++            return []
+++        limit = max(0, int(n))
+++        return normalized[:limit]
+++
+++    def get_top_codes(self, market: str, n: int) -> list[str]:
+++        return [row["code"] for row in self.get_top_with_meta(market, n)]
+++
+++
+++def get_kospi_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
+++    provider = KISMcapProvider(kis=kis, env=env)
+++    return provider.get_top_codes("KOSPI", n)
+++
+++
+++def get_kosdaq_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
+++    provider = KISMcapProvider(kis=kis, env=env)
+++    return provider.get_top_codes("KOSDAQ", n)
++diff --git a/trader/universe/seeds/kosdaq_mcap_100.csv b/trader/universe/seeds/kosdaq_mcap_100.csv
++new file mode 100644
++index 0000000..a56983b
++--- /dev/null
+++++ b/trader/universe/seeds/kosdaq_mcap_100.csv
++@@ -0,0 +1,101 @@
+++code,name
+++091990,
+++066970,
+++086520,
+++247540,
+++035900,
+++035760,
+++041510,
+++263750,
+++112040,
+++095660,
+++068760,
+++214150,
+++196170,
+++028300,
+++036930,
+++200130,
+++078520,
+++141080,
+++138080,
+++067160,
+++053800,
+++039030,
+++090460,
+++095700,
+++064550,
+++092040,
+++089980,
+++240810,
+++104830,
+++074600,
+++078340,
+++078600,
+++036540,
+++096530,
+++058470,
+++091700,
+++084370,
+++079370,
+++086890,
+++052400,
+++067310,
+++079940,
+++140860,
+++235980,
+++237690,
+++086900,
+++278280,
+++357780,
+++293490,
+++115450,
+++083310,
+++088800,
+++089970,
+++095340,
+++042700,
+++066590,
+++067630,
+++086040,
+++104460,
+++145020,
+++131970,
+++318140,
+++330860,
+++115480,
+++108230,
+++174900,
+++187270,
+++263720,
+++214270,
+++031440,
+++041930,
+++119610,
+++078070,
+++089600,
+++222080,
+++039340,
+++083450,
+++246720,
+++140070,
+++178320,
+++121600,
+++050760,
+++069510,
+++298040,
+++053580,
+++217270,
+++058400,
+++039200,
+++060250,
+++067770,
+++121800,
+++106240,
+++065450,
+++042110,
+++058820,
+++093520,
+++289220,
+++060720,
+++290650,
+++067290,
++diff --git a/trader/universe/seeds/kospi_mcap_100.csv b/trader/universe/seeds/kospi_mcap_100.csv
++new file mode 100644
++index 0000000..8323f52
++--- /dev/null
+++++ b/trader/universe/seeds/kospi_mcap_100.csv
++@@ -0,0 +1,101 @@
+++code,name
+++005930,
+++000660,
+++207940,
+++373220,
+++005380,
+++000270,
+++035420,
+++035720,
+++051910,
+++006400,
+++028260,
+++096770,
+++003670,
+++005490,
+++018260,
+++011170,
+++010130,
+++000810,
+++003550,
+++000100,
+++000120,
+++090430,
+++066570,
+++017670,
+++034220,
+++010950,
+++012330,
+++051900,
+++034730,
+++011200,
+++030200,
+++009150,
+++015760,
+++003410,
+++086790,
+++032640,
+++161390,
+++003620,
+++006360,
+++000990,
+++009540,
+++010140,
+++011780,
+++018880,
+++003490,
+++006800,
+++009830,
+++105560,
+++055550,
+++323410,
+++377300,
+++402340,
+++078930,
+++047050,
+++004020,
+++012450,
+++000880,
+++042660,
+++023530,
+++000070,
+++000080,
+++004000,
+++008770,
+++011790,
+++033780,
+++361610,
+++079160,
+++002790,
+++010060,
+++006120,
+++028050,
+++251270,
+++005830,
+++029780,
+++016360,
+++009240,
+++018670,
+++005940,
+++010120,
+++241560,
+++086280,
+++011070,
+++002380,
+++010620,
+++006260,
+++008560,
+++007070,
+++069260,
+++271560,
+++105630,
+++001450,
+++001040,
+++005070,
+++000240,
+++036570,
+++352820,
+++259960,
+++032830,
+++003090,
+++108320,
 diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index aaa977e255af2a5abdb65b99edea3be2fc1faf6e..c9da9afaec52ae2ff8025abc5eb75dbd44da4d4b 100644
+index c9da9afaec52ae2ff8025abc5eb75dbd44da4d4b..62d9f7c19c2e3344211a1a04d964e40f7b42eb60 100644
 --- a/trader/kis_wrapper.py
 +++ b/trader/kis_wrapper.py
-@@ -523,99 +523,133 @@ class KisAPI:
+@@ -4,55 +4,56 @@
+ # - 토큰 캐시
+ # - 시세/일봉/ATR
+ # - 잔고/주문
+ # - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
+ # - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
+ # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
+ # - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
+ # - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+ 
+ import os
+ import json
+ import time
+ import random
+ import logging
+ import threading
+ from datetime import datetime, timedelta
+ from typing import Dict, List, Optional, Tuple, Any
+ 
+ import requests
+ import pytz
+ from requests.adapters import HTTPAdapter
+ from urllib3.util.retry import Retry
+ 
+ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+ from trader.time_utils import is_trading_day, is_trading_window, now_kst
+-from trader.config import MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
++from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+ from trader.fills import append_fill
+ 
+ logger = logging.getLogger(__name__)
+ _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
++_DAILY_CAP_WARNED = False
+ 
+ 
+ class NetTemporaryError(Exception):
+     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+     pass
+ 
+ 
+ class DataEmptyError(Exception):
+     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
+     pass
+ 
+ 
+ class DataShortError(Exception):
+     """정상응답이나 캔들이 need_n 미만."""
+     pass
+ 
+ 
+ def _build_session():
+     s = requests.Session()
+     retry = Retry(
+         total=6, connect=5, read=5, status=3,
+         backoff_factor=0.6,
+         status_forcelist=[429, 500, 502, 503, 504],
+         allowed_methods=["GET", "POST"]
+     )
+@@ -703,57 +704,57 @@ class KisAPI:
+                     try:
+                         # [CHG] 안전요청 사용
+                         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                         data = resp.json()
+                     except Exception:
+                         continue
+                     if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                         out = data["output"]
+                         bid = sum(float(out.get(f"bidp_rsqn{i}") or 0) for i in range(1, 6))
+                         ask = sum(float(out.get(f"askp_rsqn{i}") or 0) for i in range(1, 6))
+                         if (bid + ask) > 0:
+                             return 100.0 * bid / max(1.0, ask)
          return None
  
-     def get_last_price(self, code: str, *, attempts: int = 2) -> float:
+     # === 일봉 ===
+     def get_daily_candles(self, code: str, count: int = 30) -> List[Dict[str, Any]]:
          """
-         견고한 현재가 조회:
-         - J/U 교차 + 'A' 접두/무접두 교차
-         - 0원/실패 시 지수 백오프 후 재시도
+         KIS 일봉 조회 (FHKST03010100)
+         - 날짜 파라미터(fid_input_date_1, fid_input_date_2) 필수
+         - 시장코드 J 고정
+         - 종목코드 'A' 접두사 제거(6자리)
+         - 0개 → DataEmptyError, 21개 미만 → DataShortError, 네트워크/게이트웨이 → NetTemporaryError
          """
-         c = safe_strip(code)
-         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-         markets = ("J", "U")
-         tr_list = _pick_tr(self.env, "PRICE")
-         for round_i in range(attempts):
-             for tr in tr_list:
-                 for m in markets:
-                     for cf in code_variants:
-                         px = self._inquire_price_once(tr, m, cf)
-                         if px and px > 0:
-                             return px
-             # 백오프 후 재시도
-             time.sleep(0.6 * (1.5 ** round_i) + random.uniform(0, 0.2))
-         raise RuntimeError(f"invalid last price 0 for {code}")
- 
-     def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
-         """
--        inquire-price 래퍼: 현재가 전체 응답을 dict로 반환.
-+        inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
- 
--        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환,
--        그 외에는 지정된 횟수 재시도 후 예외를 던진다.
-+        반환 예: {"last": 12345.0, "bid": 12340.0, "ask": 12350.0, "raw": {...}, ...}
-+        diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
-         """
-         c = safe_strip(code)
-         if not c:
-             return {}
-         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-         markets = ("J", "U")
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-         last_error: Exception | None = None
-+        raw_output: dict | None = None
-+
-+        def _to_float(val: Any) -> float | None:
-+            try:
-+                if val is None:
-+                    return None
-+                f = float(val)
-+                return f if f == f else None  # NaN guard
-+            except Exception:
-+                return None
-+
-         for attempt in range(1, attempts + 1):
-             self._limiter.wait("price-quote")
-             for tr in _pick_tr(self.env, "PRICE"):
-                 headers = self._headers(tr)
-                 for market_div in markets:
-                     for code_fmt in code_variants:
-                         params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                         try:
-                             resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
-                             data = resp.json()
-                         except Exception as exc:
-                             last_error = exc
-                             if diag_mode:
-                                 logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
-                                 return {}
-                             continue
-                         if "초당 거래건수" in (data.get("msg1") or ""):
-                             time.sleep(0.35 + random.uniform(0, 0.15))
-                             continue
-                         if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
--                            output = dict(data["output"])
--                            pr = output.get("stck_prpr") or output.get("prpr")
--                            try:
--                                pr_val = float(pr) if pr is not None else None
--                            except Exception:
--                                pr_val = pr
--                            output["stck_prpr"] = pr_val
--                            output.setdefault("prpr", pr_val)
--                            return output
-+                            raw_output = dict(data["output"])
-+                            break
-+                    if raw_output is not None:
-+                        break
-+                if raw_output is not None:
-+                    break
-+            if raw_output is not None:
-+                break
-             if diag_mode:
-                 break
-             time.sleep(0.6 * attempt + random.uniform(0, 0.2))
--        if diag_mode:
--            return {}
--        if last_error:
--            raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
--        raise RuntimeError(f"get_price_quote failed for {code}")
-+
-+        if raw_output is None:
-+            if diag_mode:
-+                return {}
-+            if last_error:
-+                raise RuntimeError(f"get_price_quote failed for {code}: {last_error}")
-+            raise RuntimeError(f"get_price_quote failed for {code}")
-+
-+        last_price = _to_float(raw_output.get("stck_prpr") or raw_output.get("prpr"))
-+        bid_price = _to_float(raw_output.get("bidp1") or raw_output.get("bidp") or raw_output.get("bid"))
-+        ask_price = _to_float(raw_output.get("askp1") or raw_output.get("askp") or raw_output.get("ask"))
-+
-+        # 호가가 없으면 별도 조회로 보강(실패 무시)
-+        if bid_price is None:
-+            try:
-+                bid_price = self.get_best_bid(c)
-+            except Exception:
-+                bid_price = None
-+        if ask_price is None:
-+            try:
-+                ask_price = self.get_best_ask(c)
-+            except Exception:
-+                ask_price = None
-+
-+        quote: dict = {**raw_output}
-+        quote.setdefault("stck_prpr", last_price)
-+        quote.setdefault("prpr", last_price)
-+        quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
-+        return quote
- 
-     def get_current_price(self, code: str) -> float:
-         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
-         return self.get_last_price(code)
- 
-     # --- 시초가 캐시 ---
-     def _get_cached_today_open(self, code: str) -> Optional[float]:
+         # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
          try:
-             op, ts = self._today_open_cache.get(code, (None, 0.0))
-             if op and (time.time() - ts) < self._today_open_ttl:
-                 return op
-         except Exception:
-             pass
-         return None
- 
-     def _set_cached_today_open(self, code: str, price: float):
-         try:
-             if price and price > 0:
-                 self._today_open_cache[code] = (float(price), time.time())
+-            if not getattr(self, "_env_checked_daily_capital", False):
++            global _DAILY_CAP_WARNED
++            if not _DAILY_CAP_WARNED:
+                 if os.getenv("DAILY_CAPITAL") in (None, ""):
+                     logger.warning(
+-                        "[ENV] DAILY_CAPITAL 이 .env에 설정되지 않았습니다. "
+-                        "settings의 기본값(10,000,000)이 사용될 수 있습니다."
++                        "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
+                     )
+-                self._env_checked_daily_capital = True
++                _DAILY_CAP_WARNED = True
          except Exception:
              pass
  
-     def get_today_open(self, code: str) -> Optional[float]:
-         """
-         오늘 시초가(09:00 기준).
+         # ---- (1) 파라미터 구성 ----
+         market_code = "J"                         # 시장코드: J 고정
+         iscd = code.strip().lstrip("A")          # 종목코드: 'A' 제거(6자리)
+ 
+         # 기간: 충분히 넉넉하게(휴장/결측 대비)
+         kst = pytz.timezone("Asia/Seoul")
+         now_kst = datetime.now(kst)
+         to_ymd = now_kst.strftime("%Y%m%d")
+         back_days = max(200, count * 4 + 100)
+         from_ymd = (now_kst - timedelta(days=back_days)).strftime("%Y%m%d")
+ 
+         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+         self._limiter.wait("daily")
+ 
+         last_err = None
+ 
+         for tr in _pick_tr(self.env, "DAILY_CHART"):   # TR 후보를 순차적으로 시도
+             headers = self._headers(tr)
+             headers.setdefault("accept", "*/*")
+             headers.setdefault("tr_cont", "N")
+             headers.setdefault("Connection", "keep-alive")
+ 
 diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index ca11b8670c44f46f1129cdff9fbc654bac3f47be..d3953446333e8b328a52a6dda2b47f6c506f8c70 100644
+index d3953446333e8b328a52a6dda2b47f6c506f8c70..3e2836c7fbb536b3aed5d4f796c75fb4c15b4a96 100644
 --- a/trader/pb1_engine.py
 +++ b/trader/pb1_engine.py
-@@ -164,53 +164,72 @@ class PB1Engine:
+@@ -1,31 +1,31 @@
+ from __future__ import annotations
  
+ import logging
+ from dataclasses import dataclass
+ from datetime import datetime
+-from typing import Dict, Iterable, List
++from typing import Any, Dict, Iterable, List
+ 
+ import pandas as pd
+ 
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
+     PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
+     PB1_REQUIRE_VOLUME,
+ )
+ from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+ from trader.time_utils import now_kst
+ from trader.utils.env import env_bool
+ from trader.utils.ohlcv import normalize_ohlcv
+ from trader.window_router import WindowDecision, resolve_phase
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -58,50 +58,107 @@ class PB1Engine:
+         *,
+         universe_repo: UniverseRepo,
+         orders_repo: OrdersRepo,
+         fills_repo: FillsRepo,
+         positions_repo: PositionsRepo,
+         kis: KisAPI | None,
+         window: WindowDecision,
+         phase_override: str,
+         dry_run: bool,
+         env: str,
+         run_id: str,
+     ) -> None:
+         self.universe_repo = universe_repo
+         self.orders_repo = orders_repo
+         self.fills_repo = fills_repo
+         self.positions_repo = positions_repo
+         self.kis = kis
+         self.window = window
+         self.phase = resolve_phase(window, phase_override)
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+         self._today = now_kst().date().isoformat()
+         self._universe_as_of = None
++        self._warned_keys: set[str] = set()
++        self._balance_price_map: Dict[str, float] = {}
++        self._balance_cost: float | None = None
++
++    def _warn_once(self, key: str, message: str, *args: object) -> None:
++        if key in self._warned_keys:
++            return
++        self._warned_keys.add(key)
++        logger.warning(message, *args)
++
++    @staticmethod
++    def _to_float(value: Any) -> float | None:
++        try:
++            if value is None:
++                return None
++            if isinstance(value, str):
++                value = value.replace(",", "").strip()
++            fval = float(value)
++            if fval != fval:  # NaN guard
++                return None
++            return fval
++        except Exception:
++            return None
++
++    def _extract_holdings_prices(self, holdings_rows: Iterable[dict]) -> Dict[str, float]:
++        prices: Dict[str, float] = {}
++        for row in holdings_rows or []:
++            try:
++                code = str(row.get("pdno") or row.get("code") or "").zfill(6)
++                px = self._to_float(row.get("prpr") or row.get("stck_prpr"))
++                if code and px is not None:
++                    prices[code] = px
++            except Exception:
++                continue
++        return prices
++
++    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
++        summary = holdings_summary or {}
++        for key in ("pchs_amt_smtl_amt", "pchs_amt"):
++            cost = self._to_float(summary.get(key))
++            if cost and cost > 0:
++                return cost
++        total = 0.0
++        for row in holdings_rows or []:
++            val = self._to_float(row.get("pchs_amt"))
++            if val:
++                total += val
++        return total if total > 0 else None
++
++    def _fetch_holdings_snapshot(self) -> dict:
++        if not self.kis:
++            return {}
++        try:
++            return self.kis.inquire_balance_all()
++        except Exception:
++            logger.exception("[PB1][HOLDINGS][FAIL]")
++            return {}
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+             {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+         )
+ 
+     def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
+         if not self.kis:
+             return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         try:
+             candles = self.kis.safe_get_daily_candles(code, count=count)
+         except Exception:
+             logger.exception("[PB1][DATA][FAIL] code=%s", code)
+             return pd.DataFrame(), {"volume_missing": True, "source_cols": [], "mapped": {}}
+         if not candles:
+@@ -165,81 +222,84 @@ class PB1Engine:
      def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
          ok_list = [c for c in candidates if c.setup_ok]
          total = len(ok_list)
@@ -395,33 +1892,38 @@ index ca11b8670c44f46f1129cdff9fbc654bac3f47be..d3953446333e8b328a52a6dda2b47f6c
              try:
                  diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
                  quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
--                if isinstance(quote, dict):
--                    pr = quote.get("stck_prpr") or quote.get("prpr")
--                    return float(pr) if pr is not None else None
-+                if not isinstance(quote, dict):
-+                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
-+                    return None
-+                price = quote.get("last")
-+                if price is None:
-+                    price = quote.get("stck_prpr") or quote.get("prpr")
-+                    if price is None:
-+                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
-+                        return None
-+                try:
-+                    price_val = float(price)
-+                except Exception:
-+                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
-+                    return None
-+                if quote.get("ask") is None or quote.get("bid") is None:
-+                    logger.warning(
-+                        "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
-+                        code,
-+                        quote.get("ask"),
-+                        quote.get("bid"),
-+                    )
-+                return price_val
+                 if not isinstance(quote, dict):
+-                    logger.warning("[PB1][PRICE][WARN] code=%s non-dict quote", code)
++                    self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
+                     return None
+                 price = quote.get("last")
+                 if price is None:
+                     price = quote.get("stck_prpr") or quote.get("prpr")
+                     if price is None:
+-                        logger.warning("[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys()))
++                        self._warn_once(
++                            f"quote_missing_last:{code}", "[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys())
++                        )
+                         return None
+                 try:
+                     price_val = float(price)
+                 except Exception:
+-                    logger.warning("[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
++                    self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
+                     return None
+                 if quote.get("ask") is None or quote.get("bid") is None:
+-                    logger.warning(
++                    self._warn_once(
++                        f"quote_missing_book:{code}",
+                         "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
+                         code,
+                         quote.get("ask"),
+                         quote.get("bid"),
+                     )
+                 return price_val
              except Exception:
-                 logger.exception("[PB1][PRICE][FAIL] code=%s", code)
+-                logger.exception("[PB1][PRICE][FAIL] code=%s", code)
++                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
          return None
  
      def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
@@ -429,7 +1931,8 @@ index ca11b8670c44f46f1129cdff9fbc654bac3f47be..d3953446333e8b328a52a6dda2b47f6c
          for code in codes:
              px = self._mark_price(code)
              if px is None:
-                 px = fallback.get(code)
+-                px = fallback.get(code)
++                px = self._balance_price_map.get(code) or fallback.get(code)
              if px is not None:
                  marks[code] = px
          return marks
@@ -445,94 +1948,219 @@ index ca11b8670c44f46f1129cdff9fbc654bac3f47be..d3953446333e8b328a52a6dda2b47f6c
              run_id=self.run_id,
              strategy=self.STRATEGY_NAME,
              sid=1,
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index c0e79248879d17b8ee59b249b0234006301d9b0c..07b035396de951cc72b869a16e0d7f30ccb41e2c 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -329,51 +329,51 @@ def main() -> None:
-     try:
-         kis: KisAPI | None = None
-         try:
-             kis = KisAPI()
-             if kis.env != kis_env:
-                 dry_run_reasons.append("kis_env_mismatch")
-                 dry_run = True
-                 _apply_env_flags(dry_run)
-         except Exception:
-             logger.exception("[PB1] KIS init failed, forcing dry-run")
-             dry_run_reasons.append("kis_init_failed")
-             dry_run = True
-             _apply_env_flags(dry_run)
+             mode=cf.mode,
+             code=cf.code,
+             market=cf.market,
+             side="BUY",
+             ord_type="MARKET",
+             qty=cf.planned_qty,
+             limit_price=cf.features.get("close"),
+             stage="PB1-CLOSE",
+             client_order_key=cf.client_order_key or "",
+             request_json={"features": cf.features, "reasons": cf.reasons},
+@@ -284,51 +344,55 @@ class PB1Engine:
+                 mode=cf.mode,
+                 code=cf.code,
+                 market=cf.market,
+                 side="BUY",
+                 qty=cf.planned_qty,
+                 price=cf.features.get("close") or 0.0,
+                 fee=0.0,
+                 tax=0.0,
+                 filled_at=filled_at,
+             )
+         else:
+             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
  
-         run_record_id = runs_repo.start_run(
-             env=kis_env or "practice",
-             strategy="pb1_pullback_close",
-             run_window=window_name_for_log,
-             phase=phase_override_arg,
-             event_name=event_name_lower,
-             dry_run=dry_run,
-             git_sha=os.getenv("GITHUB_SHA"),
-             workflow=os.getenv("GITHUB_WORKFLOW"),
-             workflow_run_id=workflow_run_id,
-             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
--            config_json={"dry_run_reasons": dry_run_reasons, "window": window_name_for_log, "phase": phase_for_log},
-+            config_json={"dry_run_reasons": dry_run_reasons, "run_window": window_name_for_log, "phase": phase_for_log},
+     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
+         avg = pos.get("avg_buy_price")
+         if not avg:
+             return
+         code = pos.get("code")
+         market = pos.get("market")
+         mode = pos.get("mode")
+         if pos.get("sid") != 1:
+             return
+         qty = pos.get("qty") or 0
+         if qty <= 0:
+             return
+-        mark = self._mark_price(code) or features.get("close") or avg
++        mark = self._mark_price(code)
++        if mark is None:
++            mark = self._balance_price_map.get(code)
++        if mark is None:
++            mark = features.get("close") or avg
+         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
+         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
+         if self._should_block_order(client_key):
+             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", code, mode, client_key)
+             return
+ 
+         if mode == 1:
+             atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
+             r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
+             take_profit = PB1_DAY_TP_R * r_pct
+             stop_loss = PB1_DAY_SL_R * r_pct
+             if window_tag != "morning":
+                 return
+             stage = "DAY-EXIT"
+             reasons: list[str] = []
+             if ret_pct >= take_profit:
+                 reasons.append("take_profit")
+             if ret_pct <= -stop_loss:
+                 reasons.append("stop_loss")
+             if not reasons:
+                 reasons.append("time_exit")
+         else:
+             hard_stop = KOSDAQ_HARD_STOP_PCT if market == "KOSDAQ" else KOSPI_HARD_STOP_PCT
+             if ret_pct <= -hard_stop:
+                 stage = "HARD-STOP"
+@@ -429,87 +493,108 @@ class PB1Engine:
+                     "market": state.get("market"),
+                     "holding_days": state.get("holding_days") or 0,
+                     "first_buy_ts": state.get("first_buy_ts"),
+                     "total_cost": state.get("total_cost") or 0.0,
+                     "realized_pnl": state.get("realized_pnl") or 0.0,
+                 }
+             )
+         return enriched
+ 
+     def _load_universe(self) -> list[dict]:
+         today = now_kst().date().isoformat()
+         members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
+         self._universe_as_of = today if members else None
+         if not members:
+             members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
+             if members:
+                 self._universe_as_of = members[0].get("as_of_date")
+         return members
+ 
+     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
+         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
+         marks = self._fetch_marks([p["code"] for p in positions], fallback)
+         totals = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+         for pos in positions:
+             qty = pos.get("qty") or 0
+-            mark = marks.get(pos["code"], pos.get("avg_buy_price") or 0.0)
++            mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
+             market_value = float(mark) * qty
+             cost = float(pos.get("total_cost") or 0.0)
+             totals["market_value"] += market_value
+             totals["cost"] += cost
+             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
+             totals["unrealized"] += market_value - cost
++
++        cost_source = "positions"
++        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"]
++        if self._balance_cost is not None:
++            cost_source = "kis_balance"
++            totals["cost"] = self._balance_cost
++        else:
++            totals["cost"] = totals["cost"]
++
+         portfolio_return_pct = 0.0
+-        if totals["cost"] > 0:
+-            portfolio_return_pct = (totals["market_value"] - totals["cost"] + totals["realized"]) / totals["cost"] * 100
++        if cost_base and cost_base > 0:
++            portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
++        else:
++            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=0")
++
+         logger.info(
+-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f unrealized=%.2f realized=%.2f return_pct=%.2f",
++            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%.2f",
+             self._universe_as_of or "none",
+             totals["market_value"],
+             totals["cost"],
++            cost_source,
+             totals["unrealized"],
+             totals["realized"],
+             portfolio_return_pct,
          )
+         return totals
  
-         engine_runner = PB1Engine(
-             universe_repo=universe_repo,
-             orders_repo=orders_repo,
-             fills_repo=fills_repo,
-             positions_repo=positions_repo,
-             kis=kis,
-             window=window,
-             phase_override=phase_override_arg,
-             dry_run=dry_run,
-             env=kis_env or "practice",
-             run_id=run_record_id,
-         )
-         result = engine_runner.run()
-         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
-     except Exception as exc:
-         logger.exception("[PB1][FAIL] unexpected error")
-         if run_record_id:
-             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-         raise
-     finally:
-         release_lock(engine, lock_key)
+     def run(self) -> RunResult:
++        self._warned_keys.clear()
+         entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+         if not entry_allowed:
+             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s env=%s", self.window.name, self.phase, self.dry_run, self.env)
  
+         members = self._load_universe()
+         if not members:
+             note = "universe_empty"
+             logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+             return RunResult(status="SKIPPED", notes=note)
  
+         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
++        holdings_snapshot = self._fetch_holdings_snapshot()
++        holdings_rows = holdings_snapshot.get("output1") or []
++        holdings_summary = holdings_snapshot.get("output2") or {}
++        self._balance_price_map = self._extract_holdings_prices(holdings_rows)
++        self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+         if self.phase in {"verify", "exit"}:
+             holdings = []
+-            if self.kis:
++            if holdings_rows:
++                holdings = holdings_rows
++            elif self.kis:
+                 try:
+                     holdings = self.kis.get_positions()
+                 except Exception:
+                     logger.exception("[PB1][HOLDINGS][FAIL]")
+             if not positions and holdings:
+                 bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                     env=self.env,
+                     strategy=self.STRATEGY_NAME,
+                     sid=1,
+                     mode=1,
+                     holdings=holdings,
+                 )
+                 logger.info("[PB1][BOOTSTRAP] positions_inserted=%s", bootstrapped)
+                 positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+             open_orders = self.orders_repo.get_open_orders(self.env)
+             if open_orders:
+                 logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
+             self._pnl_snapshot(self._positions_with_meta(positions))
+             if self.phase == "verify":
+                 return RunResult(status="OK", notes="verify_only")
+ 
+         code_market = {m.get("code"): m.get("market") for m in members}
+         marks_fallback: Dict[str, float] = {}
+         if self.phase in {"prep", "entry"}:
+             candidates = self._compute_candidates(members)
 diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 07e68636a9f78b04d9522980fcff04b23777f7a8..d66edd1a64408007cf5dec4de04d8c785bd9594c 100644
+index d66edd1a64408007cf5dec4de04d8c785bd9594c..c658098bb24006c201a4825cde1d552c2cf7d9fb 100644
 --- a/trader/universe/build.py
 +++ b/trader/universe/build.py
-@@ -1,192 +1,275 @@
+@@ -1,46 +1,49 @@
  from __future__ import annotations
  
  import argparse
++import csv
  import logging
  import os
--import csv
  from pathlib import Path
--
--from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
-+from typing import Iterable
+ from typing import Iterable
  
  from trader.db.engine import make_engine
  from trader.db.migrate import run_migrations
  from trader.db.repos import UniverseRepo
-+from trader.kis_wrapper import KisAPI
+ from trader.kis_wrapper import KisAPI
  from trader.time_utils import now_kst
--from trader.universe.krx_safe import patch_pykrx_logging
-+from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+-from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
++from trader.universe.providers.kis_mcap import KISMcapProvider
  
  logger = logging.getLogger(__name__)
-+
+ 
  FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
--STATIC_SEED_PATH = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq50.csv"
-+SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
-+SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
-+TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+-SEED_PATH_KOSPI = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kospi100.csv"
+-SEED_PATH_KOSDAQ = Path(__file__).resolve().parents[2] / "config" / "universe_seed_kosdaq100.csv"
++SEED_DIR = Path(__file__).resolve().parent / "seeds"
++SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
++SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
+ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
++DEFAULT_PROVIDER = "kis_mcap_200"
  
  
  def parse_args() -> argparse.Namespace:
@@ -558,13 +2186,10 @@ index 07e68636a9f78b04d9522980fcff04b23777f7a8..d66edd1a64408007cf5dec4de04d8c78
      return normalized
  
  
- def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
-     members: list[dict] = []
-     for market, rows in (selected_by_market or {}).items():
-         for idx, row in enumerate(rows or []):
+@@ -51,92 +54,128 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
              code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-+            if not code:
-+                continue
+             if not code:
+                 continue
              members.append(
                  {
                      "code": code,
@@ -577,115 +2202,137 @@ index 07e68636a9f78b04d9522980fcff04b23777f7a8..d66edd1a64408007cf5dec4de04d8c78
      return members
  
  
--def _load_static_seed() -> dict | None:
--    if not STATIC_SEED_PATH.exists():
--        return None
-+def _dedup(seq: Iterable[str]) -> list[str]:
-+    seen: set[str] = set()
-+    uniq: list[str] = []
-+    for val in seq:
-+        if val not in seen:
-+            seen.add(val)
-+            uniq.append(val)
-+    return uniq
-+
-+
-+def _load_seed_codes(path: Path) -> list[str]:
-+    if not path.exists():
-+        return []
-+    codes: list[str] = []
+ def _dedup(seq: Iterable[str]) -> list[str]:
+     seen: set[str] = set()
+     uniq: list[str] = []
+     for val in seq:
+         if val not in seen:
+             seen.add(val)
+             uniq.append(val)
+     return uniq
+ 
+ 
+-def _load_seed_codes(path: Path) -> list[str]:
++def _load_seed_rows(path: Path) -> list[dict]:
+     if not path.exists():
+         return []
+-    codes: list[str] = []
++    rows: list[dict] = []
      try:
--        with STATIC_SEED_PATH.open(newline="", encoding="utf-8") as f:
--            reader = csv.DictReader(f)
--            rows = [row for row in reader]
-+        with path.open(encoding="utf-8") as f:
-+            for line in f:
-+                code = line.strip()
-+                if code:
-+                    codes.append(code.zfill(6))
+         with path.open(encoding="utf-8") as f:
+-            for line in f:
+-                code = line.strip()
+-                if code:
+-                    codes.append(code.zfill(6))
++            # CSV with header: code,name
++            reader = csv.DictReader(f)
++            has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
++            if has_code_header:
++                for row in reader:
++                    code = str(row.get("code") or "").strip()
++                    if not code:
++                        continue
++                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
++            else:
++                f.seek(0)
++                for line in f:
++                    code = line.strip()
++                    if code:
++                        rows.append({"code": code.zfill(6), "name": None})
      except Exception:
--        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", STATIC_SEED_PATH)
--        return None
-+        logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
-+        return []
-+    return _dedup(codes)
-+
-+
-+def _load_static_seed() -> dict | None:
-+    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
-+    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
-+
-     members: list[dict] = []
-     markets: dict[str, list[dict]] = {}
--    for idx, row in enumerate(rows, start=1):
--        code = str(row.get("code") or row.get("Code") or "").zfill(6)
--        if not code.strip():
-+
+         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
+         return []
+-    return _dedup(codes)
 +    seen: set[str] = set()
-+
-+    for code in kospi_codes:
-+        if code in seen:
++    uniq_rows: list[dict] = []
++    for row in rows:
++        code = row.get("code")
++        if not code or code in seen:
 +            continue
 +        seen.add(code)
-+        rank = len(markets.get("KOSPI", [])) + 1
-+        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
-+        members.append(member)
-+        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
++        uniq_rows.append(row)
++    return uniq_rows
 +
-+    for code in kosdaq_codes:
-+        if code in seen:
++
++def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        with path.open("w", encoding="utf-8", newline="") as f:
++            writer = csv.DictWriter(f, fieldnames=["code", "name"])
++            writer.writeheader()
++            for row in rows:
++                code = str(row.get("code") or "").zfill(6)
++                if not code:
++                    continue
++                writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
++    except Exception:
++        logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
+ 
+ 
+ def _load_static_seed() -> dict | None:
+-    kospi_codes = _load_seed_codes(SEED_PATH_KOSPI)
+-    kosdaq_codes = _load_seed_codes(SEED_PATH_KOSDAQ)
++    kospi_rows = _load_seed_rows(SEED_PATH_KOSPI)
++    kosdaq_rows = _load_seed_rows(SEED_PATH_KOSDAQ)
+ 
+     members: list[dict] = []
+     markets: dict[str, list[dict]] = {}
+ 
+     seen: set[str] = set()
+ 
+-    for code in kospi_codes:
+-        if code in seen:
++    for row in kospi_rows[: TARGETS["KOSPI"]]:
++        code = row.get("code")
++        if not code or code in seen:
              continue
--        market = (row.get("market") or row.get("Market") or "KOSDAQ").strip()
--        name = (row.get("name") or row.get("Name") or "").strip() or None
--        meta_json = {}
--        if name:
--            meta_json["name"] = name
--        member = {"code": code, "market": market, "weight": None, "rank": idx, "meta_json": meta_json}
-+        seen.add(code)
-+        rank = len(markets.get("KOSDAQ", [])) + 1
-+        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
+         seen.add(code)
+         rank = len(markets.get("KOSPI", [])) + 1
+-        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {}}
++        member = {"code": code, "market": "KOSPI", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
          members.append(member)
--        markets.setdefault(market, []).append({"code": code, "weight": None, "rank": idx, "name": name})
-+        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
-+
+-        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank})
++        markets.setdefault("KOSPI", []).append({"code": code, "rank": rank, "name": row.get("name")})
+ 
+-    for code in kosdaq_codes:
+-        if code in seen:
++    for row in kosdaq_rows[: TARGETS["KOSDAQ"]]:
++        code = row.get("code")
++        if not code or code in seen:
+             continue
+         seen.add(code)
+         rank = len(markets.get("KOSDAQ", [])) + 1
+-        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {}}
++        member = {"code": code, "market": "KOSDAQ", "weight": None, "rank": rank, "meta_json": {"name": row.get("name")}}
+         members.append(member)
+-        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank})
++        markets.setdefault("KOSDAQ", []).append({"code": code, "rank": rank, "name": row.get("name")})
+ 
      if not members:
          return None
-+
+ 
      payload = _normalize_payload(
          {
              "selected": [m["code"] for m in members],
              "selected_by_market": markets,
          }
      )
--    return {"payload": payload, "members": members, "source": "fallback:static", "params": {"seed_path": str(STATIC_SEED_PATH)}}
-+    return {
-+        "payload": payload,
-+        "members": members,
-+        "source": "fallback:static",
-+        "params": {
-+            "seed_path_kospi": str(SEED_PATH_KOSPI),
-+            "seed_path_kosdaq": str(SEED_PATH_KOSDAQ),
-+        },
-+    }
+     return {
+         "payload": payload,
+         "members": members,
+         "source": "fallback:static",
+         "params": {
+             "seed_path_kospi": str(SEED_PATH_KOSPI),
+             "seed_path_kosdaq": str(SEED_PATH_KOSDAQ),
+         },
+     }
  
  
  def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
      latest = repo.get_latest_universe(env=env, strategy=strategy, max_age_days=FALLBACK_MAX_AGE_DAYS)
      if not latest:
          return None
-     universe_row, member_rows = latest
-     payload = _normalize_payload(universe_row.get("payload_json"))
-     return {
-         "payload": payload,
-         "members": member_rows,
-         "source": "fallback:db",
-         "params": {
-             "fallback_from": universe_row.get("as_of_date"),
-             "source_universe_id": str(universe_row.get("universe_id")),
-         },
-     }
- 
- 
+@@ -156,94 +195,99 @@ def _fallback_from_db(repo: UniverseRepo, env: str, strategy: str) -> dict | Non
  def _select_fallback(repo: UniverseRepo, env: str, strategy: str) -> dict | None:
      db_fallback = _fallback_from_db(repo, env, strategy)
      if db_fallback:
@@ -699,133 +2346,119 @@ index 07e68636a9f78b04d9522980fcff04b23777f7a8..d66edd1a64408007cf5dec4de04d8c78
          return db_fallback
      static_fallback = _load_static_seed()
      if static_fallback:
--        logger.info(
--            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s path=%s",
-+        logger.warning(
-+            "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s kospi_seed=%s kosdaq_seed=%s",
+         logger.warning(
+             "[UNIVERSE][FALLBACK][STATIC] env=%s strategy=%s members=%s kospi_seed=%s kosdaq_seed=%s",
              env,
              strategy,
              len(static_fallback["members"]),
--            STATIC_SEED_PATH,
-+            SEED_PATH_KOSPI,
-+            SEED_PATH_KOSDAQ,
+             SEED_PATH_KOSPI,
+             SEED_PATH_KOSDAQ,
          )
          return static_fallback
      return None
  
  
-+def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
-+    try:
-+        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
-+        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
-+    except Exception as exc:  # pragma: no cover - defensive
-+        logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
-+        return None
+-def _build_from_kis(provider: KISMarketcapTopProvider) -> dict | None:
++def _build_from_kis(provider: KISMcapProvider) -> dict | None:
+     try:
+-        kospi = provider.get_marketcap_top("KOSPI", TARGETS["KOSPI"])
+-        kosdaq = provider.get_marketcap_top("KOSDAQ", TARGETS["KOSDAQ"])
++        kospi_rows = provider.get_top_with_meta("KOSPI", TARGETS["KOSPI"])
++        kosdaq_rows = provider.get_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
+     except Exception as exc:  # pragma: no cover - defensive
+         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
+         return None
+ 
+-    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
++    if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
+         logger.warning(
+             "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
+-            len(kospi),
+-            len(kosdaq),
++            len(kospi_rows),
++            len(kosdaq_rows),
+             TARGETS,
+         )
+         return None
+ 
++    kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
++    kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
++    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
++    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
 +
-+    if len(kospi) < TARGETS["KOSPI"] or len(kosdaq) < TARGETS["KOSDAQ"]:
-+        logger.warning(
-+            "[UNIVERSE][KIS][INSUFFICIENT] kospi=%s kosdaq=%s target=%s",
-+            len(kospi),
-+            len(kosdaq),
-+            TARGETS,
-+        )
-+        return None
-+
-+    selected_by_market = {
-+        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
-+        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
-+    }
-+    payload = _normalize_payload(
-+        {
-+            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
-+            "selected_by_market": selected_by_market,
-+        }
-+    )
-+    members = _build_members_from_payload(selected_by_market)
-+    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
-+
-+
+     selected_by_market = {
+-        "KOSPI": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kospi[: TARGETS["KOSPI"]])],
+-        "KOSDAQ": [{"code": code, "rank": idx + 1} for idx, code in enumerate(kosdaq[: TARGETS["KOSDAQ"]])],
++        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
++        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+     }
+     payload = _normalize_payload(
+         {
+-            "selected": kospi[: TARGETS["KOSPI"]] + kosdaq[: TARGETS["KOSDAQ"]],
++            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+             "selected_by_market": selected_by_market,
+         }
+     )
+     members = _build_members_from_payload(selected_by_market)
+-    return {"payload": payload, "members": members, "source": "kis_marketcap_top", "params": {"targets": TARGETS}}
++    return {"payload": payload, "members": members, "source": DEFAULT_PROVIDER, "params": {"targets": TARGETS}}
+ 
+ 
  def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
      engine = make_engine()
      run_migrations(engine)
      repo = UniverseRepo(engine)
  
--    logging.getLogger("pykrx").setLevel(logging.WARNING)
--    patch_pykrx_logging()
-+    payload: dict | None = None
-+    members: list[dict] = []
-+    source = "kis_marketcap_top"
-+    params: dict = {"as_of": as_of_date}
+     payload: dict | None = None
+     members: list[dict] = []
+-    source = "kis_marketcap_top"
++    source = DEFAULT_PROVIDER
+     params: dict = {"as_of": as_of_date}
  
--    raw_payload: dict | None = None
-+    kis_provider: KISMarketcapTopProvider | None = None
+-    kis_provider: KISMarketcapTopProvider | None = None
++    kis_provider: KISMcapProvider | None = None
      try:
--        raw_payload = run_rebalance(as_of_date, return_by_market=True)
-+        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+-        kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
++        kis_provider = KISMcapProvider(kis=KisAPI(), env=env)
      except Exception as exc:
--        logger.warning("[UNIVERSE][KRX_FAIL] %s", repr(exc))
--    payload = _normalize_payload(raw_payload)
--    members = _build_members_from_payload(payload.get("selected_by_market"))
-+        logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
-+
-+    if kis_provider:
-+        kis_result = _build_from_kis(kis_provider)
-+        if kis_result:
-+            payload = kis_result["payload"]
-+            members = kis_result["members"]
-+            params.update(kis_result.get("params") or {})
-+            source = kis_result["source"]
+         logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
  
--    fallback = None
+     if kis_provider:
+         kis_result = _build_from_kis(kis_provider)
+         if kis_result:
+             payload = kis_result["payload"]
+             members = kis_result["members"]
+             params.update(kis_result.get("params") or {})
+             source = kis_result["source"]
+ 
      if len(members) == 0:
          fallback = _select_fallback(repo, env=env, strategy=strategy)
          if fallback:
              payload = fallback["payload"]
              members = fallback["members"]
-+            source = fallback["source"]
-+            params.update(fallback.get("params") or {})
+             source = fallback["source"]
+             params.update(fallback.get("params") or {})
  
      universe_id = repo.store_universe(
          env=env,
          strategy=strategy,
          as_of_date=as_of_date,
--        source=fallback["source"] if fallback else "best_k_meta_strategy",
--        params_json={"as_of": as_of_date, **(fallback.get("params") if fallback else {})},
--        payload_json=payload,
-+        source=source,
-+        params_json=params,
-+        payload_json=payload or {},
-         members=members,
-     )
-     if universe_id:
-         logger.info(
-             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s",
-             env,
-             strategy,
-             as_of_date,
-             universe_id,
-             len(members),
-         )
-     else:
-         logger.warning(
-             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
-         )
-     return universe_id
- 
- 
- def main() -> None:
-     logging.basicConfig(level=logging.INFO)
-     args = parse_args()
-     as_of = args.date or now_kst().date().isoformat()
-     build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
- 
- 
-diff --git a/trader/universe/providers/kis_marketcap_top.py b/trader/universe/providers/kis_marketcap_top.py
+         source=source,
+         params_json=params,
+diff --git a/trader/universe/providers/__init__.py b/trader/universe/providers/__init__.py
+index b71686ee1d142405af0000bec33a6abbc4b261a7..227b790a7be6dec2cbc6a9b19ecb8b270217034f 100644
+--- a/trader/universe/providers/__init__.py
++++ b/trader/universe/providers/__init__.py
+@@ -1 +1,3 @@
+ # Provider utilities for universe data sources.
++
++from .kis_mcap import KISMcapProvider, get_kosdaq_top_mcap, get_kospi_top_mcap  # noqa: F401
+diff --git a/trader/universe/providers/kis_mcap.py b/trader/universe/providers/kis_mcap.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe2e0a5caf
+index 0000000000000000000000000000000000000000..fbd0ca3bc5ff2941eb26fe4a952525fa7ec01d3d
 --- /dev/null
-+++ b/trader/universe/providers/kis_marketcap_top.py
-@@ -0,0 +1,113 @@
++++ b/trader/universe/providers/kis_mcap.py
+@@ -0,0 +1,127 @@
 +from __future__ import annotations
 +
 +import logging
@@ -838,15 +2471,15 @@ index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe
 +logger = logging.getLogger(__name__)
 +
 +
-+class KISMarketcapTopProvider:
++class KISMcapProvider:
++    """KIS 랭킹 API 기반 시가총액 상위 종목 제공자."""
++
 +    DEFAULT_ENDPOINT = "/uapi/domestic-stock/v1/ranking/market-cap"
 +    DEFAULT_TR_IDS = {
 +        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
 +        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
 +    }
 +    DEFAULT_PARAMS = {
-+        # 조건 스크린 코드/정렬 기준은 KIS 포털의 "국내주식 시가총액 상위" 기본값을 사용한다.
-+        # 필요 시 환경 변수 혹은 코드 한 곳만 수정하면 되도록 상수로 모아둔다.
 +        "fid_rank_sort_cls_code": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
 +        "fid_cond_scr_div_code": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
 +        "fid_input_iscd": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
@@ -874,8 +2507,9 @@ index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe
 +        return self.MARKET_CODE_MAP.get(market.upper(), "J")
 +
 +    @staticmethod
-+    def _normalize_codes(rows: Iterable[dict]) -> list[str]:
-+        codes: list[str] = []
++    def _normalize_rows(rows: Iterable[dict]) -> list[dict]:
++        normalized: list[dict] = []
++        seen: set[str] = set()
 +        for row in rows:
 +            code = None
 +            for key in ("stck_shrn_iscd", "mksc_shrn_iscd", "pdno", "code", "CODE"):
@@ -884,17 +2518,16 @@ index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe
 +                    break
 +            if not code:
 +                continue
-+            codes.append(code.zfill(6))
-+        # preserve order while removing duplicates
-+        seen: set[str] = set()
-+        uniq: list[str] = []
-+        for c in codes:
-+            if c not in seen:
-+                seen.add(c)
-+                uniq.append(c)
-+        return uniq
++            code = code.zfill(6)
++            if code in seen:
++                continue
++            seen.add(code)
++            name = row.get("hts_kor_isnm") or row.get("mksc_kor_isnm") or row.get("hname") or row.get("prdt_name") or row.get("name")
++            normalized.append({"code": code, "name": str(name).strip() if name else None})
++        return normalized
 +
-+    def _extract_rows(self, data: dict) -> list[dict]:
++    @staticmethod
++    def _extract_rows(data: dict) -> list[dict]:
 +        buckets = []
 +        for key in ("output", "output1", "output2"):
 +            out = data.get(key)
@@ -904,14 +2537,14 @@ index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe
 +                buckets.append(out)
 +        return buckets
 +
-+    def get_marketcap_top(self, market: str, n: int) -> list[str]:
++    def get_top_with_meta(self, market: str, n: int) -> list[dict]:
 +        """
-+        KIS "국내주식 시가총액 상위" 호출로 시장별 TopN 종목코드 반환.
-+        실패 시 예외 대신 빈 리스트를 반환하고 WARN 로그만 남긴다.
++        시장별 시가총액 상위 목록을 코드/이름 메타와 함께 반환한다.
++        실패 시 빈 리스트를 반환하고 WARN 로그만 남긴다.
 +        """
 +        tr_id = self._pick_tr_id()
 +        if not tr_id:
-+            logger.warning("[KIS][MKTCAP][TR_MISSING] env=%s market=%s", self.env, market)
++            logger.warning("[KIS][MCAP][TR_MISSING] env=%s market=%s", self.env, market)
 +            return []
 +
 +        market_code = self._market_code(market)
@@ -924,18 +2557,247 @@ index 0000000000000000000000000000000000000000..2c69209ff2bf09229627a0607e2f6bfe
 +            resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
 +            data = resp.json()
 +        except Exception as exc:
-+            logger.warning("[KIS][MKTCAP][FAIL] env=%s market=%s err=%s", self.env, market, exc)
++            logger.warning("[KIS][MCAP][FAIL] env=%s market=%s err=%s", self.env, market, exc)
 +            return []
 +
 +        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
-+        codes = self._normalize_codes(output_rows)
-+        if not codes:
++        normalized = self._normalize_rows(output_rows)
++        if not normalized:
 +            logger.warning(
-+                "[KIS][MKTCAP][EMPTY] env=%s market=%s rt_cd=%s msg=%s",
++                "[KIS][MCAP][EMPTY] env=%s market=%s rt_cd=%s msg=%s",
 +                self.env,
 +                market,
 +                data.get("rt_cd") if isinstance(data, dict) else None,
 +                data.get("msg1") if isinstance(data, dict) else None,
 +            )
 +            return []
-+        return codes[: max(0, int(n))]
++        limit = max(0, int(n))
++        return normalized[:limit]
++
++    def get_top_codes(self, market: str, n: int) -> list[str]:
++        return [row["code"] for row in self.get_top_with_meta(market, n)]
++
++
++def get_kospi_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
++    provider = KISMcapProvider(kis=kis, env=env)
++    return provider.get_top_codes("KOSPI", n)
++
++
++def get_kosdaq_top_mcap(n: int = 100, *, kis: KisAPI | None = None, env: str | None = None) -> list[str]:
++    provider = KISMcapProvider(kis=kis, env=env)
++    return provider.get_top_codes("KOSDAQ", n)
+diff --git a/trader/universe/seeds/kosdaq_mcap_100.csv b/trader/universe/seeds/kosdaq_mcap_100.csv
+new file mode 100644
+index 0000000000000000000000000000000000000000..a56983b342684f615a7859302e314c69447fbe98
+--- /dev/null
++++ b/trader/universe/seeds/kosdaq_mcap_100.csv
+@@ -0,0 +1,101 @@
++code,name
++091990,
++066970,
++086520,
++247540,
++035900,
++035760,
++041510,
++263750,
++112040,
++095660,
++068760,
++214150,
++196170,
++028300,
++036930,
++200130,
++078520,
++141080,
++138080,
++067160,
++053800,
++039030,
++090460,
++095700,
++064550,
++092040,
++089980,
++240810,
++104830,
++074600,
++078340,
++078600,
++036540,
++096530,
++058470,
++091700,
++084370,
++079370,
++086890,
++052400,
++067310,
++079940,
++140860,
++235980,
++237690,
++086900,
++278280,
++357780,
++293490,
++115450,
++083310,
++088800,
++089970,
++095340,
++042700,
++066590,
++067630,
++086040,
++104460,
++145020,
++131970,
++318140,
++330860,
++115480,
++108230,
++174900,
++187270,
++263720,
++214270,
++031440,
++041930,
++119610,
++078070,
++089600,
++222080,
++039340,
++083450,
++246720,
++140070,
++178320,
++121600,
++050760,
++069510,
++298040,
++053580,
++217270,
++058400,
++039200,
++060250,
++067770,
++121800,
++106240,
++065450,
++042110,
++058820,
++093520,
++289220,
++060720,
++290650,
++067290,
+diff --git a/trader/universe/seeds/kospi_mcap_100.csv b/trader/universe/seeds/kospi_mcap_100.csv
+new file mode 100644
+index 0000000000000000000000000000000000000000..8323f52fd946200c763c43be04721604bbdf1679
+--- /dev/null
++++ b/trader/universe/seeds/kospi_mcap_100.csv
+@@ -0,0 +1,101 @@
++code,name
++005930,
++000660,
++207940,
++373220,
++005380,
++000270,
++035420,
++035720,
++051910,
++006400,
++028260,
++096770,
++003670,
++005490,
++018260,
++011170,
++010130,
++000810,
++003550,
++000100,
++000120,
++090430,
++066570,
++017670,
++034220,
++010950,
++012330,
++051900,
++034730,
++011200,
++030200,
++009150,
++015760,
++003410,
++086790,
++032640,
++161390,
++003620,
++006360,
++000990,
++009540,
++010140,
++011780,
++018880,
++003490,
++006800,
++009830,
++105560,
++055550,
++323410,
++377300,
++402340,
++078930,
++047050,
++004020,
++012450,
++000880,
++042660,
++023530,
++000070,
++000080,
++004000,
++008770,
++011790,
++033780,
++361610,
++079160,
++002790,
++010060,
++006120,
++028050,
++251270,
++005830,
++029780,
++016360,
++009240,
++018670,
++005940,
++010120,
++241560,
++086280,
++011070,
++002380,
++010620,
++006260,
++008560,
++007070,
++069260,
++271560,
++105630,
++001450,
++001040,
++005070,
++000240,
++036570,
++352820,
++259960,
++032830,
++003090,
++108320,
+
