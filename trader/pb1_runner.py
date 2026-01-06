@@ -5,6 +5,7 @@ import logging
 import os
 import time as time_mod
 from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -58,6 +59,21 @@ def _market_session(now: datetime) -> tuple[datetime, datetime]:
     )
 
 
+def _get_now_kst() -> datetime:
+    simulated = os.getenv("PB1_SIMULATE_NOW_KST")
+    if simulated:
+        try:
+            dt = datetime.fromisoformat(simulated)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            else:
+                dt = dt.astimezone(ZoneInfo("Asia/Seoul"))
+            return dt
+        except Exception:
+            logger.warning("[PB1][SMOKE] invalid PB1_SIMULATE_NOW_KST=%s", simulated)
+    return now_kst()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
@@ -70,10 +86,11 @@ def main() -> None:
     engine = make_engine()
     run_migrations(engine)
 
-    now = now_kst()
+    now = _get_now_kst()
+    smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
     event_name_lower = event_name.lower()
-    trading_day = is_trading_day(now)
+    trading_day = True if smoke_enabled else is_trading_day(now)
     non_trading_day = not trading_day
     diag_env_flag = (
         env_bool("DIAGNOSTIC_FORCE_RUN", False)
@@ -101,6 +118,10 @@ def main() -> None:
     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
 
     force_diag = diag_env_flag or not trading_day or now.time() >= market_close_time
+    if smoke_enabled:
+        force_diag = False
+        non_trading_day = False
+        trading_day = True
     if not force_diag and window is None and trading_day and now.time() < market_close_time:
         window_starts = [
             _parse_hhmm_to_time(MORNING_WINDOW_START),
@@ -184,6 +205,12 @@ def main() -> None:
             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
             return
         action = "diag" if force_diag else "run"
+    if smoke_enabled and window is None:
+        window = WindowDecision(name="afternoon", phase="entry")
+        window_name_for_log = window.name
+        phase_for_log = window.phase
+        action = "run"
+        logger.info("[PB1][SMOKE] window_override=afternoon phase=entry reason=smoke_run_no_window")
 
     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
@@ -198,7 +225,7 @@ def main() -> None:
         os.environ["DISABLE_LIVE_TRADING"] = "1"
         os.environ["DRY_RUN"] = "1"
         os.environ["LIVE_TRADING_ENABLED"] = "0"
-    diag_enabled = force_diag or diag_env_flag
+    diag_enabled = force_diag or (diag_env_flag and not smoke_enabled)
     if force_diag and not non_trading_day and now.time() >= market_close_time:
         dry_run_reasons.append("market_closed")
     if diag_enabled:
@@ -219,6 +246,9 @@ def main() -> None:
             dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
 
     dry_run = bool(dry_run_reasons)
+    if smoke_enabled and "smoke_run" not in dry_run_reasons:
+        dry_run_reasons.append("smoke_run")
+        dry_run = True
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
 
     logger.info(
@@ -227,6 +257,11 @@ def main() -> None:
         dry_run,
         dry_run_reasons or ["live"],
     )
+    if smoke_enabled:
+        logger.info(
+            "[PB1][SMOKE] enabled=True simulated_now_kst=%s force_dry_run=True",
+            now.isoformat(),
+        )
 
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
     kis_env_raw = (os.getenv("KIS_ENV") or "").strip()

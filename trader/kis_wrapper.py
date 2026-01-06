@@ -219,6 +219,8 @@ class KisAPI:
         self._recent_sells_cooldown = 60.0
 
         self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
+        self._balance_cache: Optional[dict] = None
+        self._balance_cache_at: Optional[datetime] = None
 
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
@@ -1395,12 +1397,8 @@ class KisAPI:
 
     def get_positions(self) -> List[Dict]:
         """보유 종목 전체(페이징 병합)."""
-        try:
-            j = self.inquire_balance_all()
-            return j.get("output1") or []
-        except Exception as e:
-            logger.error("[GET_POSITIONS_FAIL] %s", e)
-            return []
+        snap = self.get_balance_cached()
+        return snap.get("output1") or []
 
     def get_balance_map(self) -> Dict[str, int]:
         pos = self.get_positions()
@@ -1418,13 +1416,29 @@ class KisAPI:
         logger.info(f"[보유수량맵] {len(mp)}종목")
         return mp
 
+    def get_balance_cached(self, force: bool = False) -> Dict[str, object]:
+        if not force and self._balance_cache is not None:
+            age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
+            logger.info("[잔고조회 캐시 HIT] age_s=%.1f", age_s)
+            return self._balance_cache
+        snap: dict = {}
+        try:
+            snap = self.inquire_balance_all()
+            self._balance_cache = snap
+            self._balance_cache_at = now_kst()
+        except Exception as e:
+            logger.error("[GET_BALANCE_FAIL] %s", e)
+        return snap
+
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:
-        return {"cash": self.get_cash_balance(), "positions": self.get_positions()}
+        snap = self.get_balance_cached()
+        positions = snap.get("output1") or []
+        return {"cash": self.get_cash_balance(), "positions": positions}
 
     def get_balance_all(self) -> Dict[str, object]:
         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
-        return self.get_balance()
+        return self.get_balance_cached()
 
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도

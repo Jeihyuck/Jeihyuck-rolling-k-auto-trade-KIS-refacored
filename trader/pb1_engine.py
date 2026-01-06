@@ -158,11 +158,7 @@ class PB1Engine:
     def _fetch_holdings_snapshot(self) -> dict:
         if not self.kis:
             return {}
-        try:
-            return self.kis.inquire_balance_all()
-        except Exception:
-            logger.exception("[PB1][HOLDINGS][FAIL]")
-            return {}
+        return self.kis.get_balance_cached()
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"

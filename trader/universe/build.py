@@ -14,7 +14,7 @@ from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
-from trader.universe.providers.krx_provider import safe_get_market_cap_by_ticker
+from trader.universe.providers.krx_provider import fetch_with_rollback
 
 logger = logging.getLogger(__name__)
 
@@ -241,12 +241,13 @@ def _build_from_kis(provider: KISMarketcapTopProvider) -> tuple[dict | None, str
 
 
 def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
-    date_str = as_of_date.replace("-", "")
-    kospi_df = safe_get_market_cap_by_ticker(date_str, "KOSPI")
-    kosdaq_df = safe_get_market_cap_by_ticker(date_str, "KOSDAQ")
-    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
-        if df is None or df.empty:
-            return None, f"{market.lower()}_empty"
+    try:
+        kospi_df, kospi_used, kospi_reason = fetch_with_rollback("KOSPI", as_of_date)
+        kosdaq_df, kosdaq_used, kosdaq_reason = fetch_with_rollback("KOSDAQ", as_of_date)
+    except Exception as exc:  # pragma: no cover - network/remote failure
+        logger.warning("[UNIVERSE][KRX][FAIL] as_of=%s err=%s", as_of_date, exc)
+        return None, "krx_fetch_fail"
+
     rows_by_market: dict[str, list[dict]] = {}
     for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
         cap_col = None
@@ -275,8 +276,19 @@ def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | No
             "selected_by_market": selected_by_market,
         }
     )
+    params = {
+        "as_of": as_of_date,
+        "used_as_of": {
+            "KOSPI": kospi_used.isoformat(),
+            "KOSDAQ": kosdaq_used.isoformat(),
+        },
+        "reasons": {
+            "KOSPI": kospi_reason,
+            "KOSDAQ": kosdaq_reason,
+        },
+    }
     members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": {"as_of": as_of_date}}, "krx_marketcap_top"
+    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": params}, "krx_marketcap_top"
 
 
 def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
