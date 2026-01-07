@@ -1,4 +1,4 @@
-name: Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]
+name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
 
 permissions:
   contents: write
