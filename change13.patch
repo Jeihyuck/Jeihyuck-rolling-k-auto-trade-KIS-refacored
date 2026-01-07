@@ -1,275 +1,291 @@
---- a/trader/config.py
-+++ b/trader/config.py
-@@ -151,6 +151,12 @@
-     "PB1_SWING_TRAIL_MA": "20",
-     "PB1_TIME_STOP_DAYS": "10",
-     "PB1_MIN_CANDLES": "60",
-+    # PB1 "최고 눌림목" 랭킹/사이징 튜닝
-+    "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
-+    "PB1_MIN_SCORE": "60",             # 점수 컷(0~100)
-+    "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
-+    "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
-+    "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
- }
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index 3009c04..52af142 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -18,6 +18,39 @@ from trader.universe.providers.krx_provider import fetch_with_rollback
+ from trader.universe.providers.lkg_provider import LKGProvider
+ from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
  
++from datetime import date
++
++
++def _parse_as_of_date(val: str) -> date | None:
++    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
++    from datetime import datetime as _datetime
++
++    if not val:
++        return None
++    s = str(val).strip()
++    try:
++        if "-" in s:
++            return _datetime.fromisoformat(s).date()
++        if len(s) == 8 and s.isdigit():
++            return _datetime.strptime(s, "%Y%m%d").date()
++        return _datetime.fromisoformat(s).date()
++    except Exception:
++        return None
++
++
++def _prefer_provider_order(chain: list[str]) -> list[str]:
++    """Prefer caches first, then live providers, then static."""
++    order = {
++        "sqlite_cache": 10,
++        "lkg": 20,
++        # live providers
++        "kis_marketcap_top": 30,
++        "krx_marketcap_top": 40,
++        # ultimate fallback
++        "seed_static": 90,
++    }
++    return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
++
+ logger = logging.getLogger(__name__)
  
-@@ -456,6 +462,12 @@
- PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
- PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
- 
-+
-+PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
-+PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or "60")
-+PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
-+PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
-+PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
- # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
- STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
- 
---- a/trader/strategies/pb1_pullback_close.py
-+++ b/trader/strategies/pb1_pullback_close.py
-@@ -38,16 +38,27 @@
-     if len(df) < min_candles:
-         raise ValueError(f"insufficient_candles:{len(df)}<{min_candles}")
-     volume_missing = df["volume"].isna().all()
-+
-     df["ma20"] = df["close"].rolling(20).mean()
-     df["ma50"] = df["close"].rolling(50).mean()
-     df["ma10"] = df["close"].rolling(10).mean()
-+
-     df["tr"] = np.maximum(df["high"], df["close"].shift(1)) - np.minimum(df["low"], df["close"].shift(1))
-     df["atr14"] = df["tr"].rolling(14).mean()
-+
-     df["tr_range_pct"] = (df["high"] - df["low"]) / df["close"] * 100
-     df["vol_contraction"] = df["tr_range_pct"].rolling(5).mean() / df["tr_range_pct"].rolling(20).mean()
-+
-     volu_contraction = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
-     df["volu_contraction"] = volu_contraction if not volume_missing else np.nan
- 
-+    # 유동성(거래대금) 지표: 20일 평균 거래대금
-+    if not volume_missing:
-+        df["value"] = df["close"] * df["volume"]
-+        df["value20"] = df["value"].rolling(20).mean()
-+    else:
-+        df["value20"] = np.nan
-+
-     ma20_tail = df["ma20"].tail(5)
-     slope = None
-     if len(ma20_tail.dropna()) >= 5:
-@@ -59,12 +70,18 @@
- 
-     last = df.iloc[-1]
-     high20 = df["high"].tail(20).max()
-+
-+    value20 = float(last["value20"])
-+    if math.isnan(value20):
-+        value20 = None
-+
-     features = {
-         "close": float(last["close"]),
-         "ma20": float(last["ma20"]),
-         "ma50": float(last["ma50"]),
-         "ma10": float(last["ma10"]),
-         "atr14": float(last["atr14"]),
-+        "atr_pct": _pct(float(last["atr14"]), float(last["close"])),
-         "vol_contraction": float(last["vol_contraction"]),
-         "volu_contraction": float(last["volu_contraction"]),
-         "ma20_slope": slope,
-@@ -72,6 +89,7 @@
-         "pullback_pct": _pct(high20 - last["close"], high20),
-         "tr_range_pct": float(last["tr_range_pct"]),
-         "trend_strength": float(last["close"] / last["ma50"] if last["ma50"] else math.inf),
-+        "value20": value20,
-         "volume_missing": volume_missing,
+ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
+@@ -181,10 +214,28 @@ def _load_static_seed() -> dict | None:
      }
-     return features
-@@ -133,6 +151,50 @@
-     return 1, reasons
  
  
-+def score_setup(features: Dict[str, float], market: str) -> float:
-+    """
-+    0~100 점수. 높을수록 '최고 눌림목'에 가깝다.
-+    - 추세 강함(trend_strength)
-+    - 눌림이 밴드 중앙에 가까움(pullback_pct)
-+    - 변동성/거래량 수축이 강함(vol_contraction, volu_contraction)
-+    - ATR%가 과도하게 크지 않음(atr_pct)
-+    """
-+    trend = float(features.get("trend_strength") or 0.0)   # close/ma50
-+    pullback = float(features.get("pullback_pct") or 999.0)
-+    vol_c = float(features.get("vol_contraction") or 9.0)
-+    volu_c = float(features.get("volu_contraction") or 9.0)
-+    atr_pct = float(features.get("atr_pct") or 999.0)
+-def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict | None:
++def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, reference_as_of: str, max_age_days: int) -> dict | None:
+     payload = provider.load(env, strategy)
+     if not payload:
+         return None
 +
-+    if market.upper() == "KOSPI":
-+        low, high = PB1_PULLBACK_BAND_KOSPI
-+    else:
-+        low, high = PB1_PULLBACK_BAND_KOSDAQ
-+
-+    # 1) 추세: 1.00~1.20 구간을 0~1로 정규화
-+    s_trend = max(0.0, min(1.0, (trend - 1.00) / 0.20))
-+
-+    # 2) 눌림: 밴드 중앙에 가까울수록 점수 ↑
-+    mid = (low + high) / 2.0
-+    half = max(1e-6, (high - low) / 2.0)
-+    s_pull = max(0.0, 1.0 - abs(pullback - mid) / half)
-+
-+    # 3) 수축: 낮을수록 좋음 (0.5가 매우 좋다고 가정)
-+    s_vol = max(0.0, min(1.0, (0.9 - vol_c) / 0.4))        # vol_c 0.5~0.9
-+    s_volu = max(0.0, min(1.0, (0.9 - volu_c) / 0.4))      # volu_c 0.5~0.9
-+
-+    # 4) ATR%: 너무 크면 감점 (2~6%가 이상적이라 가정)
-+    s_atr = max(0.0, min(1.0, (6.0 - atr_pct) / 4.0))
-+
-+    score = 100.0 * (
-+        0.35 * s_trend +
-+        0.25 * s_pull +
-+        0.20 * s_vol +
-+        0.10 * s_volu +
-+        0.10 * s_atr
-+    )
-+    return float(max(0.0, min(100.0, score)))
-+
-+
- @dataclass
- class OrderIntent:
-     code: str
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -20,11 +20,16 @@
-     PB1_TIME_STOP_DAYS,
-     PB1_REQUIRE_VOLUME,
-     PB1_MIN_CANDLES,
-+    PB1_MAX_POSITIONS,
-+    PB1_MIN_SCORE,
-+    PB1_USE_RISK_PARITY,
-+    PB1_MAX_ATR_PCT,
-+    PB1_MIN_VALUE20,
- )
- from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
- from trader.kis_wrapper import KisAPI
--from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
-+from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup, score_setup
- from trader.time_utils import now_kst
- from trader.utils.env import env_bool
- from trader.window_router import WindowDecision, resolve_phase
-@@ -275,26 +280,104 @@
-                 logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
-                 continue
-         return candidates
--
-     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
-         ok_list = [c for c in candidates if c.setup_ok]
--        total = len(ok_list)
--        if total <= 0:
-+        if not ok_list:
-             return candidates
--        capital_per = DAILY_CAPITAL * CAP_CAP / total
-+
-+        # 1) 점수 계산 + ATR/유동성 컷 + 점수 컷
-+        filtered: List[CandidateFeature] = []
-         for cf in ok_list:
--            close_px = cf.features.get("close") or 0
--            qty = int(capital_per // close_px) if close_px > 0 else 0
-+            try:
-+                score = float(score_setup(cf.features, cf.market))
-+            except Exception:
-+                score = 0.0
-+            cf.features["score"] = score
-+
-+            atr_pct = cf.features.get("atr_pct")
-+            value20 = cf.features.get("value20")
-+
-+            if score < float(PB1_MIN_SCORE):
-+                cf.setup_ok = False
-+                cf.reasons.append("score_below_cut")
-+                continue
-+            if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
-+                cf.setup_ok = False
-+                cf.reasons.append("atr_pct_missing")
-+                continue
-+            if float(atr_pct) > float(PB1_MAX_ATR_PCT):
-+                cf.setup_ok = False
-+                cf.reasons.append("atr_pct_too_high")
-+                continue
-+            if value20 is None or (isinstance(value20, float) and value20 != value20):
-+                cf.setup_ok = False
-+                cf.reasons.append("value20_missing")
-+                continue
-+            if float(value20) < float(PB1_MIN_VALUE20):
-+                cf.setup_ok = False
-+                cf.reasons.append("liquidity_too_low")
-+                continue
-+
-+            filtered.append(cf)
-+
-+        if not filtered:
-+            return candidates
-+
-+        # 2) 점수 내림차순 Top N 선택
-+        filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
-+        max_n = max(1, int(PB1_MAX_POSITIONS))
-+        selected = filtered[:max_n]
-+        selected_codes = {c.code for c in selected}
-+
-+        # 선택되지 않은 나머지는 매수 제외 처리
-+        for cf in ok_list:
-+            if cf.code not in selected_codes and cf.setup_ok:
-+                cf.setup_ok = False
-+                cf.reasons.append("not_in_topN")
-+
-+        # 3) 사이징: 리스크 패리티(ATR) 또는 균등
-+        cap_total = float(DAILY_CAPITAL) * float(CAP_CAP)
-+
-+        if PB1_USE_RISK_PARITY:
-+            inv: List[float] = []
-+            for cf in selected:
-+                atr = float(cf.features.get("atr14") or 0.0)
-+                inv.append(1.0 / max(atr, 1e-6))
-+            inv_sum = sum(inv) if sum(inv) > 0 else 1.0
-+            weights = [x / inv_sum for x in inv]
-+        else:
-+            weights = [1.0 / len(selected)] * len(selected)
-+
-+        for cf, w in zip(selected, weights):
-+            close_px = float(cf.features.get("close") or 0.0)
-+            if close_px <= 0:
-+                cf.setup_ok = False
-+                cf.reasons.append("close_zero")
-+                continue
-+
-+            capital = cap_total * float(w)
-+            qty = int(capital // close_px)
-             cf.planned_qty = max(qty, 0)
--            cf.client_order_key = self._client_order_key(
--                cf.code, cf.mode, "BUY", "close", "PB1"
--            )
-+            cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
-+
-             if cf.planned_qty <= 0:
-                 cf.setup_ok = False
-                 cf.reasons.append("planned_qty_zero")
--                self._log_setup(cf)
-+
++    cached_as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
++    ref_d = _parse_as_of_date(reference_as_of)
++    got_d = _parse_as_of_date(str(cached_as_of or ""))
++    if ref_d and got_d:
++        age = (ref_d - got_d).days
++        if age > int(max_age_days):
 +            logger.info(
-+                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s",
-+                cf.code,
-+                float(cf.features.get("score") or 0.0),
-+                float(w),
-+                float(capital),
-+                cf.planned_qty,
-+                float(cf.features.get("atr_pct") or 0.0),
-+                cf.features.get("value20"),
++                "[UNIVERSE][LKG][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s",
++                env,
++                strategy,
++                cached_as_of,
++                reference_as_of,
++                age,
++                max_age_days,
 +            )
++            return None
 +
-         return candidates
+     payload_norm = _normalize_payload(payload.get("payload"))
+     members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
+     return {
+@@ -195,8 +246,15 @@ def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict |
+     }
  
+ 
+-def _fallback_from_sqlite(provider: SQLiteCacheProvider, env: str, strategy: str) -> dict | None:
+-    payload = provider.load_latest_universe_cache(env, strategy)
++def _fallback_from_sqlite(
++    provider: SQLiteCacheProvider,
++    env: str,
++    strategy: str,
++    *,
++    reference_as_of: str,
++    max_age_days: int,
++) -> dict | None:
++    payload = provider.load_latest_universe_cache(env, strategy, max_age_days=max_age_days, reference_as_of=reference_as_of)
+     if not payload:
+         return None
+     payload_norm = _normalize_payload(payload.get("payload"))
+@@ -312,7 +370,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+     last_reason: str | None = None
+ 
+     allowed_chain = providers_for_env(env)
+-    logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
++    preferred_chain = _prefer_provider_order(allowed_chain)
++    if preferred_chain != list(allowed_chain):
++        logger.info(
++            "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
++            env,
++            strategy,
++            allowed_chain,
++            preferred_chain,
++        )
++    else:
++        logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
+ 
+     kis_provider: KISMarketcapTopProvider | None = None
+     if "kis_marketcap_top" in allowed_chain:
+@@ -325,7 +393,7 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
+     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
+ 
+-    for provider_name in allowed_chain:
++    for provider_name in preferred_chain:
+         result: dict | None = None
+         reason: str | None = None
+ 
+@@ -337,11 +405,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+         elif provider_name == "krx_marketcap_top":
+             result, reason = _build_from_krx(as_of_date, TARGETS)
+         elif provider_name == "lkg":
+-            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy)
++            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
+             reason = "lkg_hit" if result else "lkg_miss"
+         elif provider_name == "sqlite_cache":
+             if sqlite_provider:
+-                result = _fallback_from_sqlite(sqlite_provider, env=env, strategy=strategy)
++                result = _fallback_from_sqlite(
++                    sqlite_provider,
++                    env=env,
++                    strategy=strategy,
++                    reference_as_of=as_of_date,
++                    max_age_days=FALLBACK_MAX_AGE_DAYS,
++                )
+             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
+         elif provider_name == "seed_static":
+             result = _load_static_seed()
+diff --git a/trader/universe/providers/krx_provider.py b/trader/universe/providers/krx_provider.py
+index 6a60be4..9b2e4c7 100644
+--- a/trader/universe/providers/krx_provider.py
++++ b/trader/universe/providers/krx_provider.py
+@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
+ 
+ REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
+ NAME_COLUMNS = ("종목명", "Name", "name")
++REQUIRE_NAME = os.getenv("KRX_REQUIRE_NAME", "0").lower() in {"1", "true", "yes", "on"}
+ MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "5"))
+ MAX_ROLLBACK_DAYS = int(os.getenv("KRX_MAX_ROLLBACK_DAYS", "3"))
+ MAX_ATTEMPTS = int(os.getenv("KRX_MAX_ATTEMPTS", "5"))
+@@ -56,12 +57,37 @@ def _has_any_column(df: pd.DataFrame, candidates: Iterable[str]) -> bool:
+     return any(c in cols for c in candidates)
+ 
+ 
++def _find_column(df: pd.DataFrame, candidates: Iterable[str], *, fuzzy: bool = True) -> str | None:
++    """Return the first matching column name.
 +
-     def _mark_price(self, code: str) -> float | None:
-         if self.kis:
-             try:
-
++    When `fuzzy=True`, also matches a couple of common KRX/pykrx variations.
++    """
++    try:
++        cols = list(df.columns)
++    except Exception:
++        return None
++    for c in candidates:
++        if c in cols:
++            return c
++    if not fuzzy:
++        return None
++    # common fuzzy match: 시가총액 variants
++    for c in cols:
++        try:
++            s = str(c)
++        except Exception:
++            continue
++        if "시가" in s and "총" in s:
++            return c
++    return None
++
++
+ def _validate_krx_df(df: pd.DataFrame) -> bool:
+     if df is None or df.empty:
+         return False
+     if not _has_any_column(df, REQUIRED_CAP_COLUMNS):
+         return False
+-    if not _has_any_column(df, NAME_COLUMNS):
++    if REQUIRE_NAME and not _has_any_column(df, NAME_COLUMNS):
+         return False
+     return True
  
-
-
+@@ -116,13 +142,23 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days:
+         try:
+             df = safe_get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
+             if not _validate_krx_df(df):
++                cap_col = _find_column(df, REQUIRED_CAP_COLUMNS)
++                name_col = _find_column(df, NAME_COLUMNS) if REQUIRE_NAME else None
++                idx_preview = None
++                try:
++                    idx_preview = list(df.index[:5]) if df is not None else None
++                except Exception:
++                    idx_preview = None
+                 logger.warning(
+-                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s cols=%s rows=%s",
++                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s rows=%s cap_col=%s name_col=%s cols=%s idx=%s",
+                     market,
+                     requested_as_of,
+                     used_as_of,
+-                    list(df.columns),
+                     len(df) if df is not None else 0,
++                    cap_col,
++                    name_col,
++                    list(getattr(df, "columns", [])),
++                    idx_preview,
+                 )
+                 raise EmptyDataFrame("empty_or_missing_cols")
+             used_reason = "ok" if attempt == base_date else "rolled_back"
+diff --git a/trader/universe/providers/sqlite_cache_provider.py b/trader/universe/providers/sqlite_cache_provider.py
+index 888bf07..a74246a 100644
+--- a/trader/universe/providers/sqlite_cache_provider.py
++++ b/trader/universe/providers/sqlite_cache_provider.py
+@@ -5,7 +5,7 @@ import logging
+ import os
+ import sqlite3
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import date, datetime
+ from pathlib import Path
+ from typing import Optional
+ 
+@@ -14,6 +14,21 @@ from trader.db import config as db_config
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _parse_as_of_date(val: str) -> date | None:
++    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
++    if not val:
++        return None
++    s = str(val).strip()
++    try:
++        if "-" in s:
++            return datetime.fromisoformat(s).date()
++        if len(s) == 8 and s.isdigit():
++            return datetime.strptime(s, "%Y%m%d").date()
++        return datetime.fromisoformat(s).date()
++    except Exception:
++        return None
++
++
+ def _default_db_path() -> Path:
+     env_path = os.getenv("UNIVERSE_SQLITE_PATH")
+     if env_path:
+@@ -64,7 +79,13 @@ class SQLiteCacheProvider:
+         except Exception:
+             logger.exception("[UNIVERSE][SQLITE_CACHE][SAVE_FAIL] env=%s strategy=%s as_of=%s path=%s", env, strategy, as_of, self.db_path)
+ 
+-    def load_latest_universe_cache(self, env: str, strategy: str) -> Optional[dict]:
++    def load_latest_universe_cache(
++        self,
++        env: str,
++        strategy: str,
++        max_age_days: int | None = None,
++        reference_as_of: str | None = None,
++    ) -> Optional[dict]:
+         try:
+             with self._connect() as conn:
+                 row = conn.execute(
+@@ -81,6 +102,23 @@ class SQLiteCacheProvider:
+                 logger.info("[UNIVERSE][SQLITE_CACHE][MISS] env=%s strategy=%s path=%s", env, strategy, self.db_path)
+                 return None
+             payload = json.loads(row[0])
++            if max_age_days is not None and reference_as_of:
++                ref_d = _parse_as_of_date(str(reference_as_of))
++                got_d = _parse_as_of_date(str(row[1]))
++                if ref_d and got_d:
++                    age = (ref_d - got_d).days
++                    if age > int(max_age_days):
++                        logger.info(
++                            "[UNIVERSE][SQLITE_CACHE][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s path=%s",
++                            env,
++                            strategy,
++                            row[1],
++                            reference_as_of,
++                            age,
++                            max_age_days,
++                            self.db_path,
++                        )
++                        return None
+             logger.info("[UNIVERSE][SQLITE_CACHE][HIT] env=%s strategy=%s as_of=%s path=%s", env, strategy, row[1], self.db_path)
+             return payload
+         except Exception:

@@ -18,6 +18,39 @@ from trader.universe.providers.krx_provider import fetch_with_rollback
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
 
+from datetime import date
+
+
+def _parse_as_of_date(val: str) -> date | None:
+    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+    from datetime import datetime as _datetime
+
+    if not val:
+        return None
+    s = str(val).strip()
+    try:
+        if "-" in s:
+            return _datetime.fromisoformat(s).date()
+        if len(s) == 8 and s.isdigit():
+            return _datetime.strptime(s, "%Y%m%d").date()
+        return _datetime.fromisoformat(s).date()
+    except Exception:
+        return None
+
+
+def _prefer_provider_order(chain: list[str]) -> list[str]:
+    """Prefer caches first, then live providers, then static."""
+    order = {
+        "sqlite_cache": 10,
+        "lkg": 20,
+        # live providers
+        "kis_marketcap_top": 30,
+        "krx_marketcap_top": 40,
+        # ultimate fallback
+        "seed_static": 90,
+    }
+    return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
+
 logger = logging.getLogger(__name__)
 
 FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
@@ -181,10 +214,28 @@ def _load_static_seed() -> dict | None:
     }
 
 
-def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict | None:
+def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, reference_as_of: str, max_age_days: int) -> dict | None:
     payload = provider.load(env, strategy)
     if not payload:
         return None
+
+    cached_as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
+    ref_d = _parse_as_of_date(reference_as_of)
+    got_d = _parse_as_of_date(str(cached_as_of or ""))
+    if ref_d and got_d:
+        age = (ref_d - got_d).days
+        if age > int(max_age_days):
+            logger.info(
+                "[UNIVERSE][LKG][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s",
+                env,
+                strategy,
+                cached_as_of,
+                reference_as_of,
+                age,
+                max_age_days,
+            )
+            return None
+
     payload_norm = _normalize_payload(payload.get("payload"))
     members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
     return {
@@ -195,8 +246,15 @@ def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict |
     }
 
 
-def _fallback_from_sqlite(provider: SQLiteCacheProvider, env: str, strategy: str) -> dict | None:
-    payload = provider.load_latest_universe_cache(env, strategy)
+def _fallback_from_sqlite(
+    provider: SQLiteCacheProvider,
+    env: str,
+    strategy: str,
+    *,
+    reference_as_of: str,
+    max_age_days: int,
+) -> dict | None:
+    payload = provider.load_latest_universe_cache(env, strategy, max_age_days=max_age_days, reference_as_of=reference_as_of)
     if not payload:
         return None
     payload_norm = _normalize_payload(payload.get("payload"))
@@ -312,7 +370,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     last_reason: str | None = None
 
     allowed_chain = providers_for_env(env)
-    logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
+    preferred_chain = _prefer_provider_order(allowed_chain)
+    if preferred_chain != list(allowed_chain):
+        logger.info(
+            "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
+            env,
+            strategy,
+            allowed_chain,
+            preferred_chain,
+        )
+    else:
+        logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
 
     kis_provider: KISMarketcapTopProvider | None = None
     if "kis_marketcap_top" in allowed_chain:
@@ -325,7 +393,7 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
 
-    for provider_name in allowed_chain:
+    for provider_name in preferred_chain:
         result: dict | None = None
         reason: str | None = None
 
@@ -337,11 +405,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
         elif provider_name == "krx_marketcap_top":
             result, reason = _build_from_krx(as_of_date, TARGETS)
         elif provider_name == "lkg":
-            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy)
+            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
             reason = "lkg_hit" if result else "lkg_miss"
         elif provider_name == "sqlite_cache":
             if sqlite_provider:
-                result = _fallback_from_sqlite(sqlite_provider, env=env, strategy=strategy)
+                result = _fallback_from_sqlite(
+                    sqlite_provider,
+                    env=env,
+                    strategy=strategy,
+                    reference_as_of=as_of_date,
+                    max_age_days=FALLBACK_MAX_AGE_DAYS,
+                )
             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
         elif provider_name == "seed_static":
             result = _load_static_seed()

@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
 NAME_COLUMNS = ("종목명", "Name", "name")
+REQUIRE_NAME = os.getenv("KRX_REQUIRE_NAME", "0").lower() in {"1", "true", "yes", "on"}
 MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "5"))
 MAX_ROLLBACK_DAYS = int(os.getenv("KRX_MAX_ROLLBACK_DAYS", "3"))
 MAX_ATTEMPTS = int(os.getenv("KRX_MAX_ATTEMPTS", "5"))
@@ -56,12 +57,37 @@ def _has_any_column(df: pd.DataFrame, candidates: Iterable[str]) -> bool:
     return any(c in cols for c in candidates)
 
 
+def _find_column(df: pd.DataFrame, candidates: Iterable[str], *, fuzzy: bool = True) -> str | None:
+    """Return the first matching column name.
+
+    When `fuzzy=True`, also matches a couple of common KRX/pykrx variations.
+    """
+    try:
+        cols = list(df.columns)
+    except Exception:
+        return None
+    for c in candidates:
+        if c in cols:
+            return c
+    if not fuzzy:
+        return None
+    # common fuzzy match: 시가총액 variants
+    for c in cols:
+        try:
+            s = str(c)
+        except Exception:
+            continue
+        if "시가" in s and "총" in s:
+            return c
+    return None
+
+
 def _validate_krx_df(df: pd.DataFrame) -> bool:
     if df is None or df.empty:
         return False
     if not _has_any_column(df, REQUIRED_CAP_COLUMNS):
         return False
-    if not _has_any_column(df, NAME_COLUMNS):
+    if REQUIRE_NAME and not _has_any_column(df, NAME_COLUMNS):
         return False
     return True
 
@@ -116,13 +142,23 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: 
         try:
             df = safe_get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
             if not _validate_krx_df(df):
+                cap_col = _find_column(df, REQUIRED_CAP_COLUMNS)
+                name_col = _find_column(df, NAME_COLUMNS) if REQUIRE_NAME else None
+                idx_preview = None
+                try:
+                    idx_preview = list(df.index[:5]) if df is not None else None
+                except Exception:
+                    idx_preview = None
                 logger.warning(
-                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s cols=%s rows=%s",
+                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s rows=%s cap_col=%s name_col=%s cols=%s idx=%s",
                     market,
                     requested_as_of,
                     used_as_of,
-                    list(df.columns),
                     len(df) if df is not None else 0,
+                    cap_col,
+                    name_col,
+                    list(getattr(df, "columns", [])),
+                    idx_preview,
                 )
                 raise EmptyDataFrame("empty_or_missing_cols")
             used_reason = "ok" if attempt == base_date else "rolled_back"
