@@ -1,4 +1,4 @@
-name: Trade Runner
+name: Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]
 
 permissions:
   contents: write
@@ -8,13 +8,14 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  # ✅ push로도 즉시 돌고
   push:
-    branches: [ "nullim" ]
-    paths-ignore:
-      - "bot_state/**"
-      - "**/*.md"
+    branches: [ "nullim", "main" ]
 
+  # ✅ 수동 실행도 되고
   workflow_dispatch:
+
+  # ✅ 5분 tick (단, 워크플로 파일은 main에도 있어야 schedule이 돎)
   schedule:
     - cron: "*/5 * * * *"
 
@@ -22,31 +23,42 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
 
-      # --- REQUIRED SECRETS ---
-      APP_KEY: ${{ secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.APP_SECRET }}
-      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+      # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
+      KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+      KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
 
-      # --- 5-min tick design ---
+      # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
       RUN_LOOP_MINUTES: "4"
-      BOTSTATE_LOCK_TTL_SEC: "240"
-      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "60"
 
-      # Optional: strategy switches if your code reads them
+      # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
+      BOTSTATE_LOCK_TTL_SEC: "240"
+      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
+      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
+
       ACTIVE_STRATEGIES: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout code (always run nullim code)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: "nullim"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -59,7 +71,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Precheck env
+      - name: Precheck env (fail fast)
         run: |
           set -euo pipefail
           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
@@ -71,9 +83,44 @@ jobs:
           done
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
 
+      - name: Auto mode (LIVE in market hours, DIAG otherwise)
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+
+          KST = ZoneInfo("Asia/Seoul")
+          now = datetime.now(KST)
+
+          # 장중: 08:55 ~ 15:30 (필요시 조정)
+          is_weekday = now.weekday() < 5
+          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
+
+          if in_market:
+              mode = "LIVE"
+              live_enabled = "1"
+              dry_run = "0"
+              disable_live = "0"
+          else:
+              mode = "DIAG"
+              live_enabled = "0"
+              dry_run = "1"
+              disable_live = "1"
+
+          print(f"[AUTO] now={now.isoformat()} in_market={in_market} -> STRATEGY_MODE={mode}")
+          with open("runtime_env.sh", "w") as f:
+              f.write(f'export STRATEGY_MODE="{mode}"\n')
+              f.write(f'export LIVE_TRADING_ENABLED="{live_enabled}"\n')
+              f.write(f'export DRY_RUN="{dry_run}"\n')
+              f.write(f'export DISABLE_LIVE_TRADING="{disable_live}"\n')
+          PY
+          cat runtime_env.sh
+
       - name: Build universe (best_k_meta) - allow fallback
         run: |
           set -euo pipefail
+          source runtime_env.sh
           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
 
       - name: Compile check
@@ -81,7 +128,9 @@ jobs:
           set -euo pipefail
           python -m compileall trader
 
-      - name: Run PB1 (auto window) - exit within RUN_LOOP_MINUTES
+      - name: Run PB1 (auto window) - should exit within 4 minutes
         run: |
           set -euo pipefail
+          source runtime_env.sh
+          echo "[RUN] STRATEGY_MODE=$STRATEGY_MODE DRY_RUN=$DRY_RUN LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           python -m trader.pb1_runner --window auto --phase auto

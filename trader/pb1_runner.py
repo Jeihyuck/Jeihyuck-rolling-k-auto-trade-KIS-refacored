@@ -5,7 +5,7 @@ import logging
 import os
 import signal
 import time as time_mod
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -499,20 +499,27 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
-    max_seconds = _parse_int_env("RUN_LOOP_MINUTES", 4) * 60
     now = _get_now_kst()
     _, close_dt = _market_session(now)
+    max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
+    loop_deadline = now + timedelta(seconds=max_seconds) if max_seconds > 0 else None
     if run_loop_minutes > 0:
         loop_max_minutes = run_loop_minutes
         persist_interval = max(120, min(persist_interval, 240))
     logger.info(
-        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
+        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
         loop_interval,
         persist_interval,
         close_dt.isoformat(),
         loop_max_minutes,
+        run_loop_minutes,
     )
-    logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
+    logger.info(
+        "[PB1][LOOP] start now_kst=%s max_seconds=%s deadline=%s",
+        now.isoformat(),
+        max_seconds,
+        loop_deadline.isoformat() if loop_deadline else "none",
+    )
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")

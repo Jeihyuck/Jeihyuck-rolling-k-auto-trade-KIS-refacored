@@ -17,8 +17,8 @@ KST = ZoneInfo("Asia/Seoul")
 DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
 DEFAULT_LOCK_TTL_SEC = 240
-DEFAULT_LOCK_RETRY_SEC = 60
-LOCK_RETRY_STEP_SEC = 10
+DEFAULT_LOCK_RETRY_SEC = 55
+DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
 
 
 def _lock_ttl_sec() -> int:
@@ -33,6 +33,13 @@ def _lock_retry_total_sec() -> int:
         return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
     except Exception:
         return DEFAULT_LOCK_RETRY_SEC
+
+
+def _lock_retry_sleep_sec() -> int:
+    try:
+        return int(os.getenv("BOTSTATE_LOCK_RETRY_SLEEP_SEC", str(DEFAULT_LOCK_RETRY_SLEEP_SEC)))
+    except Exception:
+        return DEFAULT_LOCK_RETRY_SLEEP_SEC
 
 
 def resolve_botstate_worktree_dir() -> Path:
@@ -117,9 +124,12 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
     ttl_env = _lock_ttl_sec()
     ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
     retry_total_sec = max(0, _lock_retry_total_sec())
-    attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
+    retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+    start_ts = time.time()
+    attempt = 0
 
-    for attempt in range(1, attempts + 1):
+    while True:
+        attempt += 1
         now = datetime.now(tz=KST)
         locked = False
         stale_takeover = False
@@ -169,19 +179,29 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
             logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
             return True
 
-        if attempt < attempts:
+        elapsed = time.time() - start_ts
+        if elapsed < retry_total_sec:
             logger.info(
-                "[BOTSTATE][RETRY] wait=%s locked_until=%s",
-                LOCK_RETRY_STEP_SEC,
+                "[BOTSTATE][RETRY] wait=%s locked_until=%s attempt=%s elapsed=%.1fs total=%s",
+                retry_sleep_sec,
                 locked_until.isoformat() if locked_until else "unknown",
+                attempt,
+                elapsed,
+                retry_total_sec,
             )
-            time.sleep(LOCK_RETRY_STEP_SEC)
+            time.sleep(retry_sleep_sec)
+            continue
+        break
 
     logger.warning(
-        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
+        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s now=%s ttl_sec=%s current_owner=%s current_run_id=%s",
+        owner,
+        run_id,
+        locked_until.isoformat() if locked_until else "unknown",
+        now.isoformat(),
+        ttl_sec,
         current_owner,
         current_run_id,
-        locked_until.isoformat() if locked_until else "unknown",
     )
     return False
 

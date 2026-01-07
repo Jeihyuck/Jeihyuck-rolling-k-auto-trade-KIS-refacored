@@ -1,217 +1,243 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index c34154294f9843154809ffa5a6db97f099eb4af6..186f353af467b14f077925e7d01d3697ff9f1b07 100644
+index fb28d8049da9994f79a82d3cbdc84cb89c3f82a3..ef6d86a402a815e148d886ab0dfbe70d66db8df3 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -1,160 +1,81 @@
--name: "Trade Runner (5min tick: LIVE during market, DIAG otherwise)"
-+name: Trade Runner
+@@ -1,87 +1,136 @@
+-name: Trade Runner
++name: Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]
  
  permissions:
    contents: write
  
--# ✅ 레포 전체에서 공유되는 concurrency group (다른 워크플로도 동일 group이면 서로 겹침 방지됨)
  concurrency:
    group: trade-bot-state
    cancel-in-progress: true
  
  on:
++  # ✅ push로도 즉시 돌고
+   push:
+-    branches: [ "nullim" ]
+-    paths-ignore:
+-      - "bot_state/**"
+-      - "**/*.md"
++    branches: [ "nullim", "main" ]
+ 
++  # ✅ 수동 실행도 되고
    workflow_dispatch:
--    inputs:
--      force_mode:
--        description: "auto|live|diag"
--        required: false
--        default: "auto"
--
++
++  # ✅ 5분 tick (단, 워크플로 파일은 main에도 있어야 schedule이 돎)
    schedule:
--    # =========================
--    # KST 장중 5분 tick (UTC로 변환)
--    # KST 08:50~08:55 => UTC 23:50~23:55 (Sun~Thu UTC)
--    - cron: "50-59/5 23 * * 0-4"
--    # KST 09:00~14:55 => UTC 00:00~05:55 (Mon~Fri UTC)
--    - cron: "*/5 0-5 * * 1-5"
--    # KST 15:00~15:30 => UTC 06:00~06:30 (Mon~Fri UTC)
--    - cron: "0-30/5 6 * * 1-5"
--    # 주말 DIAG는 과도하지 않게 30분 주기
--    - cron: "*/30 * * * 0,6"
--
--env:
--  TZ: Asia/Seoul
--  PYTHONUNBUFFERED: "1"
-+    - cron: "*/5 * * * *"
+     - cron: "*/5 * * * *"
  
  jobs:
    run:
      runs-on: ubuntu-latest
--    timeout-minutes: 12
-+    timeout-minutes: 8
-+    env:
-+      TZ: Asia/Seoul
-+      PYTHONUNBUFFERED: "1"
+     timeout-minutes: 8
 +
-+      # --- REQUIRED SECRETS ---
-+      APP_KEY: ${{ secrets.APP_KEY }}
-+      APP_SECRET: ${{ secrets.APP_SECRET }}
-+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
-+      CANO: ${{ secrets.CANO }}
-+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+ 
+-      # --- REQUIRED SECRETS ---
+-      APP_KEY: ${{ secrets.APP_KEY }}
+-      APP_SECRET: ${{ secrets.APP_SECRET }}
+-      API_BASE_URL: ${{ secrets.API_BASE_URL }}
++      # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
++      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
++      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
++      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
 +      KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+-      KIS_ENV: ${{ secrets.KIS_ENV }}
++      KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
++      KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+-      # --- 5-min tick design ---
++      # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
++      APP_KEY: ${{ secrets.KIS_APP_KEY }}
++      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
++      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 +
-+      # --- 5-min tick design ---
-+      RUN_LOOP_MINUTES: "4"
-+      BOTSTATE_LOCK_TTL_SEC: "240"
-+      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "60"
++      # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
+       RUN_LOOP_MINUTES: "4"
 +
-+      # Optional: strategy switches if your code reads them
-+      ACTIVE_STRATEGIES: "1"
++      # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
+       BOTSTATE_LOCK_TTL_SEC: "240"
+-      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "60"
++      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
++      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
+ 
+-      # Optional: strategy switches if your code reads them
+       ACTIVE_STRATEGIES: "1"
  
      steps:
--      - name: "Checkout"
-+      - name: Checkout
+-      - name: Checkout
++      - name: Checkout code (always run nullim code)
          uses: actions/checkout@v4
          with:
            fetch-depth: 0
++          ref: "nullim"
  
--      - name: "Set up Python"
-+      - name: Setup Python
+       - name: Setup Python
          uses: actions/setup-python@v5
          with:
            python-version: "3.11"
  
--      - name: "Install deps"
-+      - name: Install deps
+       - name: Install deps
          run: |
            set -euo pipefail
--          python -m pip install -U pip
--          if [ -f requirements.txt ]; then
--            pip install -r requirements.txt
--          fi
--
--      # ✅ 5분 tick에서 “직전 런 결과”를 다음 런이 재사용하도록 캐시
--      - name: "Restore state cache"
--        uses: actions/cache@v4
--        with:
--          path: |
--            trader/state/pbcore.sqlite3
--            trader/state/universe_lkg
--          key: state-${{ runner.os }}-${{ github.ref_name }}
--          restore-keys: |
--            state-${{ runner.os }}-
--
--      - name: "Run (short tick)"
--        env:
--          APP_KEY: ${{ secrets.APP_KEY }}
--          APP_SECRET: ${{ secrets.APP_SECRET }}
--          CANO: ${{ secrets.CANO }}
--          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
--          API_BASE_URL: ${{ secrets.API_BASE_URL }}
--          KIS_ENV: ${{ secrets.KIS_ENV }}
--          FORCE_MODE: ${{ inputs.force_mode }}
-+          python -m pip install --upgrade pip
-+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
  
--          # ✅ 5분 tick 구조용: botstate lock TTL을 240초로 제한(코드에서 반영)
--          BOTSTATE_LOCK_TTL_SEC: "240"
-+      - name: Precheck env
+-      - name: Precheck env
++      - name: Precheck env (fail fast)
          run: |
            set -euo pipefail
--
--          # ---- secrets 선제 체크 ----
--          miss=0
-+          echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
            for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
--            v="${!k:-}"
--            if [ -z "$v" ]; then
--              echo "::error::Missing secret/env: $k"
--              miss=1
-+            if [ -z "${!k:-}" ]; then
-+              echo "::error::Missing required secret/env: $k"
-+              exit 1
+             if [ -z "${!k:-}" ]; then
+               echo "::error::Missing required secret/env: $k"
+               exit 1
              fi
            done
--          if [ "$miss" = "1" ]; then
--            exit 1
--          fi
--
--          # ---- mode 결정 ----
--          FORCE_MODE="${FORCE_MODE:-auto}"
--          DOW=$(TZ=Asia/Seoul date +%u)   # 1=Mon..7=Sun
--          HM=$(TZ=Asia/Seoul date +%H%M)
--
--          MODE="diag"
--          if [ "$FORCE_MODE" = "live" ]; then
--            MODE="live"
--          elif [ "$FORCE_MODE" = "diag" ]; then
--            MODE="diag"
--          else
--            if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ] && [ "$HM" -ge 0850 ] && [ "$HM" -le 1530 ]; then
--              MODE="live"
--            else
--              MODE="diag"
--            fi
--          fi
-+          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
  
--          # ---- 5분마다 “짧게 실행 후 종료” ----
--          if [ "$MODE" = "live" ]; then
--            export STRATEGY_MODE="LIVE"
--            export LIVE_TRADING_ENABLED="1"
--            export DISABLE_LIVE_TRADING="0"
--            export DRY_RUN="0"
--            export RUN_PHASE="live"
--            export RUN_LOOP_MINUTES="4"
--          else
--            export STRATEGY_MODE="DIAG"
--            export LIVE_TRADING_ENABLED="0"
--            export DISABLE_LIVE_TRADING="1"
--            export DRY_RUN="1"
--            export RUN_PHASE="diag"
--            export RUN_LOOP_MINUTES="2"
--          fi
--          export ACTIVE_STRATEGIES="1"
--
--          echo "[RUN] MODE=$MODE HM=$HM DOW=$DOW RUN_LOOP_MINUTES=$RUN_LOOP_MINUTES"
--          echo "[RUN] cmd: python -m trader.pb1_runner --window auto --phase ${RUN_PHASE}"
--
--          # ---- Universe는 '전 영업일'로 고정 (장중/장전에도 당일 데이터 비어있는 문제 방지) ----
--          if [ "$DOW" = "1" ]; then
--            ASOF=$(TZ=Asia/Seoul date -d "3 days ago" +%F)
--          elif [ "$DOW" = "7" ]; then
--            ASOF=$(TZ=Asia/Seoul date -d "2 days ago" +%F)
--          elif [ "$DOW" = "6" ]; then
--            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
--          else
--            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
--          fi
--          echo "[UNIVERSE] as_of=$ASOF"
--          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "${ASOF}" || true
-+      - name: Build universe (best_k_meta) - allow fallback
++      - name: Auto mode (LIVE in market hours, DIAG otherwise)
 +        run: |
 +          set -euo pipefail
-+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
++          python - << 'PY'
++          from datetime import datetime, time
++          from zoneinfo import ZoneInfo
++
++          KST = ZoneInfo("Asia/Seoul")
++          now = datetime.now(KST)
++
++          # 장중: 08:55 ~ 15:30 (필요시 조정)
++          is_weekday = now.weekday() < 5
++          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
++
++          if in_market:
++              mode = "LIVE"
++              live_enabled = "1"
++              dry_run = "0"
++              disable_live = "0"
++          else:
++              mode = "DIAG"
++              live_enabled = "0"
++              dry_run = "1"
++              disable_live = "1"
++
++          print(f"[AUTO] now={now.isoformat()} in_market={in_market} -> STRATEGY_MODE={mode}")
++          with open("runtime_env.sh", "w") as f:
++              f.write(f'export STRATEGY_MODE="{mode}"\n')
++              f.write(f'export LIVE_TRADING_ENABLED="{live_enabled}"\n')
++              f.write(f'export DRY_RUN="{dry_run}"\n')
++              f.write(f'export DISABLE_LIVE_TRADING="{disable_live}"\n')
++          PY
++          cat runtime_env.sh
++
+       - name: Build universe (best_k_meta) - allow fallback
+         run: |
+           set -euo pipefail
++          source runtime_env.sh
+           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
  
-+      - name: Compile check
-+        run: |
-+          set -euo pipefail
+       - name: Compile check
+         run: |
+           set -euo pipefail
            python -m compileall trader
--          python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
  
--      - name: "Save state cache"
--        if: always()
--        uses: actions/cache@v4
--        with:
--          path: |
--            trader/state/pbcore.sqlite3
--            trader/state/universe_lkg
--          key: state-${{ runner.os }}-${{ github.ref_name }}
-+      - name: Run PB1 (auto window) - exit within RUN_LOOP_MINUTES
-+        run: |
-+          set -euo pipefail
-+          python -m trader.pb1_runner --window auto --phase auto
+-      - name: Run PB1 (auto window) - exit within RUN_LOOP_MINUTES
++      - name: Run PB1 (auto window) - should exit within 4 minutes
+         run: |
+           set -euo pipefail
++          source runtime_env.sh
++          echo "[RUN] STRATEGY_MODE=$STRATEGY_MODE DRY_RUN=$DRY_RUN LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
+           python -m trader.pb1_runner --window auto --phase auto
 diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 51b78689da93154d7db7b7755a578ffda3565a42..f718304668f0e9131c1dc5ddb3fb41c5e6f0a90f 100644
+index f718304668f0e9131c1dc5ddb3fb41c5e6f0a90f..68034bab05509af77430adf4377f54bb4119cbdb 100644
 --- a/trader/botstate_sync.py
 +++ b/trader/botstate_sync.py
-@@ -101,112 +101,136 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
+@@ -1,62 +1,69 @@
+ from __future__ import annotations
+ 
+ import json
+ import os
+ import subprocess
+ import time
+ import logging
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Iterable
+ from zoneinfo import ZoneInfo
+ 
+ logger = logging.getLogger(__name__)
+ 
+ KST = ZoneInfo("Asia/Seoul")
+ 
+ DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
+ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
+ DEFAULT_LOCK_TTL_SEC = 240
+-DEFAULT_LOCK_RETRY_SEC = 60
+-LOCK_RETRY_STEP_SEC = 10
++DEFAULT_LOCK_RETRY_SEC = 55
++DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
+ 
+ 
+ def _lock_ttl_sec() -> int:
+     try:
+         return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
+     except Exception:
+         return DEFAULT_LOCK_TTL_SEC
+ 
+ 
+ def _lock_retry_total_sec() -> int:
+     try:
+         return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
+     except Exception:
+         return DEFAULT_LOCK_RETRY_SEC
+ 
+ 
++def _lock_retry_sleep_sec() -> int:
++    try:
++        return int(os.getenv("BOTSTATE_LOCK_RETRY_SLEEP_SEC", str(DEFAULT_LOCK_RETRY_SLEEP_SEC)))
++    except Exception:
++        return DEFAULT_LOCK_RETRY_SLEEP_SEC
++
++
+ def resolve_botstate_worktree_dir() -> Path:
+     return Path(os.getenv(BOTSTATE_WORKTREE_DIR_ENV, DEFAULT_BOTSTATE_WORKTREE_DIR)).resolve()
+ 
+ 
+ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
+     try:
+         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+     except subprocess.CalledProcessError as exc:
+         logger.error(
+             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
+             exc.cmd,
+             cwd,
+             exc.returncode,
+             exc.stdout,
+             exc.stderr,
+         )
+         raise
+ 
+ 
+ def git_porcelain(worktree_dir: Path) -> str:
+     return _git(worktree_dir, "status", "--porcelain").stdout
+ 
+ 
+ def stage_all(worktree_dir: Path) -> None:
+     _git(worktree_dir, "add", "-A")
+@@ -95,115 +102,128 @@ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+ 
+ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
+     base_dir = base_dir.resolve()
+     worktree_dir = worktree_dir.resolve()
+     worktree_dir.mkdir(parents=True, exist_ok=True)
+     _configure_safe_directories(base_dir, worktree_dir)
      try:
          _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
      except subprocess.CalledProcessError:
@@ -231,48 +257,42 @@ index 51b78689da93154d7db7b7755a578ffda3565a42..f718304668f0e9131c1dc5ddb3fb41c5
      ttl_env = _lock_ttl_sec()
      ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
      retry_total_sec = max(0, _lock_retry_total_sec())
-     attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
+-    attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
++    retry_sleep_sec = max(1, _lock_retry_sleep_sec())
++    start_ts = time.time()
++    attempt = 0
  
-     for attempt in range(1, attempts + 1):
+-    for attempt in range(1, attempts + 1):
++    while True:
++        attempt += 1
          now = datetime.now(tz=KST)
          locked = False
          stale_takeover = False
-+        locked_until = None
-+        current_owner = None
-+        current_run_id = None
+         locked_until = None
+         current_owner = None
+         current_run_id = None
          if lock_path.exists():
              try:
                  payload = json.loads(lock_path.read_text())
-+                current_owner = payload.get("owner")
-+                current_run_id = payload.get("run_id")
+                 current_owner = payload.get("owner")
+                 current_run_id = payload.get("run_id")
                  ts_raw = payload.get("ts")
                  ts = datetime.fromisoformat(ts_raw) if ts_raw else None
                  ttl = int(payload.get("ttl_sec") or ttl_sec)
                  if ts is None:
                      stale_takeover = True
                  else:
--                    until = ts + timedelta(seconds=ttl)
--                    if until > now:
-+                    locked_until = ts + timedelta(seconds=ttl)
-+                    if locked_until > now:
+                     locked_until = ts + timedelta(seconds=ttl)
+                     if locked_until > now:
                          locked = True
--                        logger.warning(
--                            "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
--                            payload.get("owner"),
--                            payload.get("run_id"),
--                            until,
--                        )
                      else:
                          stale_takeover = True
                  if stale_takeover:
                      logger.warning(
--                        "[BOTSTATE][STALE_TAKEOVER] owner=%s run_id=%s",
--                        payload.get("owner"),
--                        payload.get("run_id"),
-+                        "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
-+                        current_owner,
-+                        current_run_id,
-+                        locked_until,
+                         "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
+                         current_owner,
+                         current_run_id,
+                         locked_until,
                      )
              except Exception as exc:
                  logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
@@ -294,87 +314,74 @@ index 51b78689da93154d7db7b7755a578ffda3565a42..f718304668f0e9131c1dc5ddb3fb41c5
              logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
              return True
  
-         if attempt < attempts:
--            logger.info("[BOTSTATE][RETRY] attempt=%s total=%s sleep=%s", attempt, attempts, LOCK_RETRY_STEP_SEC)
-+            logger.info(
-+                "[BOTSTATE][RETRY] wait=%s locked_until=%s",
-+                LOCK_RETRY_STEP_SEC,
-+                locked_until.isoformat() if locked_until else "unknown",
-+            )
-             time.sleep(LOCK_RETRY_STEP_SEC)
+-        if attempt < attempts:
++        elapsed = time.time() - start_ts
++        if elapsed < retry_total_sec:
+             logger.info(
+-                "[BOTSTATE][RETRY] wait=%s locked_until=%s",
+-                LOCK_RETRY_STEP_SEC,
++                "[BOTSTATE][RETRY] wait=%s locked_until=%s attempt=%s elapsed=%.1fs total=%s",
++                retry_sleep_sec,
+                 locked_until.isoformat() if locked_until else "unknown",
++                attempt,
++                elapsed,
++                retry_total_sec,
+             )
+-            time.sleep(LOCK_RETRY_STEP_SEC)
++            time.sleep(retry_sleep_sec)
++            continue
++        break
  
-+    logger.warning(
-+        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
-+        current_owner,
-+        current_run_id,
+     logger.warning(
+-        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
++        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s now=%s ttl_sec=%s current_owner=%s current_run_id=%s",
++        owner,
++        run_id,
 +        locked_until.isoformat() if locked_until else "unknown",
-+    )
++        now.isoformat(),
++        ttl_sec,
+         current_owner,
+         current_run_id,
+-        locked_until.isoformat() if locked_until else "unknown",
+     )
      return False
  
  
--def release_lock(worktree_dir: Path, run_id: str) -> None:
-+def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
+ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
      worktree_dir = worktree_dir.resolve()
      lock_path = _lock_path(worktree_dir)
      if lock_path.exists():
-+        try:
-+            payload = json.loads(lock_path.read_text())
-+        except Exception as exc:
-+            logger.warning("[BOTSTATE][LOCK_RELEASE_SKIP] reason=parse_error err=%s", exc)
-+            return
-+        if payload.get("owner") != owner or payload.get("run_id") != run_id:
-+            logger.warning(
-+                "[BOTSTATE][LOCK_RELEASE_SKIP] owner=%s run_id=%s current_owner=%s current_run_id=%s",
-+                owner,
-+                run_id,
-+                payload.get("owner"),
-+                payload.get("run_id"),
-+            )
-+            return
+         try:
+             payload = json.loads(lock_path.read_text())
+         except Exception as exc:
+             logger.warning("[BOTSTATE][LOCK_RELEASE_SKIP] reason=parse_error err=%s", exc)
+             return
+         if payload.get("owner") != owner or payload.get("run_id") != run_id:
+             logger.warning(
+                 "[BOTSTATE][LOCK_RELEASE_SKIP] owner=%s run_id=%s current_owner=%s current_run_id=%s",
+                 owner,
+                 run_id,
+                 payload.get("owner"),
+                 payload.get("run_id"),
+             )
+             return
          lock_path.unlink()
          lock_rel_path = lock_path.relative_to(worktree_dir)
          _git(worktree_dir, "add", "-u", str(lock_rel_path))
-         push_retry(worktree_dir, message=f"unlock run_id={run_id}")
--        logger.info("[BOTSTATE][LOCK-RELEASED] run_id=%s", run_id)
-+        logger.info("[BOTSTATE][LOCK_RELEASED] owner=%s run_id=%s", owner, run_id)
- 
- 
- def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
-     worktree_dir = worktree_dir.resolve()
-     files = list(new_files)
-     for path in files:
-         try:
-             if path.resolve().is_relative_to(worktree_dir.resolve()):
-                 target = path.resolve()
-             else:
-                 if "bot_state" in path.parts:
-                     idx = path.parts.index("bot_state")
-                     rel = Path(*path.parts[idx:])
-                 else:
-                     rel = Path("bot_state") / Path(*path.parts[-4:])
-                 target = (worktree_dir / rel).resolve()
-                 target.parent.mkdir(parents=True, exist_ok=True)
-                 target.write_bytes(path.read_bytes())
-             rel_target = target.relative_to(worktree_dir)
-             _git(worktree_dir, "add", str(rel_target))
-         except Exception:
-             continue
-     push_retry(worktree_dir, message=message)
-     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
- 
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index a4dbdd161505e32e213c28e65d62297611092dc2..455e5beee5aa54b2ec7e0e522420d01a09684ed0 100644
+index 455e5beee5aa54b2ec7e0e522420d01a09684ed0..165bfa167d828688d1591cb0ecb8a93880f103c9 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -1,30 +1,31 @@
+@@ -1,33 +1,33 @@
  from __future__ import annotations
  
  import argparse
  import logging
  import os
-+import signal
+ import signal
  import time as time_mod
- from datetime import datetime, time as dtime
+-from datetime import datetime, time as dtime
++from datetime import datetime, time as dtime, timedelta
  from pathlib import Path
  from zoneinfo import ZoneInfo
  
@@ -398,7 +405,9 @@ index a4dbdd161505e32e213c28e65d62297611092dc2..455e5beee5aa54b2ec7e0e522420d01a
  )
  from trader.botstate_sync import acquire_lock as acquire_botstate_lock
  from trader.botstate_sync import persist_run_files, release_lock as release_botstate_lock
-@@ -476,83 +477,105 @@ def run_once(
+ from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
+ from trader.db.engine import make_engine
+@@ -477,64 +477,71 @@ def run_once(
              window=window,
              phase_override=phase_override_arg,
              dry_run=dry_run,
@@ -424,20 +433,30 @@ index a4dbdd161505e32e213c28e65d62297611092dc2..455e5beee5aa54b2ec7e0e522420d01a
      persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
      loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
      run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
-+    max_seconds = _parse_int_env("RUN_LOOP_MINUTES", 4) * 60
+-    max_seconds = _parse_int_env("RUN_LOOP_MINUTES", 4) * 60
      now = _get_now_kst()
      _, close_dt = _market_session(now)
++    max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
++    loop_deadline = now + timedelta(seconds=max_seconds) if max_seconds > 0 else None
      if run_loop_minutes > 0:
          loop_max_minutes = run_loop_minutes
          persist_interval = max(120, min(persist_interval, 240))
      logger.info(
-         "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
+-        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
++        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
          loop_interval,
          persist_interval,
          close_dt.isoformat(),
          loop_max_minutes,
++        run_loop_minutes,
++    )
++    logger.info(
++        "[PB1][LOOP] start now_kst=%s max_seconds=%s deadline=%s",
++        now.isoformat(),
++        max_seconds,
++        loop_deadline.isoformat() if loop_deadline else "none",
      )
-     logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
+-    logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
  
      owner = os.getenv("GITHUB_ACTOR", "local")
      workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
@@ -451,131 +470,17 @@ index a4dbdd161505e32e213c28e65d62297611092dc2..455e5beee5aa54b2ec7e0e522420d01a
      last_persist_ts = 0.0
      loop_started_ts = time_mod.time()
      exit_reason = "unknown"
-+    stop_requested = {"value": False}
-+
-+    def _request_stop(reason: str) -> None:
-+        if stop_requested["value"]:
-+            return
-+        stop_requested["value"] = True
-+        logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
-+        try:
-+            release_botstate_lock(botstate_worktree, owner, workflow_run_id)
-+        except Exception:
-+            logger.exception("[PB1][SIGNAL] botstate lock release failed")
-+
-+    signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
-     try:
-         while True:
-+            if stop_requested["value"]:
-+                exit_reason = "sigterm"
-+                break
-             now = _get_now_kst()
-             if now >= close_dt:
-                 logger.info("[PB1][LOOP] market closed -> exit")
-                 exit_reason = "market_closed"
-                 break
-+            elapsed_seconds = time_mod.time() - loop_started_ts
-+            if max_seconds > 0 and elapsed_seconds >= max_seconds:
-+                logger.info("[PB1][LOOP] max_seconds=%s exiting", max_seconds)
-+                exit_reason = "loop_timeout"
-+                break
-             if loop_max_minutes > 0:
-                 elapsed_min = (time_mod.time() - loop_started_ts) / 60
-                 if elapsed_min >= loop_max_minutes:
-                     logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
-                     exit_reason = "loop_timeout"
-                     break
-             window = decide_window(now=now, override=args.window)
-             if window is None:
-                 next_start = _next_window_start(
-                     now,
-                     [
-                         _parse_hhmm_to_time(MORNING_WINDOW_START),
-                         _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-                         _parse_hhmm_to_time(CLOSE_AUCTION_START),
-                     ],
-                 )
-                 if next_start:
-                     sleep_for = (next_start - now).total_seconds()
-                 else:
-                     sleep_for = loop_interval
-                 sleep_for = max(5.0, min(300.0, sleep_for))
-                 logger.info(
-                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
-                     sleep_for,
-                     next_start.isoformat() if next_start else "unknown",
-@@ -564,66 +587,70 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
-             touched, _did_work = run_once(args=args, engine=engine, loop_mode=True, window=window)
-             for path in touched:
-                 pending_touched[path] = path
-             if pending_touched:
-                 now_ts = time_mod.time()
-                 urgent = _is_urgent_persist(list(pending_touched.values()))
-                 if urgent or (now_ts - last_persist_ts >= persist_interval):
-                     persist_run_files(
-                         botstate_worktree,
-                         list(pending_touched.values()),
-                         message=f"pb1 loop {now.isoformat()}",
-                     )
-                     pending_touched.clear()
-                     last_persist_ts = now_ts
-             time_mod.sleep(loop_interval)
-     finally:
-         elapsed = time_mod.time() - loop_started_ts
-         if exit_reason == "unknown":
-             exit_reason = "shutdown"
-         if pending_touched:
-             persist_run_files(
-                 botstate_worktree,
-                 list(pending_touched.values()),
-                 message=f"pb1 loop {now_kst().isoformat()}",
-             )
--        release_botstate_lock(botstate_worktree, workflow_run_id)
-+        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
-         logger.info("[PB1][EXIT] reason=%s elapsed=%.1fs", exit_reason, elapsed)
+     stop_requested = {"value": False}
  
+     def _request_stop(reason: str) -> None:
+         if stop_requested["value"]:
+             return
+         stop_requested["value"] = True
+         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
+         try:
+             release_botstate_lock(botstate_worktree, owner, workflow_run_id)
+         except Exception:
+             logger.exception("[PB1][SIGNAL] botstate lock release failed")
  
- def main() -> None:
-     args = parse_args()
-     engine = make_engine()
-     run_migrations(engine)
- 
-     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
-     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
-     if run_loop_minutes > 0:
-         run_loop = True
-     if run_loop and not smoke_enabled:
-         _run_loop(args=args, engine=engine)
-         return
-     if smoke_enabled:
-         run_once(args=args, engine=engine, loop_mode=False, window=None)
-         return
- 
-     owner = os.getenv("GITHUB_ACTOR", "local")
-     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
-     if botstate_worktree is None:
-         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
-         return
-+    signal.signal(
-+        signal.SIGTERM,
-+        lambda *_args: release_botstate_lock(botstate_worktree, owner, workflow_run_id),
-+    )
-     try:
-         touched, _did_work = run_once(args=args, engine=engine, loop_mode=False, window=None)
-         if touched:
-             persist_run_files(
-                 botstate_worktree,
-                 touched,
-                 message=f"pb1 run {now_kst().isoformat()}",
-             )
-     finally:
--        release_botstate_lock(botstate_worktree, workflow_run_id)
-+        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
- 
- 
- if __name__ == "__main__":
-     main()
 
 
