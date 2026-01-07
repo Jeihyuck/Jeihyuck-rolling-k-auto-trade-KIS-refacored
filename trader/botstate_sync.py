@@ -16,6 +16,23 @@ KST = ZoneInfo("Asia/Seoul")
 
 DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
+DEFAULT_LOCK_TTL_SEC = 240
+DEFAULT_LOCK_RETRY_SEC = 60
+LOCK_RETRY_STEP_SEC = 10
+
+
+def _lock_ttl_sec() -> int:
+    try:
+        return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
+    except Exception:
+        return DEFAULT_LOCK_TTL_SEC
+
+
+def _lock_retry_total_sec() -> int:
+    try:
+        return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
+    except Exception:
+        return DEFAULT_LOCK_RETRY_SEC
 
 
 def resolve_botstate_worktree_dir() -> Path:
@@ -93,35 +110,70 @@ def _lock_path(worktree_dir: Path) -> Path:
     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
 
 
-def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int = 900) -> bool:
+def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
     worktree_dir = worktree_dir.resolve()
     lock_path = _lock_path(worktree_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(tz=KST)
-    if lock_path.exists():
-        try:
-            payload = json.loads(lock_path.read_text())
-            ts = datetime.fromisoformat(payload.get("ts"))
-            ttl = int(payload.get("ttl_sec") or ttl_sec)
-            if ts + timedelta(seconds=ttl) > now:
-                logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s", payload.get("owner"), payload.get("run_id"), ts + timedelta(seconds=ttl))
-                return False
-        except Exception:
-            pass
-    lock_payload = {
-        "owner": owner,
-        "run_id": run_id,
-        "ts": now.isoformat(),
-        "ttl_sec": ttl_sec,
-    }
-    temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
-    temp_path.write_text(json.dumps(lock_payload))
-    temp_path.replace(lock_path)
-    lock_rel_path = lock_path.relative_to(worktree_dir)
-    _git(worktree_dir, "add", str(lock_rel_path))
-    push_retry(worktree_dir, message=f"lock run_id={run_id}")
-    logger.info("[BOTSTATE][LOCK-ACQUIRED] owner=%s run_id=%s", owner, run_id)
-    return True
+    ttl_env = _lock_ttl_sec()
+    ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
+    retry_total_sec = max(0, _lock_retry_total_sec())
+    attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
+
+    for attempt in range(1, attempts + 1):
+        now = datetime.now(tz=KST)
+        locked = False
+        stale_takeover = False
+        if lock_path.exists():
+            try:
+                payload = json.loads(lock_path.read_text())
+                ts_raw = payload.get("ts")
+                ts = datetime.fromisoformat(ts_raw) if ts_raw else None
+                ttl = int(payload.get("ttl_sec") or ttl_sec)
+                if ts is None:
+                    stale_takeover = True
+                else:
+                    until = ts + timedelta(seconds=ttl)
+                    if until > now:
+                        locked = True
+                        logger.warning(
+                            "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
+                            payload.get("owner"),
+                            payload.get("run_id"),
+                            until,
+                        )
+                    else:
+                        stale_takeover = True
+                if stale_takeover:
+                    logger.warning(
+                        "[BOTSTATE][STALE_TAKEOVER] owner=%s run_id=%s",
+                        payload.get("owner"),
+                        payload.get("run_id"),
+                    )
+            except Exception as exc:
+                logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
+                stale_takeover = True
+
+        if not locked:
+            lock_payload = {
+                "owner": owner,
+                "run_id": run_id,
+                "ts": now.isoformat(),
+                "ttl_sec": ttl_sec,
+            }
+            temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
+            temp_path.write_text(json.dumps(lock_payload))
+            temp_path.replace(lock_path)
+            lock_rel_path = lock_path.relative_to(worktree_dir)
+            _git(worktree_dir, "add", str(lock_rel_path))
+            push_retry(worktree_dir, message=f"lock run_id={run_id}")
+            logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
+            return True
+
+        if attempt < attempts:
+            logger.info("[BOTSTATE][RETRY] attempt=%s total=%s sleep=%s", attempt, attempts, LOCK_RETRY_STEP_SEC)
+            time.sleep(LOCK_RETRY_STEP_SEC)
+
+    return False
 
 
 def release_lock(worktree_dir: Path, run_id: str) -> None:

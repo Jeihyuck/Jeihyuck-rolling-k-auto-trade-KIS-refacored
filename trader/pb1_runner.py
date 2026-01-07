@@ -497,19 +497,24 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
+    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
     now = _get_now_kst()
     _, close_dt = _market_session(now)
+    if run_loop_minutes > 0:
+        loop_max_minutes = run_loop_minutes
+        persist_interval = max(120, min(persist_interval, 240))
     logger.info(
-        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s",
+        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
         loop_interval,
         persist_interval,
         close_dt.isoformat(),
+        loop_max_minutes,
     )
+    logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    seconds_until_close = max(0.0, (close_dt - now).total_seconds())
-    ttl_sec = max(BOTSTATE_LOCK_TTL_SEC, int(seconds_until_close) + 600)
+    ttl_sec = BOTSTATE_LOCK_TTL_SEC
     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
     if botstate_worktree is None:
         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
@@ -518,16 +523,19 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     pending_touched: dict[Path, Path] = {}
     last_persist_ts = 0.0
     loop_started_ts = time_mod.time()
+    exit_reason = "unknown"
     try:
         while True:
             now = _get_now_kst()
             if now >= close_dt:
                 logger.info("[PB1][LOOP] market closed -> exit")
+                exit_reason = "market_closed"
                 break
             if loop_max_minutes > 0:
                 elapsed_min = (time_mod.time() - loop_started_ts) / 60
                 if elapsed_min >= loop_max_minutes:
                     logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
+                    exit_reason = "loop_timeout"
                     break
             window = decide_window(now=now, override=args.window)
             if window is None:
@@ -569,6 +577,9 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                     last_persist_ts = now_ts
             time_mod.sleep(loop_interval)
     finally:
+        elapsed = time_mod.time() - loop_started_ts
+        if exit_reason == "unknown":
+            exit_reason = "shutdown"
         if pending_touched:
             persist_run_files(
                 botstate_worktree,
@@ -576,6 +587,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
         release_botstate_lock(botstate_worktree, workflow_run_id)
+        logger.info("[PB1][EXIT] reason=%s elapsed=%.1fs", exit_reason, elapsed)
 
 
 def main() -> None:
@@ -585,6 +597,9 @@ def main() -> None:
 
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
+    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+    if run_loop_minutes > 0:
+        run_loop = True
     if run_loop and not smoke_enabled:
         _run_loop(args=args, engine=engine)
         return

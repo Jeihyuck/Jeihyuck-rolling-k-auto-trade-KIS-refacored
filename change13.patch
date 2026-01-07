@@ -1,619 +1,692 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 4b87f2818183146a1f942d212f834f6f7d2acb1c..a95a99974d2d0f82215e552885bf653c7a1d5754 100644
+index ad033d4481fc92ef611e04974d0abce1f07a3f86..c34154294f9843154809ffa5a6db97f099eb4af6 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -1,86 +1,158 @@
- name: PB1 Trade Runner
+@@ -1,239 +1,160 @@
+-name: PB1 Trade Runner
++name: "Trade Runner (5min tick: LIVE during market, DIAG otherwise)"
  
  permissions:
    contents: write
  
++# ✅ 레포 전체에서 공유되는 concurrency group (다른 워크플로도 동일 group이면 서로 겹침 방지됨)
  concurrency:
-   group: pb1-trade-runner
-   cancel-in-progress: false
+-  group: pb1-trade-runner
+-  cancel-in-progress: false
++  group: trade-bot-state
++  cancel-in-progress: true
  
  on:
-   push:
-     branches: [ main, nullim ]
-     paths-ignore:
-       - "bot_state/**"
+-  push:
+-    branches: [ main, nullim ]
+-    paths-ignore:
+-      - "bot_state/**"
+-
    workflow_dispatch:
      inputs:
-       phase:
--        description: "Runner phase (auto or smoke)"
-+        description: "Runner phase (auto/entry/exit/verify)"
-         default: "auto"
-         type: choice
--        options: [auto, smoke]
--        required: false
--      allow_wait:
--        description: "Allow wait before market open"
--        default: "0"
+-      mode:
+-        description: "Run mode (loop=LIVE loop, smoke=precheck only)"
+-        default: "loop"
 -        type: choice
--        options: ["0", "1"]
-+        options: [auto, entry, exit, verify]
+-        options: [loop, smoke]
++      force_mode:
++        description: "auto|live|diag"
          required: false
+-      phase:
+-        description: "Runner phase (auto/entry/exit/verify)"
+         default: "auto"
+-        type: choice
+-        options: [auto, entry, exit, verify]
+-        required: false
+ 
    schedule:
--    # =========================
--    # Weekdays (KST Mon-Fri) : run only during market hours (08:50~15:30 KST), every 5 min
--    # KST 08:50~08:55  => UTC 23:50~23:55 (previous UTC day)  [Sun~Thu UTC]
--    - cron: "50-59/5 23 * * 0-4"
--    # KST 09:00~14:55  => UTC 00:00~05:55 (same UTC day)      [Mon~Fri UTC]
--    - cron: "*/5 0-5 * * 1-5"
--    # KST 15:00~15:30  => UTC 06:00~06:30 (same UTC day)      [Mon~Fri UTC]
--    - cron: "0-30/5 6 * * 1-5"
--
--    # =========================
--    # Weekend (KST Sat-Sun) : DIAG every 5 min for the entire weekend day (00:00~23:55 KST)
--    # KST Sat 00:00~08:55 => UTC Fri 15:00~23:55
--    - cron: "*/5 15-23 * * 5"
--    # KST Sat 09:00~Sun 08:55 => UTC Sat 00:00~23:55 (covers full UTC Saturday)
--    - cron: "*/5 * * * 6"
--    # KST Sun 09:00~23:55 => UTC Sun 00:00~14:55
--    - cron: "*/5 0-14 * * 0"
-+    - cron: "50 23 * * 0-4"
+-    # KST Mon-Fri 08:50 = UTC Sun-Thu 23:50
+-    - cron: "50 23 * * 0-4"
++    # =========================
++    # KST 장중 5분 tick (UTC로 변환)
++    # KST 08:50~08:55 => UTC 23:50~23:55 (Sun~Thu UTC)
++    - cron: "50-59/5 23 * * 0-4"
++    # KST 09:00~14:55 => UTC 00:00~05:55 (Mon~Fri UTC)
++    - cron: "*/5 0-5 * * 1-5"
++    # KST 15:00~15:30 => UTC 06:00~06:30 (Mon~Fri UTC)
++    - cron: "0-30/5 6 * * 1-5"
++    # 주말 DIAG는 과도하지 않게 30분 주기
++    - cron: "*/30 * * * 0,6"
++
++env:
++  TZ: Asia/Seoul
++  PYTHONUNBUFFERED: "1"
  
  jobs:
--  run-trade:
--    if: github.ref != 'refs/heads/bot-state' && github.event_name != 'pull_request'
-+  run-trade-smoke:
-+    if: github.ref != 'refs/heads/bot-state' && github.event_name == 'push'
+-  run-trade-smoke:
+-    name: PB1 Smoke (manual only)
+-    if: >
+-      github.ref != 'refs/heads/bot-state' &&
+-      github.ref != 'refs/heads/bot_state' &&
+-      github.event_name == 'workflow_dispatch' &&
+-      inputs.mode == 'smoke'
++  run:
      runs-on: ubuntu-latest
-     timeout-minutes: 360
- 
-     env:
-       STRATEGY_MODE: "LIVE"
-       LIVE_TRADING_ENABLED: "1"
-       DISABLE_LIVE_TRADING: "0"
-       DRY_RUN: "0"
-       EXPECT_LIVE_TRADING: "1"
-       EXPECT_KIS_ENV: "practice"
-       PB1_ENTRY_ENABLED: "1"
-+      PB1_SMOKE_RUN: "1"
-+      PB1_RUN_LOOP: "0"
-+      PB1_ALLOW_WAIT: "0"
-+
-+      KIS_ENV: "practice"
-+      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
-+
-+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-+      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-+      CANO: ${{ secrets.CANO }}
-+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-+
-+      STATE_RECONCILE_APPLY: "1"
-+
-+      MORNING_WINDOW_START: "08:50"
-+      MORNING_WINDOW_END: "11:00"
-+      MORNING_EXIT_START: "09:00"
-+      MORNING_EXIT_END: "09:20"
-+      AFTERNOON_WINDOW_START: "14:00"
-+      AFTERNOON_WINDOW_END: "15:30"
-+      CLOSE_AUCTION_START: "15:20"
-+      CLOSE_AUCTION_END: "15:30"
-+      MARKET_OPEN_HHMM: "08:50"
-+      MARKET_CLOSE_HHMM: "15:30"
-+      PB1_WAIT_FOR_WINDOW: "1"
-+      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-+
-+      PYTHONUNBUFFERED: "1"
-+
-+    steps:
-+      - uses: actions/checkout@v4
-+        with:
-+          fetch-depth: 0
-+          persist-credentials: true
-+          token: ${{ secrets.GITHUB_TOKEN }}
-+
-+      - name: Set git identity
-+        run: |
-+          git config user.name "trade-bot"
-+          git config user.email "trade-bot@users.noreply.github.com"
-+
-+      - uses: actions/setup-python@v5
-+        with:
-+          python-version: "3.11"
-+
-+      - name: Install dependencies
-+        run: |
-+          python -m pip install --upgrade pip
-+          pip install -r requirements.txt
-+
-+      - name: Configure run mode
-+        run: |
-+          echo "RUN_PHASE=auto" >> $GITHUB_ENV
-+          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
-+
-+      - name: Run DB migrations
-+        run: |
-+          python -m trader.db.migrate
-+
-+      - name: Build Universe (best-effort)
-+        run: |
-+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
-+
-+      - name: Compile modules
-+        run: |
-+          python -m compileall trader
-+
-+      - name: Run PB1 only
-+        env:
-+          PYTHONPATH: ${{ github.workspace }}
-+        run: |
-+          python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
-+
-+  run-trade-loop:
-+    if: github.ref != 'refs/heads/bot-state' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-+    runs-on: ubuntu-latest
-+    timeout-minutes: 480
-+
-+    env:
-+      STRATEGY_MODE: "LIVE"
-+      LIVE_TRADING_ENABLED: "1"
-+      DISABLE_LIVE_TRADING: "0"
-+      DRY_RUN: "0"
-+      EXPECT_LIVE_TRADING: "1"
-+      EXPECT_KIS_ENV: "practice"
-+      PB1_ENTRY_ENABLED: "1"
-+      PB1_SMOKE_RUN: "0"
-+      PB1_RUN_LOOP: "1"
-+      PB1_ALLOW_WAIT: "1"
-+      PB1_LOOP_INTERVAL_SEC: "60"
-+      PB1_PERSIST_INTERVAL_SEC: "300"
-+      BOTSTATE_LOCK_TTL_SEC: "21600"
- 
-       KIS_ENV: "practice"
-       API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
- 
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-       APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
- 
-       STATE_RECONCILE_APPLY: "1"
- 
-       MORNING_WINDOW_START: "08:50"
-       MORNING_WINDOW_END: "11:00"
-       MORNING_EXIT_START: "09:00"
-       MORNING_EXIT_END: "09:20"
-       AFTERNOON_WINDOW_START: "14:00"
-       AFTERNOON_WINDOW_END: "15:30"
-       CLOSE_AUCTION_START: "15:20"
-       CLOSE_AUCTION_END: "15:30"
-       MARKET_OPEN_HHMM: "08:50"
-       MARKET_CLOSE_HHMM: "15:30"
-       PB1_WAIT_FOR_WINDOW: "1"
-       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-@@ -88,61 +160,46 @@ jobs:
-       PYTHONUNBUFFERED: "1"
+-    timeout-minutes: 60
+-
+-    env:
+-      STRATEGY_MODE: "LIVE"
+-      LIVE_TRADING_ENABLED: "1"
+-      DISABLE_LIVE_TRADING: "0"
+-      DRY_RUN: "0"
+-      EXPECT_LIVE_TRADING: "1"
+-      EXPECT_KIS_ENV: "practice"
+-
+-      PB1_ENTRY_ENABLED: "1"
+-      PB1_SMOKE_RUN: "1"
+-      PB1_RUN_LOOP: "0"
+-      PB1_ALLOW_WAIT: "0"
+-
+-      KIS_ENV: "practice"
+-      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+-
+-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      CANO: ${{ secrets.CANO }}
+-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+-
+-      STATE_RECONCILE_APPLY: "1"
+-
+-      MORNING_WINDOW_START: "08:50"
+-      MORNING_WINDOW_END: "11:00"
+-      MORNING_EXIT_START: "09:00"
+-      MORNING_EXIT_END: "09:20"
+-      AFTERNOON_WINDOW_START: "14:00"
+-      AFTERNOON_WINDOW_END: "15:30"
+-      CLOSE_AUCTION_START: "15:20"
+-      CLOSE_AUCTION_END: "15:30"
+-      MARKET_OPEN_HHMM: "08:50"
+-      MARKET_CLOSE_HHMM: "15:30"
+-
+-      PB1_WAIT_FOR_WINDOW: "1"
+-      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+-
+-      PYTHONUNBUFFERED: "1"
++    timeout-minutes: 12
  
      steps:
-       - uses: actions/checkout@v4
+-      - uses: actions/checkout@v4
++      - name: "Checkout"
++        uses: actions/checkout@v4
          with:
            fetch-depth: 0
-           persist-credentials: true
-           token: ${{ secrets.GITHUB_TOKEN }}
+-          persist-credentials: true
+-          token: ${{ secrets.GITHUB_TOKEN }}
+-
+-      - name: Set git identity
+-        run: |
+-          git config user.name "trade-bot"
+-          git config user.email "trade-bot@users.noreply.github.com"
  
-       - name: Set git identity
-         run: |
-           git config user.name "trade-bot"
-           git config user.email "trade-bot@users.noreply.github.com"
- 
-       - uses: actions/setup-python@v5
+-      - uses: actions/setup-python@v5
++      - name: "Set up Python"
++        uses: actions/setup-python@v5
          with:
            python-version: "3.11"
  
-       - name: Install dependencies
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
+-
+-      - name: Configure run mode
+-        run: |
+-          echo "RUN_PHASE=${{ inputs.phase || 'auto' }}" >> $GITHUB_ENV
+-          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
+-
+-      - name: Run DB migrations
+-        run: |
+-          python -m trader.db.migrate
+-
+-      - name: Build Universe (best-effort)
+-        run: |
+-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
+-
+-      - name: Compile modules
+-        run: |
+-          python -m compileall trader
+-
+-      - name: Run PB1 (smoke)
+-        env:
+-          PYTHONPATH: ${{ github.workspace }}
++      - name: "Install deps"
          run: |
-           python -m pip install --upgrade pip
-           pip install -r requirements.txt
+-          python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
+-
+-
+-  run-trade-loop:
+-    name: PB1 Live Loop
+-    if: >
+-      github.ref != 'refs/heads/bot-state' &&
+-      github.ref != 'refs/heads/bot_state' &&
+-      (
+-        github.event_name == 'push' ||
+-        github.event_name == 'schedule' ||
+-        (github.event_name == 'workflow_dispatch' && inputs.mode == 'loop')
+-      )
+-    runs-on: ubuntu-latest
+-    timeout-minutes: 480
+-
+-    env:
+-      STRATEGY_MODE: "LIVE"
+-      LIVE_TRADING_ENABLED: "1"
+-      DISABLE_LIVE_TRADING: "0"
+-      DRY_RUN: "0"
+-      EXPECT_LIVE_TRADING: "1"
+-      EXPECT_KIS_ENV: "practice"
+-
+-      PB1_ENTRY_ENABLED: "1"
+-      PB1_SMOKE_RUN: "0"
+-      PB1_RUN_LOOP: "1"
+-      PB1_ALLOW_WAIT: "1"
+-      PB1_LOOP_INTERVAL_SEC: "60"
+-      PB1_PERSIST_INTERVAL_SEC: "300"
+-      BOTSTATE_LOCK_TTL_SEC: "21600"
+-
+-      KIS_ENV: "practice"
+-      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+-
+-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
+-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
+-      CANO: ${{ secrets.CANO }}
+-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+-
+-      STATE_RECONCILE_APPLY: "1"
+-
+-      MORNING_WINDOW_START: "08:50"
+-      MORNING_WINDOW_END: "11:00"
+-      MORNING_EXIT_START: "09:00"
+-      MORNING_EXIT_END: "09:20"
+-      AFTERNOON_WINDOW_START: "14:00"
+-      AFTERNOON_WINDOW_END: "15:30"
+-      CLOSE_AUCTION_START: "15:20"
+-      CLOSE_AUCTION_END: "15:30"
+-      MARKET_OPEN_HHMM: "08:50"
+-      MARKET_CLOSE_HHMM: "15:30"
+-
+-      PB1_WAIT_FOR_WINDOW: "1"
+-      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
+-
+-      PYTHONUNBUFFERED: "1"
++          set -euo pipefail
++          python -m pip install -U pip
++          if [ -f requirements.txt ]; then
++            pip install -r requirements.txt
++          fi
  
-       - name: Configure run mode
+-    steps:
+-      - uses: actions/checkout@v4
++      # ✅ 5분 tick에서 “직전 런 결과”를 다음 런이 재사용하도록 캐시
++      - name: "Restore state cache"
++        uses: actions/cache@v4
+         with:
+-          fetch-depth: 0
+-          persist-credentials: true
+-          token: ${{ secrets.GITHUB_TOKEN }}
+-
+-      - name: Set git identity
++          path: |
++            trader/state/pbcore.sqlite3
++            trader/state/universe_lkg
++          key: state-${{ runner.os }}-${{ github.ref_name }}
++          restore-keys: |
++            state-${{ runner.os }}-
++
++      - name: "Run (short tick)"
++        env:
++          APP_KEY: ${{ secrets.APP_KEY }}
++          APP_SECRET: ${{ secrets.APP_SECRET }}
++          CANO: ${{ secrets.CANO }}
++          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
++          API_BASE_URL: ${{ secrets.API_BASE_URL }}
++          KIS_ENV: ${{ secrets.KIS_ENV }}
++          FORCE_MODE: ${{ inputs.force_mode }}
++
++          # ✅ 5분 tick 구조용: botstate lock TTL을 240초로 제한(코드에서 반영)
++          BOTSTATE_LOCK_TTL_SEC: "240"
          run: |
--          PHASE_INPUT="${{ github.event.inputs.phase || 'auto' }}"
--          ALLOW_WAIT="${{ github.event.inputs.allow_wait || '0' }}"
--          RUN_PHASE="$PHASE_INPUT"
--          if [ "${{ github.event_name }}" = "schedule" ]; then
--            ALLOW_WAIT="1"
--          fi
--          if [ "${{ github.event_name }}" = "push" ]; then
+-          git config user.name "trade-bot"
+-          git config user.email "trade-bot@users.noreply.github.com"
+-
+-      - uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
++          set -euo pipefail
++
++          # ---- secrets 선제 체크 ----
++          miss=0
++          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
++            v="${!k:-}"
++            if [ -z "$v" ]; then
++              echo "::error::Missing secret/env: $k"
++              miss=1
++            fi
++          done
++          if [ "$miss" = "1" ]; then
++            exit 1
++          fi
+ 
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          pip install -r requirements.txt
++          # ---- mode 결정 ----
++          FORCE_MODE="${FORCE_MODE:-auto}"
++          DOW=$(TZ=Asia/Seoul date +%u)   # 1=Mon..7=Sun
++          HM=$(TZ=Asia/Seoul date +%H%M)
+ 
+-      - name: Configure run mode
+-        run: |
+-          # push/schedule -> auto, workflow_dispatch -> inputs.phase
+-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+-            RUN_PHASE="${{ inputs.phase }}"
++          MODE="diag"
++          if [ "$FORCE_MODE" = "live" ]; then
++            MODE="live"
++          elif [ "$FORCE_MODE" = "diag" ]; then
++            MODE="diag"
+           else
 -            RUN_PHASE="auto"
--            ALLOW_WAIT="0"
--            echo "PB1_SMOKE_RUN=1" >> $GITHUB_ENV
--          fi
--          if [ "$PHASE_INPUT" = "smoke" ]; then
--            RUN_PHASE="auto"
--            echo "PB1_SMOKE_RUN=1" >> $GITHUB_ENV
--          fi
--          echo "PB1_ALLOW_WAIT=$ALLOW_WAIT" >> $GITHUB_ENV
-+          RUN_PHASE="${{ github.event.inputs.phase || 'auto' }}"
-           echo "RUN_PHASE=$RUN_PHASE" >> $GITHUB_ENV
-           echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
++            if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ] && [ "$HM" -ge 0850 ] && [ "$HM" -le 1530 ]; then
++              MODE="live"
++            else
++              MODE="diag"
++            fi
+           fi
+-          echo "RUN_PHASE=$RUN_PHASE" >> $GITHUB_ENV
+-          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
+-
+-      - name: Run DB migrations
+-        run: |
+-          python -m trader.db.migrate
  
-       - name: Run DB migrations
-         run: |
-           python -m trader.db.migrate
+-      - name: Build Universe (best-effort)
+-        run: |
+-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
++          # ---- 5분마다 “짧게 실행 후 종료” ----
++          if [ "$MODE" = "live" ]; then
++            export STRATEGY_MODE="LIVE"
++            export LIVE_TRADING_ENABLED="1"
++            export DISABLE_LIVE_TRADING="0"
++            export DRY_RUN="0"
++            export RUN_PHASE="live"
++            export RUN_LOOP_MINUTES="4"
++          else
++            export STRATEGY_MODE="DIAG"
++            export LIVE_TRADING_ENABLED="0"
++            export DISABLE_LIVE_TRADING="1"
++            export DRY_RUN="1"
++            export RUN_PHASE="diag"
++            export RUN_LOOP_MINUTES="2"
++          fi
++          export ACTIVE_STRATEGIES="1"
++
++          echo "[RUN] MODE=$MODE HM=$HM DOW=$DOW RUN_LOOP_MINUTES=$RUN_LOOP_MINUTES"
++          echo "[RUN] cmd: python -m trader.pb1_runner --window auto --phase ${RUN_PHASE}"
++
++          # ---- Universe는 '전 영업일'로 고정 (장중/장전에도 당일 데이터 비어있는 문제 방지) ----
++          if [ "$DOW" = "1" ]; then
++            ASOF=$(TZ=Asia/Seoul date -d "3 days ago" +%F)
++          elif [ "$DOW" = "7" ]; then
++            ASOF=$(TZ=Asia/Seoul date -d "2 days ago" +%F)
++          elif [ "$DOW" = "6" ]; then
++            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
++          else
++            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
++          fi
++          echo "[UNIVERSE] as_of=$ASOF"
++          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "${ASOF}" || true
  
-       - name: Build Universe (best-effort)
-         run: |
-           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
- 
-       - name: Compile modules
-         run: |
+-      - name: Compile modules
+-        run: |
            python -m compileall trader
- 
-       - name: Run PB1 only
-         env:
-           PYTHONPATH: ${{ github.workspace }}
-         run: |
+-
+-      - name: Run PB1 (live loop)
+-        env:
+-          PYTHONPATH: ${{ github.workspace }}
+-        run: |
            python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index e2b8e68f9fc351853a02e5618513177cd77a59b7..f3c2bc6135967dc6b86373bf6c79a8ce6e56ccef 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -1,51 +1,56 @@
+ 
+-          
+\ No newline at end of file
++      - name: "Save state cache"
++        if: always()
++        uses: actions/cache@v4
++        with:
++          path: |
++            trader/state/pbcore.sqlite3
++            trader/state/universe_lkg
++          key: state-${{ runner.os }}-${{ github.ref_name }}
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index 442fc1e727fa4c08aa35260bf7f64f26978caeae..51b78689da93154d7db7b7755a578ffda3565a42 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -1,43 +1,60 @@
  from __future__ import annotations
  
- import argparse
- import logging
+ import json
  import os
- import time as time_mod
- from datetime import datetime, time as dtime
-+from pathlib import Path
+ import subprocess
+ import time
+ import logging
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Iterable
  from zoneinfo import ZoneInfo
- 
- from trader.config import (
-     AFTERNOON_WINDOW_END,
-     AFTERNOON_WINDOW_START,
-+    BOTSTATE_LOCK_TTL_SEC,
-     CLOSE_AUCTION_END,
-     CLOSE_AUCTION_START,
-     DIAGNOSTIC_MODE,
-     DIAGNOSTIC_ONLY,
-     MARKET_CLOSE_HHMM,
-     MARKET_OPEN_HHMM,
-     MORNING_EXIT_END,
-     MORNING_EXIT_START,
-     MORNING_WINDOW_END,
-     MORNING_WINDOW_START,
-     PB1_FORCE_ENTRY_ON_PUSH,
-     PB1_MAX_WAIT_FOR_WINDOW_MIN,
-     PB1_WAIT_FOR_WINDOW,
- )
-+from trader.botstate_sync import acquire_lock as acquire_botstate_lock
-+from trader.botstate_sync import persist_run_files, release_lock as release_botstate_lock
-+from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
- from trader.db.engine import make_engine
- from trader.db.lock import release_lock, try_acquire_lock
- from trader.db.migrate import run_migrations
- from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
- from trader.kis_wrapper import KisAPI
- from trader.pb1_engine import PB1Engine
- from trader.time_utils import is_trading_day, now_kst
- from trader.utils.env import env_bool, parse_env_flag, resolve_mode
- from trader.window_router import WindowDecision, decide_window
  
  logger = logging.getLogger(__name__)
  
+ KST = ZoneInfo("Asia/Seoul")
  
- def _parse_hhmm_to_time(hhmm: str) -> dtime:
-     hh, mm = hhmm.split(":")
-     return dtime(hour=int(hh), minute=int(mm))
- 
- 
- def _next_window_start(now: datetime, window_starts: list[dtime]) -> datetime | None:
-     sorted_starts = sorted(window_starts)
-     for start in sorted_starts:
-         if now.time() < start:
-             return now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
-     return None
- 
-@@ -135,128 +140,184 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
-     if status:
-         logger.info(
-             "[SMOKE][PASS] token=%s balance=%s universe=%s pretrade=%s",
-             token_ok,
-             balance_ok,
-             universe_ok,
-             pretrade_ok,
-         )
-     else:
-         logger.warning(
-             "[SMOKE][FAIL] token=%s balance=%s universe=%s pretrade=%s",
-             token_ok,
-             balance_ok,
-             universe_ok,
-             pretrade_ok,
-         )
- 
- 
- def parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
-     parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
-     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
-     return parser.parse_args()
- 
- 
--def main() -> None:
--    args = parse_args()
--    engine = make_engine()
--    run_migrations(engine)
-+def _parse_int_env(name: str, default: int) -> int:
-+    raw = os.getenv(name)
-+    if raw is None:
-+        return default
+ DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
+ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
++DEFAULT_LOCK_TTL_SEC = 240
++DEFAULT_LOCK_RETRY_SEC = 60
++LOCK_RETRY_STEP_SEC = 10
++
++
++def _lock_ttl_sec() -> int:
 +    try:
-+        return int(raw)
-+    except ValueError:
-+        logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
-+        return default
-+
-+
-+def _collect_botstate_files(since_ts: float) -> list[Path]:
-+    base_dir = Path("bot_state")
-+    if not base_dir.exists():
-+        return []
-+    touched: list[Path] = []
-+    for path in base_dir.rglob("*"):
-+        if not path.is_file():
-+            continue
-+        try:
-+            if path.stat().st_mtime >= since_ts:
-+                touched.append(path)
-+        except FileNotFoundError:
-+            continue
-+    return touched
-+
-+
-+def _is_urgent_persist(touched: list[Path]) -> bool:
-+    keywords = {"orders", "fills", "exits_intent"}
-+    for path in touched:
-+        parts = {part.lower() for part in path.parts}
-+        if parts & keywords:
-+            return True
-+    return False
-+
- 
-+def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> Path | None:
-+    worktree_dir = resolve_botstate_worktree_dir()
-+    try:
-+        setup_worktree(Path.cwd(), worktree_dir)
++        return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
 +    except Exception:
-+        logger.exception("[BOTSTATE][SETUP] failed worktree=%s", worktree_dir)
-+        return None
-+    if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
-+        return None
-+    return worktree_dir
++        return DEFAULT_LOCK_TTL_SEC
 +
 +
-+def run_once(
-+    *,
-+    args: argparse.Namespace,
-+    engine,
-+    loop_mode: bool = False,
-+    window: WindowDecision | None = None,
-+) -> tuple[list[Path], bool]:
-     now = _get_now_kst()
-     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
-     event_name_lower = event_name.lower()
-     trading_day = True if smoke_enabled else is_trading_day(now)
-     diag_env_flag = (
-         env_bool("DIAGNOSTIC_FORCE_RUN", False)
-         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
-         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
-     )
-     open_dt, close_dt = _market_session(now)
-     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
-     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
--    window = decide_window(now=now, override=args.window)
-+    window = window or decide_window(now=now, override=args.window)
-     window_name_for_log = window.name if window else "none"
-     phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
++def _lock_retry_total_sec() -> int:
++    try:
++        return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
++    except Exception:
++        return DEFAULT_LOCK_RETRY_SEC
  
-     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
-     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
-     os.environ.setdefault("MORNING_EXIT_START", MORNING_EXIT_START)
-     os.environ.setdefault("MORNING_EXIT_END", MORNING_EXIT_END)
-     os.environ.setdefault("AFTERNOON_WINDOW_START", AFTERNOON_WINDOW_START)
-     os.environ.setdefault("AFTERNOON_WINDOW_END", AFTERNOON_WINDOW_END)
-     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
-     os.environ.setdefault("CLOSE_AUCTION_END", CLOSE_AUCTION_END)
  
--    action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
--    logger.info(
--        "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=%s target_start=%s max_wait_s=%s window=%s phase=%s allow_wait=%s",
--        event_name_lower or "unknown",
--        now.isoformat(),
--        trading_day,
--        action,
--        target_start.isoformat() if target_start else "none",
--        max_wait_s,
--        window_name_for_log,
--        phase_for_log,
--        allow_wait,
--    )
-+    action = "run"
-+    target_start = None
-+    if not loop_mode:
-+        action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
-+        logger.info(
-+            "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=%s target_start=%s max_wait_s=%s window=%s phase=%s allow_wait=%s",
-+            event_name_lower or "unknown",
-+            now.isoformat(),
-+            trading_day,
-+            action,
-+            target_start.isoformat() if target_start else "none",
-+            max_wait_s,
-+            window_name_for_log,
-+            phase_for_log,
-+            allow_wait,
-+        )
+ def resolve_botstate_worktree_dir() -> Path:
+     return Path(os.getenv(BOTSTATE_WORKTREE_DIR_ENV, DEFAULT_BOTSTATE_WORKTREE_DIR)).resolve()
  
--    if action == "wait" and target_start:
--        while True:
--            now = _get_now_kst()
--            remaining = (target_start - now).total_seconds()
--            if remaining <= 0:
--                break
--            if remaining > max_wait_s:
--                logger.info(
--                    "[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=0 reason=exceeds_max",
--                    now.isoformat(),
--                    target_start.isoformat(),
--                )
--                action = "smoke"
--                break
--            sleep_for = remaining if remaining < 30 else min(60, remaining)
--            logger.info("[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=%.0f", now.isoformat(), target_start.isoformat(), sleep_for)
--            time_mod.sleep(sleep_for)
--        if action == "wait":
--            now = _get_now_kst()
--            trading_day = True if smoke_enabled else is_trading_day(now)
--            window = decide_window(now=now, override=args.window)
--            window_name_for_log = window.name if window else "none"
--            phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
--            action = "run" if trading_day else "smoke"
--            logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_name_for_log, phase_for_log)
-+        if action == "wait" and target_start:
-+            while True:
-+                now = _get_now_kst()
-+                remaining = (target_start - now).total_seconds()
-+                if remaining <= 0:
-+                    break
-+                if remaining > max_wait_s:
-+                    logger.info(
-+                        "[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=0 reason=exceeds_max",
-+                        now.isoformat(),
-+                        target_start.isoformat(),
-+                    )
-+                    action = "smoke"
-+                    break
-+                sleep_for = remaining if remaining < 30 else min(60, remaining)
-+                logger.info("[PB1][WAIT] now_kst=%s next_open_kst=%s sleeping_s=%.0f", now.isoformat(), target_start.isoformat(), sleep_for)
-+                time_mod.sleep(sleep_for)
-+            if action == "wait":
-+                now = _get_now_kst()
-+                trading_day = True if smoke_enabled else is_trading_day(now)
-+                window = decide_window(now=now, override=args.window)
-+                window_name_for_log = window.name if window else "none"
-+                phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
-+                action = "run" if trading_day else "smoke"
-+                logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_name_for_log, phase_for_log)
-+    elif not trading_day:
-+        logger.info("[PB1][LOOP] non-trading-day -> skip")
-+        return [], False
  
-     if action == "smoke":
-         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
--        return
-+        return [], False
- 
-     if not window:
-         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
--        return
-+        return [], False
- 
-     non_trading_day = not trading_day
-     force_diag = diag_env_flag
- 
-     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
-     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
-     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
-     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-     mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-     dry_run_reasons: list[str] = []
-     diag_enabled = force_diag
-     if diag_enabled:
-         dry_run_reasons.append("diagnostic_mode")
-     if mode == "INTENT_ONLY":
-         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
-     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
-         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
-     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
-     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
-     dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
-     if not live_trading_flag.value and mode == "LIVE":
-         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
-     if dry_run_flag.value:
-         dry_run_reasons.append("DRY_RUN=1")
-     for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
-@@ -344,87 +405,210 @@ def main() -> None:
-         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
-         event_name_lower or "unknown",
-         now.isoformat(),
-         trading_day,
-         window_name_for_log,
-         phase_for_log,
-         dry_run,
-         os.getenv("DISABLE_LIVE_TRADING"),
-         os.getenv("LIVE_TRADING_ENABLED"),
-         os.getenv("STRATEGY_MODE"),
-         os.getenv("PB1_ENTRY_ENABLED"),
-         dry_run_reasons or ["live"],
-     )
- 
-     if non_trading_day:
-         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
-         if diag_enabled:
-             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
- 
-     owner = os.getenv("GITHUB_ACTOR", "local")
-     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-     lock_key = f"PB1:{kis_env_raw or 'practice'}"
-     lock_acquired = try_acquire_lock(engine, lock_key)
-     if not lock_acquired:
-         logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, owner, workflow_run_id)
--        return
-+        return [], False
- 
-     runs_repo = RunsRepo(engine)
-     universe_repo = UniverseRepo(engine)
-     orders_repo = OrdersRepo(engine)
-     fills_repo = FillsRepo(engine)
-     positions_repo = PositionsRepo(engine)
- 
-     run_record_id = None
-+    did_work = False
-+    touched_files: list[Path] = []
-+    run_start_ts = time_mod.time()
+ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
      try:
-         kis: KisAPI | None = None
-         try:
-             kis = KisAPI()
-             if kis.env != kis_env:
-                 dry_run_reasons.append("kis_env_mismatch")
-                 dry_run = True
-                 _apply_env_flags(dry_run)
-         except Exception:
-             logger.exception("[PB1] KIS init failed, forcing dry-run")
-             dry_run_reasons.append("kis_init_failed")
-             dry_run = True
-             _apply_env_flags(dry_run)
- 
-         run_record_id = runs_repo.start_run(
-             env=kis_env or "practice",
-             strategy="pb1_pullback_close",
-             run_window=window_name_for_log,
-             phase=phase_override_arg,
-             event_name=event_name_lower,
-             dry_run=dry_run,
-             git_sha=os.getenv("GITHUB_SHA"),
-             workflow=os.getenv("GITHUB_WORKFLOW"),
-             workflow_run_id=workflow_run_id,
-             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-             config_json={"dry_run_reasons": dry_run_reasons, "run_window": window_name_for_log, "phase": phase_for_log},
+         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+     except subprocess.CalledProcessError as exc:
+         logger.error(
+             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
+             exc.cmd,
+             cwd,
+             exc.returncode,
+             exc.stdout,
+             exc.stderr,
          )
+         raise
  
-         engine_runner = PB1Engine(
-             universe_repo=universe_repo,
-             orders_repo=orders_repo,
-             fills_repo=fills_repo,
-             positions_repo=positions_repo,
+ 
+ def git_porcelain(worktree_dir: Path) -> str:
+     return _git(worktree_dir, "status", "--porcelain").stdout
+ 
+ 
+@@ -71,79 +88,114 @@ def _git(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.Compl
+ 
+ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+     base_dir_resolved = base_dir.resolve()
+     worktree_dir_resolved = worktree_dir.resolve()
+     for path in {base_dir_resolved, worktree_dir_resolved}:
+         _run(["git", "config", "--global", "--add", "safe.directory", str(path)])
+ 
+ 
+ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
+     base_dir = base_dir.resolve()
+     worktree_dir = worktree_dir.resolve()
+     worktree_dir.mkdir(parents=True, exist_ok=True)
+     _configure_safe_directories(base_dir, worktree_dir)
+     try:
+         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+     except subprocess.CalledProcessError:
+         _run(["git", "fetch", "origin", f"{target_branch}:{target_branch}"], cwd=base_dir)
+         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+     _git(worktree_dir, "pull", "--rebase")
+ 
+ 
+ def _lock_path(worktree_dir: Path) -> Path:
+     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
+ 
+ 
+-def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int = 900) -> bool:
++def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+-    now = datetime.now(tz=KST)
+-    if lock_path.exists():
+-        try:
+-            payload = json.loads(lock_path.read_text())
+-            ts = datetime.fromisoformat(payload.get("ts"))
+-            ttl = int(payload.get("ttl_sec") or ttl_sec)
+-            if ts + timedelta(seconds=ttl) > now:
+-                logger.warning("[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s", payload.get("owner"), payload.get("run_id"), ts + timedelta(seconds=ttl))
+-                return False
+-        except Exception:
+-            pass
+-    lock_payload = {
+-        "owner": owner,
+-        "run_id": run_id,
+-        "ts": now.isoformat(),
+-        "ttl_sec": ttl_sec,
+-    }
+-    temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
+-    temp_path.write_text(json.dumps(lock_payload))
+-    temp_path.replace(lock_path)
+-    lock_rel_path = lock_path.relative_to(worktree_dir)
+-    _git(worktree_dir, "add", str(lock_rel_path))
+-    push_retry(worktree_dir, message=f"lock run_id={run_id}")
+-    logger.info("[BOTSTATE][LOCK-ACQUIRED] owner=%s run_id=%s", owner, run_id)
+-    return True
++    ttl_env = _lock_ttl_sec()
++    ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
++    retry_total_sec = max(0, _lock_retry_total_sec())
++    attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
++
++    for attempt in range(1, attempts + 1):
++        now = datetime.now(tz=KST)
++        locked = False
++        stale_takeover = False
++        if lock_path.exists():
++            try:
++                payload = json.loads(lock_path.read_text())
++                ts_raw = payload.get("ts")
++                ts = datetime.fromisoformat(ts_raw) if ts_raw else None
++                ttl = int(payload.get("ttl_sec") or ttl_sec)
++                if ts is None:
++                    stale_takeover = True
++                else:
++                    until = ts + timedelta(seconds=ttl)
++                    if until > now:
++                        locked = True
++                        logger.warning(
++                            "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
++                            payload.get("owner"),
++                            payload.get("run_id"),
++                            until,
++                        )
++                    else:
++                        stale_takeover = True
++                if stale_takeover:
++                    logger.warning(
++                        "[BOTSTATE][STALE_TAKEOVER] owner=%s run_id=%s",
++                        payload.get("owner"),
++                        payload.get("run_id"),
++                    )
++            except Exception as exc:
++                logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
++                stale_takeover = True
++
++        if not locked:
++            lock_payload = {
++                "owner": owner,
++                "run_id": run_id,
++                "ts": now.isoformat(),
++                "ttl_sec": ttl_sec,
++            }
++            temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
++            temp_path.write_text(json.dumps(lock_payload))
++            temp_path.replace(lock_path)
++            lock_rel_path = lock_path.relative_to(worktree_dir)
++            _git(worktree_dir, "add", str(lock_rel_path))
++            push_retry(worktree_dir, message=f"lock run_id={run_id}")
++            logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
++            return True
++
++        if attempt < attempts:
++            logger.info("[BOTSTATE][RETRY] attempt=%s total=%s sleep=%s", attempt, attempts, LOCK_RETRY_STEP_SEC)
++            time.sleep(LOCK_RETRY_STEP_SEC)
++
++    return False
+ 
+ 
+ def release_lock(worktree_dir: Path, run_id: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     if lock_path.exists():
+         lock_path.unlink()
+         lock_rel_path = lock_path.relative_to(worktree_dir)
+         _git(worktree_dir, "add", "-u", str(lock_rel_path))
+         push_retry(worktree_dir, message=f"unlock run_id={run_id}")
+         logger.info("[BOTSTATE][LOCK-RELEASED] run_id=%s", run_id)
+ 
+ 
+ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     files = list(new_files)
+     for path in files:
+         try:
+             if path.resolve().is_relative_to(worktree_dir.resolve()):
+                 target = path.resolve()
+             else:
+                 if "bot_state" in path.parts:
+                     idx = path.parts.index("bot_state")
+                     rel = Path(*path.parts[idx:])
+                 else:
+diff --git a/trader/config.py b/trader/config.py
+index e646ba2f39be7234aa29a1e510d858fe7b7470e1..3abd54b8357a9a50f451c87d0619aebfe79bda4f 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -97,51 +97,51 @@ CONFIG = {
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "trader/state/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+-    "BOTSTATE_LOCK_TTL_SEC": "1800",
++    "BOTSTATE_LOCK_TTL_SEC": "240",
+     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+     "PB1_ENTRY_ENABLED": "true",
+     "MORNING_WINDOW_START": "08:50",
+     "MORNING_WINDOW_END": "11:00",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+     "AFTERNOON_WINDOW_START": "14:00",
+     "AFTERNOON_WINDOW_END": "15:30",
+     "CLOSE_AUCTION_START": "15:20",
+     "CLOSE_AUCTION_END": "15:30",
+     "PB1_REQUIRE_VOLUME": "1",
+     "PB1_FORCE_ENTRY_ON_PUSH": "1",
+     "PB1_WAIT_FOR_WINDOW": "1",
+     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
+     "MARKET_OPEN_HHMM": "08:50",
+     "MARKET_CLOSE_HHMM": "15:30",
+     "PB1_PULLBACK_BAND_KOSPI": "3,8",
+     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
+     "PB1_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_SWING_TREND_MIN": "1.05",
+     "PB1_SWING_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_SWING_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_R_FLOOR_PCT": "2.0",
+     "PB1_DAY_TP_R": "0.8",
+@@ -402,51 +402,51 @@ def resolve_active_strategies(raw: str | None = None) -> set[int]:
+     return ACTIVE_STRATEGIES
+ 
+ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+ BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+ NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
+ 
+ 
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+ DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
+ PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
+ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+-BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "900")
++BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "11:00"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "14:00"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+ PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
+ PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
+ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
+ PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
+ MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
+ MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+ PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
+ PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
+ PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index f3c2bc6135967dc6b86373bf6c79a8ce6e56ccef..a4dbdd161505e32e213c28e65d62297611092dc2 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -475,138 +475,153 @@ def run_once(
              kis=kis,
              window=window,
              phase_override=phase_override_arg,
@@ -622,9 +695,9 @@ index e2b8e68f9fc351853a02e5618513177cd77a59b7..f3c2bc6135967dc6b86373bf6c79a8ce
              run_id=run_record_id,
          )
          result = engine_runner.run()
-+        did_work = True
+         did_work = True
          runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
-+        touched_files = _collect_botstate_files(run_start_ts)
+         touched_files = _collect_botstate_files(run_start_ts)
      except Exception as exc:
          logger.exception("[PB1][FAIL] unexpected error")
          if run_record_id:
@@ -632,126 +705,305 @@ index e2b8e68f9fc351853a02e5618513177cd77a59b7..f3c2bc6135967dc6b86373bf6c79a8ce
          raise
      finally:
          release_lock(engine, lock_key)
-+    return touched_files, did_work
-+
-+
-+def _run_loop(*, args: argparse.Namespace, engine) -> None:
-+    loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-+    persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-+    loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
-+    now = _get_now_kst()
-+    _, close_dt = _market_session(now)
-+    logger.info(
-+        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s",
-+        loop_interval,
-+        persist_interval,
-+        close_dt.isoformat(),
-+    )
-+
-+    owner = os.getenv("GITHUB_ACTOR", "local")
-+    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-+    seconds_until_close = max(0.0, (close_dt - now).total_seconds())
-+    ttl_sec = max(BOTSTATE_LOCK_TTL_SEC, int(seconds_until_close) + 600)
-+    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-+    if botstate_worktree is None:
-+        logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
-+        return
-+
-+    pending_touched: dict[Path, Path] = {}
-+    last_persist_ts = 0.0
-+    loop_started_ts = time_mod.time()
-+    try:
-+        while True:
-+            now = _get_now_kst()
-+            if now >= close_dt:
-+                logger.info("[PB1][LOOP] market closed -> exit")
-+                break
-+            if loop_max_minutes > 0:
-+                elapsed_min = (time_mod.time() - loop_started_ts) / 60
-+                if elapsed_min >= loop_max_minutes:
-+                    logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
-+                    break
-+            window = decide_window(now=now, override=args.window)
-+            if window is None:
-+                next_start = _next_window_start(
-+                    now,
-+                    [
-+                        _parse_hhmm_to_time(MORNING_WINDOW_START),
-+                        _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-+                        _parse_hhmm_to_time(CLOSE_AUCTION_START),
-+                    ],
-+                )
-+                if next_start:
-+                    sleep_for = (next_start - now).total_seconds()
-+                else:
-+                    sleep_for = loop_interval
-+                sleep_for = max(5.0, min(300.0, sleep_for))
-+                logger.info(
-+                    "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
-+                    sleep_for,
-+                    next_start.isoformat() if next_start else "unknown",
-+                )
-+                time_mod.sleep(sleep_for)
-+                continue
-+
-+            logger.info("[PB1][LOOP] tick window=%s phase=%s", window.name, window.phase)
-+            touched, _did_work = run_once(args=args, engine=engine, loop_mode=True, window=window)
-+            for path in touched:
-+                pending_touched[path] = path
-+            if pending_touched:
-+                now_ts = time_mod.time()
-+                urgent = _is_urgent_persist(list(pending_touched.values()))
-+                if urgent or (now_ts - last_persist_ts >= persist_interval):
-+                    persist_run_files(
-+                        botstate_worktree,
-+                        list(pending_touched.values()),
-+                        message=f"pb1 loop {now.isoformat()}",
-+                    )
-+                    pending_touched.clear()
-+                    last_persist_ts = now_ts
-+            time_mod.sleep(loop_interval)
-+    finally:
-+        if pending_touched:
-+            persist_run_files(
-+                botstate_worktree,
-+                list(pending_touched.values()),
-+                message=f"pb1 loop {now_kst().isoformat()}",
-+            )
-+        release_botstate_lock(botstate_worktree, workflow_run_id)
-+
-+
-+def main() -> None:
-+    args = parse_args()
-+    engine = make_engine()
-+    run_migrations(engine)
-+
-+    smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-+    run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
-+    if run_loop and not smoke_enabled:
-+        _run_loop(args=args, engine=engine)
-+        return
-+    if smoke_enabled:
-+        run_once(args=args, engine=engine, loop_mode=False, window=None)
-+        return
-+
-+    owner = os.getenv("GITHUB_ACTOR", "local")
-+    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-+    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
-+    if botstate_worktree is None:
-+        logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
-+        return
-+    try:
-+        touched, _did_work = run_once(args=args, engine=engine, loop_mode=False, window=None)
-+        if touched:
-+            persist_run_files(
-+                botstate_worktree,
-+                touched,
-+                message=f"pb1 run {now_kst().isoformat()}",
-+            )
-+    finally:
-+        release_botstate_lock(botstate_worktree, workflow_run_id)
+     return touched_files, did_work
  
  
- if __name__ == "__main__":
-     main()
+ def _run_loop(*, args: argparse.Namespace, engine) -> None:
+     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
+     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
+     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
++    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+     now = _get_now_kst()
+     _, close_dt = _market_session(now)
++    if run_loop_minutes > 0:
++        loop_max_minutes = run_loop_minutes
++        persist_interval = max(120, min(persist_interval, 240))
+     logger.info(
+-        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s",
++        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
+         loop_interval,
+         persist_interval,
+         close_dt.isoformat(),
++        loop_max_minutes,
+     )
++    logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+-    seconds_until_close = max(0.0, (close_dt - now).total_seconds())
+-    ttl_sec = max(BOTSTATE_LOCK_TTL_SEC, int(seconds_until_close) + 600)
++    ttl_sec = BOTSTATE_LOCK_TTL_SEC
+     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+     if botstate_worktree is None:
+         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
+         return
+ 
+     pending_touched: dict[Path, Path] = {}
+     last_persist_ts = 0.0
+     loop_started_ts = time_mod.time()
++    exit_reason = "unknown"
+     try:
+         while True:
+             now = _get_now_kst()
+             if now >= close_dt:
+                 logger.info("[PB1][LOOP] market closed -> exit")
++                exit_reason = "market_closed"
+                 break
+             if loop_max_minutes > 0:
+                 elapsed_min = (time_mod.time() - loop_started_ts) / 60
+                 if elapsed_min >= loop_max_minutes:
+                     logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
++                    exit_reason = "loop_timeout"
+                     break
+             window = decide_window(now=now, override=args.window)
+             if window is None:
+                 next_start = _next_window_start(
+                     now,
+                     [
+                         _parse_hhmm_to_time(MORNING_WINDOW_START),
+                         _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
+                         _parse_hhmm_to_time(CLOSE_AUCTION_START),
+                     ],
+                 )
+                 if next_start:
+                     sleep_for = (next_start - now).total_seconds()
+                 else:
+                     sleep_for = loop_interval
+                 sleep_for = max(5.0, min(300.0, sleep_for))
+                 logger.info(
+                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
+                     sleep_for,
+                     next_start.isoformat() if next_start else "unknown",
+                 )
+                 time_mod.sleep(sleep_for)
+                 continue
+ 
+             logger.info("[PB1][LOOP] tick window=%s phase=%s", window.name, window.phase)
+             touched, _did_work = run_once(args=args, engine=engine, loop_mode=True, window=window)
+             for path in touched:
+                 pending_touched[path] = path
+             if pending_touched:
+                 now_ts = time_mod.time()
+                 urgent = _is_urgent_persist(list(pending_touched.values()))
+                 if urgent or (now_ts - last_persist_ts >= persist_interval):
+                     persist_run_files(
+                         botstate_worktree,
+                         list(pending_touched.values()),
+                         message=f"pb1 loop {now.isoformat()}",
+                     )
+                     pending_touched.clear()
+                     last_persist_ts = now_ts
+             time_mod.sleep(loop_interval)
+     finally:
++        elapsed = time_mod.time() - loop_started_ts
++        if exit_reason == "unknown":
++            exit_reason = "shutdown"
+         if pending_touched:
+             persist_run_files(
+                 botstate_worktree,
+                 list(pending_touched.values()),
+                 message=f"pb1 loop {now_kst().isoformat()}",
+             )
+         release_botstate_lock(botstate_worktree, workflow_run_id)
++        logger.info("[PB1][EXIT] reason=%s elapsed=%.1fs", exit_reason, elapsed)
+ 
+ 
+ def main() -> None:
+     args = parse_args()
+     engine = make_engine()
+     run_migrations(engine)
+ 
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
++    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
++    if run_loop_minutes > 0:
++        run_loop = True
+     if run_loop and not smoke_enabled:
+         _run_loop(args=args, engine=engine)
+         return
+     if smoke_enabled:
+         run_once(args=args, engine=engine, loop_mode=False, window=None)
+         return
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
+     if botstate_worktree is None:
+         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
+         return
+     try:
+         touched, _did_work = run_once(args=args, engine=engine, loop_mode=False, window=None)
+         if touched:
+             persist_run_files(
+                 botstate_worktree,
+                 touched,
+                 message=f"pb1 run {now_kst().isoformat()}",
+             )
+     finally:
+         release_botstate_lock(botstate_worktree, workflow_run_id)
+ 
+ 
+diff --git a/trader/universe/providers/krx_provider.py b/trader/universe/providers/krx_provider.py
+index 16e0fa3a629d7a18c0891dddacf135b4951585cb..6a60be431640a37c5c68bf852167e65aa6401bde 100644
+--- a/trader/universe/providers/krx_provider.py
++++ b/trader/universe/providers/krx_provider.py
+@@ -1,137 +1,152 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from datetime import date, datetime, timedelta
+ from typing import Any, Iterable
+ 
+ import pandas as pd
+ import requests
+ from pykrx.stock import get_market_cap_by_ticker
+ 
+ from trader.universe.krx_safe import patch_pykrx_logging
+ 
+ logger = logging.getLogger(__name__)
+ 
+ REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
+ NAME_COLUMNS = ("종목명", "Name", "name")
+-MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "2"))
++MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "5"))
++MAX_ROLLBACK_DAYS = int(os.getenv("KRX_MAX_ROLLBACK_DAYS", "3"))
++MAX_ATTEMPTS = int(os.getenv("KRX_MAX_ATTEMPTS", "5"))
+ 
+ 
+ class EmptyDataFrame(Exception):
+     """Raised when pykrx returns an empty dataframe."""
+ 
+ 
+ def safe_get_market_cap_by_ticker(date_str: str, market: str) -> pd.DataFrame:
+     patch_pykrx_logging()
+     try:
+         return get_market_cap_by_ticker(date_str, market=market)
+     except (
+         requests.exceptions.JSONDecodeError,
+         json.JSONDecodeError,
+         IndexError,
+         KeyError,
+         ValueError,
+         requests.RequestException,
+     ) as e:
+         logger.warning("KRX fetch failed for %s %s: %s", market, date_str, repr(e))
+         return pd.DataFrame()
+     except Exception as e:  # pragma: no cover - unexpected edge cases
+         logger.warning("KRX fetch failed for %s %s (unexpected): %s", market, date_str, repr(e))
+         return pd.DataFrame()
+ 
+ 
+ def _prev_business_day(d: date) -> date:
+     prev = d - timedelta(days=1)
+     while prev.weekday() >= 5:
+         prev -= timedelta(days=1)
+     return prev
+ 
+ 
+ def _has_any_column(df: pd.DataFrame, candidates: Iterable[str]) -> bool:
+     cols = set(df.columns)
+     return any(c in cols for c in candidates)
+ 
+ 
+ def _validate_krx_df(df: pd.DataFrame) -> bool:
+     if df is None or df.empty:
+         return False
+     if not _has_any_column(df, REQUIRED_CAP_COLUMNS):
+         return False
++    if not _has_any_column(df, NAME_COLUMNS):
++        return False
+     return True
+ 
+ 
+ def _log_failure(market: str, requested_as_of: str, used_as_of: str, attempt_idx: int, total_attempts: int, exc: Exception, df: pd.DataFrame | None = None) -> None:
+     preview = ""
+     try:
+         if df is not None and not df.empty:
+             cols = list(df.columns)
+             preview = f"cols={cols[:10]}"
+     except Exception:
+         preview = ""
+     logger.warning(
+         "[KRX][FAIL] market=%s requested_as_of=%s used_as_of=%s attempt=%s/%s exc=%s msg=%s %s",
+         market,
+         requested_as_of,
+         used_as_of,
+         attempt_idx,
+         total_attempts,
+         exc.__class__.__name__,
+         exc,
+         preview,
+     )
+ 
+ 
+-def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: int = 7) -> tuple[pd.DataFrame, date, str]:
++def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: int | None = None) -> tuple[pd.DataFrame, date, str]:
+     patch_pykrx_logging()
+     if os.getenv("KRX_DISABLE", "0") in {"1", "true", "TRUE"}:
+         raise RuntimeError("KRX_DISABLE=1")
+     if isinstance(as_of_date, str):
+         try:
+             base_date = datetime.fromisoformat(as_of_date).date()
+         except Exception:
+             base_date = datetime.strptime(as_of_date, "%Y%m%d").date()
+     else:
+         base_date = as_of_date
+ 
++    max_rollback_days = MAX_ROLLBACK_DAYS if max_rollback_days is None else max_rollback_days
+     attempts = [base_date]
+     cursor = base_date
+-    for _ in range(max(0, int(max_rollback_days))):
++    rollback_steps = 0
++    while rollback_steps < max(0, int(max_rollback_days)) and len(attempts) < max(1, MAX_ATTEMPTS):
+         cursor = _prev_business_day(cursor)
+         attempts.append(cursor)
++        rollback_steps += 1
+ 
+     requested_as_of = base_date.isoformat()
+     last_reason = "unknown"
+     failure_counts: dict[str, int] = {}
+     for idx, attempt in enumerate(attempts, start=1):
+         used_as_of = attempt.isoformat()
+         try:
+-            df = get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
++            df = safe_get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
+             if not _validate_krx_df(df):
+-                raise EmptyDataFrame(f"empty_or_missing_cols cols={list(df.columns)}")
++                logger.warning(
++                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s cols=%s rows=%s",
++                    market,
++                    requested_as_of,
++                    used_as_of,
++                    list(df.columns),
++                    len(df) if df is not None else 0,
++                )
++                raise EmptyDataFrame("empty_or_missing_cols")
+             used_reason = "ok" if attempt == base_date else "rolled_back"
+             logger.info(
+                 "[KRX][ROLLBACK][OK] market=%s used_as_of=%s requested_as_of=%s rows=%s attempts=%s reason=%s",
+                 market,
+                 used_as_of,
+                 requested_as_of,
+                 len(df) if df is not None else 0,
+                 idx,
+                 len(attempts),
+                 used_reason,
+             )
+             return df, attempt, used_reason
+         except (
+             ValueError,
+             KeyError,
+             json.JSONDecodeError,
+             requests.exceptions.JSONDecodeError,
+             requests.RequestException,
+             EmptyDataFrame,
+         ) as exc:  # pragma: no cover - network/remote failure
+             last_reason = exc.__class__.__name__
+             failure_counts[last_reason] = failure_counts.get(last_reason, 0) + 1
+             _log_failure(market, requested_as_of, used_as_of, idx, len(attempts), exc)
+             if failure_counts[last_reason] >= MAX_REPEAT_FAIL:
+                 logger.warning(
+
 

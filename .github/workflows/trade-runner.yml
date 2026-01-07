@@ -1,239 +1,160 @@
-name: PB1 Trade Runner
+name: "Trade Runner (5min tick: LIVE during market, DIAG otherwise)"
 
 permissions:
   contents: write
 
+# ✅ 레포 전체에서 공유되는 concurrency group (다른 워크플로도 동일 group이면 서로 겹침 방지됨)
 concurrency:
-  group: pb1-trade-runner
-  cancel-in-progress: false
+  group: trade-bot-state
+  cancel-in-progress: true
 
 on:
-  push:
-    branches: [ main, nullim ]
-    paths-ignore:
-      - "bot_state/**"
-
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Run mode (loop=LIVE loop, smoke=precheck only)"
-        default: "loop"
-        type: choice
-        options: [loop, smoke]
+      force_mode:
+        description: "auto|live|diag"
         required: false
-      phase:
-        description: "Runner phase (auto/entry/exit/verify)"
         default: "auto"
-        type: choice
-        options: [auto, entry, exit, verify]
-        required: false
 
   schedule:
-    # KST Mon-Fri 08:50 = UTC Sun-Thu 23:50
-    - cron: "50 23 * * 0-4"
+    # =========================
+    # KST 장중 5분 tick (UTC로 변환)
+    # KST 08:50~08:55 => UTC 23:50~23:55 (Sun~Thu UTC)
+    - cron: "50-59/5 23 * * 0-4"
+    # KST 09:00~14:55 => UTC 00:00~05:55 (Mon~Fri UTC)
+    - cron: "*/5 0-5 * * 1-5"
+    # KST 15:00~15:30 => UTC 06:00~06:30 (Mon~Fri UTC)
+    - cron: "0-30/5 6 * * 1-5"
+    # 주말 DIAG는 과도하지 않게 30분 주기
+    - cron: "*/30 * * * 0,6"
+
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  run-trade-smoke:
-    name: PB1 Smoke (manual only)
-    if: >
-      github.ref != 'refs/heads/bot-state' &&
-      github.ref != 'refs/heads/bot_state' &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'smoke'
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      STRATEGY_MODE: "LIVE"
-      LIVE_TRADING_ENABLED: "1"
-      DISABLE_LIVE_TRADING: "0"
-      DRY_RUN: "0"
-      EXPECT_LIVE_TRADING: "1"
-      EXPECT_KIS_ENV: "practice"
-
-      PB1_ENTRY_ENABLED: "1"
-      PB1_SMOKE_RUN: "1"
-      PB1_RUN_LOOP: "0"
-      PB1_ALLOW_WAIT: "0"
-
-      KIS_ENV: "practice"
-      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
-
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-
-      STATE_RECONCILE_APPLY: "1"
-
-      MORNING_WINDOW_START: "08:50"
-      MORNING_WINDOW_END: "11:00"
-      MORNING_EXIT_START: "09:00"
-      MORNING_EXIT_END: "09:20"
-      AFTERNOON_WINDOW_START: "14:00"
-      AFTERNOON_WINDOW_END: "15:30"
-      CLOSE_AUCTION_START: "15:20"
-      CLOSE_AUCTION_END: "15:30"
-      MARKET_OPEN_HHMM: "08:50"
-      MARKET_CLOSE_HHMM: "15:30"
-
-      PB1_WAIT_FOR_WINDOW: "1"
-      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-
-      PYTHONUNBUFFERED: "1"
+    timeout-minutes: 12
 
     steps:
-      - uses: actions/checkout@v4
+      - name: "Checkout"
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set git identity
-        run: |
-          git config user.name "trade-bot"
-          git config user.email "trade-bot@users.noreply.github.com"
-
-      - uses: actions/setup-python@v5
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: "Install deps"
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Configure run mode
-        run: |
-          echo "RUN_PHASE=${{ inputs.phase || 'auto' }}" >> $GITHUB_ENV
-          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
-
-      - name: Run DB migrations
-        run: |
-          python -m trader.db.migrate
-
-      - name: Build Universe (best-effort)
-        run: |
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
-
-      - name: Compile modules
-        run: |
-          python -m compileall trader
-
-      - name: Run PB1 (smoke)
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
-
-
-  run-trade-loop:
-    name: PB1 Live Loop
-    if: >
-      github.ref != 'refs/heads/bot-state' &&
-      github.ref != 'refs/heads/bot_state' &&
-      (
-        github.event_name == 'push' ||
-        github.event_name == 'schedule' ||
-        (github.event_name == 'workflow_dispatch' && inputs.mode == 'loop')
-      )
-    runs-on: ubuntu-latest
-    timeout-minutes: 480
-
-    env:
-      STRATEGY_MODE: "LIVE"
-      LIVE_TRADING_ENABLED: "1"
-      DISABLE_LIVE_TRADING: "0"
-      DRY_RUN: "0"
-      EXPECT_LIVE_TRADING: "1"
-      EXPECT_KIS_ENV: "practice"
-
-      PB1_ENTRY_ENABLED: "1"
-      PB1_SMOKE_RUN: "0"
-      PB1_RUN_LOOP: "1"
-      PB1_ALLOW_WAIT: "1"
-      PB1_LOOP_INTERVAL_SEC: "60"
-      PB1_PERSIST_INTERVAL_SEC: "300"
-      BOTSTATE_LOCK_TTL_SEC: "21600"
-
-      KIS_ENV: "practice"
-      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
-
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      APP_KEY: ${{ secrets.KIS_APP_KEY != '' && secrets.KIS_APP_KEY || secrets.APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET != '' && secrets.KIS_APP_SECRET || secrets.APP_SECRET }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-
-      STATE_RECONCILE_APPLY: "1"
-
-      MORNING_WINDOW_START: "08:50"
-      MORNING_WINDOW_END: "11:00"
-      MORNING_EXIT_START: "09:00"
-      MORNING_EXIT_END: "09:20"
-      AFTERNOON_WINDOW_START: "14:00"
-      AFTERNOON_WINDOW_END: "15:30"
-      CLOSE_AUCTION_START: "15:20"
-      CLOSE_AUCTION_END: "15:30"
-      MARKET_OPEN_HHMM: "08:50"
-      MARKET_CLOSE_HHMM: "15:30"
-
-      PB1_WAIT_FOR_WINDOW: "1"
-      PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
-
-      PYTHONUNBUFFERED: "1"
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set git identity
-        run: |
-          git config user.name "trade-bot"
-          git config user.email "trade-bot@users.noreply.github.com"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Configure run mode
-        run: |
-          # push/schedule -> auto, workflow_dispatch -> inputs.phase
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RUN_PHASE="${{ inputs.phase }}"
-          else
-            RUN_PHASE="auto"
+          set -euo pipefail
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           fi
-          echo "RUN_PHASE=$RUN_PHASE" >> $GITHUB_ENV
-          echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
 
-      - name: Run DB migrations
-        run: |
-          python -m trader.db.migrate
+      # ✅ 5분 tick에서 “직전 런 결과”를 다음 런이 재사용하도록 캐시
+      - name: "Restore state cache"
+        uses: actions/cache@v4
+        with:
+          path: |
+            trader/state/pbcore.sqlite3
+            trader/state/universe_lkg
+          key: state-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            state-${{ runner.os }}-
 
-      - name: Build Universe (best-effort)
-        run: |
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
-
-      - name: Compile modules
-        run: |
-          python -m compileall trader
-
-      - name: Run PB1 (live loop)
+      - name: "Run (short tick)"
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          KIS_ENV: ${{ secrets.KIS_ENV }}
+          FORCE_MODE: ${{ inputs.force_mode }}
+
+          # ✅ 5분 tick 구조용: botstate lock TTL을 240초로 제한(코드에서 반영)
+          BOTSTATE_LOCK_TTL_SEC: "240"
         run: |
+          set -euo pipefail
+
+          # ---- secrets 선제 체크 ----
+          miss=0
+          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+            v="${!k:-}"
+            if [ -z "$v" ]; then
+              echo "::error::Missing secret/env: $k"
+              miss=1
+            fi
+          done
+          if [ "$miss" = "1" ]; then
+            exit 1
+          fi
+
+          # ---- mode 결정 ----
+          FORCE_MODE="${FORCE_MODE:-auto}"
+          DOW=$(TZ=Asia/Seoul date +%u)   # 1=Mon..7=Sun
+          HM=$(TZ=Asia/Seoul date +%H%M)
+
+          MODE="diag"
+          if [ "$FORCE_MODE" = "live" ]; then
+            MODE="live"
+          elif [ "$FORCE_MODE" = "diag" ]; then
+            MODE="diag"
+          else
+            if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ] && [ "$HM" -ge 0850 ] && [ "$HM" -le 1530 ]; then
+              MODE="live"
+            else
+              MODE="diag"
+            fi
+          fi
+
+          # ---- 5분마다 “짧게 실행 후 종료” ----
+          if [ "$MODE" = "live" ]; then
+            export STRATEGY_MODE="LIVE"
+            export LIVE_TRADING_ENABLED="1"
+            export DISABLE_LIVE_TRADING="0"
+            export DRY_RUN="0"
+            export RUN_PHASE="live"
+            export RUN_LOOP_MINUTES="4"
+          else
+            export STRATEGY_MODE="DIAG"
+            export LIVE_TRADING_ENABLED="0"
+            export DISABLE_LIVE_TRADING="1"
+            export DRY_RUN="1"
+            export RUN_PHASE="diag"
+            export RUN_LOOP_MINUTES="2"
+          fi
+          export ACTIVE_STRATEGIES="1"
+
+          echo "[RUN] MODE=$MODE HM=$HM DOW=$DOW RUN_LOOP_MINUTES=$RUN_LOOP_MINUTES"
+          echo "[RUN] cmd: python -m trader.pb1_runner --window auto --phase ${RUN_PHASE}"
+
+          # ---- Universe는 '전 영업일'로 고정 (장중/장전에도 당일 데이터 비어있는 문제 방지) ----
+          if [ "$DOW" = "1" ]; then
+            ASOF=$(TZ=Asia/Seoul date -d "3 days ago" +%F)
+          elif [ "$DOW" = "7" ]; then
+            ASOF=$(TZ=Asia/Seoul date -d "2 days ago" +%F)
+          elif [ "$DOW" = "6" ]; then
+            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
+          else
+            ASOF=$(TZ=Asia/Seoul date -d "1 day ago" +%F)
+          fi
+          echo "[UNIVERSE] as_of=$ASOF"
+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "${ASOF}" || true
+
+          python -m compileall trader
           python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
 
-          
+      - name: "Save state cache"
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            trader/state/pbcore.sqlite3
+            trader/state/universe_lkg
+          key: state-${{ runner.os }}-${{ github.ref_name }}

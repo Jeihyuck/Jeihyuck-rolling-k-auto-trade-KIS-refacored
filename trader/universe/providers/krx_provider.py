@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
 NAME_COLUMNS = ("종목명", "Name", "name")
-MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "2"))
+MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "5"))
+MAX_ROLLBACK_DAYS = int(os.getenv("KRX_MAX_ROLLBACK_DAYS", "3"))
+MAX_ATTEMPTS = int(os.getenv("KRX_MAX_ATTEMPTS", "5"))
 
 
 class EmptyDataFrame(Exception):
@@ -59,6 +61,8 @@ def _validate_krx_df(df: pd.DataFrame) -> bool:
         return False
     if not _has_any_column(df, REQUIRED_CAP_COLUMNS):
         return False
+    if not _has_any_column(df, NAME_COLUMNS):
+        return False
     return True
 
 
@@ -83,7 +87,7 @@ def _log_failure(market: str, requested_as_of: str, used_as_of: str, attempt_idx
     )
 
 
-def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: int = 7) -> tuple[pd.DataFrame, date, str]:
+def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: int | None = None) -> tuple[pd.DataFrame, date, str]:
     patch_pykrx_logging()
     if os.getenv("KRX_DISABLE", "0") in {"1", "true", "TRUE"}:
         raise RuntimeError("KRX_DISABLE=1")
@@ -95,11 +99,14 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: 
     else:
         base_date = as_of_date
 
+    max_rollback_days = MAX_ROLLBACK_DAYS if max_rollback_days is None else max_rollback_days
     attempts = [base_date]
     cursor = base_date
-    for _ in range(max(0, int(max_rollback_days))):
+    rollback_steps = 0
+    while rollback_steps < max(0, int(max_rollback_days)) and len(attempts) < max(1, MAX_ATTEMPTS):
         cursor = _prev_business_day(cursor)
         attempts.append(cursor)
+        rollback_steps += 1
 
     requested_as_of = base_date.isoformat()
     last_reason = "unknown"
@@ -107,9 +114,17 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days: 
     for idx, attempt in enumerate(attempts, start=1):
         used_as_of = attempt.isoformat()
         try:
-            df = get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
+            df = safe_get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
             if not _validate_krx_df(df):
-                raise EmptyDataFrame(f"empty_or_missing_cols cols={list(df.columns)}")
+                logger.warning(
+                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s cols=%s rows=%s",
+                    market,
+                    requested_as_of,
+                    used_as_of,
+                    list(df.columns),
+                    len(df) if df is not None else 0,
+                )
+                raise EmptyDataFrame("empty_or_missing_cols")
             used_reason = "ok" if attempt == base_date else "rolled_back"
             logger.info(
                 "[KRX][ROLLBACK][OK] market=%s used_as_of=%s requested_as_of=%s rows=%s attempts=%s reason=%s",
