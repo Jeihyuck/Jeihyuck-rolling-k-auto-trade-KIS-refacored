@@ -20,11 +20,16 @@ from trader.config import (
     PB1_TIME_STOP_DAYS,
     PB1_REQUIRE_VOLUME,
     PB1_MIN_CANDLES,
+    PB1_MAX_POSITIONS,
+    PB1_MIN_SCORE,
+    PB1_USE_RISK_PARITY,
+    PB1_MAX_ATR_PCT,
+    PB1_MIN_VALUE20,
 )
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
-from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
+from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup, score_setup
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool
 from trader.window_router import WindowDecision, resolve_phase
@@ -275,25 +280,103 @@ class PB1Engine:
                 logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                 continue
         return candidates
-
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
         ok_list = [c for c in candidates if c.setup_ok]
-        total = len(ok_list)
-        if total <= 0:
+        if not ok_list:
             return candidates
-        capital_per = DAILY_CAPITAL * CAP_CAP / total
+
+        # 1) 점수 계산 + ATR/유동성 컷 + 점수 컷
+        filtered: List[CandidateFeature] = []
         for cf in ok_list:
-            close_px = cf.features.get("close") or 0
-            qty = int(capital_per // close_px) if close_px > 0 else 0
+            try:
+                score = float(score_setup(cf.features, cf.market))
+            except Exception:
+                score = 0.0
+            cf.features["score"] = score
+
+            atr_pct = cf.features.get("atr_pct")
+            value20 = cf.features.get("value20")
+
+            if score < float(PB1_MIN_SCORE):
+                cf.setup_ok = False
+                cf.reasons.append("score_below_cut")
+                continue
+            if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
+                cf.setup_ok = False
+                cf.reasons.append("atr_pct_missing")
+                continue
+            if float(atr_pct) > float(PB1_MAX_ATR_PCT):
+                cf.setup_ok = False
+                cf.reasons.append("atr_pct_too_high")
+                continue
+            if value20 is None or (isinstance(value20, float) and value20 != value20):
+                cf.setup_ok = False
+                cf.reasons.append("value20_missing")
+                continue
+            if float(value20) < float(PB1_MIN_VALUE20):
+                cf.setup_ok = False
+                cf.reasons.append("liquidity_too_low")
+                continue
+
+            filtered.append(cf)
+
+        if not filtered:
+            return candidates
+
+        # 2) 점수 내림차순 Top N 선택
+        filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+        max_n = max(1, int(PB1_MAX_POSITIONS))
+        selected = filtered[:max_n]
+        selected_codes = {c.code for c in selected}
+
+        # 선택되지 않은 나머지는 매수 제외 처리
+        for cf in ok_list:
+            if cf.code not in selected_codes and cf.setup_ok:
+                cf.setup_ok = False
+                cf.reasons.append("not_in_topN")
+
+        # 3) 사이징: 리스크 패리티(ATR) 또는 균등
+        cap_total = float(DAILY_CAPITAL) * float(CAP_CAP)
+
+        if PB1_USE_RISK_PARITY:
+            inv: List[float] = []
+            for cf in selected:
+                atr = float(cf.features.get("atr14") or 0.0)
+                inv.append(1.0 / max(atr, 1e-6))
+            inv_sum = sum(inv) if sum(inv) > 0 else 1.0
+            weights = [x / inv_sum for x in inv]
+        else:
+            weights = [1.0 / len(selected)] * len(selected)
+
+        for cf, w in zip(selected, weights):
+            close_px = float(cf.features.get("close") or 0.0)
+            if close_px <= 0:
+                cf.setup_ok = False
+                cf.reasons.append("close_zero")
+                continue
+
+            capital = cap_total * float(w)
+            qty = int(capital // close_px)
             cf.planned_qty = max(qty, 0)
-            cf.client_order_key = self._client_order_key(
-                cf.code, cf.mode, "BUY", "close", "PB1"
-            )
+            cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+
             if cf.planned_qty <= 0:
                 cf.setup_ok = False
                 cf.reasons.append("planned_qty_zero")
-                self._log_setup(cf)
+
+            logger.info(
+                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s",
+                cf.code,
+                float(cf.features.get("score") or 0.0),
+                float(w),
+                float(capital),
+                cf.planned_qty,
+                float(cf.features.get("atr_pct") or 0.0),
+                cf.features.get("value20"),
+            )
+
         return candidates
+
 
     def _mark_price(self, code: str) -> float | None:
         if self.kis:

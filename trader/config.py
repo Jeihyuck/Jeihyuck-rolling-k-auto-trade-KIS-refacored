@@ -151,6 +151,12 @@ CONFIG = {
     "PB1_SWING_TRAIL_MA": "20",
     "PB1_TIME_STOP_DAYS": "10",
     "PB1_MIN_CANDLES": "60",
+    # PB1 "최고 눌림목" 랭킹/사이징 튜닝
+    "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
+    "PB1_MIN_SCORE": "60",             # 점수 컷(0~100)
+    "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
+    "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
+    "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
 }
 
 
@@ -456,6 +462,12 @@ PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
 PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
 PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
 
+
+PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
+PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or "60")
+PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
+PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
+PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 

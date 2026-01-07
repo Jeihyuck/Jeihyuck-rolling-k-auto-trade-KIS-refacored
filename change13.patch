@@ -1,486 +1,275 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index fb28d8049da9994f79a82d3cbdc84cb89c3f82a3..ef6d86a402a815e148d886ab0dfbe70d66db8df3 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -1,87 +1,136 @@
--name: Trade Runner
-+name: Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -151,6 +151,12 @@
+     "PB1_SWING_TRAIL_MA": "20",
+     "PB1_TIME_STOP_DAYS": "10",
+     "PB1_MIN_CANDLES": "60",
++    # PB1 "최고 눌림목" 랭킹/사이징 튜닝
++    "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
++    "PB1_MIN_SCORE": "60",             # 점수 컷(0~100)
++    "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
++    "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
++    "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
+ }
  
- permissions:
-   contents: write
  
- concurrency:
-   group: trade-bot-state
-   cancel-in-progress: true
+@@ -456,6 +462,12 @@
+ PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+ PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
  
- on:
-+  # ✅ push로도 즉시 돌고
-   push:
--    branches: [ "nullim" ]
--    paths-ignore:
--      - "bot_state/**"
--      - "**/*.md"
-+    branches: [ "nullim", "main" ]
- 
-+  # ✅ 수동 실행도 되고
-   workflow_dispatch:
 +
-+  # ✅ 5분 tick (단, 워크플로 파일은 main에도 있어야 schedule이 돎)
-   schedule:
-     - cron: "*/5 * * * *"
++PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
++PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or "60")
++PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
++PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
++PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
  
- jobs:
-   run:
-     runs-on: ubuntu-latest
-     timeout-minutes: 8
+--- a/trader/strategies/pb1_pullback_close.py
++++ b/trader/strategies/pb1_pullback_close.py
+@@ -38,16 +38,27 @@
+     if len(df) < min_candles:
+         raise ValueError(f"insufficient_candles:{len(df)}<{min_candles}")
+     volume_missing = df["volume"].isna().all()
 +
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
- 
--      # --- REQUIRED SECRETS ---
--      APP_KEY: ${{ secrets.APP_KEY }}
--      APP_SECRET: ${{ secrets.APP_SECRET }}
--      API_BASE_URL: ${{ secrets.API_BASE_URL }}
-+      # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
-+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-+      KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
--      KIS_ENV: ${{ secrets.KIS_ENV }}
-+      KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-+      KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
--      # --- 5-min tick design ---
-+      # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
-+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
-+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+     df["ma20"] = df["close"].rolling(20).mean()
+     df["ma50"] = df["close"].rolling(50).mean()
+     df["ma10"] = df["close"].rolling(10).mean()
 +
-+      # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
-       RUN_LOOP_MINUTES: "4"
+     df["tr"] = np.maximum(df["high"], df["close"].shift(1)) - np.minimum(df["low"], df["close"].shift(1))
+     df["atr14"] = df["tr"].rolling(14).mean()
 +
-+      # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
-       BOTSTATE_LOCK_TTL_SEC: "240"
--      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "60"
-+      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-+      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
- 
--      # Optional: strategy switches if your code reads them
-       ACTIVE_STRATEGIES: "1"
- 
-     steps:
--      - name: Checkout
-+      - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-+          ref: "nullim"
- 
-       - name: Setup Python
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
- 
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
--      - name: Precheck env
-+      - name: Precheck env (fail fast)
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-               echo "::error::Missing required secret/env: $k"
-               exit 1
-             fi
-           done
-           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
- 
-+      - name: Auto mode (LIVE in market hours, DIAG otherwise)
-+        run: |
-+          set -euo pipefail
-+          python - << 'PY'
-+          from datetime import datetime, time
-+          from zoneinfo import ZoneInfo
+     df["tr_range_pct"] = (df["high"] - df["low"]) / df["close"] * 100
+     df["vol_contraction"] = df["tr_range_pct"].rolling(5).mean() / df["tr_range_pct"].rolling(20).mean()
 +
-+          KST = ZoneInfo("Asia/Seoul")
-+          now = datetime.now(KST)
+     volu_contraction = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
+     df["volu_contraction"] = volu_contraction if not volume_missing else np.nan
+ 
++    # 유동성(거래대금) 지표: 20일 평균 거래대금
++    if not volume_missing:
++        df["value"] = df["close"] * df["volume"]
++        df["value20"] = df["value"].rolling(20).mean()
++    else:
++        df["value20"] = np.nan
 +
-+          # 장중: 08:55 ~ 15:30 (필요시 조정)
-+          is_weekday = now.weekday() < 5
-+          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
+     ma20_tail = df["ma20"].tail(5)
+     slope = None
+     if len(ma20_tail.dropna()) >= 5:
+@@ -59,12 +70,18 @@
+ 
+     last = df.iloc[-1]
+     high20 = df["high"].tail(20).max()
 +
-+          if in_market:
-+              mode = "LIVE"
-+              live_enabled = "1"
-+              dry_run = "0"
-+              disable_live = "0"
-+          else:
-+              mode = "DIAG"
-+              live_enabled = "0"
-+              dry_run = "1"
-+              disable_live = "1"
++    value20 = float(last["value20"])
++    if math.isnan(value20):
++        value20 = None
 +
-+          print(f"[AUTO] now={now.isoformat()} in_market={in_market} -> STRATEGY_MODE={mode}")
-+          with open("runtime_env.sh", "w") as f:
-+              f.write(f'export STRATEGY_MODE="{mode}"\n')
-+              f.write(f'export LIVE_TRADING_ENABLED="{live_enabled}"\n')
-+              f.write(f'export DRY_RUN="{dry_run}"\n')
-+              f.write(f'export DISABLE_LIVE_TRADING="{disable_live}"\n')
-+          PY
-+          cat runtime_env.sh
+     features = {
+         "close": float(last["close"]),
+         "ma20": float(last["ma20"]),
+         "ma50": float(last["ma50"]),
+         "ma10": float(last["ma10"]),
+         "atr14": float(last["atr14"]),
++        "atr_pct": _pct(float(last["atr14"]), float(last["close"])),
+         "vol_contraction": float(last["vol_contraction"]),
+         "volu_contraction": float(last["volu_contraction"]),
+         "ma20_slope": slope,
+@@ -72,6 +89,7 @@
+         "pullback_pct": _pct(high20 - last["close"], high20),
+         "tr_range_pct": float(last["tr_range_pct"]),
+         "trend_strength": float(last["close"] / last["ma50"] if last["ma50"] else math.inf),
++        "value20": value20,
+         "volume_missing": volume_missing,
+     }
+     return features
+@@ -133,6 +151,50 @@
+     return 1, reasons
+ 
+ 
++def score_setup(features: Dict[str, float], market: str) -> float:
++    """
++    0~100 점수. 높을수록 '최고 눌림목'에 가깝다.
++    - 추세 강함(trend_strength)
++    - 눌림이 밴드 중앙에 가까움(pullback_pct)
++    - 변동성/거래량 수축이 강함(vol_contraction, volu_contraction)
++    - ATR%가 과도하게 크지 않음(atr_pct)
++    """
++    trend = float(features.get("trend_strength") or 0.0)   # close/ma50
++    pullback = float(features.get("pullback_pct") or 999.0)
++    vol_c = float(features.get("vol_contraction") or 9.0)
++    volu_c = float(features.get("volu_contraction") or 9.0)
++    atr_pct = float(features.get("atr_pct") or 999.0)
 +
-       - name: Build universe (best_k_meta) - allow fallback
-         run: |
-           set -euo pipefail
-+          source runtime_env.sh
-           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
- 
-       - name: Compile check
-         run: |
-           set -euo pipefail
-           python -m compileall trader
- 
--      - name: Run PB1 (auto window) - exit within RUN_LOOP_MINUTES
-+      - name: Run PB1 (auto window) - should exit within 4 minutes
-         run: |
-           set -euo pipefail
-+          source runtime_env.sh
-+          echo "[RUN] STRATEGY_MODE=$STRATEGY_MODE DRY_RUN=$DRY_RUN LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
-           python -m trader.pb1_runner --window auto --phase auto
-diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index f718304668f0e9131c1dc5ddb3fb41c5e6f0a90f..68034bab05509af77430adf4377f54bb4119cbdb 100644
---- a/trader/botstate_sync.py
-+++ b/trader/botstate_sync.py
-@@ -1,62 +1,69 @@
- from __future__ import annotations
- 
- import json
- import os
- import subprocess
- import time
- import logging
- from datetime import datetime, timedelta
- from pathlib import Path
- from typing import Iterable
- from zoneinfo import ZoneInfo
- 
- logger = logging.getLogger(__name__)
- 
- KST = ZoneInfo("Asia/Seoul")
- 
- DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
- BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
- DEFAULT_LOCK_TTL_SEC = 240
--DEFAULT_LOCK_RETRY_SEC = 60
--LOCK_RETRY_STEP_SEC = 10
-+DEFAULT_LOCK_RETRY_SEC = 55
-+DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
- 
- 
- def _lock_ttl_sec() -> int:
-     try:
-         return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
-     except Exception:
-         return DEFAULT_LOCK_TTL_SEC
- 
- 
- def _lock_retry_total_sec() -> int:
-     try:
-         return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
-     except Exception:
-         return DEFAULT_LOCK_RETRY_SEC
- 
- 
-+def _lock_retry_sleep_sec() -> int:
-+    try:
-+        return int(os.getenv("BOTSTATE_LOCK_RETRY_SLEEP_SEC", str(DEFAULT_LOCK_RETRY_SLEEP_SEC)))
-+    except Exception:
-+        return DEFAULT_LOCK_RETRY_SLEEP_SEC
++    if market.upper() == "KOSPI":
++        low, high = PB1_PULLBACK_BAND_KOSPI
++    else:
++        low, high = PB1_PULLBACK_BAND_KOSDAQ
 +
++    # 1) 추세: 1.00~1.20 구간을 0~1로 정규화
++    s_trend = max(0.0, min(1.0, (trend - 1.00) / 0.20))
 +
- def resolve_botstate_worktree_dir() -> Path:
-     return Path(os.getenv(BOTSTATE_WORKTREE_DIR_ENV, DEFAULT_BOTSTATE_WORKTREE_DIR)).resolve()
- 
- 
- def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
-     try:
-         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
-     except subprocess.CalledProcessError as exc:
-         logger.error(
-             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
-             exc.cmd,
-             cwd,
-             exc.returncode,
-             exc.stdout,
-             exc.stderr,
-         )
-         raise
- 
- 
- def git_porcelain(worktree_dir: Path) -> str:
-     return _git(worktree_dir, "status", "--porcelain").stdout
- 
- 
- def stage_all(worktree_dir: Path) -> None:
-     _git(worktree_dir, "add", "-A")
-@@ -95,115 +102,128 @@ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
- 
- def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
-     base_dir = base_dir.resolve()
-     worktree_dir = worktree_dir.resolve()
-     worktree_dir.mkdir(parents=True, exist_ok=True)
-     _configure_safe_directories(base_dir, worktree_dir)
-     try:
-         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
-     except subprocess.CalledProcessError:
-         _run(["git", "fetch", "origin", f"{target_branch}:{target_branch}"], cwd=base_dir)
-         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
-     _git(worktree_dir, "pull", "--rebase")
- 
- 
- def _lock_path(worktree_dir: Path) -> Path:
-     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
- 
- 
- def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
-     worktree_dir = worktree_dir.resolve()
-     lock_path = _lock_path(worktree_dir)
-     lock_path.parent.mkdir(parents=True, exist_ok=True)
-     ttl_env = _lock_ttl_sec()
-     ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
-     retry_total_sec = max(0, _lock_retry_total_sec())
--    attempts = max(1, (retry_total_sec // LOCK_RETRY_STEP_SEC) + 1)
-+    retry_sleep_sec = max(1, _lock_retry_sleep_sec())
-+    start_ts = time.time()
-+    attempt = 0
- 
--    for attempt in range(1, attempts + 1):
-+    while True:
-+        attempt += 1
-         now = datetime.now(tz=KST)
-         locked = False
-         stale_takeover = False
-         locked_until = None
-         current_owner = None
-         current_run_id = None
-         if lock_path.exists():
-             try:
-                 payload = json.loads(lock_path.read_text())
-                 current_owner = payload.get("owner")
-                 current_run_id = payload.get("run_id")
-                 ts_raw = payload.get("ts")
-                 ts = datetime.fromisoformat(ts_raw) if ts_raw else None
-                 ttl = int(payload.get("ttl_sec") or ttl_sec)
-                 if ts is None:
-                     stale_takeover = True
-                 else:
-                     locked_until = ts + timedelta(seconds=ttl)
-                     if locked_until > now:
-                         locked = True
-                     else:
-                         stale_takeover = True
-                 if stale_takeover:
-                     logger.warning(
-                         "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
-                         current_owner,
-                         current_run_id,
-                         locked_until,
-                     )
-             except Exception as exc:
-                 logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
-                 stale_takeover = True
- 
-         if not locked:
-             lock_payload = {
-                 "owner": owner,
-                 "run_id": run_id,
-                 "ts": now.isoformat(),
-                 "ttl_sec": ttl_sec,
-             }
-             temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
-             temp_path.write_text(json.dumps(lock_payload))
-             temp_path.replace(lock_path)
-             lock_rel_path = lock_path.relative_to(worktree_dir)
-             _git(worktree_dir, "add", str(lock_rel_path))
-             push_retry(worktree_dir, message=f"lock run_id={run_id}")
-             logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
-             return True
- 
--        if attempt < attempts:
-+        elapsed = time.time() - start_ts
-+        if elapsed < retry_total_sec:
-             logger.info(
--                "[BOTSTATE][RETRY] wait=%s locked_until=%s",
--                LOCK_RETRY_STEP_SEC,
-+                "[BOTSTATE][RETRY] wait=%s locked_until=%s attempt=%s elapsed=%.1fs total=%s",
-+                retry_sleep_sec,
-                 locked_until.isoformat() if locked_until else "unknown",
-+                attempt,
-+                elapsed,
-+                retry_total_sec,
-             )
--            time.sleep(LOCK_RETRY_STEP_SEC)
-+            time.sleep(retry_sleep_sec)
-+            continue
-+        break
- 
-     logger.warning(
--        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
-+        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s now=%s ttl_sec=%s current_owner=%s current_run_id=%s",
-+        owner,
-+        run_id,
-+        locked_until.isoformat() if locked_until else "unknown",
-+        now.isoformat(),
-+        ttl_sec,
-         current_owner,
-         current_run_id,
--        locked_until.isoformat() if locked_until else "unknown",
-     )
-     return False
- 
- 
- def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
-     worktree_dir = worktree_dir.resolve()
-     lock_path = _lock_path(worktree_dir)
-     if lock_path.exists():
-         try:
-             payload = json.loads(lock_path.read_text())
-         except Exception as exc:
-             logger.warning("[BOTSTATE][LOCK_RELEASE_SKIP] reason=parse_error err=%s", exc)
-             return
-         if payload.get("owner") != owner or payload.get("run_id") != run_id:
-             logger.warning(
-                 "[BOTSTATE][LOCK_RELEASE_SKIP] owner=%s run_id=%s current_owner=%s current_run_id=%s",
-                 owner,
-                 run_id,
-                 payload.get("owner"),
-                 payload.get("run_id"),
-             )
-             return
-         lock_path.unlink()
-         lock_rel_path = lock_path.relative_to(worktree_dir)
-         _git(worktree_dir, "add", "-u", str(lock_rel_path))
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 455e5beee5aa54b2ec7e0e522420d01a09684ed0..165bfa167d828688d1591cb0ecb8a93880f103c9 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -1,33 +1,33 @@
- from __future__ import annotations
- 
- import argparse
- import logging
- import os
- import signal
- import time as time_mod
--from datetime import datetime, time as dtime
-+from datetime import datetime, time as dtime, timedelta
- from pathlib import Path
- from zoneinfo import ZoneInfo
- 
- from trader.config import (
-     AFTERNOON_WINDOW_END,
-     AFTERNOON_WINDOW_START,
-     BOTSTATE_LOCK_TTL_SEC,
-     CLOSE_AUCTION_END,
-     CLOSE_AUCTION_START,
-     DIAGNOSTIC_MODE,
-     DIAGNOSTIC_ONLY,
-     MARKET_CLOSE_HHMM,
-     MARKET_OPEN_HHMM,
-     MORNING_EXIT_END,
-     MORNING_EXIT_START,
-     MORNING_WINDOW_END,
-     MORNING_WINDOW_START,
-     PB1_FORCE_ENTRY_ON_PUSH,
-     PB1_MAX_WAIT_FOR_WINDOW_MIN,
-     PB1_WAIT_FOR_WINDOW,
- )
- from trader.botstate_sync import acquire_lock as acquire_botstate_lock
- from trader.botstate_sync import persist_run_files, release_lock as release_botstate_lock
- from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
- from trader.db.engine import make_engine
-@@ -477,64 +477,71 @@ def run_once(
-             window=window,
-             phase_override=phase_override_arg,
-             dry_run=dry_run,
-             env=kis_env or "practice",
-             run_id=run_record_id,
-         )
-         result = engine_runner.run()
-         did_work = True
-         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
-         touched_files = _collect_botstate_files(run_start_ts)
-     except Exception as exc:
-         logger.exception("[PB1][FAIL] unexpected error")
-         if run_record_id:
-             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-         raise
-     finally:
-         release_lock(engine, lock_key)
-     return touched_files, did_work
- 
- 
- def _run_loop(*, args: argparse.Namespace, engine) -> None:
-     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
-     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
--    max_seconds = _parse_int_env("RUN_LOOP_MINUTES", 4) * 60
-     now = _get_now_kst()
-     _, close_dt = _market_session(now)
-+    max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
-+    loop_deadline = now + timedelta(seconds=max_seconds) if max_seconds > 0 else None
-     if run_loop_minutes > 0:
-         loop_max_minutes = run_loop_minutes
-         persist_interval = max(120, min(persist_interval, 240))
-     logger.info(
--        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s",
-+        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
-         loop_interval,
-         persist_interval,
-         close_dt.isoformat(),
-         loop_max_minutes,
-+        run_loop_minutes,
++    # 2) 눌림: 밴드 중앙에 가까울수록 점수 ↑
++    mid = (low + high) / 2.0
++    half = max(1e-6, (high - low) / 2.0)
++    s_pull = max(0.0, 1.0 - abs(pullback - mid) / half)
++
++    # 3) 수축: 낮을수록 좋음 (0.5가 매우 좋다고 가정)
++    s_vol = max(0.0, min(1.0, (0.9 - vol_c) / 0.4))        # vol_c 0.5~0.9
++    s_volu = max(0.0, min(1.0, (0.9 - volu_c) / 0.4))      # volu_c 0.5~0.9
++
++    # 4) ATR%: 너무 크면 감점 (2~6%가 이상적이라 가정)
++    s_atr = max(0.0, min(1.0, (6.0 - atr_pct) / 4.0))
++
++    score = 100.0 * (
++        0.35 * s_trend +
++        0.25 * s_pull +
++        0.20 * s_vol +
++        0.10 * s_volu +
++        0.10 * s_atr
 +    )
-+    logger.info(
-+        "[PB1][LOOP] start now_kst=%s max_seconds=%s deadline=%s",
-+        now.isoformat(),
-+        max_seconds,
-+        loop_deadline.isoformat() if loop_deadline else "none",
-     )
--    logger.info("[PB1][LOOP] start now_kst=%s", now.isoformat())
++    return float(max(0.0, min(100.0, score)))
++
++
+ @dataclass
+ class OrderIntent:
+     code: str
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -20,11 +20,16 @@
+     PB1_TIME_STOP_DAYS,
+     PB1_REQUIRE_VOLUME,
+     PB1_MIN_CANDLES,
++    PB1_MAX_POSITIONS,
++    PB1_MIN_SCORE,
++    PB1_USE_RISK_PARITY,
++    PB1_MAX_ATR_PCT,
++    PB1_MIN_VALUE20,
+ )
+ from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.kis_wrapper import KisAPI
+-from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup
++from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup, score_setup
+ from trader.time_utils import now_kst
+ from trader.utils.env import env_bool
+ from trader.window_router import WindowDecision, resolve_phase
+@@ -275,26 +280,104 @@
+                 logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                 continue
+         return candidates
+-
+     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
+         ok_list = [c for c in candidates if c.setup_ok]
+-        total = len(ok_list)
+-        if total <= 0:
++        if not ok_list:
+             return candidates
+-        capital_per = DAILY_CAPITAL * CAP_CAP / total
++
++        # 1) 점수 계산 + ATR/유동성 컷 + 점수 컷
++        filtered: List[CandidateFeature] = []
+         for cf in ok_list:
+-            close_px = cf.features.get("close") or 0
+-            qty = int(capital_per // close_px) if close_px > 0 else 0
++            try:
++                score = float(score_setup(cf.features, cf.market))
++            except Exception:
++                score = 0.0
++            cf.features["score"] = score
++
++            atr_pct = cf.features.get("atr_pct")
++            value20 = cf.features.get("value20")
++
++            if score < float(PB1_MIN_SCORE):
++                cf.setup_ok = False
++                cf.reasons.append("score_below_cut")
++                continue
++            if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
++                cf.setup_ok = False
++                cf.reasons.append("atr_pct_missing")
++                continue
++            if float(atr_pct) > float(PB1_MAX_ATR_PCT):
++                cf.setup_ok = False
++                cf.reasons.append("atr_pct_too_high")
++                continue
++            if value20 is None or (isinstance(value20, float) and value20 != value20):
++                cf.setup_ok = False
++                cf.reasons.append("value20_missing")
++                continue
++            if float(value20) < float(PB1_MIN_VALUE20):
++                cf.setup_ok = False
++                cf.reasons.append("liquidity_too_low")
++                continue
++
++            filtered.append(cf)
++
++        if not filtered:
++            return candidates
++
++        # 2) 점수 내림차순 Top N 선택
++        filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
++        max_n = max(1, int(PB1_MAX_POSITIONS))
++        selected = filtered[:max_n]
++        selected_codes = {c.code for c in selected}
++
++        # 선택되지 않은 나머지는 매수 제외 처리
++        for cf in ok_list:
++            if cf.code not in selected_codes and cf.setup_ok:
++                cf.setup_ok = False
++                cf.reasons.append("not_in_topN")
++
++        # 3) 사이징: 리스크 패리티(ATR) 또는 균등
++        cap_total = float(DAILY_CAPITAL) * float(CAP_CAP)
++
++        if PB1_USE_RISK_PARITY:
++            inv: List[float] = []
++            for cf in selected:
++                atr = float(cf.features.get("atr14") or 0.0)
++                inv.append(1.0 / max(atr, 1e-6))
++            inv_sum = sum(inv) if sum(inv) > 0 else 1.0
++            weights = [x / inv_sum for x in inv]
++        else:
++            weights = [1.0 / len(selected)] * len(selected)
++
++        for cf, w in zip(selected, weights):
++            close_px = float(cf.features.get("close") or 0.0)
++            if close_px <= 0:
++                cf.setup_ok = False
++                cf.reasons.append("close_zero")
++                continue
++
++            capital = cap_total * float(w)
++            qty = int(capital // close_px)
+             cf.planned_qty = max(qty, 0)
+-            cf.client_order_key = self._client_order_key(
+-                cf.code, cf.mode, "BUY", "close", "PB1"
+-            )
++            cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
++
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero")
+-                self._log_setup(cf)
++
++            logger.info(
++                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s",
++                cf.code,
++                float(cf.features.get("score") or 0.0),
++                float(w),
++                float(capital),
++                cf.planned_qty,
++                float(cf.features.get("atr_pct") or 0.0),
++                cf.features.get("value20"),
++            )
++
+         return candidates
  
-     owner = os.getenv("GITHUB_ACTOR", "local")
-     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-     ttl_sec = BOTSTATE_LOCK_TTL_SEC
-     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-     if botstate_worktree is None:
-         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
-         return
- 
-     pending_touched: dict[Path, Path] = {}
-     last_persist_ts = 0.0
-     loop_started_ts = time_mod.time()
-     exit_reason = "unknown"
-     stop_requested = {"value": False}
- 
-     def _request_stop(reason: str) -> None:
-         if stop_requested["value"]:
-             return
-         stop_requested["value"] = True
-         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
-         try:
-             release_botstate_lock(botstate_worktree, owner, workflow_run_id)
-         except Exception:
-             logger.exception("[PB1][SIGNAL] botstate lock release failed")
++
+     def _mark_price(self, code: str) -> float | None:
+         if self.kis:
+             try:
+
  
 
 
