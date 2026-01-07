@@ -5,7 +5,7 @@ permissions:
 
 concurrency:
   group: trade-bot-state
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 on:
   # ✅ push로도 즉시 돌고
@@ -15,7 +15,7 @@ on:
   # ✅ 수동 실행도 되고
   workflow_dispatch:
 
-  # ✅ 5분 tick (단, 워크플로 파일은 main에도 있어야 schedule이 돎)
+  # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
   schedule:
     - cron: "*/5 * * * *"
 
@@ -121,12 +121,17 @@ jobs:
         run: |
           set -euo pipefail
           source runtime_env.sh
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || true
+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || echo "[WARN] universe build failed (continue)"
 
       - name: Compile check
         run: |
           set -euo pipefail
           python -m compileall trader
+
+      - name: Configure git identity for botstate commits
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "github-actions[bot]"
 
       - name: Run PB1 (auto window) - should exit within 4 minutes
         run: |
