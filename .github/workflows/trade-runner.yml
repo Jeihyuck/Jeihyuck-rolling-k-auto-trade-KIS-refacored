@@ -8,6 +8,12 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  push:
+    branches: [ "nullim" ]
+    paths-ignore:
+      - "bot_state/**"
+      - "**/*.md"
+
   workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
