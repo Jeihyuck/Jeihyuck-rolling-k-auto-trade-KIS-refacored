@@ -12,22 +12,36 @@ on:
     branches: [ main, nullim ]
     paths-ignore:
       - "bot_state/**"
+
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Run mode (loop=LIVE loop, smoke=precheck only)"
+        default: "loop"
+        type: choice
+        options: [loop, smoke]
+        required: false
       phase:
         description: "Runner phase (auto/entry/exit/verify)"
         default: "auto"
         type: choice
         options: [auto, entry, exit, verify]
         required: false
+
   schedule:
+    # KST Mon-Fri 08:50 = UTC Sun-Thu 23:50
     - cron: "50 23 * * 0-4"
 
 jobs:
   run-trade-smoke:
-    if: github.ref != 'refs/heads/bot-state' && github.event_name == 'push'
+    name: PB1 Smoke (manual only)
+    if: >
+      github.ref != 'refs/heads/bot-state' &&
+      github.ref != 'refs/heads/bot_state' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'smoke'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
 
     env:
       STRATEGY_MODE: "LIVE"
@@ -36,6 +50,7 @@ jobs:
       DRY_RUN: "0"
       EXPECT_LIVE_TRADING: "1"
       EXPECT_KIS_ENV: "practice"
+
       PB1_ENTRY_ENABLED: "1"
       PB1_SMOKE_RUN: "1"
       PB1_RUN_LOOP: "0"
@@ -63,6 +78,7 @@ jobs:
       CLOSE_AUCTION_END: "15:30"
       MARKET_OPEN_HHMM: "08:50"
       MARKET_CLOSE_HHMM: "15:30"
+
       PB1_WAIT_FOR_WINDOW: "1"
       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
 
@@ -91,7 +107,7 @@ jobs:
 
       - name: Configure run mode
         run: |
-          echo "RUN_PHASE=auto" >> $GITHUB_ENV
+          echo "RUN_PHASE=${{ inputs.phase || 'auto' }}" >> $GITHUB_ENV
           echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
 
       - name: Run DB migrations
@@ -106,14 +122,23 @@ jobs:
         run: |
           python -m compileall trader
 
-      - name: Run PB1 only
+      - name: Run PB1 (smoke)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m trader.pb1_runner --window auto --phase "${RUN_PHASE}"
 
+
   run-trade-loop:
-    if: github.ref != 'refs/heads/bot-state' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    name: PB1 Live Loop
+    if: >
+      github.ref != 'refs/heads/bot-state' &&
+      github.ref != 'refs/heads/bot_state' &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.mode == 'loop')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 480
 
@@ -124,6 +149,7 @@ jobs:
       DRY_RUN: "0"
       EXPECT_LIVE_TRADING: "1"
       EXPECT_KIS_ENV: "practice"
+
       PB1_ENTRY_ENABLED: "1"
       PB1_SMOKE_RUN: "0"
       PB1_RUN_LOOP: "1"
@@ -154,6 +180,7 @@ jobs:
       CLOSE_AUCTION_END: "15:30"
       MARKET_OPEN_HHMM: "08:50"
       MARKET_CLOSE_HHMM: "15:30"
+
       PB1_WAIT_FOR_WINDOW: "1"
       PB1_MAX_WAIT_FOR_WINDOW_MIN: "240"
 
@@ -182,7 +209,12 @@ jobs:
 
       - name: Configure run mode
         run: |
-          RUN_PHASE="${{ github.event.inputs.phase || 'auto' }}"
+          # push/schedule -> auto, workflow_dispatch -> inputs.phase
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_PHASE="${{ inputs.phase }}"
+          else
+            RUN_PHASE="auto"
+          fi
           echo "RUN_PHASE=$RUN_PHASE" >> $GITHUB_ENV
           echo "UNIVERSE_SQLITE_PATH=${{ github.workspace }}/trader/state/pbcore.sqlite3" >> $GITHUB_ENV
 
@@ -198,7 +230,7 @@ jobs:
         run: |
           python -m compileall trader
 
-      - name: Run PB1 only
+      - name: Run PB1 (live loop)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
