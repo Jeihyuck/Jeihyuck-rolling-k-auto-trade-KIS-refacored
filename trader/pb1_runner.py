@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import time as time_mod
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -498,6 +499,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+    max_seconds = _parse_int_env("RUN_LOOP_MINUTES", 4) * 60
     now = _get_now_kst()
     _, close_dt = _market_session(now)
     if run_loop_minutes > 0:
@@ -524,12 +526,33 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     last_persist_ts = 0.0
     loop_started_ts = time_mod.time()
     exit_reason = "unknown"
+    stop_requested = {"value": False}
+
+    def _request_stop(reason: str) -> None:
+        if stop_requested["value"]:
+            return
+        stop_requested["value"] = True
+        logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
+        try:
+            release_botstate_lock(botstate_worktree, owner, workflow_run_id)
+        except Exception:
+            logger.exception("[PB1][SIGNAL] botstate lock release failed")
+
+    signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
     try:
         while True:
+            if stop_requested["value"]:
+                exit_reason = "sigterm"
+                break
             now = _get_now_kst()
             if now >= close_dt:
                 logger.info("[PB1][LOOP] market closed -> exit")
                 exit_reason = "market_closed"
+                break
+            elapsed_seconds = time_mod.time() - loop_started_ts
+            if max_seconds > 0 and elapsed_seconds >= max_seconds:
+                logger.info("[PB1][LOOP] max_seconds=%s exiting", max_seconds)
+                exit_reason = "loop_timeout"
                 break
             if loop_max_minutes > 0:
                 elapsed_min = (time_mod.time() - loop_started_ts) / 60
@@ -586,7 +609,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 list(pending_touched.values()),
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
-        release_botstate_lock(botstate_worktree, workflow_run_id)
+        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
         logger.info("[PB1][EXIT] reason=%s elapsed=%.1fs", exit_reason, elapsed)
 
 
@@ -613,6 +636,10 @@ def main() -> None:
     if botstate_worktree is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
         return
+    signal.signal(
+        signal.SIGTERM,
+        lambda *_args: release_botstate_lock(botstate_worktree, owner, workflow_run_id),
+    )
     try:
         touched, _did_work = run_once(args=args, engine=engine, loop_mode=False, window=None)
         if touched:
@@ -622,7 +649,7 @@ def main() -> None:
                 message=f"pb1 run {now_kst().isoformat()}",
             )
     finally:
-        release_botstate_lock(botstate_worktree, workflow_run_id)
+        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
 
 
 if __name__ == "__main__":

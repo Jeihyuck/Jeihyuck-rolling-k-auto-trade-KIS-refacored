@@ -123,31 +123,31 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
         now = datetime.now(tz=KST)
         locked = False
         stale_takeover = False
+        locked_until = None
+        current_owner = None
+        current_run_id = None
         if lock_path.exists():
             try:
                 payload = json.loads(lock_path.read_text())
+                current_owner = payload.get("owner")
+                current_run_id = payload.get("run_id")
                 ts_raw = payload.get("ts")
                 ts = datetime.fromisoformat(ts_raw) if ts_raw else None
                 ttl = int(payload.get("ttl_sec") or ttl_sec)
                 if ts is None:
                     stale_takeover = True
                 else:
-                    until = ts + timedelta(seconds=ttl)
-                    if until > now:
+                    locked_until = ts + timedelta(seconds=ttl)
+                    if locked_until > now:
                         locked = True
-                        logger.warning(
-                            "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
-                            payload.get("owner"),
-                            payload.get("run_id"),
-                            until,
-                        )
                     else:
                         stale_takeover = True
                 if stale_takeover:
                     logger.warning(
-                        "[BOTSTATE][STALE_TAKEOVER] owner=%s run_id=%s",
-                        payload.get("owner"),
-                        payload.get("run_id"),
+                        "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
+                        current_owner,
+                        current_run_id,
+                        locked_until,
                     )
             except Exception as exc:
                 logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
@@ -170,21 +170,45 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
             return True
 
         if attempt < attempts:
-            logger.info("[BOTSTATE][RETRY] attempt=%s total=%s sleep=%s", attempt, attempts, LOCK_RETRY_STEP_SEC)
+            logger.info(
+                "[BOTSTATE][RETRY] wait=%s locked_until=%s",
+                LOCK_RETRY_STEP_SEC,
+                locked_until.isoformat() if locked_until else "unknown",
+            )
             time.sleep(LOCK_RETRY_STEP_SEC)
 
+    logger.warning(
+        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s",
+        current_owner,
+        current_run_id,
+        locked_until.isoformat() if locked_until else "unknown",
+    )
     return False
 
 
-def release_lock(worktree_dir: Path, run_id: str) -> None:
+def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
     worktree_dir = worktree_dir.resolve()
     lock_path = _lock_path(worktree_dir)
     if lock_path.exists():
+        try:
+            payload = json.loads(lock_path.read_text())
+        except Exception as exc:
+            logger.warning("[BOTSTATE][LOCK_RELEASE_SKIP] reason=parse_error err=%s", exc)
+            return
+        if payload.get("owner") != owner or payload.get("run_id") != run_id:
+            logger.warning(
+                "[BOTSTATE][LOCK_RELEASE_SKIP] owner=%s run_id=%s current_owner=%s current_run_id=%s",
+                owner,
+                run_id,
+                payload.get("owner"),
+                payload.get("run_id"),
+            )
+            return
         lock_path.unlink()
         lock_rel_path = lock_path.relative_to(worktree_dir)
         _git(worktree_dir, "add", "-u", str(lock_rel_path))
         push_retry(worktree_dir, message=f"unlock run_id={run_id}")
-        logger.info("[BOTSTATE][LOCK-RELEASED] run_id=%s", run_id)
+        logger.info("[BOTSTATE][LOCK_RELEASED] owner=%s run_id=%s", owner, run_id)
 
 
 def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
