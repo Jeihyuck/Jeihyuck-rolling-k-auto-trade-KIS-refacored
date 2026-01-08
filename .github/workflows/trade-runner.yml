@@ -140,3 +140,5 @@ jobs:
           source runtime_env.sh
           echo "[RUN] STRATEGY_MODE=$STRATEGY_MODE DRY_RUN=$DRY_RUN LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           python -m trader.pb1_runner --window auto --phase auto
+
+          
