@@ -1,291 +1,44 @@
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 3009c04..52af142 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -18,6 +18,39 @@ from trader.universe.providers.krx_provider import fetch_with_rollback
- from trader.universe.providers.lkg_provider import LKGProvider
- from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -93,9 +93,10 @@
+           KST = ZoneInfo("Asia/Seoul")
+           now = datetime.now(KST)
  
-+from datetime import date
+-          # 장중: 08:55 ~ 15:30 (필요시 조정)
++          # 장중: 08:50 ~ 15:30 (PB1 MORNING_WINDOW_START=08:50 과 정합)
++          # 기존 08:55 시작이면 08:50~08:55 구간이 DIAG로 떨어져 창과 불일치 발생
+           is_weekday = now.weekday() < 5
+-          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
++          in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+ 
+           if in_market:
+               mode = "LIVE"
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -582,6 +582,26 @@
+                 else:
+                     sleep_for = loop_interval
+                 sleep_for = max(5.0, min(300.0, sleep_for))
 +
-+
-+def _parse_as_of_date(val: str) -> date | None:
-+    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-+    from datetime import datetime as _datetime
-+
-+    if not val:
-+        return None
-+    s = str(val).strip()
-+    try:
-+        if "-" in s:
-+            return _datetime.fromisoformat(s).date()
-+        if len(s) == 8 and s.isdigit():
-+            return _datetime.strptime(s, "%Y%m%d").date()
-+        return _datetime.fromisoformat(s).date()
-+    except Exception:
-+        return None
-+
-+
-+def _prefer_provider_order(chain: list[str]) -> list[str]:
-+    """Prefer caches first, then live providers, then static."""
-+    order = {
-+        "sqlite_cache": 10,
-+        "lkg": 20,
-+        # live providers
-+        "kis_marketcap_top": 30,
-+        "krx_marketcap_top": 40,
-+        # ultimate fallback
-+        "seed_static": 90,
-+    }
-+    return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
-+
- logger = logging.getLogger(__name__)
- 
- FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-@@ -181,10 +214,28 @@ def _load_static_seed() -> dict | None:
-     }
- 
- 
--def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict | None:
-+def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, reference_as_of: str, max_age_days: int) -> dict | None:
-     payload = provider.load(env, strategy)
-     if not payload:
-         return None
-+
-+    cached_as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
-+    ref_d = _parse_as_of_date(reference_as_of)
-+    got_d = _parse_as_of_date(str(cached_as_of or ""))
-+    if ref_d and got_d:
-+        age = (ref_d - got_d).days
-+        if age > int(max_age_days):
-+            logger.info(
-+                "[UNIVERSE][LKG][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s",
-+                env,
-+                strategy,
-+                cached_as_of,
-+                reference_as_of,
-+                age,
-+                max_age_days,
-+            )
-+            return None
-+
-     payload_norm = _normalize_payload(payload.get("payload"))
-     members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
-     return {
-@@ -195,8 +246,15 @@ def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str) -> dict |
-     }
- 
- 
--def _fallback_from_sqlite(provider: SQLiteCacheProvider, env: str, strategy: str) -> dict | None:
--    payload = provider.load_latest_universe_cache(env, strategy)
-+def _fallback_from_sqlite(
-+    provider: SQLiteCacheProvider,
-+    env: str,
-+    strategy: str,
-+    *,
-+    reference_as_of: str,
-+    max_age_days: int,
-+) -> dict | None:
-+    payload = provider.load_latest_universe_cache(env, strategy, max_age_days=max_age_days, reference_as_of=reference_as_of)
-     if not payload:
-         return None
-     payload_norm = _normalize_payload(payload.get("payload"))
-@@ -312,7 +370,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
-     last_reason: str | None = None
- 
-     allowed_chain = providers_for_env(env)
--    logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
-+    preferred_chain = _prefer_provider_order(allowed_chain)
-+    if preferred_chain != list(allowed_chain):
-+        logger.info(
-+            "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
-+            env,
-+            strategy,
-+            allowed_chain,
-+            preferred_chain,
-+        )
-+    else:
-+        logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
- 
-     kis_provider: KISMarketcapTopProvider | None = None
-     if "kis_marketcap_top" in allowed_chain:
-@@ -325,7 +393,7 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
-     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
-     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
- 
--    for provider_name in allowed_chain:
-+    for provider_name in preferred_chain:
-         result: dict | None = None
-         reason: str | None = None
- 
-@@ -337,11 +405,17 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
-         elif provider_name == "krx_marketcap_top":
-             result, reason = _build_from_krx(as_of_date, TARGETS)
-         elif provider_name == "lkg":
--            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy)
-+            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
-             reason = "lkg_hit" if result else "lkg_miss"
-         elif provider_name == "sqlite_cache":
-             if sqlite_provider:
--                result = _fallback_from_sqlite(sqlite_provider, env=env, strategy=strategy)
-+                result = _fallback_from_sqlite(
-+                    sqlite_provider,
-+                    env=env,
-+                    strategy=strategy,
-+                    reference_as_of=as_of_date,
-+                    max_age_days=FALLBACK_MAX_AGE_DAYS,
-+                )
-             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
-         elif provider_name == "seed_static":
-             result = _load_static_seed()
-diff --git a/trader/universe/providers/krx_provider.py b/trader/universe/providers/krx_provider.py
-index 6a60be4..9b2e4c7 100644
---- a/trader/universe/providers/krx_provider.py
-+++ b/trader/universe/providers/krx_provider.py
-@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
- 
- REQUIRED_CAP_COLUMNS = ("시가총액", "시가 총액", "MKT_CAP")
- NAME_COLUMNS = ("종목명", "Name", "name")
-+REQUIRE_NAME = os.getenv("KRX_REQUIRE_NAME", "0").lower() in {"1", "true", "yes", "on"}
- MAX_REPEAT_FAIL = int(os.getenv("KRX_MAX_REPEAT_FAIL", "5"))
- MAX_ROLLBACK_DAYS = int(os.getenv("KRX_MAX_ROLLBACK_DAYS", "3"))
- MAX_ATTEMPTS = int(os.getenv("KRX_MAX_ATTEMPTS", "5"))
-@@ -56,12 +57,37 @@ def _has_any_column(df: pd.DataFrame, candidates: Iterable[str]) -> bool:
-     return any(c in cols for c in candidates)
- 
- 
-+def _find_column(df: pd.DataFrame, candidates: Iterable[str], *, fuzzy: bool = True) -> str | None:
-+    """Return the first matching column name.
-+
-+    When `fuzzy=True`, also matches a couple of common KRX/pykrx variations.
-+    """
-+    try:
-+        cols = list(df.columns)
-+    except Exception:
-+        return None
-+    for c in candidates:
-+        if c in cols:
-+            return c
-+    if not fuzzy:
-+        return None
-+    # common fuzzy match: 시가총액 variants
-+    for c in cols:
-+        try:
-+            s = str(c)
-+        except Exception:
-+            continue
-+        if "시가" in s and "총" in s:
-+            return c
-+    return None
-+
-+
- def _validate_krx_df(df: pd.DataFrame) -> bool:
-     if df is None or df.empty:
-         return False
-     if not _has_any_column(df, REQUIRED_CAP_COLUMNS):
-         return False
--    if not _has_any_column(df, NAME_COLUMNS):
-+    if REQUIRE_NAME and not _has_any_column(df, NAME_COLUMNS):
-         return False
-     return True
- 
-@@ -116,13 +142,23 @@ def fetch_with_rollback(market: str, as_of_date: str | date, max_rollback_days:
-         try:
-             df = safe_get_market_cap_by_ticker(attempt.strftime("%Y%m%d"), market=market)
-             if not _validate_krx_df(df):
-+                cap_col = _find_column(df, REQUIRED_CAP_COLUMNS)
-+                name_col = _find_column(df, NAME_COLUMNS) if REQUIRE_NAME else None
-+                idx_preview = None
-+                try:
-+                    idx_preview = list(df.index[:5]) if df is not None else None
-+                except Exception:
-+                    idx_preview = None
-                 logger.warning(
--                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s cols=%s rows=%s",
-+                    "[KRX][NO_DATA] market=%s requested_as_of=%s used_as_of=%s rows=%s cap_col=%s name_col=%s cols=%s idx=%s",
-                     market,
-                     requested_as_of,
-                     used_as_of,
--                    list(df.columns),
-                     len(df) if df is not None else 0,
-+                    cap_col,
-+                    name_col,
-+                    list(getattr(df, "columns", [])),
-+                    idx_preview,
-                 )
-                 raise EmptyDataFrame("empty_or_missing_cols")
-             used_reason = "ok" if attempt == base_date else "rolled_back"
-diff --git a/trader/universe/providers/sqlite_cache_provider.py b/trader/universe/providers/sqlite_cache_provider.py
-index 888bf07..a74246a 100644
---- a/trader/universe/providers/sqlite_cache_provider.py
-+++ b/trader/universe/providers/sqlite_cache_provider.py
-@@ -5,7 +5,7 @@ import logging
- import os
- import sqlite3
- from dataclasses import dataclass
--from datetime import datetime
-+from datetime import date, datetime
- from pathlib import Path
- from typing import Optional
- 
-@@ -14,6 +14,21 @@ from trader.db import config as db_config
- logger = logging.getLogger(__name__)
- 
- 
-+def _parse_as_of_date(val: str) -> date | None:
-+    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-+    if not val:
-+        return None
-+    s = str(val).strip()
-+    try:
-+        if "-" in s:
-+            return datetime.fromisoformat(s).date()
-+        if len(s) == 8 and s.isdigit():
-+            return datetime.strptime(s, "%Y%m%d").date()
-+        return datetime.fromisoformat(s).date()
-+    except Exception:
-+        return None
-+
-+
- def _default_db_path() -> Path:
-     env_path = os.getenv("UNIVERSE_SQLITE_PATH")
-     if env_path:
-@@ -64,7 +79,13 @@ class SQLiteCacheProvider:
-         except Exception:
-             logger.exception("[UNIVERSE][SQLITE_CACHE][SAVE_FAIL] env=%s strategy=%s as_of=%s path=%s", env, strategy, as_of, self.db_path)
- 
--    def load_latest_universe_cache(self, env: str, strategy: str) -> Optional[dict]:
-+    def load_latest_universe_cache(
-+        self,
-+        env: str,
-+        strategy: str,
-+        max_age_days: int | None = None,
-+        reference_as_of: str | None = None,
-+    ) -> Optional[dict]:
-         try:
-             with self._connect() as conn:
-                 row = conn.execute(
-@@ -81,6 +102,23 @@ class SQLiteCacheProvider:
-                 logger.info("[UNIVERSE][SQLITE_CACHE][MISS] env=%s strategy=%s path=%s", env, strategy, self.db_path)
-                 return None
-             payload = json.loads(row[0])
-+            if max_age_days is not None and reference_as_of:
-+                ref_d = _parse_as_of_date(str(reference_as_of))
-+                got_d = _parse_as_of_date(str(row[1]))
-+                if ref_d and got_d:
-+                    age = (ref_d - got_d).days
-+                    if age > int(max_age_days):
++                # FIX: RUN_LOOP_MINUTES(=max_seconds) 예산보다 더 오래 sleep 해야 하면
++                # sleep 후 깨어나자마자 loop_timeout으로 끝나 "한 번 돌고 죽는" 것처럼 보인다.
++                # 이 경우에는 sleep하지 않고 종료하여 다음 5분 tick(schedule)에 맡긴다.
++                if max_seconds > 0:
++                    remaining_budget = max_seconds - elapsed_seconds
++                    if remaining_budget <= 0:
++                        logger.info("[PB1][LOOP] budget exhausted before sleep -> exit")
++                        exit_reason = "loop_timeout"
++                        break
++                    if sleep_for >= remaining_budget:
 +                        logger.info(
-+                            "[UNIVERSE][SQLITE_CACHE][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s path=%s",
-+                            env,
-+                            strategy,
-+                            row[1],
-+                            reference_as_of,
-+                            age,
-+                            max_age_days,
-+                            self.db_path,
++                            "[PB1][LOOP] outside window but insufficient budget -> exit "
++                            "sleep=%.0fs remaining_budget=%.0fs next=%s",
++                            sleep_for,
++                            remaining_budget,
++                            next_start.isoformat() if next_start else "unknown",
 +                        )
-+                        return None
-             logger.info("[UNIVERSE][SQLITE_CACHE][HIT] env=%s strategy=%s as_of=%s path=%s", env, strategy, row[1], self.db_path)
-             return payload
-         except Exception:
++                        exit_reason = "outside_window_budget"
++                        break
+                 logger.info(
+                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
+                     sleep_for,

@@ -582,6 +582,26 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 else:
                     sleep_for = loop_interval
                 sleep_for = max(5.0, min(300.0, sleep_for))
+
+                # FIX: RUN_LOOP_MINUTES(=max_seconds) 예산보다 더 오래 sleep 해야 하면
+                # sleep 후 깨어나자마자 loop_timeout으로 끝나 "한 번 돌고 죽는" 것처럼 보인다.
+                # 이 경우에는 sleep하지 않고 종료하여 다음 5분 tick(schedule)에 맡긴다.
+                if max_seconds > 0:
+                    remaining_budget = max_seconds - elapsed_seconds
+                    if remaining_budget <= 0:
+                        logger.info("[PB1][LOOP] budget exhausted before sleep -> exit")
+                        exit_reason = "loop_timeout"
+                        break
+                    if sleep_for >= remaining_budget:
+                        logger.info(
+                            "[PB1][LOOP] outside window but insufficient budget -> exit "
+                            "sleep=%.0fs remaining_budget=%.0fs next=%s",
+                            sleep_for,
+                            remaining_budget,
+                            next_start.isoformat() if next_start else "unknown",
+                        )
+                        exit_reason = "outside_window_budget"
+                        break
                 logger.info(
                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
                     sleep_for,

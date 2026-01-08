@@ -93,9 +93,10 @@ jobs:
           KST = ZoneInfo("Asia/Seoul")
           now = datetime.now(KST)
 
-          # 장중: 08:55 ~ 15:30 (필요시 조정)
+          # 장중: 08:50 ~ 15:30 (PB1 MORNING_WINDOW_START=08:50 과 정합)
+          # 기존 08:55 시작이면 08:50~08:55 구간이 DIAG로 떨어져 창과 불일치 발생
           is_weekday = now.weekday() < 5
-          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
+          in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
 
           if in_market:
               mode = "LIVE"
