@@ -8,8 +8,8 @@ from typing import Optional
 KST = timezone(timedelta(hours=9))
 
 MORNING_WINDOW_START = time.fromisoformat(os.getenv("MORNING_WINDOW_START", "08:50"))
-MORNING_WINDOW_END = time.fromisoformat(os.getenv("MORNING_WINDOW_END", "11:00"))
-AFTERNOON_WINDOW_START = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_START", "14:00"))
+MORNING_WINDOW_END = time.fromisoformat(os.getenv("MORNING_WINDOW_END", "15:20"))
+AFTERNOON_WINDOW_START = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_START", "15:20"))
 AFTERNOON_WINDOW_END = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_END", "15:30"))
 MORNING_EXIT_START = time.fromisoformat(os.getenv("MORNING_EXIT_START", "09:00"))
 MORNING_EXIT_END = time.fromisoformat(os.getenv("MORNING_EXIT_END", "09:20"))

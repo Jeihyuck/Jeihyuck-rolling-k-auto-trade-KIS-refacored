@@ -569,6 +569,22 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                     break
             window = decide_window(now=now, override=args.window)
             if window is None:
+                if max_seconds > 0 and os.getenv("PB1_LOOP_WAIT_OUTSIDE", "0") != "1":
+                    next_start = _next_window_start(
+                        now,
+                        [
+                            _parse_hhmm_to_time(MORNING_WINDOW_START),
+                            _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
+                            _parse_hhmm_to_time(CLOSE_AUCTION_START),
+                        ],
+                    )
+                    logger.info(
+                        "[PB1][LOOP] outside window -> exit (tick mode) next=%s",
+                        next_start.isoformat() if next_start else "unknown",
+                    )
+                    exit_reason = "outside_window"
+                    break
+
                 next_start = _next_window_start(
                     now,
                     [

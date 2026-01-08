@@ -1,44 +1,72 @@
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -93,9 +93,10 @@
-           KST = ZoneInfo("Asia/Seoul")
-           now = datetime.now(KST)
- 
--          # 장중: 08:55 ~ 15:30 (필요시 조정)
-+          # 장중: 08:50 ~ 15:30 (PB1 MORNING_WINDOW_START=08:50 과 정합)
-+          # 기존 08:55 시작이면 08:50~08:55 구간이 DIAG로 떨어져 창과 불일치 발생
-           is_weekday = now.weekday() < 5
--          in_market = is_weekday and (time(8,55) <= now.time() <= time(15,30))
-+          in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
- 
-           if in_market:
-               mode = "LIVE"
+diff --git a/trader/config.py b/trader/config.py
+index 1768c84..0657aac 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -123,10 +123,10 @@ CONFIG = {
+     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+     "PB1_ENTRY_ENABLED": "true",
+     "MORNING_WINDOW_START": "08:50",
+-    "MORNING_WINDOW_END": "11:00",
++    "MORNING_WINDOW_END": "15:20",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+-    "AFTERNOON_WINDOW_START": "14:00",
++    "AFTERNOON_WINDOW_START": "15:20",
+     "AFTERNOON_WINDOW_END": "15:30",
+     "CLOSE_AUCTION_START": "15:20",
+     "CLOSE_AUCTION_END": "15:30",
+@@ -433,10 +433,10 @@ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+ BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+-MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "11:00"
++MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "15:20"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+-AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "14:00"
++AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "15:20"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 165bfa1..e8e6f63 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -582,6 +582,26 @@
-                 else:
-                     sleep_for = loop_interval
-                 sleep_for = max(5.0, min(300.0, sleep_for))
+@@ -569,6 +569,22 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
+                     break
+             window = decide_window(now=now, override=args.window)
+             if window is None:
++                if max_seconds > 0 and os.getenv("PB1_LOOP_WAIT_OUTSIDE", "0") != "1":
++                    next_start = _next_window_start(
++                        now,
++                        [
++                            _parse_hhmm_to_time(MORNING_WINDOW_START),
++                            _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
++                            _parse_hhmm_to_time(CLOSE_AUCTION_START),
++                        ],
++                    )
++                    logger.info(
++                        "[PB1][LOOP] outside window -> exit (tick mode) next=%s",
++                        next_start.isoformat() if next_start else "unknown",
++                    )
++                    exit_reason = "outside_window"
++                    break
 +
-+                # FIX: RUN_LOOP_MINUTES(=max_seconds) 예산보다 더 오래 sleep 해야 하면
-+                # sleep 후 깨어나자마자 loop_timeout으로 끝나 "한 번 돌고 죽는" 것처럼 보인다.
-+                # 이 경우에는 sleep하지 않고 종료하여 다음 5분 tick(schedule)에 맡긴다.
-+                if max_seconds > 0:
-+                    remaining_budget = max_seconds - elapsed_seconds
-+                    if remaining_budget <= 0:
-+                        logger.info("[PB1][LOOP] budget exhausted before sleep -> exit")
-+                        exit_reason = "loop_timeout"
-+                        break
-+                    if sleep_for >= remaining_budget:
-+                        logger.info(
-+                            "[PB1][LOOP] outside window but insufficient budget -> exit "
-+                            "sleep=%.0fs remaining_budget=%.0fs next=%s",
-+                            sleep_for,
-+                            remaining_budget,
-+                            next_start.isoformat() if next_start else "unknown",
-+                        )
-+                        exit_reason = "outside_window_budget"
-+                        break
-                 logger.info(
-                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
-                     sleep_for,
+                 next_start = _next_window_start(
+                     now,
+                     [
+diff --git a/trader/window_router.py b/trader/window_router.py
+index 712dd8e..ee4870a 100644
+--- a/trader/window_router.py
++++ b/trader/window_router.py
+@@ -8,8 +8,8 @@ from typing import Optional
+ KST = timezone(timedelta(hours=9))
+ 
+ MORNING_WINDOW_START = time.fromisoformat(os.getenv("MORNING_WINDOW_START", "08:50"))
+-MORNING_WINDOW_END = time.fromisoformat(os.getenv("MORNING_WINDOW_END", "11:00"))
+-AFTERNOON_WINDOW_START = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_START", "14:00"))
++MORNING_WINDOW_END = time.fromisoformat(os.getenv("MORNING_WINDOW_END", "15:20"))
++AFTERNOON_WINDOW_START = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_START", "15:20"))
+ AFTERNOON_WINDOW_END = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_END", "15:30"))
+ MORNING_EXIT_START = time.fromisoformat(os.getenv("MORNING_EXIT_START", "09:00"))
+ MORNING_EXIT_END = time.fromisoformat(os.getenv("MORNING_EXIT_END", "09:20"))
