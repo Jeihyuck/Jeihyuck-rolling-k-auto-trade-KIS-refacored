@@ -35,20 +35,20 @@ def decide_window(now: datetime | None = None, override: str = "auto") -> Option
     now = now or get_kst_now()
     if override == "morning":
         if in_window(now, MORNING_WINDOW_START, MORNING_WINDOW_END):
-            phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "verify"
+            phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"
             return WindowDecision(name="morning", phase=phase)
         return None
     if override == "afternoon":
         if in_window(now, AFTERNOON_WINDOW_START, AFTERNOON_WINDOW_END):
-            phase = "entry" if in_window(now, CLOSE_AUCTION_START, CLOSE_AUCTION_END) else "prep"
+            phase = "trade"
             return WindowDecision(name="afternoon", phase=phase)
         return None
 
     if in_window(now, MORNING_WINDOW_START, MORNING_WINDOW_END):
-        phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "verify"
+        phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"
         return WindowDecision(name="morning", phase=phase)
     if in_window(now, AFTERNOON_WINDOW_START, AFTERNOON_WINDOW_END):
-        phase = "entry" if in_window(now, CLOSE_AUCTION_START, CLOSE_AUCTION_END) else "prep"
+        phase = "trade"
         return WindowDecision(name="afternoon", phase=phase)
     return None
 
