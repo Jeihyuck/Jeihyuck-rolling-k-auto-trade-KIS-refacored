@@ -1,0 +1,513 @@
+diff --git a/.github/workflows/pb1-tick.yml b/.github/workflows/pb1-tick.yml
+deleted file mode 100644
+index c996680a76f7a00ba1f8d558dd4a9bf2fe3f959e..0000000000000000000000000000000000000000
+--- a/.github/workflows/pb1-tick.yml
++++ /dev/null
+@@ -1,47 +0,0 @@
+-name: PB1 Tick
+-
+-permissions:
+-  contents: write
+-
+-concurrency:
+-  group: trade-bot-state
+-  cancel-in-progress: false
+-
+-on:
+-  workflow_dispatch:
+-  schedule:
+-    # Weekdays (KST Mon-Fri): run during market hours, every 5 min
+-    # KST 08:50~08:55 => UTC 23:50~23:55 (prev day) [Sun~Thu UTC]
+-    - cron: "50-59/5 23 * * 0-4"
+-    # KST 09:00~14:55 => UTC 00:00~05:55 (same day) [Mon~Fri UTC]
+-    - cron: "*/5 0-5 * * 1-5"
+-    # KST 15:00~15:30 => UTC 06:00~06:30 (same day) [Mon~Fri UTC]
+-    - cron: "0-30/5 6 * * 1-5"
+-
+-jobs:
+-  tick:
+-    runs-on: ubuntu-latest
+-    steps:
+-      - name: Checkout
+-        uses: actions/checkout@v4
+-
+-      - name: Set up Python
+-        uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Install dependencies
+-        run: |
+-          python -m pip install --upgrade pip
+-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+-
+-      - name: Run PB1 once
+-        env:
+-          APP_KEY: ${{ secrets.APP_KEY }}
+-          APP_SECRET: ${{ secrets.APP_SECRET }}
+-          CANO: ${{ secrets.CANO }}
+-          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+-          KIS_ENV: ${{ secrets.KIS_ENV }}
+-        run: |
+-          python -m trader.pb1_tick
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index 52af1424f18156c1e6abbf5f2838951cda24a9c2..e95c92d3461abc0ab9d163bbc21e9a74cef8954c 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -1,95 +1,96 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import csv
+ import logging
+ import os
+ from pathlib import Path
+ from typing import Iterable
+ 
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.time_utils import now_kst
+ from trader.universe.capabilities import providers_for_env
++from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
+ from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+-from trader.universe.providers.krx_provider import fetch_with_rollback
+ from trader.universe.providers.lkg_provider import LKGProvider
+ from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
+ 
+ from datetime import date
+ 
+ 
+ def _parse_as_of_date(val: str) -> date | None:
+     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+     from datetime import datetime as _datetime
+ 
+     if not val:
+         return None
+     s = str(val).strip()
+     try:
+         if "-" in s:
+             return _datetime.fromisoformat(s).date()
+         if len(s) == 8 and s.isdigit():
+             return _datetime.strptime(s, "%Y%m%d").date()
+         return _datetime.fromisoformat(s).date()
+     except Exception:
+         return None
+ 
+ 
+ def _prefer_provider_order(chain: list[str]) -> list[str]:
+     """Prefer caches first, then live providers, then static."""
+     order = {
+         "sqlite_cache": 10,
+         "lkg": 20,
+         # live providers
++        "fdr_marketcap_top": 30,
+         "kis_marketcap_top": 30,
+-        "krx_marketcap_top": 40,
+         # ultimate fallback
+         "seed_static": 90,
+     }
+     return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
+ 
+ logger = logging.getLogger(__name__)
+ 
+ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
+ SEED_DIR = Path(__file__).resolve().parent / "seeds"
+ SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
+ SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
+ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+-DEFAULT_PROVIDER = "kis_marketcap_top"
++DEFAULT_PROVIDER = "fdr_marketcap_top"
+ ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
+ ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Build and persist universe members")
+     parser.add_argument("--env", required=True, help="Environment (practice/real)")
+     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
+     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
++    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
+     return parser.parse_args()
+ 
+ 
+ def _normalize_payload(payload: dict | None) -> dict:
+     payload = payload or {}
+     selected = payload.get("selected") or []
+     selected_stocks = payload.get("selected_stocks") or selected
+     selected_by_market = payload.get("selected_by_market") or {}
+     normalized = {
+         "selected": list(selected),
+         "selected_stocks": list(selected_stocks),
+         "selected_by_market": dict(selected_by_market),
+     }
+     if "weight_scope" in payload:
+         normalized["weight_scope"] = payload.get("weight_scope")
+     return normalized
+ 
+ 
+ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
+     members: list[dict] = []
+     for market, rows in (selected_by_market or {}).items():
+         for idx, row in enumerate(rows or []):
+             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+             if not code:
+                 continue
+@@ -285,198 +286,189 @@ def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple
+     _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+ 
+     selected_by_market = {
+         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+     }
+     payload = _normalize_payload(
+         {
+             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+             "selected_by_market": selected_by_market,
+         }
+     )
+     members = _build_members_from_payload(selected_by_market)
+     return (
+         {
+             "payload": payload,
+             "members": members,
+             "source": "kis_marketcap_top",
+             "params": {"targets": TARGETS, "as_of": as_of_date},
+         },
+         "kis_marketcap_top",
+     )
+ 
+ 
+-def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
++def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
+     try:
+-        kospi_df, kospi_used, kospi_reason = fetch_with_rollback("KOSPI", as_of_date)
+-        kosdaq_df, kosdaq_used, kosdaq_reason = fetch_with_rollback("KOSDAQ", as_of_date)
++        rows_by_market = fetch_marketcap_top(targets)
+     except Exception as exc:  # pragma: no cover - network/remote failure
+-        logger.warning("[UNIVERSE][KRX][FAIL] as_of=%s err=%s", as_of_date, exc)
+-        return None, "krx_fetch_fail"
+-
+-    rows_by_market: dict[str, list[dict]] = {}
+-    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
+-        cap_col = None
+-        for cand in ("시가총액", "시가 총액", "MKT_CAP"):
+-            if cand in df.columns:
+-                cap_col = cand
+-                break
+-        if cap_col is None:
+-            return None, f"{market.lower()}_cap_missing"
+-        df_sorted = df.sort_values(cap_col, ascending=False)
+-        selected: list[dict] = []
+-        for code, row in df_sorted.head(targets.get(market, 0)).iterrows():
+-            code_str = str(code).zfill(6)
+-            name = row.get("종목명") or row.get("Name") or row.get("name")
+-            selected.append({"code": code_str, "name": str(name).strip() if name else None})
+-        rows_by_market[market] = selected
++        logger.warning("[UNIVERSE][FDR][FAIL] as_of=%s err=%s", as_of_date, exc)
++        return None, "fdr_fetch_fail"
++
+     if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
+-        return None, "krx_rows_missing"
++        return None, "fdr_rows_missing"
++
++    kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
++    kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
++    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
++    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
++
+     selected_by_market = {
+-        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSPI"])],
+-        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSDAQ"])],
++        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
++        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+     }
+     payload = _normalize_payload(
+         {
+-            "selected": [row["code"] for row in rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]],
++            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+             "selected_by_market": selected_by_market,
+         }
+     )
+-    params = {
+-        "as_of": as_of_date,
+-        "used_as_of": {
+-            "KOSPI": kospi_used.isoformat(),
+-            "KOSDAQ": kosdaq_used.isoformat(),
+-        },
+-        "reasons": {
+-            "KOSPI": kospi_reason,
+-            "KOSDAQ": kosdaq_reason,
+-        },
+-    }
++    params = {"as_of": as_of_date, "targets": targets}
+     members = _build_members_from_payload(selected_by_market)
+-    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": params}, "krx_marketcap_top"
++    return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
+ 
+ 
+-def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
++def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
+     engine = make_engine()
+     run_migrations(engine)
+     repo = UniverseRepo(engine)
+ 
+     payload: dict | None = None
+     members: list[dict] = []
+-    source = DEFAULT_PROVIDER
++    source = provider_override or DEFAULT_PROVIDER
+     params: dict = {"as_of": as_of_date}
+     last_reason: str | None = None
+ 
++    logger.info(
++        "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
++        env,
++        strategy,
++        as_of_date,
++        provider_override or DEFAULT_PROVIDER,
++    )
++
+     allowed_chain = providers_for_env(env)
++    if provider_override:
++        if provider_override not in allowed_chain:
++            logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
++        allowed_chain = [provider_override]
+     preferred_chain = _prefer_provider_order(allowed_chain)
+     if preferred_chain != list(allowed_chain):
+         logger.info(
+             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
+             env,
+             strategy,
+             allowed_chain,
+             preferred_chain,
+         )
+     else:
+         logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
+ 
+     kis_provider: KISMarketcapTopProvider | None = None
+     if "kis_marketcap_top" in allowed_chain:
+         try:
+             kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+         except Exception as exc:
+             last_reason = f"kis_init_fail:{exc}"
+             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
+ 
+     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
+     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
+ 
+     for provider_name in preferred_chain:
+         result: dict | None = None
+         reason: str | None = None
+ 
+-        if provider_name == "kis_marketcap_top":
++        if provider_name == "fdr_marketcap_top":
++            result, reason = _build_from_fdr(as_of_date, TARGETS)
++        elif provider_name == "kis_marketcap_top":
+             if not kis_provider:
+                 reason = last_reason or "kis_provider_unavailable"
+             else:
+                 result, reason = _build_from_kis(kis_provider, as_of_date)
+-        elif provider_name == "krx_marketcap_top":
+-            result, reason = _build_from_krx(as_of_date, TARGETS)
+         elif provider_name == "lkg":
+             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
+             reason = "lkg_hit" if result else "lkg_miss"
+         elif provider_name == "sqlite_cache":
+             if sqlite_provider:
+                 result = _fallback_from_sqlite(
+                     sqlite_provider,
+                     env=env,
+                     strategy=strategy,
+                     reference_as_of=as_of_date,
+                     max_age_days=FALLBACK_MAX_AGE_DAYS,
+                 )
+             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
+         elif provider_name == "seed_static":
+             result = _load_static_seed()
+             reason = "seed_static" if result else "seed_missing"
+         else:
+             logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
+             continue
+ 
+         if result:
+             payload = result["payload"]
+             members = result["members"]
+             source = result.get("source", provider_name)
+             params.update(result.get("params") or {})
+             last_reason = reason or provider_name
+             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
+-            if source in {"kis_marketcap_top", "krx_marketcap_top"}:
++            if source in {"fdr_marketcap_top", "kis_marketcap_top"}:
+                 if ENABLE_LKG:
+                     try:
+                         lkg_provider.save(env, strategy, result)
+                     except Exception:
+                         logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
+                 if ENABLE_SQLITE_CACHE and sqlite_provider:
+                     sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
+             break
+ 
+         last_reason = reason or provider_name
+         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
+ 
+     universe_id = repo.store_universe(
+         env=env,
+         strategy=strategy,
+         as_of_date=as_of_date,
+         source=source,
+         params_json=params,
+         payload_json=payload or {},
+         members=members,
+     )
+     if universe_id:
+         logger.info(
+             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
+             env,
+             strategy,
+             as_of_date,
+             universe_id,
+             len(members),
+             source,
+             last_reason or "n/a",
+         )
+     else:
+         logger.warning(
+             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
+         )
+     return universe_id
+ 
+ 
+ def main() -> None:
+     logging.basicConfig(level=logging.INFO)
+     args = parse_args()
+     as_of = args.date or now_kst().date().isoformat()
+-    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
++    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/trader/universe/capabilities.py b/trader/universe/capabilities.py
+index 5e2558585dfd9d720033f13a9187594ef0ec8188..a5519699cfab3086c122cb58cdc031db852a0a7d 100644
+--- a/trader/universe/capabilities.py
++++ b/trader/universe/capabilities.py
+@@ -1,11 +1,11 @@
+ from __future__ import annotations
+ 
+ ALLOWED_PROVIDER_CHAIN = {
+-    "practice": ["krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
+-    "real": ["kis_marketcap_top", "krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
++    "practice": ["fdr_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
++    "real": ["fdr_marketcap_top", "kis_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
+ }
+ 
+ 
+ def providers_for_env(env: str) -> list[str]:
+     normalized = (env or "practice").lower()
+     return list(ALLOWED_PROVIDER_CHAIN.get(normalized, ALLOWED_PROVIDER_CHAIN["practice"]))
+diff --git a/trader/universe/providers/__init__.py b/trader/universe/providers/__init__.py
+index 227b790a7be6dec2cbc6a9b19ecb8b270217034f..cef832a002323f44b95576bb733d97e86d9e23be 100644
+--- a/trader/universe/providers/__init__.py
++++ b/trader/universe/providers/__init__.py
+@@ -1,3 +1,4 @@
+ # Provider utilities for universe data sources.
+ 
++from .fdr_marketcap_top import fetch_marketcap_top  # noqa: F401
+ from .kis_mcap import KISMcapProvider, get_kosdaq_top_mcap, get_kospi_top_mcap  # noqa: F401
+diff --git a/trader/universe/providers/fdr_marketcap_top.py b/trader/universe/providers/fdr_marketcap_top.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b844464ec3e87c6e3764818bca4f6bd49ba80676
+--- /dev/null
++++ b/trader/universe/providers/fdr_marketcap_top.py
+@@ -0,0 +1,88 @@
++from __future__ import annotations
++
++import logging
++from typing import Iterable
++
++import pandas as pd
++
++logger = logging.getLogger(__name__)
++
++MARKET_CAP_COLUMNS = ("Marcap", "MarketCap", "MARKET_CAP", "시가총액", "시가 총액")
++MARKET_COLUMNS = ("Market", "시장", "MKT", "MarketName")
++CODE_COLUMNS = ("Code", "Symbol", "종목코드", "종목코드(6자리)")
++NAME_COLUMNS = ("Name", "종목명", "종목명(국문)", "StockName")
++
++
++def _normalize_code(code: object) -> str:
++    code_str = str(code).strip()
++    if code_str.isdigit() and len(code_str) < 6:
++        return code_str.zfill(6)
++    return code_str
++
++
++def _find_column(columns: Iterable[str], candidates: Iterable[str], label: str) -> str:
++    cols = list(columns)
++    for candidate in candidates:
++        if candidate in cols:
++            return candidate
++    raise RuntimeError(f"[UNIVERSE][FDR] {label} column not found in columns={cols}")
++
++
++def _filter_market(df: pd.DataFrame, market_col: str, market_name: str) -> pd.DataFrame:
++    market_series = df[market_col].astype(str).str.upper()
++    return df[market_series.str.contains(market_name.upper(), na=False)].copy()
++
++
++def _normalize_rows(df: pd.DataFrame, code_col: str, name_col: str | None) -> list[dict]:
++    rows: list[dict] = []
++    for _, row in df.iterrows():
++        code = _normalize_code(row.get(code_col))
++        if not code:
++            continue
++        name = None
++        if name_col:
++            raw_name = row.get(name_col)
++            if raw_name is not None:
++                name = str(raw_name).strip() or None
++        rows.append({"code": code, "name": name})
++    return rows
++
++
++def fetch_marketcap_top(targets: dict[str, int]) -> dict[str, list[dict]]:
++    """Return marketcap top rows for each market using FinanceDataReader."""
++    try:
++        import FinanceDataReader as fdr
++    except Exception:
++        logger.exception("[UNIVERSE][FDR] FinanceDataReader import failed")
++        raise
++
++    logger.info("[UNIVERSE][FDR][START] targets=%s", targets)
++    listing = fdr.StockListing("KRX")
++    logger.info("[UNIVERSE][FDR][LISTING] rows=%s cols=%s", len(listing), list(listing.columns))
++
++    market_col = _find_column(listing.columns, MARKET_COLUMNS, "market")
++    cap_col = _find_column(listing.columns, MARKET_CAP_COLUMNS, "market cap")
++    code_col = _find_column(listing.columns, CODE_COLUMNS, "code")
++    name_col = None
++    try:
++        name_col = _find_column(listing.columns, NAME_COLUMNS, "name")
++    except RuntimeError:
++        name_col = None
++
++    results: dict[str, list[dict]] = {}
++    for market_name in ("KOSPI", "KOSDAQ"):
++        market_df = _filter_market(listing, market_col, market_name)
++        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce").fillna(0)
++        market_df = market_df.sort_values(cap_col, ascending=False)
++        limit = max(0, int(targets.get(market_name, 0)))
++        logger.info("[UNIVERSE][FDR][SORT] market=%s column=%s order=desc limit=%s", market_name, cap_col, limit)
++        top_df = market_df.head(limit)
++        rows = _normalize_rows(top_df, code_col, name_col)
++        sample_codes = [row["code"] for row in rows[:5]]
++        logger.info("[UNIVERSE][FDR][SAMPLE] market=%s codes=%s", market_name, sample_codes)
++        logger.info("[UNIVERSE][FDR][SELECTED] market=%s count=%s", market_name, len(rows))
++        results[market_name] = rows
++
++    total_count = sum(len(rows) for rows in results.values())
++    logger.info("[UNIVERSE][FDR][DONE] total=%s", total_count)
++    return results
