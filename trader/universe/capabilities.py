@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 ALLOWED_PROVIDER_CHAIN = {
-    "practice": ["krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
-    "real": ["kis_marketcap_top", "krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
+    "practice": ["fdr_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
+    "real": ["fdr_marketcap_top", "kis_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
 }
 
 

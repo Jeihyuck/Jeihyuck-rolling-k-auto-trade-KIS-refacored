@@ -13,8 +13,8 @@ from trader.db.repos import UniverseRepo
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
+from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
-from trader.universe.providers.krx_provider import fetch_with_rollback
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
 
@@ -44,8 +44,8 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
         "sqlite_cache": 10,
         "lkg": 20,
         # live providers
+        "fdr_marketcap_top": 30,
         "kis_marketcap_top": 30,
-        "krx_marketcap_top": 40,
         # ultimate fallback
         "seed_static": 90,
     }
@@ -58,7 +58,7 @@ SEED_DIR = Path(__file__).resolve().parent / "seeds"
 SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
-DEFAULT_PROVIDER = "kis_marketcap_top"
+DEFAULT_PROVIDER = "fdr_marketcap_top"
 ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
 ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
 
@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", required=True, help="Environment (practice/real)")
     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
+    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
     return parser.parse_args()
 
 
@@ -307,69 +308,60 @@ def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple
     )
 
 
-def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
+def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
     try:
-        kospi_df, kospi_used, kospi_reason = fetch_with_rollback("KOSPI", as_of_date)
-        kosdaq_df, kosdaq_used, kosdaq_reason = fetch_with_rollback("KOSDAQ", as_of_date)
+        rows_by_market = fetch_marketcap_top(targets)
     except Exception as exc:  # pragma: no cover - network/remote failure
-        logger.warning("[UNIVERSE][KRX][FAIL] as_of=%s err=%s", as_of_date, exc)
-        return None, "krx_fetch_fail"
+        logger.warning("[UNIVERSE][FDR][FAIL] as_of=%s err=%s", as_of_date, exc)
+        return None, "fdr_fetch_fail"
 
-    rows_by_market: dict[str, list[dict]] = {}
-    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
-        cap_col = None
-        for cand in ("시가총액", "시가 총액", "MKT_CAP"):
-            if cand in df.columns:
-                cap_col = cand
-                break
-        if cap_col is None:
-            return None, f"{market.lower()}_cap_missing"
-        df_sorted = df.sort_values(cap_col, ascending=False)
-        selected: list[dict] = []
-        for code, row in df_sorted.head(targets.get(market, 0)).iterrows():
-            code_str = str(code).zfill(6)
-            name = row.get("종목명") or row.get("Name") or row.get("name")
-            selected.append({"code": code_str, "name": str(name).strip() if name else None})
-        rows_by_market[market] = selected
     if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
-        return None, "krx_rows_missing"
+        return None, "fdr_rows_missing"
+
+    kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
+    kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
+    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+
     selected_by_market = {
-        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSPI"])],
-        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSDAQ"])],
+        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
     }
     payload = _normalize_payload(
         {
-            "selected": [row["code"] for row in rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]],
+            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
             "selected_by_market": selected_by_market,
         }
     )
-    params = {
-        "as_of": as_of_date,
-        "used_as_of": {
-            "KOSPI": kospi_used.isoformat(),
-            "KOSDAQ": kosdaq_used.isoformat(),
-        },
-        "reasons": {
-            "KOSPI": kospi_reason,
-            "KOSDAQ": kosdaq_reason,
-        },
-    }
+    params = {"as_of": as_of_date, "targets": targets}
     members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": params}, "krx_marketcap_top"
+    return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
 
 
-def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
+def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
 
     payload: dict | None = None
     members: list[dict] = []
-    source = DEFAULT_PROVIDER
+    source = provider_override or DEFAULT_PROVIDER
     params: dict = {"as_of": as_of_date}
     last_reason: str | None = None
 
+    logger.info(
+        "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
+        env,
+        strategy,
+        as_of_date,
+        provider_override or DEFAULT_PROVIDER,
+    )
+
     allowed_chain = providers_for_env(env)
+    if provider_override:
+        if provider_override not in allowed_chain:
+            logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
+        allowed_chain = [provider_override]
     preferred_chain = _prefer_provider_order(allowed_chain)
     if preferred_chain != list(allowed_chain):
         logger.info(
@@ -397,13 +389,13 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
         result: dict | None = None
         reason: str | None = None
 
-        if provider_name == "kis_marketcap_top":
+        if provider_name == "fdr_marketcap_top":
+            result, reason = _build_from_fdr(as_of_date, TARGETS)
+        elif provider_name == "kis_marketcap_top":
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
             else:
                 result, reason = _build_from_kis(kis_provider, as_of_date)
-        elif provider_name == "krx_marketcap_top":
-            result, reason = _build_from_krx(as_of_date, TARGETS)
         elif provider_name == "lkg":
             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
             reason = "lkg_hit" if result else "lkg_miss"
@@ -431,7 +423,7 @@ def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
             params.update(result.get("params") or {})
             last_reason = reason or provider_name
             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
-            if source in {"kis_marketcap_top", "krx_marketcap_top"}:
+            if source in {"fdr_marketcap_top", "kis_marketcap_top"}:
                 if ENABLE_LKG:
                     try:
                         lkg_provider.save(env, strategy, result)
@@ -475,7 +467,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     as_of = args.date or now_kst().date().isoformat()
-    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
+    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
 
 
 if __name__ == "__main__":
