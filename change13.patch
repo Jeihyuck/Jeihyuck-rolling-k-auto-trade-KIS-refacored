@@ -1,513 +1,584 @@
-diff --git a/.github/workflows/pb1-tick.yml b/.github/workflows/pb1-tick.yml
-deleted file mode 100644
-index c996680a76f7a00ba1f8d558dd4a9bf2fe3f959e..0000000000000000000000000000000000000000
---- a/.github/workflows/pb1-tick.yml
-+++ /dev/null
-@@ -1,47 +0,0 @@
--name: PB1 Tick
--
--permissions:
--  contents: write
--
--concurrency:
--  group: trade-bot-state
--  cancel-in-progress: false
--
--on:
--  workflow_dispatch:
--  schedule:
--    # Weekdays (KST Mon-Fri): run during market hours, every 5 min
--    # KST 08:50~08:55 => UTC 23:50~23:55 (prev day) [Sun~Thu UTC]
--    - cron: "50-59/5 23 * * 0-4"
--    # KST 09:00~14:55 => UTC 00:00~05:55 (same day) [Mon~Fri UTC]
--    - cron: "*/5 0-5 * * 1-5"
--    # KST 15:00~15:30 => UTC 06:00~06:30 (same day) [Mon~Fri UTC]
--    - cron: "0-30/5 6 * * 1-5"
--
--jobs:
--  tick:
--    runs-on: ubuntu-latest
--    steps:
--      - name: Checkout
--        uses: actions/checkout@v4
--
--      - name: Set up Python
--        uses: actions/setup-python@v5
--        with:
--          python-version: "3.11"
--
--      - name: Install dependencies
--        run: |
--          python -m pip install --upgrade pip
--          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
--
--      - name: Run PB1 once
--        env:
--          APP_KEY: ${{ secrets.APP_KEY }}
--          APP_SECRET: ${{ secrets.APP_SECRET }}
--          CANO: ${{ secrets.CANO }}
--          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
--          API_BASE_URL: ${{ secrets.API_BASE_URL }}
--          KIS_ENV: ${{ secrets.KIS_ENV }}
--        run: |
--          python -m trader.pb1_tick
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 52af1424f18156c1e6abbf5f2838951cda24a9c2..e95c92d3461abc0ab9d163bbc21e9a74cef8954c 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -1,95 +1,96 @@
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index 68034bab05509af77430adf4377f54bb4119cbdb..b1fc868ee522bfb9ce8683038b27b40f3a8091e0 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -1,43 +1,46 @@
  from __future__ import annotations
  
- import argparse
- import csv
- import logging
+ import json
  import os
+ import subprocess
+ import time
+ import logging
++from dataclasses import dataclass
+ from datetime import datetime, timedelta
  from pathlib import Path
- from typing import Iterable
- 
- from trader.db.engine import make_engine
- from trader.db.migrate import run_migrations
- from trader.db.repos import UniverseRepo
- from trader.kis_wrapper import KisAPI
- from trader.time_utils import now_kst
- from trader.universe.capabilities import providers_for_env
-+from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
- from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
--from trader.universe.providers.krx_provider import fetch_with_rollback
- from trader.universe.providers.lkg_provider import LKGProvider
- from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
- 
- from datetime import date
- 
- 
- def _parse_as_of_date(val: str) -> date | None:
-     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-     from datetime import datetime as _datetime
- 
-     if not val:
-         return None
-     s = str(val).strip()
-     try:
-         if "-" in s:
-             return _datetime.fromisoformat(s).date()
-         if len(s) == 8 and s.isdigit():
-             return _datetime.strptime(s, "%Y%m%d").date()
-         return _datetime.fromisoformat(s).date()
-     except Exception:
-         return None
- 
- 
- def _prefer_provider_order(chain: list[str]) -> list[str]:
-     """Prefer caches first, then live providers, then static."""
-     order = {
-         "sqlite_cache": 10,
-         "lkg": 20,
-         # live providers
-+        "fdr_marketcap_top": 30,
-         "kis_marketcap_top": 30,
--        "krx_marketcap_top": 40,
-         # ultimate fallback
-         "seed_static": 90,
-     }
-     return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
+-from typing import Iterable
++from typing import Iterable, Optional, Tuple
+ from zoneinfo import ZoneInfo
  
  logger = logging.getLogger(__name__)
  
- FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
- SEED_DIR = Path(__file__).resolve().parent / "seeds"
- SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
- SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
- TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
--DEFAULT_PROVIDER = "kis_marketcap_top"
-+DEFAULT_PROVIDER = "fdr_marketcap_top"
- ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
- ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
+ KST = ZoneInfo("Asia/Seoul")
+ 
+ DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
+ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
++SYNC_MODE_FETCH_RESET = "FETCH_RESET"
++BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
+ DEFAULT_LOCK_TTL_SEC = 240
+ DEFAULT_LOCK_RETRY_SEC = 55
+ DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
  
  
- def parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Build and persist universe members")
-     parser.add_argument("--env", required=True, help="Environment (practice/real)")
-     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
-     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
-+    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
-     return parser.parse_args()
- 
- 
- def _normalize_payload(payload: dict | None) -> dict:
-     payload = payload or {}
-     selected = payload.get("selected") or []
-     selected_stocks = payload.get("selected_stocks") or selected
-     selected_by_market = payload.get("selected_by_market") or {}
-     normalized = {
-         "selected": list(selected),
-         "selected_stocks": list(selected_stocks),
-         "selected_by_market": dict(selected_by_market),
-     }
-     if "weight_scope" in payload:
-         normalized["weight_scope"] = payload.get("weight_scope")
-     return normalized
- 
- 
- def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
-     members: list[dict] = []
-     for market, rows in (selected_by_market or {}).items():
-         for idx, row in enumerate(rows or []):
-             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-             if not code:
-                 continue
-@@ -285,198 +286,189 @@ def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple
-     _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
-     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
- 
-     selected_by_market = {
-         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-     }
-     payload = _normalize_payload(
-         {
-             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-             "selected_by_market": selected_by_market,
-         }
-     )
-     members = _build_members_from_payload(selected_by_market)
-     return (
-         {
-             "payload": payload,
-             "members": members,
-             "source": "kis_marketcap_top",
-             "params": {"targets": TARGETS, "as_of": as_of_date},
-         },
-         "kis_marketcap_top",
-     )
- 
- 
--def _build_from_krx(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
-+def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
+ def _lock_ttl_sec() -> int:
      try:
--        kospi_df, kospi_used, kospi_reason = fetch_with_rollback("KOSPI", as_of_date)
--        kosdaq_df, kosdaq_used, kosdaq_reason = fetch_with_rollback("KOSDAQ", as_of_date)
-+        rows_by_market = fetch_marketcap_top(targets)
-     except Exception as exc:  # pragma: no cover - network/remote failure
--        logger.warning("[UNIVERSE][KRX][FAIL] as_of=%s err=%s", as_of_date, exc)
--        return None, "krx_fetch_fail"
--
--    rows_by_market: dict[str, list[dict]] = {}
--    for market, df in (("KOSPI", kospi_df), ("KOSDAQ", kosdaq_df)):
--        cap_col = None
--        for cand in ("시가총액", "시가 총액", "MKT_CAP"):
--            if cand in df.columns:
--                cap_col = cand
--                break
--        if cap_col is None:
--            return None, f"{market.lower()}_cap_missing"
--        df_sorted = df.sort_values(cap_col, ascending=False)
--        selected: list[dict] = []
--        for code, row in df_sorted.head(targets.get(market, 0)).iterrows():
--            code_str = str(code).zfill(6)
--            name = row.get("종목명") or row.get("Name") or row.get("name")
--            selected.append({"code": code_str, "name": str(name).strip() if name else None})
--        rows_by_market[market] = selected
-+        logger.warning("[UNIVERSE][FDR][FAIL] as_of=%s err=%s", as_of_date, exc)
-+        return None, "fdr_fetch_fail"
+         return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
+     except Exception:
+         return DEFAULT_LOCK_TTL_SEC
+ 
+ 
+ def _lock_retry_total_sec() -> int:
+     try:
+         return int(os.getenv("BOTSTATE_LOCK_RETRY_TOTAL_SEC", str(DEFAULT_LOCK_RETRY_SEC)))
+     except Exception:
+         return DEFAULT_LOCK_RETRY_SEC
+ 
+ 
+ def _lock_retry_sleep_sec() -> int:
+     try:
+         return int(os.getenv("BOTSTATE_LOCK_RETRY_SLEEP_SEC", str(DEFAULT_LOCK_RETRY_SLEEP_SEC)))
+     except Exception:
+         return DEFAULT_LOCK_RETRY_SLEEP_SEC
+ 
+@@ -71,253 +74,444 @@ def stage_all(worktree_dir: Path) -> None:
+ 
+ def commit_if_staged(worktree_dir: Path, message: str) -> bool:
+     diff_proc = _git(worktree_dir, "diff", "--cached", "--quiet", check=False)
+     if diff_proc.returncode == 0:
+         return False
+     _git(worktree_dir, "commit", "-m", message)
+     return True
+ 
+ 
+ def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
+     status = git_porcelain(worktree_dir)
+     files = [line.strip() for line in status.splitlines() if line.strip()]
+     dirty = bool(files)
+     logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
+     if not dirty:
+         return
+     stage_all(worktree_dir)
+     committed = commit_if_staged(worktree_dir, message_for_autosave)
+     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
+ 
+ 
+ def _git(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+     return _run(["git", "-C", str(worktree_dir), *args], check=check)
+ 
+ 
++@dataclass
++class GitSyncStatus:
++    remote: str
++    branch: str
++    remote_ref: str
++    ahead: int
++    behind: int
 +
-     if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
--        return None, "krx_rows_missing"
-+        return None, "fdr_rows_missing"
 +
-+    kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
-+    kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
-+    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
-+    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
++def _run_git(cmd: list[str], cwd: Optional[str] = None, check: bool = True) -> Tuple[int, str]:
++    p = subprocess.run(
++        cmd,
++        cwd=cwd,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        text=True,
++    )
++    out = (p.stdout or "").strip()
++    if check and p.returncode != 0:
++        raise RuntimeError(f"git command failed: {' '.join(cmd)}\n{out}")
++    return p.returncode, out
 +
-     selected_by_market = {
--        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSPI"])],
--        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(rows_by_market["KOSDAQ"])],
-+        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-+        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-     }
-     payload = _normalize_payload(
-         {
--            "selected": [row["code"] for row in rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]],
-+            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-             "selected_by_market": selected_by_market,
-         }
-     )
--    params = {
--        "as_of": as_of_date,
--        "used_as_of": {
--            "KOSPI": kospi_used.isoformat(),
--            "KOSDAQ": kosdaq_used.isoformat(),
--        },
--        "reasons": {
--            "KOSPI": kospi_reason,
--            "KOSDAQ": kosdaq_reason,
--        },
--    }
-+    params = {"as_of": as_of_date, "targets": targets}
-     members = _build_members_from_payload(selected_by_market)
--    return {"payload": payload, "members": members, "source": "krx_marketcap_top", "params": params}, "krx_marketcap_top"
-+    return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
++
++def git_fetch_reset(remote: str, branch: str, cwd: str) -> GitSyncStatus:
++    """
++    Deterministic sync:
++      fetch origin <branch>
++      reset --hard origin/<branch>
++    Then compute ahead/behind vs origin/<branch>.
++    """
++    remote_ref = f"{remote}/{branch}"
++    _run_git(["git", "fetch", remote, branch], cwd=cwd, check=True)
++    _run_git(["git", "reset", "--hard", remote_ref], cwd=cwd, check=True)
++    _, cnt = _run_git(
++        ["git", "rev-list", "--left-right", "--count", f"HEAD...{remote_ref}"],
++        cwd=cwd,
++        check=True,
++    )
++    left, right = cnt.split()
++    ahead = int(left)
++    behind = int(right)
++    return GitSyncStatus(remote=remote, branch=branch, remote_ref=remote_ref, ahead=ahead, behind=behind)
++
++
++def git_push(remote: str, branch: str, cwd: str) -> Tuple[bool, str]:
++    rc, out = _run_git(["git", "push", remote, f"HEAD:{branch}"], cwd=cwd, check=False)
++    ok = rc == 0
++    return ok, out
++
++
++def is_non_fast_forward(push_output: str) -> bool:
++    s = (push_output or "").lower()
++    return ("non-fast-forward" in s) or ("fetch first" in s) or ("rejected" in s)
++
++
+ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+     base_dir_resolved = base_dir.resolve()
+     worktree_dir_resolved = worktree_dir.resolve()
+     for path in {base_dir_resolved, worktree_dir_resolved}:
+         _run(["git", "config", "--global", "--add", "safe.directory", str(path)])
  
  
--def build_universe(as_of_date: str, env: str, strategy: str) -> str | None:
-+def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
-     engine = make_engine()
-     run_migrations(engine)
-     repo = UniverseRepo(engine)
+ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
+     base_dir = base_dir.resolve()
+     worktree_dir = worktree_dir.resolve()
+     worktree_dir.mkdir(parents=True, exist_ok=True)
+     _configure_safe_directories(base_dir, worktree_dir)
+     try:
+         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+     except subprocess.CalledProcessError:
+         _run(["git", "fetch", "origin", f"{target_branch}:{target_branch}"], cwd=base_dir)
+         _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+-    _git(worktree_dir, "pull", "--rebase")
++    git_fetch_reset("origin", target_branch, cwd=str(worktree_dir))
  
-     payload: dict | None = None
-     members: list[dict] = []
--    source = DEFAULT_PROVIDER
-+    source = provider_override or DEFAULT_PROVIDER
-     params: dict = {"as_of": as_of_date}
-     last_reason: str | None = None
  
+ def _lock_path(worktree_dir: Path) -> Path:
+     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
+ 
+ 
+ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
++    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
++    remote = "origin"
++    sync_mode = SYNC_MODE_FETCH_RESET
+     ttl_env = _lock_ttl_sec()
+     ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
+     retry_total_sec = max(0, _lock_retry_total_sec())
+     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+-    start_ts = time.time()
++    deadline_ts = time.time() + retry_total_sec
+     attempt = 0
+ 
+-    while True:
 +    logger.info(
-+        "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
-+        env,
-+        strategy,
-+        as_of_date,
-+        provider_override or DEFAULT_PROVIDER,
++        "[BOTSTATE][SYNC] SYNC_MODE=%s step=pre_lock_sync remote=%s branch=%s",
++        sync_mode,
++        remote,
++        branch,
 +    )
 +
-     allowed_chain = providers_for_env(env)
-+    if provider_override:
-+        if provider_override not in allowed_chain:
-+            logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
-+        allowed_chain = [provider_override]
-     preferred_chain = _prefer_provider_order(allowed_chain)
-     if preferred_chain != list(allowed_chain):
-         logger.info(
-             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
-             env,
-             strategy,
-             allowed_chain,
-             preferred_chain,
-         )
-     else:
-         logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
- 
-     kis_provider: KISMarketcapTopProvider | None = None
-     if "kis_marketcap_top" in allowed_chain:
-         try:
-             kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
-         except Exception as exc:
-             last_reason = f"kis_init_fail:{exc}"
-             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
- 
-     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
-     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
- 
-     for provider_name in preferred_chain:
-         result: dict | None = None
-         reason: str | None = None
- 
--        if provider_name == "kis_marketcap_top":
-+        if provider_name == "fdr_marketcap_top":
-+            result, reason = _build_from_fdr(as_of_date, TARGETS)
-+        elif provider_name == "kis_marketcap_top":
-             if not kis_provider:
-                 reason = last_reason or "kis_provider_unavailable"
-             else:
-                 result, reason = _build_from_kis(kis_provider, as_of_date)
--        elif provider_name == "krx_marketcap_top":
--            result, reason = _build_from_krx(as_of_date, TARGETS)
-         elif provider_name == "lkg":
-             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
-             reason = "lkg_hit" if result else "lkg_miss"
-         elif provider_name == "sqlite_cache":
-             if sqlite_provider:
-                 result = _fallback_from_sqlite(
-                     sqlite_provider,
-                     env=env,
-                     strategy=strategy,
-                     reference_as_of=as_of_date,
-                     max_age_days=FALLBACK_MAX_AGE_DAYS,
-                 )
-             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
-         elif provider_name == "seed_static":
-             result = _load_static_seed()
-             reason = "seed_static" if result else "seed_missing"
-         else:
-             logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
-             continue
- 
-         if result:
-             payload = result["payload"]
-             members = result["members"]
-             source = result.get("source", provider_name)
-             params.update(result.get("params") or {})
-             last_reason = reason or provider_name
-             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
--            if source in {"kis_marketcap_top", "krx_marketcap_top"}:
-+            if source in {"fdr_marketcap_top", "kis_marketcap_top"}:
-                 if ENABLE_LKG:
-                     try:
-                         lkg_provider.save(env, strategy, result)
-                     except Exception:
-                         logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
-                 if ENABLE_SQLITE_CACHE and sqlite_provider:
-                     sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
-             break
- 
-         last_reason = reason or provider_name
-         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
- 
-     universe_id = repo.store_universe(
-         env=env,
-         strategy=strategy,
-         as_of_date=as_of_date,
-         source=source,
-         params_json=params,
-         payload_json=payload or {},
-         members=members,
-     )
-     if universe_id:
-         logger.info(
-             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
-             env,
-             strategy,
-             as_of_date,
-             universe_id,
-             len(members),
-             source,
-             last_reason or "n/a",
-         )
-     else:
-         logger.warning(
-             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
-         )
-     return universe_id
- 
- 
- def main() -> None:
-     logging.basicConfig(level=logging.INFO)
-     args = parse_args()
-     as_of = args.date or now_kst().date().isoformat()
--    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy)
-+    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
- 
- 
- if __name__ == "__main__":
-     main()
-diff --git a/trader/universe/capabilities.py b/trader/universe/capabilities.py
-index 5e2558585dfd9d720033f13a9187594ef0ec8188..a5519699cfab3086c122cb58cdc031db852a0a7d 100644
---- a/trader/universe/capabilities.py
-+++ b/trader/universe/capabilities.py
-@@ -1,11 +1,11 @@
- from __future__ import annotations
- 
- ALLOWED_PROVIDER_CHAIN = {
--    "practice": ["krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
--    "real": ["kis_marketcap_top", "krx_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
-+    "practice": ["fdr_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
-+    "real": ["fdr_marketcap_top", "kis_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
- }
- 
- 
- def providers_for_env(env: str) -> list[str]:
-     normalized = (env or "practice").lower()
-     return list(ALLOWED_PROVIDER_CHAIN.get(normalized, ALLOWED_PROVIDER_CHAIN["practice"]))
-diff --git a/trader/universe/providers/__init__.py b/trader/universe/providers/__init__.py
-index 227b790a7be6dec2cbc6a9b19ecb8b270217034f..cef832a002323f44b95576bb733d97e86d9e23be 100644
---- a/trader/universe/providers/__init__.py
-+++ b/trader/universe/providers/__init__.py
-@@ -1,3 +1,4 @@
- # Provider utilities for universe data sources.
- 
-+from .fdr_marketcap_top import fetch_marketcap_top  # noqa: F401
- from .kis_mcap import KISMcapProvider, get_kosdaq_top_mcap, get_kospi_top_mcap  # noqa: F401
-diff --git a/trader/universe/providers/fdr_marketcap_top.py b/trader/universe/providers/fdr_marketcap_top.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..b844464ec3e87c6e3764818bca4f6bd49ba80676
---- /dev/null
-+++ b/trader/universe/providers/fdr_marketcap_top.py
-@@ -0,0 +1,88 @@
-+from __future__ import annotations
-+
-+import logging
-+from typing import Iterable
-+
-+import pandas as pd
-+
-+logger = logging.getLogger(__name__)
-+
-+MARKET_CAP_COLUMNS = ("Marcap", "MarketCap", "MARKET_CAP", "시가총액", "시가 총액")
-+MARKET_COLUMNS = ("Market", "시장", "MKT", "MarketName")
-+CODE_COLUMNS = ("Code", "Symbol", "종목코드", "종목코드(6자리)")
-+NAME_COLUMNS = ("Name", "종목명", "종목명(국문)", "StockName")
-+
-+
-+def _normalize_code(code: object) -> str:
-+    code_str = str(code).strip()
-+    if code_str.isdigit() and len(code_str) < 6:
-+        return code_str.zfill(6)
-+    return code_str
-+
-+
-+def _find_column(columns: Iterable[str], candidates: Iterable[str], label: str) -> str:
-+    cols = list(columns)
-+    for candidate in candidates:
-+        if candidate in cols:
-+            return candidate
-+    raise RuntimeError(f"[UNIVERSE][FDR] {label} column not found in columns={cols}")
-+
-+
-+def _filter_market(df: pd.DataFrame, market_col: str, market_name: str) -> pd.DataFrame:
-+    market_series = df[market_col].astype(str).str.upper()
-+    return df[market_series.str.contains(market_name.upper(), na=False)].copy()
-+
-+
-+def _normalize_rows(df: pd.DataFrame, code_col: str, name_col: str | None) -> list[dict]:
-+    rows: list[dict] = []
-+    for _, row in df.iterrows():
-+        code = _normalize_code(row.get(code_col))
-+        if not code:
++    while time.time() < deadline_ts:
+         attempt += 1
++        try:
++            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++            logger.info(
++                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
++                sync_mode,
++                st.remote_ref,
++                st.behind,
++                st.ahead,
++                attempt,
++            )
++        except Exception as exc:
++            logger.warning(
++                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
++                sync_mode,
++                attempt,
++                str(exc),
++            )
++            time.sleep(retry_sleep_sec)
 +            continue
-+        name = None
-+        if name_col:
-+            raw_name = row.get(name_col)
-+            if raw_name is not None:
-+                name = str(raw_name).strip() or None
-+        rows.append({"code": code, "name": name})
-+    return rows
 +
+         now = datetime.now(tz=KST)
+         locked = False
+         stale_takeover = False
+         locked_until = None
+         current_owner = None
+         current_run_id = None
+         if lock_path.exists():
+             try:
+                 payload = json.loads(lock_path.read_text())
+                 current_owner = payload.get("owner")
+                 current_run_id = payload.get("run_id")
+                 ts_raw = payload.get("ts")
+                 ts = datetime.fromisoformat(ts_raw) if ts_raw else None
+                 ttl = int(payload.get("ttl_sec") or ttl_sec)
+                 if ts is None:
+                     stale_takeover = True
+                 else:
+                     locked_until = ts + timedelta(seconds=ttl)
+                     if locked_until > now:
+                         locked = True
+                     else:
+                         stale_takeover = True
+                 if stale_takeover:
+                     logger.warning(
+                         "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
+                         current_owner,
+                         current_run_id,
+                         locked_until,
+                     )
+             except Exception as exc:
+                 logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
+                 stale_takeover = True
+ 
+         if not locked:
+             lock_payload = {
+                 "owner": owner,
+                 "run_id": run_id,
+                 "ts": now.isoformat(),
+                 "ttl_sec": ttl_sec,
+             }
+             temp_path = lock_path.with_name(f"{lock_path.name}.tmp")
+             temp_path.write_text(json.dumps(lock_payload))
+             temp_path.replace(lock_path)
+             lock_rel_path = lock_path.relative_to(worktree_dir)
+             _git(worktree_dir, "add", str(lock_rel_path))
+-            push_retry(worktree_dir, message=f"lock run_id={run_id}")
+-            logger.info("[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%s", owner, run_id, ttl_sec)
+-            return True
+-
+-        elapsed = time.time() - start_ts
+-        if elapsed < retry_total_sec:
++            committed = commit_if_staged(worktree_dir, message=f"lock run_id={run_id}")
+             logger.info(
+-                "[BOTSTATE][RETRY] wait=%s locked_until=%s attempt=%s elapsed=%.1fs total=%s",
+-                retry_sleep_sec,
+-                locked_until.isoformat() if locked_until else "unknown",
++                "[BOTSTATE][GIT] SYNC_MODE=%s step=lock_commit committed=%s attempt=%d",
++                sync_mode,
++                committed,
++                attempt,
++            )
++            push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
++            if push_ok:
++                logger.info(
++                    "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
++                    sync_mode,
++                    attempt,
++                )
++                logger.info(
++                    "[BOTSTATE][LOCK_ACQUIRED] owner=%s run_id=%s ttl_sec=%d",
++                    owner,
++                    run_id,
++                    ttl_sec,
++                )
++                return True
 +
-+def fetch_marketcap_top(targets: dict[str, int]) -> dict[str, list[dict]]:
-+    """Return marketcap top rows for each market using FinanceDataReader."""
-+    try:
-+        import FinanceDataReader as fdr
-+    except Exception:
-+        logger.exception("[UNIVERSE][FDR] FinanceDataReader import failed")
-+        raise
++            logger.warning(
++                "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
++                sync_mode,
+                 attempt,
+-                elapsed,
+-                retry_total_sec,
++                is_non_fast_forward(out),
++                (out[-400:] if out else ""),
+             )
++            try:
++                st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++                logger.info(
++                    "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
++                    sync_mode,
++                    st2.remote_ref,
++                    st2.behind,
++                    st2.ahead,
++                    attempt,
++                )
++            except Exception as exc:
++                logger.warning(
++                    "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
++                    sync_mode,
++                    attempt,
++                    str(exc),
++                )
+             time.sleep(retry_sleep_sec)
+             continue
+-        break
+-
+-    logger.warning(
+-        "[BOTSTATE][LOCKED] owner=%s run_id=%s until=%s now=%s ttl_sec=%s current_owner=%s current_run_id=%s",
+-        owner,
+-        run_id,
+-        locked_until.isoformat() if locked_until else "unknown",
+-        now.isoformat(),
+-        ttl_sec,
+-        current_owner,
+-        current_run_id,
+-    )
 +
-+    logger.info("[UNIVERSE][FDR][START] targets=%s", targets)
-+    listing = fdr.StockListing("KRX")
-+    logger.info("[UNIVERSE][FDR][LISTING] rows=%s cols=%s", len(listing), list(listing.columns))
++        logger.info(
++            "[BOTSTATE][RETRY] wait=%s locked_until=%s attempt=%s",
++            retry_sleep_sec,
++            locked_until.isoformat() if locked_until else "unknown",
++            attempt,
++        )
++        time.sleep(retry_sleep_sec)
 +
-+    market_col = _find_column(listing.columns, MARKET_COLUMNS, "market")
-+    cap_col = _find_column(listing.columns, MARKET_CAP_COLUMNS, "market cap")
-+    code_col = _find_column(listing.columns, CODE_COLUMNS, "code")
-+    name_col = None
-+    try:
-+        name_col = _find_column(listing.columns, NAME_COLUMNS, "name")
-+    except RuntimeError:
-+        name_col = None
++    logger.error("[BOTSTATE][LOCK_ACQUIRE][TIMEOUT] SYNC_MODE=%s attempts=%d", sync_mode, attempt)
+     return False
+ 
+ 
+ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+-    if lock_path.exists():
++    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
++    remote = "origin"
++    sync_mode = SYNC_MODE_FETCH_RESET
++    retry_total_sec = max(0, _lock_retry_total_sec())
++    retry_sleep_sec = max(1, _lock_retry_sleep_sec())
++    deadline_ts = time.time() + retry_total_sec
++    attempt = 0
 +
-+    results: dict[str, list[dict]] = {}
-+    for market_name in ("KOSPI", "KOSDAQ"):
-+        market_df = _filter_market(listing, market_col, market_name)
-+        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce").fillna(0)
-+        market_df = market_df.sort_values(cap_col, ascending=False)
-+        limit = max(0, int(targets.get(market_name, 0)))
-+        logger.info("[UNIVERSE][FDR][SORT] market=%s column=%s order=desc limit=%s", market_name, cap_col, limit)
-+        top_df = market_df.head(limit)
-+        rows = _normalize_rows(top_df, code_col, name_col)
-+        sample_codes = [row["code"] for row in rows[:5]]
-+        logger.info("[UNIVERSE][FDR][SAMPLE] market=%s codes=%s", market_name, sample_codes)
-+        logger.info("[UNIVERSE][FDR][SELECTED] market=%s count=%s", market_name, len(rows))
-+        results[market_name] = rows
++    while time.time() < deadline_ts:
++        attempt += 1
++        try:
++            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++            logger.info(
++                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
++                sync_mode,
++                st.remote_ref,
++                st.behind,
++                st.ahead,
++                attempt,
++            )
++        except Exception as exc:
++            logger.warning(
++                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
++                sync_mode,
++                attempt,
++                str(exc),
++            )
++            time.sleep(retry_sleep_sec)
++            continue
 +
-+    total_count = sum(len(rows) for rows in results.values())
-+    logger.info("[UNIVERSE][FDR][DONE] total=%s", total_count)
-+    return results
++        if not lock_path.exists():
++            return
+         try:
+             payload = json.loads(lock_path.read_text())
+         except Exception as exc:
+             logger.warning("[BOTSTATE][LOCK_RELEASE_SKIP] reason=parse_error err=%s", exc)
+             return
+         if payload.get("owner") != owner or payload.get("run_id") != run_id:
+             logger.warning(
+                 "[BOTSTATE][LOCK_RELEASE_SKIP] owner=%s run_id=%s current_owner=%s current_run_id=%s",
+                 owner,
+                 run_id,
+                 payload.get("owner"),
+                 payload.get("run_id"),
+             )
+             return
+         lock_path.unlink()
+         lock_rel_path = lock_path.relative_to(worktree_dir)
+         _git(worktree_dir, "add", "-u", str(lock_rel_path))
+-        push_retry(worktree_dir, message=f"unlock run_id={run_id}")
+-        logger.info("[BOTSTATE][LOCK_RELEASED] owner=%s run_id=%s", owner, run_id)
++        committed = commit_if_staged(worktree_dir, message=f"unlock run_id={run_id}")
++        logger.info(
++            "[BOTSTATE][GIT] SYNC_MODE=%s step=unlock_commit committed=%s attempt=%d",
++            sync_mode,
++            committed,
++            attempt,
++        )
++        push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
++        if push_ok:
++            logger.info(
++                "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
++                sync_mode,
++                attempt,
++            )
++            logger.info("[BOTSTATE][LOCK_RELEASED] owner=%s run_id=%s", owner, run_id)
++            return
++        logger.warning(
++            "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
++            sync_mode,
++            attempt,
++            is_non_fast_forward(out),
++            (out[-400:] if out else ""),
++        )
++        try:
++            st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++            logger.info(
++                "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
++                sync_mode,
++                st2.remote_ref,
++                st2.behind,
++                st2.ahead,
++                attempt,
++            )
++        except Exception as exc:
++            logger.warning(
++                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
++                sync_mode,
++                attempt,
++                str(exc),
++            )
++        time.sleep(retry_sleep_sec)
+ 
+ 
+ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
+     worktree_dir = worktree_dir.resolve()
+     files = list(new_files)
+     for path in files:
+         try:
+             if path.resolve().is_relative_to(worktree_dir.resolve()):
+                 target = path.resolve()
+             else:
+                 if "bot_state" in path.parts:
+                     idx = path.parts.index("bot_state")
+                     rel = Path(*path.parts[idx:])
+                 else:
+                     rel = Path("bot_state") / Path(*path.parts[-4:])
+                 target = (worktree_dir / rel).resolve()
+                 target.parent.mkdir(parents=True, exist_ok=True)
+                 target.write_bytes(path.read_bytes())
+             rel_target = target.relative_to(worktree_dir)
+             _git(worktree_dir, "add", str(rel_target))
+         except Exception:
+             continue
+     push_retry(worktree_dir, message=message)
+     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+ 
+ 
+-def _pull_with_autostash(worktree_dir: Path, branch: str) -> bool:
+-    try:
+-        _git(worktree_dir, "pull", "--rebase", "--autostash", "origin", branch)
+-        return True
+-    except subprocess.CalledProcessError as exc:
+-        stdout = exc.stdout or ""
+-        stderr = exc.stderr or ""
+-        if "--autostash" in stderr or "unknown option" in stderr or "unknown option" in stdout:
+-            logger.warning("[BOTSTATE][GIT] --autostash unsupported fallback -> manual stash")
+-            _git(worktree_dir, "stash", "push", "-u", "-m", "autostash botstate")
+-            try:
+-                _git(worktree_dir, "pull", "--rebase", "origin", branch)
+-                return True
+-            finally:
+-                try:
+-                    _git(worktree_dir, "stash", "pop")
+-                except subprocess.CalledProcessError:
+-                    logger.warning("[BOTSTATE][GIT] stash pop failed after manual autostash")
+-                    raise
+-        raise
+-
+-
+ def push_retry(worktree_dir: Path, message: str, retries: int = 3) -> None:
+     worktree_dir = worktree_dir.resolve()
+     branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
++    remote = "origin"
++    sync_mode = SYNC_MODE_FETCH_RESET
+     for attempt in range(1, retries + 1):
+-        pull_ok = False
+-        push_ok = False
+-        retry_reason = ""
+         try:
+-            _git(worktree_dir, "fetch", "origin", branch)
+-            committed = commit_if_staged(worktree_dir, message)
+-            logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message)
+-            ensure_clean_before_rebase(worktree_dir, message_for_autosave=f"autosave before {message}")
+-            rev_list = _git(worktree_dir, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD").stdout.strip()
+-            try:
+-                behind, ahead = (int(x) for x in rev_list.split())
+-            except Exception:
+-                behind, ahead = 0, 0
+-            logger.info("[BOTSTATE][GIT] behind=%s ahead=%s", behind, ahead)
+-
+-            if behind == 0 and ahead > 0:
+-                _git(worktree_dir, "push")
+-                push_ok = True
+-            elif behind > 0:
+-                pull_ok = _pull_with_autostash(worktree_dir, branch)
+-                _git(worktree_dir, "push")
+-                push_ok = True
+-            else:
+-                _git(worktree_dir, "push")
+-                push_ok = True
+-
+-            logger.info("[BOTSTATE][GIT] push_ok=%s pull_ok=%s attempt=%s", push_ok, pull_ok, attempt)
+-            return
+-        except subprocess.CalledProcessError as exc:
+-            retry_reason = (exc.stderr or "").strip() or (exc.stdout or "").strip() or str(exc)
+-            logger.warning("[BOTSTATE][GIT] push_ok=%s pull_ok=%s retry_reason=%s attempt=%s", push_ok, pull_ok, retry_reason, attempt)
+-            if "non-fast-forward" in retry_reason or "fetch first" in retry_reason.lower():
+-                ensure_clean_before_rebase(worktree_dir, message_for_autosave=f"autosave before {message}")
+-                try:
+-                    pull_ok = _pull_with_autostash(worktree_dir, branch)
+-                except subprocess.CalledProcessError as pull_exc:
+-                    retry_reason = (pull_exc.stderr or "").strip() or (pull_exc.stdout or "").strip() or str(pull_exc)
++            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++            logger.info(
++                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
++                sync_mode,
++                st.remote_ref,
++                st.behind,
++                st.ahead,
++                attempt,
++            )
++        except Exception as exc:
++            logger.warning(
++                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
++                sync_mode,
++                attempt,
++                str(exc),
++            )
+             if attempt == retries:
+                 raise
+             time.sleep(2 * attempt)
++            continue
++
++        committed = commit_if_staged(worktree_dir, message)
++        logger.info(
++            "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
++            sync_mode,
++            committed,
++            message,
++            attempt,
++        )
++        push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
++        if push_ok:
++            logger.info(
++                "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
++                sync_mode,
++                attempt,
++            )
++            return
++
++        logger.warning(
++            "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
++            sync_mode,
++            attempt,
++            is_non_fast_forward(out),
++            (out[-400:] if out else ""),
++        )
++        try:
++            st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
++            logger.info(
++                "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
++                sync_mode,
++                st2.remote_ref,
++                st2.behind,
++                st2.ahead,
++                attempt,
++            )
++        except Exception as exc:
++            logger.warning(
++                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
++                sync_mode,
++                attempt,
++                str(exc),
++            )
++        if attempt == retries:
++            raise RuntimeError(f"git push failed after retries: {out}")
++        time.sleep(2 * attempt)
