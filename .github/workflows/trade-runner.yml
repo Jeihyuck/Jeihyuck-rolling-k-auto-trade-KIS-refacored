@@ -189,3 +189,14 @@ jobs:
         env:
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
+
+      - name: Debug bot_state contents (after run)
+        run: |
+          set -euo pipefail
+          echo "=== bot_state tree ==="
+          find bot_state -maxdepth 3 -type f -print || true
+          echo "=== git status (bot-state worktree if exists) ==="
+          git status --porcelain || true
+
+
+
