@@ -26,6 +26,7 @@ from trader.config import (
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
+    resolve_strategy_mode,
 )
 from trader.botstate_sync import acquire_lock as acquire_botstate_lock
 from trader.botstate_sync import persist_run_files, release_lock as release_botstate_lock
@@ -35,8 +36,8 @@ from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
 from trader.kis_wrapper import KisAPI
-from trader.pb1_engine import PB1Engine
-from trader.time_utils import is_trading_day, now_kst
+from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 
@@ -65,18 +66,28 @@ def _market_session(now: datetime) -> tuple[datetime, datetime]:
     )
 
 
+def _parse_now_override(raw: str | None, label: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        else:
+            dt = dt.astimezone(ZoneInfo("Asia/Seoul"))
+        return dt
+    except Exception:
+        logger.warning("[PB1][SMOKE] invalid %s=%s", label, raw)
+        return None
+
+
 def _get_now_kst() -> datetime:
-    simulated = os.getenv("PB1_SIMULATE_NOW_KST")
+    override = _parse_now_override(os.getenv("NOW_KST_OVERRIDE"), "NOW_KST_OVERRIDE")
+    if override:
+        return override
+    simulated = _parse_now_override(os.getenv("PB1_SIMULATE_NOW_KST"), "PB1_SIMULATE_NOW_KST")
     if simulated:
-        try:
-            dt = datetime.fromisoformat(simulated)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
-            else:
-                dt = dt.astimezone(ZoneInfo("Asia/Seoul"))
-            return dt
-        except Exception:
-            logger.warning("[PB1][SMOKE] invalid PB1_SIMULATE_NOW_KST=%s", simulated)
+        return simulated
     return now_kst()
 
 
@@ -174,6 +185,13 @@ def _parse_int_env(name: str, default: int) -> int:
         return default
 
 
+def _resolve_lock_ttl(max_seconds: int) -> tuple[int, int]:
+    buffer_sec = _parse_int_env("BOTSTATE_LOCK_TTL_BUFFER_SEC", 180)
+    base_sec = max_seconds if max_seconds > 0 else BOTSTATE_LOCK_TTL_SEC
+    ttl_sec = base_sec + buffer_sec
+    return ttl_sec, buffer_sec
+
+
 def _collect_botstate_files(since_ts: float) -> list[Path]:
     base_dir = Path("bot_state")
     if not base_dir.exists():
@@ -217,12 +235,27 @@ def run_once(
     engine,
     loop_mode: bool = False,
     window: WindowDecision | None = None,
-) -> tuple[list[Path], bool]:
+) -> tuple[list[Path], bool, dict[str, int], str]:
     now = _get_now_kst()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
     event_name_lower = event_name.lower()
-    trading_day = True if smoke_enabled else is_trading_day(now)
+    mode, trading_day, market_window, mode_source = resolve_strategy_mode(
+        now_kst=now,
+        force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
+    )
+    effective_mode = mode
+    if smoke_enabled:
+        trading_day = True
+    logger.info(
+        "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
+        mode_source,
+        now.isoformat(),
+        trading_day,
+        market_window,
+        mode,
+    )
+    os.environ["STRATEGY_MODE"] = mode
     diag_env_flag = (
         env_bool("DIAGNOSTIC_FORCE_RUN", False)
         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
@@ -233,7 +266,13 @@ def run_once(
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
     window = window or decide_window(now=now, override=args.window)
     window_name_for_log = window.name if window else "none"
-    phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+
+    entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
+    os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
+    force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
+    phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
+    resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+    phase_for_log = resolved_phase
 
     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
@@ -280,23 +319,45 @@ def run_once(
                 time_mod.sleep(sleep_for)
             if action == "wait":
                 now = _get_now_kst()
-                trading_day = True if smoke_enabled else is_trading_day(now)
+                mode, trading_day, market_window, mode_source = resolve_strategy_mode(
+                    now_kst=now,
+                    force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
+                )
+                effective_mode = mode
+                os.environ["STRATEGY_MODE"] = mode
                 window = decide_window(now=now, override=args.window)
                 window_name_for_log = window.name if window else "none"
-                phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+                resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+                phase_for_log = resolved_phase
+                logger.info(
+                    "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
+                    mode_source,
+                    now.isoformat(),
+                    trading_day,
+                    market_window,
+                    mode,
+                )
+                logger.info(
+                    "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s",
+                    now.isoformat(),
+                    phase_window,
+                    resolved_phase,
+                    phase_reason,
+                    entry_flag.value,
+                )
                 action = "run" if trading_day else "smoke"
                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_name_for_log, phase_for_log)
     elif not trading_day:
         logger.info("[PB1][LOOP] non-trading-day -> skip")
-        return [], False
+        return [], False, {}, phase_for_log
 
     if action == "smoke":
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
-        return [], False
+        return [], False, {}, phase_for_log
 
     if not window:
         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-        return [], False
+        return [], False, {}, phase_for_log
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag
@@ -305,19 +366,19 @@ def run_once(
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-    mode = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+    mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     dry_run_reasons: list[str] = []
     diag_enabled = force_diag
     if diag_enabled:
         dry_run_reasons.append("diagnostic_mode")
-    if mode == "INTENT_ONLY":
+    if mode_resolved == "INTENT_ONLY":
         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
     dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
-    if not live_trading_flag.value and mode == "LIVE":
+    if not live_trading_flag.value and mode_resolved == "LIVE":
         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
     if dry_run_flag.value:
         dry_run_reasons.append("DRY_RUN=1")
@@ -353,7 +414,7 @@ def run_once(
             guard_failures.append("LIVE_TRADING_ENABLED!=1")
         if disable_live_flag.value or not disable_live_flag.valid:
             guard_failures.append("DISABLE_LIVE_TRADING!=0")
-        if mode != "LIVE":
+        if mode_resolved != "LIVE":
             guard_failures.append("STRATEGY_MODE!=LIVE")
         if kis_env != "practice":
             guard_failures.append("KIS_ENV!=practice")
@@ -368,15 +429,17 @@ def run_once(
         os.environ["DRY_RUN"] = "1" if dry else "0"
         os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
         os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
-        os.environ["STRATEGY_MODE"] = mode
+        os.environ["STRATEGY_MODE"] = effective_mode
 
     _apply_env_flags(dry_run)
 
-    phase_override_arg = args.phase
+    force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
+    phase_override_arg = resolved_phase
     if (
         window
         and event_name_lower == "push"
-        and phase_override_arg == "auto"
+        and args.phase == "auto"
+        and not force_phase_env
         and window.name == "afternoon"
         and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
     ):
@@ -386,29 +449,41 @@ def run_once(
             in_afternoon = start.time() <= now.time() < end.time()
         except Exception:
             in_afternoon = False
-        if trading_day and in_afternoon and window.phase == "prep":
-            logger.info("[PB1][PHASE_OVERRIDE] event=push from=prep to=entry reason=PB1_FORCE_ENTRY_ON_PUSH")
+        if trading_day and in_afternoon:
+            logger.info("[PB1][PHASE_OVERRIDE] event=push from=%s to=entry reason=PB1_FORCE_ENTRY_ON_PUSH", phase_override_arg)
             phase_override_arg = "entry"
+            phase_reason = "force_push"
 
     if diag_enabled:
         dry_run = True
         dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
         dry_run_reasons = dry_run_reasons or ["diagnostic"]
-        if args.phase == "auto":
+        if args.phase == "auto" and not force_phase_env:
             phase_override_arg = "verify"
+            phase_reason = "diagnostic"
         window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
         _apply_env_flags(dry_run)
 
     window_name_for_log = window.name if window else "none"
-    phase_for_log = window.phase if window and hasattr(window, "phase") else "none"
+    phase_for_log = phase_override_arg or "none"
+    logger.info(
+        "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s",
+        now.isoformat(),
+        phase_window,
+        phase_for_log,
+        phase_reason,
+        entry_flag.value,
+    )
 
     logger.info(
-        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s window=%s phase=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
+        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
         event_name_lower or "unknown",
         now.isoformat(),
         trading_day,
+        market_window,
         window_name_for_log,
         phase_for_log,
+        phase_reason,
         dry_run,
         os.getenv("DISABLE_LIVE_TRADING"),
         os.getenv("LIVE_TRADING_ENABLED"),
@@ -428,7 +503,7 @@ def run_once(
     lock_acquired = try_acquire_lock(engine, lock_key)
     if not lock_acquired:
         logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, owner, workflow_run_id)
-        return [], False
+        return [], False, {}, phase_for_log
 
     runs_repo = RunsRepo(engine)
     universe_repo = UniverseRepo(engine)
@@ -439,6 +514,7 @@ def run_once(
     run_record_id = None
     did_work = False
     touched_files: list[Path] = []
+    result = None
     run_start_ts = time_mod.time()
     try:
         kis: KisAPI | None = None
@@ -465,7 +541,12 @@ def run_once(
             workflow=os.getenv("GITHUB_WORKFLOW"),
             workflow_run_id=workflow_run_id,
             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-            config_json={"dry_run_reasons": dry_run_reasons, "run_window": window_name_for_log, "phase": phase_for_log},
+            config_json={
+                "dry_run_reasons": dry_run_reasons,
+                "run_window": window_name_for_log,
+                "phase": phase_override_arg,
+                "phase_reason": phase_reason,
+            },
         )
 
         engine_runner = PB1Engine(
@@ -475,7 +556,7 @@ def run_once(
             positions_repo=positions_repo,
             kis=kis,
             window=window,
-            phase_override=phase_override_arg,
+            phase=phase_override_arg,
             dry_run=dry_run,
             env=kis_env or "practice",
             run_id=run_record_id,
@@ -491,7 +572,12 @@ def run_once(
         raise
     finally:
         release_lock(engine, lock_key)
-    return touched_files, did_work
+    metrics = {
+        "balance_api_calls": result.balance_api_calls if result else 0,
+        "balance_cache_hits": result.balance_cache_hits if result else 0,
+        "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
+    }
+    return touched_files, did_work, metrics, phase_for_log
 
 
 def _run_loop(*, args: argparse.Namespace, engine) -> None:
@@ -523,7 +609,13 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec = BOTSTATE_LOCK_TTL_SEC
+    ttl_sec, ttl_buffer = _resolve_lock_ttl(max_seconds)
+    logger.info(
+        "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+        ttl_sec,
+        max_seconds,
+        ttl_buffer,
+    )
     botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
     if botstate_worktree is None:
         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
@@ -534,6 +626,10 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     loop_started_ts = time_mod.time()
     exit_reason = "unknown"
     stop_requested = {"value": False}
+    balance_api_calls = 0
+    balance_cache_hits = 0
+    balance_tick_cache_hits = 0
+    last_phase = "none"
 
     def _request_stop(reason: str) -> None:
         if stop_requested["value"]:
@@ -627,7 +723,10 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 continue
 
             logger.info("[PB1][LOOP] tick window=%s phase=%s", window.name, window.phase)
-            touched, _did_work = run_once(args=args, engine=engine, loop_mode=True, window=window)
+            touched, _did_work, metrics, last_phase = run_once(args=args, engine=engine, loop_mode=True, window=window)
+            balance_api_calls += metrics.get("balance_api_calls", 0)
+            balance_cache_hits += metrics.get("balance_cache_hits", 0)
+            balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
             for path in touched:
                 pending_touched[path] = path
             if pending_touched:
@@ -653,7 +752,30 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
         release_botstate_lock(botstate_worktree, owner, workflow_run_id)
-        logger.info("[PB1][EXIT] reason=%s elapsed=%.1fs", exit_reason, elapsed)
+        if max_seconds > 0 and elapsed > max_seconds:
+            logger.warning(
+                "[PB1][EXIT][WARN] reason=%s elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                exit_reason,
+                elapsed,
+                max_seconds,
+                loop_deadline.isoformat() if loop_deadline else "none",
+                last_phase,
+                balance_api_calls,
+                balance_cache_hits,
+                balance_tick_cache_hits,
+            )
+        else:
+            logger.info(
+                "[PB1][EXIT] reason=%s elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                exit_reason,
+                elapsed,
+                max_seconds,
+                loop_deadline.isoformat() if loop_deadline else "none",
+                last_phase,
+                balance_api_calls,
+                balance_cache_hits,
+                balance_tick_cache_hits,
+            )
 
 
 def main() -> None:
@@ -675,7 +797,14 @@ def main() -> None:
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=BOTSTATE_LOCK_TTL_SEC)
+    ttl_sec, ttl_buffer = _resolve_lock_ttl(run_loop_minutes * 60)
+    logger.info(
+        "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+        ttl_sec,
+        run_loop_minutes * 60,
+        ttl_buffer,
+    )
+    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
     if botstate_worktree is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
         return
@@ -683,8 +812,11 @@ def main() -> None:
         signal.SIGTERM,
         lambda *_args: release_botstate_lock(botstate_worktree, owner, workflow_run_id),
     )
+    metrics: dict[str, int] = {}
+    phase_for_log = "none"
+    start_ts = time_mod.time()
     try:
-        touched, _did_work = run_once(args=args, engine=engine, loop_mode=False, window=None)
+        touched, _did_work, metrics, phase_for_log = run_once(args=args, engine=engine, loop_mode=False, window=None)
         if touched:
             persist_run_files(
                 botstate_worktree,
@@ -693,6 +825,17 @@ def main() -> None:
             )
     finally:
         release_botstate_lock(botstate_worktree, owner, workflow_run_id)
+        elapsed = time_mod.time() - start_ts
+        logger.info(
+            "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+            elapsed,
+            run_loop_minutes * 60,
+            "none",
+            phase_for_log,
+            metrics.get("balance_api_calls", 0),
+            metrics.get("balance_cache_hits", 0),
+            metrics.get("balance_tick_cache_hits", 0),
+        )
 
 
 if __name__ == "__main__":

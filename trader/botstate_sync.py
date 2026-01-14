@@ -183,7 +183,7 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     ttl_env = _lock_ttl_sec()
-    ttl_sec = min(ttl_sec, ttl_env) if ttl_sec is not None else ttl_env
+    ttl_sec = ttl_sec if ttl_sec is not None else ttl_env
     retry_total_sec = max(0, _lock_retry_total_sec())
     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
     deadline_ts = time.time() + retry_total_sec

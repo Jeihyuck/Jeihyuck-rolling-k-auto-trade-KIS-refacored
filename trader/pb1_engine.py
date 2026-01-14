@@ -25,14 +25,20 @@ from trader.config import (
     PB1_USE_RISK_PARITY,
     PB1_MAX_ATR_PCT,
     PB1_MIN_VALUE20,
+    PB1_ENTRY_WINDOW_START,
+    PB1_ENTRY_OPEN_END,
+    PB1_ENTRY_WINDOW_END,
+    PB1_EXIT_WINDOW_START,
+    PB1_EXIT_WINDOW_END,
+    resolve_market_window,
 )
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup, score_setup
 from trader.time_utils import now_kst
-from trader.utils.env import env_bool
-from trader.window_router import WindowDecision, resolve_phase
+from trader.utils.env import env_bool, parse_env_flag
+from trader.window_router import WindowDecision
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,37 @@ class CandidateFeature:
 class RunResult:
     status: str
     notes: str | None = None
+    balance_api_calls: int = 0
+    balance_cache_hits: int = 0
+    balance_tick_cache_hits: int = 0
+
+
+def resolve_pb1_phase(
+    now: datetime,
+    trading_day: bool,
+    force_phase_env: str | None = None,
+) -> tuple[str, str, str]:
+    force_raw = (force_phase_env or "").strip().lower()
+    if force_raw:
+        if force_raw in {"entry", "exit", "verify"}:
+            window = resolve_market_window(now, trading_day)
+            return force_raw, "force", window
+        logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
+    window = resolve_market_window(now, trading_day)
+    if not trading_day:
+        return "exit", "auto_non_trading_day", window
+    entry_start = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_START, "%H:%M").time(), now.tzinfo)
+    entry_open_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_OPEN_END, "%H:%M").time(), now.tzinfo)
+    entry_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time(), now.tzinfo)
+    exit_start = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_START, "%H:%M").time(), now.tzinfo)
+    exit_end = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_END, "%H:%M").time(), now.tzinfo)
+    if entry_start <= now < entry_open_end:
+        return "entry", "auto_opening", window
+    if entry_open_end <= now < entry_end:
+        return "entry", "auto_day", window
+    if exit_start <= now <= exit_end:
+        return "exit", "auto_close", window
+    return "exit", "auto_outside_window", window
 
 
 class PB1Engine:
@@ -69,7 +106,7 @@ class PB1Engine:
         positions_repo: PositionsRepo,
         kis: KisAPI | None,
         window: WindowDecision,
-        phase_override: str,
+        phase: str,
         dry_run: bool,
         env: str,
         run_id: str,
@@ -80,10 +117,13 @@ class PB1Engine:
         self.positions_repo = positions_repo
         self.kis = kis
         self.window = window
-        self.phase = resolve_phase(window, phase_override)
+        self.phase = phase
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
+        self.balance_api_calls = 0
+        self.balance_cache_hits = 0
+        self.balance_tick_cache_hits = 0
         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
         self.min_candles = int(PB1_MIN_CANDLES)
         providers = []
@@ -99,6 +139,10 @@ class PB1Engine:
         self._balance_cost: float | None = None
         self._balance_snapshot: dict | None = None
         self._holdings_summary: Dict[str, Any] = {}
+        entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
+        self.entry_enabled = entry_flag.value
+        self.entry_flag_valid = entry_flag.valid
+        self.entry_flag_raw = entry_flag.raw
 
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
@@ -164,12 +208,18 @@ class PB1Engine:
 
     def _fetch_holdings_snapshot(self) -> dict:
         if self._balance_snapshot is not None:
-            logger.info("[BALANCE][CACHE] hit=True")
+            self.balance_tick_cache_hits += 1
+            logger.info("[BALANCE][CACHE] hit=True source=tick_cache")
             return self._balance_snapshot
         if not self.kis:
             return {}
-        logger.info("[BALANCE][CACHE] hit=False")
-        self._balance_snapshot = self.kis.get_balance_cached()
+        snap, source = self.kis.get_balance_cached(return_source=True)
+        if source == "api":
+            self.balance_api_calls += 1
+        else:
+            self.balance_cache_hits += 1
+        logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+        self._balance_snapshot = snap
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
@@ -709,9 +759,9 @@ class PB1Engine:
         self._setup_reason_counter.clear()
         final_status = "OK"
         final_notes: str | None = None
-        entry_allowed = PB1_ENTRY_ENABLED and env_bool("PB1_ENTRY_ENABLED", PB1_ENTRY_ENABLED)
+        entry_allowed = self.entry_enabled
         if not entry_allowed:
-            logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s -> skip new entries", entry_allowed)
+            logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
         logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s env=%s", self.window.name, self.phase, self.dry_run, self.env)
 
         members = self._load_universe()
@@ -719,7 +769,13 @@ class PB1Engine:
             note = "universe_empty"
             logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
             self._log_reason_summary("universe_empty")
-            return RunResult(status="SKIPPED", notes=note)
+            return RunResult(
+                status="SKIPPED",
+                notes=note,
+                balance_api_calls=self.balance_api_calls,
+                balance_cache_hits=self.balance_cache_hits,
+                balance_tick_cache_hits=self.balance_tick_cache_hits,
+            )
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         holdings_snapshot = self._fetch_holdings_snapshot()
@@ -729,14 +785,9 @@ class PB1Engine:
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         if self.phase in {"verify", "exit"}:
-            holdings = []
-            if holdings_rows:
-                holdings = holdings_rows
-            elif self.kis:
-                try:
-                    holdings = self.kis.get_positions()
-                except Exception:
-                    logger.exception("[PB1][HOLDINGS][FAIL]")
+            holdings = list(holdings_rows or [])
+            if not holdings and self.kis:
+                logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
             if not positions and holdings:
                 bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
                     env=self.env,
@@ -755,7 +806,13 @@ class PB1Engine:
                 final_status = "OK"
                 final_notes = "verify_only"
                 self._log_reason_summary(final_notes)
-                return RunResult(status=final_status, notes=final_notes)
+                return RunResult(
+                    status=final_status,
+                    notes=final_notes,
+                    balance_api_calls=self.balance_api_calls,
+                    balance_cache_hits=self.balance_cache_hits,
+                    balance_tick_cache_hits=self.balance_tick_cache_hits,
+                )
 
         code_market = {m.get("code"): m.get("market") for m in members}
         candidates: List[CandidateFeature] = []
@@ -799,4 +856,10 @@ class PB1Engine:
         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
-        return RunResult(status=final_status, notes=final_notes)
+        return RunResult(
+            status=final_status,
+            notes=final_notes,
+            balance_api_calls=self.balance_api_calls,
+            balance_cache_hits=self.balance_cache_hits,
+            balance_tick_cache_hits=self.balance_tick_cache_hits,
+        )

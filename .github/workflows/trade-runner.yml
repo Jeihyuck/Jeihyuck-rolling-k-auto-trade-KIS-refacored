@@ -29,6 +29,8 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
+      FORCE_STRATEGY_MODE: ""
+      FORCE_PB1_PHASE: ""
 
       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -85,45 +87,60 @@ jobs:
           done
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
 
-      - name: Auto mode (LIVE in market hours, DIAG otherwise)
+      - name: Resolve market-aware runtime mode
         run: |
           set -euo pipefail
           python - << 'PY'
           from datetime import datetime, time
           from zoneinfo import ZoneInfo
+          import os
 
           KST = ZoneInfo("Asia/Seoul")
           now = datetime.now(KST)
 
-          # 장중: 08:50 ~ 15:30 (PB1 MORNING_WINDOW_START=08:50 과 정합)
-          # 기존 08:55 시작이면 08:50~08:55 구간이 DIAG로 떨어져 창과 불일치 발생
+          force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
+          force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+
           is_weekday = now.weekday() < 5
           in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+          mode = "LIVE" if in_market else "DIAG"
+          if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
+              mode = "LIVE" if force_mode == "LIVE" else "DIAG"
 
-          if in_market:
-              mode = "LIVE"
-              live_enabled = "1"
-              dry_run = "0"
-              disable_live = "0"
+          if not is_weekday:
+              window = "after"
           else:
-              mode = "DIAG"
-              live_enabled = "0"
-              dry_run = "1"
-              disable_live = "1"
+              now_t = now.time()
+              if time(8, 50) <= now_t < time(9, 5):
+                  window = "preopen"
+              elif time(9, 5) <= now_t < time(10, 0):
+                  window = "morning"
+              elif time(10, 0) <= now_t < time(15, 15):
+                  window = "day"
+              elif time(15, 15) <= now_t <= time(15, 30):
+                  window = "close"
+              else:
+                  window = "after"
 
-          print(f"[AUTO] now={now.isoformat()} in_market={in_market} -> STRATEGY_MODE={mode}")
-          with open("runtime_env.sh", "w") as f:
-              f.write(f'export STRATEGY_MODE="{mode}"\n')
-              f.write(f'export LIVE_TRADING_ENABLED="{live_enabled}"\n')
-              f.write(f'export DRY_RUN="{dry_run}"\n')
-              f.write(f'export DISABLE_LIVE_TRADING="{disable_live}"\n')
+          if force_phase in {"entry", "exit", "verify"}:
+              pb1_phase = force_phase
+          else:
+              pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+
+          print(
+              f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
+              f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
+              f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
+              f.write(f"MARKET_WINDOW={window}\n")
+              f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
-          cat runtime_env.sh
 
       - name: Build universe (best_k_meta) - allow fallback
         run: |
           set -euo pipefail
-          source runtime_env.sh
           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || echo "[WARN] universe build failed (continue)"
 
       - name: Compile check
@@ -139,8 +156,10 @@ jobs:
       - name: Run PB1 (auto window) - should exit within 4 minutes
         run: |
           set -euo pipefail
-          source runtime_env.sh
-          echo "[RUN] STRATEGY_MODE=$STRATEGY_MODE DRY_RUN=$DRY_RUN LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
-          python -m trader.pb1_runner --window auto --phase auto
+          echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+          python -m trader.run --window auto --phase auto
+        env:
+          STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
+          LIVE_TRADING_ENABLED: "1"
 
           

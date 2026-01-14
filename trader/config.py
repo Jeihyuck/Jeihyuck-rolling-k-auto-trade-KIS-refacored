@@ -122,6 +122,12 @@ CONFIG = {
     "BOTSTATE_LOCK_TTL_SEC": "240",
     "LEDGER_BASE_DIR": "bot_state/trader_ledger",
     "PB1_ENTRY_ENABLED": "true",
+    "PB1_ENTRY_WINDOW_START": "08:50",
+    "PB1_ENTRY_OPEN_END": "09:05",
+    "PB1_ENTRY_WINDOW_END": "15:15",
+    "PB1_EXIT_WINDOW_START": "15:15",
+    "PB1_EXIT_WINDOW_END": "15:30",
+    "PB1_MORNING_WINDOW_END": "10:00",
     "MORNING_WINDOW_START": "08:50",
     "MORNING_WINDOW_END": "15:20",
     "MORNING_EXIT_START": "09:00",
@@ -446,6 +452,12 @@ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
 PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
 MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
 MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
+PB1_ENTRY_WINDOW_START = _cfg("PB1_ENTRY_WINDOW_START") or "08:50"
+PB1_ENTRY_OPEN_END = _cfg("PB1_ENTRY_OPEN_END") or "09:05"
+PB1_ENTRY_WINDOW_END = _cfg("PB1_ENTRY_WINDOW_END") or "15:15"
+PB1_EXIT_WINDOW_START = _cfg("PB1_EXIT_WINDOW_START") or "15:15"
+PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
+PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:00"
 PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
 PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
 PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.80")
@@ -474,3 +486,53 @@ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 def _this_iso_week_key(now=None):
     now = now or datetime.now(KST)
     return f"{now.year}-W{now.isocalendar().week:02d}"
+
+
+def _normalize_strategy_mode(raw: str | None) -> str | None:
+    normalized = (raw or "").strip().upper()
+    if normalized in {"LIVE", "EXECUTE", "EXECUTION"}:
+        return "LIVE"
+    if normalized in {"DIAG", "DIAGNOSTIC", "INTENT_ONLY", "INTENT"}:
+        return "DIAG"
+    return None
+
+
+def resolve_market_window(now: datetime, trading_day: bool) -> str:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    if not trading_day:
+        return "after"
+    open_time = _parse_hhmm(PB1_ENTRY_WINDOW_START)
+    entry_open_end = _parse_hhmm(PB1_ENTRY_OPEN_END)
+    morning_end = _parse_hhmm(PB1_MORNING_WINDOW_END)
+    entry_end = _parse_hhmm(PB1_ENTRY_WINDOW_END)
+    exit_end = _parse_hhmm(PB1_EXIT_WINDOW_END)
+    now_time = now.time()
+    if open_time <= now_time < entry_open_end:
+        return "preopen"
+    if entry_open_end <= now_time < morning_end:
+        return "morning"
+    if morning_end <= now_time < entry_end:
+        return "day"
+    if entry_end <= now_time <= exit_end:
+        return "close"
+    return "after"
+
+
+def resolve_strategy_mode(
+    now_kst: datetime | None = None,
+    force_mode_env: str | None = None,
+) -> tuple[str, bool, str, str]:
+    now_kst = now_kst or datetime.now(KST)
+    if now_kst.tzinfo is None:
+        now_kst = now_kst.replace(tzinfo=KST)
+    trading_day = now_kst.weekday() < 5
+    window = resolve_market_window(now_kst, trading_day)
+    forced = _normalize_strategy_mode(force_mode_env)
+    if forced:
+        return forced, trading_day, window, "force"
+    market_open = _parse_hhmm(MARKET_OPEN_HHMM)
+    market_close = _parse_hhmm(MARKET_CLOSE_HHMM)
+    in_market = trading_day and (market_open <= now_kst.time() <= market_close)
+    mode = "LIVE" if in_market else "DIAG"
+    return mode, trading_day, window, "auto"

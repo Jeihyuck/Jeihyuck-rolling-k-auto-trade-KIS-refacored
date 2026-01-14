@@ -1416,10 +1416,14 @@ class KisAPI:
         logger.info(f"[보유수량맵] {len(mp)}종목")
         return mp
 
-    def get_balance_cached(self, force: bool = False) -> Dict[str, object]:
+    def get_balance_cached(self, force: bool = False, *, return_source: bool = False) -> Dict[str, object] | tuple[Dict[str, object], str]:
+        source = "api"
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
             logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
+            source = "wrapper_cache"
+            if return_source:
+                return self._balance_cache, source
             return self._balance_cache
         logger.info("[BALANCE][CACHE] hit=False force=%s", force)
         snap: dict = {}
@@ -1429,6 +1433,8 @@ class KisAPI:
             self._balance_cache_at = now_kst()
         except Exception as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
+        if return_source:
+            return snap, source
         return snap
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
