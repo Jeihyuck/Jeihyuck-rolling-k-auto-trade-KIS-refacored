@@ -15,9 +15,9 @@ NAME_COLUMNS = ("Name", "종목명", "종목명(국문)", "StockName")
 
 def _normalize_code(code: object) -> str:
     code_str = str(code).strip()
-    if code_str.isdigit() and len(code_str) < 6:
-        return code_str.zfill(6)
-    return code_str
+    if not code_str.isdigit():
+        return ""
+    return code_str.zfill(6)
 
 
 def _find_column(columns: Iterable[str], candidates: Iterable[str], label: str) -> str:

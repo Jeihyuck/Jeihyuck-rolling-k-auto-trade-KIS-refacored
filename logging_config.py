@@ -3,6 +3,7 @@
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -22,7 +23,7 @@ while root_logger.handlers:
     root_logger.handlers.pop()
 
 # 콘솔 핸들러
-ch = logging.StreamHandler()
+ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 ch.setFormatter(logging.Formatter(LOG_FMT))
 root_logger.addHandler(ch)

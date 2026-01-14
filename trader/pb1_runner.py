@@ -71,8 +71,8 @@ def _resolve_window_label(market_window: str, window: WindowDecision | None) -> 
     normalized = (market_window or "").strip().lower()
     if normalized == "day":
         if window and window.name != "day":
-            logger.error(
-                "[PB1][WINDOW][ERROR] market_window=day mismatch window=%s -> forcing day",
+            logger.warning(
+                "[PB1][WINDOW][WARN] market_window=day mismatch window=%s -> forcing day",
                 window.name,
             )
         return "day"
@@ -626,6 +626,7 @@ def run_once(
             dry_run=dry_run,
             env=kis_env or "practice",
             run_id=run_record_id,
+            now_kst_value=now,
         )
         result = engine_runner.run()
         did_work = True

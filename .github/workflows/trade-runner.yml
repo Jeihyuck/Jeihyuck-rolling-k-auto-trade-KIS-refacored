@@ -56,6 +56,7 @@ jobs:
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
 
       ACTIVE_STRATEGIES: "1"
+      DAILY_CAPITAL: "250000000"
 
     steps:
       - name: Checkout code (always run nullim code)

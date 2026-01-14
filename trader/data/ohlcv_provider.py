@@ -32,12 +32,19 @@ class KISOHLCVProvider:
 
     def __init__(self, kis: object) -> None:
         self.kis = kis
+        self._warned_keys: set[str] = set()
+
+    def _warn_once(self, key: str, message: str, *args: object) -> None:
+        if key in self._warned_keys:
+            return
+        self._warned_keys.add(key)
+        logger.warning(message, *args)
 
     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
         try:
             candles = self.kis.get_daily_candles(symbol, count=max(days, 120))  # type: ignore[attr-defined]
         except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
+            self._warn_once(f"fail:{symbol}", "[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
 
         if not candles:
@@ -63,6 +70,13 @@ class KRXOHLCVProvider:
 
     def __init__(self, *, lookback_pad_days: int = 40) -> None:
         self.lookback_pad_days = lookback_pad_days
+        self._warned_keys: set[str] = set()
+
+    def _warn_once(self, key: str, message: str, *args: object) -> None:
+        if key in self._warned_keys:
+            return
+        self._warned_keys.add(key)
+        logger.warning(message, *args)
 
     def _calc_window(self, days: int) -> tuple[str, str]:
         end = now_kst().date()
@@ -74,7 +88,7 @@ class KRXOHLCVProvider:
         try:
             from pykrx.stock import get_market_ohlcv_by_date
         except Exception as exc:  # pragma: no cover - import guard
-            logger.warning("[OHLCV][KRX][IMPORT_FAIL] symbol=%s err=%s", symbol, exc)
+            self._warn_once("import_fail", "[OHLCV][KRX][IMPORT_FAIL] symbol=%s err=%s", symbol, exc)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
 
         patch_pykrx_logging()
@@ -82,7 +96,7 @@ class KRXOHLCVProvider:
         try:
             df_raw = get_market_ohlcv_by_date(start, end, symbol)
         except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("[OHLCV][KRX][FAIL] symbol=%s start=%s end=%s err=%s", symbol, start, end, exc)
+            self._warn_once(f"fail:{symbol}", "[OHLCV][KRX][FAIL] symbol=%s start=%s end=%s err=%s", symbol, start, end, exc)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
 
         if df_raw is None or df_raw.empty:

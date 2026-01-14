@@ -470,8 +470,8 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         last_reason = reason or provider_name
         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
 
-    validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "0").lower() in {"1", "true", "yes", "on"}
-    min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(PB1_MIN_CANDLES)))
+    validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
+    min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
     members, stats = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
     logger.info(

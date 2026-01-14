@@ -5,6 +5,7 @@ import os
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
@@ -228,6 +229,13 @@ def resolve_pb1_phase(
     return "exit", "auto_outside_window", window
 
 
+def compute_window(now_kst: datetime) -> str:
+    if now_kst.tzinfo is None:
+        now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    trading_day = now_kst.weekday() < 5
+    return resolve_market_window(now_kst, trading_day)
+
+
 class PB1Engine:
     STRATEGY_NAME = "pb1_pullback_close"
     UNIVERSE_STRATEGY = "best_k_meta"
@@ -246,6 +254,7 @@ class PB1Engine:
         dry_run: bool,
         env: str,
         run_id: str,
+        now_kst_value: datetime | None = None,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -269,7 +278,8 @@ class PB1Engine:
         providers.append(KRXOHLCVProvider())
         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
         self._setup_reason_counter: Counter[str] = Counter()
-        self._today = now_kst().date().isoformat()
+        self._now_kst = now_kst_value or now_kst()
+        self._today = self._now_kst.date().isoformat()
         self._universe_as_of = None
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
@@ -281,6 +291,13 @@ class PB1Engine:
         self.entry_enabled = entry_flag.value
         self.entry_flag_valid = entry_flag.valid
         self.entry_flag_raw = entry_flag.raw
+        self.window_internal = self._resolve_window_internal()
+
+    def _resolve_window_internal(self) -> str:
+        internal = compute_window(self._now_kst)
+        if self.window_label in {"morning", "day"}:
+            internal = self.window_label
+        return internal
 
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
@@ -568,12 +585,18 @@ class PB1Engine:
         candidates: List[CandidateFeature],
     ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str]]:
         strict_thresholds = self._resolve_strict_thresholds()
-        medium_thresholds = self.filter_thresholds
+        medium_thresholds = self.filter_thresholds.with_overrides(
+            vol_contraction_max=1.00,
+            volu_contraction_max=1.00,
+            pullback_min=0.03,
+            pullback_max=0.15,
+            require_both_contractions=True,
+        )
         loose_thresholds = self.filter_thresholds.with_overrides(
-            vol_contraction_max=1.15,
-            volu_contraction_max=1.25,
-            pullback_min=0.01,
-            pullback_max=0.25,
+            vol_contraction_max=1.10,
+            volu_contraction_max=1.10,
+            pullback_min=0.02,
+            pullback_max=0.18,
             require_both_contractions=False,
         )
         tiers = [
@@ -617,6 +640,37 @@ class PB1Engine:
             selected_candidates = self._apply_thresholds(candidates, selected_thresholds, log_results=True)
         return selected_candidates, selected_tier, selected_thresholds, all_reason_counts, tiers_tried
 
+    def _apply_score_fallback(self, candidates: List[CandidateFeature]) -> int:
+        scored: list[CandidateFeature] = []
+        for cf in candidates:
+            if not cf.features.get("data_ok"):
+                continue
+            try:
+                score = float(score_setup(cf.features, cf.market))
+            except Exception:
+                score = 0.0
+            cf.features["score"] = score
+            scored.append(cf)
+
+        if not scored:
+            return 0
+
+        scored.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+        max_n = max(1, int(PB1_MAX_POSITIONS))
+        selected = scored[:max_n]
+        selected_codes = {c.code for c in selected}
+        for cf in candidates:
+            if cf.code in selected_codes:
+                cf.setup_ok = True
+                cf.features["score_fallback"] = True
+                cf.reasons = list(cf.reasons or []) + ["score_fallback"]
+        logger.info(
+            "[PB1][CANDIDATES][FALLBACK] mode=score_based selected=%s total=%s",
+            len(selected_codes),
+            len(candidates),
+        )
+        return len(selected_codes)
+
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
         ok_list = [c for c in candidates if c.setup_ok]
         if not ok_list:
@@ -633,8 +687,9 @@ class PB1Engine:
 
             atr_pct = cf.features.get("atr_pct")
             value20 = cf.features.get("value20")
+            score_fallback = bool(cf.features.get("score_fallback"))
 
-            if score < float(PB1_MIN_SCORE):
+            if score < float(PB1_MIN_SCORE) and not score_fallback:
                 cf.setup_ok = False
                 cf.reasons.append("score_below_cut")
                 continue
@@ -976,7 +1031,7 @@ class PB1Engine:
         return enriched
 
     def _load_universe(self) -> list[dict]:
-        today = now_kst().date().isoformat()
+        today = self._now_kst.date().isoformat()
         members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
         self._universe_as_of = today if members else None
         if not members:
@@ -1098,7 +1153,7 @@ class PB1Engine:
         logger.info(
             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
             self.window_label,
-            self.window.name,
+            self.window_internal,
             self.phase,
             self.dry_run,
             self.env,
@@ -1171,6 +1226,8 @@ class PB1Engine:
                 all_reason_counts,
                 tiers_tried,
             ) = self._select_candidates_with_fallback(candidates)
+            if not any(c.setup_ok for c in candidates):
+                self._apply_score_fallback(candidates)
             candidates = self._size_positions(candidates)
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
@@ -1227,7 +1284,7 @@ class PB1Engine:
                     continue
                 features["market"] = pos.get("market") or code_market.get(pos["code"], "")
                 marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
-                self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
+                self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
