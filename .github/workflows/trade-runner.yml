@@ -32,6 +32,7 @@ jobs:
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
       STATE_PATH: "bot_state/runtime/state.json"
+      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
 
@@ -188,24 +189,3 @@ jobs:
         env:
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
-
-      - name: Persist bot_state back to bot-state branch
-        if: always()
-        run: |
-          set -euo pipefail
-          rsync -a --delete repo/bot_state/ botstate/bot_state/
-
-          cd botstate
-          git config user.email "actions@github.com"
-          git config user.name "github-actions[bot]"
-          git add -A bot_state
-
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no changes"
-            exit 0
-          fi
-
-          git commit -m "botstate: persist ${GITHUB_RUN_ID} $(date -Iseconds)"
-          git push origin HEAD:bot-state
-
-          

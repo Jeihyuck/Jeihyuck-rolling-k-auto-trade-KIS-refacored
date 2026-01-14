@@ -419,27 +419,111 @@ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
         time.sleep(retry_sleep_sec)
 
 
-def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str) -> None:
+def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str, retries: int = 3) -> None:
     worktree_dir = worktree_dir.resolve()
     files = list(new_files)
-    for path in files:
+    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    remote = "origin"
+    sync_mode = SYNC_MODE_FETCH_RESET
+    retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+
+    for attempt in range(1, retries + 1):
         try:
-            if path.resolve().is_relative_to(worktree_dir.resolve()):
-                target = path.resolve()
-            else:
-                if "bot_state" in path.parts:
-                    idx = path.parts.index("bot_state")
-                    rel = Path(*path.parts[idx:])
-                else:
-                    rel = Path("bot_state") / Path(*path.parts[-4:])
-                target = (worktree_dir / rel).resolve()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(path.read_bytes())
-            rel_target = target.relative_to(worktree_dir)
-            _git(worktree_dir, "add", str(rel_target))
-        except Exception:
+            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
+            logger.info(
+                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
+                sync_mode,
+                st.remote_ref,
+                st.behind,
+                st.ahead,
+                attempt,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
+                sync_mode,
+                attempt,
+                str(exc),
+            )
+            if attempt == retries:
+                raise
+            time.sleep(retry_sleep_sec)
             continue
-    push_retry(worktree_dir, message=message)
+
+        staged_any = False
+        for path in files:
+            try:
+                if path.resolve().is_relative_to(worktree_dir.resolve()):
+                    target = path.resolve()
+                else:
+                    if "bot_state" in path.parts:
+                        idx = path.parts.index("bot_state")
+                        rel = Path(*path.parts[idx:])
+                    else:
+                        rel = Path("bot_state") / Path(*path.parts[-4:])
+                    target = (worktree_dir / rel).resolve()
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(path.read_bytes())
+                rel_target = target.relative_to(worktree_dir)
+                _git(worktree_dir, "add", str(rel_target))
+                staged_any = True
+            except Exception:
+                continue
+
+        if not staged_any:
+            logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
+            return
+
+        committed = commit_if_staged(worktree_dir, message)
+        logger.info(
+            "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
+            sync_mode,
+            committed,
+            message,
+            attempt,
+        )
+        if not committed:
+            logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
+            return
+
+        push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
+        if push_ok:
+            logger.info(
+                "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
+                sync_mode,
+                attempt,
+            )
+            logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+            return
+
+        logger.warning(
+            "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
+            sync_mode,
+            attempt,
+            is_non_fast_forward(out),
+            (out[-400:] if out else ""),
+        )
+        try:
+            st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
+            logger.info(
+                "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
+                sync_mode,
+                st2.remote_ref,
+                st2.behind,
+                st2.ahead,
+                attempt,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
+                sync_mode,
+                attempt,
+                str(exc),
+            )
+        if attempt == retries:
+            raise RuntimeError(f"git push failed after retries: {out}")
+        time.sleep(retry_sleep_sec)
+
     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
 
 

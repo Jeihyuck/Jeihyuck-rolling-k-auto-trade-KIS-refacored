@@ -232,13 +232,26 @@ def _resolve_lock_ttl(max_seconds: int) -> tuple[int, int]:
 def _collect_botstate_files(since_ts: float) -> list[Path]:
     base_dir = Path("bot_state")
     if not base_dir.exists():
-        return []
-    touched: list[Path] = []
+        touched: list[Path] = []
+    else:
+        touched = []
     for path in base_dir.rglob("*"):
         if not path.is_file():
             continue
         try:
             if path.stat().st_mtime >= since_ts:
+                touched.append(path)
+        except FileNotFoundError:
+            continue
+    for env_key in ("STATE_PATH", "LOT_STATE_PATH"):
+        env_path = os.getenv(env_key)
+        if not env_path:
+            continue
+        path = Path(env_path)
+        if not path.exists():
+            continue
+        try:
+            if path.stat().st_mtime >= since_ts or path not in touched:
                 touched.append(path)
         except FileNotFoundError:
             continue
@@ -720,10 +733,6 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
             return
         stop_requested["value"] = True
         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
-        try:
-            release_botstate_lock(botstate_worktree, owner, workflow_run_id)
-        except Exception:
-            logger.exception("[PB1][SIGNAL] botstate lock release failed")
 
     signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
     try:
@@ -904,7 +913,7 @@ def main() -> None:
         return
     signal.signal(
         signal.SIGTERM,
-        lambda *_args: release_botstate_lock(botstate_worktree, owner, workflow_run_id),
+        lambda *_args: logger.warning("[PB1][SIGNAL] SIGTERM -> defer release until shutdown"),
     )
     metrics: dict[str, int] = {}
     phase_for_log = "none"
