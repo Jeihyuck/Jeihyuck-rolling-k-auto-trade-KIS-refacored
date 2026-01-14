@@ -42,6 +42,52 @@ from trader.window_router import WindowDecision
 
 logger = logging.getLogger(__name__)
 
+_OUTPUT2_LIST_NORMALIZED_LOGGED = False
+_OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
+
+COST_KEYS = (
+    "pchs_amt_smtl_amt",
+    "pchs_amt",
+)
+EVAL_KEYS = (
+    "scts_evlu_amt",
+    "evlu_amt_smtl_amt",
+    "tot_evlu_amt",
+    "nass_amt",
+)
+CASH_KEYS = (
+    "dnca_tot_amt",
+    "nxdy_excc_amt",
+    "ord_psbl_cash",
+    "evlu_amt_sbst_amt",
+)
+
+
+def _as_first_dict(v: Any) -> Dict[str, Any]:
+    """
+    KIS 응답에서 output2가 list([dict])로 오는 케이스가 많음.
+    dict / list / None 등 어떤 형태든 dict로 정규화.
+    """
+    global _OUTPUT2_LIST_NORMALIZED_LOGGED
+    global _OUTPUT2_UNEXPECTED_TYPE_LOGGED
+
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, list):
+        if not _OUTPUT2_LIST_NORMALIZED_LOGGED:
+            logger.info("[BALANCE] output2 list->dict normalized")
+            _OUTPUT2_LIST_NORMALIZED_LOGGED = True
+        for item in v:
+            if isinstance(item, dict):
+                return item
+        return {}
+    if not _OUTPUT2_UNEXPECTED_TYPE_LOGGED:
+        logger.warning("[BALANCE] output2 unexpected type=%s using rows fallback", type(v).__name__)
+        _OUTPUT2_UNEXPECTED_TYPE_LOGGED = True
+    return {}
+
 
 @dataclass
 class CandidateFeature:
@@ -193,17 +239,21 @@ class PB1Engine:
                 continue
         return prices
 
-    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
-        summary = holdings_summary or {}
-        for key in ("pchs_amt_smtl_amt", "pchs_amt", "prvs_tot_evlu_amt", "tot_evlu_amt", "nass_amt"):
-            cost = self._to_float(summary.get(key))
-            if cost and cost > 0:
-                return cost
+    def _sum_cost_from_rows(self, rows: Iterable[dict]) -> float:
         total = 0.0
-        for row in holdings_rows or []:
+        for row in rows or []:
             val = self._to_float(row.get("pchs_amt"))
             if val:
                 total += val
+        return total
+
+    def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
+        summary = _as_first_dict(holdings_summary)
+        for key in COST_KEYS:
+            cost = self._to_float(summary.get(key))
+            if cost and cost > 0:
+                return cost
+        total = self._sum_cost_from_rows(holdings_rows)
         return total if total > 0 else None
 
     def _fetch_holdings_snapshot(self) -> dict:
@@ -713,12 +763,16 @@ class PB1Engine:
             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
             totals["unrealized"] += market_value - cost
 
-        summary_mv = self._to_float(self._holdings_summary.get("tot_evlu_amt") or self._holdings_summary.get("nass_amt"))
-        summary_cash = self._to_float(
-            self._holdings_summary.get("dnca_tot_amt")
-            or self._holdings_summary.get("ord_psbl_cash")
-            or self._holdings_summary.get("evlu_amt_sbst_amt")
-        )
+        summary_mv = None
+        for key in EVAL_KEYS:
+            summary_mv = self._to_float(self._holdings_summary.get(key))
+            if summary_mv is not None:
+                break
+        summary_cash = None
+        for key in CASH_KEYS:
+            summary_cash = self._to_float(self._holdings_summary.get(key))
+            if summary_cash is not None:
+                break
         if not positions and summary_mv is not None:
             totals["market_value"] = summary_mv
             totals["unrealized"] = 0.0
@@ -780,8 +834,9 @@ class PB1Engine:
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_rows = holdings_snapshot.get("output1") or []
-        holdings_summary = holdings_snapshot.get("output2") or {}
-        self._holdings_summary = holdings_summary or {}
+        holdings_summary_raw = holdings_snapshot.get("output2")
+        holdings_summary = _as_first_dict(holdings_summary_raw)
+        self._holdings_summary = holdings_summary
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         if self.phase in {"verify", "exit"}:
