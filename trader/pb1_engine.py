@@ -299,6 +299,41 @@ class PB1Engine:
             internal = self.window_label
         return internal
 
+    @staticmethod
+    def _float_env(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+            return default
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+            return default
+
+    def _resolve_entry_cutoff(self) -> tuple[datetime, str]:
+        raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
+        if not raw:
+            raw = "15:15"
+        try:
+            cutoff_time = datetime.strptime(raw, "%H:%M").time()
+        except ValueError:
+            logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s fallback=%s", raw, PB1_ENTRY_WINDOW_END)
+            cutoff_time = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
+            raw = PB1_ENTRY_WINDOW_END
+        cutoff = datetime.combine(self._now_kst.date(), cutoff_time, tzinfo=self._now_kst.tzinfo)
+        return cutoff, raw
+
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
             return
@@ -307,20 +342,10 @@ class PB1Engine:
 
     @staticmethod
     def _resolve_filter_thresholds() -> FilterThresholds:
-        def _float_env(name: str, default: float) -> float:
-            raw = os.getenv(name)
-            if raw is None:
-                return default
-            try:
-                return float(raw)
-            except ValueError:
-                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
-                return default
-
-        vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
-        volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
-        pullback_min = _float_env("PB1_PULLBACK_MIN", 0.02)
-        pullback_max = _float_env("PB1_PULLBACK_MAX", 0.18)
+        vol_max = PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
+        volu_max = PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
+        pullback_min = PB1Engine._float_env("PB1_PULLBACK_MIN", 0.02)
+        pullback_max = PB1Engine._float_env("PB1_PULLBACK_MAX", 0.18)
         require_both = env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True)
         return FilterThresholds(
             vol_contraction_max=vol_max,
@@ -332,21 +357,11 @@ class PB1Engine:
 
     @staticmethod
     def _resolve_strict_thresholds() -> FilterThresholds:
-        def _float_env(name: str, default: float) -> float:
-            raw = os.getenv(name)
-            if raw is None:
-                return default
-            try:
-                return float(raw)
-            except ValueError:
-                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
-                return default
-
         return FilterThresholds(
-            vol_contraction_max=_float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
-            volu_contraction_max=_float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
-            pullback_min=_float_env("PB1_PULLBACK_MIN", 0.05),
-            pullback_max=_float_env("PB1_PULLBACK_MAX", 0.12),
+            vol_contraction_max=PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
+            volu_contraction_max=PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
+            pullback_min=PB1Engine._float_env("PB1_PULLBACK_MIN", 0.05),
+            pullback_max=PB1Engine._float_env("PB1_PULLBACK_MAX", 0.12),
             require_both_contractions=env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True),
         )
 
@@ -409,6 +424,30 @@ class PB1Engine:
                 return cost
         total = self._sum_cost_from_rows(holdings_rows)
         return total if total > 0 else None
+
+    def _extract_available_cash(self, holdings_summary: dict | None) -> float | None:
+        summary = _as_first_dict(holdings_summary)
+        for key in CASH_KEYS:
+            cash = self._to_float(summary.get(key))
+            if cash is not None:
+                return cash
+        return None
+
+    @staticmethod
+    def _record_drop(
+        counter: Counter[str],
+        examples: Dict[str, list[str]],
+        reason: str,
+        code: str,
+        *,
+        limit: int = 3,
+    ) -> None:
+        if not reason:
+            return
+        counter[reason] += 1
+        sample_list = examples.setdefault(reason, [])
+        if len(sample_list) < limit:
+            sample_list.append(code)
 
     def _fetch_holdings_snapshot(self) -> dict:
         if self._balance_snapshot is not None:
@@ -1148,6 +1187,12 @@ class PB1Engine:
         final_status = "OK"
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
+        entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
+        max_positions = int(PB1_MAX_POSITIONS)
+        target_new_positions = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
+        min_order_krw = self._float_env("MIN_ORDER_KRW", 0.0)
+        entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
+        skip_entry_scan = False
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
         logger.info(
@@ -1158,6 +1203,23 @@ class PB1Engine:
             self.dry_run,
             self.env,
         )
+
+        if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
+            skip_entry_scan = True
+            entry_allowed = False
+            logger.info(
+                "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
+                self._now_kst.isoformat(),
+                entry_cutoff_dt.isoformat(),
+            )
+            if self.phase in {"prep", "entry"}:
+                return RunResult(
+                    status="SKIPPED",
+                    notes="entry_cutoff",
+                    balance_api_calls=self.balance_api_calls,
+                    balance_cache_hits=self.balance_cache_hits,
+                    balance_tick_cache_hits=self.balance_tick_cache_hits,
+                )
 
         members = self._load_universe()
         if not members:
@@ -1180,6 +1242,17 @@ class PB1Engine:
         self._holdings_summary = holdings_summary
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+        available_cash_krw = self._extract_available_cash(holdings_summary)
+        logger.info(
+            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s",
+            max_positions,
+            target_new_positions,
+            entry_capital_krw,
+            min_order_krw,
+            entry_cutoff_raw,
+            len(positions),
+            f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
+        )
         if self.phase in {"verify", "exit"}:
             holdings = list(holdings_rows or [])
             if not holdings and self.kis:
@@ -1217,7 +1290,13 @@ class PB1Engine:
         selected_thresholds = self.filter_thresholds
         all_reason_counts: Counter[str] = Counter()
         tiers_tried: list[str] = []
-        if self.phase in {"prep", "entry", "trade"}:
+        setup_ok_codes: list[str] = []
+        drop_reason_counter: Counter[str] = Counter()
+        drop_examples: Dict[str, list[str]] = {}
+        after_risk_check_count = 0
+        after_buyable_check_count = 0
+        after_dedup_count = 0
+        if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
             candidates = self._compute_candidates(members)
             (
                 candidates,
@@ -1228,7 +1307,53 @@ class PB1Engine:
             ) = self._select_candidates_with_fallback(candidates)
             if not any(c.setup_ok for c in candidates):
                 self._apply_score_fallback(candidates)
+            setup_ok_codes = [c.code for c in candidates if c.setup_ok]
             candidates = self._size_positions(candidates)
+            ok_after_risk = [c for c in candidates if c.setup_ok]
+            after_risk_check_count = len(ok_after_risk)
+            dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
+            for cf in candidates:
+                if cf.code in dropped_after_risk:
+                    for reason in cf.reasons or ["unspecified_fail"]:
+                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+
+            slots_remaining = max(0, max_positions - len(positions))
+            new_position_limit = max(0, min(target_new_positions, slots_remaining))
+            buyable_candidates: list[CandidateFeature] = []
+            for cf in ok_after_risk:
+                order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
+                reasons: list[str] = []
+                if new_position_limit <= 0:
+                    reasons.append("max_positions")
+                if target_new_positions <= 0:
+                    reasons.append("target_new_positions_zero")
+                if entry_capital_krw <= 0:
+                    reasons.append("entry_capital_zero")
+                if available_cash_krw is not None and available_cash_krw <= 0:
+                    reasons.append("available_cash_zero")
+                if min_order_krw > 0 and order_value < min_order_krw:
+                    reasons.append("min_order_krw")
+                if order_value <= 0:
+                    reasons.append("order_value_zero")
+                if available_cash_krw is not None and order_value > available_cash_krw:
+                    reasons.append("insufficient_cash")
+                if not reasons and len(buyable_candidates) >= new_position_limit:
+                    reasons.append("target_new_positions_limit")
+                if reasons:
+                    for reason in reasons:
+                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                    continue
+                buyable_candidates.append(cf)
+
+            after_buyable_check_count = len(buyable_candidates)
+            dedup_candidates: list[CandidateFeature] = []
+            for cf in buyable_candidates:
+                if self._should_block_order(cf.client_order_key or ""):
+                    self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                    continue
+                dedup_candidates.append(cf)
+            after_dedup_count = len(dedup_candidates)
+
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
                 "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
@@ -1242,6 +1367,16 @@ class PB1Engine:
                 selected_thresholds.pullback_min,
                 selected_thresholds.pullback_max,
                 selected_thresholds.require_both_contractions,
+            )
+            logger.info(
+                "[PB1][CANDIDATES][SNAPSHOT] setup_ok_count=%s setup_ok_sample=%s after_risk_check_count=%s after_buyable_check_count=%s after_dedup_count=%s drop_reasons_topN=%s drop_examples=%s",
+                len(setup_ok_codes),
+                setup_ok_codes[:3],
+                after_risk_check_count,
+                after_buyable_check_count,
+                after_dedup_count,
+                drop_reason_counter.most_common(3),
+                {k: v for k, v in drop_examples.items() if v},
             )
             if not candidates or ok_count == 0:
                 top_reasons = all_reason_counts.most_common(3)
@@ -1266,11 +1401,41 @@ class PB1Engine:
             if self.phase in {"entry", "trade"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
-                for cf in candidates:
-                    if not cf.setup_ok or self._should_block_order(cf.client_order_key or ""):
-                        continue
+                orderable_candidates = dedup_candidates if entry_allowed else []
+                if ok_count > 0 and not orderable_candidates:
+                    no_orders_reasons: list[str] = []
                     if not entry_allowed:
-                        continue
+                        no_orders_reasons.append("entry_disabled")
+                    if skip_entry_scan:
+                        no_orders_reasons.append("entry_cutoff")
+                    if max_positions - len(positions) <= 0:
+                        no_orders_reasons.append("max_positions")
+                    if target_new_positions <= 0:
+                        no_orders_reasons.append("target_new_positions_zero")
+                    if entry_capital_krw <= 0:
+                        no_orders_reasons.append("entry_capital_zero")
+                    if available_cash_krw is not None and available_cash_krw <= 0:
+                        no_orders_reasons.append("available_cash_zero")
+                    if min_order_krw > 0 and after_buyable_check_count == 0:
+                        no_orders_reasons.append("min_order_krw")
+                    if any(reason == "duplicate_order" for reason, _ in drop_reason_counter.most_common()):
+                        no_orders_reasons.append("duplicate_order")
+                    final_status = "NO_TRADE"
+                    final_notes = f"no_orders:{no_orders_reasons or 'none'}"
+                    logger.info(
+                        "[PB1][NO_TRADE] reason=no_orders no_orders_reason=%s",
+                        no_orders_reasons or ["none"],
+                    )
+                    if self.phase in {"prep", "entry"}:
+                        self._log_reason_summary(final_notes)
+                        return RunResult(
+                            status=final_status,
+                            notes=final_notes,
+                            balance_api_calls=self.balance_api_calls,
+                            balance_cache_hits=self.balance_cache_hits,
+                            balance_tick_cache_hits=self.balance_tick_cache_hits,
+                        )
+                for cf in orderable_candidates:
                     self._place_entry(cf)
         if self.phase in {"exit", "verify", "trade"}:
             pos_list = self._positions_with_meta(positions)

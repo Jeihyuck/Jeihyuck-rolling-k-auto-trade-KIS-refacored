@@ -1,345 +1,14 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 8f9d3e10b2cbcd1df649612042100f5ebda0b076..aedff4c32f11e566c07f92aa4c3c78ed7ac4feb8 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -34,50 +34,51 @@ jobs:
- 
-       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
-       RUN_LOOP_MINUTES: "4"
- 
-       # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
-       BOTSTATE_LOCK_TTL_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
- 
-       ACTIVE_STRATEGIES: "1"
-+      DAILY_CAPITAL: "250000000"
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
- 
-       - name: Setup Python
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
- 
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Precheck env (fail fast)
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-diff --git a/logging_config.py b/logging_config.py
-index ee272f9f1c4ed59d1a0c3cf34e5d81d8532a469c..e965e6ed555ae70c5471555e40c2479f1c246b6b 100644
---- a/logging_config.py
-+++ b/logging_config.py
-@@ -1,40 +1,41 @@
- # logging_config.py
- # 루트(상위 탑 디렉토리)에 위치. 모든 모듈에서 import 하도록 경로 주의.
- 
- import logging
- import os
-+import sys
- from logging.handlers import RotatingFileHandler
- 
- LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
- LOG_DIR = os.getenv("LOG_DIR", "logs")
- LOG_FILE = os.path.join(LOG_DIR, "app.log")
- LOG_FMT = os.getenv("LOG_FMT", "[%(asctime)s] %(levelname)s %(name)s: %(message)s")
- LOG_MAX_MB = int(os.getenv("LOG_MAX_MB", "10"))  # 파일 당 최대 크기(MB)
- LOG_BACKUP = int(os.getenv("LOG_BACKUP", "5"))  # 보관 파일 개수
- 
- os.makedirs(LOG_DIR, exist_ok=True)
- 
- root_logger = logging.getLogger()
- root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
- 
- # 기존 핸들러 제거(중복 방지)
- while root_logger.handlers:
-     root_logger.handlers.pop()
- 
- # 콘솔 핸들러
--ch = logging.StreamHandler()
-+ch = logging.StreamHandler(sys.stdout)
- ch.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
- ch.setFormatter(logging.Formatter(LOG_FMT))
- root_logger.addHandler(ch)
- 
- # 파일 핸들러(순환)
- fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_MB*1024*1024, backupCount=LOG_BACKUP, encoding="utf-8")
- fh.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
- fh.setFormatter(logging.Formatter(LOG_FMT))
- root_logger.addHandler(fh)
- 
- # 필요시 모듈별 수준 조정 예시
- # logging.getLogger("uvicorn").setLevel(logging.WARNING)
- # logging.getLogger("fastapi").setLevel(logging.INFO)
- 
- logging.info(f"[logging_config] LOG_FILE={LOG_FILE} LEVEL={LOG_LEVEL}")
-diff --git a/trader/data/ohlcv_provider.py b/trader/data/ohlcv_provider.py
-index aeef86f0dceb8968dbf5a448c43e97a1a132cd70..60b67879541241ed037803f40b839b33b604cb64 100644
---- a/trader/data/ohlcv_provider.py
-+++ b/trader/data/ohlcv_provider.py
-@@ -10,101 +10,115 @@ import pandas as pd
- 
- from trader.time_utils import now_kst
- from trader.universe.krx_safe import patch_pykrx_logging
- from trader.utils.ohlcv import normalize_ohlcv
- 
- logger = logging.getLogger(__name__)
- 
- 
- @dataclass
- class OHLCVResult:
-     df: pd.DataFrame
-     meta: dict
- 
- 
- class OHLCVProvider(Protocol):
-     name: str
- 
-     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult: ...
- 
- 
- class KISOHLCVProvider:
-     name = "kis"
- 
-     def __init__(self, kis: object) -> None:
-         self.kis = kis
-+        self._warned_keys: set[str] = set()
-+
-+    def _warn_once(self, key: str, message: str, *args: object) -> None:
-+        if key in self._warned_keys:
-+            return
-+        self._warned_keys.add(key)
-+        logger.warning(message, *args)
- 
-     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
-         try:
-             candles = self.kis.get_daily_candles(symbol, count=max(days, 120))  # type: ignore[attr-defined]
-         except Exception as exc:  # pragma: no cover - network dependent
--            logger.warning("[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
-+            self._warn_once(f"fail:{symbol}", "[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
-             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
- 
-         if not candles:
-             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": "empty", "volume_missing": True})
- 
-         df = pd.DataFrame(candles)
-         raw_keys = list(df.columns)
-         df_norm, meta = normalize_ohlcv(df)
-         df_norm = df_norm.tail(days) if days else df_norm
-         meta.update(
-             {
-                 "provider": self.name,
-                 "source": self.name,
-                 "raw_keys": raw_keys,
-                 "rows": len(df_norm),
-             }
-         )
-         return OHLCVResult(df_norm, meta)
- 
- 
- class KRXOHLCVProvider:
-     name = "krx"
- 
-     def __init__(self, *, lookback_pad_days: int = 40) -> None:
-         self.lookback_pad_days = lookback_pad_days
-+        self._warned_keys: set[str] = set()
-+
-+    def _warn_once(self, key: str, message: str, *args: object) -> None:
-+        if key in self._warned_keys:
-+            return
-+        self._warned_keys.add(key)
-+        logger.warning(message, *args)
- 
-     def _calc_window(self, days: int) -> tuple[str, str]:
-         end = now_kst().date()
-         back = max(120, days * 3) + self.lookback_pad_days
-         start = end - timedelta(days=back)
-         return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
- 
-     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
-         try:
-             from pykrx.stock import get_market_ohlcv_by_date
-         except Exception as exc:  # pragma: no cover - import guard
--            logger.warning("[OHLCV][KRX][IMPORT_FAIL] symbol=%s err=%s", symbol, exc)
-+            self._warn_once("import_fail", "[OHLCV][KRX][IMPORT_FAIL] symbol=%s err=%s", symbol, exc)
-             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
- 
-         patch_pykrx_logging()
-         start, end = self._calc_window(days)
-         try:
-             df_raw = get_market_ohlcv_by_date(start, end, symbol)
-         except Exception as exc:  # pragma: no cover - network dependent
--            logger.warning("[OHLCV][KRX][FAIL] symbol=%s start=%s end=%s err=%s", symbol, start, end, exc)
-+            self._warn_once(f"fail:{symbol}", "[OHLCV][KRX][FAIL] symbol=%s start=%s end=%s err=%s", symbol, start, end, exc)
-             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
- 
-         if df_raw is None or df_raw.empty:
-             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": "empty", "volume_missing": True})
- 
-         df = df_raw.reset_index()
-         raw_keys = list(df.columns)
-         df_norm, meta = normalize_ohlcv(df)
-         df_norm = df_norm.tail(days) if days else df_norm
-         meta.update(
-             {
-                 "provider": self.name,
-                 "source": self.name,
-                 "raw_keys": raw_keys,
-                 "rows": len(df_norm),
-             }
-         )
-         return OHLCVResult(df_norm, meta)
- 
- 
- class ChainOHLCVProvider:
-     def __init__(self, providers: Iterable[OHLCVProvider], *, env: str | None = None, cache_dir: Path | None = None) -> None:
-         self.providers: List[OHLCVProvider] = list(providers)
-         base_cache = cache_dir or (Path(__file__).resolve().parent.parent / "state" / "ohlcv_cache")
-         self.cache_dir = base_cache / env if env else base_cache
 diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d723254254595cd38 100644
+index 133ed7bc7608d78661b6004d723254254595cd38..629ae7e37c6525a77acfce314afb496dc3b61deb 100644
 --- a/trader/pb1_engine.py
 +++ b/trader/pb1_engine.py
-@@ -1,32 +1,33 @@
- from __future__ import annotations
- 
- import logging
- import os
- from collections import Counter
- from dataclasses import dataclass
- from datetime import datetime
-+from zoneinfo import ZoneInfo
- from typing import Any, Dict, Iterable, List
- 
- import pandas as pd
- 
- from trader.config import (
-     CAP_CAP,
-     DAILY_CAPITAL,
-     KOSDAQ_HARD_STOP_PCT,
-     KOSPI_HARD_STOP_PCT,
-     PB1_ENTRY_ENABLED,
-     PB1_DAY_SL_R,
-     PB1_DAY_TP_R,
-     PB1_R_FLOOR_PCT,
-     PB1_TIME_STOP_DAYS,
-     PB1_REQUIRE_VOLUME,
-     PB1_MIN_CANDLES,
-     PB1_MAX_POSITIONS,
-     PB1_MIN_SCORE,
-     PB1_USE_RISK_PARITY,
-     PB1_MAX_ATR_PCT,
-     PB1_MIN_VALUE20,
-     PB1_ENTRY_WINDOW_START,
-     PB1_ENTRY_OPEN_END,
-     PB1_ENTRY_WINDOW_END,
-     PB1_EXIT_WINDOW_START,
-@@ -206,103 +207,119 @@ def resolve_pb1_phase(
-     force_phase_env: str | None = None,
- ) -> tuple[str, str, str]:
-     force_raw = (force_phase_env or "").strip().lower()
-     if force_raw:
-         if force_raw in {"entry", "exit", "verify"}:
-             window = resolve_market_window(now, trading_day)
-             return force_raw, "force", window
-         logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
-     window = resolve_market_window(now, trading_day)
-     if not trading_day:
-         return "exit", "auto_non_trading_day", window
-     entry_start = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_START, "%H:%M").time(), now.tzinfo)
-     entry_open_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_OPEN_END, "%H:%M").time(), now.tzinfo)
-     entry_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time(), now.tzinfo)
-     exit_start = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_START, "%H:%M").time(), now.tzinfo)
-     exit_end = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_END, "%H:%M").time(), now.tzinfo)
-     if entry_start <= now < entry_open_end:
-         return "entry", "auto_opening", window
-     if entry_open_end <= now < entry_end:
-         return "entry", "auto_day", window
-     if exit_start <= now <= exit_end:
-         return "exit", "auto_close", window
-     return "exit", "auto_outside_window", window
- 
- 
-+def compute_window(now_kst: datetime) -> str:
-+    if now_kst.tzinfo is None:
-+        now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
-+    trading_day = now_kst.weekday() < 5
-+    return resolve_market_window(now_kst, trading_day)
-+
-+
- class PB1Engine:
-     STRATEGY_NAME = "pb1_pullback_close"
-     UNIVERSE_STRATEGY = "best_k_meta"
- 
-     def __init__(
-         self,
-         *,
-         universe_repo: UniverseRepo,
-         orders_repo: OrdersRepo,
-         fills_repo: FillsRepo,
-         positions_repo: PositionsRepo,
-         kis: KisAPI | None,
-         window: WindowDecision,
-         window_label: str,
-         phase: str,
-         dry_run: bool,
-         env: str,
-         run_id: str,
-+        now_kst_value: datetime | None = None,
-     ) -> None:
-         self.universe_repo = universe_repo
-         self.orders_repo = orders_repo
-         self.fills_repo = fills_repo
-         self.positions_repo = positions_repo
-         self.kis = kis
-         self.window = window
-         self.window_label = window_label
-         self.phase = phase
-         self.dry_run = dry_run
-         self.env = env
-         self.run_id = run_id
-         self.balance_api_calls = 0
-         self.balance_cache_hits = 0
-         self.balance_tick_cache_hits = 0
-         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
-         self.min_candles = int(PB1_MIN_CANDLES)
-         providers = []
-         if kis:
+@@ -277,98 +277,113 @@ class PB1Engine:
              providers.append(KISOHLCVProvider(kis))
          providers.append(KRXOHLCVProvider())
          self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
          self._setup_reason_counter: Counter[str] = Counter()
--        self._today = now_kst().date().isoformat()
-+        self._now_kst = now_kst_value or now_kst()
-+        self._today = self._now_kst.date().isoformat()
+         self._now_kst = now_kst_value or now_kst()
+         self._today = self._now_kst.date().isoformat()
          self._universe_as_of = None
          self._warned_keys: set[str] = set()
          self._balance_price_map: Dict[str, float] = {}
@@ -351,14 +20,49 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
          self.entry_enabled = entry_flag.value
          self.entry_flag_valid = entry_flag.valid
          self.entry_flag_raw = entry_flag.raw
-+        self.window_internal = self._resolve_window_internal()
-+
-+    def _resolve_window_internal(self) -> str:
-+        internal = compute_window(self._now_kst)
-+        if self.window_label in {"morning", "day"}:
-+            internal = self.window_label
-+        return internal
+         self.window_internal = self._resolve_window_internal()
  
+     def _resolve_window_internal(self) -> str:
+         internal = compute_window(self._now_kst)
+         if self.window_label in {"morning", "day"}:
+             internal = self.window_label
+         return internal
+ 
++    @staticmethod
++    def _float_env(name: str, default: float) -> float:
++        raw = os.getenv(name)
++        if raw is None:
++            return default
++        try:
++            return float(raw)
++        except ValueError:
++            logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
++            return default
++
++    @staticmethod
++    def _int_env(name: str, default: int) -> int:
++        raw = os.getenv(name)
++        if raw is None:
++            return default
++        try:
++            return int(raw)
++        except ValueError:
++            logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
++            return default
++
++    def _resolve_entry_cutoff(self) -> tuple[datetime, str]:
++        raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
++        if not raw:
++            raw = "15:15"
++        try:
++            cutoff_time = datetime.strptime(raw, "%H:%M").time()
++        except ValueError:
++            logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s fallback=%s", raw, PB1_ENTRY_WINDOW_END)
++            cutoff_time = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
++            raw = PB1_ENTRY_WINDOW_END
++        cutoff = datetime.combine(self._now_kst.date(), cutoff_time, tzinfo=self._now_kst.tzinfo)
++        return cutoff, raw
++
      def _warn_once(self, key: str, message: str, *args: object) -> None:
          if key in self._warned_keys:
              return
@@ -367,238 +71,160 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
  
      @staticmethod
      def _resolve_filter_thresholds() -> FilterThresholds:
-         def _float_env(name: str, default: float) -> float:
-             raw = os.getenv(name)
-             if raw is None:
-                 return default
-             try:
-                 return float(raw)
-             except ValueError:
-                 logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
-                 return default
- 
-         vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
-         volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
-         pullback_min = _float_env("PB1_PULLBACK_MIN", 0.02)
-         pullback_max = _float_env("PB1_PULLBACK_MAX", 0.18)
+-        def _float_env(name: str, default: float) -> float:
+-            raw = os.getenv(name)
+-            if raw is None:
+-                return default
+-            try:
+-                return float(raw)
+-            except ValueError:
+-                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+-                return default
+-
+-        vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
+-        volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
+-        pullback_min = _float_env("PB1_PULLBACK_MIN", 0.02)
+-        pullback_max = _float_env("PB1_PULLBACK_MAX", 0.18)
++        vol_max = PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
++        volu_max = PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
++        pullback_min = PB1Engine._float_env("PB1_PULLBACK_MIN", 0.02)
++        pullback_max = PB1Engine._float_env("PB1_PULLBACK_MAX", 0.18)
          require_both = env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True)
          return FilterThresholds(
-@@ -546,117 +563,155 @@ class PB1Engine:
-             elif not reasons:
-                 reasons = ["unspecified_fail"]
-             clone.setup_ok = ok
-             clone.reasons = reasons
-             if log_results:
-                 self._log_setup(clone)
-             evaluated.append(clone)
-         return evaluated
+             vol_contraction_max=vol_max,
+             volu_contraction_max=volu_max,
+             pullback_min=pullback_min,
+             pullback_max=pullback_max,
+             require_both_contractions=require_both,
+         )
  
      @staticmethod
-     def _collect_reason_counts(candidates: Iterable[CandidateFeature]) -> Counter[str]:
-         counts: Counter[str] = Counter()
-         for cf in candidates:
-             if cf.setup_ok:
-                 continue
-             reasons = cf.reasons or ["unspecified_fail"]
-             for reason in reasons:
-                 counts[reason] += 1
-         return counts
- 
-     def _select_candidates_with_fallback(
-         self,
-         candidates: List[CandidateFeature],
-     ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str]]:
-         strict_thresholds = self._resolve_strict_thresholds()
--        medium_thresholds = self.filter_thresholds
-+        medium_thresholds = self.filter_thresholds.with_overrides(
-+            vol_contraction_max=1.00,
-+            volu_contraction_max=1.00,
-+            pullback_min=0.03,
-+            pullback_max=0.15,
-+            require_both_contractions=True,
-+        )
-         loose_thresholds = self.filter_thresholds.with_overrides(
--            vol_contraction_max=1.15,
--            volu_contraction_max=1.25,
--            pullback_min=0.01,
--            pullback_max=0.25,
-+            vol_contraction_max=1.10,
-+            volu_contraction_max=1.10,
-+            pullback_min=0.02,
-+            pullback_max=0.18,
-             require_both_contractions=False,
+     def _resolve_strict_thresholds() -> FilterThresholds:
+-        def _float_env(name: str, default: float) -> float:
+-            raw = os.getenv(name)
+-            if raw is None:
+-                return default
+-            try:
+-                return float(raw)
+-            except ValueError:
+-                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+-                return default
+-
+         return FilterThresholds(
+-            vol_contraction_max=_float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
+-            volu_contraction_max=_float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
+-            pullback_min=_float_env("PB1_PULLBACK_MIN", 0.05),
+-            pullback_max=_float_env("PB1_PULLBACK_MAX", 0.12),
++            vol_contraction_max=PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
++            volu_contraction_max=PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
++            pullback_min=PB1Engine._float_env("PB1_PULLBACK_MIN", 0.05),
++            pullback_max=PB1Engine._float_env("PB1_PULLBACK_MAX", 0.12),
+             require_both_contractions=env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True),
          )
-         tiers = [
-             ("tier1", strict_thresholds),
-             ("tier2", medium_thresholds),
-             ("tier3", loose_thresholds),
-         ]
-         selected_candidates: List[CandidateFeature] = []
-         selected_tier = tiers[-1][0]
-         selected_thresholds = tiers[-1][1]
-         tiers_tried: list[str] = []
-         all_reason_counts: Counter[str] = Counter()
  
-         for tier_name, thresholds in tiers:
-             tiers_tried.append(tier_name)
-             evaluated = self._apply_thresholds(candidates, thresholds, log_results=False)
-             ok_count = len([c for c in evaluated if c.setup_ok])
-             reason_counts = self._collect_reason_counts(evaluated)
-             all_reason_counts.update(reason_counts)
-             logger.info(
-                 "[PB1][CANDIDATES] tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
-                 tier_name,
-                 ok_count,
-                 len(evaluated),
-                 thresholds.vol_contraction_max,
-                 thresholds.volu_contraction_max,
-                 thresholds.pullback_min,
-                 thresholds.pullback_max,
-                 thresholds.require_both_contractions,
-             )
-             if ok_count > 0:
-                 selected_candidates = self._apply_thresholds(candidates, thresholds, log_results=True)
-                 selected_tier = tier_name
-                 selected_thresholds = thresholds
-                 break
-             selected_candidates = evaluated
-             selected_tier = tier_name
-             selected_thresholds = thresholds
+     def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
+         for reason in reasons:
+             if not reason:
+                 continue
+             self._setup_reason_counter[reason] += 1
  
-         if selected_candidates and all(c.setup_ok is False for c in selected_candidates):
-             selected_candidates = self._apply_thresholds(candidates, selected_thresholds, log_results=True)
-         return selected_candidates, selected_tier, selected_thresholds, all_reason_counts, tiers_tried
+     def _log_reason_summary(self, note: str | None = None) -> None:
+         if not self._setup_reason_counter:
+             return
+         top = self._setup_reason_counter.most_common(3)
+         logger.info(
+             "[PB1][SETUP-REASONS] total_bad=%s top3=%s%s",
+             sum(self._setup_reason_counter.values()),
+             top,
+             f" note={note}" if note else "",
+         )
  
-+    def _apply_score_fallback(self, candidates: List[CandidateFeature]) -> int:
-+        scored: list[CandidateFeature] = []
-+        for cf in candidates:
-+            if not cf.features.get("data_ok"):
-+                continue
-+            try:
-+                score = float(score_setup(cf.features, cf.market))
-+            except Exception:
-+                score = 0.0
-+            cf.features["score"] = score
-+            scored.append(cf)
-+
-+        if not scored:
-+            return 0
-+
-+        scored.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
-+        max_n = max(1, int(PB1_MAX_POSITIONS))
-+        selected = scored[:max_n]
-+        selected_codes = {c.code for c in selected}
-+        for cf in candidates:
-+            if cf.code in selected_codes:
-+                cf.setup_ok = True
-+                cf.features["score_fallback"] = True
-+                cf.reasons = list(cf.reasons or []) + ["score_fallback"]
-+        logger.info(
-+            "[PB1][CANDIDATES][FALLBACK] mode=score_based selected=%s total=%s",
-+            len(selected_codes),
-+            len(candidates),
-+        )
-+        return len(selected_codes)
-+
-     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
-         ok_list = [c for c in candidates if c.setup_ok]
-         if not ok_list:
-             return candidates
- 
-         # 1) 점수 계산 + ATR/유동성 컷 + 점수 컷
-         filtered: List[CandidateFeature] = []
-         for cf in ok_list:
-             try:
-                 score = float(score_setup(cf.features, cf.market))
+     @staticmethod
+     def _to_float(value: Any) -> float | None:
+         try:
+             if value is None:
+                 return None
+@@ -388,50 +403,74 @@ class PB1Engine:
+                 code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+                 px = self._to_float(row.get("prpr") or row.get("stck_prpr"))
+                 if code and px is not None:
+                     prices[code] = px
              except Exception:
-                 score = 0.0
-             cf.features["score"] = score
- 
-             atr_pct = cf.features.get("atr_pct")
-             value20 = cf.features.get("value20")
-+            score_fallback = bool(cf.features.get("score_fallback"))
- 
--            if score < float(PB1_MIN_SCORE):
-+            if score < float(PB1_MIN_SCORE) and not score_fallback:
-                 cf.setup_ok = False
-                 cf.reasons.append("score_below_cut")
                  continue
-             if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
-                 cf.setup_ok = False
-                 cf.reasons.append("atr_pct_missing")
-                 continue
-             if float(atr_pct) > float(PB1_MAX_ATR_PCT):
-                 cf.setup_ok = False
-                 cf.reasons.append("atr_pct_too_high")
-                 continue
-             if value20 is None or (isinstance(value20, float) and value20 != value20):
-                 cf.setup_ok = False
-                 cf.reasons.append("value20_missing")
-                 continue
-             if float(value20) < float(PB1_MIN_VALUE20):
-                 cf.setup_ok = False
-                 cf.reasons.append("liquidity_too_low")
-                 continue
+         return prices
  
-             filtered.append(cf)
+     def _sum_cost_from_rows(self, rows: Iterable[dict]) -> float:
+         total = 0.0
+         for row in rows or []:
+             val = self._to_float(row.get("pchs_amt"))
+             if val:
+                 total += val
+         return total
  
-         if not filtered:
-             return candidates
+     def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
+         summary = _as_first_dict(holdings_summary)
+         for key in COST_KEYS:
+             cost = self._to_float(summary.get(key))
+             if cost and cost > 0:
+                 return cost
+         total = self._sum_cost_from_rows(holdings_rows)
+         return total if total > 0 else None
  
-@@ -954,51 +1009,51 @@ class PB1Engine:
++    def _extract_available_cash(self, holdings_summary: dict | None) -> float | None:
++        summary = _as_first_dict(holdings_summary)
++        for key in CASH_KEYS:
++            cash = self._to_float(summary.get(key))
++            if cash is not None:
++                return cash
++        return None
++
++    @staticmethod
++    def _record_drop(
++        counter: Counter[str],
++        examples: Dict[str, list[str]],
++        reason: str,
++        code: str,
++        *,
++        limit: int = 3,
++    ) -> None:
++        if not reason:
++            return
++        counter[reason] += 1
++        sample_list = examples.setdefault(reason, [])
++        if len(sample_list) < limit:
++            sample_list.append(code)
++
+     def _fetch_holdings_snapshot(self) -> dict:
+         if self._balance_snapshot is not None:
+             self.balance_tick_cache_hits += 1
+             logger.info("[BALANCE][CACHE] hit=True source=tick_cache")
+             return self._balance_snapshot
+         if not self.kis:
+             return {}
+         snap, source = self.kis.get_balance_cached(return_source=True)
+         if source == "api":
+             self.balance_api_calls += 1
          else:
-             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
+             self.balance_cache_hits += 1
+         logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+         self._balance_snapshot = snap
+         return self._balance_snapshot
  
-     def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:
-         enriched: List[Dict] = []
-         for state in positions:
-             if state.get("sid") != 1:
-                 continue
-             enriched.append(
-                 {
-                     "code": state.get("code"),
-                     "sid": state.get("sid"),
-                     "mode": state.get("mode"),
-                     "qty": state.get("qty") or 0,
-                     "avg_buy_price": state.get("avg_buy_price"),
-                     "market": state.get("market"),
-                     "holding_days": state.get("holding_days") or 0,
-                     "first_buy_ts": state.get("first_buy_ts"),
-                     "total_cost": state.get("total_cost") or 0.0,
-                     "realized_pnl": state.get("realized_pnl") or 0.0,
-                 }
-             )
-         return enriched
+     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
+         return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
  
-     def _load_universe(self) -> list[dict]:
--        today = now_kst().date().isoformat()
-+        today = self._now_kst.date().isoformat()
-         members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
-         self._universe_as_of = today if members else None
-         if not members:
-             members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
-             if members:
-                 self._universe_as_of = members[0].get("as_of_date")
-         return members
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         if not cf.setup_ok:
+             self._record_setup_reasons(cf.reasons or ["unspecified_fail"])
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+@@ -1126,172 +1165,298 @@ class PB1Engine:
  
-     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
-         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
-         marks = self._fetch_marks([p["code"] for p in positions], fallback)
-         totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
-         for pos in positions:
-             qty = pos.get("qty") or 0
-             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
-             market_value = float(mark) * qty
-             cost = float(pos.get("total_cost") or 0.0)
-             totals["market_value"] += market_value
-             totals["cost"] += cost
-             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
-             totals["unrealized"] += market_value - cost
- 
-         summary_mv = None
-         for key in EVAL_KEYS:
-             summary_mv = self._to_float(self._holdings_summary.get(key))
-@@ -1076,51 +1131,51 @@ class PB1Engine:
+         logger.info(
+             "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s invested_return_pct=%s total_asset_return_pct=%s",
+             self._universe_as_of or "none",
+             totals["market_value"],
              totals["cost"],
              cost_source,
              totals["unrealized"],
@@ -619,18 +245,40 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
          final_status = "OK"
          final_notes: str | None = None
          entry_allowed = self.entry_enabled
++        entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
++        max_positions = int(PB1_MAX_POSITIONS)
++        target_new_positions = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
++        min_order_krw = self._float_env("MIN_ORDER_KRW", 0.0)
++        entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
++        skip_entry_scan = False
          if not entry_allowed:
              logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
          logger.info(
              "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
              self.window_label,
--            self.window.name,
-+            self.window_internal,
+             self.window_internal,
              self.phase,
              self.dry_run,
              self.env,
          )
  
++        if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
++            skip_entry_scan = True
++            entry_allowed = False
++            logger.info(
++                "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
++                self._now_kst.isoformat(),
++                entry_cutoff_dt.isoformat(),
++            )
++            if self.phase in {"prep", "entry"}:
++                return RunResult(
++                    status="SKIPPED",
++                    notes="entry_cutoff",
++                    balance_api_calls=self.balance_api_calls,
++                    balance_cache_hits=self.balance_cache_hits,
++                    balance_tick_cache_hits=self.balance_tick_cache_hits,
++                )
++
          members = self._load_universe()
          if not members:
              note = "universe_empty"
@@ -651,7 +299,39 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
          holdings_summary = _as_first_dict(holdings_summary_raw)
          self._holdings_summary = holdings_summary
          self._balance_price_map = self._extract_holdings_prices(holdings_rows)
-@@ -1149,50 +1204,52 @@ class PB1Engine:
+         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
++        available_cash_krw = self._extract_available_cash(holdings_summary)
++        logger.info(
++            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s",
++            max_positions,
++            target_new_positions,
++            entry_capital_krw,
++            min_order_krw,
++            entry_cutoff_raw,
++            len(positions),
++            f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
++        )
+         if self.phase in {"verify", "exit"}:
+             holdings = list(holdings_rows or [])
+             if not holdings and self.kis:
+                 logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
+             if not positions and holdings:
+                 bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                     env=self.env,
+                     strategy=self.STRATEGY_NAME,
+                     sid=1,
+                     mode=1,
+                     holdings=holdings,
+                 )
+                 logger.info("[PB1][BOOTSTRAP] positions_inserted=%s", bootstrapped)
+                 positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+             open_orders = self.orders_repo.get_open_orders(self.env)
+             if open_orders:
+                 logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
+             self._pnl_snapshot(self._positions_with_meta(positions))
+             if self.phase == "verify":
+                 final_status = "OK"
+                 final_notes = "verify_only"
                  self._log_reason_summary(final_notes)
                  return RunResult(
                      status=final_status,
@@ -668,7 +348,14 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
          selected_thresholds = self.filter_thresholds
          all_reason_counts: Counter[str] = Counter()
          tiers_tried: list[str] = []
-         if self.phase in {"prep", "entry", "trade"}:
+-        if self.phase in {"prep", "entry", "trade"}:
++        setup_ok_codes: list[str] = []
++        drop_reason_counter: Counter[str] = Counter()
++        drop_examples: Dict[str, list[str]] = {}
++        after_risk_check_count = 0
++        after_buyable_check_count = 0
++        after_dedup_count = 0
++        if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
              candidates = self._compute_candidates(members)
              (
                  candidates,
@@ -677,9 +364,55 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
                  all_reason_counts,
                  tiers_tried,
              ) = self._select_candidates_with_fallback(candidates)
-+            if not any(c.setup_ok for c in candidates):
-+                self._apply_score_fallback(candidates)
+             if not any(c.setup_ok for c in candidates):
+                 self._apply_score_fallback(candidates)
++            setup_ok_codes = [c.code for c in candidates if c.setup_ok]
              candidates = self._size_positions(candidates)
++            ok_after_risk = [c for c in candidates if c.setup_ok]
++            after_risk_check_count = len(ok_after_risk)
++            dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
++            for cf in candidates:
++                if cf.code in dropped_after_risk:
++                    for reason in cf.reasons or ["unspecified_fail"]:
++                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
++
++            slots_remaining = max(0, max_positions - len(positions))
++            new_position_limit = max(0, min(target_new_positions, slots_remaining))
++            buyable_candidates: list[CandidateFeature] = []
++            for cf in ok_after_risk:
++                order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
++                reasons: list[str] = []
++                if new_position_limit <= 0:
++                    reasons.append("max_positions")
++                if target_new_positions <= 0:
++                    reasons.append("target_new_positions_zero")
++                if entry_capital_krw <= 0:
++                    reasons.append("entry_capital_zero")
++                if available_cash_krw is not None and available_cash_krw <= 0:
++                    reasons.append("available_cash_zero")
++                if min_order_krw > 0 and order_value < min_order_krw:
++                    reasons.append("min_order_krw")
++                if order_value <= 0:
++                    reasons.append("order_value_zero")
++                if available_cash_krw is not None and order_value > available_cash_krw:
++                    reasons.append("insufficient_cash")
++                if not reasons and len(buyable_candidates) >= new_position_limit:
++                    reasons.append("target_new_positions_limit")
++                if reasons:
++                    for reason in reasons:
++                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
++                    continue
++                buyable_candidates.append(cf)
++
++            after_buyable_check_count = len(buyable_candidates)
++            dedup_candidates: list[CandidateFeature] = []
++            for cf in buyable_candidates:
++                if self._should_block_order(cf.client_order_key or ""):
++                    self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
++                    continue
++                dedup_candidates.append(cf)
++            after_dedup_count = len(dedup_candidates)
++
              ok_count = len([c for c in candidates if c.setup_ok])
              logger.info(
                  "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
@@ -694,6 +427,16 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
                  selected_thresholds.pullback_max,
                  selected_thresholds.require_both_contractions,
              )
++            logger.info(
++                "[PB1][CANDIDATES][SNAPSHOT] setup_ok_count=%s setup_ok_sample=%s after_risk_check_count=%s after_buyable_check_count=%s after_dedup_count=%s drop_reasons_topN=%s drop_examples=%s",
++                len(setup_ok_codes),
++                setup_ok_codes[:3],
++                after_risk_check_count,
++                after_buyable_check_count,
++                after_dedup_count,
++                drop_reason_counter.most_common(3),
++                {k: v for k, v in drop_examples.items() if v},
++            )
              if not candidates or ok_count == 0:
                  top_reasons = all_reason_counts.most_common(3)
                  final_status = "NO_TRADE"
@@ -704,7 +447,12 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
                      selected_tier,
                      len(candidates),
                      top_reasons or "none",
-@@ -1205,36 +1262,36 @@ class PB1Engine:
+                 )
+                 if self.phase in {"prep", "entry"}:
+                     self._log_reason_summary(final_notes)
+                     return RunResult(
+                         status=final_status,
+                         notes=final_notes,
                          balance_api_calls=self.balance_api_calls,
                          balance_cache_hits=self.balance_cache_hits,
                          balance_tick_cache_hits=self.balance_tick_cache_hits,
@@ -712,11 +460,45 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
              if self.phase in {"entry", "trade"}:
                  if not entry_allowed:
                      logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
-                 for cf in candidates:
-                     if not cf.setup_ok or self._should_block_order(cf.client_order_key or ""):
-                         continue
+-                for cf in candidates:
+-                    if not cf.setup_ok or self._should_block_order(cf.client_order_key or ""):
+-                        continue
++                orderable_candidates = dedup_candidates if entry_allowed else []
++                if ok_count > 0 and not orderable_candidates:
++                    no_orders_reasons: list[str] = []
                      if not entry_allowed:
-                         continue
+-                        continue
++                        no_orders_reasons.append("entry_disabled")
++                    if skip_entry_scan:
++                        no_orders_reasons.append("entry_cutoff")
++                    if max_positions - len(positions) <= 0:
++                        no_orders_reasons.append("max_positions")
++                    if target_new_positions <= 0:
++                        no_orders_reasons.append("target_new_positions_zero")
++                    if entry_capital_krw <= 0:
++                        no_orders_reasons.append("entry_capital_zero")
++                    if available_cash_krw is not None and available_cash_krw <= 0:
++                        no_orders_reasons.append("available_cash_zero")
++                    if min_order_krw > 0 and after_buyable_check_count == 0:
++                        no_orders_reasons.append("min_order_krw")
++                    if any(reason == "duplicate_order" for reason, _ in drop_reason_counter.most_common()):
++                        no_orders_reasons.append("duplicate_order")
++                    final_status = "NO_TRADE"
++                    final_notes = f"no_orders:{no_orders_reasons or 'none'}"
++                    logger.info(
++                        "[PB1][NO_TRADE] reason=no_orders no_orders_reason=%s",
++                        no_orders_reasons or ["none"],
++                    )
++                    if self.phase in {"prep", "entry"}:
++                        self._log_reason_summary(final_notes)
++                        return RunResult(
++                            status=final_status,
++                            notes=final_notes,
++                            balance_api_calls=self.balance_api_calls,
++                            balance_cache_hits=self.balance_cache_hits,
++                            balance_tick_cache_hits=self.balance_tick_cache_hits,
++                        )
++                for cf in orderable_candidates:
                      self._place_entry(cf)
          if self.phase in {"exit", "verify", "trade"}:
              pos_list = self._positions_with_meta(positions)
@@ -730,8 +512,7 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
                      continue
                  features["market"] = pos.get("market") or code_market.get(pos["code"], "")
                  marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
--                self._plan_exit_event(pos, features, "morning" if self.window.name == "morning" else "close")
-+                self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
+                 self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
          self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
          final_notes = final_notes or self._universe_as_of or "ok"
          self._log_reason_summary(final_notes)
@@ -742,226 +523,4 @@ index fd43e83c0756135708dcbebf9c303d026eea6d6f..133ed7bc7608d78661b6004d72325425
              balance_cache_hits=self.balance_cache_hits,
              balance_tick_cache_hits=self.balance_tick_cache_hits,
          )
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index d2a3b3edec39d7e6b2de04e54a774c76c3838a08..d13264615db48fabb34f0bd2bfef01784f5c81fa 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -49,52 +49,52 @@ def _resolve_market_context(
-     now: datetime,
-     trading_day: bool,
-     market_window: str,
-     window_override: str,
-     phase_seed: str | None,
- ) -> tuple[WindowDecision | None, str, str, str, str, list[str]]:
-     window = decide_window(now=now, override=window_override)
-     window_label = _resolve_window_label(market_window, window)
-     resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
-     reasons: list[str] = []
-     if not resolved_phase:
-         fallback = (os.getenv("PB1_PHASE_DEFAULT") or "entry").strip().lower()
-         resolved_phase = fallback if fallback else "entry"
-         phase_reason = "default_env"
-         reasons.append("phase_default_env")
-     reasons.append(f"market_window:{market_window}")
-     reasons.append(f"window:{window_label}")
-     reasons.append(f"phase:{resolved_phase}")
-     return window, window_label, resolved_phase, phase_reason, phase_window, reasons
- 
- 
- def _resolve_window_label(market_window: str, window: WindowDecision | None) -> str:
-     normalized = (market_window or "").strip().lower()
-     if normalized == "day":
-         if window and window.name != "day":
--            logger.error(
--                "[PB1][WINDOW][ERROR] market_window=day mismatch window=%s -> forcing day",
-+            logger.warning(
-+                "[PB1][WINDOW][WARN] market_window=day mismatch window=%s -> forcing day",
-                 window.name,
-             )
-         return "day"
-     if normalized in {"morning", "afternoon", "close", "preopen", "after"}:
-         return normalized
-     return window.name if window else "none"
- 
- 
- def _parse_hhmm_to_time(hhmm: str) -> dtime:
-     hh, mm = hhmm.split(":")
-     return dtime(hour=int(hh), minute=int(mm))
- 
- 
- def _next_window_start(now: datetime, window_starts: list[dtime]) -> datetime | None:
-     sorted_starts = sorted(window_starts)
-     for start in sorted_starts:
-         if now.time() < start:
-             return now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
-     return None
- 
- 
- def _market_session(now: datetime) -> tuple[datetime, datetime]:
-     open_t = _parse_hhmm_to_time(MARKET_OPEN_HHMM)
-     close_t = _parse_hhmm_to_time(MARKET_CLOSE_HHMM)
-     return (
-@@ -604,50 +604,51 @@ def run_once(
-             dry_run=dry_run,
-             git_sha=os.getenv("GITHUB_SHA"),
-             workflow=os.getenv("GITHUB_WORKFLOW"),
-             workflow_run_id=workflow_run_id,
-             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-             config_json={
-                 "dry_run_reasons": dry_run_reasons,
-                 "run_window": window_label,
-                 "phase": phase_override_arg,
-                 "phase_reason": phase_reason,
-             },
-         )
- 
-         engine_runner = PB1Engine(
-             universe_repo=universe_repo,
-             orders_repo=orders_repo,
-             fills_repo=fills_repo,
-             positions_repo=positions_repo,
-             kis=kis,
-             window=window,
-             window_label=window_label,
-             phase=phase_override_arg,
-             dry_run=dry_run,
-             env=kis_env or "practice",
-             run_id=run_record_id,
-+            now_kst_value=now,
-         )
-         result = engine_runner.run()
-         did_work = True
-         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
-         touched_files = _collect_botstate_files(run_start_ts)
-     except Exception as exc:
-         logger.exception("[PB1][FAIL] unexpected error")
-         if run_record_id:
-             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-         raise
-     finally:
-         release_lock(engine, lock_key)
-     metrics = {
-         "balance_api_calls": result.balance_api_calls if result else 0,
-         "balance_cache_hits": result.balance_cache_hits if result else 0,
-         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
-     }
-     result_status = result.status if result else "UNKNOWN"
-     return touched_files, did_work, metrics, phase_for_log, result_status
- 
- 
- def _run_loop(*, args: argparse.Namespace, engine) -> None:
-     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 448215914d7c500adf4fe1f9667000eb4817c10c..d5f75d4baf04f7b0b42bd0ff15963772af5de6e4 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -448,52 +448,52 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
-             reason = "seed_static" if result else "seed_missing"
-         else:
-             logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
-             continue
- 
-         if result:
-             payload = result["payload"]
-             members = result["members"]
-             source = result.get("source", provider_name)
-             params.update(result.get("params") or {})
-             last_reason = reason or provider_name
-             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
-             if source in {"fdr_marketcap_top", "kis_marketcap_top"}:
-                 if ENABLE_LKG:
-                     try:
-                         lkg_provider.save(env, strategy, result)
-                     except Exception:
-                         logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
-                 if ENABLE_SQLITE_CACHE and sqlite_provider:
-                     sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
-             break
- 
-         last_reason = reason or provider_name
-         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
- 
--    validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "0").lower() in {"1", "true", "yes", "on"}
--    min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(PB1_MIN_CANDLES)))
-+    validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
-+    min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
-     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
-     members, stats = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
-     logger.info(
-         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
-         stats["total_raw"],
-         stats["invalid_format"],
-         stats["insufficient_history"],
-         stats["final"],
-     )
- 
-     universe_id = repo.store_universe(
-         env=env,
-         strategy=strategy,
-         as_of_date=as_of_date,
-         source=source,
-         params_json=params,
-         payload_json=payload or {},
-         members=members,
-     )
-     if universe_id:
-         logger.info(
-             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
-             env,
-             strategy,
-             as_of_date,
-diff --git a/trader/universe/providers/fdr_marketcap_top.py b/trader/universe/providers/fdr_marketcap_top.py
-index b844464ec3e87c6e3764818bca4f6bd49ba80676..6088d5a6f1d09e7ae7a574907f4b2f203a469f03 100644
---- a/trader/universe/providers/fdr_marketcap_top.py
-+++ b/trader/universe/providers/fdr_marketcap_top.py
-@@ -1,45 +1,45 @@
- from __future__ import annotations
- 
- import logging
- from typing import Iterable
- 
- import pandas as pd
- 
- logger = logging.getLogger(__name__)
- 
- MARKET_CAP_COLUMNS = ("Marcap", "MarketCap", "MARKET_CAP", "시가총액", "시가 총액")
- MARKET_COLUMNS = ("Market", "시장", "MKT", "MarketName")
- CODE_COLUMNS = ("Code", "Symbol", "종목코드", "종목코드(6자리)")
- NAME_COLUMNS = ("Name", "종목명", "종목명(국문)", "StockName")
- 
- 
- def _normalize_code(code: object) -> str:
-     code_str = str(code).strip()
--    if code_str.isdigit() and len(code_str) < 6:
--        return code_str.zfill(6)
--    return code_str
-+    if not code_str.isdigit():
-+        return ""
-+    return code_str.zfill(6)
- 
- 
- def _find_column(columns: Iterable[str], candidates: Iterable[str], label: str) -> str:
-     cols = list(columns)
-     for candidate in candidates:
-         if candidate in cols:
-             return candidate
-     raise RuntimeError(f"[UNIVERSE][FDR] {label} column not found in columns={cols}")
- 
- 
- def _filter_market(df: pd.DataFrame, market_col: str, market_name: str) -> pd.DataFrame:
-     market_series = df[market_col].astype(str).str.upper()
-     return df[market_series.str.contains(market_name.upper(), na=False)].copy()
- 
- 
- def _normalize_rows(df: pd.DataFrame, code_col: str, name_col: str | None) -> list[dict]:
-     rows: list[dict] = []
-     for _, row in df.iterrows():
-         code = _normalize_code(row.get(code_col))
-         if not code:
-             continue
-         name = None
-         if name_col:
-             raw_name = row.get(name_col)
-             if raw_name is not None:
+
