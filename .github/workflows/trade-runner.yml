@@ -198,5 +198,15 @@ jobs:
           echo "=== git status (bot-state worktree if exists) ==="
           git status --porcelain || true
 
-
+      - name: Debug paths (where am I?)
+        run: |
+          set -euo pipefail
+          echo "PWD=$(pwd)"
+          ls -al
+          echo "---- find bot_state anywhere ----"
+          find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
+          echo "---- find pbcore.sqlite3 anywhere ----"
+          find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
+          echo "---- git root? ----"
+          git rev-parse --show-toplevel || true 
 
