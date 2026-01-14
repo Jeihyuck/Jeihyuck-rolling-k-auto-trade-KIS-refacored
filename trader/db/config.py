@@ -3,8 +3,15 @@ from pathlib import Path
 
 from sqlalchemy.engine.url import make_url
 
+from trader.config import PBCORE_DB_PATH
 
-DEFAULT_SQLITE_PATH = Path(os.getenv("UNIVERSE_SQLITE_PATH") or Path(__file__).resolve().parents[1] / "state" / "pbcore.sqlite3")
+
+DEFAULT_SQLITE_PATH = Path(
+    os.getenv("PBCORE_DB_PATH")
+    or os.getenv("UNIVERSE_SQLITE_PATH")
+    or PBCORE_DB_PATH
+    or Path(__file__).resolve().parents[1] / "state" / "pbcore.sqlite3"
+)
 
 
 def using_external_db() -> bool:

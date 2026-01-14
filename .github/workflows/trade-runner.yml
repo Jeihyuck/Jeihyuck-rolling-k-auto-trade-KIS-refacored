@@ -31,6 +31,9 @@ jobs:
       PYTHONUNBUFFERED: "1"
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
+      STATE_PATH: "bot_state/runtime/state.json"
+      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
 
       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -64,6 +67,23 @@ jobs:
         with:
           fetch-depth: 0
           ref: "nullim"
+          path: repo
+
+      - name: Checkout bot-state branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "bot-state"
+          path: botstate
+
+      - name: Restore bot_state into workspace
+        run: |
+          set -euo pipefail
+          mkdir -p repo/bot_state
+          if [ -d botstate/bot_state ]; then
+            rsync -a --delete botstate/bot_state/ repo/bot_state/
+          fi
+          echo "[RESTORE] repo/bot_state restored"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -71,12 +91,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Precheck env (fail fast)
+        working-directory: repo
         run: |
           set -euo pipefail
           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
@@ -140,21 +162,25 @@ jobs:
           PY
 
       - name: Build universe (best_k_meta) - allow fallback
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || echo "[WARN] universe build failed (continue)"
 
       - name: Compile check
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m compileall trader
 
       - name: Configure git identity for botstate commits
+        working-directory: repo
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
       - name: Run PB1 (auto window) - should exit within 4 minutes
+        working-directory: repo
         run: |
           set -euo pipefail
           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
@@ -162,5 +188,24 @@ jobs:
         env:
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
+
+      - name: Persist bot_state back to bot-state branch
+        if: always()
+        run: |
+          set -euo pipefail
+          rsync -a --delete repo/bot_state/ botstate/bot_state/
+
+          cd botstate
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git add -A bot_state
+
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no changes"
+            exit 0
+          fi
+
+          git commit -m "botstate: persist ${GITHUB_RUN_ID} $(date -Iseconds)"
+          git push origin HEAD:bot-state
 
           

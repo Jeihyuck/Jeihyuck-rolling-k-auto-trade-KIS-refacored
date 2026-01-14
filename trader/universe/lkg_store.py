@@ -10,7 +10,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _LKG_ROOT = Path(
-    os.getenv("UNIVERSE_LKG_ROOT")
+    os.getenv("UNIVERSE_LKG_DIR")
+    or os.getenv("UNIVERSE_LKG_ROOT")
     or Path(__file__).resolve().parent.parent / "state" / "universe_lkg"
 )
 

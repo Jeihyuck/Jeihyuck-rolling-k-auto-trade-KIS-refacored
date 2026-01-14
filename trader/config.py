@@ -198,6 +198,7 @@ STATE_DIR_RAW = _cfg("STATE_DIR")
 STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else Path(__file__).parent / "state"
 STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+PBCORE_DB_PATH = os.getenv("PBCORE_DB_PATH", "bot_state/db/pbcore.sqlite3")
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
