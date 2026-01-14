@@ -59,30 +59,41 @@ def _resolve_run_id() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
     parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
+    parser.add_argument(
+        "--soft-fail",
+        action="store_true",
+        help="Log errors and exit 0 instead of failing the job",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    base_dir = Path.cwd().resolve()
-    worktree_dir = resolve_botstate_worktree_dir()
-    setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
-
-    owner = _resolve_owner()
-    run_id = _resolve_run_id()
-
-    if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
-        logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
-        return 1
-
     try:
-        files = _collect_paths(base_dir)
-        if not files:
-            logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
+        base_dir = Path.cwd().resolve()
+        worktree_dir = resolve_botstate_worktree_dir()
+        setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
+
+        owner = _resolve_owner()
+        run_id = _resolve_run_id()
+
+        if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
+            logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
+            return 1
+
+        try:
+            files = _collect_paths(base_dir)
+            if not files:
+                logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
+                return 0
+            persist_run_files(worktree_dir, files, args.message)
             return 0
-        persist_run_files(worktree_dir, files, args.message)
-        return 0
-    finally:
-        release_lock(worktree_dir, owner=owner, run_id=run_id)
+        finally:
+            release_lock(worktree_dir, owner=owner, run_id=run_id)
+    except Exception as exc:
+        if args.soft_fail:
+            logger.warning("[BOTSTATE][PERSIST][SOFT-FAIL] %s", exc, exc_info=True)
+            return 0
+        raise
 
 
 if __name__ == "__main__":

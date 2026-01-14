@@ -163,12 +163,23 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     worktree_dir = worktree_dir.resolve()
     worktree_dir.mkdir(parents=True, exist_ok=True)
     _configure_safe_directories(base_dir, worktree_dir)
-    try:
-        _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
-    except subprocess.CalledProcessError:
-        _run(["git", "fetch", "origin", f"{target_branch}:{target_branch}"], cwd=base_dir)
-        _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
-    git_fetch_reset("origin", target_branch, cwd=str(worktree_dir))
+
+    remote = "origin"
+    remote_ref = f"{remote}/{target_branch}"
+
+    if (worktree_dir / ".git").exists():
+        _run(["git", "-C", str(worktree_dir), "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
+        _run(["git", "fetch", remote, target_branch], cwd=base_dir)
+        _run(["git", "-C", str(worktree_dir), "checkout", "-B", target_branch], cwd=base_dir)
+        _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+        return
+
+    _run(["git", "fetch", remote, target_branch], cwd=base_dir)
+    _run(
+        ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
+        cwd=base_dir,
+    )
+    _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
 
 
 def _lock_path(worktree_dir: Path) -> Path:

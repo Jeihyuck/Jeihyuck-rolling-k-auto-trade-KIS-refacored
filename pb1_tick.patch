@@ -1,130 +1,8 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 3161c543193008070dc028cbc7d87759c7d16863..2ad3b5cce5baf7795f1a422d0be6a4c25d2cfb3c 100644
+index 2ad3b5cce5baf7795f1a422d0be6a4c25d2cfb3c..09b01680be22654fd54d233d56502eb3d19e8d5e 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -1,110 +1,116 @@
- name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
- 
- permissions:
-   contents: write
- 
- concurrency:
-   group: trade-bot-state
-   cancel-in-progress: false
- 
- on:
-   # ✅ push로도 즉시 돌고
-   push:
-     branches: [ "nullim", "main" ]
- 
-   # ✅ 수동 실행도 되고
-   workflow_dispatch:
- 
-   # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
-   schedule:
-     - cron: "50-59/5 23 * * 0-4"
-     - cron: "*/5 0-5 * * 1-5"
-     - cron: "0-30/5 6 * * 1-5"
- 
-+defaults:
-+  run:
-+    shell: bash
-+    working-directory: repo
-+
- jobs:
-   run:
-     runs-on: ubuntu-latest
-     timeout-minutes: 8
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-+      BOTSTATE_WORKTREE_DIR: "_botstate"
- 
-       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
-       RUN_LOOP_MINUTES: "4"
- 
-       # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
-       BOTSTATE_LOCK_TTL_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
- 
-       ACTIVE_STRATEGIES: "1"
-       DAILY_CAPITAL: "250000000"
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
-           path: repo
- 
-       - name: Checkout bot-state branch
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "bot-state"
-           path: botstate
- 
-       - name: Restore bot_state into workspace
-         run: |
-           set -euo pipefail
--          mkdir -p repo/bot_state
--          if [ -d botstate/bot_state ]; then
--            rsync -a --delete botstate/bot_state/ repo/bot_state/
-+          mkdir -p bot_state
-+          if [ -d ../botstate/bot_state ]; then
-+            rsync -a --delete ../botstate/bot_state/ bot_state/
-           fi
-           echo "[RESTORE] repo/bot_state restored"
- 
-       - name: Setup Python
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
- 
-       - name: Install deps
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Precheck env (fail fast)
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-               echo "::error::Missing required secret/env: $k"
-               exit 1
-             fi
-@@ -188,25 +194,32 @@ jobs:
-           python -m trader.run --window auto --phase auto
-         env:
+@@ -196,30 +196,31 @@ jobs:
            STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
            LIVE_TRADING_ENABLED: "1"
  
@@ -148,410 +26,178 @@ index 3161c543193008070dc028cbc7d87759c7d16863..2ad3b5cce5baf7795f1a422d0be6a4c2
            echo "---- git root? ----"
            git rev-parse --show-toplevel || true 
  
-+      - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
-+        if: always()
-+        run: |
-+          set -euo pipefail
-+          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)"
-+        env:
-+          BOTSTATE_WORKTREE_DIR: _botstate
-diff --git a/scripts/state_push_plain.sh b/scripts/state_push_plain.sh
-index 4a104d7f1da80cd6cb952db7478d35fd8197dddc..e8dc97008de5c8ab2a781e44bfc9669069950ab4 100755
---- a/scripts/state_push_plain.sh
-+++ b/scripts/state_push_plain.sh
-@@ -1,93 +1,6 @@
- #!/usr/bin/env bash
- set -euo pipefail
- 
--STATE_DIR="bot_state"
--JSON_PATH="${STATE_DIR}/state.json"
--POS_STATE_DIR="trader/state"
--POS_JSON_PATH="${POS_STATE_DIR}/state.json"
--INTENT_LOG_PATH="${POS_STATE_DIR}/strategy_intents.jsonl"
--INTENT_CURSOR_PATH="${POS_STATE_DIR}/strategy_intents_state.json"
--DIAG_DIR="${POS_STATE_DIR}/diagnostics"
--DIAG_LATEST="${DIAG_DIR}/diag_latest.json"
--LEDGER_JSON="${POS_STATE_DIR}/../logs/ledger.jsonl"
-+MESSAGE="${1:-Update bot state (plain) [skip ci]}"
- 
--if [[ ! -f "${JSON_PATH}" ]]; then
--  echo "[STATE] WARN: ${JSON_PATH} not found. Skipping."
--  exit 0
--fi
--if [[ ! -f "${POS_JSON_PATH}" ]]; then
--  echo "[STATE] WARN: ${POS_JSON_PATH} not found. Skipping."
--  exit 0
--fi
--
--tmp_state="$(mktemp)"
--tmp_pos_state="$(mktemp)"
--tmp_intent_log="$(mktemp)"
--tmp_intent_cursor="$(mktemp)"
--tmp_diag_dir="$(mktemp -d)"
--trap 'rm -f "${tmp_state}" "${tmp_pos_state}" "${tmp_intent_log}" "${tmp_intent_cursor}"; rm -rf "${tmp_diag_dir}"' EXIT
--cp -f "${JSON_PATH}" "${tmp_state}"
--cp -f "${POS_JSON_PATH}" "${tmp_pos_state}"
--cp -f "${INTENT_LOG_PATH}" "${tmp_intent_log}" 2>/dev/null || touch "${tmp_intent_log}"
--cp -f "${INTENT_CURSOR_PATH}" "${tmp_intent_cursor}" 2>/dev/null || touch "${tmp_intent_cursor}"
--if [[ -f "${DIAG_LATEST}" ]]; then
--  cp -f "${DIAG_LATEST}" "${tmp_diag_dir}/diag_latest.json"
--fi
--if [[ -d "${DIAG_DIR}" ]]; then
--  find "${DIAG_DIR}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${tmp_diag_dir}/" \;
--fi
--if [[ -f "${LEDGER_JSON}" ]]; then
--  cp -f "${LEDGER_JSON}" "${tmp_diag_dir}/ledger.jsonl" 2>/dev/null || true
--fi
--
--# IMPORTANT: avoid "untracked would be overwritten by checkout"
--rm -f "${JSON_PATH}" || true
--rm -f "${POS_JSON_PATH}" || true
--rm -f "${INTENT_LOG_PATH}" || true
--rm -f "${INTENT_CURSOR_PATH}" || true
--rm -rf "${DIAG_DIR}" || true
--
--if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
--  git fetch --no-tags origin bot-state:refs/remotes/origin/bot-state >/dev/null 2>&1 || true
--  git checkout -B bot-state origin/bot-state
--else
--  git checkout --orphan bot-state
--  git rm -r --cached . >/dev/null 2>&1 || true
--fi
--
--mkdir -p "${STATE_DIR}"
--cp -f "${tmp_state}" "${JSON_PATH}"
--mkdir -p "${POS_STATE_DIR}"
--cp -f "${tmp_pos_state}" "${POS_JSON_PATH}"
--cp -f "${tmp_intent_log}" "${INTENT_LOG_PATH}"
--cp -f "${tmp_intent_cursor}" "${INTENT_CURSOR_PATH}"
--mkdir -p "${DIAG_DIR}"
--if [[ -d "${tmp_diag_dir}" ]]; then
--  cp -f "${tmp_diag_dir}/diag_latest.json" "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
--  find "${tmp_diag_dir}" -maxdepth 1 -name "diag_*.json" -type f -exec cp -f {} "${DIAG_DIR}/" \;
--  if [[ -f "${tmp_diag_dir}/ledger.jsonl" ]]; then
--    mkdir -p "$(dirname "${LEDGER_JSON}")"
--    cp -f "${tmp_diag_dir}/ledger.jsonl" "${LEDGER_JSON}" 2>/dev/null || true
--  fi
--fi
--
--git add -f "${JSON_PATH}"
--git add -f "${POS_JSON_PATH}"
--git add -f "${INTENT_LOG_PATH}"
--git add -f "${INTENT_CURSOR_PATH}"
--git add -f ${DIAG_DIR}/diag_*.json 2>/dev/null || true
--git add -f "${DIAG_DIR}/diag_latest.json" 2>/dev/null || true
--git add -f "${POS_STATE_DIR}/strategy_intents_state.json" 2>/dev/null || true
--git add -f "${POS_STATE_DIR}/strategy_intents.jsonl" 2>/dev/null || true
--git add -f "${LEDGER_JSON}" 2>/dev/null || true
--echo "[STATE] Staged diagnostics + state.json"
--git status --porcelain
--if git diff --cached --quiet; then
--  echo "[STATE] No changes to commit."
--  exit 0
--fi
--
--git commit -m "Update bot state (plain) [skip ci]"
--git push --force-with-lease origin HEAD:bot-state
--echo "[STATE] Pushed ${JSON_PATH} to bot-state branch."
--echo "[STATE] Pushed diagnostics dumps to bot-state branch."
-+python -m trader.botstate_persist --message "${MESSAGE}"
+       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
+         if: always()
++        working-directory: repo
+         run: |
+           set -euo pipefail
+-          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)"
++          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+         env:
+           BOTSTATE_WORKTREE_DIR: _botstate
 diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..d2fccc96772db1f03f14f77369c6aa29de20bbce
---- /dev/null
+index d2fccc96772db1f03f14f77369c6aa29de20bbce..f99aea5260314afab70b70a01310b1014c12c570 100644
+--- a/trader/botstate_persist.py
 +++ b/trader/botstate_persist.py
-@@ -0,0 +1,89 @@
-+from __future__ import annotations
+@@ -37,53 +37,64 @@ def _collect_paths(base_dir: Path) -> list[Path]:
+     _add_if_exists(paths, base_dir / "bot_state/state.json")
+     _add_if_exists(paths, base_dir / "bot_state/runtime/state.json")
+     _add_if_exists(paths, base_dir / "bot_state/runtime/lot_state.json")
+     _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/latest.json")
+     _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/history/*.json")
+     _add_if_exists(paths, base_dir / "trader/state/state.json")
+     _add_if_exists(paths, base_dir / "trader/state/strategy_intents.jsonl")
+     _add_if_exists(paths, base_dir / "trader/state/strategy_intents_state.json")
+     _add_if_exists(paths, base_dir / "trader/state/diagnostics/diag_latest.json")
+     _add_glob(paths, base_dir, "trader/state/diagnostics/diag_*.json")
+     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
+     return paths
+ 
+ 
+ def _resolve_owner() -> str:
+     return os.getenv("GITHUB_ACTOR", "local")
+ 
+ 
+ def _resolve_run_id() -> str:
+     return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
+     parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
++    parser.add_argument(
++        "--soft-fail",
++        action="store_true",
++        help="Log errors and exit 0 instead of failing the job",
++    )
+     args = parser.parse_args()
+ 
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+ 
+-    base_dir = Path.cwd().resolve()
+-    worktree_dir = resolve_botstate_worktree_dir()
+-    setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
+-
+-    owner = _resolve_owner()
+-    run_id = _resolve_run_id()
+-
+-    if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
+-        logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
+-        return 1
+-
+     try:
+-        files = _collect_paths(base_dir)
+-        if not files:
+-            logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
++        base_dir = Path.cwd().resolve()
++        worktree_dir = resolve_botstate_worktree_dir()
++        setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
 +
-+import argparse
-+import logging
-+import os
-+import sys
-+from datetime import datetime
-+from pathlib import Path
-+from zoneinfo import ZoneInfo
++        owner = _resolve_owner()
++        run_id = _resolve_run_id()
 +
-+from trader.botstate_sync import (
-+    acquire_lock,
-+    persist_run_files,
-+    release_lock,
-+    resolve_botstate_worktree_dir,
-+    setup_worktree,
-+)
++        if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
++            logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
++            return 1
 +
-+logger = logging.getLogger(__name__)
-+KST = ZoneInfo("Asia/Seoul")
-+
-+
-+def _add_if_exists(paths: list[Path], candidate: Path) -> None:
-+    if candidate.is_file():
-+        paths.append(candidate)
-+
-+
-+def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
-+    for path in base_dir.glob(pattern):
-+        if path.is_file():
-+            paths.append(path)
-+
-+
-+def _collect_paths(base_dir: Path) -> list[Path]:
-+    paths: list[Path] = []
-+    _add_if_exists(paths, base_dir / "bot_state/db/pbcore.sqlite3")
-+    _add_if_exists(paths, base_dir / "bot_state/state.json")
-+    _add_if_exists(paths, base_dir / "bot_state/runtime/state.json")
-+    _add_if_exists(paths, base_dir / "bot_state/runtime/lot_state.json")
-+    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/latest.json")
-+    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/history/*.json")
-+    _add_if_exists(paths, base_dir / "trader/state/state.json")
-+    _add_if_exists(paths, base_dir / "trader/state/strategy_intents.jsonl")
-+    _add_if_exists(paths, base_dir / "trader/state/strategy_intents_state.json")
-+    _add_if_exists(paths, base_dir / "trader/state/diagnostics/diag_latest.json")
-+    _add_glob(paths, base_dir, "trader/state/diagnostics/diag_*.json")
-+    _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
-+    return paths
-+
-+
-+def _resolve_owner() -> str:
-+    return os.getenv("GITHUB_ACTOR", "local")
-+
-+
-+def _resolve_run_id() -> str:
-+    return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
-+
-+
-+def main() -> int:
-+    parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
-+    parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
-+    args = parser.parse_args()
-+
-+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-+
-+    base_dir = Path.cwd().resolve()
-+    worktree_dir = resolve_botstate_worktree_dir()
-+    setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
-+
-+    owner = _resolve_owner()
-+    run_id = _resolve_run_id()
-+
-+    if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
-+        logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
-+        return 1
-+
-+    try:
-+        files = _collect_paths(base_dir)
-+        if not files:
-+            logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
++        try:
++            files = _collect_paths(base_dir)
++            if not files:
++                logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
++                return 0
++            persist_run_files(worktree_dir, files, args.message)
 +            return 0
-+        persist_run_files(worktree_dir, files, args.message)
-+        return 0
-+    finally:
-+        release_lock(worktree_dir, owner=owner, run_id=run_id)
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
++        finally:
++            release_lock(worktree_dir, owner=owner, run_id=run_id)
++    except Exception as exc:
++        if args.soft_fail:
++            logger.warning("[BOTSTATE][PERSIST][SOFT-FAIL] %s", exc, exc_info=True)
+             return 0
+-        persist_run_files(worktree_dir, files, args.message)
+-        return 0
+-    finally:
+-        release_lock(worktree_dir, owner=owner, run_id=run_id)
++        raise
+ 
+ 
+ if __name__ == "__main__":
+     sys.exit(main())
 diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 0cefcb04b4bd837110fc6785f40b8ecab6a1320b..a3f6f07e43ecd4766543e049594bda57832ff35e 100644
+index a3f6f07e43ecd4766543e049594bda57832ff35e..d44aca74b788b544dd0224053a5fcf506a9b91aa 100644
 --- a/trader/botstate_sync.py
 +++ b/trader/botstate_sync.py
-@@ -464,138 +464,145 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-                     target = (worktree_dir / rel).resolve()
-                     target.parent.mkdir(parents=True, exist_ok=True)
-                     target.write_bytes(path.read_bytes())
-                 rel_target = target.relative_to(worktree_dir)
-                 _git(worktree_dir, "add", str(rel_target))
-                 staged_any = True
-             except Exception:
-                 continue
- 
-         if not staged_any:
-             logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
-             return
- 
-         committed = commit_if_staged(worktree_dir, message)
-         logger.info(
-             "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
-             sync_mode,
-             committed,
-             message,
-             attempt,
-         )
-         if not committed:
-             logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
-             return
- 
--        push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
--        if push_ok:
-+        try:
-+            push_retry(worktree_dir, message=message, retries=1, sync_before_commit=False)
-             logger.info(
-                 "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
-                 sync_mode,
-                 attempt,
-             )
-             logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
-             return
--
--        logger.warning(
--            "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
--            sync_mode,
--            attempt,
--            is_non_fast_forward(out),
--            (out[-400:] if out else ""),
--        )
-+        except RuntimeError as exc:
-+            logger.warning(
-+                "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d err=%s",
-+                sync_mode,
-+                attempt,
-+                str(exc),
-+            )
-         try:
-             st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-             logger.info(
-                 "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
-                 sync_mode,
-                 st2.remote_ref,
-                 st2.behind,
-                 st2.ahead,
-                 attempt,
-             )
-         except Exception as exc:
-             logger.warning(
-                 "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
-                 sync_mode,
-                 attempt,
-                 str(exc),
-             )
-         if attempt == retries:
--            raise RuntimeError(f"git push failed after retries: {out}")
-+            raise RuntimeError("git push failed after retries")
-         time.sleep(retry_sleep_sec)
- 
-     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+@@ -141,56 +141,67 @@ def git_fetch_reset(remote: str, branch: str, cwd: str) -> GitSyncStatus:
  
  
--def push_retry(worktree_dir: Path, message: str, retries: int = 3) -> None:
-+def push_retry(
-+    worktree_dir: Path,
-+    message: str,
-+    retries: int = 3,
-+    *,
-+    sync_before_commit: bool = True,
-+) -> None:
+ def git_push(remote: str, branch: str, cwd: str) -> Tuple[bool, str]:
+     rc, out = _run_git(["git", "push", remote, f"HEAD:{branch}"], cwd=cwd, check=False)
+     ok = rc == 0
+     return ok, out
+ 
+ 
+ def is_non_fast_forward(push_output: str) -> bool:
+     s = (push_output or "").lower()
+     return ("non-fast-forward" in s) or ("fetch first" in s) or ("rejected" in s)
+ 
+ 
+ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+     base_dir_resolved = base_dir.resolve()
+     worktree_dir_resolved = worktree_dir.resolve()
+     for path in {base_dir_resolved, worktree_dir_resolved}:
+         _run(["git", "config", "--global", "--add", "safe.directory", str(path)])
+ 
+ 
+ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
+     base_dir = base_dir.resolve()
      worktree_dir = worktree_dir.resolve()
+     worktree_dir.mkdir(parents=True, exist_ok=True)
+     _configure_safe_directories(base_dir, worktree_dir)
+-    try:
+-        _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+-    except subprocess.CalledProcessError:
+-        _run(["git", "fetch", "origin", f"{target_branch}:{target_branch}"], cwd=base_dir)
+-        _run(["git", "worktree", "add", "-B", target_branch, str(worktree_dir), target_branch], cwd=base_dir)
+-    git_fetch_reset("origin", target_branch, cwd=str(worktree_dir))
++
++    remote = "origin"
++    remote_ref = f"{remote}/{target_branch}"
++
++    if (worktree_dir / ".git").exists():
++        _run(["git", "-C", str(worktree_dir), "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
++        _run(["git", "fetch", remote, target_branch], cwd=base_dir)
++        _run(["git", "-C", str(worktree_dir), "checkout", "-B", target_branch], cwd=base_dir)
++        _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
++        return
++
++    _run(["git", "fetch", remote, target_branch], cwd=base_dir)
++    _run(
++        ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
++        cwd=base_dir,
++    )
++    _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+ 
+ 
+ def _lock_path(worktree_dir: Path) -> Path:
+     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
+ 
+ 
+ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
      branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
      remote = "origin"
      sync_mode = SYNC_MODE_FETCH_RESET
-     for attempt in range(1, retries + 1):
--        try:
--            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-+        if sync_before_commit:
-+            try:
-+                st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-+                logger.info(
-+                    "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
-+                    sync_mode,
-+                    st.remote_ref,
-+                    st.behind,
-+                    st.ahead,
-+                    attempt,
-+                )
-+            except Exception as exc:
-+                logger.warning(
-+                    "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
-+                    sync_mode,
-+                    attempt,
-+                    str(exc),
-+                )
-+                if attempt == retries:
-+                    raise
-+                time.sleep(2 * attempt)
-+                continue
-+
-+            committed = commit_if_staged(worktree_dir, message)
-             logger.info(
--                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
--                sync_mode,
--                st.remote_ref,
--                st.behind,
--                st.ahead,
--                attempt,
--            )
--        except Exception as exc:
--            logger.warning(
--                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
-+                "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
-                 sync_mode,
-+                committed,
-+                message,
-                 attempt,
--                str(exc),
-             )
--            if attempt == retries:
--                raise
--            time.sleep(2 * attempt)
--            continue
--
--        committed = commit_if_staged(worktree_dir, message)
--        logger.info(
--            "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
--            sync_mode,
--            committed,
--            message,
--            attempt,
--        )
-         push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
-         if push_ok:
-             logger.info(
-                 "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
-                 sync_mode,
-                 attempt,
-             )
-             return
+     ttl_env = _lock_ttl_sec()
+     ttl_sec = ttl_sec if ttl_sec is not None else ttl_env
+     retry_total_sec = max(0, _lock_retry_total_sec())
+     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+     deadline_ts = time.time() + retry_total_sec
+     attempt = 0
  
-         logger.warning(
-             "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
-             sync_mode,
-             attempt,
-             is_non_fast_forward(out),
-             (out[-400:] if out else ""),
-         )
--        try:
--            st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
--            logger.info(
--                "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
--                sync_mode,
--                st2.remote_ref,
--                st2.behind,
--                st2.ahead,
--                attempt,
--            )
--        except Exception as exc:
--            logger.warning(
--                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
--                sync_mode,
--                attempt,
--                str(exc),
--            )
-+        if sync_before_commit:
-+            try:
-+                st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-+                logger.info(
-+                    "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
-+                    sync_mode,
-+                    st2.remote_ref,
-+                    st2.behind,
-+                    st2.ahead,
-+                    attempt,
-+                )
-+            except Exception as exc:
-+                logger.warning(
-+                    "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
-+                    sync_mode,
-+                    attempt,
-+                    str(exc),
-+                )
-         if attempt == retries:
-             raise RuntimeError(f"git push failed after retries: {out}")
-         time.sleep(2 * attempt)
+     logger.info(
+         "[BOTSTATE][SYNC] SYNC_MODE=%s step=pre_lock_sync remote=%s branch=%s",
+         sync_mode,
+         remote,
+         branch,
+

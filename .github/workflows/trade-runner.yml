@@ -218,8 +218,9 @@ jobs:
 
       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
         if: always()
+        working-directory: repo
         run: |
           set -euo pipefail
-          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)"
+          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
         env:
           BOTSTATE_WORKTREE_DIR: _botstate
