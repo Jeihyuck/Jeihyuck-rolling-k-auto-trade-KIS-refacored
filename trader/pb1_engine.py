@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,7 +36,7 @@ from trader.config import (
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
-from trader.strategies.pb1_pullback_close import choose_mode, compute_features, evaluate_setup, score_setup
+from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag
 from trader.window_router import WindowDecision
@@ -45,6 +46,14 @@ logger = logging.getLogger(__name__)
 _OUTPUT2_LIST_NORMALIZED_LOGGED = False
 _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
 
+UNREALIZED_KEYS = (
+    "evlu_pfls_amt",
+    "evlu_pfls_smtl_amt",
+)
+RETURN_PCT_KEYS = (
+    "asst_icdc_erng_rt",
+    "evlu_pfls_rt",
+)
 COST_KEYS = (
     "pchs_amt_smtl_amt",
     "pchs_amt",
@@ -89,6 +98,10 @@ def _as_first_dict(v: Any) -> Dict[str, Any]:
     return {}
 
 
+def _is_missing(value: float | None) -> bool:
+    return value is None or (isinstance(value, float) and value != value)
+
+
 @dataclass
 class CandidateFeature:
     code: str
@@ -109,6 +122,82 @@ class RunResult:
     balance_api_calls: int = 0
     balance_cache_hits: int = 0
     balance_tick_cache_hits: int = 0
+
+
+@dataclass(frozen=True)
+class FilterThresholds:
+    vol_contraction_max: float
+    volu_contraction_max: float
+    pullback_min: float
+    pullback_max: float
+    require_both_contractions: bool
+
+    def with_overrides(self, **kwargs: float | bool) -> "FilterThresholds":
+        data = {
+            "vol_contraction_max": self.vol_contraction_max,
+            "volu_contraction_max": self.volu_contraction_max,
+            "pullback_min": self.pullback_min,
+            "pullback_max": self.pullback_max,
+            "require_both_contractions": self.require_both_contractions,
+        }
+        data.update(kwargs)
+        return FilterThresholds(**data)
+
+
+def evaluate_filters(
+    features: Dict[str, float],
+    market: str,
+    thresholds: FilterThresholds,
+    *,
+    require_volume: bool,
+) -> tuple[bool, List[str]]:
+    reasons: List[str] = []
+    close = features.get("close")
+    ma20 = features.get("ma20")
+    ma50 = features.get("ma50")
+    pullback = features.get("pullback_pct")
+    vol_c = features.get("vol_contraction")
+    volu_c = features.get("volu_contraction")
+    slope = features.get("ma20_slope")
+    volume_missing = bool(features.get("volume_missing"))
+
+    if volume_missing and require_volume:
+        reasons.append("volume_missing")
+    if close is None or ma20 is None or ma50 is None:
+        reasons.append("missing_ma")
+    else:
+        if not (close > ma20 and close > ma50):
+            reasons.append("close_below_ma")
+    if slope is None or slope <= 0:
+        reasons.append("ma20_slope_nonpos")
+
+    if pullback is None:
+        reasons.append("pullback_missing")
+    else:
+        low = thresholds.pullback_min
+        high = thresholds.pullback_max
+        if high <= 1.0:
+            low *= 100.0
+            high *= 100.0
+        if not (low <= pullback <= high):
+            reasons.append("pullback_out_of_band")
+
+    vol_c_missing = _is_missing(vol_c)
+    volu_missing = _is_missing(volu_c)
+    if thresholds.require_both_contractions:
+        if vol_c_missing or vol_c > thresholds.vol_contraction_max:
+            reasons.append("vol_contraction_fail")
+        if not volume_missing and (volu_missing or volu_c > thresholds.volu_contraction_max):
+            reasons.append("volu_contraction_fail")
+    else:
+        vol_c_ok = (not vol_c_missing) and vol_c <= thresholds.vol_contraction_max
+        volu_ok = volume_missing or ((not volu_missing) and volu_c <= thresholds.volu_contraction_max)
+        if not (vol_c_ok or volu_ok):
+            reasons.append("vol_contraction_fail")
+            if not volume_missing:
+                reasons.append("volu_contraction_fail")
+
+    return (len(reasons) == 0, reasons)
 
 
 def resolve_pb1_phase(
@@ -185,6 +274,7 @@ class PB1Engine:
         self._balance_cost: float | None = None
         self._balance_snapshot: dict | None = None
         self._holdings_summary: Dict[str, Any] = {}
+        self.filter_thresholds = self._resolve_filter_thresholds()
         entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
         self.entry_enabled = entry_flag.value
         self.entry_flag_valid = entry_flag.valid
@@ -195,6 +285,31 @@ class PB1Engine:
             return
         self._warned_keys.add(key)
         logger.warning(message, *args)
+
+    @staticmethod
+    def _resolve_filter_thresholds() -> FilterThresholds:
+        def _float_env(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+                return default
+
+        vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 0.95)
+        volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 0.90)
+        pullback_min = _float_env("PB1_PULLBACK_MIN", 0.05)
+        pullback_max = _float_env("PB1_PULLBACK_MAX", 0.12)
+        require_both = env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True)
+        return FilterThresholds(
+            vol_contraction_max=vol_max,
+            volu_contraction_max=volu_max,
+            pullback_min=pullback_min,
+            pullback_max=pullback_max,
+            require_both_contractions=require_both,
+        )
 
     def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
         for reason in reasons:
@@ -314,13 +429,12 @@ class PB1Engine:
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": reasons},
+                        features={"reasons": reasons, "data_ok": False},
                         setup_ok=False,
                         reasons=reasons,
                         mode=1,
                         mode_reasons=["default_day_mode"],
                     )
-                    self._log_setup(cf)
                     candidates.append(cf)
                     continue
                 if len(df) < self.min_candles:
@@ -328,13 +442,12 @@ class PB1Engine:
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": reasons, "count": len(df)},
+                        features={"reasons": reasons, "count": len(df), "data_ok": False},
                         setup_ok=False,
                         reasons=reasons,
                         mode=1,
                         mode_reasons=["default_day_mode"],
                     )
-                    self._log_setup(cf)
                     candidates.append(cf)
                     continue
                 try:
@@ -344,42 +457,108 @@ class PB1Engine:
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": reasons, "count": len(df)},
+                        features={"reasons": reasons, "count": len(df), "data_ok": False},
                         setup_ok=False,
                         reasons=reasons,
                         mode=1,
                         mode_reasons=["default_day_mode"],
                     )
-                    self._log_setup(cf)
                     candidates.append(cf)
                     continue
                 features["market"] = market
                 features["volume_missing"] = bool(meta.get("volume_missing"))
+                features["data_ok"] = True
                 if features.get("volume_missing"):
                     features["volu_contraction"] = None
-                ok, reasons = evaluate_setup(features, market, require_volume=self.require_volume)
-                if features.get("volume_missing") and "volume_missing" not in reasons:
-                    reasons.append("volume_missing")
-                if ok:
-                    reasons = []
-                elif not reasons:
-                    reasons = ["unspecified_fail"]
                 mode, mode_reasons = choose_mode(features)
                 cf = CandidateFeature(
                     code=code,
                     market=market,
                     features=features,
-                    setup_ok=ok,
-                    reasons=reasons,
+                    setup_ok=False,
+                    reasons=[],
                     mode=mode,
                     mode_reasons=mode_reasons,
                 )
-                self._log_setup(cf)
                 candidates.append(cf)
             except Exception:
                 logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                 continue
         return candidates
+
+    @staticmethod
+    def _clone_candidate(cf: CandidateFeature) -> CandidateFeature:
+        return CandidateFeature(
+            code=cf.code,
+            market=cf.market,
+            features=dict(cf.features),
+            setup_ok=cf.setup_ok,
+            reasons=list(cf.reasons),
+            mode=cf.mode,
+            mode_reasons=list(cf.mode_reasons),
+            client_order_key=cf.client_order_key,
+            planned_qty=cf.planned_qty,
+        )
+
+    def _apply_thresholds(
+        self,
+        candidates: List[CandidateFeature],
+        thresholds: FilterThresholds,
+        *,
+        log_results: bool,
+    ) -> List[CandidateFeature]:
+        evaluated: List[CandidateFeature] = []
+        for cf in candidates:
+            clone = self._clone_candidate(cf)
+            data_ok = bool(clone.features.get("data_ok"))
+            if not data_ok:
+                if log_results:
+                    self._log_setup(clone)
+                evaluated.append(clone)
+                continue
+            ok, reasons = evaluate_filters(clone.features, clone.market, thresholds, require_volume=self.require_volume)
+            if clone.features.get("volume_missing") and "volume_missing" not in reasons and self.require_volume:
+                reasons.append("volume_missing")
+            if ok:
+                reasons = []
+            elif not reasons:
+                reasons = ["unspecified_fail"]
+            clone.setup_ok = ok
+            clone.reasons = reasons
+            if log_results:
+                self._log_setup(clone)
+            evaluated.append(clone)
+        return evaluated
+
+    def _select_candidates_with_fallback(
+        self,
+        candidates: List[CandidateFeature],
+    ) -> tuple[List[CandidateFeature], str, FilterThresholds]:
+        tiers = [
+            ("tier1", self.filter_thresholds),
+            ("tier2", self.filter_thresholds.with_overrides(volu_contraction_max=1.05)),
+            ("tier3", self.filter_thresholds.with_overrides(vol_contraction_max=1.05, volu_contraction_max=1.10)),
+        ]
+        selected_tier = tiers[-1][0]
+        selected_thresholds = tiers[-1][1]
+        selected_candidates: List[CandidateFeature] = []
+        for tier_name, thresholds in tiers:
+            evaluated = self._apply_thresholds(candidates, thresholds, log_results=False)
+            ok_count = len([c for c in evaluated if c.setup_ok])
+            if ok_count > 0:
+                selected_tier = tier_name
+                selected_thresholds = thresholds
+                selected_candidates = self._apply_thresholds(candidates, thresholds, log_results=True)
+                break
+            selected_candidates = evaluated
+            selected_tier = tier_name
+            selected_thresholds = thresholds
+
+        if selected_candidates and all(c.setup_ok is False for c in selected_candidates):
+            selected_candidates = self._apply_thresholds(candidates, tiers[-1][1], log_results=True)
+            selected_thresholds = tiers[-1][1]
+            selected_tier = tiers[-1][0]
+        return selected_candidates, selected_tier, selected_thresholds
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
         ok_list = [c for c in candidates if c.setup_ok]
         if not ok_list:
@@ -789,21 +968,54 @@ class PB1Engine:
             cost_source = "balance_summary"
             totals["cost"] = summary_cost
 
-        portfolio_return_pct = None
-        if cost_base and cost_base > 0:
-            portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
-        else:
-            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
+        balance_unrealized = None
+        for row in self._balance_snapshot.get("output1", []) if self._balance_snapshot else []:
+            for key in UNREALIZED_KEYS:
+                val = self._to_float(row.get(key))
+                if val is not None:
+                    balance_unrealized = (balance_unrealized or 0.0) + val
+        summary_unrealized = None
+        for key in UNREALIZED_KEYS:
+            summary_unrealized = self._to_float(self._holdings_summary.get(key))
+            if summary_unrealized is not None:
+                break
+        unrealized_source = "positions"
+        if balance_unrealized is not None:
+            totals["unrealized"] = balance_unrealized
+            unrealized_source = "kis_balance_rows"
+        elif summary_unrealized is not None:
+            totals["unrealized"] = summary_unrealized
+            unrealized_source = "kis_balance_summary"
+
+        return_pct_source = "computed"
+        balance_return_pct = None
+        for key in RETURN_PCT_KEYS:
+            balance_return_pct = self._to_float(self._holdings_summary.get(key))
+            if balance_return_pct is not None:
+                return_pct_source = f"kis_balance:{key}"
+                break
+
+        portfolio_return_pct = balance_return_pct
+        if portfolio_return_pct is None:
+            if cost_base and cost_base > 0:
+                portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
+            else:
+                self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
+
+        realized_source = "ledger" if totals["realized"] != 0.0 else "none"
 
         logger.info(
-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f realized=%.2f return_pct=%s",
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s",
             self._universe_as_of or "none",
             totals["market_value"],
             totals["cost"],
             cost_source,
             totals["unrealized"],
+            unrealized_source,
             totals["realized"],
+            realized_source,
             f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
+            return_pct_source,
         )
         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
         return totals
@@ -872,20 +1084,46 @@ class PB1Engine:
         code_market = {m.get("code"): m.get("market") for m in members}
         candidates: List[CandidateFeature] = []
         marks_fallback: Dict[str, float] = {}
+        selected_tier = "tier1"
+        selected_thresholds = self.filter_thresholds
         if self.phase in {"prep", "entry", "trade"}:
             candidates = self._compute_candidates(members)
+            candidates, selected_tier, selected_thresholds = self._select_candidates_with_fallback(candidates)
             candidates = self._size_positions(candidates)
             ok_count = len([c for c in candidates if c.setup_ok])
+            logger.info(
+                "[PB1][CANDIDATES] universe=%s scanned=%s tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+                len(members),
+                len(candidates),
+                selected_tier,
+                ok_count,
+                len(candidates),
+                selected_thresholds.vol_contraction_max,
+                selected_thresholds.volu_contraction_max,
+                selected_thresholds.pullback_min,
+                selected_thresholds.pullback_max,
+                selected_thresholds.require_both_contractions,
+            )
             if candidates and ok_count == 0:
                 final_status = "NO_CANDIDATES"
                 top_reasons = self._setup_reason_counter.most_common(3)
                 final_notes = f"no_candidates:{top_reasons}"
-                logger.warning("[PB1][NO_CANDIDATES] total=%s top_reasons=%s", len(candidates), top_reasons)
+                logger.warning(
+                    "[PB1][NO_CANDIDATES] tier=%s total=%s top_reasons=%s",
+                    selected_tier,
+                    len(candidates),
+                    top_reasons,
+                )
             if not candidates:
                 final_status = "NO_CANDIDATES"
                 top_reasons = self._setup_reason_counter.most_common(3)
                 final_notes = f"no_candidates:{top_reasons or 'none'}"
-                logger.warning("[PB1][NO_CANDIDATES] total=%s top_reasons=%s", len(candidates), top_reasons or "none")
+                logger.warning(
+                    "[PB1][NO_CANDIDATES] tier=%s total=%s top_reasons=%s",
+                    selected_tier,
+                    len(candidates),
+                    top_reasons or "none",
+                )
             if self.phase in {"entry", "trade"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")

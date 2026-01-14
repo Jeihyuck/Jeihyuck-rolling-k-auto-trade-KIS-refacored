@@ -109,6 +109,7 @@ class ChainOHLCVProvider:
         base_cache = cache_dir or (Path(__file__).resolve().parent.parent / "state" / "ohlcv_cache")
         self.cache_dir = base_cache / env if env else base_cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_cache: dict[tuple[str, int], OHLCVResult] = {}
 
     def _cache_path(self, symbol: str) -> Path:
         return self.cache_dir / f"{symbol}.parquet"
@@ -137,13 +138,25 @@ class ChainOHLCVProvider:
         except Exception as exc:  # pragma: no cover - filesystem issues
             logger.warning("[OHLCV][CACHE][WRITE_FAIL] path=%s err=%s", path, exc)
 
+    @staticmethod
+    def _annotate_result(result: OHLCVResult, *, days: int) -> OHLCVResult:
+        result.meta.setdefault("required_days", days)
+        result.meta.setdefault("rows", len(result.df))
+        result.meta["insufficient_candles"] = len(result.df) < days if days else False
+        return result
+
     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
         errors: list[str] = []
         best: OHLCVResult | None = None
+        memory_key = (symbol, days)
+        cached = self._memory_cache.get(memory_key)
+        if cached:
+            return self._annotate_result(cached, days=days)
         cache_result = self._load_cache(symbol, days)
         if cache_result:
-            best = cache_result
+            best = self._annotate_result(cache_result, days=days)
             if not cache_result.meta.get("volume_missing") and cache_result.meta.get("rows", 0) >= days:
+                self._memory_cache[memory_key] = cache_result
                 return cache_result
 
         for provider in self.providers:
@@ -159,7 +172,7 @@ class ChainOHLCVProvider:
 
             result.meta.setdefault("provider", getattr(provider, "name", "unknown"))
             result.meta.setdefault("source", getattr(provider, "name", "unknown"))
-            result.meta["rows"] = len(result.df)
+            result = self._annotate_result(result, days=days)
 
             if result.df.empty:
                 best = best or result
@@ -172,6 +185,7 @@ class ChainOHLCVProvider:
                 result.meta["errors"] = errors
                 if result.meta.get("provider") != "cache":
                     self._persist_cache(symbol, result.df)
+                self._memory_cache[memory_key] = result
                 return result
 
             if best is None:
@@ -191,6 +205,10 @@ class ChainOHLCVProvider:
             best.meta["errors"] = errors
             if best.meta.get("provider") not in {"cache", None} and not best.df.empty:
                 self._persist_cache(symbol, best.df)
+            self._memory_cache[memory_key] = best
             return best
 
-        return OHLCVResult(pd.DataFrame(), {"provider": "none", "source": "none", "errors": errors, "volume_missing": True})
+        result = OHLCVResult(pd.DataFrame(), {"provider": "none", "source": "none", "errors": errors, "volume_missing": True})
+        result = self._annotate_result(result, days=days)
+        self._memory_cache[memory_key] = result
+        return result

@@ -4,9 +4,12 @@ import argparse
 import csv
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Iterable
 
+from trader.config import PB1_MIN_CANDLES
+from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
@@ -61,6 +64,7 @@ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
 DEFAULT_PROVIDER = "fdr_marketcap_top"
 ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
 ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
+TICKER_PATTERN = re.compile(r"^\d{6}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +153,36 @@ def _load_seed_rows(path: Path) -> list[dict]:
         seen.add(code)
         uniq_rows.append(row)
     return uniq_rows
+
+
+def _sanitize_members(
+    members: list[dict],
+    *,
+    ohlcv_provider: ChainOHLCVProvider | None = None,
+    min_candles: int = 0,
+) -> tuple[list[dict], dict[str, int]]:
+    stats = {"total_raw": len(members), "invalid_format": 0, "insufficient_history": 0, "final": 0}
+    sanitized: list[dict] = []
+    for member in members:
+        raw_code = str(member.get("code") or member.get("pdno") or "").strip()
+        code = raw_code.zfill(6) if raw_code.isdigit() else raw_code
+        if not TICKER_PATTERN.match(code):
+            stats["invalid_format"] += 1
+            continue
+        member["code"] = code
+        if ohlcv_provider and min_candles > 0:
+            try:
+                result = ohlcv_provider.get_ohlcv(code, min_candles)
+            except Exception:
+                logger.exception("[UNIVERSE][VALIDATE][FAIL] code=%s", code)
+                stats["insufficient_history"] += 1
+                continue
+            if result.meta.get("insufficient_candles") or result.meta.get("rows", 0) < min_candles:
+                stats["insufficient_history"] += 1
+                continue
+        sanitized.append(member)
+    stats["final"] = len(sanitized)
+    return sanitized, stats
 
 
 def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
@@ -435,6 +469,18 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
         last_reason = reason or provider_name
         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
+
+    validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "0").lower() in {"1", "true", "yes", "on"}
+    min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(PB1_MIN_CANDLES)))
+    ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
+    members, stats = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
+    logger.info(
+        "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
+        stats["total_raw"],
+        stats["invalid_format"],
+        stats["insufficient_history"],
+        stats["final"],
+    )
 
     universe_id = repo.store_universe(
         env=env,

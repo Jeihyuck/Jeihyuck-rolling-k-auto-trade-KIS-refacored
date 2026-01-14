@@ -5,7 +5,7 @@ import logging
 import os
 import signal
 import time as time_mod
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -42,6 +42,29 @@ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_market_context(
+    *,
+    now: datetime,
+    trading_day: bool,
+    market_window: str,
+    window_override: str,
+    phase_seed: str | None,
+) -> tuple[WindowDecision | None, str, str, str, str, list[str]]:
+    window = decide_window(now=now, override=window_override)
+    window_label = window.name if window else "none"
+    resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+    reasons: list[str] = []
+    if not resolved_phase:
+        fallback = (os.getenv("PB1_PHASE_DEFAULT") or "entry").strip().lower()
+        resolved_phase = fallback if fallback else "entry"
+        phase_reason = "default_env"
+        reasons.append("phase_default_env")
+    reasons.append(f"market_window:{market_window}")
+    reasons.append(f"window:{window_label}")
+    reasons.append(f"phase:{resolved_phase}")
+    return window, window_label, resolved_phase, phase_reason, phase_window, reasons
 
 
 def _parse_hhmm_to_time(hhmm: str) -> dtime:
@@ -264,14 +287,23 @@ def run_once(
     open_dt, close_dt = _market_session(now)
     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
-    window = window or decide_window(now=now, override=args.window)
-    window_name_for_log = window.name if window else "none"
 
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
     os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
-    resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+    resolved_window, window_name_for_log, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
+        now=now,
+        trading_day=trading_day,
+        market_window=market_window,
+        window_override=args.window,
+        phase_seed=phase_seed,
+    )
+    if window is not None:
+        resolved_window = window
+        window_name_for_log = window.name
+        context_reasons.append("window:locked")
+    window = resolved_window
     phase_for_log = resolved_phase
 
     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
@@ -325,9 +357,14 @@ def run_once(
                 )
                 effective_mode = mode
                 os.environ["STRATEGY_MODE"] = mode
-                window = decide_window(now=now, override=args.window)
-                window_name_for_log = window.name if window else "none"
-                resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+                resolved_window, window_name_for_log, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
+                    now=now,
+                    trading_day=trading_day,
+                    market_window=market_window,
+                    window_override=args.window,
+                    phase_seed=phase_seed,
+                )
+                window = resolved_window
                 phase_for_log = resolved_phase
                 logger.info(
                     "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
@@ -466,6 +503,9 @@ def run_once(
 
     window_name_for_log = window.name if window else "none"
     phase_for_log = phase_override_arg or "none"
+    context_reasons = [r for r in context_reasons if not r.startswith("window:") and not r.startswith("phase:")]
+    context_reasons.append(f"window:{window_name_for_log}")
+    context_reasons.append(f"phase:{phase_for_log}")
     logger.info(
         "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s",
         now.isoformat(),
@@ -473,6 +513,15 @@ def run_once(
         phase_for_log,
         phase_reason,
         entry_flag.value,
+    )
+
+    logger.info(
+        "[PB1][TICK] now_kst=%s market_window=%s window=%s phase=%s reasons=%s",
+        now.isoformat(),
+        market_window,
+        window_name_for_log,
+        phase_for_log,
+        context_reasons or ["none"],
     )
 
     logger.info(
@@ -588,7 +637,6 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     now = _get_now_kst()
     _, close_dt = _market_session(now)
     max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
-    loop_deadline = now + timedelta(seconds=max_seconds) if max_seconds > 0 else None
     if run_loop_minutes > 0:
         loop_max_minutes = run_loop_minutes
         persist_interval = max(120, min(persist_interval, 240))
@@ -601,10 +649,9 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
         run_loop_minutes,
     )
     logger.info(
-        "[PB1][LOOP] start now_kst=%s max_seconds=%s deadline=%s",
+        "[PB1][LOOP] start now_kst=%s max_seconds=%s",
         now.isoformat(),
         max_seconds,
-        loop_deadline.isoformat() if loop_deadline else "none",
     )
 
     owner = os.getenv("GITHUB_ACTOR", "local")
@@ -624,6 +671,16 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     pending_touched: dict[Path, Path] = {}
     last_persist_ts = 0.0
     loop_started_ts = time_mod.time()
+    loop_deadline_ts = loop_started_ts + max_seconds if max_seconds > 0 else None
+    loop_deadline = (
+        datetime.fromtimestamp(loop_deadline_ts, tz=ZoneInfo("Asia/Seoul")) if loop_deadline_ts else None
+    )
+    logger.info(
+        "[PB1][LOOP] deadline_ready now_kst=%s deadline=%s max_seconds=%s",
+        _get_now_kst().isoformat(),
+        loop_deadline.isoformat() if loop_deadline else "none",
+        max_seconds,
+    )
     exit_reason = "unknown"
     stop_requested = {"value": False}
     balance_api_calls = 0
@@ -722,7 +779,10 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 time_mod.sleep(sleep_for)
                 continue
 
-            logger.info("[PB1][LOOP] tick window=%s phase=%s", window.name, window.phase)
+            if loop_deadline_ts and time_mod.time() > loop_deadline_ts:
+                logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
+                exit_reason = "deadline_exceeded_pre_trade"
+                break
             touched, _did_work, metrics, last_phase = run_once(args=args, engine=engine, loop_mode=True, window=window)
             balance_api_calls += metrics.get("balance_api_calls", 0)
             balance_cache_hits += metrics.get("balance_cache_hits", 0)
