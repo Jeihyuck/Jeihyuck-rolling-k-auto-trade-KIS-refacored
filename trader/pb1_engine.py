@@ -241,6 +241,7 @@ class PB1Engine:
         positions_repo: PositionsRepo,
         kis: KisAPI | None,
         window: WindowDecision,
+        window_label: str,
         phase: str,
         dry_run: bool,
         env: str,
@@ -252,6 +253,7 @@ class PB1Engine:
         self.positions_repo = positions_repo
         self.kis = kis
         self.window = window
+        self.window_label = window_label
         self.phase = phase
         self.dry_run = dry_run
         self.env = env
@@ -298,10 +300,10 @@ class PB1Engine:
                 logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
                 return default
 
-        vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 0.95)
-        volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 0.90)
-        pullback_min = _float_env("PB1_PULLBACK_MIN", 0.05)
-        pullback_max = _float_env("PB1_PULLBACK_MAX", 0.12)
+        vol_max = _float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
+        volu_max = _float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
+        pullback_min = _float_env("PB1_PULLBACK_MIN", 0.02)
+        pullback_max = _float_env("PB1_PULLBACK_MAX", 0.18)
         require_both = env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True)
         return FilterThresholds(
             vol_contraction_max=vol_max,
@@ -309,6 +311,26 @@ class PB1Engine:
             pullback_min=pullback_min,
             pullback_max=pullback_max,
             require_both_contractions=require_both,
+        )
+
+    @staticmethod
+    def _resolve_strict_thresholds() -> FilterThresholds:
+        def _float_env(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+                return default
+
+        return FilterThresholds(
+            vol_contraction_max=_float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
+            volu_contraction_max=_float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
+            pullback_min=_float_env("PB1_PULLBACK_MIN", 0.05),
+            pullback_max=_float_env("PB1_PULLBACK_MAX", 0.12),
+            require_both_contractions=env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True),
         )
 
     def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
@@ -530,35 +552,71 @@ class PB1Engine:
             evaluated.append(clone)
         return evaluated
 
+    @staticmethod
+    def _collect_reason_counts(candidates: Iterable[CandidateFeature]) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        for cf in candidates:
+            if cf.setup_ok:
+                continue
+            reasons = cf.reasons or ["unspecified_fail"]
+            for reason in reasons:
+                counts[reason] += 1
+        return counts
+
     def _select_candidates_with_fallback(
         self,
         candidates: List[CandidateFeature],
-    ) -> tuple[List[CandidateFeature], str, FilterThresholds]:
+    ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str]]:
+        strict_thresholds = self._resolve_strict_thresholds()
+        medium_thresholds = self.filter_thresholds
+        loose_thresholds = self.filter_thresholds.with_overrides(
+            vol_contraction_max=1.15,
+            volu_contraction_max=1.25,
+            pullback_min=0.01,
+            pullback_max=0.25,
+            require_both_contractions=False,
+        )
         tiers = [
-            ("tier1", self.filter_thresholds),
-            ("tier2", self.filter_thresholds.with_overrides(volu_contraction_max=1.05)),
-            ("tier3", self.filter_thresholds.with_overrides(vol_contraction_max=1.05, volu_contraction_max=1.10)),
+            ("tier1", strict_thresholds),
+            ("tier2", medium_thresholds),
+            ("tier3", loose_thresholds),
         ]
+        selected_candidates: List[CandidateFeature] = []
         selected_tier = tiers[-1][0]
         selected_thresholds = tiers[-1][1]
-        selected_candidates: List[CandidateFeature] = []
+        tiers_tried: list[str] = []
+        all_reason_counts: Counter[str] = Counter()
+
         for tier_name, thresholds in tiers:
+            tiers_tried.append(tier_name)
             evaluated = self._apply_thresholds(candidates, thresholds, log_results=False)
             ok_count = len([c for c in evaluated if c.setup_ok])
+            reason_counts = self._collect_reason_counts(evaluated)
+            all_reason_counts.update(reason_counts)
+            logger.info(
+                "[PB1][CANDIDATES] tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+                tier_name,
+                ok_count,
+                len(evaluated),
+                thresholds.vol_contraction_max,
+                thresholds.volu_contraction_max,
+                thresholds.pullback_min,
+                thresholds.pullback_max,
+                thresholds.require_both_contractions,
+            )
             if ok_count > 0:
+                selected_candidates = self._apply_thresholds(candidates, thresholds, log_results=True)
                 selected_tier = tier_name
                 selected_thresholds = thresholds
-                selected_candidates = self._apply_thresholds(candidates, thresholds, log_results=True)
                 break
             selected_candidates = evaluated
             selected_tier = tier_name
             selected_thresholds = thresholds
 
         if selected_candidates and all(c.setup_ok is False for c in selected_candidates):
-            selected_candidates = self._apply_thresholds(candidates, tiers[-1][1], log_results=True)
-            selected_thresholds = tiers[-1][1]
-            selected_tier = tiers[-1][0]
-        return selected_candidates, selected_tier, selected_thresholds
+            selected_candidates = self._apply_thresholds(candidates, selected_thresholds, log_results=True)
+        return selected_candidates, selected_tier, selected_thresholds, all_reason_counts, tiers_tried
+
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
         ok_list = [c for c in candidates if c.setup_ok]
         if not ok_list:
@@ -655,7 +713,6 @@ class PB1Engine:
             )
 
         return candidates
-
 
     def _mark_price(self, code: str) -> float | None:
         if self.kis:
@@ -1002,10 +1059,18 @@ class PB1Engine:
             else:
                 self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
 
+        invested_return_pct = None
+        invested_pnl = self._to_float(self._holdings_summary.get("evlu_pfls_smtl_amt"))
+        invested_cost = self._to_float(self._holdings_summary.get("pchs_amt_smtl_amt"))
+        if invested_pnl is not None and invested_cost and invested_cost > 0:
+            invested_return_pct = (invested_pnl / invested_cost) * 100
+
+        total_asset_return_pct = self._to_float(self._holdings_summary.get("asst_icdc_erng_rt"))
+
         realized_source = "ledger" if totals["realized"] != 0.0 else "none"
 
         logger.info(
-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s",
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s invested_return_pct=%s total_asset_return_pct=%s",
             self._universe_as_of or "none",
             totals["market_value"],
             totals["cost"],
@@ -1016,6 +1081,8 @@ class PB1Engine:
             realized_source,
             f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
             return_pct_source,
+            f"{invested_return_pct:.2f}" if invested_return_pct is not None else "N/A",
+            f"{total_asset_return_pct:.2f}" if total_asset_return_pct is not None else "N/A",
         )
         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
         return totals
@@ -1028,7 +1095,14 @@ class PB1Engine:
         entry_allowed = self.entry_enabled
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
-        logger.info("[PB1][RUN] window=%s phase=%s dry_run=%s env=%s", self.window.name, self.phase, self.dry_run, self.env)
+        logger.info(
+            "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
+            self.window_label,
+            self.window.name,
+            self.phase,
+            self.dry_run,
+            self.env,
+        )
 
         members = self._load_universe()
         if not members:
@@ -1086,13 +1160,21 @@ class PB1Engine:
         marks_fallback: Dict[str, float] = {}
         selected_tier = "tier1"
         selected_thresholds = self.filter_thresholds
+        all_reason_counts: Counter[str] = Counter()
+        tiers_tried: list[str] = []
         if self.phase in {"prep", "entry", "trade"}:
             candidates = self._compute_candidates(members)
-            candidates, selected_tier, selected_thresholds = self._select_candidates_with_fallback(candidates)
+            (
+                candidates,
+                selected_tier,
+                selected_thresholds,
+                all_reason_counts,
+                tiers_tried,
+            ) = self._select_candidates_with_fallback(candidates)
             candidates = self._size_positions(candidates)
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
-                "[PB1][CANDIDATES] universe=%s scanned=%s tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+                "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
                 len(members),
                 len(candidates),
                 selected_tier,
@@ -1104,26 +1186,26 @@ class PB1Engine:
                 selected_thresholds.pullback_max,
                 selected_thresholds.require_both_contractions,
             )
-            if candidates and ok_count == 0:
-                final_status = "NO_CANDIDATES"
-                top_reasons = self._setup_reason_counter.most_common(3)
-                final_notes = f"no_candidates:{top_reasons}"
-                logger.warning(
-                    "[PB1][NO_CANDIDATES] tier=%s total=%s top_reasons=%s",
-                    selected_tier,
-                    len(candidates),
-                    top_reasons,
-                )
-            if not candidates:
-                final_status = "NO_CANDIDATES"
-                top_reasons = self._setup_reason_counter.most_common(3)
+            if not candidates or ok_count == 0:
+                top_reasons = all_reason_counts.most_common(3)
+                final_status = "NO_TRADE"
                 final_notes = f"no_candidates:{top_reasons or 'none'}"
-                logger.warning(
-                    "[PB1][NO_CANDIDATES] tier=%s total=%s top_reasons=%s",
+                logger.info(
+                    "[PB1][NO_TRADE] reason=no_candidates tiers_tried=%s tier=%s total=%s top_reasons=%s",
+                    tiers_tried or ["none"],
                     selected_tier,
                     len(candidates),
                     top_reasons or "none",
                 )
+                if self.phase in {"prep", "entry"}:
+                    self._log_reason_summary(final_notes)
+                    return RunResult(
+                        status=final_status,
+                        notes=final_notes,
+                        balance_api_calls=self.balance_api_calls,
+                        balance_cache_hits=self.balance_cache_hits,
+                        balance_tick_cache_hits=self.balance_tick_cache_hits,
+                    )
             if self.phase in {"entry", "trade"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
