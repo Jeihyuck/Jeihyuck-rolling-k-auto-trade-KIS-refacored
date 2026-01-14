@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from trader.botstate_sync import (
+    acquire_lock,
+    persist_run_files,
+    release_lock,
+    resolve_botstate_worktree_dir,
+    setup_worktree,
+)
+
+logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _add_if_exists(paths: list[Path], candidate: Path) -> None:
+    if candidate.is_file():
+        paths.append(candidate)
+
+
+def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
+    for path in base_dir.glob(pattern):
+        if path.is_file():
+            paths.append(path)
+
+
+def _collect_paths(base_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    _add_if_exists(paths, base_dir / "bot_state/db/pbcore.sqlite3")
+    _add_if_exists(paths, base_dir / "bot_state/state.json")
+    _add_if_exists(paths, base_dir / "bot_state/runtime/state.json")
+    _add_if_exists(paths, base_dir / "bot_state/runtime/lot_state.json")
+    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/latest.json")
+    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/history/*.json")
+    _add_if_exists(paths, base_dir / "trader/state/state.json")
+    _add_if_exists(paths, base_dir / "trader/state/strategy_intents.jsonl")
+    _add_if_exists(paths, base_dir / "trader/state/strategy_intents_state.json")
+    _add_if_exists(paths, base_dir / "trader/state/diagnostics/diag_latest.json")
+    _add_glob(paths, base_dir, "trader/state/diagnostics/diag_*.json")
+    _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
+    return paths
+
+
+def _resolve_owner() -> str:
+    return os.getenv("GITHUB_ACTOR", "local")
+
+
+def _resolve_run_id() -> str:
+    return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
+    parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    base_dir = Path.cwd().resolve()
+    worktree_dir = resolve_botstate_worktree_dir()
+    setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
+
+    owner = _resolve_owner()
+    run_id = _resolve_run_id()
+
+    if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
+        logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
+        return 1
+
+    try:
+        files = _collect_paths(base_dir)
+        if not files:
+            logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
+            return 0
+        persist_run_files(worktree_dir, files, args.message)
+        return 0
+    finally:
+        release_lock(worktree_dir, owner=owner, run_id=run_id)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -486,8 +486,8 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
             return
 
-        push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
-        if push_ok:
+        try:
+            push_retry(worktree_dir, message=message, retries=1, sync_before_commit=False)
             logger.info(
                 "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
                 sync_mode,
@@ -495,14 +495,13 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             )
             logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
             return
-
-        logger.warning(
-            "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d non_ff=%s out=%s",
-            sync_mode,
-            attempt,
-            is_non_fast_forward(out),
-            (out[-400:] if out else ""),
-        )
+        except RuntimeError as exc:
+            logger.warning(
+                "[BOTSTATE][PUSH][FAIL] SYNC_MODE=%s push_ok=False attempt=%d err=%s",
+                sync_mode,
+                attempt,
+                str(exc),
+            )
         try:
             st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
             logger.info(
@@ -521,48 +520,55 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                 str(exc),
             )
         if attempt == retries:
-            raise RuntimeError(f"git push failed after retries: {out}")
+            raise RuntimeError("git push failed after retries")
         time.sleep(retry_sleep_sec)
 
     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
 
 
-def push_retry(worktree_dir: Path, message: str, retries: int = 3) -> None:
+def push_retry(
+    worktree_dir: Path,
+    message: str,
+    retries: int = 3,
+    *,
+    sync_before_commit: bool = True,
+) -> None:
     worktree_dir = worktree_dir.resolve()
     branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     for attempt in range(1, retries + 1):
-        try:
-            st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-            logger.info(
-                "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
-                sync_mode,
-                st.remote_ref,
-                st.behind,
-                st.ahead,
-                attempt,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
-                sync_mode,
-                attempt,
-                str(exc),
-            )
-            if attempt == retries:
-                raise
-            time.sleep(2 * attempt)
-            continue
+        if sync_before_commit:
+            try:
+                st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
+                logger.info(
+                    "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
+                    sync_mode,
+                    st.remote_ref,
+                    st.behind,
+                    st.ahead,
+                    attempt,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
+                    sync_mode,
+                    attempt,
+                    str(exc),
+                )
+                if attempt == retries:
+                    raise
+                time.sleep(2 * attempt)
+                continue
 
-        committed = commit_if_staged(worktree_dir, message)
-        logger.info(
-            "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
-            sync_mode,
-            committed,
-            message,
-            attempt,
-        )
+            committed = commit_if_staged(worktree_dir, message)
+            logger.info(
+                "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
+                sync_mode,
+                committed,
+                message,
+                attempt,
+            )
         push_ok, out = git_push(remote=remote, branch=branch, cwd=str(worktree_dir))
         if push_ok:
             logger.info(
@@ -579,23 +585,24 @@ def push_retry(worktree_dir: Path, message: str, retries: int = 3) -> None:
             is_non_fast_forward(out),
             (out[-400:] if out else ""),
         )
-        try:
-            st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-            logger.info(
-                "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
-                sync_mode,
-                st2.remote_ref,
-                st2.behind,
-                st2.ahead,
-                attempt,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
-                sync_mode,
-                attempt,
-                str(exc),
-            )
+        if sync_before_commit:
+            try:
+                st2 = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
+                logger.info(
+                    "[BOTSTATE][SYNC] SYNC_MODE=%s step=resync_after_push_fail remote_ref=%s behind=%d ahead=%d attempt=%d",
+                    sync_mode,
+                    st2.remote_ref,
+                    st2.behind,
+                    st2.ahead,
+                    attempt,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=resync_failed attempt=%d err=%s",
+                    sync_mode,
+                    attempt,
+                    str(exc),
+                )
         if attempt == retries:
             raise RuntimeError(f"git push failed after retries: {out}")
         time.sleep(2 * attempt)
