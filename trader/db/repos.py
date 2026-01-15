@@ -20,6 +20,7 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
+from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
 ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
@@ -256,7 +257,9 @@ class OrdersRepo:
         stage: str,
         client_order_key: str,
         request_json: dict | None,
-    ) -> str:
+        *,
+        status: str = "CREATED",
+    ) -> tuple[str, bool]:
         db_url = str(self.engine.url)
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
@@ -273,6 +276,7 @@ class OrdersRepo:
             "limit_price": limit_price,
             "stage": stage,
             "client_order_key": client_order_key,
+            "status": status,
             "request_json": request_json or {},
         }
         with self.engine.begin() as conn:
@@ -282,14 +286,14 @@ class OrdersRepo:
                 )
             ).scalar()
             if existing:
-                return str(existing)
+                return str(existing), False
             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
             try:
                 res = conn.execute(stmt)
-                return str(res.scalar())
+                return str(res.scalar()), True
             except Exception:
                 conn.execute(sa.insert(self._schema.orders).values(**payload))
-                return str(payload["order_id"])
+                return str(payload["order_id"]), True
 
     def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
         with self.engine.begin() as conn:
@@ -340,6 +344,112 @@ class OrdersRepo:
         )
         with self.engine.begin() as conn:
             return conn.execute(stmt).scalar() is not None
+
+    def list_today_orders(
+        self,
+        env: str,
+        *,
+        side: str | None = None,
+        code: str | None = None,
+        status_exclude: Iterable[str] | None = ("ERROR",),
+    ) -> list[dict]:
+        now = now_kst()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        conditions = [self._schema.orders.c.env == env, self._schema.orders.c.created_at >= start, self._schema.orders.c.created_at < end]
+        if side:
+            conditions.append(self._schema.orders.c.side == side)
+        if code:
+            conditions.append(self._schema.orders.c.code == code)
+        if status_exclude:
+            conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
+        stmt = select(self._schema.orders).where(and_(*conditions))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def upsert_reconciled_order(
+        self,
+        *,
+        env: str,
+        run_id: str | None,
+        strategy: str,
+        sid: int,
+        mode: int,
+        code: str,
+        market: str | None,
+        side: str,
+        ord_type: str,
+        qty: int,
+        limit_price: float | None,
+        stage: str | None,
+        client_order_key: str,
+        kis_odno: str | None,
+        status: str,
+        request_json: dict | None,
+        response_json: dict | None,
+        submitted_at: datetime | None,
+        acked_at: datetime | None,
+    ) -> str:
+        db_url = str(self.engine.url)
+        payload = {
+            "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+            "env": env,
+            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+            "strategy": strategy,
+            "sid": sid,
+            "mode": mode,
+            "code": code,
+            "market": market,
+            "side": side,
+            "ord_type": ord_type,
+            "qty": qty,
+            "limit_price": limit_price,
+            "stage": stage,
+            "client_order_key": client_order_key,
+            "status": status,
+            "kis_odno": kis_odno,
+            "request_json": request_json or {},
+            "response_json": response_json or {},
+            "submitted_at": submitted_at,
+            "acked_at": acked_at,
+        }
+        with self.engine.begin() as conn:
+            existing = None
+            if kis_odno:
+                existing = conn.execute(
+                    select(self._schema.orders.c.order_id).where(
+                        and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno)
+                    )
+                ).scalar()
+            if not existing:
+                existing = conn.execute(
+                    select(self._schema.orders.c.order_id).where(
+                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+                    )
+                ).scalar()
+            if existing:
+                conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(self._schema.orders.c.order_id == existing)
+                    .values(
+                        status=status,
+                        kis_odno=kis_odno,
+                        response_json=response_json or {},
+                        request_json=request_json or {},
+                        submitted_at=submitted_at,
+                        acked_at=acked_at,
+                        updated_at=func.now(),
+                    )
+                )
+                return str(existing)
+            stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
+            try:
+                res = conn.execute(stmt)
+                return str(res.scalar())
+            except Exception:
+                conn.execute(sa.insert(self._schema.orders).values(**payload))
+                return str(payload["order_id"])
 
 
 class FillsRepo:
@@ -420,6 +530,63 @@ class FillsRepo:
             except Exception:
                 conn.execute(sa.insert(self._schema.fills).values(**payload))
                 return str(payload["fill_id"])
+
+
+class LedgerEventsRepo:
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+
+    def append_event(
+        self,
+        *,
+        env: str,
+        run_id: str | None,
+        event_type: str,
+        ts: datetime,
+        code: str | None = None,
+        market: str | None = None,
+        sid: int | None = None,
+        mode: int | None = None,
+        side: str | None = None,
+        qty: int | None = None,
+        price: float | None = None,
+        kis_odno: str | None = None,
+        client_order_key: str | None = None,
+        ok: bool = True,
+        reasons: list[str] | None = None,
+        stage: str | None = None,
+        payload_json: dict | None = None,
+    ) -> str:
+        db_url = str(self.engine.url)
+        payload = {
+            "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+            "env": env,
+            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+            "event_type": event_type,
+            "ts": ts,
+            "code": code,
+            "market": market,
+            "sid": sid,
+            "mode": mode,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "kis_odno": kis_odno,
+            "client_order_key": client_order_key,
+            "ok": ok,
+            "reasons": reasons or [],
+            "stage": stage,
+            "payload_json": payload_json or {},
+        }
+        stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+        with self.engine.begin() as conn:
+            try:
+                res = conn.execute(stmt)
+                return str(res.scalar())
+            except Exception:
+                conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
+                return str(payload["ledger_event_id"])
 
 
 class PositionsRepo:

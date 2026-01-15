@@ -160,6 +160,7 @@ TR_MAP = {
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
         "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER", "VTTC8908R")],
+        "DAILY_CCLD": [os.getenv("KIS_TR_ID_DAILY_CCLD", "VTTC8001R")],
         "TOKEN": "/oauth2/tokenP",
     },
     "real": {
@@ -171,6 +172,7 @@ TR_MAP = {
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART_REAL", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART_REAL", "FHKST03010200")],
         "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER_REAL", "TTTC8908R")],
+        "DAILY_CCLD": [os.getenv("KIS_TR_ID_DAILY_CCLD_REAL", "TTTC8001R")],
         "TOKEN": "/oauth2/token",
     },
 }
@@ -1446,6 +1448,37 @@ class KisAPI:
     def get_balance_all(self) -> Dict[str, object]:
         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
         return self.get_balance_cached()
+
+    def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
+        """당일 주문/체결 조회."""
+        tr_ids = _pick_tr(self.env, "DAILY_CCLD")
+        if not tr_ids:
+            raise ValueError("KIS daily reconcile TR_ID not configured")
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        params = {
+            "CANO": self.CANO,
+            "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": end_date,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN": "00",
+            "SORT_SQN": "00",
+        }
+        last_err: Exception | None = None
+        for tr_id in tr_ids:
+            try:
+                headers = self._headers(tr_id)
+                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                return resp.json()
+            except Exception as exc:
+                last_err = exc
+                logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
+        raise Exception(f"reconcile_daily_failed: {last_err}")
 
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도

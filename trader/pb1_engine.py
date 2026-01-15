@@ -36,7 +36,7 @@ from trader.config import (
     MIN_ORDER_KRW,
     resolve_market_window,
 )
-from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
@@ -249,6 +249,7 @@ class PB1Engine:
         orders_repo: OrdersRepo,
         fills_repo: FillsRepo,
         positions_repo: PositionsRepo,
+        ledger_repo: LedgerEventsRepo,
         kis: KisAPI | None,
         window: WindowDecision,
         window_label: str,
@@ -262,6 +263,7 @@ class PB1Engine:
         self.orders_repo = orders_repo
         self.fills_repo = fills_repo
         self.positions_repo = positions_repo
+        self.ledger_repo = ledger_repo
         self.kis = kis
         self.window = window
         self.window_label = window_label
@@ -289,6 +291,7 @@ class PB1Engine:
         self._balance_snapshot: dict | None = None
         self._holdings_summary: Dict[str, Any] = {}
         self.filter_thresholds = self._resolve_filter_thresholds()
+        self._code_name_map: Dict[str, str] = {}
         entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
         self.entry_enabled = entry_flag.value
         self.entry_flag_valid = entry_flag.valid
@@ -451,6 +454,25 @@ class PB1Engine:
         if len(sample_list) < limit:
             sample_list.append(code)
 
+    def _log_order_skip(self, cf: CandidateFeature, reasons: list[str], stage: str) -> None:
+        try:
+            self._append_ledger_event(
+                event_type="ORDER_SKIP",
+                code=cf.code,
+                market=cf.market,
+                mode=cf.mode,
+                side="BUY",
+                qty=cf.planned_qty,
+                price=float(cf.features.get("close") or 0.0),
+                client_order_key=cf.client_order_key,
+                ok=False,
+                reasons=reasons,
+                stage=stage,
+                payload_json={"features": cf.features},
+            )
+        except Exception:
+            logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", cf.code)
+
     def _fetch_holdings_snapshot(self) -> dict:
         if self._balance_snapshot is not None:
             self.balance_tick_cache_hits += 1
@@ -468,7 +490,60 @@ class PB1Engine:
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
-        return f"{self._today}|{code}|sid=1|mode={mode}|{side}|{window_tag}|{stage}"
+        return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{side.upper()}"
+
+    def _name_for_code(self, code: str | None) -> str | None:
+        if not code:
+            return None
+        return self._code_name_map.get(str(code).zfill(6))
+
+    def _display_code(self, code: str | None) -> str:
+        if not code:
+            return ""
+        name = self._name_for_code(code)
+        return f"{name}({code})" if name else str(code)
+
+    def _with_name_reason(self, reasons: list[str] | None, code: str | None) -> list[str]:
+        enriched = list(reasons or [])
+        name = self._name_for_code(code)
+        if name:
+            enriched.append(f"name:{name}")
+        return enriched
+
+    def _append_ledger_event(
+        self,
+        *,
+        event_type: str,
+        code: str | None,
+        market: str | None,
+        mode: int | None,
+        side: str | None,
+        qty: int | None,
+        price: float | None,
+        client_order_key: str | None,
+        ok: bool,
+        reasons: list[str] | None,
+        stage: str | None,
+        payload_json: dict | None = None,
+    ) -> None:
+        self.ledger_repo.append_event(
+            env=self.env,
+            run_id=self.run_id,
+            event_type=event_type,
+            ts=now_kst(),
+            code=code,
+            market=market,
+            sid=1,
+            mode=mode,
+            side=side,
+            qty=qty,
+            price=price,
+            client_order_key=client_order_key,
+            ok=ok,
+            reasons=self._with_name_reason(reasons, code),
+            stage=stage,
+            payload_json=payload_json or {},
+        )
 
     def _log_setup(self, cf: CandidateFeature) -> None:
         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
@@ -860,27 +935,73 @@ class PB1Engine:
         return self.orders_repo.has_client_order_key(self.env, client_order_key)
 
     def _place_entry(self, cf: CandidateFeature) -> None:
-        order_id = self.orders_repo.create_intent_idempotent(
-            env=self.env,
-            run_id=self.run_id,
-            strategy=self.STRATEGY_NAME,
-            sid=1,
-            mode=cf.mode,
-            code=cf.code,
-            market=cf.market,
-            side="BUY",
-            ord_type="MARKET",
-            qty=cf.planned_qty,
-            limit_price=cf.features.get("close"),
-            stage="PB1-CLOSE",
-            client_order_key=cf.client_order_key or "",
-            request_json={"features": cf.features, "reasons": cf.reasons},
-        )
+        display_code = self._display_code(cf.code)
+        try:
+            order_id, created = self.orders_repo.create_intent_idempotent(
+                env=self.env,
+                run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=cf.mode,
+                code=cf.code,
+                market=cf.market,
+                side="BUY",
+                ord_type="MARKET",
+                qty=cf.planned_qty,
+                limit_price=cf.features.get("close"),
+                stage="PB1-CLOSE",
+                client_order_key=cf.client_order_key or "",
+                request_json={"features": cf.features, "reasons": cf.reasons},
+                status="CREATED",
+            )
+        except Exception:
+            logger.exception("[PB1][ENTRY][DB_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
+        if not created:
+            try:
+                self._append_ledger_event(
+                    event_type="ORDER_SKIP",
+                    code=cf.code,
+                    market=cf.market,
+                    mode=cf.mode,
+                    side="BUY",
+                    qty=cf.planned_qty,
+                    price=float(cf.features.get("close") or 0.0),
+                    client_order_key=cf.client_order_key,
+                    ok=False,
+                    reasons=["duplicate_order"],
+                    stage="PB1-CLOSE",
+                )
+            except Exception:
+                logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", display_code)
+            return
+        try:
+            self._append_ledger_event(
+                event_type="ORDER_INTENT",
+                code=cf.code,
+                market=cf.market,
+                mode=cf.mode,
+                side="BUY",
+                qty=cf.planned_qty,
+                price=float(cf.features.get("close") or 0.0),
+                client_order_key=cf.client_order_key,
+                ok=True,
+                reasons=["entry"] + (cf.reasons or []),
+                stage="PB1-CLOSE",
+                payload_json={"features": cf.features},
+            )
+        except Exception:
+            logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
         if self.dry_run:
-            logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", cf.code, cf.planned_qty, cf.client_order_key, order_id)
+            logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
             return
         if not self.kis:
-            logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", cf.code)
+            logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
             return
         resp = None
         kis_odno = None
@@ -888,7 +1009,7 @@ class PB1Engine:
             resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
-            logger.exception("[PB1][ENTRY][FAIL] code=%s", cf.code)
+            logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -931,6 +1052,7 @@ class PB1Engine:
         if not avg:
             return
         code = pos.get("code")
+        display_code = self._display_code(code)
         market = pos.get("market")
         mode = pos.get("mode")
         if pos.get("sid") != 1:
@@ -946,7 +1068,23 @@ class PB1Engine:
         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
         if self._should_block_order(client_key):
-            logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", code, mode, client_key)
+            logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
+            try:
+                self._append_ledger_event(
+                    event_type="EXIT_SKIP",
+                    code=code,
+                    market=market,
+                    mode=mode,
+                    side="SELL",
+                    qty=qty,
+                    price=mark,
+                    client_order_key=client_key,
+                    ok=False,
+                    reasons=["duplicate_order"],
+                    stage="EXIT",
+                )
+            except Exception:
+                logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
             return
 
         if mode == 1:
@@ -984,27 +1122,72 @@ class PB1Engine:
                     return
             reasons = ["pb1_exit"]
 
-        order_id = self.orders_repo.create_intent_idempotent(
-            env=self.env,
-            run_id=self.run_id,
-            strategy=self.STRATEGY_NAME,
-            sid=1,
-            mode=mode,
-            code=code,
-            market=market,
-            side="SELL",
-            ord_type="MARKET",
-            qty=qty,
-            limit_price=mark,
-            stage=stage,
-            client_order_key=client_key,
-            request_json={"reasons": reasons, "ret_pct": ret_pct},
-        )
+        try:
+            order_id, created = self.orders_repo.create_intent_idempotent(
+                env=self.env,
+                run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=mode,
+                code=code,
+                market=market,
+                side="SELL",
+                ord_type="MARKET",
+                qty=qty,
+                limit_price=mark,
+                stage=stage,
+                client_order_key=client_key,
+                request_json={"reasons": reasons, "ret_pct": ret_pct},
+                status="CREATED",
+            )
+        except Exception:
+            logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
+        if not created:
+            try:
+                self._append_ledger_event(
+                    event_type="EXIT_SKIP",
+                    code=code,
+                    market=market,
+                    mode=mode,
+                    side="SELL",
+                    qty=qty,
+                    price=mark,
+                    client_order_key=client_key,
+                    ok=False,
+                    reasons=["duplicate_order"],
+                    stage=stage,
+                )
+        except Exception:
+            logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
+            return
+        try:
+            self._append_ledger_event(
+                event_type="EXIT_INTENT",
+                code=code,
+                market=market,
+                mode=mode,
+                side="SELL",
+                qty=qty,
+                price=mark,
+                client_order_key=client_key,
+                ok=True,
+                reasons=reasons,
+                stage=stage,
+                payload_json={"ret_pct": ret_pct},
+            )
+        except Exception:
+            logger.exception("[PB1][LEDGER][EXIT_INTENT_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
         if self.dry_run:
-            logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", code, qty, client_key, order_id)
+            logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
             return
         if not self.kis:
-            logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", code)
+            logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
             return
         resp = None
         kis_odno = None
@@ -1012,7 +1195,7 @@ class PB1Engine:
             resp = self.kis.sell_stock_market(code, qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
-            logger.exception("[PB1][EXIT][FAIL] code=%s", code)
+            logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -1079,6 +1262,11 @@ class PB1Engine:
             members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
             if members:
                 self._universe_as_of = members[0].get("as_of_date")
+        self._code_name_map = {
+            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
+            for m in members or []
+            if m.get("code")
+        }
         return members
 
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
@@ -1329,16 +1517,33 @@ class PB1Engine:
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             open_orders = self.orders_repo.get_open_orders(self.env)
             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+            today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+            today_buy_codes = {row.get("code") for row in today_orders if row.get("code")}
+            today_spent = 0.0
+            for row in today_orders:
+                qty = float(row.get("qty") or 0)
+                limit_price = row.get("limit_price")
+                if limit_price is None:
+                    limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
+                today_spent += qty * float(limit_price or 0.0)
+            planned_spent = today_spent
             orderable_candidates: list[CandidateFeature] = []
             for cf in ok_after_risk:
                 if not allow_add_to_existing and cf.code in held_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
+                    self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
                     continue
                 if cf.code in open_buy_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
+                    self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
+                    continue
+                if cf.code in today_buy_codes:
+                    self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
+                    self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
                     continue
                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                    self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
                     continue
                 order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                 reasons: list[str] = []
@@ -1356,13 +1561,17 @@ class PB1Engine:
                     reasons.append("order_value_zero")
                 if available_cash_krw is not None and order_value > available_cash_krw:
                     reasons.append("insufficient_cash")
+                if planned_spent + order_value > float(DAILY_CAPITAL):
+                    reasons.append("daily_cap_exceeded")
                 if not reasons and len(orderable_candidates) >= new_position_limit:
                     reasons.append("target_new_positions_limit")
                 if reasons:
                     for reason in reasons:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                    self._log_order_skip(cf, reasons, "PB1-CLOSE")
                     continue
                 orderable_candidates.append(cf)
+                planned_spent += order_value
                 if len(orderable_candidates) >= new_position_limit:
                     break
 

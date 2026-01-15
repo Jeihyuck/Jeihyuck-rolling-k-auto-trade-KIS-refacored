@@ -34,6 +34,7 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
       STATE_PATH: "bot_state/runtime/state.json"

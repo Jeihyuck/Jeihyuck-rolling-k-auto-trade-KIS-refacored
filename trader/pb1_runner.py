@@ -39,9 +39,10 @@ from trader.botstate_sync import (
 from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
-from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
 from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+from trader.reconcile_kis import reconcile_today
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
@@ -586,6 +587,7 @@ def run_once(
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
+    ledger_repo = LedgerEventsRepo(engine)
 
     run_record_id = None
     did_work = False
@@ -624,12 +626,28 @@ def run_once(
                 "phase_reason": phase_reason,
             },
         )
+        if kis:
+            try:
+                reconcile_today(
+                    engine=engine,
+                    kis=kis,
+                    env=kis_env or "practice",
+                    run_id=run_record_id,
+                    strategy="pb1_pullback_close",
+                )
+            except Exception as exc:
+                if not dry_run and mode_resolved == "LIVE":
+                    logger.error("[PB1][RECONCILE][FAIL] live run halted: %s", exc)
+                    runs_repo.finish_run(run_record_id, status="FAILED", notes="reconcile_failed")
+                    return [], False, {}, phase_for_log, "RECONCILE_FAIL"
+                logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
             orders_repo=orders_repo,
             fills_repo=fills_repo,
             positions_repo=positions_repo,
+            ledger_repo=ledger_repo,
             kis=kis,
             window=window,
             window_label=window_label,
