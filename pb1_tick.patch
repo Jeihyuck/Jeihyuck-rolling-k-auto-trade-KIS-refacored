@@ -1,118 +1,80 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index ab8ea8e9fb9dd6f3818cfeabd5bb14f3665551d9..54738faf19bf3e997cfc3db4b4d809c2dc4bc274 100644
+index 54738faf19bf3e997cfc3db4b4d809c2dc4bc274..c3a877ae5a31845de6530aab666da296f5468c07 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -158,51 +158,51 @@ jobs:
-               pb1_phase = force_phase
-           else:
-               pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+@@ -68,53 +68,59 @@ jobs:
+       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
  
-           print(
-               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
-               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
-           )
-           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
-               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
-               f.write(f"MARKET_WINDOW={window}\n")
-               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
-           PY
+       ACTIVE_STRATEGIES: "1"
+       DAILY_CAPITAL: "250000000"
  
-       - name: Build universe (best_k_meta) - allow fallback
+     steps:
+       - name: Checkout code (always run nullim code)
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "nullim"
+           path: repo
+ 
+       - name: Checkout bot-state branch
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "bot-state"
+           path: botstate
+ 
+       - name: Restore bot_state into workspace
+         run: |
+           set -euo pipefail
+           mkdir -p bot_state
+           if [ -d ../botstate/bot_state ]; then
+-            rsync -a --delete --exclude='.gitkeep' ../botstate/bot_state/ bot_state/
++            rsync -a --delete --exclude='.gitignore' ../botstate/bot_state/ bot_state/
+           fi
+           echo "[RESTORE] repo/bot_state restored"
++          ls -al bot_state/.gitignore
++          git status --porcelain
++          if [ ! -f bot_state/.gitignore ]; then
++            echo "::error::Missing bot_state/.gitignore after restore"
++            exit 1
++          fi
+ 
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install deps
          working-directory: repo
          run: |
            set -euo pipefail
-           python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || echo "[WARN] universe build failed (continue)"
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
  
-       - name: Compile check
+       - name: Precheck env (fail fast)
          working-directory: repo
          run: |
            set -euo pipefail
--          python -m compileall trader
-+          python -m compileall -q trader
- 
-       - name: Configure git identity for botstate commits
-         working-directory: repo
-         run: |
-           git config --global user.email "actions@github.com"
-           git config --global user.name "github-actions[bot]"
- 
-       - name: Run PB1 (auto window) - should exit within 4 minutes
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
-           python -m trader.run --window auto --phase auto
-         env:
-           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
-           LIVE_TRADING_ENABLED: "1"
- 
-       - name: Debug bot_state contents (after run)
-         run: |
-           set -euo pipefail
-           echo "=== bot_state tree ==="
-           find bot_state -maxdepth 3 -type f -print || true
-           echo "=== git status (bot-state worktree if exists) ==="
-           git status --porcelain || true
- 
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index 353645d34b6e146c0d09a15a67f1ccad7ac70c1b..c6f840815b8fb4018f27264f1813d38549c43524 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -1138,53 +1138,53 @@ class PB1Engine:
-                 stage=stage,
-                 client_order_key=client_key,
-                 request_json={"reasons": reasons, "ret_pct": ret_pct},
-                 status="CREATED",
-             )
-         except Exception:
-             logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-         if not created:
-             try:
-                 self._append_ledger_event(
-                     event_type="EXIT_SKIP",
-                     code=code,
-                     market=market,
-                     mode=mode,
-                     side="SELL",
-                     qty=qty,
-                     price=mark,
-                     client_order_key=client_key,
-                     ok=False,
-                     reasons=["duplicate_order"],
-                     stage=stage,
-                 )
--        except Exception:
--            logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
--            return
-+            except Exception as e:
-+                logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
-+                return
-         try:
-             self._append_ledger_event(
-                 event_type="EXIT_INTENT",
-                 code=code,
-                 market=market,
-                 mode=mode,
-                 side="SELL",
-                 qty=qty,
-                 price=mark,
-                 client_order_key=client_key,
-                 ok=True,
-                 reasons=reasons,
-                 stage=stage,
-                 payload_json={"ret_pct": ret_pct},
-             )
-         except Exception:
-             logger.exception("[PB1][LEDGER][EXIT_INTENT_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-         if self.dry_run:
-             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
-             return
-         if not self.kis:
-             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+             if [ -z "${!k:-}" ]; then
+               echo "::error::Missing required secret/env: $k"
+               exit 1
+             fi
+           done
+           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+diff --git a/bot_state/.gitignore b/bot_state/.gitignore
+index 191dca45ac24ee45562f7d0d4a80701700fd7f57..48e65ba7dbf2eff68e7747ef485a44cfd056524a 100644
+--- a/bot_state/.gitignore
++++ b/bot_state/.gitignore
+@@ -1,3 +1,9 @@
++db/
++runtime/
++trader_state/
++trader_ledger/
++universe_lkg/
++
+ runtime/ohlcv_cache/
+ runtime/**.parquet
+ runtime/diagnostics/
+

@@ -90,9 +90,15 @@ jobs:
           set -euo pipefail
           mkdir -p bot_state
           if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' ../botstate/bot_state/ bot_state/
+            rsync -a --delete --exclude='.gitignore' ../botstate/bot_state/ bot_state/
           fi
           echo "[RESTORE] repo/bot_state restored"
+          ls -al bot_state/.gitignore
+          git status --porcelain
+          if [ ! -f bot_state/.gitignore ]; then
+            echo "::error::Missing bot_state/.gitignore after restore"
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
