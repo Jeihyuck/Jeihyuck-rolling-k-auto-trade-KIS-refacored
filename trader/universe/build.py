@@ -58,7 +58,15 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
 logger = logging.getLogger(__name__)
 
 FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-SEED_DIR = Path(__file__).resolve().parent / "seeds"
+
+
+def _resolve_seed_dir() -> Path:
+    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", "bot_state/universe_lkg"))
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    return seed_dir
+
+
+SEED_DIR = _resolve_seed_dir()
 SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}

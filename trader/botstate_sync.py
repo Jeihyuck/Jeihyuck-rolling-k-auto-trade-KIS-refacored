@@ -166,14 +166,34 @@ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
         _run(["git", "config", "--global", "--add", "safe.directory", str(path)])
 
 
+def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] | None = None) -> list[str]:
+    excludes = [path.strip().rstrip("/") for path in (paths_to_exclude or []) if path and str(path).strip()]
+    exclude_specs = [f":(exclude){path}" for path in excludes]
+    pathspec = ["--", ".", *exclude_specs]
+    tracked_out = _run(
+        ["git", "-C", str(base_dir), "diff", "--name-status", "HEAD", *pathspec],
+        check=True,
+    ).stdout.strip()
+    untracked_out = _run(
+        ["git", "-C", str(base_dir), "ls-files", "--others", "--exclude-standard", *pathspec],
+        check=True,
+    ).stdout.strip()
+    lines: list[str] = []
+    if tracked_out:
+        lines.extend([line for line in tracked_out.splitlines() if line.strip()])
+    if untracked_out:
+        lines.extend([f"?? {line}" for line in untracked_out.splitlines() if line.strip()])
+    return lines
+
+
 def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
     base_dir = base_dir.resolve()
     worktree_dir = worktree_dir.resolve()
     worktree_dir.mkdir(parents=True, exist_ok=True)
     _configure_safe_directories(base_dir, worktree_dir)
-    status = _run(["git", "-C", str(base_dir), "status", "--porcelain"], check=True).stdout.strip()
-    if status:
-        raise RuntimeError(f"code worktree dirty; refusing botstate sync: {status}")
+    dirty_files = get_dirty_status_excluding(base_dir, paths_to_exclude=["bot_state", "runtime"])
+    if dirty_files:
+        raise RuntimeError(f"code worktree dirty; refusing botstate sync: {dirty_files}")
 
     remote = "origin"
     remote_ref = f"{remote}/{target_branch}"
