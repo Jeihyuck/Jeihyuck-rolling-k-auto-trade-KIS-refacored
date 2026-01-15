@@ -1160,9 +1160,9 @@ class PB1Engine:
                     reasons=["duplicate_order"],
                     stage=stage,
                 )
-        except Exception:
-            logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
-            return
+            except Exception as e:
+                logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
+                return
         try:
             self._append_ledger_event(
                 event_type="EXIT_INTENT",

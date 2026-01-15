@@ -180,7 +180,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m compileall trader
+          python -m compileall -q trader
 
       - name: Configure git identity for botstate commits
         working-directory: repo
