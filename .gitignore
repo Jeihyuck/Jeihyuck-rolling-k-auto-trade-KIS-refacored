@@ -12,3 +12,8 @@ watchlists/
 bot_state/state.json
 kis_token_cache.json
 fastapi.log
+_botstate/
+trader/state/
+trader/state/ohlcv_cache/
+runtime/
+bot_state/

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 import logging
@@ -189,7 +190,6 @@ def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] |
 def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
     base_dir = base_dir.resolve()
     worktree_dir = worktree_dir.resolve()
-    worktree_dir.mkdir(parents=True, exist_ok=True)
     _configure_safe_directories(base_dir, worktree_dir)
     dirty_files = get_dirty_status_excluding(base_dir, paths_to_exclude=["bot_state", "runtime"])
     if dirty_files:
@@ -198,20 +198,70 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     remote = "origin"
     remote_ref = f"{remote}/{target_branch}"
 
-    if (worktree_dir / ".git").exists():
-        _run(["git", "-C", str(worktree_dir), "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
-        _run(["git", "-C", str(worktree_dir), "fetch", remote, target_branch], cwd=base_dir)
-        _run(["git", "-C", str(worktree_dir), "checkout", "-B", target_branch], cwd=base_dir)
-        _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
-        os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
-        return
+    list_proc = _run(
+        ["git", "-C", str(base_dir), "worktree", "list", "--porcelain"],
+        check=False,
+    )
+    worktree_paths = [
+        line.split(" ", 1)[1].strip()
+        for line in list_proc.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    logger.info("[BOTSTATE][WORKTREE] list=%s", worktree_paths)
 
-    _run(["git", "fetch", remote, target_branch], cwd=base_dir)
-    _run(
+    registered = str(worktree_dir) in worktree_paths
+    exists = worktree_dir.exists()
+    if registered:
+        logger.info(
+            "[BOTSTATE][WORKTREE] dir=%s exists=%s registered=%s -> removing",
+            worktree_dir,
+            exists,
+            registered,
+        )
+        _run(
+            ["git", "-C", str(base_dir), "worktree", "remove", "--force", str(worktree_dir)],
+            check=False,
+        )
+        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
+    elif exists:
+        logger.info(
+            "[BOTSTATE][WORKTREE] dir=%s exists=%s registered=%s -> rmtree",
+            worktree_dir,
+            exists,
+            registered,
+        )
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+
+    _run(["git", "fetch", remote, "--prune"], cwd=base_dir)
+
+    add_proc = _run(
         ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
         cwd=base_dir,
+        check=False,
     )
+    if add_proc.returncode != 0 and "already exists" in (add_proc.stderr or "").lower():
+        logger.info("[BOTSTATE][WORKTREE] add failed with already exists -> retry")
+        _run(
+            ["git", "-C", str(base_dir), "worktree", "remove", "--force", str(worktree_dir)],
+            check=False,
+        )
+        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
+        add_proc = _run(
+            ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
+            cwd=base_dir,
+            check=False,
+        )
+
+    if add_proc.returncode != 0:
+        raise RuntimeError(
+            "git worktree add failed: "
+            f"returncode={add_proc.returncode} stdout={add_proc.stdout} stderr={add_proc.stderr}"
+        )
+
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+    logger.info("[BOTSTATE][WORKTREE] add ok")
     os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
 
 
