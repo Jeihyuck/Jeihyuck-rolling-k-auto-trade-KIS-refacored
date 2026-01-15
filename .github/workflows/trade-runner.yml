@@ -18,6 +18,7 @@ on:
   # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
   schedule:
     - cron: "50-59/5 23 * * 0-4"
+    - cron: "45 23 * * 0-4"
     - cron: "*/5 0-5 * * 1-5"
     - cron: "0-30/5 6 * * 1-5"
 
@@ -40,8 +41,12 @@ jobs:
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       TRADER_CACHE_ROOT: "bot_state/runtime"
+      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+      ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+      COMPILE_CHECK_ENABLED: "0"
+      MIGRATE_MODE: "AUTO"
+      PERSIST_MODE: "ON_CHANGE"
       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
 
       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
@@ -107,6 +112,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         working-directory: repo
@@ -179,23 +192,67 @@ jobs:
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
 
-      - name: Build universe (best_k_meta) - allow fallback
+      - name: Universe policy (08:45 only) + LKG safety gate
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)" || echo "[WARN] universe build failed (continue)"
+          today="$(TZ=Asia/Seoul date +%F)"
+          hhmm="$(TZ=Asia/Seoul date +%H:%M)"
+          dow="$(TZ=Asia/Seoul date +%u)"
+          allow_build=0
+          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ] && [ "$hhmm" = "08:45" ]; then
+            allow_build=1
+          fi
+          lkg="$(find "${UNIVERSE_LKG_DIR}" -maxdepth 6 -type f -name "latest.json" 2>/dev/null | head -n 1 || true)"
+          lkg_exists=0
+          if [ -n "$lkg" ]; then
+            lkg_exists=1
+          fi
+          should_build=$allow_build
+          in_market=0
+          if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "LIVE" ] && [[ "${MARKET_WINDOW:-}" =~ ^(preopen|morning|day|close)$ ]]; then
+            in_market=1
+          fi
+          block=0
+          if [ "$in_market" = "1" ] && [ "$should_build" = "0" ] && [ "$lkg_exists" = "0" ]; then
+            block=1
+          fi
+          echo "SHOULD_BUILD_UNIVERSE=$should_build" >> "$GITHUB_ENV"
+          echo "BLOCK_TRADING_NO_LKG=$block" >> "$GITHUB_ENV"
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ] || [ "$should_build" = "1" ]; then
+            echo "COMPILE_CHECK_ENABLED=1" >> "$GITHUB_ENV"
+          else
+            echo "COMPILE_CHECK_ENABLED=0" >> "$GITHUB_ENV"
+          fi
+          echo "[UNIVERSE][POLICY] kst_hhmm=$hhmm dow=$dow allow_build=$allow_build in_market=$in_market lkg_exists=$lkg_exists -> build=$should_build block_trading=$block event=${GITHUB_EVENT_NAME:-}"
 
-      - name: Compile check
+      - name: Build universe (best_k_meta)
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m compileall -q trader
+          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)"
+          echo "$(TZ=Asia/Seoul date +%F)" > "${UNIVERSE_LKG_DIR}/last_build_date.txt"
+
+      - name: Compile check (gated)
+        if: env.COMPILE_CHECK_ENABLED == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m compileall trader
 
       - name: Configure git identity for botstate commits
         working-directory: repo
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
+
+      - name: Fail fast if no universe LKG during market hours
+        if: env.BLOCK_TRADING_NO_LKG == '1'
+        working-directory: repo
+        run: |
+          echo "::error::Market is open but universe LKG is missing. Universe build is forbidden now. Wait for next 08:45 KST build."
+          exit 1
 
       - name: Run PB1 (auto window) - should exit within 4 minutes
         working-directory: repo
@@ -232,6 +289,15 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
+            flag="${TRADER_CACHE_ROOT}/changed.flag"
+            if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
+              echo "[PERSIST] changes detected -> persist"
+            else
+              echo "[PERSIST] no changes -> skip"
+              exit 0
+            fi
+          fi
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"

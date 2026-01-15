@@ -175,10 +175,13 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
     try:
         members = repo.get_latest_universe_members(kis_env, "best_k_meta")
         if not members:
-            from trader.universe import build as universe_build
+            if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
+                from trader.universe import build as universe_build
 
-            universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
-            members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+                universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
+                members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+            else:
+                logger.info("[UNIVERSE][SKIP] forbidden during trade path")
         universe_ok = bool(members)
     except Exception:
         logger.exception("[SMOKE][FAIL] universe")
@@ -255,6 +258,18 @@ def _collect_botstate_files(since_ts: float) -> list[Path]:
         except FileNotFoundError:
             continue
     return touched
+
+
+def _change_flag_path() -> Path:
+    cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
+    return cache_root / "changed.flag"
+
+
+def _write_change_flag(changed: bool, reasons: list[str]) -> None:
+    flag_path = _change_flag_path()
+    flag_path.parent.mkdir(parents=True, exist_ok=True)
+    flag_path.write_text("1\n" if changed else "0\n", encoding="utf-8")
+    logger.info("[PB1][CHANGE] changed=%s reasons=%s", int(changed), reasons)
 
 
 def _is_urgent_persist(touched: list[Path]) -> bool:
@@ -843,6 +858,8 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 logger.info("[PB1][LOOP] no trade -> exit")
                 exit_reason = "no_candidates"
                 break
+            if touched:
+                _write_change_flag(True, ["touched_files"])
             for path in touched:
                 pending_touched[path] = path
             if pending_touched:
@@ -901,6 +918,7 @@ def main() -> None:
     args = parse_args()
     engine = make_engine()
     run_migrations(engine)
+    _write_change_flag(False, ["init"])
 
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
@@ -937,11 +955,14 @@ def main() -> None:
     try:
         touched, _did_work, metrics, phase_for_log, _result_status = run_once(args=args, engine=engine, loop_mode=False, window=None)
         if touched:
+            _write_change_flag(True, ["touched_files"])
             persist_run_files(
                 botstate_worktree,
                 touched,
                 message=f"pb1 run {now_kst().isoformat()}",
             )
+        else:
+            _write_change_flag(False, ["no_changes"])
     finally:
         release_botstate_lock(botstate_worktree, owner, workflow_run_id)
         elapsed = time_mod.time() - start_ts
