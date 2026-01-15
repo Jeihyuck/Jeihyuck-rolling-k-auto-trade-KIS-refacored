@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
 
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_cache_root
 from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
 
 # =========================
@@ -99,7 +99,7 @@ CONFIG = {
     "DIAGNOSTIC_MODE": "false",
     "DIAGNOSTIC_ONLY": "false",
     "DIAGNOSTIC_FORCE_RUN": "false",
-    "DIAGNOSTIC_DUMP_PATH": "runtime/diagnostics",
+    "DIAGNOSTIC_DUMP_PATH": "",
     "DIAGNOSTIC_TARGET_MARKETS": "",
     "DIAGNOSTIC_MAX_SYMBOLS": "200",
     # === Strategy intent/exec defaults ===
@@ -340,11 +340,8 @@ STRATEGY_ALLOW_SELL_ONLY = _cfg_bool("STRATEGY_ALLOW_SELL_ONLY")
 DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
 DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
 DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
-DIAGNOSTIC_DUMP_DIR = Path(
-    _cfg("DIAGNOSTIC_DUMP_DIR")
-    or _cfg("DIAGNOSTIC_DUMP_PATH")
-    or botstate_path(*Path(CONFIG["DIAGNOSTIC_DUMP_PATH"]).parts)
-)
+_diag_dump_env = os.getenv("DIAGNOSTIC_DUMP_DIR") or os.getenv("DIAGNOSTIC_DUMP_PATH")
+DIAGNOSTIC_DUMP_DIR = Path(_diag_dump_env) if _diag_dump_env else get_cache_root() / "diagnostics"
 ensure_not_repo_tracked_path(DIAGNOSTIC_DUMP_DIR)
 DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
 DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])

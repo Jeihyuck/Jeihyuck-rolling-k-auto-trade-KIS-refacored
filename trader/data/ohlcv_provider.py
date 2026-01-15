@@ -8,6 +8,7 @@ from typing import Iterable, List, Protocol
 
 import pandas as pd
 
+from trader.botstate_paths import get_ohlcv_cache_dir
 from trader.time_utils import now_kst
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv
@@ -120,7 +121,7 @@ class KRXOHLCVProvider:
 class ChainOHLCVProvider:
     def __init__(self, providers: Iterable[OHLCVProvider], *, env: str | None = None, cache_dir: Path | None = None) -> None:
         self.providers: List[OHLCVProvider] = list(providers)
-        base_cache = cache_dir or (Path(__file__).resolve().parent.parent / "state" / "ohlcv_cache")
+        base_cache = cache_dir or get_ohlcv_cache_dir()
         self.cache_dir = base_cache / env if env else base_cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._memory_cache: dict[tuple[str, int], OHLCVResult] = {}

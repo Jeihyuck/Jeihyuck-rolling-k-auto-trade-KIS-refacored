@@ -1,0 +1,3 @@
+runtime/ohlcv_cache/
+runtime/**.parquet
+runtime/diagnostics/

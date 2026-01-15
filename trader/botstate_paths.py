@@ -5,6 +5,7 @@ from pathlib import Path
 
 BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
+TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
 DEFAULT_BOTSTATE_ROOT = "bot_state"
 
 
@@ -46,3 +47,20 @@ def botstate_path(*parts: str) -> Path:
         raise RuntimeError(f"Botstate path must stay under {root}: {resolved}")
     ensure_not_repo_tracked_path(resolved)
     return path
+
+
+def get_cache_root() -> Path:
+    env_root = os.getenv(TRADER_CACHE_ROOT_ENV)
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+    else:
+        botstate_runtime = get_botstate_root() / "runtime"
+        root = botstate_runtime.resolve() if botstate_runtime.exists() else Path("runtime").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def get_ohlcv_cache_dir() -> Path:
+    cache_dir = get_cache_root() / "ohlcv_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir

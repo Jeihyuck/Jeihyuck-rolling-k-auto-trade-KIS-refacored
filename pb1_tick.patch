@@ -1,208 +1,388 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 09b01680be22654fd54d233d56502eb3d19e8d5e..d0a9d5f4a0cd57605e0f93f0d3eb3906ca78ef10 100644
+index d0a9d5f4a0cd57605e0f93f0d3eb3906ca78ef10..55a78ccb6f841b9eadc99fbbe9c4b513efc790ed 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -66,51 +66,51 @@ jobs:
+@@ -18,50 +18,51 @@ on:
+   # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
+   schedule:
+     - cron: "50-59/5 23 * * 0-4"
+     - cron: "*/5 0-5 * * 1-5"
+     - cron: "0-30/5 6 * * 1-5"
+ 
+ defaults:
+   run:
+     shell: bash
+     working-directory: repo
+ 
+ jobs:
+   run:
+     runs-on: ubuntu-latest
+     timeout-minutes: 8
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
++      TRADER_CACHE_ROOT: "bot_state/runtime"
+       BOTSTATE_WORKTREE_DIR: "_botstate"
+ 
+       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+       # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
+       RUN_LOOP_MINUTES: "4"
+ 
+       # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
+       BOTSTATE_LOCK_TTL_SEC: "240"
+       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
        BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
  
-       ACTIVE_STRATEGIES: "1"
-       DAILY_CAPITAL: "250000000"
+diff --git a/bot_state/.gitignore b/bot_state/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..191dca45ac24ee45562f7d0d4a80701700fd7f57
+--- /dev/null
++++ b/bot_state/.gitignore
+@@ -0,0 +1,3 @@
++runtime/ohlcv_cache/
++runtime/**.parquet
++runtime/diagnostics/
+diff --git a/trader/botstate_paths.py b/trader/botstate_paths.py
+index 92c6df4f791610d3d3dd4f9b789c4e4e91f2cc8d..82ea26c9d25a69c637b9c430c94f8ade71fb91aa 100644
+--- a/trader/botstate_paths.py
++++ b/trader/botstate_paths.py
+@@ -1,48 +1,66 @@
+ from __future__ import annotations
  
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
-           path: repo
+ import os
+ from pathlib import Path
  
-       - name: Checkout bot-state branch
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "bot-state"
-           path: botstate
- 
-       - name: Restore bot_state into workspace
-         run: |
-           set -euo pipefail
-           mkdir -p bot_state
-           if [ -d ../botstate/bot_state ]; then
--            rsync -a --delete ../botstate/bot_state/ bot_state/
-+            rsync -a --delete --exclude='.gitkeep' ../botstate/bot_state/ bot_state/
-           fi
-           echo "[RESTORE] repo/bot_state restored"
- 
-       - name: Setup Python
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
- 
-       - name: Install deps
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Precheck env (fail fast)
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-               echo "::error::Missing required secret/env: $k"
-               exit 1
-             fi
-diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 33c85ccc5d68e216fa43e3605271cf540c6235cd..4e40e011552342c40860da4843fbdd8453fd729e 100644
---- a/trader/botstate_sync.py
-+++ b/trader/botstate_sync.py
-@@ -144,58 +144,78 @@ def git_fetch_reset(remote: str, branch: str, cwd: str) -> GitSyncStatus:
-     )
-     left, right = cnt.split()
-     ahead = int(left)
-     behind = int(right)
-     return GitSyncStatus(remote=remote, branch=branch, remote_ref=remote_ref, ahead=ahead, behind=behind)
+ BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
+ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
++TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
+ DEFAULT_BOTSTATE_ROOT = "bot_state"
  
  
- def git_push(remote: str, branch: str, cwd: str) -> Tuple[bool, str]:
-     rc, out = _run_git(["git", "push", remote, f"HEAD:{branch}"], cwd=cwd, check=False)
-     ok = rc == 0
-     return ok, out
+ def _repo_root() -> Path:
+     return Path(__file__).resolve().parents[1]
  
  
- def is_non_fast_forward(push_output: str) -> bool:
-     s = (push_output or "").lower()
-     return ("non-fast-forward" in s) or ("fetch first" in s) or ("rejected" in s)
+ def _is_relative_to(path: Path, base: Path) -> bool:
+     try:
+         path.relative_to(base)
+         return True
+     except ValueError:
+         return False
  
  
- def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
-     base_dir_resolved = base_dir.resolve()
-     worktree_dir_resolved = worktree_dir.resolve()
-     for path in {base_dir_resolved, worktree_dir_resolved}:
-         _run(["git", "config", "--global", "--add", "safe.directory", str(path)])
+ def get_botstate_root() -> Path:
+     env_root = os.getenv(BOTSTATE_ROOT_ENV)
+     if env_root:
+         return Path(env_root).expanduser().resolve()
+     worktree_dir = os.getenv(BOTSTATE_WORKTREE_DIR_ENV)
+     if worktree_dir:
+         return (Path(worktree_dir).expanduser() / "bot_state").resolve()
+     return Path(DEFAULT_BOTSTATE_ROOT).resolve()
  
  
-+def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] | None = None) -> list[str]:
-+    excludes = [path.strip().rstrip("/") for path in (paths_to_exclude or []) if path and str(path).strip()]
-+    exclude_specs = [f":(exclude){path}" for path in excludes]
-+    pathspec = ["--", ".", *exclude_specs]
-+    tracked_out = _run(
-+        ["git", "-C", str(base_dir), "diff", "--name-status", "HEAD", *pathspec],
-+        check=True,
-+    ).stdout.strip()
-+    untracked_out = _run(
-+        ["git", "-C", str(base_dir), "ls-files", "--others", "--exclude-standard", *pathspec],
-+        check=True,
-+    ).stdout.strip()
-+    lines: list[str] = []
-+    if tracked_out:
-+        lines.extend([line for line in tracked_out.splitlines() if line.strip()])
-+    if untracked_out:
-+        lines.extend([f"?? {line}" for line in untracked_out.splitlines() if line.strip()])
-+    return lines
+ def ensure_not_repo_tracked_path(path: Path) -> None:
+     repo_root = _repo_root()
+     seeds_dir = (repo_root / "trader" / "universe" / "seeds").resolve()
+     target = path.expanduser().resolve()
+     if _is_relative_to(target, seeds_dir):
+         raise RuntimeError(f"Refusing to write to repo-tracked seed path: {target}")
+ 
+ 
+ def botstate_path(*parts: str) -> Path:
+     root = get_botstate_root()
+     path = root.joinpath(*parts)
+     resolved = path.expanduser().resolve()
+     if not _is_relative_to(resolved, root):
+         raise RuntimeError(f"Botstate path must stay under {root}: {resolved}")
+     ensure_not_repo_tracked_path(resolved)
+     return path
 +
 +
- def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
-     base_dir = base_dir.resolve()
-     worktree_dir = worktree_dir.resolve()
-     worktree_dir.mkdir(parents=True, exist_ok=True)
-     _configure_safe_directories(base_dir, worktree_dir)
--    status = _run(["git", "-C", str(base_dir), "status", "--porcelain"], check=True).stdout.strip()
--    if status:
--        raise RuntimeError(f"code worktree dirty; refusing botstate sync: {status}")
-+    dirty_files = get_dirty_status_excluding(base_dir, paths_to_exclude=["bot_state", "runtime"])
-+    if dirty_files:
-+        raise RuntimeError(f"code worktree dirty; refusing botstate sync: {dirty_files}")
++def get_cache_root() -> Path:
++    env_root = os.getenv(TRADER_CACHE_ROOT_ENV)
++    if env_root:
++        root = Path(env_root).expanduser().resolve()
++    else:
++        botstate_runtime = get_botstate_root() / "runtime"
++        root = botstate_runtime.resolve() if botstate_runtime.exists() else Path("runtime").resolve()
++    root.mkdir(parents=True, exist_ok=True)
++    return root
++
++
++def get_ohlcv_cache_dir() -> Path:
++    cache_dir = get_cache_root() / "ohlcv_cache"
++    cache_dir.mkdir(parents=True, exist_ok=True)
++    return cache_dir
+diff --git a/trader/config.py b/trader/config.py
+index 7c191ae9f400ee99f4fb9b455037f069cd85d0bf..9d0b983999d0d648e6a1daa6f977aefc6c98224e 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -1,41 +1,41 @@
+ # -*- coding: utf-8 -*-
+ """공용 설정 및 환경 파싱 모듈.
  
-     remote = "origin"
-     remote_ref = f"{remote}/{target_branch}"
+ trader.py가 분리되어도 모든 전략/유틸이 동일한 설정을 참조할 수 있도록
+ CONFIG와 파생 상수를 한 곳에 모았다.
+ """
+ from __future__ import annotations
  
-     if (worktree_dir / ".git").exists():
-         _run(["git", "-C", str(worktree_dir), "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
-         _run(["git", "-C", str(worktree_dir), "fetch", remote, target_branch], cwd=base_dir)
-         _run(["git", "-C", str(worktree_dir), "checkout", "-B", target_branch], cwd=base_dir)
-         _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
-         os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
-         return
+ import logging
+ import os
+ from datetime import datetime, time as dtime
+ from pathlib import Path
+ from typing import Dict
+ from zoneinfo import ZoneInfo
  
-     _run(["git", "fetch", remote, target_branch], cwd=base_dir)
-     _run(
-         ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
-         cwd=base_dir,
-     )
-     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
-     os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
+-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
++from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_cache_root
+ from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
+ 
+ # =========================
+ # [CONFIG] .env 없이도 동작
+ # - 아래 값을 기본으로 사용
+ # - (선택) 동일 키를 환경변수로 넘기면 override
+ # =========================
+ CONFIG = {
+     "SELL_FORCE_TIME": "14:40",
+     "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
+     "API_RATE_SLEEP_SEC": "0.5",
+     "FORCE_SELL_PASSES_CUTOFF": "2",
+     "FORCE_SELL_PASSES_CLOSE": "4",
+     "FORCE_SELL_BLOCKED_LOTS": "0",
+     "PARTIAL1": "0.5",
+     "PARTIAL2": "0.3",
+     "TRAIL_PCT": "0.02",
+     "FAST_STOP": "0.01",
+     "ATR_STOP": "1.5",
+     "TIME_STOP_HHMM": "13:00",
+     "DEFAULT_PROFIT_PCT": "3.0",
+     "DEFAULT_LOSS_PCT": "-5.0",
+     "DAILY_CAPITAL": "250000000",
+     "CAP_CAP": "0.8",
+     "SLIPPAGE_LIMIT_PCT": "0.25",
+@@ -77,51 +77,51 @@ CONFIG = {
+     "NEUTRAL_ENTRY_SCALE": "0.6",          # 중립 레짐 신규/재진입 스케일링 비율
+     # 기타
+     "MARKET_DATA_WHEN_CLOSED": "false",
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+-    "DIAGNOSTIC_DUMP_PATH": "runtime/diagnostics",
++    "DIAGNOSTIC_DUMP_PATH": "",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "runtime/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "240",
+     "LEDGER_BASE_DIR": "trader_ledger",
+     "PB1_ENTRY_ENABLED": "true",
+     "PB1_ENTRY_WINDOW_START": "08:50",
+     "PB1_ENTRY_OPEN_END": "09:05",
+@@ -318,55 +318,52 @@ def _resolve_min_order_krw() -> float:
+     except ValueError:
+         logger.warning("[CONFIG] MIN_ORDER_KRW invalid=%s -> fallback=100000", raw)
+         value = 0.0
+     if value <= 0:
+         logger.warning("[CONFIG] MIN_ORDER_KRW=%s -> fallback=100000", raw)
+         value = 100000.0
+     if STRATEGY_MODE == "LIVE" and value < 50000:
+         raise RuntimeError(f"MIN_ORDER_KRW too low for LIVE mode: {value}")
+     return value
  
  
- def _lock_path(worktree_dir: Path) -> Path:
-     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
+ MIN_ORDER_KRW = _resolve_min_order_krw()
+ STRATEGY_INTENTS_PATH = Path(
+     _cfg("STRATEGY_INTENTS_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_PATH"]).parts)
+ )
+ STRATEGY_INTENTS_STATE_PATH = Path(
+     _cfg("STRATEGY_INTENTS_STATE_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_STATE_PATH"]).parts)
+ )
+ STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
+ STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
+ STRATEGY_ALLOW_SELL_ONLY = _cfg_bool("STRATEGY_ALLOW_SELL_ONLY")
  
+ DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
+ DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
+ DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
+-DIAGNOSTIC_DUMP_DIR = Path(
+-    _cfg("DIAGNOSTIC_DUMP_DIR")
+-    or _cfg("DIAGNOSTIC_DUMP_PATH")
+-    or botstate_path(*Path(CONFIG["DIAGNOSTIC_DUMP_PATH"]).parts)
+-)
++_diag_dump_env = os.getenv("DIAGNOSTIC_DUMP_DIR") or os.getenv("DIAGNOSTIC_DUMP_PATH")
++DIAGNOSTIC_DUMP_DIR = Path(_diag_dump_env) if _diag_dump_env else get_cache_root() / "diagnostics"
+ ensure_not_repo_tracked_path(DIAGNOSTIC_DUMP_DIR)
+ DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+ DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+ DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
+ DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
  
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 08a959f706a1b66975fbb3418352e30fa5930916..2216ee841b637d39d10e304eafe8903da4cd8a08 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -36,51 +36,59 @@ def _parse_as_of_date(val: str) -> date | None:
-         if "-" in s:
-             return _datetime.fromisoformat(s).date()
-         if len(s) == 8 and s.isdigit():
-             return _datetime.strptime(s, "%Y%m%d").date()
-         return _datetime.fromisoformat(s).date()
-     except Exception:
-         return None
+ if DIAGNOSTIC_MODE:
+     STRATEGY_MODE = "INTENT_ONLY"
+     STRATEGY_DRY_RUN = True
+     STRATEGY_ALLOW_SELL_ONLY = True
  
+ logger.info(
+     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
+     DIAG_ENABLED,
+ )
  
- def _prefer_provider_order(chain: list[str]) -> list[str]:
-     """Prefer caches first, then live providers, then static."""
-     order = {
-         "sqlite_cache": 10,
-         "lkg": 20,
-         # live providers
-         "fdr_marketcap_top": 30,
-         "kis_marketcap_top": 30,
-         # ultimate fallback
-         "seed_static": 90,
-     }
-     return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+diff --git a/trader/data/ohlcv_provider.py b/trader/data/ohlcv_provider.py
+index 60b67879541241ed037803f40b839b33b604cb64..22441189f2bd3483aa65784837d5189cab83164f 100644
+--- a/trader/data/ohlcv_provider.py
++++ b/trader/data/ohlcv_provider.py
+@@ -1,35 +1,36 @@
+ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import dataclass
+ from datetime import timedelta
+ from pathlib import Path
+ from typing import Iterable, List, Protocol
+ 
+ import pandas as pd
+ 
++from trader.botstate_paths import get_ohlcv_cache_dir
+ from trader.time_utils import now_kst
+ from trader.universe.krx_safe import patch_pykrx_logging
+ from trader.utils.ohlcv import normalize_ohlcv
  
  logger = logging.getLogger(__name__)
  
- FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
--SEED_DIR = Path(__file__).resolve().parent / "seeds"
-+
-+
-+def _resolve_seed_dir() -> Path:
-+    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", "bot_state/universe_lkg"))
-+    seed_dir.mkdir(parents=True, exist_ok=True)
-+    return seed_dir
-+
-+
-+SEED_DIR = _resolve_seed_dir()
- SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
- SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
- TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
- DEFAULT_PROVIDER = "fdr_marketcap_top"
- ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
- ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
- TICKER_PATTERN = re.compile(r"^\d{6}$")
+ 
+ @dataclass
+ class OHLCVResult:
+     df: pd.DataFrame
+     meta: dict
  
  
- def parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Build and persist universe members")
-     parser.add_argument("--env", required=True, help="Environment (practice/real)")
-     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
-     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
-     parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
-     return parser.parse_args()
+ class OHLCVProvider(Protocol):
+     name: str
+ 
+     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult: ...
  
  
- def _normalize_payload(payload: dict | None) -> dict:
-     payload = payload or {}
-     selected = payload.get("selected") or []
-     selected_stocks = payload.get("selected_stocks") or selected
-     selected_by_market = payload.get("selected_by_market") or {}
-     normalized = {
-         "selected": list(selected),
+ class KISOHLCVProvider:
+     name = "kis"
+ 
+     def __init__(self, kis: object) -> None:
+         self.kis = kis
+         self._warned_keys: set[str] = set()
+@@ -98,51 +99,51 @@ class KRXOHLCVProvider:
+         except Exception as exc:  # pragma: no cover - network dependent
+             self._warn_once(f"fail:{symbol}", "[OHLCV][KRX][FAIL] symbol=%s start=%s end=%s err=%s", symbol, start, end, exc)
+             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
+ 
+         if df_raw is None or df_raw.empty:
+             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": "empty", "volume_missing": True})
+ 
+         df = df_raw.reset_index()
+         raw_keys = list(df.columns)
+         df_norm, meta = normalize_ohlcv(df)
+         df_norm = df_norm.tail(days) if days else df_norm
+         meta.update(
+             {
+                 "provider": self.name,
+                 "source": self.name,
+                 "raw_keys": raw_keys,
+                 "rows": len(df_norm),
+             }
+         )
+         return OHLCVResult(df_norm, meta)
+ 
+ 
+ class ChainOHLCVProvider:
+     def __init__(self, providers: Iterable[OHLCVProvider], *, env: str | None = None, cache_dir: Path | None = None) -> None:
+         self.providers: List[OHLCVProvider] = list(providers)
+-        base_cache = cache_dir or (Path(__file__).resolve().parent.parent / "state" / "ohlcv_cache")
++        base_cache = cache_dir or get_ohlcv_cache_dir()
+         self.cache_dir = base_cache / env if env else base_cache
+         self.cache_dir.mkdir(parents=True, exist_ok=True)
+         self._memory_cache: dict[tuple[str, int], OHLCVResult] = {}
+ 
+     def _cache_path(self, symbol: str) -> Path:
+         return self.cache_dir / f"{symbol}.parquet"
+ 
+     def _load_cache(self, symbol: str, days: int) -> OHLCVResult | None:
+         path = self._cache_path(symbol)
+         if not path.exists():
+             return None
+         try:
+             df = pd.read_parquet(path)
+         except Exception as exc:  # pragma: no cover - corrupted cache
+             logger.warning("[OHLCV][CACHE][READ_FAIL] path=%s err=%s", path, exc)
+             return None
+         df = df.sort_values("date")
+         df = df.tail(days) if days else df
+         volume_missing = "volume" not in df.columns or df["volume"].isna().all()
+         meta = {"provider": "cache", "source": "cache", "cache_path": str(path), "rows": len(df), "volume_missing": volume_missing, "cache_hit": True}
+         return OHLCVResult(df, meta)
+ 
+     def _persist_cache(self, symbol: str, df: pd.DataFrame) -> None:
+         path = self._cache_path(symbol)
+         try:

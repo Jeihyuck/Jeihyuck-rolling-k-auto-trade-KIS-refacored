@@ -40,6 +40,7 @@ jobs:
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+      TRADER_CACHE_ROOT: "bot_state/runtime"
       BOTSTATE_WORKTREE_DIR: "_botstate"
 
       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
