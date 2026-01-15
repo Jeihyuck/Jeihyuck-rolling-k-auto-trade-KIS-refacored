@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from trader.botstate_paths import botstate_path, get_botstate_root
 from trader.botstate_sync import (
     acquire_lock,
     persist_run_files,
@@ -33,17 +34,16 @@ def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
 
 def _collect_paths(base_dir: Path) -> list[Path]:
     paths: list[Path] = []
-    _add_if_exists(paths, base_dir / "bot_state/db/pbcore.sqlite3")
-    _add_if_exists(paths, base_dir / "bot_state/state.json")
-    _add_if_exists(paths, base_dir / "bot_state/runtime/state.json")
-    _add_if_exists(paths, base_dir / "bot_state/runtime/lot_state.json")
-    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/latest.json")
-    _add_glob(paths, base_dir, "bot_state/universe_lkg/**/best_k_meta/history/*.json")
-    _add_if_exists(paths, base_dir / "trader/state/state.json")
-    _add_if_exists(paths, base_dir / "trader/state/strategy_intents.jsonl")
-    _add_if_exists(paths, base_dir / "trader/state/strategy_intents_state.json")
-    _add_if_exists(paths, base_dir / "trader/state/diagnostics/diag_latest.json")
-    _add_glob(paths, base_dir, "trader/state/diagnostics/diag_*.json")
+    bot_root = get_botstate_root()
+    _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
+    _add_if_exists(paths, bot_root / "runtime/state.json")
+    _add_if_exists(paths, bot_root / "runtime/lot_state.json")
+    _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
+    _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
+    _add_if_exists(paths, botstate_path("runtime", "strategy_intents.jsonl"))
+    _add_if_exists(paths, botstate_path("runtime", "strategy_intents_state.json"))
+    _add_if_exists(paths, botstate_path("runtime", "diagnostics", "diag_latest.json"))
+    _add_glob(paths, bot_root, "runtime/diagnostics/diag_*.json")
     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
     return paths
 

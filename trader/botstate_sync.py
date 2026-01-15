@@ -22,13 +22,21 @@ BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
 DEFAULT_LOCK_TTL_SEC = 240
 DEFAULT_LOCK_RETRY_SEC = 55
 DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
+DEFAULT_LOCK_BUFFER_SEC = 180
 
 
-def _lock_ttl_sec() -> int:
+def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
     try:
-        return int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
+        buffer_sec = int(os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)))
     except Exception:
-        return DEFAULT_LOCK_TTL_SEC
+        buffer_sec = DEFAULT_LOCK_BUFFER_SEC
+    try:
+        base_sec = int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
+    except Exception:
+        base_sec = DEFAULT_LOCK_TTL_SEC
+    ttl_base = max_seconds if max_seconds > 0 else base_sec
+    ttl_sec = ttl_base + buffer_sec
+    return ttl_sec, buffer_sec
 
 
 def _lock_retry_total_sec() -> int:
@@ -163,15 +171,19 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     worktree_dir = worktree_dir.resolve()
     worktree_dir.mkdir(parents=True, exist_ok=True)
     _configure_safe_directories(base_dir, worktree_dir)
+    status = _run(["git", "-C", str(base_dir), "status", "--porcelain"], check=True).stdout.strip()
+    if status:
+        raise RuntimeError(f"code worktree dirty; refusing botstate sync: {status}")
 
     remote = "origin"
     remote_ref = f"{remote}/{target_branch}"
 
     if (worktree_dir / ".git").exists():
         _run(["git", "-C", str(worktree_dir), "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
-        _run(["git", "fetch", remote, target_branch], cwd=base_dir)
+        _run(["git", "-C", str(worktree_dir), "fetch", remote, target_branch], cwd=base_dir)
         _run(["git", "-C", str(worktree_dir), "checkout", "-B", target_branch], cwd=base_dir)
         _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+        os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
         return
 
     _run(["git", "fetch", remote, target_branch], cwd=base_dir)
@@ -180,6 +192,7 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
         cwd=base_dir,
     )
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+    os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
 
 
 def _lock_path(worktree_dir: Path) -> Path:
@@ -193,8 +206,8 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
     branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
-    ttl_env = _lock_ttl_sec()
-    ttl_sec = ttl_sec if ttl_sec is not None else ttl_env
+    if ttl_sec is None:
+        ttl_sec, _ = compute_lock_ttl(0)
     retry_total_sec = max(0, _lock_retry_total_sec())
     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
     deadline_ts = time.time() + retry_total_sec

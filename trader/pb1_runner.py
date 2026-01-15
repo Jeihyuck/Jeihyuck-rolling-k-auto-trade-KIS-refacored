@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
-    BOTSTATE_LOCK_TTL_SEC,
     CLOSE_AUCTION_END,
     CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
@@ -28,9 +27,15 @@ from trader.config import (
     PB1_WAIT_FOR_WINDOW,
     resolve_strategy_mode,
 )
-from trader.botstate_sync import acquire_lock as acquire_botstate_lock
-from trader.botstate_sync import persist_run_files, release_lock as release_botstate_lock
-from trader.botstate_sync import resolve_botstate_worktree_dir, setup_worktree
+from trader.botstate_paths import get_botstate_root
+from trader.botstate_sync import (
+    acquire_lock as acquire_botstate_lock,
+    compute_lock_ttl,
+    persist_run_files,
+    release_lock as release_botstate_lock,
+    resolve_botstate_worktree_dir,
+    setup_worktree,
+)
 from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
@@ -222,15 +227,8 @@ def _parse_int_env(name: str, default: int) -> int:
         return default
 
 
-def _resolve_lock_ttl(max_seconds: int) -> tuple[int, int]:
-    buffer_sec = _parse_int_env("BOTSTATE_LOCK_TTL_BUFFER_SEC", 180)
-    base_sec = max_seconds if max_seconds > 0 else BOTSTATE_LOCK_TTL_SEC
-    ttl_sec = base_sec + buffer_sec
-    return ttl_sec, buffer_sec
-
-
 def _collect_botstate_files(since_ts: float) -> list[Path]:
-    base_dir = Path("bot_state")
+    base_dir = get_botstate_root()
     if not base_dir.exists():
         touched: list[Path] = []
     else:
@@ -689,7 +687,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     total_start_ts = time_mod.monotonic()
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec, ttl_buffer = _resolve_lock_ttl(max_seconds)
+    ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
     logger.info(
         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
         ttl_sec,
@@ -900,7 +898,7 @@ def main() -> None:
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec, ttl_buffer = _resolve_lock_ttl(run_loop_minutes * 60)
+    ttl_sec, ttl_buffer = compute_lock_ttl(run_loop_minutes * 60)
     logger.info(
         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
         ttl_sec,

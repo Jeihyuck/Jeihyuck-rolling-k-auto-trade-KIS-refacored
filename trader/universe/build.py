@@ -20,6 +20,7 @@ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
+from trader.botstate_paths import ensure_not_repo_tracked_path
 
 from datetime import date
 
@@ -187,6 +188,7 @@ def _sanitize_members(
 
 def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
     try:
+        ensure_not_repo_tracked_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["code", "name"])
@@ -198,6 +200,7 @@ def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
                 writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
     except Exception:
         logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
+        raise
 
 
 def _load_static_seed() -> dict | None:

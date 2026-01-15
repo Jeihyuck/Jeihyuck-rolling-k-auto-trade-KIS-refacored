@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
 
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
 from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
 
 # =========================
@@ -98,15 +99,15 @@ CONFIG = {
     "DIAGNOSTIC_MODE": "false",
     "DIAGNOSTIC_ONLY": "false",
     "DIAGNOSTIC_FORCE_RUN": "false",
-    "DIAGNOSTIC_DUMP_PATH": "trader/state/diagnostics",
+    "DIAGNOSTIC_DUMP_PATH": "runtime/diagnostics",
     "DIAGNOSTIC_TARGET_MARKETS": "",
     "DIAGNOSTIC_MAX_SYMBOLS": "200",
     # === Strategy intent/exec defaults ===
     "ENABLED_STRATEGIES": "",
     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
     "STRATEGY_DRY_RUN": "true",
-    "STRATEGY_INTENTS_PATH": "trader/state/strategy_intents.jsonl",
-    "STRATEGY_INTENTS_STATE_PATH": "trader/state/strategy_intents_state.json",
+    "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
+    "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
     "STRATEGY_MAX_OPEN_INTENTS": "20",
     "STRATEGY_MAX_POSITION_PCT": "0.10",
     "STRATEGY_ALLOW_SELL_ONLY": "false",
@@ -115,12 +116,12 @@ CONFIG = {
     "DISABLE_KOSPI_ENGINE": "false",
     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
     "ALLOW_ADOPT_UNMANAGED": "false",
-    "STATE_PATH": "trader/state/state.json",
+    "STATE_PATH": "runtime/state.json",
     # PB1 close-pullback defaults
     "ENABLE_BREAKOUT": "false",
     "LEDGER_LOOKBACK_DAYS": "120",
     "BOTSTATE_LOCK_TTL_SEC": "240",
-    "LEDGER_BASE_DIR": "bot_state/trader_ledger",
+    "LEDGER_BASE_DIR": "trader_ledger",
     "PB1_ENTRY_ENABLED": "true",
     "PB1_ENTRY_WINDOW_START": "08:50",
     "PB1_ENTRY_OPEN_END": "09:05",
@@ -140,6 +141,8 @@ CONFIG = {
     "PB1_FORCE_ENTRY_ON_PUSH": "1",
     "PB1_WAIT_FOR_WINDOW": "1",
     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
+    "PB1_ALLOW_ADD_TO_EXISTING": "0",
+    "MIN_ORDER_KRW": "0",
     "MARKET_OPEN_HHMM": "08:50",
     "MARKET_CLOSE_HHMM": "15:30",
     "PB1_PULLBACK_BAND_KOSPI": "3,8",
@@ -195,10 +198,12 @@ LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
 STATE_DIR_RAW = _cfg("STATE_DIR")
-STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else Path(__file__).parent / "state"
+STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else botstate_path("runtime")
 STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
+ensure_not_repo_tracked_path(STATE_PATH)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-PBCORE_DB_PATH = os.getenv("PBCORE_DB_PATH", "bot_state/db/pbcore.sqlite3")
+PBCORE_DB_PATH = os.getenv("PBCORE_DB_PATH") or str(botstate_path("db", "pbcore.sqlite3"))
+Path(PBCORE_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
@@ -304,9 +309,29 @@ else:
 STRATEGY_MODE = resolve_mode(_cfg("STRATEGY_MODE") or "INTENT_ONLY")
 _STRATEGY_DRY_RUN_DEFAULT = _cfg_bool("STRATEGY_DRY_RUN", fallback=True)
 STRATEGY_DRY_RUN = env_bool("DRY_RUN", default=_STRATEGY_DRY_RUN_DEFAULT)
-STRATEGY_INTENTS_PATH = Path(_cfg("STRATEGY_INTENTS_PATH") or CONFIG["STRATEGY_INTENTS_PATH"])
+
+
+def _resolve_min_order_krw() -> float:
+    raw = _cfg("MIN_ORDER_KRW") or "0"
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("[CONFIG] MIN_ORDER_KRW invalid=%s -> fallback=100000", raw)
+        value = 0.0
+    if value <= 0:
+        logger.warning("[CONFIG] MIN_ORDER_KRW=%s -> fallback=100000", raw)
+        value = 100000.0
+    if STRATEGY_MODE == "LIVE" and value < 50000:
+        raise RuntimeError(f"MIN_ORDER_KRW too low for LIVE mode: {value}")
+    return value
+
+
+MIN_ORDER_KRW = _resolve_min_order_krw()
+STRATEGY_INTENTS_PATH = Path(
+    _cfg("STRATEGY_INTENTS_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_PATH"]).parts)
+)
 STRATEGY_INTENTS_STATE_PATH = Path(
-    _cfg("STRATEGY_INTENTS_STATE_PATH") or CONFIG["STRATEGY_INTENTS_STATE_PATH"]
+    _cfg("STRATEGY_INTENTS_STATE_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_STATE_PATH"]).parts)
 )
 STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
 STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
@@ -316,8 +341,11 @@ DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
 DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
 DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
 DIAGNOSTIC_DUMP_DIR = Path(
-    _cfg("DIAGNOSTIC_DUMP_DIR") or _cfg("DIAGNOSTIC_DUMP_PATH") or CONFIG["DIAGNOSTIC_DUMP_PATH"]
+    _cfg("DIAGNOSTIC_DUMP_DIR")
+    or _cfg("DIAGNOSTIC_DUMP_PATH")
+    or botstate_path(*Path(CONFIG["DIAGNOSTIC_DUMP_PATH"]).parts)
 )
+ensure_not_repo_tracked_path(DIAGNOSTIC_DUMP_DIR)
 DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
 DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
 DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
@@ -441,7 +469,8 @@ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
 PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
 LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
 BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
-LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or "bot_state/trader_ledger")
+LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or botstate_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
+ensure_not_repo_tracked_path(LEDGER_BASE_DIR)
 MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
 MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "15:20"
 MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
@@ -484,6 +513,7 @@ PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or "60")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
 PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
 PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
+PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 

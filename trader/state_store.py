@@ -8,7 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from .config import ACTIVE_STRATEGIES, KST, STATE_PATH, UNMANAGED_STRATEGY_ID
+from trader.botstate_paths import botstate_path
+from .config import ACTIVE_STRATEGIES, KST, UNMANAGED_STRATEGY_ID
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ def get_state_path() -> Path:
     env_path = os.getenv("STATE_PATH")
     if env_path:
         return Path(env_path)
-    return Path(STATE_PATH)
+    return botstate_path("runtime", "state.json")
 
 
 def get_runtime_paths() -> tuple[Path, Path]:

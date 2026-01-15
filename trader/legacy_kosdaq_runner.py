@@ -14,6 +14,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from trader.utils.env import env_bool
+from trader.botstate_paths import botstate_path
 
 
 try:
@@ -147,7 +148,7 @@ def main(
     state_loaded_midnight = f"{state_loaded_date} 00:00:00"
 
     holding, traded = load_state()
-    lot_state_path = "bot_state/state.json"
+    lot_state_path = str(botstate_path("runtime", "lot_state.json"))
     lot_state = load_lot_state(lot_state_path)
     position_state_path = str(STATE_PATH)
     position_state = load_position_state(position_state_path)

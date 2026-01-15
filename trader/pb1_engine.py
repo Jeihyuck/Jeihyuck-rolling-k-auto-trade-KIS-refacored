@@ -32,6 +32,8 @@ from trader.config import (
     PB1_ENTRY_WINDOW_END,
     PB1_EXIT_WINDOW_START,
     PB1_EXIT_WINDOW_END,
+    PB1_ALLOW_ADD_TO_EXISTING,
+    MIN_ORDER_KRW,
     resolve_market_window,
 )
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, UniverseRepo
@@ -1189,8 +1191,8 @@ class PB1Engine:
         entry_allowed = self.entry_enabled
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
         max_positions = int(PB1_MAX_POSITIONS)
-        target_new_positions = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
-        min_order_krw = self._float_env("MIN_ORDER_KRW", 0.0)
+        target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
+        min_order_krw = float(MIN_ORDER_KRW)
         entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
         skip_entry_scan = False
         if not entry_allowed:
@@ -1235,6 +1237,8 @@ class PB1Engine:
             )
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
+        existing_positions_count = len(existing_positions)
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")
@@ -1243,15 +1247,19 @@ class PB1Engine:
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         available_cash_krw = self._extract_available_cash(holdings_summary)
+        slots_remaining = max(0, max_positions - existing_positions_count)
+        target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
+        allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
         logger.info(
-            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s",
+            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
             max_positions,
             target_new_positions,
             entry_capital_krw,
             min_order_krw,
             entry_cutoff_raw,
-            len(positions),
+            existing_positions_count,
             f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
+            allow_add_to_existing,
         )
         if self.phase in {"verify", "exit"}:
             holdings = list(holdings_rows or [])
@@ -1317,10 +1325,21 @@ class PB1Engine:
                     for reason in cf.reasons or ["unspecified_fail"]:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
 
-            slots_remaining = max(0, max_positions - len(positions))
-            new_position_limit = max(0, min(target_new_positions, slots_remaining))
-            buyable_candidates: list[CandidateFeature] = []
+            new_position_limit = target_new_positions
+            held_codes = {p.get("code") for p in existing_positions if p.get("code")}
+            open_orders = self.orders_repo.get_open_orders(self.env)
+            open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+            orderable_candidates: list[CandidateFeature] = []
             for cf in ok_after_risk:
+                if not allow_add_to_existing and cf.code in held_codes:
+                    self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
+                    continue
+                if cf.code in open_buy_codes:
+                    self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
+                    continue
+                if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
+                    self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                    continue
                 order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                 reasons: list[str] = []
                 if new_position_limit <= 0:
@@ -1337,22 +1356,18 @@ class PB1Engine:
                     reasons.append("order_value_zero")
                 if available_cash_krw is not None and order_value > available_cash_krw:
                     reasons.append("insufficient_cash")
-                if not reasons and len(buyable_candidates) >= new_position_limit:
+                if not reasons and len(orderable_candidates) >= new_position_limit:
                     reasons.append("target_new_positions_limit")
                 if reasons:
                     for reason in reasons:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                     continue
-                buyable_candidates.append(cf)
+                orderable_candidates.append(cf)
+                if len(orderable_candidates) >= new_position_limit:
+                    break
 
-            after_buyable_check_count = len(buyable_candidates)
-            dedup_candidates: list[CandidateFeature] = []
-            for cf in buyable_candidates:
-                if self._should_block_order(cf.client_order_key or ""):
-                    self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
-                    continue
-                dedup_candidates.append(cf)
-            after_dedup_count = len(dedup_candidates)
+            after_buyable_check_count = len(orderable_candidates)
+            after_dedup_count = len(orderable_candidates)
 
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
@@ -1401,14 +1416,14 @@ class PB1Engine:
             if self.phase in {"entry", "trade"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
-                orderable_candidates = dedup_candidates if entry_allowed else []
+                orderable_candidates = orderable_candidates if entry_allowed else []
                 if ok_count > 0 and not orderable_candidates:
                     no_orders_reasons: list[str] = []
                     if not entry_allowed:
                         no_orders_reasons.append("entry_disabled")
                     if skip_entry_scan:
                         no_orders_reasons.append("entry_cutoff")
-                    if max_positions - len(positions) <= 0:
+                    if max_positions - existing_positions_count <= 0:
                         no_orders_reasons.append("max_positions")
                     if target_new_positions <= 0:
                         no_orders_reasons.append("target_new_positions_zero")
@@ -1418,8 +1433,8 @@ class PB1Engine:
                         no_orders_reasons.append("available_cash_zero")
                     if min_order_krw > 0 and after_buyable_check_count == 0:
                         no_orders_reasons.append("min_order_krw")
-                    if any(reason == "duplicate_order" for reason, _ in drop_reason_counter.most_common()):
-                        no_orders_reasons.append("duplicate_order")
+                    if not no_orders_reasons:
+                        no_orders_reasons.append("exhausted_candidates")
                     final_status = "NO_TRADE"
                     final_notes = f"no_orders:{no_orders_reasons or 'none'}"
                     logger.info(

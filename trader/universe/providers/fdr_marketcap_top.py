@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Iterable
 
 import pandas as pd
@@ -33,19 +34,48 @@ def _filter_market(df: pd.DataFrame, market_col: str, market_name: str) -> pd.Da
     return df[market_series.str.contains(market_name.upper(), na=False)].copy()
 
 
-def _normalize_rows(df: pd.DataFrame, code_col: str, name_col: str | None) -> list[dict]:
+def _normalize_rows(
+    df: pd.DataFrame,
+    *,
+    code_col: str,
+    name_col: str | None,
+    cap_col: str,
+    market_col: str,
+    market_name: str,
+    target: int,
+) -> tuple[list[dict], Counter[str]]:
     rows: list[dict] = []
+    dropped: Counter[str] = Counter()
+    seen: set[str] = set()
     for _, row in df.iterrows():
+        if len(rows) >= target:
+            break
+        market_val = str(row.get(market_col) or "").upper()
+        if market_name.upper() not in market_val:
+            dropped["non_target_market"] += 1
+            continue
         code = _normalize_code(row.get(code_col))
         if not code:
+            dropped["invalid_code"] += 1
             continue
+        try:
+            marcap = float(row.get(cap_col))
+        except Exception:
+            marcap = 0.0
+        if pd.isna(marcap) or marcap <= 0:
+            dropped["nan_marcap"] += 1
+            continue
+        if code in seen:
+            dropped["dup_code"] += 1
+            continue
+        seen.add(code)
         name = None
         if name_col:
             raw_name = row.get(name_col)
             if raw_name is not None:
                 name = str(raw_name).strip() or None
         rows.append({"code": code, "name": name})
-    return rows
+    return rows, dropped
 
 
 def fetch_marketcap_top(targets: dict[str, int]) -> dict[str, list[dict]]:
@@ -72,15 +102,38 @@ def fetch_marketcap_top(targets: dict[str, int]) -> dict[str, list[dict]]:
     results: dict[str, list[dict]] = {}
     for market_name in ("KOSPI", "KOSDAQ"):
         market_df = _filter_market(listing, market_col, market_name)
-        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce").fillna(0)
+        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce")
         market_df = market_df.sort_values(cap_col, ascending=False)
         limit = max(0, int(targets.get(market_name, 0)))
-        logger.info("[UNIVERSE][FDR][SORT] market=%s column=%s order=desc limit=%s", market_name, cap_col, limit)
-        top_df = market_df.head(limit)
-        rows = _normalize_rows(top_df, code_col, name_col)
+        candidate_limit = max(limit * 3, limit)
+        logger.info(
+            "[UNIVERSE][FDR][SORT] market=%s column=%s order=desc limit=%s candidate_limit=%s",
+            market_name,
+            cap_col,
+            limit,
+            candidate_limit,
+        )
+        top_df = market_df.head(candidate_limit)
+        rows, dropped = _normalize_rows(
+            top_df,
+            code_col=code_col,
+            name_col=name_col,
+            cap_col=cap_col,
+            market_col=market_col,
+            market_name=market_name,
+            target=limit,
+        )
         sample_codes = [row["code"] for row in rows[:5]]
         logger.info("[UNIVERSE][FDR][SAMPLE] market=%s codes=%s", market_name, sample_codes)
         logger.info("[UNIVERSE][FDR][SELECTED] market=%s count=%s", market_name, len(rows))
+        if len(rows) < limit:
+            logger.warning(
+                "[UNIVERSE][FDR][FILLDOWN][WARN] market=%s target=%s selected=%s dropped=%s",
+                market_name,
+                limit,
+                len(rows),
+                dict(dropped),
+            )
         results[market_name] = rows
 
     total_count = sum(len(rows) for rows in results.values())
