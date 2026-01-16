@@ -44,6 +44,7 @@ from trader.kis_wrapper import KisAPI
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
 from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
+from trader.eventlog import emit_event
 from trader.utils.env import env_bool, parse_env_flag
 from trader.window_router import WindowDecision
 
@@ -480,6 +481,37 @@ class PB1Engine:
             )
         except Exception:
             logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", cf.code)
+
+    def _emit_buy_decision(
+        self,
+        cf: CandidateFeature,
+        *,
+        order_value: float,
+        reasons: list[str],
+        entry_allowed: bool,
+        entry_reason: str,
+    ) -> None:
+        price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
+        buyable = entry_allowed and not reasons
+        reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
+        emit_event(
+            as_of=self._today,
+            event="PB1_BUY_DECISION",
+            code=cf.code,
+            market=cf.market,
+            score=float(cf.score or 0.0),
+            qty=int(cf.planned_qty or 0),
+            price=float(price or 0.0),
+            notional=float(order_value or 0.0),
+            buyable=buyable,
+            reasons=reasons_out,
+        )
+        if not buyable:
+            logger.info(
+                "[PB1][BUY][SKIP] code=%s reasons=%s",
+                self._display_code(cf.code),
+                reasons_out,
+            )
 
     def _fetch_holdings_snapshot(self) -> dict:
         if self._balance_snapshot is not None:
@@ -1021,6 +1053,16 @@ class PB1Engine:
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
             return
+        emit_event(
+            as_of=self._today,
+            event="ORDER_SUBMIT",
+            side="BUY",
+            code=cf.code,
+            qty=cf.planned_qty,
+            price=float(cf.features.get("close") or 0.0),
+            order_type="MARKET",
+            client_order_key=cf.client_order_key,
+        )
         resp = None
         kis_odno = None
         try:
@@ -1029,6 +1071,28 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        emit_event(
+            as_of=self._today,
+            event="ORDER_RESULT",
+            side="BUY",
+            code=cf.code,
+            ok=ok,
+            rt_cd=rt_cd,
+            msg_cd=msg_cd,
+            msg1=msg1,
+            kis_odno=kis_odno,
+        )
+        logger.info(
+            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s rt_cd=%s msg_cd=%s",
+            display_code,
+            int(ok),
+            rt_cd,
+            msg_cd,
+        )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
             filled_at = now_kst()
@@ -1155,6 +1219,16 @@ class PB1Engine:
         if not self.kis:
             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
             return
+        emit_event(
+            as_of=self._today,
+            event="ORDER_SUBMIT",
+            side="BUY",
+            code=cf.code,
+            qty=cf.planned_qty,
+            price=float(cap),
+            order_type="LIMIT",
+            client_order_key=cf.client_order_key,
+        )
         resp = None
         kis_odno = None
         try:
@@ -1163,6 +1237,28 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        emit_event(
+            as_of=self._today,
+            event="ORDER_RESULT",
+            side="BUY",
+            code=cf.code,
+            ok=ok,
+            rt_cd=rt_cd,
+            msg_cd=msg_cd,
+            msg1=msg1,
+            kis_odno=kis_odno,
+        )
+        logger.info(
+            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s rt_cd=%s msg_cd=%s",
+            display_code,
+            int(ok),
+            rt_cd,
+            msg_cd,
+        )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
             self._append_close_entry_record(
@@ -1200,6 +1296,78 @@ class PB1Engine:
             mark = features.get("close") or avg
         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
+
+        holding_days = pos.get("holding_days") or 0
+        stage = "EXIT"
+        decision_reasons: list[str] = []
+        should_sell = False
+        if mode == 1:
+            atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
+            r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
+            take_profit = PB1_DAY_TP_R * r_pct
+            stop_loss = PB1_DAY_SL_R * r_pct
+            if window_tag != "morning":
+                decision_reasons = ["sell_disabled"]
+            else:
+                stage = "DAY-EXIT"
+                if ret_pct >= take_profit:
+                    decision_reasons.append("take_profit_hit")
+                if ret_pct <= -stop_loss:
+                    decision_reasons.append("stop_loss_hit")
+                if decision_reasons:
+                    should_sell = True
+                else:
+                    decision_reasons = ["time_stop"]
+                    should_sell = True
+        else:
+            hard_stop = KOSDAQ_HARD_STOP_PCT if market == "KOSDAQ" else KOSPI_HARD_STOP_PCT
+            if ret_pct <= -hard_stop:
+                stage = "HARD-STOP"
+                if window_tag not in {"morning", "close"}:
+                    decision_reasons = ["sell_disabled"]
+                else:
+                    decision_reasons = ["stop_loss_hit"]
+                    should_sell = True
+            else:
+                if window_tag != "close":
+                    decision_reasons = ["sell_disabled"]
+                else:
+                    close_px = features.get("close")
+                    ma20 = features.get("ma20")
+                    if holding_days >= PB1_TIME_STOP_DAYS:
+                        stage = "TIME-STOP"
+                        decision_reasons = ["time_stop"]
+                        should_sell = True
+                    elif close_px is not None and ma20 is not None and close_px < ma20:
+                        stage = "MA20-TRAIL"
+                        decision_reasons = ["trailing_stop_hit"]
+                        should_sell = True
+                    else:
+                        decision_reasons = ["ok_hold"]
+        if not decision_reasons:
+            decision_reasons = ["ok_hold"]
+
+        emit_event(
+            as_of=self._today,
+            event="PB1_SELL_DECISION",
+            code=str(code),
+            qty=int(qty),
+            avg_price=float(avg),
+            mark=float(mark),
+            pnl_pct=float(ret_pct),
+            should_sell=bool(should_sell),
+            reasons=decision_reasons,
+        )
+        logger.info(
+            "[PB1][SELL][DECISION] code=%s should_sell=%s reasons=%s",
+            display_code,
+            int(should_sell),
+            decision_reasons,
+        )
+
+        if not should_sell:
+            return
+
         if self._should_block_order(client_key):
             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
             try:
@@ -1220,40 +1388,7 @@ class PB1Engine:
                 logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
             return
 
-        holding_days = pos.get("holding_days") or 0
-        if mode == 1:
-            atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
-            r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
-            take_profit = PB1_DAY_TP_R * r_pct
-            stop_loss = PB1_DAY_SL_R * r_pct
-            if window_tag != "morning":
-                return
-            stage = "DAY-EXIT"
-            reasons: list[str] = []
-            if ret_pct >= take_profit:
-                reasons.append("take_profit")
-            if ret_pct <= -stop_loss:
-                reasons.append("stop_loss")
-            if not reasons:
-                reasons.append("time_exit")
-        else:
-            hard_stop = KOSDAQ_HARD_STOP_PCT if market == "KOSDAQ" else KOSPI_HARD_STOP_PCT
-            if ret_pct <= -hard_stop:
-                stage = "HARD-STOP"
-                if window_tag not in {"morning", "close"}:
-                    return
-            else:
-                if window_tag != "close":
-                    return
-                close_px = features.get("close")
-                ma20 = features.get("ma20")
-                if holding_days >= PB1_TIME_STOP_DAYS:
-                    stage = "TIME-STOP"
-                elif close_px is not None and ma20 is not None and close_px < ma20:
-                    stage = "MA20-TRAIL"
-                else:
-                    return
-            reasons = ["pb1_exit"]
+        reasons = decision_reasons
 
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
@@ -1334,6 +1469,16 @@ class PB1Engine:
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
             return
+        emit_event(
+            as_of=self._today,
+            event="ORDER_SUBMIT",
+            side="SELL",
+            code=code,
+            qty=qty,
+            price=float(mark),
+            order_type="MARKET",
+            client_order_key=client_key,
+        )
         resp = None
         kis_odno = None
         try:
@@ -1342,6 +1487,28 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        emit_event(
+            as_of=self._today,
+            event="ORDER_RESULT",
+            side="SELL",
+            code=code,
+            ok=ok,
+            rt_cd=rt_cd,
+            msg_cd=msg_cd,
+            msg1=msg1,
+            kis_odno=kis_odno,
+        )
+        logger.info(
+            "[PB1][ORDER][RESULT] side=SELL code=%s ok=%s rt_cd=%s msg_cd=%s",
+            display_code,
+            int(ok),
+            rt_cd,
+            msg_cd,
+        )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
             filled_at = now_kst()
@@ -1604,6 +1771,8 @@ class PB1Engine:
         final_status = "OK"
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
+        entry_reason = "ok"
+        entry_summary_emitted = False
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
@@ -1612,6 +1781,10 @@ class PB1Engine:
         skip_entry_scan = False
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
+            entry_reason = "entry_disabled"
+        if self.phase == "verify":
+            entry_allowed = False
+            entry_reason = "phase_verify"
         logger.info(
             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
             self.window_label,
@@ -1620,10 +1793,20 @@ class PB1Engine:
             self.dry_run,
             self.env,
         )
+        emit_event(
+            as_of=self._today,
+            event="PB1_RUN_START",
+            env=self.env,
+            window=self.window_label,
+            phase=self.phase,
+            dry_run=self.dry_run,
+            entry_enabled=self.entry_enabled,
+        )
 
         if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
             skip_entry_scan = True
             entry_allowed = False
+            entry_reason = "entry_cutoff"
             logger.info(
                 "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
                 self._now_kst.isoformat(),
@@ -1632,6 +1815,29 @@ class PB1Engine:
             if self.phase in {"prep", "entry"}:
                 final_status = "SKIPPED"
                 final_notes = "entry_cutoff"
+
+        if not entry_allowed:
+            logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
+
+        def _emit_entry_summary(
+            setup_ok_codes: list[str] | None,
+            orderable_candidates: list[CandidateFeature] | None,
+            drop_reason_counter: Counter[str] | None,
+        ) -> None:
+            nonlocal entry_summary_emitted
+            if entry_summary_emitted:
+                return
+            drop_reason_counter = drop_reason_counter or Counter()
+            emit_event(
+                as_of=self._today,
+                event="PB1_ENTRY_SUMMARY",
+                entry_allowed=entry_allowed,
+                entry_block_reason=entry_reason,
+                setup_ok_count=len(setup_ok_codes or []),
+                selected_count=len(orderable_candidates or []),
+                top_drop_reasons=drop_reason_counter.most_common(5),
+            )
+            entry_summary_emitted = True
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
@@ -1671,6 +1877,7 @@ class PB1Engine:
             final_status = "OK"
             final_notes = "verify_only"
             self._log_reason_summary(final_notes)
+            _emit_entry_summary([], [], Counter())
             return RunResult(
                 status=final_status,
                 notes=final_notes,
@@ -1680,11 +1887,22 @@ class PB1Engine:
             )
 
         members = self._load_universe()
+        emit_event(
+            as_of=self._today,
+            event="PB1_UNIVERSE_STATUS",
+            ok=bool(members),
+            universe_members=len(members),
+            universe_as_of=self._universe_as_of,
+        )
         if not members:
             note = "universe_empty"
             logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
             self._log_reason_summary("universe_empty")
+            entry_reason = "universe_empty"
+            entry_allowed = False
+            logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
             if self.phase in {"prep", "entry"}:
+                _emit_entry_summary([], [], Counter())
                 return RunResult(
                     status="SKIPPED",
                     notes=note,
@@ -1706,6 +1924,7 @@ class PB1Engine:
         after_risk_check_count = 0
         after_buyable_check_count = 0
         after_dedup_count = 0
+        orderable_candidates: list[CandidateFeature] = []
         if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
             candidates = self._compute_candidates(members)
             (
@@ -1741,25 +1960,52 @@ class PB1Engine:
                     limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
                 today_spent += qty * float(limit_price or 0.0)
             planned_spent = today_spent
-            orderable_candidates: list[CandidateFeature] = []
             for cf in ok_after_risk:
+                order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                 if not allow_add_to_existing and cf.code in held_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
                     self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["holding_position"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
                     continue
                 if cf.code in open_buy_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
                     self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["open_order"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
                     continue
                 if cf.code in today_buy_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
                     self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["today_buy_exists"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
                     continue
                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
                     self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["duplicate_order"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
                     continue
-                order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                 reasons: list[str] = []
                 if new_position_limit <= 0:
                     reasons.append("max_positions")
@@ -1783,8 +2029,22 @@ class PB1Engine:
                     for reason in reasons:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                     self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=reasons,
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
                     continue
                 orderable_candidates.append(cf)
+                self._emit_buy_decision(
+                    cf,
+                    order_value=order_value,
+                    reasons=[],
+                    entry_allowed=entry_allowed,
+                    entry_reason=entry_reason,
+                )
                 planned_spent += order_value
                 if len(orderable_candidates) >= new_position_limit:
                     break
@@ -1816,6 +2076,7 @@ class PB1Engine:
                 drop_reason_counter.most_common(3),
                 {k: v for k, v in drop_examples.items() if v},
             )
+            _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
                 top_reasons = all_reason_counts.most_common(3)
                 final_status = "NO_TRADE"
@@ -1829,6 +2090,7 @@ class PB1Engine:
                 )
                 if self.phase in {"prep", "entry"}:
                     self._log_reason_summary(final_notes)
+                    _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
                     return RunResult(
                         status=final_status,
                         notes=final_notes,
@@ -1866,6 +2128,7 @@ class PB1Engine:
                     )
                     if self.phase in {"prep", "entry"}:
                         self._log_reason_summary(final_notes)
+                        _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
                         return RunResult(
                             status=final_status,
                             notes=final_notes,
@@ -1878,6 +2141,7 @@ class PB1Engine:
                         self._place_entry_close(cf)
                     else:
                         self._place_entry(cf)
+        _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)

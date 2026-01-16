@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 import signal
 import time as time_mod
 from datetime import datetime, time as dtime, timedelta
@@ -43,12 +44,47 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
-from trader.runtime_store import check_universe_ready
+from trader.runtime_store import universe_check
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
+
+
+def universe_build_flag(as_of: str) -> Path:
+    return Path("bot_state/runtime") / f"universe_build_done_{as_of}.flag"
+
+
+def ensure_universe_built_once(as_of: str, reason: str) -> None:
+    ok, meta = universe_check(as_of)
+    flag = universe_build_flag(as_of)
+
+    if not ok:
+        return
+
+    if meta.get("have_today"):
+        return
+
+    if flag.exists():
+        return
+
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
+
+    cmd = [
+        "python",
+        "-m",
+        "trader.universe.build",
+        "--env",
+        os.getenv("KIS_ENV", ""),
+        "--strategy",
+        "best_k_meta",
+        "--date",
+        as_of,
+    ]
+    logger.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+    subprocess.run(cmd, check=False)
 
 
 def _resolve_market_context(
@@ -283,7 +319,7 @@ def _is_urgent_persist(touched: list[Path]) -> bool:
 
 
 def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> Path | None:
-    worktree_dir = resolve_botstate_worktree_dir()
+    worktree_dir = resolve_botstate_worktree_dir(Path.cwd())
     try:
         setup_worktree(Path.cwd(), worktree_dir)
     except Exception:
@@ -302,6 +338,9 @@ def run_once(
     window: WindowDecision | None = None,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
+    as_of = now.date().isoformat()
+    if not loop_mode:
+        ensure_universe_built_once(as_of, reason="auto_missing_today")
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
     if close_cancel_only:
@@ -615,12 +654,13 @@ def run_once(
     run_start_ts = time_mod.time()
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            universe_status = check_universe_ready(now.date())
-            if not universe_status["ok"]:
+            universe_ok, universe_meta = universe_check(as_of)
+            if not universe_ok:
                 if phase_for_log == "entry":
                     os.environ["PB1_ENTRY_ENABLED"] = "0"
-                    logger.info("[PB1][ENTRY_BLOCKED] reason=universe_not_ready date=%s", now.date().isoformat())
-                logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_not_ready date=%s", now.date().isoformat())
+                    logger.info("[PB1][ENTRY_BLOCKED] reason=universe_missing_both entry_allowed=0")
+                logger.info("[PB1][SKIP] reason=universe_missing_both as_of=%s", as_of)
+                logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_missing_both as_of=%s", as_of)
         kis: KisAPI | None = None
         try:
             kis = KisAPI()
@@ -766,6 +806,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
         loop_deadline.isoformat() if loop_deadline else "none",
         max_seconds,
     )
+    ensure_universe_built_once(now_kst_value.date().isoformat(), reason="auto_missing_today")
     exit_reason = "unknown"
     stop_requested = {"value": False}
     balance_api_calls = 0

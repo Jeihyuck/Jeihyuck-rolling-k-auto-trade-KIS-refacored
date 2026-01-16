@@ -70,7 +70,7 @@ def main() -> int:
 
     try:
         base_dir = Path.cwd().resolve()
-        worktree_dir = resolve_botstate_worktree_dir()
+        worktree_dir = resolve_botstate_worktree_dir(base_dir)
         setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
 
         owner = _resolve_owner()

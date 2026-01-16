@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import time
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
-DEFAULT_BOTSTATE_WORKTREE_DIR = "_botstate"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
 SYNC_MODE_FETCH_RESET = "FETCH_RESET"
 BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
@@ -54,8 +53,23 @@ def _lock_retry_sleep_sec() -> int:
         return DEFAULT_LOCK_RETRY_SLEEP_SEC
 
 
-def resolve_botstate_worktree_dir() -> Path:
-    return Path(os.getenv(BOTSTATE_WORKTREE_DIR_ENV, DEFAULT_BOTSTATE_WORKTREE_DIR)).resolve()
+def resolve_botstate_worktree_dir(repo_dir: Path) -> Path:
+    """
+    Priority:
+    1) BOTSTATE_WORKTREE_DIR env
+    2) GitHub Actions: $RUNNER_TEMP/botstate_worktree_<GITHUB_RUN_ID>
+    3) local: repo_dir / "_botstate"
+    """
+    raw = os.getenv(BOTSTATE_WORKTREE_DIR_ENV, "").strip()
+    if raw:
+        return Path(raw)
+
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        tmp = os.getenv("RUNNER_TEMP", "").strip() or "/tmp"
+        run_id = os.getenv("GITHUB_RUN_ID", "").strip() or "0"
+        return Path(tmp) / f"botstate_worktree_{run_id}"
+
+    return repo_dir / "_botstate"
 
 
 def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
@@ -74,18 +88,18 @@ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subp
 
 
 def git_porcelain(worktree_dir: Path) -> str:
-    return _git(worktree_dir, "status", "--porcelain").stdout
+    return _git_worktree(worktree_dir, "status", "--porcelain").stdout
 
 
 def stage_all(worktree_dir: Path) -> None:
-    _git(worktree_dir, "add", "-A")
+    _git_worktree(worktree_dir, "add", "-A")
 
 
 def commit_if_staged(worktree_dir: Path, message: str) -> bool:
-    diff_proc = _git(worktree_dir, "diff", "--cached", "--quiet", check=False)
+    diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
     if diff_proc.returncode == 0:
         return False
-    _git(worktree_dir, "commit", "-m", message)
+    _git_worktree(worktree_dir, "commit", "-m", message)
     return True
 
 
@@ -101,7 +115,7 @@ def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) ->
     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
 
 
-def _git(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git_worktree(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return _run(["git", "-C", str(worktree_dir), *args], check=check)
 
 
@@ -187,6 +201,64 @@ def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] |
     return lines
 
 
+def _git(repo_dir: Path, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=repo_dir, check=check, text=True, capture_output=True)
+
+
+def get_worktree_paths(repo_dir: Path) -> set[Path]:
+    """
+    Parse: git worktree list --porcelain
+    Return: set of worktree paths
+    """
+    out = _git(repo_dir, ["git", "worktree", "list", "--porcelain"], check=True).stdout.splitlines()
+    paths: set[Path] = set()
+    for line in out:
+        if line.startswith("worktree "):
+            p = line.split(" ", 1)[1].strip()
+            if p:
+                paths.add(Path(p).resolve())
+    return paths
+
+
+def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref: str) -> None:
+    """
+    Guarantee worktree_dir is usable.
+    - If dir exists but not registered: rmtree
+    - If registered: reuse
+    - If registered but broken: remove --force then recreate
+    """
+    wt = worktree_dir.resolve()
+    registered = get_worktree_paths(repo_dir)
+
+    if wt.exists() and wt not in registered:
+        logger.warning("[BOTSTATE][WORKTREE][DECISION] action=rmtree dir=%s registered=0", wt)
+        shutil.rmtree(wt, ignore_errors=True)
+
+    registered = get_worktree_paths(repo_dir)
+    if wt in registered:
+        logger.info("[BOTSTATE][WORKTREE][DECISION] action=reuse dir=%s", wt)
+        return
+
+    _git(repo_dir, ["git", "worktree", "prune"], check=False)
+    logger.info("[BOTSTATE][WORKTREE][DECISION] action=create dir=%s branch=%s ref=%s", wt, branch, remote_ref)
+    proc = _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=False)
+    if proc.returncode == 0:
+        logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s", wt)
+        return
+
+    logger.error(
+        "[BOTSTATE][WORKTREE][CREATE_FAIL] rc=%s stderr=%s",
+        proc.returncode,
+        (proc.stderr or "").strip(),
+    )
+    _git(repo_dir, ["git", "worktree", "remove", "--force", str(wt)], check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    _git(repo_dir, ["git", "worktree", "prune"], check=False)
+
+    _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=True)
+    logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s retried=1", wt)
+
+
 def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
     base_dir = base_dir.resolve()
     worktree_dir = worktree_dir.resolve()
@@ -197,71 +269,9 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
 
     remote = "origin"
     remote_ref = f"{remote}/{target_branch}"
-
-    list_proc = _run(
-        ["git", "-C", str(base_dir), "worktree", "list", "--porcelain"],
-        check=False,
-    )
-    worktree_paths = [
-        line.split(" ", 1)[1].strip()
-        for line in list_proc.stdout.splitlines()
-        if line.startswith("worktree ")
-    ]
-    logger.info("[BOTSTATE][WORKTREE] list=%s", worktree_paths)
-
-    registered = str(worktree_dir) in worktree_paths
-    exists = worktree_dir.exists()
-    if registered:
-        logger.info(
-            "[BOTSTATE][WORKTREE] dir=%s exists=%s registered=%s -> removing",
-            worktree_dir,
-            exists,
-            registered,
-        )
-        _run(
-            ["git", "-C", str(base_dir), "worktree", "remove", "--force", str(worktree_dir)],
-            check=False,
-        )
-        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
-    elif exists:
-        logger.info(
-            "[BOTSTATE][WORKTREE] dir=%s exists=%s registered=%s -> rmtree",
-            worktree_dir,
-            exists,
-            registered,
-        )
-        shutil.rmtree(worktree_dir, ignore_errors=True)
-
     _run(["git", "fetch", remote, "--prune"], cwd=base_dir)
-
-    add_proc = _run(
-        ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
-        cwd=base_dir,
-        check=False,
-    )
-    if add_proc.returncode != 0 and "already exists" in (add_proc.stderr or "").lower():
-        logger.info("[BOTSTATE][WORKTREE] add failed with already exists -> retry")
-        _run(
-            ["git", "-C", str(base_dir), "worktree", "remove", "--force", str(worktree_dir)],
-            check=False,
-        )
-        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
-        shutil.rmtree(worktree_dir, ignore_errors=True)
-        _run(["git", "-C", str(base_dir), "worktree", "prune"], check=False)
-        add_proc = _run(
-            ["git", "worktree", "add", "-B", target_branch, str(worktree_dir), remote_ref],
-            cwd=base_dir,
-            check=False,
-        )
-
-    if add_proc.returncode != 0:
-        raise RuntimeError(
-            "git worktree add failed: "
-            f"returncode={add_proc.returncode} stdout={add_proc.stdout} stderr={add_proc.stderr}"
-        )
-
+    ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
-    logger.info("[BOTSTATE][WORKTREE] add ok")
     os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
 
 
@@ -273,7 +283,7 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
     worktree_dir = worktree_dir.resolve()
     lock_path = _lock_path(worktree_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     if ttl_sec is None:
@@ -356,7 +366,7 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
             temp_path.write_text(json.dumps(lock_payload))
             temp_path.replace(lock_path)
             lock_rel_path = lock_path.relative_to(worktree_dir)
-            _git(worktree_dir, "add", str(lock_rel_path))
+            _git_worktree(worktree_dir, "add", str(lock_rel_path))
             committed = commit_if_staged(worktree_dir, message=f"lock run_id={run_id}")
             logger.info(
                 "[BOTSTATE][GIT] SYNC_MODE=%s step=lock_commit committed=%s attempt=%d",
@@ -421,7 +431,7 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
 def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
     worktree_dir = worktree_dir.resolve()
     lock_path = _lock_path(worktree_dir)
-    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     retry_total_sec = max(0, _lock_retry_total_sec())
@@ -469,7 +479,7 @@ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
             return
         lock_path.unlink()
         lock_rel_path = lock_path.relative_to(worktree_dir)
-        _git(worktree_dir, "add", "-u", str(lock_rel_path))
+        _git_worktree(worktree_dir, "add", "-u", str(lock_rel_path))
         committed = commit_if_staged(worktree_dir, message=f"unlock run_id={run_id}")
         logger.info(
             "[BOTSTATE][GIT] SYNC_MODE=%s step=unlock_commit committed=%s attempt=%d",
@@ -516,7 +526,7 @@ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
 def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str, retries: int = 3) -> None:
     worktree_dir = worktree_dir.resolve()
     files = list(new_files)
-    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
@@ -559,7 +569,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(path.read_bytes())
                 rel_target = target.relative_to(worktree_dir)
-                _git(worktree_dir, "add", str(rel_target))
+                _git_worktree(worktree_dir, "add", str(rel_target))
                 staged_any = True
             except Exception:
                 continue
@@ -628,7 +638,7 @@ def push_retry(
     sync_before_commit: bool = True,
 ) -> None:
     worktree_dir = worktree_dir.resolve()
-    branch = _git(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     for attempt in range(1, retries + 1):

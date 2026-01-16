@@ -48,7 +48,7 @@ jobs:
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -192,7 +192,7 @@ jobs:
           set -euo pipefail
           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
         env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+          BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
 
   trade_tick:
     runs-on: ubuntu-latest
@@ -214,7 +214,7 @@ jobs:
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
       PERSIST_MODE: "ON_CHANGE"
-      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
 
       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -307,6 +307,19 @@ jobs:
             fi
           done
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+
+      - name: Ensure universe exists (once per day)
+        working-directory: repo
+        run: |
+          python - << 'PY'
+          import os
+          from trader.time_utils import now_kst
+          from trader.pb1_runner import ensure_universe_built_once
+
+          as_of = now_kst().date().isoformat()
+          ensure_universe_built_once(as_of, reason="workflow_preflight")
+          print("universe preflight done", as_of, os.getenv("KIS_ENV", ""))
+          PY
 
       - name: Resolve market-aware runtime mode
         run: |
@@ -418,7 +431,7 @@ jobs:
           fi
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
         env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+          BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
 
   close_cancel:
     runs-on: ubuntu-latest
@@ -440,7 +453,7 @@ jobs:
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
       PERSIST_MODE: "ON_CHANGE"
-      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
       PB1_CLOSE_CANCEL_ONLY: "1"
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -535,4 +548,4 @@ jobs:
           fi
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
         env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+          BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"

@@ -1,36 +1,105 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date
+from pathlib import Path
 
-from trader.db.engine import make_engine
-from trader.db.repos import UniverseRepo
+from trader.botstate_paths import botstate_path
 from trader.universe.lkg_store import lkg_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
 
+def _resolve_universe_env() -> str:
+    return (os.getenv("KIS_ENV") or "practice").lower()
+
+
+def _resolve_universe_strategy() -> str:
+    return os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+
+
+def universe_today_path(as_of: str) -> Path:
+    return botstate_path("runtime", "universe", f"{as_of}.json")
+
+
+def universe_lkg_path() -> Path:
+    env = _resolve_universe_env()
+    strategy = _resolve_universe_strategy()
+    return lkg_path(env, strategy)
+
+
+def universe_check(as_of: str) -> tuple[bool, dict]:
+    today = universe_today_path(as_of)
+    lkg = universe_lkg_path()
+    meta = {
+        "as_of": as_of,
+        "today_path": str(today),
+        "lkg_path": str(lkg),
+        "have_today": today.exists(),
+        "have_lkg": lkg.exists(),
+    }
+    ok = meta["have_today"] or meta["have_lkg"]
+    meta["ok"] = ok
+    meta["reason"] = "today" if meta["have_today"] else ("lkg" if meta["have_lkg"] else "missing")
+    selected_path = ""
+    if ok:
+        selected_path = str(today if meta["have_today"] else lkg)
+    meta["selected_path"] = selected_path
+    members_count = 0
+    if selected_path:
+        try:
+            with Path(selected_path).open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            members = data.get("members") if isinstance(data, dict) else data
+            if isinstance(members, list):
+                members_count = len(members)
+        except Exception:
+            logger.exception("[UNIVERSE][CHECK][LOAD_FAIL] path=%s", selected_path)
+    meta["members"] = members_count
+    logger.info(
+        "[UNIVERSE][CHECK] as_of=%s have_today=%s have_lkg=%s ok=%s reason=%s selected_path=%s members=%s",
+        meta["as_of"],
+        int(meta["have_today"]),
+        int(meta["have_lkg"]),
+        int(meta["ok"]),
+        meta["reason"],
+        meta["selected_path"],
+        meta["members"],
+    )
+    return ok, meta
+
+
+def load_universe_for_trading(as_of: str) -> tuple[list[dict], dict]:
+    """
+    Prefer today; else LKG.
+    Returns: (members, meta)
+    """
+    ok, meta = universe_check(as_of)
+    if not ok:
+        return [], meta
+
+    today = Path(meta["today_path"])
+    p = today if today.exists() else Path(meta["lkg_path"])
+    meta["selected_path"] = str(p)
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    members = data.get("members") if isinstance(data, dict) else data
+    if not isinstance(members, list):
+        members = []
+    meta["members"] = len(members)
+    return members, meta
+
 
 def check_universe_ready(today: date) -> dict[str, bool]:
-    env = (os.getenv("KIS_ENV") or "practice").lower()
-    strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
-    as_of = today.isoformat()
-    engine = make_engine()
-    repo = UniverseRepo(engine)
-    members = repo.get_universe_members(env, strategy, as_of)
-    db_ok = bool(members)
-    lkg_ok = lkg_path(env, strategy).exists()
-    ok = db_ok and lkg_ok
-    logger.info(
-        "[UNIVERSE][CHECK] date=%s db=%s lkg=%s -> ok=%s",
-        as_of,
-        "Y" if db_ok else "N",
-        "Y" if lkg_ok else "N",
-        "Y" if ok else "N",
-    )
-    return {"db_ok": db_ok, "lkg_ok": lkg_ok, "ok": ok}
+    ok, meta = universe_check(today.isoformat())
+    return {
+        "db_ok": meta.get("have_today", False),
+        "lkg_ok": meta.get("have_lkg", False),
+        "ok": ok,
+    }
 
 
 def universe_today_exists(today: date) -> bool:
