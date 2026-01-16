@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -7,6 +8,8 @@ BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
 TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
 DEFAULT_BOTSTATE_ROOT = "bot_state"
+
+logger = logging.getLogger(__name__)
 
 
 def _repo_root() -> Path:
@@ -64,3 +67,15 @@ def get_ohlcv_cache_dir() -> Path:
     cache_dir = get_cache_root() / "ohlcv_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def close_entry_orders_path(order_date: str) -> Path:
+    """order_date: 'YYYY-MM-DD'"""
+    path = botstate_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+_BOTSTATE_ROOT = get_botstate_root()
+_CACHE_ROOT = get_cache_root()
+logger.info("[BOTSTATE][PATHS] root=%s cache_root=%s", _BOTSTATE_ROOT, _CACHE_ROOT)

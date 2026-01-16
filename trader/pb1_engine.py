@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import Counter
@@ -10,6 +11,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
+from trader.botstate_paths import close_entry_orders_path
 from trader.config import (
     CAP_CAP,
     DAILY_CAPITAL,
@@ -41,6 +43,7 @@ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRX
 from trader.kis_wrapper import KisAPI
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
 from trader.time_utils import now_kst
+from trader.core_utils import _round_to_tick
 from trader.utils.env import env_bool, parse_env_flag
 from trader.window_router import WindowDecision
 
@@ -236,6 +239,11 @@ def compute_window(now_kst: datetime) -> str:
         now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
     trading_day = now_kst.weekday() < 5
     return resolve_market_window(now_kst, trading_day)
+
+
+def round_to_tick(price: float) -> int:
+    """KRX 호가단위로 올림(ceiling) 처리"""
+    return _round_to_tick(price, mode="up")
 
 
 class PB1Engine:
@@ -936,6 +944,16 @@ class PB1Engine:
 
     def _place_entry(self, cf: CandidateFeature) -> None:
         display_code = self._display_code(cf.code)
+        reasons = cf.reasons or []
+        features_snapshot = {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction", "score"]}
+        logger.info(
+            "[PB1][ENTRY][WHY] code=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
+            display_code,
+            reasons,
+            ", ".join(reasons),
+            features_snapshot,
+            "PB1-CLOSE",
+        )
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -1047,6 +1065,120 @@ class PB1Engine:
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
 
+    def _append_close_entry_record(self, payload: dict) -> None:
+        path = close_entry_orders_path(self._today)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _place_entry_close(self, cf: CandidateFeature) -> None:
+        display_code = self._display_code(cf.code)
+        cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
+        ref_daily_close = cf.features.get("close")
+        snap = self.kis.get_quote_snapshot(cf.code) if self.kis else {}
+        ap = snap.get("ap") if isinstance(snap, dict) else None
+        tp = snap.get("tp") if isinstance(snap, dict) else None
+        base_from = None
+        base = None
+        if ap:
+            base_from = "ap"
+            base = float(ap)
+        elif tp:
+            base_from = "tp"
+            base = float(tp)
+        reasons = ["close_entry"] + (cf.reasons or [])
+        if base is None:
+            logger.info(
+                "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%s cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
+                display_code,
+                base_from or "none",
+                base,
+                None,
+                cap_buffer_pct,
+                ref_daily_close,
+                reasons + ["missing_quote_base"],
+            )
+            logger.warning("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=missing_quote_base", display_code)
+            return
+        cap = round_to_tick(base * (1 + cap_buffer_pct / 100.0))
+        logger.info(
+            "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%.2f cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
+            display_code,
+            base_from,
+            base,
+            cap,
+            cap_buffer_pct,
+            ref_daily_close,
+            reasons,
+        )
+        try:
+            order_id, created = self.orders_repo.create_intent_idempotent(
+                env=self.env,
+                run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=cf.mode,
+                code=cf.code,
+                market=cf.market,
+                side="BUY",
+                ord_type="LIMIT",
+                qty=cf.planned_qty,
+                limit_price=cap,
+                stage="PB1-CLOSE",
+                client_order_key=cf.client_order_key or "",
+                request_json={
+                    "features": cf.features,
+                    "reasons": reasons,
+                    "base_from": base_from,
+                    "base": base,
+                    "cap_buffer_pct": cap_buffer_pct,
+                },
+                status="CREATED",
+            )
+        except Exception:
+            logger.exception("[PB1][CLOSE_ENTRY][DB_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
+        if not created:
+            logger.info("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=duplicate_order", display_code)
+            return
+        if self.dry_run:
+            logger.info(
+                "[PB1][CLOSE_ENTRY-DRY] code=%s qty=%s cap=%s key=%s order_id=%s",
+                display_code,
+                cf.planned_qty,
+                cap,
+                cf.client_order_key,
+                order_id,
+            )
+            return
+        if not self.kis:
+            logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
+            return
+        resp = None
+        kis_odno = None
+        try:
+            resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
+            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+        except Exception:
+            logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
+        self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+            self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            self._append_close_entry_record(
+                {
+                    "order_id": order_id,
+                    "code": cf.code,
+                    "qty": cf.planned_qty,
+                    "cap_price": cap,
+                    "client_order_key": cf.client_order_key,
+                    "kis_odno": kis_odno,
+                    "created_at": now_kst().isoformat(),
+                }
+            )
+        else:
+            self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
         avg = pos.get("avg_buy_price")
         if not avg:
@@ -1055,7 +1187,8 @@ class PB1Engine:
         display_code = self._display_code(code)
         market = pos.get("market")
         mode = pos.get("mode")
-        if pos.get("sid") != 1:
+        sid = int(pos.get("sid") or 0)
+        if sid != 1:
             return
         qty = pos.get("qty") or 0
         if qty <= 0:
@@ -1087,6 +1220,7 @@ class PB1Engine:
                 logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
             return
 
+        holding_days = pos.get("holding_days") or 0
         if mode == 1:
             atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
             r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
@@ -1113,7 +1247,6 @@ class PB1Engine:
                     return
                 close_px = features.get("close")
                 ma20 = features.get("ma20")
-                holding_days = pos.get("holding_days") or 0
                 if holding_days >= PB1_TIME_STOP_DAYS:
                     stage = "TIME-STOP"
                 elif close_px is not None and ma20 is not None and close_px < ma20:
@@ -1183,6 +1316,18 @@ class PB1Engine:
             if not self.dry_run:
                 raise
             return
+        logger.info(
+            "[PB1][EXIT][WHY] code=%s qty=%s mark=%s avg=%s ret_pct=%.2f exit_reason_codes=%s exit_reason_text=%s holding_days=%s stage=%s",
+            display_code,
+            qty,
+            mark,
+            avg,
+            ret_pct,
+            reasons,
+            ", ".join(reasons),
+            holding_days,
+            stage,
+        )
         if self.dry_run:
             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
             return
@@ -1253,6 +1398,88 @@ class PB1Engine:
                 }
             )
         return enriched
+
+    def _run_exit_always(
+        self,
+        *,
+        positions: list[dict],
+        holdings_rows: list[dict],
+        marks_fallback: dict[str, float],
+    ) -> list[dict]:
+        holdings = list(holdings_rows or [])
+        if not positions and holdings:
+            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=1,
+                holdings=holdings,
+            )
+            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings), bootstrapped)
+            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        pos_list = self._positions_with_meta(positions)
+        for pos in pos_list:
+            df, _ = self._fetch_daily(pos["code"], count=120)
+            if df.empty:
+                continue
+            try:
+                features = compute_features(df, min_candles=self.min_candles)
+            except ValueError:
+                continue
+            features["market"] = pos.get("market") or ""
+            marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
+            self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
+        return positions
+
+    def _load_close_entry_orders(self) -> list[dict]:
+        path = close_entry_orders_path(self._today)
+        if not path.exists():
+            logger.info("[PB1][CLOSE_CANCEL][WHY] reason_codes=%s reason_text=%s stage=%s", ["close_entry_file_missing"], "close_entry_file_missing", "PB1-CLOSE")
+            return []
+        orders: list[dict] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                orders.append(json.loads(line))
+        except Exception:
+            logger.exception("[PB1][CLOSE_CANCEL][FAIL] invalid close_entry file path=%s", path)
+            return []
+        return orders
+
+    def run_close_cancel(self) -> RunResult:
+        open_orders = self.orders_repo.get_open_orders(self.env)
+        tracked = self._load_close_entry_orders()
+        tracked_keys = {row.get("client_order_key") for row in tracked if row.get("client_order_key")}
+        target_orders = []
+        for row in open_orders:
+            if str(row.get("side") or "").upper() != "BUY":
+                continue
+            if row.get("stage") != "PB1-CLOSE":
+                continue
+            if tracked_keys and row.get("client_order_key") not in tracked_keys:
+                continue
+            target_orders.append(row)
+        for row in target_orders:
+            code = row.get("code")
+            qty = row.get("qty") or 0
+            client_key = row.get("client_order_key")
+            logger.info(
+                "[PB1][CLOSE_CANCEL][WHY] code=%s qty=%s reason_codes=%s reason_text=%s stage=%s",
+                self._display_code(code),
+                qty,
+                ["close_cancel"],
+                "close_cancel",
+                row.get("stage") or "PB1-CLOSE",
+            )
+            self.orders_repo.mark_cancelled(self.env, client_key, response_json={"reason": "close_cancel"})
+        return RunResult(
+            status="OK",
+            notes="close_cancel_only",
+            balance_api_calls=self.balance_api_calls,
+            balance_cache_hits=self.balance_cache_hits,
+            balance_tick_cache_hits=self.balance_tick_cache_hits,
+        )
 
     def _load_universe(self) -> list[dict]:
         today = self._now_kst.date().isoformat()
@@ -1403,26 +1630,8 @@ class PB1Engine:
                 entry_cutoff_dt.isoformat(),
             )
             if self.phase in {"prep", "entry"}:
-                return RunResult(
-                    status="SKIPPED",
-                    notes="entry_cutoff",
-                    balance_api_calls=self.balance_api_calls,
-                    balance_cache_hits=self.balance_cache_hits,
-                    balance_tick_cache_hits=self.balance_tick_cache_hits,
-                )
-
-        members = self._load_universe()
-        if not members:
-            note = "universe_empty"
-            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
-            self._log_reason_summary("universe_empty")
-            return RunResult(
-                status="SKIPPED",
-                notes=note,
-                balance_api_calls=self.balance_api_calls,
-                balance_cache_hits=self.balance_cache_hits,
-                balance_tick_cache_hits=self.balance_tick_cache_hits,
-            )
+                final_status = "SKIPPED"
+                final_notes = "entry_cutoff"
 
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
@@ -1449,39 +1658,44 @@ class PB1Engine:
             f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
             allow_add_to_existing,
         )
-        if self.phase in {"verify", "exit"}:
-            holdings = list(holdings_rows or [])
-            if not holdings and self.kis:
-                logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
-            if not positions and holdings:
-                bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
-                    env=self.env,
-                    strategy=self.STRATEGY_NAME,
-                    sid=1,
-                    mode=1,
-                    holdings=holdings,
-                )
-                logger.info("[PB1][BOOTSTRAP] positions_inserted=%s", bootstrapped)
-                positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-            open_orders = self.orders_repo.get_open_orders(self.env)
-            if open_orders:
-                logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
-            self._pnl_snapshot(self._positions_with_meta(positions))
-            if self.phase == "verify":
-                final_status = "OK"
-                final_notes = "verify_only"
-                self._log_reason_summary(final_notes)
+        holdings = list(holdings_rows or [])
+        if not holdings and self.kis:
+            logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
+        marks_fallback: Dict[str, float] = {}
+        positions = self._run_exit_always(positions=positions, holdings_rows=holdings, marks_fallback=marks_fallback)
+        open_orders = self.orders_repo.get_open_orders(self.env)
+        if open_orders:
+            logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
+        self._pnl_snapshot(self._positions_with_meta(positions))
+        if self.phase == "verify":
+            final_status = "OK"
+            final_notes = "verify_only"
+            self._log_reason_summary(final_notes)
+            return RunResult(
+                status=final_status,
+                notes=final_notes,
+                balance_api_calls=self.balance_api_calls,
+                balance_cache_hits=self.balance_cache_hits,
+                balance_tick_cache_hits=self.balance_tick_cache_hits,
+            )
+
+        members = self._load_universe()
+        if not members:
+            note = "universe_empty"
+            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+            self._log_reason_summary("universe_empty")
+            if self.phase in {"prep", "entry"}:
                 return RunResult(
-                    status=final_status,
-                    notes=final_notes,
+                    status="SKIPPED",
+                    notes=note,
                     balance_api_calls=self.balance_api_calls,
                     balance_cache_hits=self.balance_cache_hits,
                     balance_tick_cache_hits=self.balance_tick_cache_hits,
                 )
+            skip_entry_scan = True
 
         code_market = {m.get("code"): m.get("market") for m in members}
         candidates: List[CandidateFeature] = []
-        marks_fallback: Dict[str, float] = {}
         selected_tier = "tier1"
         selected_thresholds = self.filter_thresholds
         all_reason_counts: Counter[str] = Counter()
@@ -1660,20 +1874,10 @@ class PB1Engine:
                             balance_tick_cache_hits=self.balance_tick_cache_hits,
                         )
                 for cf in orderable_candidates:
-                    self._place_entry(cf)
-        if self.phase in {"exit", "verify", "trade"}:
-            pos_list = self._positions_with_meta(positions)
-            for pos in pos_list:
-                df, _ = self._fetch_daily(pos["code"], count=120)
-                if df.empty:
-                    continue
-                try:
-                    features = compute_features(df, min_candles=self.min_candles)
-                except ValueError:
-                    continue
-                features["market"] = pos.get("market") or code_market.get(pos["code"], "")
-                marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
-                self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
+                    if self.window_internal == "close":
+                        self._place_entry_close(cf)
+                    else:
+                        self._place_entry(cf)
         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)

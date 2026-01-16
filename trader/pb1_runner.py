@@ -43,6 +43,7 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
+from trader.runtime_store import universe_today_exists
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
@@ -302,6 +303,9 @@ def run_once(
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+    close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
+    if close_cancel_only:
+        logger.info("[PB1][MODE] close_cancel_only=Y")
     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
     event_name_lower = event_name.lower()
     mode, trading_day, market_window, mode_source = resolve_strategy_mode(
@@ -434,7 +438,7 @@ def run_once(
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
 
-    if not window:
+    if not window and not close_cancel_only:
         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
         return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
 
@@ -610,6 +614,10 @@ def run_once(
     result = None
     run_start_ts = time_mod.time()
     try:
+        if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+            if not universe_today_exists(now.date()):
+                logger.info("[PB1][SKIP] reason=universe_not_ready date=%s", now.date().isoformat())
+                return [], False, {}, phase_for_log, "SKIPPED"
         kis: KisAPI | None = None
         try:
             kis = KisAPI()
@@ -672,7 +680,10 @@ def run_once(
             run_id=run_record_id,
             now_kst_value=now,
         )
-        result = engine_runner.run()
+        if close_cancel_only:
+            result = engine_runner.run_close_cancel()
+        else:
+            result = engine_runner.run()
         did_work = True
         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
         touched_files = _collect_botstate_files(run_start_ts)

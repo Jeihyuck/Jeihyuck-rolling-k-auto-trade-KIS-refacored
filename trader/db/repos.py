@@ -330,6 +330,14 @@ class OrdersRepo:
                 .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
             )
 
+    def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.update(self._schema.orders)
+                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                .values(status="CANCELLED", response_json=response_json or {}, updated_at=func.now()),
+            )
+
     def get_open_orders(self, env: str) -> list[dict]:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
