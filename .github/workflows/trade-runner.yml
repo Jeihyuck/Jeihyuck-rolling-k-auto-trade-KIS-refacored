@@ -8,11 +8,9 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  # ✅ push로도 즉시 돌고
   push:
     branches: [ "nullim", "main" ]
 
-  # ✅ 수동 실행도 되고
   workflow_dispatch:
     inputs:
       EMERGENCY_UNIVERSE_BUILD:
@@ -20,12 +18,16 @@ on:
         required: false
         default: "0"
 
-  # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
   schedule:
+    # KST 08:50~08:55  => UTC 23:50~23:55 (Sun~Thu UTC)
     - cron: "50-59/5 23 * * 0-4"
+    # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
     - cron: "45 23 * * 0-4"
+    # KST 09:00~14:55  => UTC 00:00~05:55 (Mon~Fri UTC)
     - cron: "*/5 0-5 * * 1-5"
+    # KST 15:00~15:30  => UTC 06:00~06:30 (Mon~Fri UTC)
     - cron: "0-30/5 6 * * 1-5"
+    # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
     - cron: "29 6 * * 1-5"
 
 defaults:
@@ -43,12 +45,15 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
+
+      # ✅ FIX: do NOT use runner.temp (invalid in this context). Use github.workspace.
+      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -88,6 +93,12 @@ jobs:
           fi
           echo "[RESTORE] repo/bot_state restored"
 
+      - name: Ensure BOTSTATE_WORKTREE_DIR exists
+        run: |
+          set -euo pipefail
+          mkdir -p "${BOTSTATE_WORKTREE_DIR}"
+          echo "[BOTSTATE_WORKTREE_DIR] ${BOTSTATE_WORKTREE_DIR}"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -102,40 +113,41 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install deps
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Resolve universe build gate
-        working-directory: repo
         run: |
           set -euo pipefail
           as_of="$(TZ=Asia/Seoul date +%F)"
           now_kst="$(TZ=Asia/Seoul date -Iseconds)"
           echo "AS_OF_DATE=$as_of" >> "$GITHUB_ENV"
+
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             echo "SHOULD_BUILD_UNIVERSE=1" >> "$GITHUB_ENV"
             echo "[UNIVERSE][SCHEDULED_BUILD] now_kst=$now_kst as_of=$as_of"
             exit 0
           fi
+
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${EMERGENCY_UNIVERSE_BUILD:-0}" = "1" ]; then
             python - << 'PY'
             from datetime import date
             import os
-
             from trader.db.engine import make_engine
             from trader.db.repos import UniverseRepo
 
             env = (os.getenv("KIS_ENV") or "practice").lower()
             strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
             as_of = date.today().isoformat()
+
             engine = make_engine()
             repo = UniverseRepo(engine)
             members = repo.get_universe_members(env, strategy, as_of)
             db_ok = bool(members)
-            print(f"[UNIVERSE][EMERGENCY_CHECK] as_of={as_of} db={'Y' if db_ok else 'N'}")
+
+            print(f"[UNIVERSE][EMERGENCY_CHECK] as_of={as_of} db={'Y' if db_ok else 'N'} members={len(members)}")
             should_build = "0" if db_ok else "1"
             with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
                 f.write(f"SHOULD_BUILD_UNIVERSE={should_build}\n")
@@ -147,20 +159,17 @@ jobs:
 
       - name: Build universe (best_k_meta)
         if: env.SHOULD_BUILD_UNIVERSE == '1'
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.universe.build --env "${KIS_ENV}" --strategy best_k_meta --date "${AS_OF_DATE}"
 
       - name: Verify universe save
         if: env.SHOULD_BUILD_UNIVERSE == '1'
-        working-directory: repo
         run: |
           set -euo pipefail
           python - << 'PY'
           from datetime import date
           import os
-
           from trader.db.engine import make_engine
           from trader.db.repos import UniverseRepo
           from trader.universe.lkg_store import lkg_path
@@ -168,11 +177,13 @@ jobs:
           env = (os.getenv("KIS_ENV") or "practice").lower()
           strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
           as_of = os.getenv("AS_OF_DATE") or date.today().isoformat()
+
           engine = make_engine()
           repo = UniverseRepo(engine)
           members = repo.get_universe_members(env, strategy, as_of)
           db_ok = bool(members)
           lkg_ok = lkg_path(env, strategy).exists()
+
           print(
               "[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s"
               % ("Y" if lkg_ok else "N", "Y" if db_ok else "N", as_of, len(members))
@@ -180,17 +191,17 @@ jobs:
           PY
 
       - name: Configure git identity for botstate commits
-        working-directory: repo
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
       - name: Persist bot_state (fetch_reset)
         if: env.SHOULD_BUILD_UNIVERSE == '1'
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
   trade_tick:
     runs-on: ubuntu-latest
@@ -201,20 +212,24 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
+
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
       PERSIST_MODE: "ON_CHANGE"
-      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
 
-      # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
+      # ✅ FIX: do NOT use runner.temp here either
+      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
@@ -224,15 +239,12 @@ jobs:
       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
 
-      # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
       APP_KEY: ${{ secrets.KIS_APP_KEY }}
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
       RUN_LOOP_MINUTES: "4"
 
-      # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
       BOTSTATE_LOCK_TTL_SEC: "240"
       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
@@ -265,13 +277,13 @@ jobs:
           echo "[RESTORE] repo/bot_state restored"
           ls -al bot_state/.gitignore || true
           ls -al bot_state/.gitkeep || true
-          git status --porcelain
-          if [ ! -f bot_state/.gitkeep ]; then
-            echo "::warning::missing bot_state/.gitkeep"
-          fi
-          if [ ! -f bot_state/.gitignore ]; then
-            echo "::warning::missing bot_state/.gitignore"
-          fi
+          git status --porcelain || true
+
+      - name: Ensure BOTSTATE_WORKTREE_DIR exists
+        run: |
+          set -euo pipefail
+          mkdir -p "${BOTSTATE_WORKTREE_DIR}"
+          echo "[BOTSTATE_WORKTREE_DIR] ${BOTSTATE_WORKTREE_DIR}"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -287,14 +299,12 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install deps
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Precheck env (fail fast)
-        working-directory: repo
         run: |
           set -euo pipefail
           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
@@ -307,8 +317,8 @@ jobs:
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
 
       - name: Ensure universe exists (once per day)
-        working-directory: repo
         run: |
+          set -euo pipefail
           python - << 'PY'
           import os
           from trader.time_utils import now_kst
@@ -335,6 +345,7 @@ jobs:
 
           is_weekday = now.weekday() < 5
           in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+
           mode = "LIVE" if in_market else "DIAG"
           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
@@ -363,6 +374,7 @@ jobs:
               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
           )
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
@@ -372,19 +384,16 @@ jobs:
 
       - name: Compile check (gated)
         if: env.COMPILE_CHECK_ENABLED == '1'
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m compileall trader
 
       - name: Configure git identity for botstate commits
-        working-directory: repo
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
       - name: Run PB1 (auto window) - should exit within 4 minutes
-        working-directory: repo
         run: |
           set -euo pipefail
           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
@@ -394,30 +403,32 @@ jobs:
           LIVE_TRADING_ENABLED: "1"
 
       - name: Debug bot_state contents (after run)
+        if: always()
         run: |
           set -euo pipefail
           echo "=== bot_state tree ==="
           find bot_state -maxdepth 3 -type f -print || true
-          echo "=== git status (bot-state worktree if exists) ==="
+          echo "=== git status (workspace) ==="
           git status --porcelain || true
 
       - name: Debug paths (where am I?)
+        if: always()
         run: |
           set -euo pipefail
           echo "PWD=$(pwd)"
           ls -al
           echo "---- find bot_state anywhere ----"
-          find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
+          find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate_worktree" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
           echo "---- find pbcore.sqlite3 anywhere ----"
           find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
           echo "---- git root? ----"
-          git rev-parse --show-toplevel || true 
+          git rev-parse --show-toplevel || true
 
       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
         if: always()
-        working-directory: repo
         run: |
           set -euo pipefail
+
           if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
             flag="${TRADER_CACHE_ROOT}/changed.flag"
             if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
@@ -427,7 +438,10 @@ jobs:
               exit 0
             fi
           fi
+
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
   close_cancel:
     runs-on: ubuntu-latest
@@ -438,18 +452,23 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
+
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
       PERSIST_MODE: "ON_CHANGE"
-      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
+
+      # ✅ FIX: do NOT use runner.temp here either
+      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
       PB1_CLOSE_CANCEL_ONLY: "1"
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -496,6 +515,12 @@ jobs:
           fi
           echo "[RESTORE] repo/bot_state restored"
 
+      - name: Ensure BOTSTATE_WORKTREE_DIR exists
+        run: |
+          set -euo pipefail
+          mkdir -p "${BOTSTATE_WORKTREE_DIR}"
+          echo "[BOTSTATE_WORKTREE_DIR] ${BOTSTATE_WORKTREE_DIR}"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -510,29 +535,26 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install deps
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Configure git identity for botstate commits
-        working-directory: repo
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
       - name: Run PB1 close-cancel (auto window)
-        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.pb1_runner --window auto --phase auto
 
       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
         if: always()
-        working-directory: repo
         run: |
           set -euo pipefail
+
           if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
             flag="${TRADER_CACHE_ROOT}/changed.flag"
             if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
@@ -542,4 +564,8 @@ jobs:
               exit 0
             fi
           fi
+
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+
