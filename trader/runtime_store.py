@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
 
 
-def universe_today_exists(today: date) -> bool:
+def check_universe_ready(today: date) -> dict[str, bool]:
     env = (os.getenv("KIS_ENV") or "practice").lower()
     strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
     as_of = today.isoformat()
@@ -30,4 +30,8 @@ def universe_today_exists(today: date) -> bool:
         "Y" if lkg_ok else "N",
         "Y" if ok else "N",
     )
-    return ok
+    return {"db_ok": db_ok, "lkg_ok": lkg_ok, "ok": ok}
+
+
+def universe_today_exists(today: date) -> bool:
+    return check_universe_ready(today)["ok"]

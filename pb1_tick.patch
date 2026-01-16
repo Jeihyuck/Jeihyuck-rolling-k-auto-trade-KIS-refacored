@@ -1,8 +1,8 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e4207953c43 100644
+index 5d036b7ad31104124d47e6f209151e4207953c43..c5964be2f1b415fdbf2c049285ece2e5f566555e 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -1,48 +1,49 @@
+@@ -1,58 +1,224 @@
  name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
  
  permissions:
@@ -19,6 +19,11 @@ index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e42
  
    # ✅ 수동 실행도 되고
    workflow_dispatch:
++    inputs:
++      EMERGENCY_UNIVERSE_BUILD:
++        description: "Set to 1 to allow one-time emergency universe build when DB is missing."
++        required: false
++        default: "0"
  
    # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
    schedule:
@@ -26,7 +31,7 @@ index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e42
      - cron: "45 23 * * 0-4"
      - cron: "*/5 0-5 * * 1-5"
      - cron: "0-30/5 6 * * 1-5"
-+    - cron: "29 6 * * 1-5"
+     - cron: "29 6 * * 1-5"
  
  defaults:
    run:
@@ -34,73 +39,23 @@ index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e42
      working-directory: repo
  
  jobs:
-   run:
+-  run:
++  universe_build:
      runs-on: ubuntu-latest
-     timeout-minutes: 8
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-       COMPILE_CHECK_ENABLED: "0"
-       MIGRATE_MODE: "AUTO"
-@@ -279,25 +280,142 @@ jobs:
-           ls -al
-           echo "---- find bot_state anywhere ----"
-           find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
-           echo "---- find pbcore.sqlite3 anywhere ----"
-           find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
-           echo "---- git root? ----"
-           git rev-parse --show-toplevel || true 
- 
-       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
-         if: always()
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
-             flag="${TRADER_CACHE_ROOT}/changed.flag"
-             if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
-               echo "[PERSIST] changes detected -> persist"
-             else
-               echo "[PERSIST] no changes -> skip"
-               exit 0
-             fi
-           fi
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
-         env:
-           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
-+
-+  close_cancel:
-+    runs-on: ubuntu-latest
-+    if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
-+    timeout-minutes: 8
++    if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
++    timeout-minutes: 15
 +
 +    env:
 +      TZ: Asia/Seoul
 +      PYTHONUNBUFFERED: "1"
 +      PYTHONPATH: ${{ github.workspace }}/repo
-+      FORCE_STRATEGY_MODE: ""
-+      FORCE_PB1_PHASE: ""
 +      STATE_PATH: "bot_state/runtime/state.json"
 +      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
 +      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
 +      TRADER_CACHE_ROOT: "bot_state/runtime"
 +      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-+      ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-+      COMPILE_CHECK_ENABLED: "0"
-+      MIGRATE_MODE: "AUTO"
-+      PERSIST_MODE: "ON_CHANGE"
 +      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
-+      PB1_CLOSE_CANCEL_ONLY: "1"
++      EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
 +
 +      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
 +      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
@@ -114,13 +69,6 @@ index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e42
 +      APP_KEY: ${{ secrets.KIS_APP_KEY }}
 +      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
 +      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
-+
-+      BOTSTATE_LOCK_TTL_SEC: "240"
-+      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-+      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
-+
-+      ACTIVE_STRATEGIES: "1"
-+      DAILY_CAPITAL: "250000000"
 +
 +    steps:
 +      - name: Checkout code (always run nullim code)
@@ -166,1024 +114,238 @@ index fb43022748693ef290f9f8cbac7f8813b4517aff..5d036b7ad31104124d47e6f209151e42
 +          python -m pip install --upgrade pip
 +          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 +
++      - name: Resolve universe build gate
++        working-directory: repo
++        run: |
++          set -euo pipefail
++          as_of="$(TZ=Asia/Seoul date +%F)"
++          now_kst="$(TZ=Asia/Seoul date -Iseconds)"
++          echo "AS_OF_DATE=$as_of" >> "$GITHUB_ENV"
++          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
++            echo "SHOULD_BUILD_UNIVERSE=1" >> "$GITHUB_ENV"
++            echo "[UNIVERSE][SCHEDULED_BUILD] now_kst=$now_kst as_of=$as_of"
++            exit 0
++          fi
++          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${EMERGENCY_UNIVERSE_BUILD:-0}" = "1" ]; then
++            python - << 'PY'
++            from datetime import date
++            import os
++
++            from trader.db.engine import make_engine
++            from trader.db.repos import UniverseRepo
++
++            env = (os.getenv("KIS_ENV") or "practice").lower()
++            strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
++            as_of = date.today().isoformat()
++            engine = make_engine()
++            repo = UniverseRepo(engine)
++            members = repo.get_universe_members(env, strategy, as_of)
++            db_ok = bool(members)
++            print(f"[UNIVERSE][EMERGENCY_CHECK] as_of={as_of} db={'Y' if db_ok else 'N'}")
++            should_build = "0" if db_ok else "1"
++            with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
++                f.write(f"SHOULD_BUILD_UNIVERSE={should_build}\n")
++            PY
++          else
++            echo "SHOULD_BUILD_UNIVERSE=0" >> "$GITHUB_ENV"
++            echo "[UNIVERSE][EMERGENCY_SKIP] reason=not_requested"
++          fi
++
++      - name: Build universe (best_k_meta)
++        if: env.SHOULD_BUILD_UNIVERSE == '1'
++        working-directory: repo
++        run: |
++          set -euo pipefail
++          python -m trader.universe.build --env "${KIS_ENV}" --strategy best_k_meta --date "${AS_OF_DATE}"
++
++      - name: Verify universe save
++        if: env.SHOULD_BUILD_UNIVERSE == '1'
++        working-directory: repo
++        run: |
++          set -euo pipefail
++          python - << 'PY'
++          from datetime import date
++          import os
++
++          from trader.db.engine import make_engine
++          from trader.db.repos import UniverseRepo
++          from trader.universe.lkg_store import lkg_path
++
++          env = (os.getenv("KIS_ENV") or "practice").lower()
++          strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
++          as_of = os.getenv("AS_OF_DATE") or date.today().isoformat()
++          engine = make_engine()
++          repo = UniverseRepo(engine)
++          members = repo.get_universe_members(env, strategy, as_of)
++          db_ok = bool(members)
++          lkg_ok = lkg_path(env, strategy).exists()
++          print(
++              "[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s"
++              % ("Y" if lkg_ok else "N", "Y" if db_ok else "N", as_of, len(members))
++          )
++          PY
++
 +      - name: Configure git identity for botstate commits
 +        working-directory: repo
 +        run: |
 +          git config --global user.email "actions@github.com"
 +          git config --global user.name "github-actions[bot]"
 +
-+      - name: Run PB1 close-cancel (auto window)
++      - name: Persist bot_state (fetch_reset)
++        if: env.SHOULD_BUILD_UNIVERSE == '1'
 +        working-directory: repo
 +        run: |
 +          set -euo pipefail
-+          python -m trader.pb1_runner --window auto --phase auto
-+
-+      - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
-+        if: always()
-+        working-directory: repo
-+        run: |
-+          set -euo pipefail
-+          if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
-+            flag="${TRADER_CACHE_ROOT}/changed.flag"
-+            if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
-+              echo "[PERSIST] changes detected -> persist"
-+            else
-+              echo "[PERSIST] no changes -> skip"
-+              exit 0
-+            fi
-+          fi
-+          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
++          python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
 +        env:
 +          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
-diff --git a/trader/botstate_paths.py b/trader/botstate_paths.py
-index 82ea26c9d25a69c637b9c430c94f8ade71fb91aa..c13b619b34cc144ec9353cd64d0ddc887a3b942e 100644
---- a/trader/botstate_paths.py
-+++ b/trader/botstate_paths.py
-@@ -1,35 +1,38 @@
- from __future__ import annotations
- 
-+import logging
- import os
- from pathlib import Path
- 
- BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
- BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
- TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
- DEFAULT_BOTSTATE_ROOT = "bot_state"
- 
-+logger = logging.getLogger(__name__)
 +
++  trade_tick:
++    runs-on: ubuntu-latest
++    if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
+     timeout-minutes: 8
  
- def _repo_root() -> Path:
-     return Path(__file__).resolve().parents[1]
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
+       PERSIST_MODE: "ON_CHANGE"
+       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
  
+       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+@@ -171,112 +337,63 @@ jobs:
+               elif time(9, 5) <= now_t < time(10, 0):
+                   window = "morning"
+               elif time(10, 0) <= now_t < time(15, 15):
+                   window = "day"
+               elif time(15, 15) <= now_t <= time(15, 30):
+                   window = "close"
+               else:
+                   window = "after"
  
- def _is_relative_to(path: Path, base: Path) -> bool:
-     try:
-         path.relative_to(base)
-         return True
-     except ValueError:
-         return False
+           if force_phase in {"entry", "exit", "verify"}:
+               pb1_phase = force_phase
+           else:
+               pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
  
+           print(
+               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
+               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
+           )
+           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
+               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
+               f.write(f"MARKET_WINDOW={window}\n")
+               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+           PY
  
- def get_botstate_root() -> Path:
-     env_root = os.getenv(BOTSTATE_ROOT_ENV)
-     if env_root:
-         return Path(env_root).expanduser().resolve()
-     worktree_dir = os.getenv(BOTSTATE_WORKTREE_DIR_ENV)
-     if worktree_dir:
-         return (Path(worktree_dir).expanduser() / "bot_state").resolve()
-     return Path(DEFAULT_BOTSTATE_ROOT).resolve()
- 
- 
- def ensure_not_repo_tracked_path(path: Path) -> None:
-     repo_root = _repo_root()
-@@ -42,25 +45,37 @@ def ensure_not_repo_tracked_path(path: Path) -> None:
- def botstate_path(*parts: str) -> Path:
-     root = get_botstate_root()
-     path = root.joinpath(*parts)
-     resolved = path.expanduser().resolve()
-     if not _is_relative_to(resolved, root):
-         raise RuntimeError(f"Botstate path must stay under {root}: {resolved}")
-     ensure_not_repo_tracked_path(resolved)
-     return path
- 
- 
- def get_cache_root() -> Path:
-     env_root = os.getenv(TRADER_CACHE_ROOT_ENV)
-     if env_root:
-         root = Path(env_root).expanduser().resolve()
-     else:
-         botstate_runtime = get_botstate_root() / "runtime"
-         root = botstate_runtime.resolve() if botstate_runtime.exists() else Path("runtime").resolve()
-     root.mkdir(parents=True, exist_ok=True)
-     return root
- 
- 
- def get_ohlcv_cache_dir() -> Path:
-     cache_dir = get_cache_root() / "ohlcv_cache"
-     cache_dir.mkdir(parents=True, exist_ok=True)
-     return cache_dir
-+
-+
-+def close_entry_orders_path(order_date: str) -> Path:
-+    """order_date: 'YYYY-MM-DD'"""
-+    path = botstate_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    return path
-+
-+
-+_BOTSTATE_ROOT = get_botstate_root()
-+_CACHE_ROOT = get_cache_root()
-+logger.info("[BOTSTATE][PATHS] root=%s cache_root=%s", _BOTSTATE_ROOT, _CACHE_ROOT)
-diff --git a/trader/db/repos.py b/trader/db/repos.py
-index 9e8158a1d14926d6057f21957f287c3fee6ccc80..f315f0b7274536ca88a2ab48b6c52a14d1cdfd73 100644
---- a/trader/db/repos.py
-+++ b/trader/db/repos.py
-@@ -308,50 +308,58 @@ class OrdersRepo:
-                     updated_at=func.now(),
-                 )
-             )
- 
-     def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
-                 .values(
-                     status="ACKED",
-                     response_json=response_json,
-                     acked_at=func.now(),
-                     updated_at=func.now(),
-                 )
-             )
- 
-     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                 .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
-             )
- 
-+    def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
-+        with self.engine.begin() as conn:
-+            conn.execute(
-+                sa.update(self._schema.orders)
-+                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-+                .values(status="CANCELLED", response_json=response_json or {}, updated_at=func.now()),
-+            )
-+
-     def get_open_orders(self, env: str) -> list[dict]:
-         stmt = select(self._schema.orders).where(
-             and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
-         )
-         with self.engine.begin() as conn:
-             rows = conn.execute(stmt).mappings().all()
-             return [dict(r) for r in rows]
- 
-     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
-         stmt = select(self._schema.orders.c.order_id).where(
-             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
-         )
-         with self.engine.begin() as conn:
-             return conn.execute(stmt).scalar() is not None
- 
-     def list_today_orders(
-         self,
-         env: str,
-         *,
-         side: str | None = None,
-         code: str | None = None,
-         status_exclude: Iterable[str] | None = ("ERROR",),
-     ) -> list[dict]:
-         now = now_kst()
-         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index c6f840815b8fb4018f27264f1813d38549c43524..d75adef40dabb590bf3637f1850b3157d44df1fa 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -1,68 +1,71 @@
- from __future__ import annotations
- 
-+import json
- import logging
- import os
- from collections import Counter
- from dataclasses import dataclass
- from datetime import datetime
- from zoneinfo import ZoneInfo
- from typing import Any, Dict, Iterable, List
- 
- import pandas as pd
- 
-+from trader.botstate_paths import close_entry_orders_path
- from trader.config import (
-     CAP_CAP,
-     DAILY_CAPITAL,
-     KOSDAQ_HARD_STOP_PCT,
-     KOSPI_HARD_STOP_PCT,
-     PB1_ENTRY_ENABLED,
-     PB1_DAY_SL_R,
-     PB1_DAY_TP_R,
-     PB1_R_FLOOR_PCT,
-     PB1_TIME_STOP_DAYS,
-     PB1_REQUIRE_VOLUME,
-     PB1_MIN_CANDLES,
-     PB1_MAX_POSITIONS,
-     PB1_MIN_SCORE,
-     PB1_USE_RISK_PARITY,
-     PB1_MAX_ATR_PCT,
-     PB1_MIN_VALUE20,
-     PB1_ENTRY_WINDOW_START,
-     PB1_ENTRY_OPEN_END,
-     PB1_ENTRY_WINDOW_END,
-     PB1_EXIT_WINDOW_START,
-     PB1_EXIT_WINDOW_END,
-     PB1_ALLOW_ADD_TO_EXISTING,
-     MIN_ORDER_KRW,
-     resolve_market_window,
- )
- from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
- from trader.kis_wrapper import KisAPI
- from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
- from trader.time_utils import now_kst
-+from trader.core_utils import _round_to_tick
- from trader.utils.env import env_bool, parse_env_flag
- from trader.window_router import WindowDecision
- 
- logger = logging.getLogger(__name__)
- 
- _OUTPUT2_LIST_NORMALIZED_LOGGED = False
- _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
- 
- UNREALIZED_KEYS = (
-     "evlu_pfls_amt",
-     "evlu_pfls_smtl_amt",
- )
- RETURN_PCT_KEYS = (
-     "asst_icdc_erng_rt",
-     "evlu_pfls_rt",
- )
- COST_KEYS = (
-     "pchs_amt_smtl_amt",
-     "pchs_amt",
- )
- EVAL_KEYS = (
-     "scts_evlu_amt",
-     "evlu_amt_smtl_amt",
-     "tot_evlu_amt",
-     "nass_amt",
-@@ -216,50 +219,55 @@ def resolve_pb1_phase(
-         logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
-     window = resolve_market_window(now, trading_day)
-     if not trading_day:
-         return "exit", "auto_non_trading_day", window
-     entry_start = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_START, "%H:%M").time(), now.tzinfo)
-     entry_open_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_OPEN_END, "%H:%M").time(), now.tzinfo)
-     entry_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time(), now.tzinfo)
-     exit_start = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_START, "%H:%M").time(), now.tzinfo)
-     exit_end = datetime.combine(now.date(), datetime.strptime(PB1_EXIT_WINDOW_END, "%H:%M").time(), now.tzinfo)
-     if entry_start <= now < entry_open_end:
-         return "entry", "auto_opening", window
-     if entry_open_end <= now < entry_end:
-         return "entry", "auto_day", window
-     if exit_start <= now <= exit_end:
-         return "exit", "auto_close", window
-     return "exit", "auto_outside_window", window
- 
- 
- def compute_window(now_kst: datetime) -> str:
-     if now_kst.tzinfo is None:
-         now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
-     trading_day = now_kst.weekday() < 5
-     return resolve_market_window(now_kst, trading_day)
- 
- 
-+def round_to_tick(price: float) -> int:
-+    """KRX 호가단위로 올림(ceiling) 처리"""
-+    return _round_to_tick(price, mode="up")
-+
-+
- class PB1Engine:
-     STRATEGY_NAME = "pb1_pullback_close"
-     UNIVERSE_STRATEGY = "best_k_meta"
- 
-     def __init__(
-         self,
-         *,
-         universe_repo: UniverseRepo,
-         orders_repo: OrdersRepo,
-         fills_repo: FillsRepo,
-         positions_repo: PositionsRepo,
-         ledger_repo: LedgerEventsRepo,
-         kis: KisAPI | None,
-         window: WindowDecision,
-         window_label: str,
-         phase: str,
-         dry_run: bool,
-         env: str,
-         run_id: str,
-         now_kst_value: datetime | None = None,
-     ) -> None:
-         self.universe_repo = universe_repo
-         self.orders_repo = orders_repo
-         self.fills_repo = fills_repo
-         self.positions_repo = positions_repo
-@@ -914,50 +922,60 @@ class PB1Engine:
-                         quote.get("ask"),
-                         quote.get("bid"),
-                     )
-                 return price_val
-             except Exception:
-                 self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
-         return None
- 
-     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
-         marks: Dict[str, float] = {}
-         for code in codes:
-             px = self._mark_price(code)
-             if px is None:
-                 px = self._balance_price_map.get(code) or fallback.get(code)
-             if px is not None:
-                 marks[code] = px
-         return marks
- 
-     def _should_block_order(self, client_order_key: str) -> bool:
-         if not client_order_key:
-             return True
-         return self.orders_repo.has_client_order_key(self.env, client_order_key)
- 
-     def _place_entry(self, cf: CandidateFeature) -> None:
-         display_code = self._display_code(cf.code)
-+        reasons = cf.reasons or []
-+        features_snapshot = {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction", "score"]}
-+        logger.info(
-+            "[PB1][ENTRY][WHY] code=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
-+            display_code,
-+            reasons,
-+            ", ".join(reasons),
-+            features_snapshot,
-+            "PB1-CLOSE",
-+        )
-         try:
-             order_id, created = self.orders_repo.create_intent_idempotent(
-                 env=self.env,
-                 run_id=self.run_id,
-                 strategy=self.STRATEGY_NAME,
-                 sid=1,
-                 mode=cf.mode,
-                 code=cf.code,
-                 market=cf.market,
-                 side="BUY",
-                 ord_type="MARKET",
-                 qty=cf.planned_qty,
-                 limit_price=cf.features.get("close"),
-                 stage="PB1-CLOSE",
-                 client_order_key=cf.client_order_key or "",
-                 request_json={"features": cf.features, "reasons": cf.reasons},
-                 status="CREATED",
-             )
-         except Exception:
-             logger.exception("[PB1][ENTRY][DB_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-         if not created:
-             try:
-@@ -1025,117 +1043,232 @@ class PB1Engine:
-                 side="BUY",
-                 qty=cf.planned_qty,
-                 price=cf.features.get("close") or 0.0,
-                 fee=0.0,
-                 tax=0.0,
-                 filled_at=filled_at,
-                 raw_json=resp,
-             )
-             self.positions_repo.apply_fill(
-                 env=self.env,
-                 strategy=self.STRATEGY_NAME,
-                 sid=1,
-                 mode=cf.mode,
-                 code=cf.code,
-                 market=cf.market,
-                 side="BUY",
-                 qty=cf.planned_qty,
-                 price=cf.features.get("close") or 0.0,
-                 fee=0.0,
-                 tax=0.0,
-                 filled_at=filled_at,
-             )
-         else:
-             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
- 
-+    def _append_close_entry_record(self, payload: dict) -> None:
-+        path = close_entry_orders_path(self._today)
-+        with path.open("a", encoding="utf-8") as handle:
-+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-+
-+    def _place_entry_close(self, cf: CandidateFeature) -> None:
-+        display_code = self._display_code(cf.code)
-+        cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
-+        ref_daily_close = cf.features.get("close")
-+        snap = self.kis.get_quote_snapshot(cf.code) if self.kis else {}
-+        ap = snap.get("ap") if isinstance(snap, dict) else None
-+        tp = snap.get("tp") if isinstance(snap, dict) else None
-+        base_from = None
-+        base = None
-+        if ap:
-+            base_from = "ap"
-+            base = float(ap)
-+        elif tp:
-+            base_from = "tp"
-+            base = float(tp)
-+        reasons = ["close_entry"] + (cf.reasons or [])
-+        if base is None:
-+            logger.info(
-+                "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%s cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
-+                display_code,
-+                base_from or "none",
-+                base,
-+                None,
-+                cap_buffer_pct,
-+                ref_daily_close,
-+                reasons + ["missing_quote_base"],
-+            )
-+            logger.warning("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=missing_quote_base", display_code)
-+            return
-+        cap = round_to_tick(base * (1 + cap_buffer_pct / 100.0))
-+        logger.info(
-+            "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%.2f cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
-+            display_code,
-+            base_from,
-+            base,
-+            cap,
-+            cap_buffer_pct,
-+            ref_daily_close,
-+            reasons,
-+        )
-+        try:
-+            order_id, created = self.orders_repo.create_intent_idempotent(
-+                env=self.env,
-+                run_id=self.run_id,
-+                strategy=self.STRATEGY_NAME,
-+                sid=1,
-+                mode=cf.mode,
-+                code=cf.code,
-+                market=cf.market,
-+                side="BUY",
-+                ord_type="LIMIT",
-+                qty=cf.planned_qty,
-+                limit_price=cap,
-+                stage="PB1-CLOSE",
-+                client_order_key=cf.client_order_key or "",
-+                request_json={
-+                    "features": cf.features,
-+                    "reasons": reasons,
-+                    "base_from": base_from,
-+                    "base": base,
-+                    "cap_buffer_pct": cap_buffer_pct,
-+                },
-+                status="CREATED",
-+            )
-+        except Exception:
-+            logger.exception("[PB1][CLOSE_ENTRY][DB_FAIL] code=%s", display_code)
-+            if not self.dry_run:
-+                raise
-+            return
-+        if not created:
-+            logger.info("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=duplicate_order", display_code)
-+            return
-+        if self.dry_run:
-+            logger.info(
-+                "[PB1][CLOSE_ENTRY-DRY] code=%s qty=%s cap=%s key=%s order_id=%s",
-+                display_code,
-+                cf.planned_qty,
-+                cap,
-+                cf.client_order_key,
-+                order_id,
-+            )
-+            return
-+        if not self.kis:
-+            logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
-+            return
-+        resp = None
-+        kis_odno = None
-+        try:
-+            resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
-+            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-+        except Exception:
-+            logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
-+        self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-+        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
-+            self.orders_repo.mark_acked(self.env, kis_odno, resp)
-+            self._append_close_entry_record(
-+                {
-+                    "order_id": order_id,
-+                    "code": cf.code,
-+                    "qty": cf.planned_qty,
-+                    "cap_price": cap,
-+                    "client_order_key": cf.client_order_key,
-+                    "kis_odno": kis_odno,
-+                    "created_at": now_kst().isoformat(),
-+                }
-+            )
-+        else:
-+            self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
-+
-     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
-         avg = pos.get("avg_buy_price")
-         if not avg:
-             return
-         code = pos.get("code")
-         display_code = self._display_code(code)
-         market = pos.get("market")
-         mode = pos.get("mode")
--        if pos.get("sid") != 1:
-+        sid = int(pos.get("sid") or 0)
-+        if sid != 1:
-             return
-         qty = pos.get("qty") or 0
-         if qty <= 0:
-             return
-         mark = self._mark_price(code)
-         if mark is None:
-             mark = self._balance_price_map.get(code)
-         if mark is None:
-             mark = features.get("close") or avg
-         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
-         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
-         if self._should_block_order(client_key):
-             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
-             try:
-                 self._append_ledger_event(
-                     event_type="EXIT_SKIP",
-                     code=code,
-                     market=market,
-                     mode=mode,
-                     side="SELL",
-                     qty=qty,
-                     price=mark,
-                     client_order_key=client_key,
-                     ok=False,
-                     reasons=["duplicate_order"],
-                     stage="EXIT",
-                 )
-             except Exception:
-                 logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
-             return
- 
-+        holding_days = pos.get("holding_days") or 0
-         if mode == 1:
-             atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
-             r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
-             take_profit = PB1_DAY_TP_R * r_pct
-             stop_loss = PB1_DAY_SL_R * r_pct
-             if window_tag != "morning":
-                 return
-             stage = "DAY-EXIT"
-             reasons: list[str] = []
-             if ret_pct >= take_profit:
-                 reasons.append("take_profit")
-             if ret_pct <= -stop_loss:
-                 reasons.append("stop_loss")
-             if not reasons:
-                 reasons.append("time_exit")
-         else:
-             hard_stop = KOSDAQ_HARD_STOP_PCT if market == "KOSDAQ" else KOSPI_HARD_STOP_PCT
-             if ret_pct <= -hard_stop:
-                 stage = "HARD-STOP"
-                 if window_tag not in {"morning", "close"}:
-                     return
-             else:
-                 if window_tag != "close":
-                     return
-                 close_px = features.get("close")
-                 ma20 = features.get("ma20")
--                holding_days = pos.get("holding_days") or 0
-                 if holding_days >= PB1_TIME_STOP_DAYS:
-                     stage = "TIME-STOP"
-                 elif close_px is not None and ma20 is not None and close_px < ma20:
-                     stage = "MA20-TRAIL"
-                 else:
-                     return
-             reasons = ["pb1_exit"]
- 
-         try:
-             order_id, created = self.orders_repo.create_intent_idempotent(
-                 env=self.env,
-                 run_id=self.run_id,
-                 strategy=self.STRATEGY_NAME,
-                 sid=1,
-                 mode=mode,
-                 code=code,
-                 market=market,
-                 side="SELL",
-                 ord_type="MARKET",
-                 qty=qty,
-                 limit_price=mark,
-                 stage=stage,
-                 client_order_key=client_key,
-                 request_json={"reasons": reasons, "ret_pct": ret_pct},
-                 status="CREATED",
-@@ -1161,50 +1294,62 @@ class PB1Engine:
-                     stage=stage,
-                 )
-             except Exception as e:
-                 logger.exception("[PB1][LEDGER][EXIT_SKIP_FAIL] code=%s", display_code)
-                 return
-         try:
-             self._append_ledger_event(
-                 event_type="EXIT_INTENT",
-                 code=code,
-                 market=market,
-                 mode=mode,
-                 side="SELL",
-                 qty=qty,
-                 price=mark,
-                 client_order_key=client_key,
-                 ok=True,
-                 reasons=reasons,
-                 stage=stage,
-                 payload_json={"ret_pct": ret_pct},
-             )
-         except Exception:
-             logger.exception("[PB1][LEDGER][EXIT_INTENT_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-+        logger.info(
-+            "[PB1][EXIT][WHY] code=%s qty=%s mark=%s avg=%s ret_pct=%.2f exit_reason_codes=%s exit_reason_text=%s holding_days=%s stage=%s",
-+            display_code,
-+            qty,
-+            mark,
-+            avg,
-+            ret_pct,
-+            reasons,
-+            ", ".join(reasons),
-+            holding_days,
-+            stage,
-+        )
-         if self.dry_run:
-             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
-             return
-         if not self.kis:
-             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
-             return
-         resp = None
-         kis_odno = None
-         try:
-             resp = self.kis.sell_stock_market(code, qty)
-             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-         except Exception:
-             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
-         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
-             self.orders_repo.mark_acked(self.env, kis_odno, resp)
-             filled_at = now_kst()
-             self.fills_repo.upsert_fill(
-                 env=self.env,
-                 run_id=self.run_id,
-                 order_id=order_id,
-                 kis_odno=kis_odno,
-                 trade_id=None,
-                 code=code,
-                 market=market,
-@@ -1232,50 +1377,132 @@ class PB1Engine:
-             )
-         else:
-             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
- 
-     def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:
-         enriched: List[Dict] = []
-         for state in positions:
-             if state.get("sid") != 1:
-                 continue
-             enriched.append(
-                 {
-                     "code": state.get("code"),
-                     "sid": state.get("sid"),
-                     "mode": state.get("mode"),
-                     "qty": state.get("qty") or 0,
-                     "avg_buy_price": state.get("avg_buy_price"),
-                     "market": state.get("market"),
-                     "holding_days": state.get("holding_days") or 0,
-                     "first_buy_ts": state.get("first_buy_ts"),
-                     "total_cost": state.get("total_cost") or 0.0,
-                     "realized_pnl": state.get("realized_pnl") or 0.0,
-                 }
-             )
-         return enriched
- 
-+    def _run_exit_always(
-+        self,
-+        *,
-+        positions: list[dict],
-+        holdings_rows: list[dict],
-+        marks_fallback: dict[str, float],
-+    ) -> list[dict]:
-+        holdings = list(holdings_rows or [])
-+        if not positions and holdings:
-+            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
-+                env=self.env,
-+                strategy=self.STRATEGY_NAME,
-+                sid=1,
-+                mode=1,
-+                holdings=holdings,
-+            )
-+            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings), bootstrapped)
-+            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-+        pos_list = self._positions_with_meta(positions)
-+        for pos in pos_list:
-+            df, _ = self._fetch_daily(pos["code"], count=120)
-+            if df.empty:
-+                continue
-+            try:
-+                features = compute_features(df, min_candles=self.min_candles)
-+            except ValueError:
-+                continue
-+            features["market"] = pos.get("market") or ""
-+            marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
-+            self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
-+        return positions
-+
-+    def _load_close_entry_orders(self) -> list[dict]:
-+        path = close_entry_orders_path(self._today)
-+        if not path.exists():
-+            logger.info("[PB1][CLOSE_CANCEL][WHY] reason_codes=%s reason_text=%s stage=%s", ["close_entry_file_missing"], "close_entry_file_missing", "PB1-CLOSE")
-+            return []
-+        orders: list[dict] = []
-+        try:
-+            for line in path.read_text(encoding="utf-8").splitlines():
-+                if not line.strip():
-+                    continue
-+                orders.append(json.loads(line))
-+        except Exception:
-+            logger.exception("[PB1][CLOSE_CANCEL][FAIL] invalid close_entry file path=%s", path)
-+            return []
-+        return orders
-+
-+    def run_close_cancel(self) -> RunResult:
-+        open_orders = self.orders_repo.get_open_orders(self.env)
-+        tracked = self._load_close_entry_orders()
-+        tracked_keys = {row.get("client_order_key") for row in tracked if row.get("client_order_key")}
-+        target_orders = []
-+        for row in open_orders:
-+            if str(row.get("side") or "").upper() != "BUY":
-+                continue
-+            if row.get("stage") != "PB1-CLOSE":
-+                continue
-+            if tracked_keys and row.get("client_order_key") not in tracked_keys:
-+                continue
-+            target_orders.append(row)
-+        for row in target_orders:
-+            code = row.get("code")
-+            qty = row.get("qty") or 0
-+            client_key = row.get("client_order_key")
-+            logger.info(
-+                "[PB1][CLOSE_CANCEL][WHY] code=%s qty=%s reason_codes=%s reason_text=%s stage=%s",
-+                self._display_code(code),
-+                qty,
-+                ["close_cancel"],
-+                "close_cancel",
-+                row.get("stage") or "PB1-CLOSE",
-+            )
-+            self.orders_repo.mark_cancelled(self.env, client_key, response_json={"reason": "close_cancel"})
-+        return RunResult(
-+            status="OK",
-+            notes="close_cancel_only",
-+            balance_api_calls=self.balance_api_calls,
-+            balance_cache_hits=self.balance_cache_hits,
-+            balance_tick_cache_hits=self.balance_tick_cache_hits,
-+        )
-+
-     def _load_universe(self) -> list[dict]:
-         today = self._now_kst.date().isoformat()
-         members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
-         self._universe_as_of = today if members else None
-         if not members:
-             members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
-             if members:
-                 self._universe_as_of = members[0].get("as_of_date")
-         self._code_name_map = {
-             str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
-             for m in members or []
-             if m.get("code")
-         }
-         return members
- 
-     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
-         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
-         marks = self._fetch_marks([p["code"] for p in positions], fallback)
-         totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
-         for pos in positions:
-             qty = pos.get("qty") or 0
-             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
-             market_value = float(mark) * qty
-             cost = float(pos.get("total_cost") or 0.0)
-             totals["market_value"] += market_value
-@@ -1381,129 +1608,116 @@ class PB1Engine:
-         max_positions = int(PB1_MAX_POSITIONS)
-         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
-         min_order_krw = float(MIN_ORDER_KRW)
-         entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
-         skip_entry_scan = False
-         if not entry_allowed:
-             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
-         logger.info(
-             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
-             self.window_label,
-             self.window_internal,
-             self.phase,
-             self.dry_run,
-             self.env,
-         )
- 
-         if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
-             skip_entry_scan = True
-             entry_allowed = False
-             logger.info(
-                 "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
-                 self._now_kst.isoformat(),
-                 entry_cutoff_dt.isoformat(),
-             )
-             if self.phase in {"prep", "entry"}:
--                return RunResult(
--                    status="SKIPPED",
--                    notes="entry_cutoff",
--                    balance_api_calls=self.balance_api_calls,
--                    balance_cache_hits=self.balance_cache_hits,
--                    balance_tick_cache_hits=self.balance_tick_cache_hits,
--                )
+-      - name: Universe policy (08:45 only) + LKG safety gate
+-        working-directory: repo
+-        run: |
+-          set -euo pipefail
+-          today="$(TZ=Asia/Seoul date +%F)"
+-          hhmm="$(TZ=Asia/Seoul date +%H:%M)"
+-          dow="$(TZ=Asia/Seoul date +%u)"
+-          allow_build=0
+-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ] && [ "$hhmm" = "08:45" ]; then
+-            allow_build=1
+-          fi
+-          lkg="$(find "${UNIVERSE_LKG_DIR}" -maxdepth 6 -type f -name "latest.json" 2>/dev/null | head -n 1 || true)"
+-          lkg_exists=0
+-          if [ -n "$lkg" ]; then
+-            lkg_exists=1
+-          fi
+-          should_build=$allow_build
+-          in_market=0
+-          if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "LIVE" ] && [[ "${MARKET_WINDOW:-}" =~ ^(preopen|morning|day|close)$ ]]; then
+-            in_market=1
+-          fi
+-          block=0
+-          if [ "$in_market" = "1" ] && [ "$should_build" = "0" ] && [ "$lkg_exists" = "0" ]; then
+-            block=1
+-          fi
+-          echo "SHOULD_BUILD_UNIVERSE=$should_build" >> "$GITHUB_ENV"
+-          echo "BLOCK_TRADING_NO_LKG=$block" >> "$GITHUB_ENV"
+-          if [ "${GITHUB_EVENT_NAME:-}" = "push" ] || [ "$should_build" = "1" ]; then
+-            echo "COMPILE_CHECK_ENABLED=1" >> "$GITHUB_ENV"
+-          else
+-            echo "COMPILE_CHECK_ENABLED=0" >> "$GITHUB_ENV"
+-          fi
+-          echo "[UNIVERSE][POLICY] kst_hhmm=$hhmm dow=$dow allow_build=$allow_build in_market=$in_market lkg_exists=$lkg_exists -> build=$should_build block_trading=$block event=${GITHUB_EVENT_NAME:-}"
 -
--        members = self._load_universe()
--        if not members:
--            note = "universe_empty"
--            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
--            self._log_reason_summary("universe_empty")
--            return RunResult(
--                status="SKIPPED",
--                notes=note,
--                balance_api_calls=self.balance_api_calls,
--                balance_cache_hits=self.balance_cache_hits,
--                balance_tick_cache_hits=self.balance_tick_cache_hits,
--            )
-+                final_status = "SKIPPED"
-+                final_notes = "entry_cutoff"
+-      - name: Build universe (best_k_meta)
+-        if: env.SHOULD_BUILD_UNIVERSE == '1'
+-        working-directory: repo
+-        run: |
+-          set -euo pipefail
+-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)"
+-          echo "$(TZ=Asia/Seoul date +%F)" > "${UNIVERSE_LKG_DIR}/last_build_date.txt"
+-
+       - name: Compile check (gated)
+         if: env.COMPILE_CHECK_ENABLED == '1'
+         working-directory: repo
+         run: |
+           set -euo pipefail
+           python -m compileall trader
  
-         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-         existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
-         existing_positions_count = len(existing_positions)
-         holdings_snapshot = self._fetch_holdings_snapshot()
-         holdings_rows = holdings_snapshot.get("output1") or []
-         holdings_summary_raw = holdings_snapshot.get("output2")
-         holdings_summary = _as_first_dict(holdings_summary_raw)
-         self._holdings_summary = holdings_summary
-         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
-         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
-         available_cash_krw = self._extract_available_cash(holdings_summary)
-         slots_remaining = max(0, max_positions - existing_positions_count)
-         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
-         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
-         logger.info(
-             "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
-             max_positions,
-             target_new_positions,
-             entry_capital_krw,
-             min_order_krw,
-             entry_cutoff_raw,
-             existing_positions_count,
-             f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
-             allow_add_to_existing,
-         )
--        if self.phase in {"verify", "exit"}:
--            holdings = list(holdings_rows or [])
--            if not holdings and self.kis:
--                logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
--            if not positions and holdings:
--                bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
--                    env=self.env,
--                    strategy=self.STRATEGY_NAME,
--                    sid=1,
--                    mode=1,
--                    holdings=holdings,
--                )
--                logger.info("[PB1][BOOTSTRAP] positions_inserted=%s", bootstrapped)
--                positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
--            open_orders = self.orders_repo.get_open_orders(self.env)
--            if open_orders:
--                logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
--            self._pnl_snapshot(self._positions_with_meta(positions))
--            if self.phase == "verify":
--                final_status = "OK"
--                final_notes = "verify_only"
--                self._log_reason_summary(final_notes)
-+        holdings = list(holdings_rows or [])
-+        if not holdings and self.kis:
-+            logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
-+        marks_fallback: Dict[str, float] = {}
-+        positions = self._run_exit_always(positions=positions, holdings_rows=holdings, marks_fallback=marks_fallback)
-+        open_orders = self.orders_repo.get_open_orders(self.env)
-+        if open_orders:
-+            logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
-+        self._pnl_snapshot(self._positions_with_meta(positions))
-+        if self.phase == "verify":
-+            final_status = "OK"
-+            final_notes = "verify_only"
-+            self._log_reason_summary(final_notes)
-+            return RunResult(
-+                status=final_status,
-+                notes=final_notes,
-+                balance_api_calls=self.balance_api_calls,
-+                balance_cache_hits=self.balance_cache_hits,
-+                balance_tick_cache_hits=self.balance_tick_cache_hits,
-+            )
-+
-+        members = self._load_universe()
-+        if not members:
-+            note = "universe_empty"
-+            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
-+            self._log_reason_summary("universe_empty")
-+            if self.phase in {"prep", "entry"}:
-                 return RunResult(
--                    status=final_status,
--                    notes=final_notes,
-+                    status="SKIPPED",
-+                    notes=note,
-                     balance_api_calls=self.balance_api_calls,
-                     balance_cache_hits=self.balance_cache_hits,
-                     balance_tick_cache_hits=self.balance_tick_cache_hits,
-                 )
-+            skip_entry_scan = True
+       - name: Configure git identity for botstate commits
+         working-directory: repo
+         run: |
+           git config --global user.email "actions@github.com"
+           git config --global user.name "github-actions[bot]"
  
-         code_market = {m.get("code"): m.get("market") for m in members}
-         candidates: List[CandidateFeature] = []
--        marks_fallback: Dict[str, float] = {}
-         selected_tier = "tier1"
-         selected_thresholds = self.filter_thresholds
-         all_reason_counts: Counter[str] = Counter()
-         tiers_tried: list[str] = []
-         setup_ok_codes: list[str] = []
-         drop_reason_counter: Counter[str] = Counter()
-         drop_examples: Dict[str, list[str]] = {}
-         after_risk_check_count = 0
-         after_buyable_check_count = 0
-         after_dedup_count = 0
-         if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
-             candidates = self._compute_candidates(members)
-             (
-                 candidates,
-                 selected_tier,
-                 selected_thresholds,
-                 all_reason_counts,
-                 tiers_tried,
-             ) = self._select_candidates_with_fallback(candidates)
-             if not any(c.setup_ok for c in candidates):
-                 self._apply_score_fallback(candidates)
-             setup_ok_codes = [c.code for c in candidates if c.setup_ok]
-             candidates = self._size_positions(candidates)
-             ok_after_risk = [c for c in candidates if c.setup_ok]
-             after_risk_check_count = len(ok_after_risk)
-@@ -1638,49 +1852,39 @@ class PB1Engine:
-                         no_orders_reasons.append("target_new_positions_zero")
-                     if entry_capital_krw <= 0:
-                         no_orders_reasons.append("entry_capital_zero")
-                     if available_cash_krw is not None and available_cash_krw <= 0:
-                         no_orders_reasons.append("available_cash_zero")
-                     if min_order_krw > 0 and after_buyable_check_count == 0:
-                         no_orders_reasons.append("min_order_krw")
-                     if not no_orders_reasons:
-                         no_orders_reasons.append("exhausted_candidates")
-                     final_status = "NO_TRADE"
-                     final_notes = f"no_orders:{no_orders_reasons or 'none'}"
-                     logger.info(
-                         "[PB1][NO_TRADE] reason=no_orders no_orders_reason=%s",
-                         no_orders_reasons or ["none"],
-                     )
-                     if self.phase in {"prep", "entry"}:
-                         self._log_reason_summary(final_notes)
-                         return RunResult(
-                             status=final_status,
-                             notes=final_notes,
-                             balance_api_calls=self.balance_api_calls,
-                             balance_cache_hits=self.balance_cache_hits,
-                             balance_tick_cache_hits=self.balance_tick_cache_hits,
-                         )
-                 for cf in orderable_candidates:
--                    self._place_entry(cf)
--        if self.phase in {"exit", "verify", "trade"}:
--            pos_list = self._positions_with_meta(positions)
--            for pos in pos_list:
--                df, _ = self._fetch_daily(pos["code"], count=120)
--                if df.empty:
--                    continue
--                try:
--                    features = compute_features(df, min_candles=self.min_candles)
--                except ValueError:
--                    continue
--                features["market"] = pos.get("market") or code_market.get(pos["code"], "")
--                marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
--                self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
-+                    if self.window_internal == "close":
-+                        self._place_entry_close(cf)
-+                    else:
-+                        self._place_entry(cf)
-         self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
-         final_notes = final_notes or self._universe_as_of or "ok"
-         self._log_reason_summary(final_notes)
-         return RunResult(
-             status=final_status,
-             notes=final_notes,
-             balance_api_calls=self.balance_api_calls,
-             balance_cache_hits=self.balance_cache_hits,
-             balance_tick_cache_hits=self.balance_tick_cache_hits,
-         )
+-      - name: Fail fast if no universe LKG during market hours
+-        if: env.BLOCK_TRADING_NO_LKG == '1'
+-        working-directory: repo
+-        run: |
+-          echo "::error::Market is open but universe LKG is missing. Universe build is forbidden now. Wait for next 08:45 KST build."
+-          exit 1
+-
+       - name: Run PB1 (auto window) - should exit within 4 minutes
+         working-directory: repo
+         run: |
+           set -euo pipefail
+           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+           python -m trader.run --window auto --phase auto
+         env:
+           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
+           LIVE_TRADING_ENABLED: "1"
+ 
+       - name: Debug bot_state contents (after run)
+         run: |
+           set -euo pipefail
+           echo "=== bot_state tree ==="
+           find bot_state -maxdepth 3 -type f -print || true
+           echo "=== git status (bot-state worktree if exists) ==="
+           git status --porcelain || true
+ 
+       - name: Debug paths (where am I?)
+         run: |
+           set -euo pipefail
+           echo "PWD=$(pwd)"
+           ls -al
+           echo "---- find bot_state anywhere ----"
+           find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 32328bc80f66bec431f7ae31368311bfd89ce9d9..2ba260ab80b5760defc77e63cc2303f0742f0fb9 100644
+index 2ba260ab80b5760defc77e63cc2303f0742f0fb9..79b24d15086895d515db816a0d6233c2ad9620fa 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -21,50 +21,51 @@ from trader.config import (
+@@ -21,51 +21,51 @@ from trader.config import (
      MORNING_EXIT_END,
      MORNING_EXIT_START,
      MORNING_WINDOW_END,
@@ -1209,7 +371,8 @@ index 32328bc80f66bec431f7ae31368311bfd89ce9d9..2ba260ab80b5760defc77e63cc2303f0
  from trader.kis_wrapper import KisAPI
  from trader.pb1_engine import PB1Engine, resolve_pb1_phase
  from trader.reconcile_kis import reconcile_today
-+from trader.runtime_store import universe_today_exists
+-from trader.runtime_store import universe_today_exists
++from trader.runtime_store import check_universe_ready
  from trader.time_utils import now_kst
  from trader.utils.env import env_bool, parse_env_flag, resolve_mode
  from trader.window_router import WindowDecision, decide_window
@@ -1235,115 +398,7 @@ index 32328bc80f66bec431f7ae31368311bfd89ce9d9..2ba260ab80b5760defc77e63cc2303f0
          phase_reason = "default_env"
          reasons.append("phase_default_env")
      reasons.append(f"market_window:{market_window}")
-@@ -280,50 +281,53 @@ def _is_urgent_persist(touched: list[Path]) -> bool:
-             return True
-     return False
- 
- 
- def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> Path | None:
-     worktree_dir = resolve_botstate_worktree_dir()
-     try:
-         setup_worktree(Path.cwd(), worktree_dir)
-     except Exception:
-         logger.exception("[BOTSTATE][SETUP] failed worktree=%s", worktree_dir)
-         return None
-     if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
-         return None
-     return worktree_dir
- 
- 
- def run_once(
-     *,
-     args: argparse.Namespace,
-     engine,
-     loop_mode: bool = False,
-     window: WindowDecision | None = None,
- ) -> tuple[list[Path], bool, dict[str, int], str, str]:
-     now = _get_now_kst()
-     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-+    close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
-+    if close_cancel_only:
-+        logger.info("[PB1][MODE] close_cancel_only=Y")
-     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
-     event_name_lower = event_name.lower()
-     mode, trading_day, market_window, mode_source = resolve_strategy_mode(
-         now_kst=now,
-         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
-     )
-     effective_mode = mode
-     if smoke_enabled:
-         trading_day = True
-     logger.info(
-         "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
-         mode_source,
-         now.isoformat(),
-         trading_day,
-         market_window,
-         mode,
-     )
-     os.environ["STRATEGY_MODE"] = mode
-     diag_env_flag = (
-         env_bool("DIAGNOSTIC_FORCE_RUN", False)
-         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
-         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
-     )
-     open_dt, close_dt = _market_session(now)
-     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
-@@ -412,51 +416,51 @@ def run_once(
-                     mode_source,
-                     now.isoformat(),
-                     trading_day,
-                     market_window,
-                     mode,
-                 )
-                 logger.info(
-                     "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s phase_window=%s",
-                     now.isoformat(),
-                     window_label,
-                     resolved_phase,
-                     phase_reason,
-                     entry_flag.value,
-                     phase_window,
-                 )
-                 action = "run" if trading_day else "smoke"
-                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
-     elif not trading_day:
-         logger.info("[PB1][LOOP] non-trading-day -> skip")
-         return [], False, {}, phase_for_log, "SKIPPED"
- 
-     if action == "smoke":
-         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
-         return [], False, {}, phase_for_log, "SMOKE"
- 
--    if not window:
-+    if not window and not close_cancel_only:
-         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-         return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
- 
-     non_trading_day = not trading_day
-     force_diag = diag_env_flag
- 
-     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
-     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
-     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
-     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-     mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-     dry_run_reasons: list[str] = []
-     diag_enabled = force_diag
-     if diag_enabled:
-         dry_run_reasons.append("diagnostic_mode")
-     if mode_resolved == "INTENT_ONLY":
-         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
-     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
-         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
-     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
-     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
-     dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
-     if not live_trading_flag.value and mode_resolved == "LIVE":
-         dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
-     if dry_run_flag.value:
-@@ -588,50 +592,54 @@ def run_once(
-         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
+@@ -593,53 +593,56 @@ def run_once(
          if diag_enabled:
              logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
  
@@ -1368,10 +423,16 @@ index 32328bc80f66bec431f7ae31368311bfd89ce9d9..2ba260ab80b5760defc77e63cc2303f0
      result = None
      run_start_ts = time_mod.time()
      try:
-+        if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-+            if not universe_today_exists(now.date()):
-+                logger.info("[PB1][SKIP] reason=universe_not_ready date=%s", now.date().isoformat())
-+                return [], False, {}, phase_for_log, "SKIPPED"
+         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+-            if not universe_today_exists(now.date()):
+-                logger.info("[PB1][SKIP] reason=universe_not_ready date=%s", now.date().isoformat())
+-                return [], False, {}, phase_for_log, "SKIPPED"
++            universe_status = check_universe_ready(now.date())
++            if not universe_status["ok"]:
++                if phase_for_log == "entry":
++                    os.environ["PB1_ENTRY_ENABLED"] = "0"
++                    logger.info("[PB1][ENTRY_BLOCKED] reason=universe_not_ready date=%s", now.date().isoformat())
++                logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_not_ready date=%s", now.date().isoformat())
          kis: KisAPI | None = None
          try:
              kis = KisAPI()
@@ -1397,98 +458,49 @@ index 32328bc80f66bec431f7ae31368311bfd89ce9d9..2ba260ab80b5760defc77e63cc2303f0
              workflow_run_id=workflow_run_id,
              workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
              config_json={
-@@ -650,51 +658,54 @@ def run_once(
-                     run_id=run_record_id,
-                     strategy="pb1_pullback_close",
-                 )
-             except Exception as exc:
-                 if not dry_run and mode_resolved == "LIVE":
-                     logger.error("[PB1][RECONCILE][FAIL] live run halted: %s", exc)
-                     runs_repo.finish_run(run_record_id, status="FAILED", notes="reconcile_failed")
-                     return [], False, {}, phase_for_log, "RECONCILE_FAIL"
-                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
- 
-         engine_runner = PB1Engine(
-             universe_repo=universe_repo,
-             orders_repo=orders_repo,
-             fills_repo=fills_repo,
-             positions_repo=positions_repo,
-             ledger_repo=ledger_repo,
-             kis=kis,
-             window=window,
-             window_label=window_label,
-             phase=phase_override_arg,
-             dry_run=dry_run,
-             env=kis_env or "practice",
-             run_id=run_record_id,
-             now_kst_value=now,
-         )
--        result = engine_runner.run()
-+        if close_cancel_only:
-+            result = engine_runner.run_close_cancel()
-+        else:
-+            result = engine_runner.run()
-         did_work = True
-         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
-         touched_files = _collect_botstate_files(run_start_ts)
-     except Exception as exc:
-         logger.exception("[PB1][FAIL] unexpected error")
-         if run_record_id:
-             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-         raise
-     finally:
-         release_lock(engine, lock_key)
-     metrics = {
-         "balance_api_calls": result.balance_api_calls if result else 0,
-         "balance_cache_hits": result.balance_cache_hits if result else 0,
-         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
-     }
-     result_status = result.status if result else "UNKNOWN"
-     return touched_files, did_work, metrics, phase_for_log, result_status
- 
- 
- def _run_loop(*, args: argparse.Namespace, engine) -> None:
-     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
-     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
-     now = _get_now_kst()
 diff --git a/trader/runtime_store.py b/trader/runtime_store.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..c2b03addaf2b6c69b51a3990f240294b5c676658
---- /dev/null
+index c2b03addaf2b6c69b51a3990f240294b5c676658..cd8f7d3db048bce1d13eec6e9336be9e5db49242 100644
+--- a/trader/runtime_store.py
 +++ b/trader/runtime_store.py
-@@ -0,0 +1,33 @@
-+from __future__ import annotations
-+
-+import logging
-+import os
-+from datetime import date
-+
-+from trader.db.engine import make_engine
-+from trader.db.repos import UniverseRepo
-+from trader.universe.lkg_store import lkg_path
-+
-+logger = logging.getLogger(__name__)
-+
-+DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+@@ -1,33 +1,37 @@
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ from datetime import date
+ 
+ from trader.db.engine import make_engine
+ from trader.db.repos import UniverseRepo
+ from trader.universe.lkg_store import lkg_path
+ 
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+ 
+ 
+-def universe_today_exists(today: date) -> bool:
++def check_universe_ready(today: date) -> dict[str, bool]:
+     env = (os.getenv("KIS_ENV") or "practice").lower()
+     strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+     as_of = today.isoformat()
+     engine = make_engine()
+     repo = UniverseRepo(engine)
+     members = repo.get_universe_members(env, strategy, as_of)
+     db_ok = bool(members)
+     lkg_ok = lkg_path(env, strategy).exists()
+     ok = db_ok and lkg_ok
+     logger.info(
+         "[UNIVERSE][CHECK] date=%s db=%s lkg=%s -> ok=%s",
+         as_of,
+         "Y" if db_ok else "N",
+         "Y" if lkg_ok else "N",
+         "Y" if ok else "N",
+     )
+-    return ok
++    return {"db_ok": db_ok, "lkg_ok": lkg_ok, "ok": ok}
 +
 +
 +def universe_today_exists(today: date) -> bool:
-+    env = (os.getenv("KIS_ENV") or "practice").lower()
-+    strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
-+    as_of = today.isoformat()
-+    engine = make_engine()
-+    repo = UniverseRepo(engine)
-+    members = repo.get_universe_members(env, strategy, as_of)
-+    db_ok = bool(members)
-+    lkg_ok = lkg_path(env, strategy).exists()
-+    ok = db_ok and lkg_ok
-+    logger.info(
-+        "[UNIVERSE][CHECK] date=%s db=%s lkg=%s -> ok=%s",
-+        as_of,
-+        "Y" if db_ok else "N",
-+        "Y" if lkg_ok else "N",
-+        "Y" if ok else "N",
-+    )
-+    return ok
++    return check_universe_ready(today)["ok"]
+
+

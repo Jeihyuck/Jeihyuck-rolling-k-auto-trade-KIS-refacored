@@ -43,7 +43,7 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
-from trader.runtime_store import universe_today_exists
+from trader.runtime_store import check_universe_ready
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
@@ -615,9 +615,12 @@ def run_once(
     run_start_ts = time_mod.time()
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            if not universe_today_exists(now.date()):
-                logger.info("[PB1][SKIP] reason=universe_not_ready date=%s", now.date().isoformat())
-                return [], False, {}, phase_for_log, "SKIPPED"
+            universe_status = check_universe_ready(now.date())
+            if not universe_status["ok"]:
+                if phase_for_log == "entry":
+                    os.environ["PB1_ENTRY_ENABLED"] = "0"
+                    logger.info("[PB1][ENTRY_BLOCKED] reason=universe_not_ready date=%s", now.date().isoformat())
+                logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_not_ready date=%s", now.date().isoformat())
         kis: KisAPI | None = None
         try:
             kis = KisAPI()

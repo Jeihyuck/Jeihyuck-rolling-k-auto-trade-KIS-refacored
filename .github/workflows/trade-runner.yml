@@ -14,6 +14,11 @@ on:
 
   # ✅ 수동 실행도 되고
   workflow_dispatch:
+    inputs:
+      EMERGENCY_UNIVERSE_BUILD:
+        description: "Set to 1 to allow one-time emergency universe build when DB is missing."
+        required: false
+        default: "0"
 
   # ✅ 5분 tick (스케줄 안정성을 위해 main에도 이 파일 존재 권장)
   schedule:
@@ -29,8 +34,169 @@ defaults:
     working-directory: repo
 
 jobs:
-  run:
+  universe_build:
     runs-on: ubuntu-latest
+    if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+      STATE_PATH: "bot_state/runtime/state.json"
+      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+      TRADER_CACHE_ROOT: "bot_state/runtime"
+      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+      BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+      EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+      KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+    steps:
+      - name: Checkout code (always run nullim code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "nullim"
+          path: repo
+
+      - name: Checkout bot-state branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "bot-state"
+          path: botstate
+
+      - name: Restore bot_state into workspace
+        run: |
+          set -euo pipefail
+          mkdir -p bot_state
+          if [ -d ../botstate/bot_state ]; then
+            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ bot_state/
+          fi
+          echo "[RESTORE] repo/bot_state restored"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Resolve universe build gate
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          as_of="$(TZ=Asia/Seoul date +%F)"
+          now_kst="$(TZ=Asia/Seoul date -Iseconds)"
+          echo "AS_OF_DATE=$as_of" >> "$GITHUB_ENV"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "SHOULD_BUILD_UNIVERSE=1" >> "$GITHUB_ENV"
+            echo "[UNIVERSE][SCHEDULED_BUILD] now_kst=$now_kst as_of=$as_of"
+            exit 0
+          fi
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${EMERGENCY_UNIVERSE_BUILD:-0}" = "1" ]; then
+            python - << 'PY'
+            from datetime import date
+            import os
+
+            from trader.db.engine import make_engine
+            from trader.db.repos import UniverseRepo
+
+            env = (os.getenv("KIS_ENV") or "practice").lower()
+            strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
+            as_of = date.today().isoformat()
+            engine = make_engine()
+            repo = UniverseRepo(engine)
+            members = repo.get_universe_members(env, strategy, as_of)
+            db_ok = bool(members)
+            print(f"[UNIVERSE][EMERGENCY_CHECK] as_of={as_of} db={'Y' if db_ok else 'N'}")
+            should_build = "0" if db_ok else "1"
+            with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                f.write(f"SHOULD_BUILD_UNIVERSE={should_build}\n")
+            PY
+          else
+            echo "SHOULD_BUILD_UNIVERSE=0" >> "$GITHUB_ENV"
+            echo "[UNIVERSE][EMERGENCY_SKIP] reason=not_requested"
+          fi
+
+      - name: Build universe (best_k_meta)
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m trader.universe.build --env "${KIS_ENV}" --strategy best_k_meta --date "${AS_OF_DATE}"
+
+      - name: Verify universe save
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          from datetime import date
+          import os
+
+          from trader.db.engine import make_engine
+          from trader.db.repos import UniverseRepo
+          from trader.universe.lkg_store import lkg_path
+
+          env = (os.getenv("KIS_ENV") or "practice").lower()
+          strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
+          as_of = os.getenv("AS_OF_DATE") or date.today().isoformat()
+          engine = make_engine()
+          repo = UniverseRepo(engine)
+          members = repo.get_universe_members(env, strategy, as_of)
+          db_ok = bool(members)
+          lkg_ok = lkg_path(env, strategy).exists()
+          print(
+              "[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s"
+              % ("Y" if lkg_ok else "N", "Y" if db_ok else "N", as_of, len(members))
+          )
+          PY
+
+      - name: Configure git identity for botstate commits
+        working-directory: repo
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Persist bot_state (fetch_reset)
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate"
+
+  trade_tick:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
     timeout-minutes: 8
 
     env:
@@ -193,48 +359,6 @@ jobs:
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
 
-      - name: Universe policy (08:45 only) + LKG safety gate
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          today="$(TZ=Asia/Seoul date +%F)"
-          hhmm="$(TZ=Asia/Seoul date +%H:%M)"
-          dow="$(TZ=Asia/Seoul date +%u)"
-          allow_build=0
-          if [ "$dow" -ge 1 ] && [ "$dow" -le 5 ] && [ "$hhmm" = "08:45" ]; then
-            allow_build=1
-          fi
-          lkg="$(find "${UNIVERSE_LKG_DIR}" -maxdepth 6 -type f -name "latest.json" 2>/dev/null | head -n 1 || true)"
-          lkg_exists=0
-          if [ -n "$lkg" ]; then
-            lkg_exists=1
-          fi
-          should_build=$allow_build
-          in_market=0
-          if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "LIVE" ] && [[ "${MARKET_WINDOW:-}" =~ ^(preopen|morning|day|close)$ ]]; then
-            in_market=1
-          fi
-          block=0
-          if [ "$in_market" = "1" ] && [ "$should_build" = "0" ] && [ "$lkg_exists" = "0" ]; then
-            block=1
-          fi
-          echo "SHOULD_BUILD_UNIVERSE=$should_build" >> "$GITHUB_ENV"
-          echo "BLOCK_TRADING_NO_LKG=$block" >> "$GITHUB_ENV"
-          if [ "${GITHUB_EVENT_NAME:-}" = "push" ] || [ "$should_build" = "1" ]; then
-            echo "COMPILE_CHECK_ENABLED=1" >> "$GITHUB_ENV"
-          else
-            echo "COMPILE_CHECK_ENABLED=0" >> "$GITHUB_ENV"
-          fi
-          echo "[UNIVERSE][POLICY] kst_hhmm=$hhmm dow=$dow allow_build=$allow_build in_market=$in_market lkg_exists=$lkg_exists -> build=$should_build block_trading=$block event=${GITHUB_EVENT_NAME:-}"
-
-      - name: Build universe (best_k_meta)
-        if: env.SHOULD_BUILD_UNIVERSE == '1'
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy "best_k_meta" --date "$(date +%F)"
-          echo "$(TZ=Asia/Seoul date +%F)" > "${UNIVERSE_LKG_DIR}/last_build_date.txt"
-
       - name: Compile check (gated)
         if: env.COMPILE_CHECK_ENABLED == '1'
         working-directory: repo
@@ -247,13 +371,6 @@ jobs:
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
-
-      - name: Fail fast if no universe LKG during market hours
-        if: env.BLOCK_TRADING_NO_LKG == '1'
-        working-directory: repo
-        run: |
-          echo "::error::Market is open but universe LKG is missing. Universe build is forbidden now. Wait for next 08:45 KST build."
-          exit 1
 
       - name: Run PB1 (auto window) - should exit within 4 minutes
         working-directory: repo
