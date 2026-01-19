@@ -1,155 +1,356 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 83e8b6daeb0b889c8d6bcda5b9fbe19d1ca7e60e..cae38982301335cfc91dae3efe63f92c3c0fca91 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -303,55 +303,65 @@ jobs:
-             ${{ runner.os }}-pip-
+diff --git a/.gitignore b/.gitignore
+index a02893941d2167965acd13c3919494f58a003ca3..4f7adb060e8677a7736ffb7e0ad508ba76cab79a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,19 +1,32 @@
+ __pycache__/
+ .runtime/
+ **/__pycache__/
+ .venv/
+ .vscode/
+ .idea/
+ logs/
+ watchlists/
+ *.log
+ *.json
+ .env
+ bot_state/state.json
+ kis_token_cache.json
+ fastapi.log
+ _botstate/
+ trader/state/
+ trader/state/ohlcv_cache/
+ runtime/
+ bot_state/
++
++# Allow tracking runtime universe outputs in bot_state
++!bot_state/
++!bot_state/runtime/
++!bot_state/runtime/universe/
++!bot_state/runtime/universe/**
++!bot_state/runtime/universe_build_done_*.flag
++!bot_state/runtime/universe_sanitize_*.json
++!bot_state/runtime/*.flag
++!bot_state/runtime/*.json
++!bot_state/runtime/diagnostics/
++!bot_state/runtime/diagnostics/*.json
++!bot_state/runtime/diagnostics/universe_drop_*.json
+diff --git a/bot_state/.gitignore b/bot_state/.gitignore
+index 48e65ba7dbf2eff68e7747ef485a44cfd056524a..4287afbd5674b3b671e74a115327a7c6480d7e1c 100644
+--- a/bot_state/.gitignore
++++ b/bot_state/.gitignore
+@@ -1,9 +1,18 @@
+ db/
+ runtime/
+ trader_state/
+ trader_ledger/
+ universe_lkg/
  
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Precheck env (fail fast)
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-               echo "::error::Missing required secret/env: $k"
-               exit 1
-             fi
-           done
-           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
- 
-       - name: Ensure universe exists (once per day)
-         run: |
-           set -euo pipefail
-           python - << 'PY'
-           import os
-+          from pathlib import Path
-           from trader.time_utils import now_kst
-           from trader.pb1_runner import ensure_universe_built_once
-+          from trader.runtime_store import RuntimeStore
- 
-           as_of = now_kst().date().isoformat()
--          ensure_universe_built_once(as_of=as_of)
-+          bot_state_dir = os.getenv("BOT_STATE_DIR") or str((Path(os.getenv("GITHUB_WORKSPACE", ".")) / "bot_state").resolve())
-+          runtime_store = RuntimeStore(bot_state_dir=bot_state_dir)
-+          ensure_universe_built_once(
-+              runtime_store=runtime_store,
-+              env=os.getenv("KIS_ENV"),
-+              strategy="best_k_meta",
-+              as_of=os.getenv("AS_OF") or as_of,
-+              force=False,
-+          )
-           print("universe preflight done", as_of, os.getenv("KIS_ENV", ""))
-           PY
- 
-       - name: Resolve market-aware runtime mode
-         run: |
-           set -euo pipefail
-           python - << 'PY'
-           from datetime import datetime, time
-           from zoneinfo import ZoneInfo
-           import os
- 
-           KST = ZoneInfo("Asia/Seoul")
-           now = datetime.now(KST)
- 
-           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
-           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
- 
-           is_weekday = now.weekday() < 5
-           in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
- 
-           mode = "LIVE" if in_market else "DIAG"
-           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
-               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
- 
-           if not is_weekday:
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 4a4116f53aa99bfcbadb9325f421638ab72c3bfd..5125a384076388a548603cb188237bf9e042f117 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -57,63 +57,79 @@ from trader.kis_wrapper import KisAPI
- from trader.ledger.store import LedgerStore
- from trader.pb1_engine import PB1Engine, resolve_pb1_phase
- from trader.reconcile_kis import reconcile_today
- from trader.reset_utils import detect_account_fp, purge_bot_state
- from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
- from trader.time_utils import now_kst
- from trader.utils.env import env_bool, parse_env_flag, resolve_mode
- from trader.window_router import WindowDecision, decide_window
+ runtime/ohlcv_cache/
+ runtime/**.parquet
+ runtime/diagnostics/
++!runtime/
++!runtime/universe/
++!runtime/universe/**
++!runtime/universe_build_done_*.flag
++!runtime/universe_sanitize_*.json
++!runtime/*.flag
++!runtime/*.json
++!runtime/diagnostics/
++!runtime/diagnostics/universe_drop_*.json
+diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
+index 119a9ac564edd4c459c26267de89ffe4ed26279e..b9756175ddc1f309532bbe58f12064d29092a721 100644
+--- a/trader/botstate_persist.py
++++ b/trader/botstate_persist.py
+@@ -16,56 +16,61 @@ from trader.botstate_sync import (
+     resolve_botstate_worktree_dir,
+     setup_worktree,
+ )
  
  logger = logging.getLogger(__name__)
- log = logger
+ KST = ZoneInfo("Asia/Seoul")
  
  
- def _deepcopy_json(value):
-     try:
-         return copy.deepcopy(value)
-     except Exception:
-         return value
+ def _add_if_exists(paths: list[Path], candidate: Path) -> None:
+     if candidate.is_file():
+         paths.append(candidate)
  
  
- def universe_build_flag(as_of: str) -> Path:
-     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
+ def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
+     for path in base_dir.glob(pattern):
+         if path.is_file():
+             paths.append(path)
  
  
- def ensure_universe_built_once(
--    runtime_store: RuntimeStore,
-+    runtime_store: RuntimeStore | None = None,
-     *,
-     env: str | None = None,
-     strategy: str | None = None,
-     as_of: str | None = None,
-     force: bool = False,
- ) -> None:
--    if env is None:
--        env = os.getenv("KIS_ENV", "").strip()
--    if strategy is None:
--        strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
--    if as_of is None:
--        as_of = _get_now_kst().date().isoformat()
-+    if runtime_store is None:
-+        bot_state_dir = os.getenv("BOT_STATE_DIR")
-+        if bot_state_dir:
-+            base = Path(bot_state_dir)
-+        else:
-+            ws = os.getenv("GITHUB_WORKSPACE")
-+            base = Path(ws) / "bot_state" if ws else Path("bot_state")
-+        runtime_store = RuntimeStore(bot_state_dir=str(base.resolve()))
-+        logger.info(
-+            "[UNIVERSE][ENSURE][AUTO_RUNTIME_STORE] bot_state_dir=%s",
-+            runtime_store.bot_state_dir,
-+        )
-+
-+    env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
-+    if env is not None:
-+        env = env.strip()
-+    strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
-+    as_of = as_of or _get_now_kst().date().isoformat()
-+
-+    assert env, "env is required"
-+    assert strategy, "strategy is required"
-+    assert as_of, "as_of is required"
+ def _collect_paths(base_dir: Path) -> list[Path]:
+     paths: list[Path] = []
+     bot_root = get_botstate_root()
+     _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
+     _add_if_exists(paths, bot_root / "runtime/state.json")
+     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
++    _add_glob(paths, bot_root, "runtime/universe/*.json")
++    _add_glob(paths, bot_root, "runtime/universe/**/*.json")
++    _add_glob(paths, bot_root, "runtime/universe_build_done_*.flag")
++    _add_glob(paths, bot_root, "runtime/universe_sanitize_*.json")
+     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
+     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
+     _add_if_exists(paths, botstate_path("runtime", "strategy_intents.jsonl"))
+     _add_if_exists(paths, botstate_path("runtime", "strategy_intents_state.json"))
+     _add_if_exists(paths, botstate_path("runtime", "diagnostics", "diag_latest.json"))
+     _add_glob(paths, bot_root, "runtime/diagnostics/diag_*.json")
++    _add_glob(paths, bot_root, "runtime/diagnostics/universe_drop_*.json")
+     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
+     return paths
  
-     log.info(
-         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
-         type(runtime_store).__name__,
-         env,
-         strategy,
-         as_of,
-         force,
+ 
+ def _resolve_owner() -> str:
+     return os.getenv("GITHUB_ACTOR", "local")
+ 
+ 
+ def _resolve_run_id() -> str:
+     return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
+     parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
+     parser.add_argument(
+         "--soft-fail",
+         action="store_true",
+         help="Log errors and exit 0 instead of failing the job",
      )
+     args = parser.parse_args()
  
-     ok, meta = runtime_store.universe_check(as_of)
-     flag = universe_build_flag(as_of)
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
  
-     if not force:
-         if not ok:
+     try:
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e7e540738 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -73,50 +73,69 @@ def resolve_botstate_worktree_dir(repo_dir: Path) -> Path:
+ 
+ 
+ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
+     try:
+         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+     except subprocess.CalledProcessError as exc:
+         logger.error(
+             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
+             exc.cmd,
+             cwd,
+             exc.returncode,
+             exc.stdout,
+             exc.stderr,
+         )
+         raise
+ 
+ 
+ def git_porcelain(worktree_dir: Path) -> str:
+     return _git_worktree(worktree_dir, "status", "--porcelain").stdout
+ 
+ 
+ def stage_all(worktree_dir: Path) -> None:
+     _git_worktree(worktree_dir, "add", "-A")
+ 
+ 
++def stage_runtime_universe(worktree_dir: Path) -> None:
++    pathspecs = [
++        "bot_state/runtime/universe",
++        "bot_state/runtime/universe_build_done_*.flag",
++        "bot_state/runtime/universe_sanitize_*.json",
++        "bot_state/runtime/diagnostics/universe_drop_*.json",
++        "bot_state/runtime/*.flag",
++        "bot_state/runtime/*.json",
++        "bot_state/runtime/diagnostics/*.json",
++    ]
++    for spec in pathspecs:
++        _git_worktree(worktree_dir, "add", "--", spec, check=False)
++
++
++def _cached_diff_names(worktree_dir: Path) -> list[str]:
++    output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
++    return [line for line in output.splitlines() if line.strip()]
++
++
+ def commit_if_staged(worktree_dir: Path, message: str) -> bool:
+     diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
+     if diff_proc.returncode == 0:
+         return False
+     _git_worktree(worktree_dir, "commit", "-m", message)
+     return True
+ 
+ 
+ def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
+     status = git_porcelain(worktree_dir)
+     files = [line.strip() for line in status.splitlines() if line.strip()]
+     dirty = bool(files)
+     logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
+     if not dirty:
+         return
+     stage_all(worktree_dir)
+     committed = commit_if_staged(worktree_dir, message_for_autosave)
+     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
+ 
+ 
+ def _git_worktree(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+     return _run(["git", "-C", str(worktree_dir), *args], check=check)
+ 
+ 
+ @dataclass
+@@ -192,76 +211,92 @@ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
+ 
+ def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] | None = None) -> list[str]:
+     excludes = [path.strip().rstrip("/") for path in (paths_to_exclude or []) if path and str(path).strip()]
+     exclude_specs = [f":(exclude){path}" for path in excludes]
+     pathspec = ["--", ".", *exclude_specs]
+     tracked_out = _run(
+         ["git", "-C", str(base_dir), "diff", "--name-status", "HEAD", *pathspec],
+         check=True,
+     ).stdout.strip()
+     untracked_out = _run(
+         ["git", "-C", str(base_dir), "ls-files", "--others", "--exclude-standard", *pathspec],
+         check=True,
+     ).stdout.strip()
+     lines: list[str] = []
+     if tracked_out:
+         lines.extend([line for line in tracked_out.splitlines() if line.strip()])
+     if untracked_out:
+         lines.extend([f"?? {line}" for line in untracked_out.splitlines() if line.strip()])
+     return lines
+ 
+ 
+ def _git(repo_dir: Path, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+     return subprocess.run(cmd, cwd=repo_dir, check=check, text=True, capture_output=True)
+ 
+ 
++def _is_valid_git_worktree(path: Path) -> bool:
++    try:
++        proc = subprocess.run(
++            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
++            check=False,
++            text=True,
++            capture_output=True,
++        )
++    except Exception:
++        return False
++    return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
++
++
+ def get_worktree_paths(repo_dir: Path) -> set[Path]:
+     """
+     Parse: git worktree list --porcelain
+     Return: set of worktree paths
+     """
+     out = _git(repo_dir, ["git", "worktree", "list", "--porcelain"], check=True).stdout.splitlines()
+     paths: set[Path] = set()
+     for line in out:
+         if line.startswith("worktree "):
+             p = line.split(" ", 1)[1].strip()
+             if p:
+                 paths.add(Path(p).resolve())
+     return paths
+ 
+ 
+ def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref: str) -> None:
+     """
+     Guarantee worktree_dir is usable.
+     - If dir exists but not registered: rmtree
+     - If registered: reuse
+     - If registered but broken: remove --force then recreate
+     """
+     wt = worktree_dir.resolve()
+     registered = get_worktree_paths(repo_dir)
+ 
+     if wt.exists() and wt not in registered:
++        if _is_valid_git_worktree(wt):
++            logger.warning("[BOTSTATE][WORKTREE][DECISION] action=adopt dir=%s registered=0", wt)
++            return
+         logger.warning("[BOTSTATE][WORKTREE][DECISION] action=rmtree dir=%s registered=0", wt)
+         shutil.rmtree(wt, ignore_errors=True)
+ 
+     registered = get_worktree_paths(repo_dir)
+     if wt in registered:
+         logger.info("[BOTSTATE][WORKTREE][DECISION] action=reuse dir=%s", wt)
+         return
+ 
+     _git(repo_dir, ["git", "worktree", "prune"], check=False)
+     logger.info("[BOTSTATE][WORKTREE][DECISION] action=create dir=%s branch=%s ref=%s", wt, branch, remote_ref)
+     proc = _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=False)
+     if proc.returncode == 0:
+         logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s", wt)
+         return
+ 
+     logger.error(
+         "[BOTSTATE][WORKTREE][CREATE_FAIL] rc=%s stderr=%s",
+         proc.returncode,
+         (proc.stderr or "").strip(),
+     )
+     _git(repo_dir, ["git", "worktree", "remove", "--force", str(wt)], check=False)
+     shutil.rmtree(wt, ignore_errors=True)
+     _git(repo_dir, ["git", "worktree", "prune"], check=False)
+ 
+     _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=True)
+@@ -569,50 +604,54 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
+             if attempt == retries:
+                 raise
+             time.sleep(retry_sleep_sec)
+             continue
+ 
+         staged_any = False
+         for path in files:
+             try:
+                 if path.resolve().is_relative_to(worktree_dir.resolve()):
+                     target = path.resolve()
+                 else:
+                     if "bot_state" in path.parts:
+                         idx = path.parts.index("bot_state")
+                         rel = Path(*path.parts[idx:])
+                     else:
+                         rel = Path("bot_state") / Path(*path.parts[-4:])
+                     target = (worktree_dir / rel).resolve()
+                     target.parent.mkdir(parents=True, exist_ok=True)
+                     target.write_bytes(path.read_bytes())
+                 rel_target = target.relative_to(worktree_dir)
+                 _git_worktree(worktree_dir, "add", str(rel_target))
+                 staged_any = True
+             except Exception:
+                 continue
+ 
++        stage_runtime_universe(worktree_dir)
++        staged_files = _cached_diff_names(worktree_dir)
++        logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
++        staged_any = staged_any or bool(staged_files)
+         if not staged_any:
+             logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
+             return
+ 
+         committed = commit_if_staged(worktree_dir, message)
+         logger.info(
+             "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
+             sync_mode,
+             committed,
+             message,
+             attempt,
+         )
+         if not committed:
+             logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
+             return
+ 
+         try:
+             push_retry(worktree_dir, message=message, retries=1, sync_before_commit=False)
+             logger.info(
+                 "[BOTSTATE][PUSH] SYNC_MODE=%s push_ok=True attempt=%d",
+                 sync_mode,
+                 attempt,
+             )
+             logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+             return
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 5125a384076388a548603cb188237bf9e042f117..bf86af508c7c1023f6f1e49833f3fd00e485780f 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -126,50 +126,61 @@ def ensure_universe_built_once(
              return
  
          if meta.get("have_today"):
@@ -160,66 +361,133 @@ index 4a4116f53aa99bfcbadb9325f421638ab72c3bfd..5125a384076388a548603cb188237bf9
  
      reason = "force" if force else "auto_missing_today"
      flag.parent.mkdir(parents=True, exist_ok=True)
+     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
+ 
+     cmd = [
+         "python",
+         "-m",
+         "trader.universe.build",
+         "--env",
+         env,
+         "--strategy",
+         strategy,
+         "--date",
+         as_of,
+     ]
+     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+     subprocess.run(cmd, check=False)
++    _, post_meta = runtime_store.load_today_universe(as_of)
++    if post_meta.get("have_today"):
++        log.info(
++            "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
++            post_meta.get("today_path"),
++        )
++    else:
++        log.warning(
++            "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
++            post_meta.get("today_path"),
++        )
+ 
+ 
+ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+     events_dir = base_dir / "runtime" / "events"
+     events_dir.mkdir(parents=True, exist_ok=True)
+     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
+     ensure_not_repo_tracked_path(path)
+     line = json.dumps(payload, ensure_ascii=False)
+     with path.open("a", encoding="utf-8") as handle:
+         handle.write(line + "\n")
+     logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
+     return path
+ 
+ 
+ def _handle_missing_positions_reset(
+     *,
+     balance_snapshot: dict | None,
+     env: str,
+     strategy: str,
+     run_id: str | None,
+     positions_repo: PositionsRepo,
+     ledger_repo: LedgerEventsRepo,
+     bot_state_dir: Path,
+ ) -> bool:
+     if not balance_snapshot:
 diff --git a/trader/runtime_store.py b/trader/runtime_store.py
-index 78e57174c418f7dfe43d97d31291d32f97582e21..42534d8dbcea9225aa5c49bd71a49a3b1baed439 100644
+index 42534d8dbcea9225aa5c49bd71a49a3b1baed439..2453f2c0f293cd9259fc8e6075c772ce67ae7e5e 100644
 --- a/trader/runtime_store.py
 +++ b/trader/runtime_store.py
-@@ -11,52 +11,55 @@ from trader.botstate_paths import botstate_path, get_botstate_root
- from trader.universe.lkg_store import lkg_path
+@@ -149,49 +149,71 @@ class RuntimeStore:
+             meta["members"],
+         )
+         if not meta["have_today"] and meta["have_lkg"]:
+             logger.info(
+                 "[UNIVERSE][CHECK] today_missing -> using_lkg path=%s members=%s",
+                 meta["selected_path"],
+                 meta["members"],
+             )
+         return ok, meta
  
- logger = logging.getLogger(__name__)
+     def load_universe_for_trading(self, as_of: str) -> tuple[list[dict], dict]:
+         ok, meta = self.universe_check(as_of)
+         if not ok:
+             return [], meta
+         today = Path(meta["today_path"])
+         p = today if today.exists() else Path(meta["lkg_path"])
+         meta["selected_path"] = str(p)
+         with p.open("r", encoding="utf-8") as f:
+             data = json.load(f)
+         members = data.get("members") if isinstance(data, dict) else data
+         if not isinstance(members, list):
+             members = []
+         meta["members"] = len(members)
+         return members, meta
  
- DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
++    def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
++        today_raw = self._today_path(as_of)
++        today, today_rel = self._resolve_universe_path(today_raw)
++        meta = {
++            "as_of": as_of,
++            "today_path": str(today),
++            "today_rel": str(today_rel),
++            "have_today": today.exists(),
++        }
++        members: list[dict] = []
++        if meta["have_today"]:
++            try:
++                with today.open("r", encoding="utf-8") as handle:
++                    data = json.load(handle)
++                loaded = data.get("members") if isinstance(data, dict) else data
++                if isinstance(loaded, list):
++                    members = loaded
++            except Exception:
++                logger.exception("[UNIVERSE][LOAD_TODAY][FAIL] path=%s", today)
++        meta["members"] = len(members)
++        return members, meta
++
  
- def _resolve_universe_env() -> str:
-     return (os.getenv("KIS_ENV") or "practice").lower()
+ def universe_check(as_of: str) -> tuple[bool, dict]:
+     return RuntimeStore(get_botstate_root()).universe_check(as_of)
  
  
- def _resolve_universe_strategy() -> str:
-     return os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+ def load_universe_for_trading(as_of: str) -> tuple[list[dict], dict]:
+     """
+     Prefer today; else LKG.
+     Returns: (members, meta)
+     """
+     return RuntimeStore(get_botstate_root()).load_universe_for_trading(as_of)
  
  
- def universe_today_path(as_of: str) -> Path:
-     return botstate_path("runtime", "universe", f"{as_of}.json")
+ def check_universe_ready(today: date) -> dict[str, bool]:
+     ok, meta = universe_check(today.isoformat())
+     return {
+         "db_ok": meta.get("have_today", False),
+         "lkg_ok": meta.get("have_lkg", False),
+         "ok": ok,
+     }
  
  
- def universe_lkg_path() -> Path:
-     env = _resolve_universe_env()
-     strategy = _resolve_universe_strategy()
-     return lkg_path(env, strategy)
- 
- 
- class RuntimeStore:
--    def __init__(self, base_dir: Path) -> None:
-+    def __init__(self, base_dir: Path | None = None, *, bot_state_dir: str | Path | None = None) -> None:
-+        if base_dir is None:
-+            base_dir = bot_state_dir if bot_state_dir is not None else get_botstate_root()
-         self.base_dir = Path(base_dir)
-+        self.bot_state_dir = self.base_dir
- 
-     def _normalize_rel(self, path: Path) -> Path:
-         raw = Path(path)
-         if raw.is_absolute():
-             try:
-                 return raw.relative_to(self.base_dir)
-             except ValueError:
-                 pass
-         parts = raw.parts
-         if "bot_state" in parts:
-             idx = parts.index("bot_state")
-             return Path(*parts[idx + 1 :])
-         if parts and parts[0] == "bot_state":
-             return Path(*parts[1:])
-         return raw
- 
-     def _resolve_universe_path(self, raw_path: Path) -> tuple[Path, Path]:
-         rel = self._normalize_rel(raw_path)
-         abs_path = (self.base_dir / rel).resolve()
-         exists = abs_path.exists()
-         logger.info(
-             "[UNIVERSE][LOAD] bot_state_dir=%s rel=%s abs=%s exists=%s",
-             self.base_dir,
-             rel,
-             abs_path,
+ def universe_today_exists(today: date) -> bool:
+     return check_universe_ready(today)["ok"]
+
 
 

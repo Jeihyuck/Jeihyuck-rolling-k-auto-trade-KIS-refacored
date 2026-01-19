@@ -171,6 +171,28 @@ class RuntimeStore:
         meta["members"] = len(members)
         return members, meta
 
+    def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
+        today_raw = self._today_path(as_of)
+        today, today_rel = self._resolve_universe_path(today_raw)
+        meta = {
+            "as_of": as_of,
+            "today_path": str(today),
+            "today_rel": str(today_rel),
+            "have_today": today.exists(),
+        }
+        members: list[dict] = []
+        if meta["have_today"]:
+            try:
+                with today.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                loaded = data.get("members") if isinstance(data, dict) else data
+                if isinstance(loaded, list):
+                    members = loaded
+            except Exception:
+                logger.exception("[UNIVERSE][LOAD_TODAY][FAIL] path=%s", today)
+        meta["members"] = len(members)
+        return members, meta
+
 
 def universe_check(as_of: str) -> tuple[bool, dict]:
     return RuntimeStore(get_botstate_root()).universe_check(as_of)

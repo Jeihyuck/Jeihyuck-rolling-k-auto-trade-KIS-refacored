@@ -95,6 +95,25 @@ def stage_all(worktree_dir: Path) -> None:
     _git_worktree(worktree_dir, "add", "-A")
 
 
+def stage_runtime_universe(worktree_dir: Path) -> None:
+    pathspecs = [
+        "bot_state/runtime/universe",
+        "bot_state/runtime/universe_build_done_*.flag",
+        "bot_state/runtime/universe_sanitize_*.json",
+        "bot_state/runtime/diagnostics/universe_drop_*.json",
+        "bot_state/runtime/*.flag",
+        "bot_state/runtime/*.json",
+        "bot_state/runtime/diagnostics/*.json",
+    ]
+    for spec in pathspecs:
+        _git_worktree(worktree_dir, "add", "--", spec, check=False)
+
+
+def _cached_diff_names(worktree_dir: Path) -> list[str]:
+    output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
+    return [line for line in output.splitlines() if line.strip()]
+
+
 def commit_if_staged(worktree_dir: Path, message: str) -> bool:
     diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
     if diff_proc.returncode == 0:
@@ -214,6 +233,19 @@ def _git(repo_dir: Path, cmd: list[str], check: bool = True) -> subprocess.Compl
     return subprocess.run(cmd, cwd=repo_dir, check=check, text=True, capture_output=True)
 
 
+def _is_valid_git_worktree(path: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
+
+
 def get_worktree_paths(repo_dir: Path) -> set[Path]:
     """
     Parse: git worktree list --porcelain
@@ -240,6 +272,9 @@ def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref:
     registered = get_worktree_paths(repo_dir)
 
     if wt.exists() and wt not in registered:
+        if _is_valid_git_worktree(wt):
+            logger.warning("[BOTSTATE][WORKTREE][DECISION] action=adopt dir=%s registered=0", wt)
+            return
         logger.warning("[BOTSTATE][WORKTREE][DECISION] action=rmtree dir=%s registered=0", wt)
         shutil.rmtree(wt, ignore_errors=True)
 
@@ -591,6 +626,10 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
+        stage_runtime_universe(worktree_dir)
+        staged_files = _cached_diff_names(worktree_dir)
+        logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
+        staged_any = staged_any or bool(staged_files)
         if not staged_any:
             logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
             return

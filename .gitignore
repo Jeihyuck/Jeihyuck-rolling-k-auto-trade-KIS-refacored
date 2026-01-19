@@ -17,3 +17,16 @@ trader/state/
 trader/state/ohlcv_cache/
 runtime/
 bot_state/
+
+# Allow tracking runtime universe outputs in bot_state
+!bot_state/
+!bot_state/runtime/
+!bot_state/runtime/universe/
+!bot_state/runtime/universe/**
+!bot_state/runtime/universe_build_done_*.flag
+!bot_state/runtime/universe_sanitize_*.json
+!bot_state/runtime/*.flag
+!bot_state/runtime/*.json
+!bot_state/runtime/diagnostics/
+!bot_state/runtime/diagnostics/*.json
+!bot_state/runtime/diagnostics/universe_drop_*.json

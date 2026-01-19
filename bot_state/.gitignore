@@ -7,3 +7,12 @@ universe_lkg/
 runtime/ohlcv_cache/
 runtime/**.parquet
 runtime/diagnostics/
+!runtime/
+!runtime/universe/
+!runtime/universe/**
+!runtime/universe_build_done_*.flag
+!runtime/universe_sanitize_*.json
+!runtime/*.flag
+!runtime/*.json
+!runtime/diagnostics/
+!runtime/diagnostics/universe_drop_*.json

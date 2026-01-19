@@ -148,6 +148,17 @@ def ensure_universe_built_once(
     ]
     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
     subprocess.run(cmd, check=False)
+    _, post_meta = runtime_store.load_today_universe(as_of)
+    if post_meta.get("have_today"):
+        log.info(
+            "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+            post_meta.get("today_path"),
+        )
+    else:
+        log.warning(
+            "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+            post_meta.get("today_path"),
+        )
 
 
 def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
