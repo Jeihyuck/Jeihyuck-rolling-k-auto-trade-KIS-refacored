@@ -1,10 +1,3 @@
-def test_ensure_universe_built_once_noarg_does_not_crash(monkeypatch):
-    monkeypatch.setenv("BOT_STATE_DIR", "bot_state")
-    from trader.pb1_runner import ensure_universe_built_once
-
-    ensure_universe_built_once()
-
-
 def test_ensure_universe_built_once_with_runtime_store(monkeypatch, tmp_path):
     bot_state_dir = tmp_path / "bot_state"
     bot_state_dir.mkdir(parents=True, exist_ok=True)

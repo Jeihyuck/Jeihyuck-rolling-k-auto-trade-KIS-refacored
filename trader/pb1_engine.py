@@ -125,6 +125,34 @@ def _extract_output2_keys(summary_raw: Any) -> list[str]:
     return [f"type:{type(summary_raw).__name__}"]
 
 
+def _log_balance_snapshot_shape(snapshot: Any, *, label: str) -> None:
+    if not isinstance(snapshot, dict):
+        logger.info("[BALANCE][SHAPE] label=%s type=%s", label, type(snapshot).__name__)
+        return
+    keys = list(snapshot.keys())
+    output2 = snapshot.get("output2")
+    output2_type = type(output2).__name__
+    output2_len = len(output2) if isinstance(output2, list) else None
+    output2_first_type = None
+    output2_first_keys = None
+    if isinstance(output2, list) and output2:
+        output2_first_type = type(output2[0]).__name__
+        if isinstance(output2[0], dict):
+            output2_first_keys = list(output2[0].keys())
+    elif isinstance(output2, dict):
+        output2_first_type = "dict"
+        output2_first_keys = list(output2.keys())
+    logger.info(
+        "[BALANCE][SHAPE] label=%s type=dict keys=%s output2_type=%s output2_len=%s output2_first_type=%s output2_first_keys=%s",
+        label,
+        keys,
+        output2_type,
+        output2_len,
+        output2_first_type,
+        output2_first_keys,
+    )
+
+
 def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
     output2 = snapshot.get("output2") or []
     if not isinstance(output2, list) or not output2:
@@ -516,11 +544,19 @@ class PB1Engine:
         summary = _as_first_dict(summary_raw)
         selected_key = None
         cash_value = None
-        for key in ("dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt", "ord_psbl_cash", "nrcvb_buy_amt"):
+        for key in ("nxdy_excc_amt", "dnca_tot_amt"):
             if key in summary:
                 selected_key = key
                 cash_value = self._to_float(summary.get(key))
                 break
+        if cash_value is None:
+            tot_evlu = self._to_float(summary.get("tot_evlu_amt"))
+            scts_evlu = self._to_float(summary.get("scts_evlu_amt"))
+            if tot_evlu is not None and scts_evlu is not None:
+                estimated = tot_evlu - scts_evlu
+                if estimated >= 0:
+                    selected_key = "tot_evlu_minus_scts_evlu"
+                    cash_value = estimated
         output2_keys = _extract_output2_keys(summary_raw)
         meta = {
             "selected_key": selected_key,
@@ -531,6 +567,7 @@ class PB1Engine:
         return int(cash_value), meta
 
     def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
+        _log_balance_snapshot_shape(snapshot, label="input")
         if _is_sanitized_balance_snapshot(snapshot):
             logger.warning("[PB1][CASH][SANITIZED] detected -> force refetch raw")
             if self.kis:
@@ -543,31 +580,31 @@ class PB1Engine:
         orderable = None
         if self.kis:
             try:
-                orderable, _meta = self.kis.get_orderable_cash(code_hint="000000", price_hint=1000)
+                orderable = self.kis.get_orderable_cash_krw(force=False)
             except Exception:
                 orderable = None
 
         if isinstance(orderable, (int, float)) and orderable > 0:
             available_cash_krw = int(orderable)
-            return snapshot, available_cash_krw, {"source": "orderable_cash"}
+            return snapshot, available_cash_krw, {"source": "orderable_cash", "selected_key": "ord_psbl_cash"}
 
         balance_resp = snapshot
+        cash, meta = self._parse_available_cash_snapshot(balance_resp)
+        if cash is not None and cash > 0:
+            return snapshot, int(cash), {**meta, "source": "balance_snapshot"}
+
         if self.kis:
             try:
-                balance_resp = self.kis.get_balance_cached(force=False)
-            except Exception:
-                balance_resp = snapshot
-
-        out2 = balance_resp.get("output2")
-        if isinstance(out2, list) and out2 and isinstance(out2[0], dict) and not out2[0]:
-            if self.kis:
                 balance_resp = self.kis.get_balance_cached(force=True)
+                _log_balance_snapshot_shape(balance_resp, label="force_refresh")
+                cash, meta = self._parse_available_cash_snapshot(balance_resp)
+            except Exception:
+                cash = None
 
-        dnca = _extract_dnca_tot_amt(balance_resp)
-        if dnca is None:
-            raise RuntimeError("Balance parse failed: cannot locate dnca_tot_amt/ord_psbl_cash")
+        if cash is None or cash <= 0:
+            raise RuntimeError("Balance parse failed: cannot locate usable cash fields")
 
-        return snapshot, int(dnca), {"source": "balance_dnca_tot_amt"}
+        return balance_resp, int(cash), {**meta, "source": "balance_snapshot"}
 
     def _resolve_entry_capital(
         self,
@@ -577,13 +614,20 @@ class PB1Engine:
         reserve_pct: float,
     ) -> tuple[int, int, dict]:
         use_override = override_capital is not None and int(override_capital) > 0
-        entry_capital = int(override_capital) if use_override else int(available_cash_krw)
+        auto_mode = not use_override and (override_capital is None or int(override_capital) <= 0)
+        if auto_mode:
+            entry_capital = max(int(available_cash_krw * (1 - reserve_pct)), 0)
+            usable = entry_capital
+        else:
+            entry_capital = int(override_capital) if use_override else int(available_cash_krw)
+            usable = int(entry_capital * (1 - reserve_pct))
         clamp_meta = {}
         if (self.env or "").lower() != "real":
             cap = min(int(available_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
             if entry_capital > cap:
                 before = entry_capital
                 entry_capital = cap
+                usable = entry_capital if auto_mode else int(entry_capital * (1 - reserve_pct))
                 clamp_meta = {"before": before, "cap": cap, "after": entry_capital}
                 logger.info(
                     "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
@@ -591,8 +635,7 @@ class PB1Engine:
                     cap,
                     entry_capital,
                 )
-        usable = int(entry_capital * (1 - reserve_pct))
-        meta = {"use_override": use_override, "clamp": clamp_meta}
+        meta = {"use_override": use_override, "auto": auto_mode, "clamp": clamp_meta, "reserve_pct": reserve_pct}
         return entry_capital, usable, meta
 
     def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
@@ -2104,6 +2147,13 @@ class PB1Engine:
         )
         self.entry_capital_krw = float(entry_capital_krw)
         self.entry_usable_krw = float(entry_usable_krw)
+        if capital_meta.get("auto"):
+            logger.info(
+                "[PB1][CAPITAL][AUTO] entry_capital_runtime=%s source=%s reserve=%.2f",
+                entry_capital_krw,
+                cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
+                reserve_pct,
+            )
         logger.info(
             "[PB1][CAPITAL] available_cash=%s override=%s use_override=%s -> entry_capital=%s reserve=%.2f usable=%s source=%s",
             available_cash_krw,
@@ -2112,7 +2162,7 @@ class PB1Engine:
             entry_capital_krw,
             reserve_pct,
             entry_usable_krw,
-            cash_meta.get("selected_key") or "unknown",
+            cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
         )
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:

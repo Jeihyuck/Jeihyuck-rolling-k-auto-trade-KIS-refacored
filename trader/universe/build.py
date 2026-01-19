@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
-from trader.botstate_paths import ensure_not_repo_tracked_path
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
 
 from datetime import date
 
@@ -169,14 +170,20 @@ def _sanitize_members(
     *,
     ohlcv_provider: ChainOHLCVProvider | None = None,
     min_candles: int = 0,
-) -> tuple[list[dict], dict[str, int]]:
+) -> tuple[list[dict], dict[str, int], dict]:
     stats = {"total_raw": len(members), "invalid_format": 0, "insufficient_history": 0, "final": 0}
     sanitized: list[dict] = []
+    invalid_format_codes: list[str] = []
+    insufficient_history_codes: list[str] = []
+    dropped: list[dict] = []
     for member in members:
         raw_code = str(member.get("code") or member.get("pdno") or "").strip()
         code = raw_code.zfill(6) if raw_code.isdigit() else raw_code
         if not TICKER_PATTERN.match(code):
             stats["invalid_format"] += 1
+            if raw_code:
+                invalid_format_codes.append(raw_code)
+                dropped.append({"code": raw_code, "reason": "invalid_format"})
             continue
         member["code"] = code
         if ohlcv_provider and min_candles > 0:
@@ -185,13 +192,52 @@ def _sanitize_members(
             except Exception:
                 logger.exception("[UNIVERSE][VALIDATE][FAIL] code=%s", code)
                 stats["insufficient_history"] += 1
+                insufficient_history_codes.append(code)
+                dropped.append({"code": code, "reason": "insufficient_history"})
                 continue
             if result.meta.get("insufficient_candles") or result.meta.get("rows", 0) < min_candles:
                 stats["insufficient_history"] += 1
+                insufficient_history_codes.append(code)
+                dropped.append({"code": code, "reason": "insufficient_history"})
                 continue
         sanitized.append(member)
     stats["final"] = len(sanitized)
-    return sanitized, stats
+    return (
+        sanitized,
+        stats,
+        {
+            "invalid_format_codes": invalid_format_codes,
+            "insufficient_history_codes": insufficient_history_codes,
+            "kept": [m.get("code") for m in sanitized],
+            "dropped": dropped,
+        },
+    )
+
+
+def _write_runtime_universe(*, as_of_date: str, env: str, strategy: str, payload: dict | None, members: list[dict], source: str, params: dict) -> Path:
+    path = botstate_path("runtime", "universe", f"{as_of_date}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "as_of": as_of_date,
+        "env": env,
+        "strategy": strategy,
+        "source": source,
+        "params": params,
+        "payload": payload or {},
+        "members": members,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s", path, len(members), source)
+    return path
+
+
+def _write_universe_sanitize_report(*, as_of_date: str, keep_codes: list[str], dropped: list[dict]) -> Path:
+    path = botstate_path("runtime", f"universe_sanitize_{as_of_date}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"as_of": as_of_date, "kept": keep_codes, "dropped": dropped}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[UNIVERSE][SANITIZE][SAVE] path=%s kept=%s dropped=%s", path, len(keep_codes), len(dropped))
+    return path
 
 
 def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
@@ -484,7 +530,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
-    members, stats = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
+    members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
     logger.info(
         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
         stats["total_raw"],
@@ -492,6 +538,20 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         stats["insufficient_history"],
         stats["final"],
     )
+    invalid_codes = sanitize_detail.get("invalid_format_codes") or []
+    insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
+    if invalid_codes:
+        logger.info(
+            "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
+            len(invalid_codes),
+            invalid_codes[: min(5, len(invalid_codes))],
+        )
+    if insufficient_codes:
+        logger.info(
+            "[UNIVERSE][DROP] reason=insufficient_history count=%s sample=%s",
+            len(insufficient_codes),
+            insufficient_codes[: min(5, len(insufficient_codes))],
+        )
 
     universe_id = repo.store_universe(
         env=env,
@@ -517,6 +577,24 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         logger.warning(
             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
         )
+    _write_runtime_universe(
+        as_of_date=as_of_date,
+        env=env,
+        strategy=strategy,
+        payload=payload,
+        members=members,
+        source=source,
+        params=params,
+    )
+    _write_universe_sanitize_report(
+        as_of_date=as_of_date,
+        keep_codes=sanitize_detail.get("kept") or [],
+        dropped=sanitize_detail.get("dropped") or [],
+    )
+    flag = botstate_path("runtime", f"universe_build_done_{as_of_date}.flag")
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    if not flag.exists():
+        flag.write_text("done\n", encoding="utf-8")
     return universe_id
 
 

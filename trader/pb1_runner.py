@@ -38,7 +38,7 @@ from trader.config import (
     PAPER_MAX_CAPITAL_KRW,
     resolve_strategy_mode,
 )
-from trader.botstate_paths import get_botstate_root
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
 from trader.botstate_sync import (
     BotStateContext,
     acquire_lock as acquire_botstate_lock,
@@ -75,46 +75,17 @@ def _deepcopy_json(value):
 
 
 def universe_build_flag(as_of: str) -> Path:
-    return Path("bot_state/runtime") / f"universe_build_done_{as_of}.flag"
-
-def _default_runtime_store() -> RuntimeStore:
-    """
-    하위호환용: runtime_store를 외부에서 넘기지 않은 경우의 기본 생성 로직.
-    bot_state 기반으로 RuntimeStore를 만든다.
-    """
-    bot_state_dir = os.getenv("BOT_STATE_DIR", "").strip()
-    if bot_state_dir:
-        base = Path(bot_state_dir)
-    else:
-        base = Path("bot_state")
-
-    from trader.runtime_store import RuntimeStore  # 실제 위치에 맞게 import 조정
-
-    try:
-        rs = RuntimeStore(bot_state_dir=base)
-    except TypeError:
-        try:
-            rs = RuntimeStore(base_dir=base)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to initialize RuntimeStore with base_dir={base}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Failed to initialize RuntimeStore with bot_state_dir={base}") from exc
-    log.info("[UNIVERSE][DEFAULT_RUNTIME_STORE] bot_state_dir=%s", str(base))
-    return rs
+    return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
 
 
 def ensure_universe_built_once(
-    runtime_store: RuntimeStore | None = None,
+    runtime_store: RuntimeStore,
     *,
     env: str | None = None,
     strategy: str | None = None,
     as_of: str | None = None,
     force: bool = False,
 ) -> None:
-    if runtime_store is None:
-        runtime_store = _default_runtime_store()
-        log.warning("[UNIVERSE][COMPAT] ensure_universe_built_once() called without runtime_store -> using default")
-
     if env is None:
         env = os.getenv("KIS_ENV", "").strip()
     if strategy is None:
@@ -161,6 +132,82 @@ def ensure_universe_built_once(
     ]
     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
     subprocess.run(cmd, check=False)
+
+
+def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+    events_dir = base_dir / "runtime" / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
+    ensure_not_repo_tracked_path(path)
+    line = json.dumps(payload, ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
+    return path
+
+
+def _handle_missing_positions_reset(
+    *,
+    balance_snapshot: dict | None,
+    env: str,
+    strategy: str,
+    run_id: str | None,
+    positions_repo: PositionsRepo,
+    ledger_repo: LedgerEventsRepo,
+    bot_state_dir: Path,
+) -> bool:
+    if not balance_snapshot:
+        return False
+    holdings_rows = balance_snapshot.get("output1") or []
+    kis_codes = {str(row.get("pdno") or row.get("code") or "").zfill(6) for row in holdings_rows}
+    kis_codes = {code for code in kis_codes if code}
+    if kis_codes:
+        return False
+    positions = positions_repo.list_positions(env, strategy)
+    position_codes = {str(p.get("code") or "").zfill(6) for p in positions if int(p.get("qty") or 0) > 0}
+    ledger_store = LedgerStore(LEDGER_BASE_DIR, env=env, run_id=run_id)
+    ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+    ledger_codes = {code for (code, sid, mode) in ledger_positions.keys() if code}
+    missing_codes = sorted(position_codes | ledger_codes)
+    if not missing_codes:
+        return False
+    closed_count = 0
+    if position_codes:
+        closed_count = positions_repo.close_positions(env=env, strategy=strategy, codes=sorted(position_codes))
+    for code in missing_codes:
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            event_type="ACCOUNT_RESET_POSITION_CLOSED",
+            ts=now_kst(),
+            code=code,
+            sid=1,
+            mode=1,
+            ok=True,
+            reasons=["account_reset_or_position_missing"],
+            payload_json={"source": "missing_position_reset"},
+        )
+    _write_account_reset_event(
+        bot_state_dir,
+        {
+            "ts": now_kst().isoformat(),
+            "env": env,
+            "strategy": strategy,
+            "reason": "account_reset_or_position_missing",
+            "kis_holdings_count": len(holdings_rows),
+            "missing_codes": missing_codes,
+            "ledger_position_count": len(ledger_codes),
+            "db_position_count": len(position_codes),
+            "closed_positions": closed_count,
+        },
+    )
+    logger.warning(
+        "[PB1][RESET][SAFE_EXIT] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s",
+        env,
+        missing_codes,
+        closed_count,
+    )
+    return True
 
 
 def _resolve_market_context(
@@ -882,6 +929,21 @@ def run_once(
                 "phase_reason": phase_reason,
             },
         )
+        if _handle_missing_positions_reset(
+            balance_snapshot=balance_snapshot_raw,
+            env=kis_env or "practice",
+            strategy="pb1_pullback_close",
+            run_id=run_record_id,
+            positions_repo=positions_repo,
+            ledger_repo=ledger_repo,
+            bot_state_dir=resolved_bot_state_dir,
+        ):
+            if env_bool("PRACTICE_RESET_DAY", False):
+                os.environ["PB1_ENTRY_ENABLED"] = "0"
+                logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
+            runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
+            touched_files = _collect_botstate_files(run_start_ts)
+            return touched_files, True, {}, phase_for_log, "RESET_ABORT"
         if kis:
             try:
                 reconcile_today(

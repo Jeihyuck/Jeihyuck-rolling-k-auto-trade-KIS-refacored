@@ -31,6 +31,9 @@ class DummyKis:
     def get_orderable_cash(self, code_hint=None, price_hint=None):
         return self.orderable, {}
 
+    def get_orderable_cash_krw(self, force=False):
+        return self.orderable
+
 
 def _make_engine(*, kis=None, ledger_repo=None, env="practice"):
     return PB1Engine(
@@ -57,7 +60,7 @@ def test_entry_capital_ignores_zero_override():
         reserve_pct=0.1,
     )
 
-    assert entry_capital == 10_000_000
+    assert entry_capital == 9_000_000
     assert usable == 9_000_000
     assert meta["use_override"] is False
 
@@ -69,12 +72,12 @@ def test_balance_parse_refreshes_once_on_failure():
     engine = _make_engine(kis=kis)
     initial = {"output2": [{}], "output1": []}
 
-    refreshed, cash, meta = engine._resolve_holdings_snapshot_with_cash(initial)
+    returned_snapshot, cash, meta = engine._resolve_holdings_snapshot_with_cash(initial)
 
     assert cash == 10_000_000
-    assert meta["source"] == "balance_dnca_tot_amt"
-    assert refreshed == initial
-    assert kis.calls == [False, True]
+    assert meta["source"] == "balance_snapshot"
+    assert returned_snapshot == refreshed
+    assert kis.calls == [True]
 
 
 def test_balance_parse_raises_after_failed_refresh():
@@ -85,7 +88,7 @@ def test_balance_parse_raises_after_failed_refresh():
     with pytest.raises(RuntimeError, match="Balance parse failed"):
         engine._resolve_holdings_snapshot_with_cash(snapshot)
 
-    assert kis.calls == [False, True]
+    assert kis.calls == [True, True]
 
 
 def test_ledger_only_positions_are_marked_orphan(monkeypatch):

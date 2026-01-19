@@ -131,6 +131,12 @@ class RuntimeStore:
             meta["selected_path"],
             meta["members"],
         )
+        if not meta["have_today"] and meta["have_lkg"]:
+            logger.info(
+                "[UNIVERSE][CHECK] today_missing -> using_lkg path=%s members=%s",
+                meta["selected_path"],
+                meta["members"],
+            )
         return ok, meta
 
     def load_universe_for_trading(self, as_of: str) -> tuple[list[dict], dict]:

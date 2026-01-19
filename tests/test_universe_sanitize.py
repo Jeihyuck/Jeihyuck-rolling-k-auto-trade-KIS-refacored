@@ -22,9 +22,11 @@ def test_universe_sanitize_filters_invalid_and_insufficient():
     ]
     provider = FakeOHLCVProvider({"005930": 30, "001234": 10})
 
-    sanitized, stats = _sanitize_members(members, ohlcv_provider=provider, min_candles=20)
+    sanitized, stats, detail = _sanitize_members(members, ohlcv_provider=provider, min_candles=20)
 
     assert [m["code"] for m in sanitized] == ["005930"]
     assert stats["invalid_format"] == 1
     assert stats["insufficient_history"] == 1
     assert stats["final"] == 1
+    assert detail["invalid_format_codes"] == ["0009K0"]
+    assert detail["insufficient_history_codes"] == ["001234"]

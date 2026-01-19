@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 import logging
 
+from trader.botstate_paths import get_botstate_root
+
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -262,6 +264,27 @@ def _mk_md_table(rows: List[List[str]]) -> str:
         md += "| " + " | ".join(r) + " |\n"
     return md
 
+
+def _load_universe_sanitize(as_of: date) -> Dict[str, Any] | None:
+    base_dir = Path(os.getenv("BOT_STATE_DIR", "")).expanduser()
+    if not str(base_dir):
+        base_dir = get_botstate_root()
+    path = base_dir / "runtime" / f"universe_sanitize_{as_of.isoformat()}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("[CEO REPORT] universe sanitize load failed path=%s", path)
+        return None
+    kept = data.get("kept") if isinstance(data, dict) else None
+    dropped = data.get("dropped") if isinstance(data, dict) else None
+    return {
+        "path": str(path),
+        "kept": kept if isinstance(kept, list) else [],
+        "dropped": dropped if isinstance(dropped, list) else [],
+    }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 메인: CEO 리포트
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,6 +329,25 @@ def ceo_report(base_dt_kst: Optional[datetime] = None, period: str = "daily") ->
     md_lines.append(f"- 승/패: **{summ.wins} / {summ.losses}**")
     md_lines.append(f"- 총 손익: **{_fmt_krw(summ.gross_profit)}**")
     md_lines.append(f"- 평균 수익률: **{str(summ.avg_pnl_pct) + '%' if summ.avg_pnl_pct is not None else '-'}**")
+    md_lines.append("")
+
+    universe_meta = _load_universe_sanitize(end_dt.date())
+    md_lines.append("## Universe Build")
+    if universe_meta:
+        kept = universe_meta["kept"]
+        dropped = universe_meta["dropped"]
+        reason_counts: Dict[str, int] = {}
+        for row in dropped:
+            reason = row.get("reason") if isinstance(row, dict) else None
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        md_lines.append(f"- kept: **{len(kept)}**")
+        md_lines.append(f"- dropped: **{len(dropped)}**")
+        if reason_counts:
+            md_lines.append(f"- drop_reasons: {reason_counts}")
+        md_lines.append(f"- sanitize_report: `{universe_meta['path']}`")
+    else:
+        md_lines.append("> universe sanitize report 없음")
     md_lines.append("")
 
     # Top Winners
@@ -381,6 +423,7 @@ def ceo_report(base_dt_kst: Optional[datetime] = None, period: str = "daily") ->
         "summary": asdict(summ),
         "top_winners": [asdict(x) for x in top_w],
         "top_losers": [asdict(x) for x in top_l],
+        "universe": universe_meta or {},
     }
     return payload
 

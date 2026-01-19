@@ -624,6 +624,25 @@ class PositionsRepo:
             rows = conn.execute(stmt).mappings().all()
             return [dict(r) for r in rows]
 
+    def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
+        if not codes:
+            return 0
+        stmt = (
+            sa.update(self._schema.positions)
+            .where(
+                and_(
+                    self._schema.positions.c.env == env,
+                    self._schema.positions.c.strategy == strategy,
+                    self._schema.positions.c.code.in_(codes),
+                    self._schema.positions.c.qty > 0,
+                )
+            )
+            .values(qty=0, avg_buy_price=None, total_cost=0.0, updated_at=func.now())
+        )
+        with self.engine.begin() as conn:
+            result = conn.execute(stmt)
+            return int(result.rowcount or 0)
+
     def apply_fill(
         self,
         *,

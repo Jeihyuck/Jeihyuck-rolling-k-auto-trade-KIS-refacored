@@ -231,6 +231,9 @@ class KisAPI:
         self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
         self._balance_cache: Optional[dict] = None
         self._balance_cache_at: Optional[datetime] = None
+        self._orderable_cash_cache: Optional[int] = None
+        self._orderable_cash_cache_at: Optional[datetime] = None
+        self._orderable_cash_cache_ttl_sec = 5.0
 
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
@@ -444,6 +447,36 @@ class KisAPI:
             cash_meta.get("clamp_applied"),
         )
         return cash, cash_meta
+
+    def get_orderable_cash_krw(self, force: bool = False) -> int:
+        """
+        주문가능현금(원) 단일 조회.
+        - psbl order endpoint만 사용
+        - 짧은 TTL 캐시 적용
+        """
+        if not force and self._orderable_cash_cache is not None and self._orderable_cash_cache_at is not None:
+            age_s = (now_kst() - self._orderable_cash_cache_at).total_seconds()
+            if age_s <= self._orderable_cash_cache_ttl_sec:
+                logger.info("[CASH][PSBL][CACHE] hit=True age_s=%.2f", age_s)
+                return int(self._orderable_cash_cache)
+        logger.info("[CASH][PSBL][CACHE] hit=False force=%s", force)
+        cash = 0
+        try:
+            resp = self._inquire_psbl_order("005930", 1000)
+            cash, meta = self._parse_cash_from_psbl_order(resp)
+            raw_fields = meta.get("raw_fields") or {}
+            logger.info(
+                "[CASH][PSBL][KRW] ord_psbl_cash=%s ord_psbl_amt=%s",
+                raw_fields.get("ord_psbl_cash"),
+                raw_fields.get("ord_psbl_amt"),
+            )
+        except Exception as exc:
+            logger.warning("[CASH][PSBL][KRW][FAIL] err=%s", exc)
+            return 0
+        if cash > 0:
+            self._orderable_cash_cache = cash
+            self._orderable_cash_cache_at = now_kst()
+        return int(max(cash, 0))
 
     def get_cash_available_today(self) -> int:
         """
