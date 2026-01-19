@@ -1,0 +1,15 @@
+# --- botstate (tracked artifacts) ---
+# Keep universe artifacts, diagnostics, db, and minimal runtime meta.
+
+# Large caches MUST NOT be committed
+bot_state/runtime/ohlcv_cache/
+bot_state/runtime/ohlcv_cache/**
+
+# Optional: other noisy runtime temp (필요시 켜기)
+# bot_state/runtime/tmp/
+# bot_state/runtime/tmp/**
+
+# Python / OS noise
+.DS_Store
+__pycache__/
+*.pyc
