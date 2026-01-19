@@ -125,6 +125,21 @@ def _extract_output2_keys(summary_raw: Any) -> list[str]:
     return [f"type:{type(summary_raw).__name__}"]
 
 
+def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
+    output2 = snapshot.get("output2") or []
+    if not isinstance(output2, list) or not output2:
+        return False
+    first = output2[0]
+    if not isinstance(first, dict):
+        return False
+    if len(first.keys()) == 0:
+        return True
+    values = [value for value in first.values() if value is not None]
+    if not values:
+        return False
+    return all(isinstance(value, str) and value == "****" for value in values)
+
+
 def _is_missing(value: float | None) -> bool:
     return value is None or (isinstance(value, float) and value != value)
 
@@ -482,7 +497,7 @@ class PB1Engine:
         summary = _as_first_dict(summary_raw)
         selected_key = None
         cash_value = None
-        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
+        for key in ("dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt", "ord_psbl_cash", "nrcvb_buy_amt"):
             if key in summary:
                 selected_key = key
                 cash_value = self._to_float(summary.get(key))
@@ -497,6 +512,14 @@ class PB1Engine:
         return int(cash_value), meta
 
     def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
+        if _is_sanitized_balance_snapshot(snapshot):
+            logger.warning("[PB1][CASH][SANITIZED] detected -> force refetch raw")
+            if self.kis:
+                try:
+                    refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
+                    snapshot = refreshed_snapshot
+                except Exception as exc:
+                    raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
         available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
         if available_cash_krw is None:
             logger.warning(

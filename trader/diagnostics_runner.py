@@ -20,6 +20,7 @@ from trader.config import (
 from trader.core_utils import get_rebalance_anchor_date
 from trader.data_health import check_data_health
 from trader.kis_wrapper import KisAPI
+from trader.balance_utils import sanitize_balance_snapshot
 from trader.setup_eval import evaluate_setup
 from trader.time_utils import now_kst
 
@@ -204,6 +205,7 @@ def run_diagnostics(
     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
     selected_by_market = _filter_markets(selected_by_market, target_markets)
     balance, holdings = _load_balance(kis)
+    balance_safe = sanitize_balance_snapshot(balance)
     try:
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
             runtime_state,
@@ -424,7 +426,7 @@ def run_diagnostics(
         "exit_eval": exit_eval_results,
         "orphans": runtime_state["diagnostics"]["orphans"],
         "selected_by_market": selected_by_market or {},
-        "balance": balance,
+        "balance": balance_safe,
         "managed_positions": managed_positions_count,
         "unmanaged_positions": unmanaged_positions_count,
         "unknown_positions": unknown_positions_count,

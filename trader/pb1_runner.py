@@ -47,6 +47,7 @@ from trader.botstate_sync import (
     resolve_botstate_worktree_dir,
     setup_worktree,
 )
+from trader.balance_utils import sanitize_balance_snapshot
 from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
@@ -394,6 +395,22 @@ def _load_runtime_meta(bot_state_dir: Path) -> dict:
 def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
     path = _runtime_meta_path(bot_state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _balance_snapshot_path(bot_state_dir: Path) -> Path:
+    return bot_state_dir / "runtime" / "balance_snapshot.json"
+
+
+def _persist_balance_snapshot(balance_snapshot: dict, bot_state_dir: Path, *, as_of: datetime | None = None) -> None:
+    if not balance_snapshot:
+        return
+    path = _balance_snapshot_path(bot_state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "as_of": (as_of or now_kst()).isoformat(),
+        "balance": balance_snapshot,
+    }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -784,18 +801,21 @@ def run_once(
             dry_run = True
             _apply_env_flags(dry_run)
 
-        balance_snapshot: dict | None = None
+        balance_snapshot_raw: dict | None = None
+        balance_snapshot_safe: dict | None = None
         balance_source: str | None = None
         if kis:
             try:
                 _log_balance_cache(force=False)
-                balance_snapshot, balance_source = kis.get_balance_cached(force=False, return_source=True)
+                balance_snapshot_raw, balance_source = kis.get_balance_cached(force=False, return_source=True)
+                balance_snapshot_safe = sanitize_balance_snapshot(balance_snapshot_raw)
+                _persist_balance_snapshot(balance_snapshot_safe, resolved_bot_state_dir, as_of=now)
             except Exception:
                 logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
 
         reset_reason = None
         account_fp_now = None
-        if kis and balance_snapshot:
+        if kis and balance_snapshot_raw:
             account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
             runtime_fp = runtime_meta.get("account_fp")
@@ -804,7 +824,7 @@ def run_once(
             elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
                 reset_reason = "account_fp_mismatch"
             elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
-                kis_holdings = balance_snapshot.get("output1") or []
+                kis_holdings = balance_snapshot_raw.get("output1") or []
                 existing_positions = positions_repo.list_positions(kis_env or "practice", "pb1_pullback_close")
                 existing_positions_count = len([p for p in existing_positions if int(p.get("qty") or 0) > 0])
                 ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
@@ -812,7 +832,7 @@ def run_once(
                 ledger_has_positions = any(
                     int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
                 )
-                dnca_total = _extract_dnca_total(balance_snapshot)
+                dnca_total = _extract_dnca_total(balance_snapshot_raw)
                 is_paper_env = (kis_env or "").lower() != "real"
                 if len(kis_holdings) == 0 and (existing_positions_count > 0 or ledger_has_positions) and dnca_total is not None:
                     if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
@@ -883,7 +903,7 @@ def run_once(
             env=kis_env or "practice",
             run_id=run_record_id,
             now_kst_value=now,
-            balance_snapshot=balance_snapshot,
+            balance_snapshot=balance_snapshot_raw,
             balance_source=balance_source,
         )
         if close_cancel_only:

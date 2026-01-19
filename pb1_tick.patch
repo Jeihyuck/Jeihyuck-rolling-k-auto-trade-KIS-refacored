@@ -1,395 +1,189 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 01fcd45033b161bbe4c51c34d85614f6995250a2..83e8b6daeb0b889c8d6bcda5b9fbe19d1ca7e60e 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -30,50 +30,51 @@ on:
-     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
-     - cron: "29 6 * * 1-5"
- 
- defaults:
-   run:
-     shell: bash
-     working-directory: repo
- 
- jobs:
-   universe_build:
-     runs-on: ubuntu-latest
-     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
-     timeout-minutes: 15
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
- 
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
-+      PAPER_MAX_CAPITAL_KRW: "10000000"
- 
-       # ✅ FIX: do NOT use runner.temp (invalid in this context). Use github.workspace.
-       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
-       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
- 
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
-           path: repo
-@@ -201,50 +202,51 @@ jobs:
-         run: |
-           set -euo pipefail
-           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
-         env:
-           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
- 
-   trade_tick:
-     runs-on: ubuntu-latest
-     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
-     timeout-minutes: 8
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
- 
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
- 
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
-+      PAPER_MAX_CAPITAL_KRW: "10000000"
- 
-       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-       COMPILE_CHECK_ENABLED: "0"
-       MIGRATE_MODE: "AUTO"
-       PERSIST_MODE: "ON_CHANGE"
- 
-       # ✅ FIX: do NOT use runner.temp here either
-       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
- 
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       RUN_LOOP_MINUTES: "4"
- 
-       BOTSTATE_LOCK_TTL_SEC: "240"
-@@ -442,50 +444,51 @@ jobs:
-           fi
- 
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
-         env:
-           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
- 
-   close_cancel:
-     runs-on: ubuntu-latest
-     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
-     timeout-minutes: 8
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
- 
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
- 
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
-+      PAPER_MAX_CAPITAL_KRW: "10000000"
- 
-       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-       COMPILE_CHECK_ENABLED: "0"
-       MIGRATE_MODE: "AUTO"
-       PERSIST_MODE: "ON_CHANGE"
- 
-       # ✅ FIX: do NOT use runner.temp here either
-       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
-       PB1_CLOSE_CANCEL_ONLY: "1"
- 
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       BOTSTATE_LOCK_TTL_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-diff --git a/tests/test_pb1_capital_orphan.py b/tests/test_pb1_capital_orphan.py
+diff --git a/trader/balance_utils.py b/trader/balance_utils.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..286308a03e177ef975132ec1f76c7b66ddfd3b22
+index 0000000000000000000000000000000000000000..33384fac1ce1314c5c94b92193ed2f64077ebb72
 --- /dev/null
-+++ b/tests/test_pb1_capital_orphan.py
-@@ -0,0 +1,100 @@
-+import pytest
++++ b/trader/balance_utils.py
+@@ -0,0 +1,17 @@
++from __future__ import annotations
 +
-+from trader.pb1_engine import PB1Engine
-+from trader.window_router import WindowDecision
-+from trader.ledger.store import LedgerStore
++from typing import Any
 +
 +
-+class DummyLedgerRepo:
-+    def __init__(self):
-+        self.events = []
-+
-+    def append_event(self, **kwargs):
-+        self.events.append(kwargs)
-+        return "evt"
++def sanitize_balance_snapshot(snapshot: dict | None) -> dict:
++    return _sanitize_value(snapshot or {})
 +
 +
-+class DummyKis:
-+    def __init__(self, snapshot):
-+        self.snapshot = snapshot
-+        self.calls = []
-+
-+    def get_balance_cached(self, force=False, return_source=False):
-+        self.calls.append(force)
-+        if return_source:
-+            return self.snapshot, "api"
-+        return self.snapshot
-+
-+
-+def _make_engine(*, kis=None, ledger_repo=None, env="practice"):
-+    return PB1Engine(
-+        universe_repo=object(),
-+        orders_repo=object(),
-+        fills_repo=object(),
-+        positions_repo=object(),
-+        ledger_repo=ledger_repo or DummyLedgerRepo(),
-+        kis=kis,
-+        window=WindowDecision(name="morning", phase="trade"),
-+        window_label="morning",
-+        phase="trade",
-+        dry_run=True,
-+        env=env,
-+        run_id="test",
-+    )
-+
-+
-+def test_entry_capital_ignores_zero_override():
-+    engine = _make_engine()
-+    entry_capital, usable, meta = engine._resolve_entry_capital(
-+        available_cash_krw=10_000_000,
-+        override_capital=0.0,
-+        reserve_pct=0.1,
-+    )
-+
-+    assert entry_capital == 10_000_000
-+    assert usable == 9_000_000
-+    assert meta["use_override"] is False
-+
-+
-+def test_balance_parse_refreshes_once_on_failure():
-+    snapshot = {"output2": [{"dnca_tot_amt": "10000000"}], "output1": []}
-+    kis = DummyKis(snapshot)
-+    engine = _make_engine(kis=kis)
-+    initial = {"output2": [], "output1": []}
-+
-+    refreshed, cash, meta = engine._resolve_holdings_snapshot_with_cash(initial)
-+
-+    assert cash == 10_000_000
-+    assert meta["selected_key"] == "dnca_tot_amt"
-+    assert refreshed == snapshot
-+    assert kis.calls == [True]
-+
-+
-+def test_balance_parse_raises_after_failed_refresh():
-+    snapshot = {"output2": [], "output1": []}
-+    kis = DummyKis(snapshot)
-+    engine = _make_engine(kis=kis)
-+
-+    with pytest.raises(RuntimeError, match="Balance parse failed"):
-+        engine._resolve_holdings_snapshot_with_cash(snapshot)
-+
-+    assert kis.calls == [True]
-+
-+
-+def test_ledger_only_positions_are_marked_orphan(monkeypatch):
-+    ledger_repo = DummyLedgerRepo()
-+    engine = _make_engine(ledger_repo=ledger_repo)
-+
-+    def fake_rebuild(self, lookback_days=120):
-+        return {("000001", 1, 1): {"total_qty": 5, "market": "KOSPI"}}
-+
-+    monkeypatch.setattr(LedgerStore, "rebuild_positions_average_cost", fake_rebuild)
-+
-+    positions = engine._build_positions_from_kis([])
-+
-+    assert positions == []
-+    assert len(ledger_repo.events) == 1
-+    event = ledger_repo.events[0]
-+    assert event["event_type"] == "POSITION_ORPHANED"
-+    assert event["code"] == "000001"
-+    assert event["qty"] == 5
-diff --git a/trader/config.py b/trader/config.py
-index 05bc512bc4a4966fe625d4316d2e2d8dd82a7f53..ddd9cdaf23bf0851a1bc2cb0bf4707cf4dc68e0b 100644
---- a/trader/config.py
-+++ b/trader/config.py
-@@ -458,50 +458,51 @@ NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
++def _sanitize_value(value: Any) -> Any:
++    if isinstance(value, dict):
++        return {key: _sanitize_value(val) for key, val in value.items()}
++    if isinstance(value, list):
++        return [_sanitize_value(item) for item in value]
++    if value is None:
++        return None
++    return "****"
+diff --git a/trader/diagnostics_runner.py b/trader/diagnostics_runner.py
+index 2287e95ce4d02ba65f37832d3510584179ffa835..68934929a7d0cd95ecad81e8408926ac05d41bf8 100644
+--- a/trader/diagnostics_runner.py
++++ b/trader/diagnostics_runner.py
+@@ -1,47 +1,48 @@
+ from __future__ import annotations
  
- def _parse_hhmm(hhmm: str) -> dtime:
-     try:
-         hh, mm = hhmm.split(":")
-         return dtime(hour=int(hh), minute=int(mm))
-     except Exception:
-         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
-         return dtime(hour=14, minute=40)
+ import json
+ import logging
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
  
- 
- SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
- TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
- ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
- DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
- DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
- ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
- PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
- LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
- BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
- LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or botstate_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
- ensure_not_repo_tracked_path(LEDGER_BASE_DIR)
- BOT_STATE_RESET = _cfg_bool("BOT_STATE_RESET")
- BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH = _cfg_bool("BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH", fallback=True)
- BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS = _cfg_bool("BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS", fallback=True)
- BOT_STATE_RESET_CASH_MAX_KRW = int(_cfg("BOT_STATE_RESET_CASH_MAX_KRW") or "15000000")
-+PAPER_MAX_CAPITAL_KRW = int(_cfg("PAPER_MAX_CAPITAL_KRW") or "10000000")
- PB1_CAPITAL_MODE = (_cfg("PB1_CAPITAL_MODE") or "CASH").strip().upper()
- PB1_ENTRY_CAPITAL_KRW = float(_cfg("PB1_ENTRY_CAPITAL_KRW") or "0")
- PB1_CASH_RESERVE_PCT = float(_cfg("PB1_CASH_RESERVE_PCT") or "0.10")
- PB1_BLOCK_PREOPEN = _cfg_bool("PB1_BLOCK_PREOPEN", fallback=True)
- 
- logger.info(
-     "[CONFIG] BOT_STATE_RESET=%s CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
-     int(BOT_STATE_RESET),
-     PB1_CAPITAL_MODE,
-     int(PB1_ENTRY_CAPITAL_KRW),
-     PB1_CASH_RESERVE_PCT,
- )
- MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
- MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "15:20"
- MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
- MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
- AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "15:20"
- AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
- CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
- CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
- PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
- PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
- PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
- PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
- MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index 7c7e98c0dae84bfba8ad1741fc75b388db2bb725..634c9eb7b0668e898dd9c8fdd9c804702300014e 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -12,50 +12,51 @@ from typing import Any, Dict, Iterable, List
- import pandas as pd
- 
- from trader.botstate_paths import close_entry_orders_path
+ from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+ from trader import state_store as runtime_state_store
  from trader.config import (
-     CAP_CAP,
-     DAILY_CAPITAL,
-     KOSDAQ_HARD_STOP_PCT,
-     KOSPI_HARD_STOP_PCT,
-     LEDGER_BASE_DIR,
-     LEDGER_LOOKBACK_DAYS,
-     PB1_ENTRY_ENABLED,
-     PB1_DAY_SL_R,
-     PB1_DAY_TP_R,
-     PB1_R_FLOOR_PCT,
-     PB1_TIME_STOP_DAYS,
-     PB1_REQUIRE_VOLUME,
-     PB1_MIN_CANDLES,
-     PB1_MAX_POSITIONS,
-     PB1_MIN_SCORE,
-     PB1_USE_RISK_PARITY,
-     PB1_MAX_ATR_PCT,
-     PB1_MIN_VALUE20,
-     PB1_CAPITAL_MODE,
-     PB1_ENTRY_CAPITAL_KRW,
-     PB1_CASH_RESERVE_PCT,
-+    PAPER_MAX_CAPITAL_KRW,
-     PB1_ENTRY_WINDOW_START,
-     PB1_ENTRY_OPEN_END,
-     PB1_ENTRY_WINDOW_END,
-     PB1_EXIT_WINDOW_START,
-     PB1_EXIT_WINDOW_END,
-     PB1_ALLOW_ADD_TO_EXISTING,
-     MIN_ORDER_KRW,
-     resolve_market_window,
+     ACTIVE_STRATEGIES,
+     DIAG_ENABLED,
+     DIAGNOSTIC_DUMP_DIR,
+     DIAGNOSTIC_MAX_SYMBOLS,
+     DIAGNOSTIC_TARGET_MARKETS,
+     KST,
+     UNMANAGED_STRATEGY_ID,
  )
- from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.core_utils import get_rebalance_anchor_date
+ from trader.data_health import check_data_health
  from trader.kis_wrapper import KisAPI
- from trader.ledger.store import LedgerStore
- from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
++from trader.balance_utils import sanitize_balance_snapshot
+ from trader.setup_eval import evaluate_setup
  from trader.time_utils import now_kst
- from trader.core_utils import _round_to_tick
- from trader.eventlog import emit_event
- from trader.utils.env import env_bool, parse_env_flag
- from trader.window_router import WindowDecision
  
  logger = logging.getLogger(__name__)
  
- _OUTPUT2_LIST_NORMALIZED_LOGGED = False
- _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
  
-@@ -89,50 +90,63 @@ def _as_first_dict(v: Any) -> Dict[str, Any]:
-     """
-     KIS 응답에서 output2가 list([dict])로 오는 케이스가 많음.
-     dict / list / None 등 어떤 형태든 dict로 정규화.
-     """
-     global _OUTPUT2_LIST_NORMALIZED_LOGGED
-     global _OUTPUT2_UNEXPECTED_TYPE_LOGGED
+ def _normalize_code(sym: str | None) -> str:
+     return str(sym or "").strip().lstrip("A").zfill(6)
  
-     if v is None:
-         return {}
-     if isinstance(v, dict):
-         return v
-     if isinstance(v, list):
-         if not _OUTPUT2_LIST_NORMALIZED_LOGGED:
+ 
+ def _iso_now() -> str:
+     return datetime.now(KST).isoformat()
+ 
+ 
+ def _ensure_runtime_keys(runtime_state: Dict[str, Any]) -> None:
+     runtime_state.setdefault("diagnostics", {})
+     runtime_state.setdefault("memory", {})
+     runtime_state["diagnostics"].setdefault("orphans", {})
+     runtime_state["memory"].setdefault("data_health", {})
+     runtime_state["memory"].setdefault("setup_eval", {})
+     runtime_state["memory"].setdefault("exit_eval", {})
+     runtime_state["diagnostics"].setdefault("last_run", {})
+ 
+ 
+ def _filter_markets(
+@@ -182,50 +183,51 @@ def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str,
+         return {}, []
+ 
+ 
+ def run_diagnostics(
+     *,
+     kis: Optional[KisAPI],
+     runtime_state: Dict[str, Any],
+     selected_by_market: Dict[str, Any] | None,
+ ) -> Dict[str, Any]:
+     runtime_state = runtime_state or runtime_state_store.load_state()
+     _ensure_runtime_keys(runtime_state)
+     ts = now_kst()
+     ts_iso = ts.isoformat()
+ 
+     if selected_by_market is None:
+         try:
+             rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
+             selected_by_market = rebalance_payload.get("selected_by_market") or {}
+         except Exception as e:
+             logger.exception("[DIAG][REBALANCE] failed: %s", e)
+             selected_by_market = {}
+ 
+     target_markets = [m for m in (DIAGNOSTIC_TARGET_MARKETS or "").split(",") if m.strip()]
+     selected_by_market = _filter_markets(selected_by_market, target_markets)
+     balance, holdings = _load_balance(kis)
++    balance_safe = sanitize_balance_snapshot(balance)
+     try:
+         runtime_state = runtime_state_store.reconcile_with_kis_balance(
+             runtime_state,
+             balance,
+             active_strategies=ACTIVE_STRATEGIES,
+             unmanaged_strategy_id=UNMANAGED_STRATEGY_ID,
+         )
+         runtime_state_store.save_state(runtime_state)
+         logger.info("[DIAG][STATE] reconciled positions=%d", len(runtime_state.get("positions", {})))
+     except Exception:
+         logger.exception("[DIAG][STATE] reconcile failed during diagnostics")
+     positions = runtime_state.get("positions") or {}
+ 
+     targets = _collect_target_symbols(
+         holdings=holdings,
+         runtime_state=runtime_state,
+         selected_by_market=selected_by_market,
+     )
+     logger.info("[DIAG][MD] symbols=%d as_of=%s", len(targets), ts_iso)
+     runtime_state["diagnostics"]["last_run"].update({"ts": ts_iso, "targets": targets})
+ 
+     orphan_n = 0
+     unknown_n = 0
+     unmanaged_n = 0
+     managed_n = 0
+@@ -402,51 +404,51 @@ def run_diagnostics(
+     unknown_positions_count = 0
+     if isinstance(positions, dict):
+         for pos in positions.values():
+             sid_val = str((pos or {}).get("strategy_id")).strip().upper()
+             if sid_val == "UNKNOWN":
+                 unknown_positions_count += 1
+                 continue
+             if bool((pos or {}).get("managed")):
+                 managed_positions_count += 1
+             else:
+                 unmanaged_positions_count += 1
+ 
+     diag_payload = {
+         "as_of": ts_iso,
+         "diag_enabled": bool(DIAG_ENABLED),
+         "targets": targets,
+         "orphans_n": orphan_n,
+         "unknown_n": unknown_n,
+         "data_health_fail_n": data_health_fail_n,
+         "setup_bad_n": setup_bad_n,
+         "data_health": data_health_results,
+         "setup_eval": setup_eval_results,
+         "exit_eval": exit_eval_results,
+         "orphans": runtime_state["diagnostics"]["orphans"],
+         "selected_by_market": selected_by_market or {},
+-        "balance": balance,
++        "balance": balance_safe,
+         "managed_positions": managed_positions_count,
+         "unmanaged_positions": unmanaged_positions_count,
+         "unknown_positions": unknown_positions_count,
+     }
+ 
+     diag_path = DIAGNOSTIC_DUMP_DIR / "diag_latest.json"
+     timestamped_path = DIAGNOSTIC_DUMP_DIR / f"diag_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+     try:
+         _dump_json(diag_path, diag_payload)
+         _dump_json(timestamped_path, diag_payload)
+         logger.info(
+             "[DIAG][DUMP] wrote=%s targets=%d orphans=%d unknown=%d",
+             diag_path,
+             len(targets),
+             orphan_n,
+             unknown_n,
+         )
+     except Exception as e:
+         logger.exception("[DIAG][DUMP_FAIL] path=%s err=%s", diag_path, e)
+ 
+     try:
+         runtime_state_store.save_state(runtime_state)
+     except Exception:
+         logger.exception("[DIAG][STATE] failed to persist diagnostic annotations")
+ 
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 634c9eb7b0668e898dd9c8fdd9c804702300014e..7969b4fdca77001e44dd3cee5d24437f793d05f4 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -103,50 +103,65 @@ def _as_first_dict(v: Any) -> Dict[str, Any]:
              logger.info("[BALANCE] output2 list->dict normalized")
              _OUTPUT2_LIST_NORMALIZED_LOGGED = True
          for item in v:
@@ -402,17 +196,32 @@ index 7c7e98c0dae84bfba8ad1741fc75b388db2bb725..634c9eb7b0668e898dd9c8fdd9c80470
      return {}
  
  
-+def _extract_output2_keys(summary_raw: Any) -> list[str]:
-+    if isinstance(summary_raw, list) and summary_raw:
-+        row = summary_raw[0]
-+        if isinstance(row, dict):
-+            return list(row.keys())
-+        return [f"type:{type(row).__name__}"]
-+    if isinstance(summary_raw, dict):
-+        return list(summary_raw.keys())
-+    if summary_raw is None:
-+        return []
-+    return [f"type:{type(summary_raw).__name__}"]
+ def _extract_output2_keys(summary_raw: Any) -> list[str]:
+     if isinstance(summary_raw, list) and summary_raw:
+         row = summary_raw[0]
+         if isinstance(row, dict):
+             return list(row.keys())
+         return [f"type:{type(row).__name__}"]
+     if isinstance(summary_raw, dict):
+         return list(summary_raw.keys())
+     if summary_raw is None:
+         return []
+     return [f"type:{type(summary_raw).__name__}"]
+ 
+ 
++def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
++    output2 = snapshot.get("output2") or []
++    if not isinstance(output2, list) or not output2:
++        return False
++    first = output2[0]
++    if not isinstance(first, dict):
++        return False
++    if len(first.keys()) == 0:
++        return True
++    values = [value for value in first.values() if value is not None]
++    if not values:
++        return False
++    return all(isinstance(value, str) and value == "****" for value in values)
 +
 +
  def _is_missing(value: float | None) -> bool:
@@ -440,12 +249,7 @@ index 7c7e98c0dae84bfba8ad1741fc75b388db2bb725..634c9eb7b0668e898dd9c8fdd9c80470
      balance_cache_hits: int = 0
      balance_tick_cache_hits: int = 0
  
-@@ -441,74 +455,170 @@ class PB1Engine:
-     def _sum_cost_from_rows(self, rows: Iterable[dict]) -> float:
-         total = 0.0
-         for row in rows or []:
-             val = self._to_float(row.get("pchs_amt"))
-             if val:
+@@ -460,65 +475,73 @@ class PB1Engine:
                  total += val
          return total
  
@@ -466,280 +270,65 @@ index 7c7e98c0dae84bfba8ad1741fc75b388db2bb725..634c9eb7b0668e898dd9c8fdd9c80470
                  return cash
          return None
  
-+    def _parse_available_cash_snapshot(self, snapshot: dict) -> tuple[int | None, dict]:
-+        summary_raw = snapshot.get("output2")
-+        summary = _as_first_dict(summary_raw)
-+        selected_key = None
-+        cash_value = None
-+        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
-+            if key in summary:
-+                selected_key = key
-+                cash_value = self._to_float(summary.get(key))
-+                break
-+        output2_keys = _extract_output2_keys(summary_raw)
-+        meta = {
-+            "selected_key": selected_key,
-+            "output2_keys": output2_keys,
-+        }
-+        if cash_value is None:
-+            return None, meta
-+        return int(cash_value), meta
-+
-+    def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
-+        available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
-+        if available_cash_krw is None:
-+            logger.warning(
-+                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
-+                list(snapshot.keys()),
-+                cash_meta.get("output2_keys") or [],
-+            )
+     def _parse_available_cash_snapshot(self, snapshot: dict) -> tuple[int | None, dict]:
+         summary_raw = snapshot.get("output2")
+         summary = _as_first_dict(summary_raw)
+         selected_key = None
+         cash_value = None
+-        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
++        for key in ("dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt", "ord_psbl_cash", "nrcvb_buy_amt"):
+             if key in summary:
+                 selected_key = key
+                 cash_value = self._to_float(summary.get(key))
+                 break
+         output2_keys = _extract_output2_keys(summary_raw)
+         meta = {
+             "selected_key": selected_key,
+             "output2_keys": output2_keys,
+         }
+         if cash_value is None:
+             return None, meta
+         return int(cash_value), meta
+ 
+     def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
++        if _is_sanitized_balance_snapshot(snapshot):
++            logger.warning("[PB1][CASH][SANITIZED] detected -> force refetch raw")
 +            if self.kis:
 +                try:
 +                    refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
 +                    snapshot = refreshed_snapshot
-+                    available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
 +                except Exception as exc:
-+                    raise RuntimeError("Balance refresh failed after parse error") from exc
-+        if available_cash_krw is None:
-+            logger.warning(
-+                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
-+                list(snapshot.keys()),
-+                cash_meta.get("output2_keys") or [],
-+            )
-+            raise RuntimeError("Balance parse failed: cannot locate dnca_tot_amt/ord_psbl_cash")
-+        return snapshot, available_cash_krw, cash_meta
-+
-+    def _resolve_entry_capital(
-+        self,
-+        *,
-+        available_cash_krw: int,
-+        override_capital: float | None,
-+        reserve_pct: float,
-+    ) -> tuple[int, int, dict]:
-+        use_override = override_capital is not None and int(override_capital) > 0
-+        entry_capital = int(override_capital) if use_override else int(available_cash_krw)
-+        clamp_meta = {}
-+        if (self.env or "").lower() != "real":
-+            cap = min(int(available_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
-+            if entry_capital > cap:
-+                before = entry_capital
-+                entry_capital = cap
-+                clamp_meta = {"before": before, "cap": cap, "after": entry_capital}
-+                logger.info(
-+                    "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
-+                    before,
-+                    cap,
-+                    entry_capital,
-+                )
-+        usable = int(entry_capital * (1 - reserve_pct))
-+        meta = {"use_override": use_override, "clamp": clamp_meta}
-+        return entry_capital, usable, meta
-+
-     def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
-         holdings: dict[str, dict] = {}
-         for row in holdings_rows or []:
-             code = str(row.get("pdno") or row.get("code") or "").zfill(6)
-             qty_raw = row.get("qty") if "qty" in row else row.get("hldg_qty") or row.get("ord_psbl_qty")
-             try:
-                 qty = int(float(qty_raw or 0))
-             except Exception:
-                 qty = 0
-             if not code or qty <= 0:
-                 continue
-             avg = self._to_float(row.get("avg_price") or row.get("pchs_avg_pric") or row.get("pchs_avg_price"))
-             holdings[code] = {
-                 "code": code,
-                 "qty": qty,
-                 "avg_buy_price": avg,
-                 "market": row.get("market") or row.get("prdt_type_cd") or row.get("mket_gb"),
-             }
-         return holdings
- 
-     def _build_positions_from_kis(self, holdings_rows: Iterable[dict]) -> list[dict]:
-         kis_holdings = self._parse_kis_holdings(holdings_rows)
-         ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
-         ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-+        if ledger_positions:
-+            api_codes = set(kis_holdings.keys())
-+            for (code, sid, mode), state in ledger_positions.items():
-+                if sid != 1:
-+                    continue
-+                total_qty = int(state.get("total_qty") or 0)
-+                if total_qty <= 0 or code in api_codes:
-+                    continue
-+                logger.warning(
-+                    "[RECONCILE][ORPHAN] code=%s reason=ledger_only ledger_qty=%s",
-+                    code,
-+                    total_qty,
-+                )
-+                self.ledger_repo.append_event(
-+                    env=self.env,
-+                    run_id=self.run_id,
-+                    event_type="POSITION_ORPHANED",
-+                    ts=now_kst(),
-+                    code=code,
-+                    market=state.get("market"),
-+                    sid=sid,
-+                    mode=mode,
-+                    qty=total_qty,
-+                    ok=True,
-+                    reasons=["ledger_only"],
-+                    payload_json={"ledger_total_qty": total_qty},
-+                )
-         ledger_by_code: dict[str, dict] = {}
-         for (code, sid, mode), state in ledger_positions.items():
-             if sid != 1:
-                 continue
-             existing = ledger_by_code.get(code)
-             if not existing or int(state.get("total_qty") or 0) > int(existing.get("total_qty") or 0):
-                 ledger_by_code[code] = {**state, "sid": sid, "mode": mode, "code": code}
- 
-         positions: list[dict] = []
-         for code, holding in kis_holdings.items():
-             ledger_state = ledger_by_code.get(code, {})
-             qty = holding.get("qty") or 0
-             avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
-             positions.append(
-                 {
-                     "code": code,
-                     "sid": 1,
-                     "mode": int(ledger_state.get("mode") or 1),
-                     "qty": qty,
-                     "kis_qty": qty,
-                     "avg_buy_price": avg or None,
-                     "market": holding.get("market") or ledger_state.get("market"),
-                     "holding_days": ledger_state.get("holding_days") or 0,
-                     "first_buy_ts": ledger_state.get("first_buy_ts"),
-                     "total_cost": float(ledger_state.get("total_cost") or 0.0) or (avg * qty if avg else 0.0),
-@@ -1906,96 +2016,76 @@ class PB1Engine:
- 
-         if not entry_allowed:
-             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
- 
-         def _emit_entry_summary(
-             setup_ok_codes: list[str] | None,
-             orderable_candidates: list[CandidateFeature] | None,
-             drop_reason_counter: Counter[str] | None,
-         ) -> None:
-             nonlocal entry_summary_emitted
-             if entry_summary_emitted:
-                 return
-             drop_reason_counter = drop_reason_counter or Counter()
-             emit_event(
-                 as_of=self._today,
-                 event="PB1_ENTRY_SUMMARY",
-                 entry_allowed=entry_allowed,
-                 entry_block_reason=entry_reason,
-                 setup_ok_count=len(setup_ok_codes or []),
-                 selected_count=len(orderable_candidates or []),
-                 top_drop_reasons=drop_reason_counter.most_common(5),
++                    raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
+         available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
+         if available_cash_krw is None:
+             logger.warning(
+                 "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
+                 list(snapshot.keys()),
+                 cash_meta.get("output2_keys") or [],
              )
-             entry_summary_emitted = True
- 
-         holdings_snapshot = self._fetch_holdings_snapshot()
-+        holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
-+        self._balance_snapshot = holdings_snapshot
-         holdings_rows = holdings_snapshot.get("output1") or []
-         holdings_summary_raw = holdings_snapshot.get("output2")
-         holdings_summary = _as_first_dict(holdings_summary_raw)
-         self._holdings_summary = holdings_summary
-         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
-         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
--        available_cash_raw = None
--        holdings_summary_keys = None
--        output2_0_keys = None
--        if isinstance(holdings_summary_raw, list) and holdings_summary_raw:
--            output2_0 = holdings_summary_raw[0]
--            if isinstance(output2_0, dict):
--                output2_0_keys = list(output2_0.keys())
--                available_cash_raw = self._to_float(output2_0.get("dnca_tot_amt"))
--            else:
--                output2_0_keys = [f"type:{type(output2_0).__name__}"]
--        elif isinstance(holdings_summary_raw, dict):
--            holdings_summary_keys = list(holdings_summary_raw.keys())
--        elif holdings_summary_raw is not None:
--            holdings_summary_keys = [f"type:{type(holdings_summary_raw).__name__}"]
--        if available_cash_raw is None:
--            logger.warning(
--                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
--                holdings_summary_keys or [],
--                output2_0_keys or [],
--            )
--        available_cash_krw = int(available_cash_raw or 0)
--        override_capital = PB1_ENTRY_CAPITAL_KRW
--        if override_capital is not None and override_capital > 0:
--            entry_capital_krw = float(override_capital)
--        else:
--            entry_capital_krw = float(available_cash_krw)
-         reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
--        entry_usable_krw = int(entry_capital_krw * (1 - reserve_pct))
--        self.entry_capital_krw = entry_capital_krw
--        self.entry_usable_krw = entry_usable_krw
-+        override_capital = PB1_ENTRY_CAPITAL_KRW
-+        entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
-+            available_cash_krw=available_cash_krw,
-+            override_capital=override_capital,
-+            reserve_pct=reserve_pct,
-+        )
-+        self.entry_capital_krw = float(entry_capital_krw)
-+        self.entry_usable_krw = float(entry_usable_krw)
-         logger.info(
--            "[PB1][CAPITAL] available_cash=%s override=%s -> entry_capital=%s",
-+            "[PB1][CAPITAL] available_cash=%s override=%s use_override=%s -> entry_capital=%s reserve=%.2f usable=%s source=%s",
-             available_cash_krw,
-             int(override_capital) if override_capital is not None else None,
--            int(entry_capital_krw),
--        )
--        logger.info(
--            "[PB1][CAPITAL][RESERVE] reserve_pct=%.2f usable=%s",
-+            int(capital_meta.get("use_override") or 0),
-+            entry_capital_krw,
-             reserve_pct,
-             entry_usable_krw,
-+            cash_meta.get("selected_key") or "unknown",
-         )
-         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-         if not positions and holdings_rows:
-             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
-                 env=self.env,
-                 strategy=self.STRATEGY_NAME,
-                 sid=1,
-                 mode=1,
-                 holdings=holdings_rows,
+             if self.kis:
+                 try:
+                     refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
+                     snapshot = refreshed_snapshot
+                     available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
+                 except Exception as exc:
+                     raise RuntimeError("Balance refresh failed after parse error") from exc
+         if available_cash_krw is None:
+             logger.warning(
+                 "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
+                 list(snapshot.keys()),
+                 cash_meta.get("output2_keys") or [],
              )
-             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
-             positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-         positions_for_exit = self._build_positions_from_kis(holdings_rows)
-         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
-         existing_positions_count = len(existing_positions)
-         slots_remaining = max(0, max_positions - existing_positions_count)
-         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
-         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
-         logger.info(
-             "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
-             max_positions,
-             target_new_positions,
-             entry_capital_krw,
-             min_order_krw,
-             entry_cutoff_raw,
+             raise RuntimeError("Balance parse failed: cannot locate dnca_tot_amt/ord_psbl_cash")
+         return snapshot, available_cash_krw, cash_meta
+ 
+     def _resolve_entry_capital(
+         self,
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b79140064 100644
+index f1dedf74d0078c273154eff82e9cb75b79140064..66a048aaa8cd7268e66384f76dac2b34ea6bea40 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -12,100 +12,106 @@ from pathlib import Path
- from zoneinfo import ZoneInfo
- 
- from trader.config import (
-     AFTERNOON_WINDOW_END,
-     AFTERNOON_WINDOW_START,
-     BOT_STATE_RESET,
-     BOT_STATE_RESET_CASH_MAX_KRW,
-     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
-     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
-     CLOSE_AUCTION_END,
-     CLOSE_AUCTION_START,
-     DIAGNOSTIC_MODE,
-     DIAGNOSTIC_ONLY,
+@@ -25,50 +25,51 @@ from trader.config import (
      LEDGER_BASE_DIR,
      LEDGER_LOOKBACK_DAYS,
      MARKET_CLOSE_HHMM,
@@ -752,7 +341,7 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
      PB1_FORCE_ENTRY_ON_PUSH,
      PB1_MAX_WAIT_FOR_WINDOW_MIN,
      PB1_WAIT_FOR_WINDOW,
-+    PAPER_MAX_CAPITAL_KRW,
+     PAPER_MAX_CAPITAL_KRW,
      resolve_strategy_mode,
  )
  from trader.botstate_paths import get_botstate_root
@@ -765,6 +354,7 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
      resolve_botstate_worktree_dir,
      setup_worktree,
  )
++from trader.balance_utils import sanitize_balance_snapshot
  from trader.db.engine import make_engine
  from trader.db.lock import release_lock, try_acquire_lock
  from trader.db.migrate import run_migrations
@@ -790,59 +380,117 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
      """
      하위호환용: runtime_store를 외부에서 넘기지 않은 경우의 기본 생성 로직.
      bot_state 기반으로 RuntimeStore를 만든다.
-     """
-     bot_state_dir = os.getenv("BOT_STATE_DIR", "").strip()
-     if bot_state_dir:
-         base = Path(bot_state_dir)
-     else:
-         base = Path("bot_state")
+@@ -375,50 +376,66 @@ def _write_change_flag(changed: bool, reasons: list[str]) -> None:
+     flag_path.write_text("1\n" if changed else "0\n", encoding="utf-8")
+     logger.info("[PB1][CHANGE] changed=%s reasons=%s", int(changed), reasons)
  
-     from trader.runtime_store import RuntimeStore  # 실제 위치에 맞게 import 조정
  
+ def _runtime_meta_path(bot_state_dir: Path) -> Path:
+     return bot_state_dir / "runtime" / "runtime_meta.json"
+ 
+ 
+ def _load_runtime_meta(bot_state_dir: Path) -> dict:
+     path = _runtime_meta_path(bot_state_dir)
+     if not path.exists():
+         return {}
      try:
-         rs = RuntimeStore(bot_state_dir=base)
-     except TypeError:
--        rs = RuntimeStore(base_dir=base)
-+        try:
-+            rs = RuntimeStore(base_dir=base)
-+        except Exception as exc:
-+            raise RuntimeError(f"Failed to initialize RuntimeStore with base_dir={base}") from exc
-+    except Exception as exc:
-+        raise RuntimeError(f"Failed to initialize RuntimeStore with bot_state_dir={base}") from exc
-     log.info("[UNIVERSE][DEFAULT_RUNTIME_STORE] bot_state_dir=%s", str(base))
-     return rs
+         return json.loads(path.read_text(encoding="utf-8"))
+     except Exception:
+         logger.exception("[STATE][META][LOAD_FAIL] path=%s", path)
+         return {}
  
  
- def ensure_universe_built_once(
-     runtime_store: RuntimeStore | None = None,
-     *,
-     env: str | None = None,
-     strategy: str | None = None,
-     as_of: str | None = None,
-     force: bool = False,
- ) -> None:
-     if runtime_store is None:
-         runtime_store = _default_runtime_store()
-         log.warning("[UNIVERSE][COMPAT] ensure_universe_built_once() called without runtime_store -> using default")
+ def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
+     path = _runtime_meta_path(bot_state_dir)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
  
-     if env is None:
-         env = os.getenv("KIS_ENV", "").strip()
-     if strategy is None:
-         strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
-     if as_of is None:
-         as_of = _get_now_kst().date().isoformat()
  
-     log.info(
-         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
-@@ -785,57 +791,60 @@ def run_once(
++def _balance_snapshot_path(bot_state_dir: Path) -> Path:
++    return bot_state_dir / "runtime" / "balance_snapshot.json"
++
++
++def _persist_balance_snapshot(balance_snapshot: dict, bot_state_dir: Path, *, as_of: datetime | None = None) -> None:
++    if not balance_snapshot:
++        return
++    path = _balance_snapshot_path(bot_state_dir)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "as_of": (as_of or now_kst()).isoformat(),
++        "balance": balance_snapshot,
++    }
++    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
++
++
+ def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
+     if not balance_snapshot:
+         return None
+     summary_raw = balance_snapshot.get("output2")
+     summary = summary_raw[0] if isinstance(summary_raw, list) and summary_raw else summary_raw if isinstance(summary_raw, dict) else None
+     if not isinstance(summary, dict):
+         return None
+     raw = summary.get("dnca_tot_amt")
+     if raw is None:
+         return None
+     try:
+         return int(float(str(raw).replace(",", "")))
+     except Exception:
+         return None
+ 
+ 
+ def _is_urgent_persist(touched: list[Path]) -> bool:
+     keywords = {"orders", "fills", "exits_intent"}
+     for path in touched:
+         parts = {part.lower() for part in path.parts}
+         if parts & keywords:
+             return True
+     return False
+ 
+ 
+@@ -762,79 +779,82 @@ def run_once(
+     touched_files: list[Path] = []
+     result = None
+     run_start_ts = time_mod.time()
+     try:
+         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+             universe_ok, universe_meta = runtime_store.universe_check(as_of)
+             if not universe_ok:
+                 if phase_for_log == "entry":
+                     os.environ["PB1_ENTRY_ENABLED"] = "0"
+                     logger.info("[PB1][ENTRY_BLOCKED] reason=universe_missing_both entry_allowed=0")
+                 logger.info("[PB1][SKIP] reason=universe_missing_both as_of=%s", as_of)
+                 logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_missing_both as_of=%s", as_of)
+         kis: KisAPI | None = None
+         try:
+             kis = KisAPI()
+             if kis.env != kis_env:
+                 dry_run_reasons.append("kis_env_mismatch")
+                 dry_run = True
+                 _apply_env_flags(dry_run)
+         except Exception:
+             logger.exception("[PB1] KIS init failed, forcing dry-run")
+             dry_run_reasons.append("kis_init_failed")
+             dry_run = True
+             _apply_env_flags(dry_run)
+ 
+-        balance_snapshot: dict | None = None
++        balance_snapshot_raw: dict | None = None
++        balance_snapshot_safe: dict | None = None
+         balance_source: str | None = None
+         if kis:
+             try:
                  _log_balance_cache(force=False)
-                 balance_snapshot, balance_source = kis.get_balance_cached(force=False, return_source=True)
+-                balance_snapshot, balance_source = kis.get_balance_cached(force=False, return_source=True)
++                balance_snapshot_raw, balance_source = kis.get_balance_cached(force=False, return_source=True)
++                balance_snapshot_safe = sanitize_balance_snapshot(balance_snapshot_raw)
++                _persist_balance_snapshot(balance_snapshot_safe, resolved_bot_state_dir, as_of=now)
              except Exception:
                  logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
  
          reset_reason = None
          account_fp_now = None
-         if kis and balance_snapshot:
+-        if kis and balance_snapshot:
++        if kis and balance_snapshot_raw:
              account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
              runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
              runtime_fp = runtime_meta.get("account_fp")
@@ -851,7 +499,8 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
              elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
                  reset_reason = "account_fp_mismatch"
              elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
-                 kis_holdings = balance_snapshot.get("output1") or []
+-                kis_holdings = balance_snapshot.get("output1") or []
++                kis_holdings = balance_snapshot_raw.get("output1") or []
                  existing_positions = positions_repo.list_positions(kis_env or "practice", "pb1_pullback_close")
                  existing_positions_count = len([p for p in existing_positions if int(p.get("qty") or 0) > 0])
                  ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
@@ -859,24 +508,18 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
                  ledger_has_positions = any(
                      int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
                  )
-                 dnca_total = _extract_dnca_total(balance_snapshot)
--                if (
--                    len(kis_holdings) == 0
--                    and (existing_positions_count > 0 or ledger_has_positions)
--                    and dnca_total is not None
--                    and dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW
--                ):
--                    reset_reason = "empty_kis_holdings_detected"
-+                is_paper_env = (kis_env or "").lower() != "real"
-+                if len(kis_holdings) == 0 and (existing_positions_count > 0 or ledger_has_positions) and dnca_total is not None:
-+                    if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
-+                        reset_reason = "paper_reset_detected"
-+                        logger.warning(
-+                            "[PB1][RESET][DETECTED] reason=paper_reset dnca_tot_amt=%s",
-+                            dnca_total,
-+                        )
-+                    elif dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
-+                        reset_reason = "empty_kis_holdings_detected"
+-                dnca_total = _extract_dnca_total(balance_snapshot)
++                dnca_total = _extract_dnca_total(balance_snapshot_raw)
+                 is_paper_env = (kis_env or "").lower() != "real"
+                 if len(kis_holdings) == 0 and (existing_positions_count > 0 or ledger_has_positions) and dnca_total is not None:
+                     if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
+                         reset_reason = "paper_reset_detected"
+                         logger.warning(
+                             "[PB1][RESET][DETECTED] reason=paper_reset dnca_tot_amt=%s",
+                             dnca_total,
+                         )
+                     elif dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
+                         reset_reason = "empty_kis_holdings_detected"
  
          if reset_reason:
              archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -892,14 +535,56 @@ index 735d5b26cc14415e8ce0904bf5e8162254c71459..f1dedf74d0078c273154eff82e9cb75b
          run_record_id = runs_repo.start_run(
              env=kis_env or "practice",
              strategy="pb1_pullback_close",
-             run_window=window_label,
+@@ -861,51 +881,51 @@ def run_once(
+                     env=kis_env or "practice",
+                     run_id=run_record_id,
+                     strategy="pb1_pullback_close",
+                 )
+             except Exception as exc:
+                 if not dry_run and mode_resolved == "LIVE":
+                     logger.error("[PB1][RECONCILE][FAIL] live run halted: %s", exc)
+                     runs_repo.finish_run(run_record_id, status="FAILED", notes="reconcile_failed")
+                     return [], False, {}, phase_for_log, "RECONCILE_FAIL"
+                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+ 
+         engine_runner = PB1Engine(
+             universe_repo=universe_repo,
+             orders_repo=orders_repo,
+             fills_repo=fills_repo,
+             positions_repo=positions_repo,
+             ledger_repo=ledger_repo,
+             kis=kis,
+             window=window,
+             window_label=window_label,
              phase=phase_override_arg,
-             event_name=event_name_lower,
              dry_run=dry_run,
-             git_sha=os.getenv("GITHUB_SHA"),
-             workflow=os.getenv("GITHUB_WORKFLOW"),
-             workflow_run_id=workflow_run_id,
-             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-             config_json={
-                 "dry_run_reasons": dry_run_reasons,
-
+             env=kis_env or "practice",
+             run_id=run_record_id,
+             now_kst_value=now,
+-            balance_snapshot=balance_snapshot,
++            balance_snapshot=balance_snapshot_raw,
+             balance_source=balance_source,
+         )
+         if close_cancel_only:
+             result = engine_runner.run_close_cancel()
+         else:
+             result = engine_runner.run()
+         did_work = True
+         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+         touched_files = _collect_botstate_files(run_start_ts)
+     except Exception as exc:
+         logger.exception("[PB1][FAIL] unexpected error")
+         if run_record_id:
+             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+         raise
+     finally:
+         release_lock(engine, lock_key)
+     metrics = {
+         "balance_api_calls": result.balance_api_calls if result else 0,
+         "balance_cache_hits": result.balance_cache_hits if result else 0,
+         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
+     }
+     result_status = result.status if result else "UNKNOWN"
+     return touched_files, did_work, metrics, phase_for_log, result_status
+ 
+ 
