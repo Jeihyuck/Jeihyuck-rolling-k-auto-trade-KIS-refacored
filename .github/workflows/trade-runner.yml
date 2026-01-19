@@ -197,39 +197,36 @@ jobs:
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
-      - name: Persist bot_state (fetch_reset)
+      - name: Persist bot_state (stage untracked + commit/push)
         if: env.SHOULD_BUILD_UNIVERSE == '1'
+        working-directory: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
           set -euo pipefail
-          python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
-          cd "${BOTSTATE_WORKTREE_DIR}"
-          git add -A bot_state
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no changes -> skip"
-          else
-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-            git push --force-with-lease origin HEAD:bot-state
-          fi
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "[PERSIST][FAIL] botstate worktree still dirty"
-            git status --porcelain
-            exit 1
-          fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
-      - name: Verify bot_state clean after persist
-        if: env.SHOULD_BUILD_UNIVERSE == '1'
-        run: |
-          set -euo pipefail
-          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
-          echo "$status" | head -n 50
-          if [ -n "$status" ]; then
+          echo "[PERSIST] workdir=$(pwd)"
+          git status --porcelain | head -n 50 || true
+
+          python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+
+          # 1) untracked 포함 bot_state 전체 stage
+          git add -A bot_state
+
+          # 2) staged 변경이 없으면 스킵
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no staged changes -> skip"
+          else
+            git config user.email "actions@github.com"
+            git config user.name "github-actions[bot]"
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push origin HEAD:bot-state
+          fi
+
+          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
+          if [[ -n "$(git status --porcelain)" ]]; then
             echo "::error::botstate worktree dirty after persist"
+            git status --porcelain | head -n 200
             exit 1
           fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
   trade_tick:
     runs-on: ubuntu-latest
@@ -280,7 +277,7 @@ jobs:
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
 
       ACTIVE_STRATEGIES: "1"
-      DAILY_CAPITAL: "250000000"
+      DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
 
     steps:
       - name: Checkout code (always run nullim code)
@@ -416,6 +413,12 @@ jobs:
           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
           python -m trader.run --window auto --phase auto
         env:
+          BOT_STATE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state
+          TRADER_CACHE_ROOT: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/runtime
+          UNIVERSE_LKG_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/universe_lkg
+          PBCORE_DB_PATH: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/db/pbcore.sqlite3
+          STATE_PATH: bot_state/runtime/state.json
+          LOT_STATE_PATH: bot_state/runtime/lot_state.json
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
 
@@ -441,50 +444,36 @@ jobs:
           echo "---- git root? ----"
           git rev-parse --show-toplevel || true
 
-      - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
-        if: always()
+      - name: Persist bot_state (stage untracked + commit/push)
+        if: env.PERSIST_MODE != 'OFF'
+        working-directory: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
           set -euo pipefail
 
-          if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
-            flag="${TRADER_CACHE_ROOT}/changed.flag"
-            if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
-              echo "[PERSIST] changes detected -> persist"
-            else
-              echo "[PERSIST] no changes -> skip"
-              exit 0
-            fi
-          fi
+          echo "[PERSIST] workdir=$(pwd)"
+          git status --porcelain | head -n 50 || true
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
-          cd "${BOTSTATE_WORKTREE_DIR}"
-          git add -A bot_state
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no changes -> skip"
-          else
-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-            git push --force-with-lease origin HEAD:bot-state
-          fi
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "[PERSIST][FAIL] botstate worktree still dirty"
-            git status --porcelain
-            exit 1
-          fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
-      - name: Verify bot_state clean after persist
-        if: always()
-        run: |
-          set -euo pipefail
-          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
-          echo "$status" | head -n 50
-          if [ -n "$status" ]; then
+          # 1) untracked 포함 bot_state 전체 stage
+          git add -A bot_state
+
+          # 2) staged 변경이 없으면 스킵
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no staged changes -> skip"
+          else
+            git config user.email "actions@github.com"
+            git config user.name "github-actions[bot]"
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push origin HEAD:bot-state
+          fi
+
+          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
+          if [[ -n "$(git status --porcelain)" ]]; then
             echo "::error::botstate worktree dirty after persist"
+            git status --porcelain | head -n 200
             exit 1
           fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
   close_cancel:
     runs-on: ubuntu-latest
@@ -534,7 +523,7 @@ jobs:
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
 
       ACTIVE_STRATEGIES: "1"
-      DAILY_CAPITAL: "250000000"
+      DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
 
     steps:
       - name: Checkout code (always run nullim code)
@@ -594,51 +583,44 @@ jobs:
         run: |
           set -euo pipefail
           python -m trader.pb1_runner --window auto --phase auto
+        env:
+          BOT_STATE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state
+          TRADER_CACHE_ROOT: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/runtime
+          UNIVERSE_LKG_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/universe_lkg
+          PBCORE_DB_PATH: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state/db/pbcore.sqlite3
+          STATE_PATH: bot_state/runtime/state.json
+          LOT_STATE_PATH: bot_state/runtime/lot_state.json
 
-      - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
-        if: always()
+      - name: Persist bot_state (stage untracked + commit/push)
+        if: env.PERSIST_MODE != 'OFF'
+        working-directory: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
           set -euo pipefail
 
-          if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
-            flag="${TRADER_CACHE_ROOT}/changed.flag"
-            if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
-              echo "[PERSIST] changes detected -> persist"
-            else
-              echo "[PERSIST] no changes -> skip"
-              exit 0
-            fi
-          fi
+          echo "[PERSIST] workdir=$(pwd)"
+          git status --porcelain | head -n 50 || true
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
-          cd "${BOTSTATE_WORKTREE_DIR}"
-          git add -A bot_state
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no changes -> skip"
-          else
-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-            git push --force-with-lease origin HEAD:bot-state
-          fi
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "[PERSIST][FAIL] botstate worktree still dirty"
-            git status --porcelain
-            exit 1
-          fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
-      - name: Verify bot_state clean after persist
-        if: always()
-        run: |
-          set -euo pipefail
-          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
-          echo "$status" | head -n 50
-          if [ -n "$status" ]; then
+          # 1) untracked 포함 bot_state 전체 stage
+          git add -A bot_state
+
+          # 2) staged 변경이 없으면 스킵
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no staged changes -> skip"
+          else
+            git config user.email "actions@github.com"
+            git config user.name "github-actions[bot]"
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push origin HEAD:bot-state
+          fi
+
+          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
+          if [[ -n "$(git status --porcelain)" ]]; then
             echo "::error::botstate worktree dirty after persist"
+            git status --porcelain | head -n 200
             exit 1
           fi
-        env:
-          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
 
           

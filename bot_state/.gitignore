@@ -5,10 +5,7 @@ trader_ledger/
 universe_lkg/
 
 # ---- runtime big caches: do NOT persist to git ----
-runtime/ohlcv_cache/
-runtime/ohlcv_cache/**
 runtime/**.parquet
-runtime/diagnostics/
 !runtime/
 !runtime/universe/
 !runtime/universe/**
@@ -17,4 +14,10 @@ runtime/diagnostics/
 !runtime/*.flag
 !runtime/*.json
 !runtime/diagnostics/
-!runtime/diagnostics/universe_drop_*.json
+!runtime/diagnostics/**
+
+# ------------------------------
+# runtime cache: DO NOT persist
+# ------------------------------
+runtime/ohlcv_cache/
+runtime/ohlcv_cache/**
