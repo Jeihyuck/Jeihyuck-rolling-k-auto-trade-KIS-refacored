@@ -4,7 +4,9 @@ trader_state/
 trader_ledger/
 universe_lkg/
 
+# ---- runtime big caches: do NOT persist to git ----
 runtime/ohlcv_cache/
+runtime/ohlcv_cache/**
 runtime/**.parquet
 runtime/diagnostics/
 !runtime/

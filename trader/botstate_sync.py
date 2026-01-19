@@ -626,11 +626,12 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
+        _git_worktree(worktree_dir, "add", "-A", "bot_state")
+        if _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False).returncode == 0:
+            logger.info("[BOTSTATE][PERSIST] no staged changes after add -A bot_state -> skip")
+            return
         status = git_porcelain(worktree_dir)
         status_lines = [line for line in status.splitlines() if line.strip()]
-        if not status_lines:
-            logger.info("[PERSIST] no changes -> skip")
-            return
         stage_runtime_universe(worktree_dir)
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
         stage_all(worktree_dir)

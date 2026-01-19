@@ -202,6 +202,19 @@ jobs:
         run: |
           set -euo pipefail
           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+          cd "${BOTSTATE_WORKTREE_DIR}"
+          git add -A bot_state
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no changes -> skip"
+          else
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push --force-with-lease origin HEAD:bot-state
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "[PERSIST][FAIL] botstate worktree still dirty"
+            git status --porcelain
+            exit 1
+          fi
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
@@ -444,6 +457,19 @@ jobs:
           fi
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+          cd "${BOTSTATE_WORKTREE_DIR}"
+          git add -A bot_state
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no changes -> skip"
+          else
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push --force-with-lease origin HEAD:bot-state
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "[PERSIST][FAIL] botstate worktree still dirty"
+            git status --porcelain
+            exit 1
+          fi
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
@@ -585,6 +611,19 @@ jobs:
           fi
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+          cd "${BOTSTATE_WORKTREE_DIR}"
+          git add -A bot_state
+          if git diff --cached --quiet; then
+            echo "[PERSIST] no changes -> skip"
+          else
+            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+            git push --force-with-lease origin HEAD:bot-state
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "[PERSIST][FAIL] botstate worktree still dirty"
+            git status --porcelain
+            exit 1
+          fi
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
