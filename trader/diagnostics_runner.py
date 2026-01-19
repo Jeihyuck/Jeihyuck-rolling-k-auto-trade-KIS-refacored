@@ -175,8 +175,8 @@ def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str,
     if kis is None:
         return {}, []
     try:
-        balance = kis.get_balance()
-        positions = balance.get("positions") or []
+        balance = kis.get_balance_cached()
+        positions = balance.get("output1") or []
         return balance, positions
     except Exception as e:
         logger.exception("[DIAG][BALANCE] failed to fetch: %s", e)

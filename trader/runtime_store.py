@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from trader.botstate_paths import botstate_path, get_botstate_root
 from trader.universe.lkg_store import lkg_path
@@ -64,6 +65,19 @@ class RuntimeStore:
         if not exists:
             self._log_dir_snapshot()
         return abs_path, rel
+
+    def save_json(self, rel: str | Path, data: Any) -> Path:
+        target = self.base_dir / self._normalize_rel(Path(rel))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return target
+
+    def touch_flag(self, rel: str | Path, *, content: str = "done\n") -> Path:
+        target = self.base_dir / self._normalize_rel(Path(rel))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text(content, encoding="utf-8")
+        return target
 
     def _log_dir_snapshot(self) -> None:
         base = self.base_dir

@@ -21,7 +21,8 @@ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+from trader.runtime_store import RuntimeStore
 
 from datetime import date
 
@@ -214,9 +215,17 @@ def _sanitize_members(
     )
 
 
-def _write_runtime_universe(*, as_of_date: str, env: str, strategy: str, payload: dict | None, members: list[dict], source: str, params: dict) -> Path:
-    path = botstate_path("runtime", "universe", f"{as_of_date}.json")
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_runtime_universe(
+    *,
+    runtime_store: RuntimeStore,
+    as_of_date: str,
+    env: str,
+    strategy: str,
+    payload: dict | None,
+    members: list[dict],
+    source: str,
+    params: dict,
+) -> Path:
     data = {
         "as_of": as_of_date,
         "env": env,
@@ -226,8 +235,14 @@ def _write_runtime_universe(*, as_of_date: str, env: str, strategy: str, payload
         "payload": payload or {},
         "members": members,
     }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s", path, len(members), source)
+    path = runtime_store.save_json(Path("runtime") / "universe" / f"{as_of_date}.json", data)
+    logger.info(
+        "[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s exists_after=%s",
+        path,
+        len(members),
+        source,
+        int(path.exists()),
+    )
     return path
 
 
@@ -237,6 +252,30 @@ def _write_universe_sanitize_report(*, as_of_date: str, keep_codes: list[str], d
     payload = {"as_of": as_of_date, "kept": keep_codes, "dropped": dropped}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("[UNIVERSE][SANITIZE][SAVE] path=%s kept=%s dropped=%s", path, len(keep_codes), len(dropped))
+    return path
+
+
+def _write_universe_drop_diagnostics(
+    *,
+    runtime_store: RuntimeStore,
+    as_of_date: str,
+    source: str,
+    invalid_format_codes: list[str],
+    insufficient_history_codes: list[str],
+) -> Path:
+    payload = {
+        "invalid_format": list(invalid_format_codes or []),
+        "insufficient_history": list(insufficient_history_codes or []),
+        "source": source,
+        "as_of": as_of_date,
+    }
+    path = runtime_store.save_json(Path("runtime") / "diagnostics" / f"universe_drop_{as_of_date}.json", payload)
+    logger.info(
+        "[UNIVERSE][SANITIZE][DIAGNOSTICS] path=%s invalid_format=%s insufficient_history=%s",
+        path,
+        len(payload["invalid_format"]),
+        len(payload["insufficient_history"]),
+    )
     return path
 
 
@@ -433,6 +472,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
+    runtime_store = RuntimeStore(base_dir=get_botstate_root())
 
     payload: dict | None = None
     members: list[dict] = []
@@ -578,6 +618,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
         )
     _write_runtime_universe(
+        runtime_store=runtime_store,
         as_of_date=as_of_date,
         env=env,
         strategy=strategy,
@@ -591,10 +632,14 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         keep_codes=sanitize_detail.get("kept") or [],
         dropped=sanitize_detail.get("dropped") or [],
     )
-    flag = botstate_path("runtime", f"universe_build_done_{as_of_date}.flag")
-    flag.parent.mkdir(parents=True, exist_ok=True)
-    if not flag.exists():
-        flag.write_text("done\n", encoding="utf-8")
+    _write_universe_drop_diagnostics(
+        runtime_store=runtime_store,
+        as_of_date=as_of_date,
+        source=source,
+        invalid_format_codes=sanitize_detail.get("invalid_format_codes") or [],
+        insufficient_history_codes=sanitize_detail.get("insufficient_history_codes") or [],
+    )
+    runtime_store.touch_flag(Path("runtime") / f"universe_build_done_{as_of_date}.flag")
     return universe_id
 
 

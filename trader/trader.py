@@ -186,7 +186,7 @@ def main() -> None:
     try:
         runtime_state = runtime_state_store.load_state()
         kis = KisAPI()
-        balance = kis.get_balance()
+        balance = kis.get_balance_cached()
         runtime_state = runtime_state_store.reconcile_with_kis_balance(
             runtime_state,
             balance,

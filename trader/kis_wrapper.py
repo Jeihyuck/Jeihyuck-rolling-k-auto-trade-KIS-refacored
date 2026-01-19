@@ -100,6 +100,16 @@ def _deepcopy_json(value: Any) -> Any:
         return value
 
 
+def _is_raw_balance_snapshot(snapshot: Any) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    output2 = snapshot.get("output2")
+    if isinstance(output2, list) and output2:
+        first = output2[0]
+        return isinstance(first, dict) and bool(first)
+    return False
+
+
 def _order_block_reason(now: datetime | None = None) -> Optional[str]:
     now = now or now_kst()
     state_date = _ORDER_BLOCK_STATE.get("date")
@@ -1463,11 +1473,15 @@ class KisAPI:
         source = "api"
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
-            logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
-            source = "wrapper_cache"
-            if return_source:
-                return _deepcopy_json(self._balance_cache), source
-            return _deepcopy_json(self._balance_cache)
+            cached = _deepcopy_json(self._balance_cache)
+            if _is_raw_balance_snapshot(cached):
+                logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
+                source = "wrapper_cache"
+                if return_source:
+                    return cached, source
+                return cached
+            logger.warning("[BALANCE][CACHE] invalid_shape=1 -> refetching raw")
+            force = True
         logger.info("[BALANCE][CACHE] hit=False force=%s", force)
         snap: dict = {}
         try:
@@ -1483,9 +1497,7 @@ class KisAPI:
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:
-        snap = self.get_balance_cached()
-        positions = snap.get("output1") or []
-        return {"cash": self.get_cash_balance(), "positions": positions}
+        return self.get_balance_cached()
 
     def get_balance_all(self) -> Dict[str, object]:
         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""

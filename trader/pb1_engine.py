@@ -544,7 +544,7 @@ class PB1Engine:
         summary = _as_first_dict(summary_raw)
         selected_key = None
         cash_value = None
-        for key in ("nxdy_excc_amt", "dnca_tot_amt"):
+        for key in ("dnca_tot_amt", "ord_psbl_cash"):
             if key in summary:
                 selected_key = key
                 cash_value = self._to_float(summary.get(key))
@@ -602,7 +602,14 @@ class PB1Engine:
                 cash = None
 
         if cash is None or cash <= 0:
-            raise RuntimeError("Balance parse failed: cannot locate usable cash fields")
+            output2 = balance_resp.get("output2") if isinstance(balance_resp, dict) else None
+            output2_type = type(output2).__name__
+            output2_len = len(output2) if isinstance(output2, list) else None
+            output2_keys = _extract_output2_keys(output2)
+            raise RuntimeError(
+                "Balance parse failed: cannot locate usable cash fields "
+                f"(cache object shape type(output2)={output2_type} len={output2_len} keys(output2[0])={output2_keys})"
+            )
 
         return balance_resp, int(cash), {**meta, "source": "balance_snapshot"}
 
@@ -2155,13 +2162,14 @@ class PB1Engine:
                 reserve_pct,
             )
         logger.info(
-            "[PB1][CAPITAL] available_cash=%s override=%s use_override=%s -> entry_capital=%s reserve=%.2f usable=%s source=%s",
+            "[PB1][CAPITAL] mode=%s override=%s available_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s source=%s",
+            PB1_CAPITAL_MODE,
+            override_capital,
             available_cash_krw,
-            int(override_capital) if override_capital is not None else None,
-            int(capital_meta.get("use_override") or 0),
-            entry_capital_krw,
             reserve_pct,
             entry_usable_krw,
+            int(capital_meta.get("use_override") or 0),
+            entry_capital_krw,
             cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
         )
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
