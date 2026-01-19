@@ -1935,29 +1935,43 @@ class PB1Engine:
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         available_cash_raw = None
+        holdings_summary_keys = None
+        output2_0_keys = None
         if isinstance(holdings_summary_raw, list) and holdings_summary_raw:
-            available_cash_raw = self._to_float(holdings_summary_raw[0].get("dnca_tot_amt"))
+            output2_0 = holdings_summary_raw[0]
+            if isinstance(output2_0, dict):
+                output2_0_keys = list(output2_0.keys())
+                available_cash_raw = self._to_float(output2_0.get("dnca_tot_amt"))
+            else:
+                output2_0_keys = [f"type:{type(output2_0).__name__}"]
         elif isinstance(holdings_summary_raw, dict):
-            available_cash_raw = self._to_float(holdings_summary_raw.get("dnca_tot_amt"))
+            holdings_summary_keys = list(holdings_summary_raw.keys())
+        elif holdings_summary_raw is not None:
+            holdings_summary_keys = [f"type:{type(holdings_summary_raw).__name__}"]
         if available_cash_raw is None:
-            available_cash_raw = self._extract_available_cash(holdings_summary)
+            logger.warning(
+                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
+                holdings_summary_keys or [],
+                output2_0_keys or [],
+            )
         available_cash_krw = int(available_cash_raw or 0)
-        capital_mode = (PB1_CAPITAL_MODE or "CASH").upper()
-        if capital_mode == "FIXED":
-            entry_capital_krw = min(float(available_cash_krw), float(PB1_ENTRY_CAPITAL_KRW))
+        override_capital = PB1_ENTRY_CAPITAL_KRW
+        if override_capital is not None and override_capital > 0:
+            entry_capital_krw = float(override_capital)
         else:
-            if capital_mode != "CASH":
-                logger.warning("[PB1][CAPITAL][WARN] unknown mode=%s -> fallback=CASH", capital_mode)
             entry_capital_krw = float(available_cash_krw)
         reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
         entry_usable_krw = int(entry_capital_krw * (1 - reserve_pct))
         self.entry_capital_krw = entry_capital_krw
         self.entry_usable_krw = entry_usable_krw
         logger.info(
-            "[PB1][CAPITAL] mode=%s available_cash=%s entry_capital=%s reserve_pct=%.2f usable=%s",
-            capital_mode,
+            "[PB1][CAPITAL] available_cash=%s override=%s -> entry_capital=%s",
             available_cash_krw,
+            int(override_capital) if override_capital is not None else None,
             int(entry_capital_krw),
+        )
+        logger.info(
+            "[PB1][CAPITAL][RESERVE] reserve_pct=%.2f usable=%s",
             reserve_pct,
             entry_usable_krw,
         )
