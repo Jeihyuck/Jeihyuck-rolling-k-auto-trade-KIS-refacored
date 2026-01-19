@@ -1,61 +1,281 @@
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index cae38982301335cfc91dae3efe63f92c3c0fca91..48dc44bb8a1d9b5ebe9817d86b1b58d805dbb9e3 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -183,50 +183,63 @@ jobs:
+           engine = make_engine()
+           repo = UniverseRepo(engine)
+           members = repo.get_universe_members(env, strategy, as_of)
+           db_ok = bool(members)
+           lkg_ok = lkg_path(env, strategy).exists()
+ 
+           print(
+               "[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s"
+               % ("Y" if lkg_ok else "N", "Y" if db_ok else "N", as_of, len(members))
+           )
+           PY
+ 
+       - name: Configure git identity for botstate commits
+         run: |
+           git config --global user.email "actions@github.com"
+           git config --global user.name "github-actions[bot]"
+ 
+       - name: Persist bot_state (fetch_reset)
+         if: env.SHOULD_BUILD_UNIVERSE == '1'
+         run: |
+           set -euo pipefail
+           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+         env:
+           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+ 
++      - name: Verify bot_state clean after persist
++        if: env.SHOULD_BUILD_UNIVERSE == '1'
++        run: |
++          set -euo pipefail
++          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
++          echo "$status" | head -n 50
++          if [ -n "$status" ]; then
++            echo "::error::botstate worktree dirty after persist"
++            exit 1
++          fi
++        env:
++          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
++
+   trade_tick:
+     runs-on: ubuntu-latest
+     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
+     timeout-minutes: 8
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+ 
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
+       PERSIST_MODE: "ON_CHANGE"
+@@ -298,73 +311,50 @@ jobs:
+         uses: actions/cache@v4
+         with:
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+           restore-keys: |
+             ${{ runner.os }}-pip-
+ 
+       - name: Install deps
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+       - name: Precheck env (fail fast)
+         run: |
+           set -euo pipefail
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+             if [ -z "${!k:-}" ]; then
+               echo "::error::Missing required secret/env: $k"
+               exit 1
+             fi
+           done
+           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+ 
+-      - name: Ensure universe exists (once per day)
+-        run: |
+-          set -euo pipefail
+-          python - << 'PY'
+-          import os
+-          from pathlib import Path
+-          from trader.time_utils import now_kst
+-          from trader.pb1_runner import ensure_universe_built_once
+-          from trader.runtime_store import RuntimeStore
+-
+-          as_of = now_kst().date().isoformat()
+-          bot_state_dir = os.getenv("BOT_STATE_DIR") or str((Path(os.getenv("GITHUB_WORKSPACE", ".")) / "bot_state").resolve())
+-          runtime_store = RuntimeStore(bot_state_dir=bot_state_dir)
+-          ensure_universe_built_once(
+-              runtime_store=runtime_store,
+-              env=os.getenv("KIS_ENV"),
+-              strategy="best_k_meta",
+-              as_of=os.getenv("AS_OF") or as_of,
+-              force=False,
+-          )
+-          print("universe preflight done", as_of, os.getenv("KIS_ENV", ""))
+-          PY
+-
+       - name: Resolve market-aware runtime mode
+         run: |
+           set -euo pipefail
+           python - << 'PY'
+           from datetime import datetime, time
+           from zoneinfo import ZoneInfo
+           import os
+ 
+           KST = ZoneInfo("Asia/Seoul")
+           now = datetime.now(KST)
+ 
+           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
+           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+ 
+           is_weekday = now.weekday() < 5
+           in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+ 
+           mode = "LIVE" if in_market else "DIAG"
+           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
+               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
+ 
+           if not is_weekday:
+               window = "after"
+           else:
+               now_t = now.time()
+@@ -435,50 +425,63 @@ jobs:
+           find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate_worktree" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
+           echo "---- find pbcore.sqlite3 anywhere ----"
+           find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
+           echo "---- git root? ----"
+           git rev-parse --show-toplevel || true
+ 
+       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
+         if: always()
+         run: |
+           set -euo pipefail
+ 
+           if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
+             flag="${TRADER_CACHE_ROOT}/changed.flag"
+             if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
+               echo "[PERSIST] changes detected -> persist"
+             else
+               echo "[PERSIST] no changes -> skip"
+               exit 0
+             fi
+           fi
+ 
+           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+         env:
+           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+ 
++      - name: Verify bot_state clean after persist
++        if: always()
++        run: |
++          set -euo pipefail
++          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
++          echo "$status" | head -n 50
++          if [ -n "$status" ]; then
++            echo "::error::botstate worktree dirty after persist"
++            exit 1
++          fi
++        env:
++          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
++
+   close_cancel:
+     runs-on: ubuntu-latest
+     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
+     timeout-minutes: 8
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+ 
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
+       PERSIST_MODE: "ON_CHANGE"
+@@ -563,27 +566,40 @@ jobs:
+ 
+       - name: Run PB1 close-cancel (auto window)
+         run: |
+           set -euo pipefail
+           python -m trader.pb1_runner --window auto --phase auto
+ 
+       - name: Persist bot_state atomically (lock + fetch_reset + push_retry)
+         if: always()
+         run: |
+           set -euo pipefail
+ 
+           if [ "${PERSIST_MODE}" = "ON_CHANGE" ]; then
+             flag="${TRADER_CACHE_ROOT}/changed.flag"
+             if [ -f "$flag" ] && [ "$(tr -d '[:space:]' < "$flag")" = "1" ]; then
+               echo "[PERSIST] changes detected -> persist"
+             else
+               echo "[PERSIST] no changes -> skip"
+               exit 0
+             fi
+           fi
+ 
+           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+         env:
+           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+ 
++      - name: Verify bot_state clean after persist
++        if: always()
++        run: |
++          set -euo pipefail
++          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
++          echo "$status" | head -n 50
++          if [ -n "$status" ]; then
++            echo "::error::botstate worktree dirty after persist"
++            exit 1
++          fi
++        env:
++          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
++
+ 
+           
 diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 88c07379dda624ba012d576dc4dd296e7e540738..abf6ffc6a14362fb464c63f0b1389b99c0a8e767 100644
+index abf6ffc6a14362fb464c63f0b1389b99c0a8e767..168f86a66427d5790bfeb6a3e2644239741439d1 100644
 --- a/trader/botstate_sync.py
 +++ b/trader/botstate_sync.py
-@@ -82,50 +82,51 @@ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subp
-             cwd,
-             exc.returncode,
-             exc.stdout,
-             exc.stderr,
-         )
-         raise
+@@ -585,85 +585,81 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
+     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
  
+     for attempt in range(1, retries + 1):
+         try:
+             st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
+             logger.info(
+                 "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
+                 sync_mode,
+                 st.remote_ref,
+                 st.behind,
+                 st.ahead,
+                 attempt,
+             )
+         except Exception as exc:
+             logger.warning(
+                 "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
+                 sync_mode,
+                 attempt,
+                 str(exc),
+             )
+             if attempt == retries:
+                 raise
+             time.sleep(retry_sleep_sec)
+             continue
  
- def git_porcelain(worktree_dir: Path) -> str:
-     return _git_worktree(worktree_dir, "status", "--porcelain").stdout
- 
- 
- def stage_all(worktree_dir: Path) -> None:
-     _git_worktree(worktree_dir, "add", "-A")
- 
- 
- def stage_runtime_universe(worktree_dir: Path) -> None:
-     pathspecs = [
-         "bot_state/runtime/universe",
-         "bot_state/runtime/universe_build_done_*.flag",
-         "bot_state/runtime/universe_sanitize_*.json",
-         "bot_state/runtime/diagnostics/universe_drop_*.json",
-         "bot_state/runtime/*.flag",
-         "bot_state/runtime/*.json",
-         "bot_state/runtime/diagnostics/*.json",
-+        "bot_state/universe_lkg/**/best_k_meta/latest.json",
-     ]
-     for spec in pathspecs:
-         _git_worktree(worktree_dir, "add", "--", spec, check=False)
- 
- 
- def _cached_diff_names(worktree_dir: Path) -> list[str]:
-     output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
-     return [line for line in output.splitlines() if line.strip()]
- 
- 
- def commit_if_staged(worktree_dir: Path, message: str) -> bool:
-     diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
-     if diff_proc.returncode == 0:
-         return False
-     _git_worktree(worktree_dir, "commit", "-m", message)
-     return True
- 
- 
- def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
-     status = git_porcelain(worktree_dir)
-     files = [line.strip() for line in status.splitlines() if line.strip()]
-     dirty = bool(files)
-     logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
-     if not dirty:
-         return
-@@ -609,51 +610,60 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-         staged_any = False
+-        staged_any = False
          for path in files:
              try:
                  if path.resolve().is_relative_to(worktree_dir.resolve()):
@@ -71,26 +291,37 @@ index 88c07379dda624ba012d576dc4dd296e7e540738..abf6ffc6a14362fb464c63f0b1389b99
                      target.write_bytes(path.read_bytes())
                  rel_target = target.relative_to(worktree_dir)
                  _git_worktree(worktree_dir, "add", str(rel_target))
-                 staged_any = True
+-                staged_any = True
              except Exception:
                  continue
  
-         stage_runtime_universe(worktree_dir)
+-        stage_runtime_universe(worktree_dir)
++        status = git_porcelain(worktree_dir)
++        status_lines = [line for line in status.splitlines() if line.strip()]
++        if not status_lines:
++            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
++            return
++        logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
++        stage_all(worktree_dir)
++        status2 = git_porcelain(worktree_dir)
++        status2_lines = [line for line in status2.splitlines() if line.strip()]
          staged_files = _cached_diff_names(worktree_dir)
-         logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
-         staged_any = staged_any or bool(staged_files)
-         if not staged_any:
--            logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
-+            status = git_porcelain(worktree_dir).strip()
-+            if not status:
-+                logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
-+            else:
-+                logger.info(
-+                    "[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d status=%s",
-+                    message,
-+                    attempt,
-+                    status,
-+                )
+-        logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
+-        staged_any = staged_any or bool(staged_files)
+-        if not staged_any:
+-            status = git_porcelain(worktree_dir).strip()
+-            if not status:
+-                logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
+-            else:
+-                logger.info(
+-                    "[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d status=%s",
+-                    message,
+-                    attempt,
+-                    status,
+-                )
++        logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
++        if not status2_lines:
++            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
              return
  
          committed = commit_if_staged(worktree_dir, message)
@@ -116,6 +347,285 @@ index 88c07379dda624ba012d576dc4dd296e7e540738..abf6ffc6a14362fb464c63f0b1389b99
              return
          except RuntimeError as exc:
              logger.warning(
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index bf86af508c7c1023f6f1e49833f3fd00e485780f..0da3ac2a5fae0b599e4da195cd233e8bddc40d3e 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -65,111 +65,105 @@ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ log = logger
+ 
+ 
+ def _deepcopy_json(value):
+     try:
+         return copy.deepcopy(value)
+     except Exception:
+         return value
+ 
+ 
+ def universe_build_flag(as_of: str) -> Path:
+     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
+ 
+ 
+ def ensure_universe_built_once(
+     runtime_store: RuntimeStore | None = None,
+     *,
+     env: str | None = None,
+     strategy: str | None = None,
+     as_of: str | None = None,
+     force: bool = False,
+ ) -> None:
+     if runtime_store is None:
+-        bot_state_dir = os.getenv("BOT_STATE_DIR")
+-        if bot_state_dir:
+-            base = Path(bot_state_dir)
+-        else:
+-            ws = os.getenv("GITHUB_WORKSPACE")
+-            base = Path(ws) / "bot_state" if ws else Path("bot_state")
+-        runtime_store = RuntimeStore(bot_state_dir=str(base.resolve()))
+-        logger.info(
+-            "[UNIVERSE][ENSURE][AUTO_RUNTIME_STORE] bot_state_dir=%s",
+-            runtime_store.bot_state_dir,
+-        )
++        raise ValueError("runtime_store is required for ensure_universe_built_once")
+ 
+     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
+     if env is not None:
+         env = env.strip()
+     strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
+     as_of = as_of or _get_now_kst().date().isoformat()
+ 
+     assert env, "env is required"
+     assert strategy, "strategy is required"
+     assert as_of, "as_of is required"
+ 
+     log.info(
+         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
+         type(runtime_store).__name__,
+         env,
+         strategy,
+         as_of,
+         force,
+     )
+ 
+     ok, meta = runtime_store.universe_check(as_of)
+     flag = universe_build_flag(as_of)
+ 
+     if not force:
+         if not ok:
+             return
+ 
+         if meta.get("have_today"):
+             return
+ 
+         if flag.exists():
+             return
+ 
+     reason = "force" if force else "auto_missing_today"
+     flag.parent.mkdir(parents=True, exist_ok=True)
+     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
+ 
+     cmd = [
+         "python",
+         "-m",
+         "trader.universe.build",
+         "--env",
+         env,
+         "--strategy",
+         strategy,
+         "--date",
+         as_of,
+     ]
+     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+-    subprocess.run(cmd, check=False)
++    bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
++    env_vars = os.environ.copy()
++    env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
++    env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
++    subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
+     _, post_meta = runtime_store.load_today_universe(as_of)
+     if post_meta.get("have_today"):
+         log.info(
+             "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+             post_meta.get("today_path"),
+         )
+     else:
+         log.warning(
+             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+             post_meta.get("today_path"),
+         )
+ 
+ 
+ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+     events_dir = base_dir / "runtime" / "events"
+     events_dir.mkdir(parents=True, exist_ok=True)
+     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
+     ensure_not_repo_tracked_path(path)
+     line = json.dumps(payload, ensure_ascii=False)
+     with path.open("a", encoding="utf-8") as handle:
+         handle.write(line + "\n")
+     logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
+     return path
+ 
+ 
+diff --git a/trader/run.py b/trader/run.py
+index 1d215f32e24079b0d41b35372aba782919c8d0e5..afc10cb067c0221f90a4ad6551054e68bd5dd609 100644
+--- a/trader/run.py
++++ b/trader/run.py
+@@ -1,31 +1,20 @@
+ from __future__ import annotations
+ 
+ import logging
+-import os
+ import sys
+ 
+ import trader
+ from trader import pb1_runner
+-from trader.botstate_paths import get_botstate_root
+-from trader.runtime_store import RuntimeStore
+-from trader.time_utils import now_kst
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> int:
+     logger.info("[IMPORT_ORIGIN] trader=%s", trader.__file__)
+     logger.info("[SYSPATH_HEAD]=%s", sys.path[:10])
+-    runtime_store = RuntimeStore(base_dir=get_botstate_root())
+-    pb1_runner.ensure_universe_built_once(
+-        runtime_store=runtime_store,
+-        env=os.getenv("KIS_ENV"),
+-        strategy=os.getenv("PB1_UNIVERSE_STRATEGY"),
+-        as_of=now_kst().date().isoformat(),
+-    )
+     pb1_runner.main()
+     return 0
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index b70a46eb5ec1bcd1e78e4e5cdd02962fae4b8f29..12cae943cf75aa6248b5f592f72dd41f3ddd264f 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -40,52 +40,60 @@ def _parse_as_of_date(val: str) -> date | None:
+         if len(s) == 8 and s.isdigit():
+             return _datetime.strptime(s, "%Y%m%d").date()
+         return _datetime.fromisoformat(s).date()
+     except Exception:
+         return None
+ 
+ 
+ def _prefer_provider_order(chain: list[str]) -> list[str]:
+     """Prefer caches first, then live providers, then static."""
+     order = {
+         "sqlite_cache": 10,
+         "lkg": 20,
+         # live providers
+         "fdr_marketcap_top": 30,
+         "kis_marketcap_top": 30,
+         # ultimate fallback
+         "seed_static": 90,
+     }
+     return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
+ 
+ logger = logging.getLogger(__name__)
+ 
+ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
+ 
+ 
++def _resolve_bot_state_dir() -> Path:
++    raw = os.getenv("BOT_STATE_DIR", "").strip()
++    if raw:
++        return Path(raw).expanduser().resolve()
++    return get_botstate_root()
++
++
+ def _resolve_seed_dir() -> Path:
+-    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", "bot_state/universe_lkg"))
++    default_dir = _resolve_bot_state_dir() / "universe_lkg"
++    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", str(default_dir)))
+     seed_dir.mkdir(parents=True, exist_ok=True)
+     return seed_dir
+ 
+ 
+ SEED_DIR = _resolve_seed_dir()
+ SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
+ SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
+ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+ DEFAULT_PROVIDER = "fdr_marketcap_top"
+ ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
+ ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
+ TICKER_PATTERN = re.compile(r"^\d{6}$")
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Build and persist universe members")
+     parser.add_argument("--env", required=True, help="Environment (practice/real)")
+     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
+     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
+     parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
+     return parser.parse_args()
+ 
+ 
+ def _normalize_payload(payload: dict | None) -> dict:
+     payload = payload or {}
+@@ -450,51 +458,53 @@ def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | No
+ 
+     kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
+     kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
+     _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+ 
+     selected_by_market = {
+         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+     }
+     payload = _normalize_payload(
+         {
+             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+             "selected_by_market": selected_by_market,
+         }
+     )
+     params = {"as_of": as_of_date, "targets": targets}
+     members = _build_members_from_payload(selected_by_market)
+     return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
+ 
+ 
+ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
+     engine = make_engine()
+     run_migrations(engine)
+     repo = UniverseRepo(engine)
+-    runtime_store = RuntimeStore(base_dir=get_botstate_root())
++    bot_state_dir = _resolve_bot_state_dir()
++    os.environ.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
++    runtime_store = RuntimeStore(base_dir=bot_state_dir)
+ 
+     payload: dict | None = None
+     members: list[dict] = []
+     source = provider_override or DEFAULT_PROVIDER
+     params: dict = {"as_of": as_of_date}
+     last_reason: str | None = None
+ 
+     logger.info(
+         "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
+         env,
+         strategy,
+         as_of_date,
+         provider_override or DEFAULT_PROVIDER,
+     )
+ 
+     allowed_chain = providers_for_env(env)
+     if provider_override:
+         if provider_override not in allowed_chain:
+             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
+         allowed_chain = [provider_override]
+     preferred_chain = _prefer_provider_order(allowed_chain)
+     if preferred_chain != list(allowed_chain):
+         logger.info(
+             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
+             env,
 
 
 

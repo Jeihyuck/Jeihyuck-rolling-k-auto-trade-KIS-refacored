@@ -62,8 +62,16 @@ logger = logging.getLogger(__name__)
 FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
 
 
+def _resolve_bot_state_dir() -> Path:
+    raw = os.getenv("BOT_STATE_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return get_botstate_root()
+
+
 def _resolve_seed_dir() -> Path:
-    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", "bot_state/universe_lkg"))
+    default_dir = _resolve_bot_state_dir() / "universe_lkg"
+    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", str(default_dir)))
     seed_dir.mkdir(parents=True, exist_ok=True)
     return seed_dir
 
@@ -472,7 +480,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
-    runtime_store = RuntimeStore(base_dir=get_botstate_root())
+    bot_state_dir = _resolve_bot_state_dir()
+    os.environ.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
+    runtime_store = RuntimeStore(base_dir=bot_state_dir)
 
     payload: dict | None = None
     members: list[dict] = []

@@ -87,17 +87,7 @@ def ensure_universe_built_once(
     force: bool = False,
 ) -> None:
     if runtime_store is None:
-        bot_state_dir = os.getenv("BOT_STATE_DIR")
-        if bot_state_dir:
-            base = Path(bot_state_dir)
-        else:
-            ws = os.getenv("GITHUB_WORKSPACE")
-            base = Path(ws) / "bot_state" if ws else Path("bot_state")
-        runtime_store = RuntimeStore(bot_state_dir=str(base.resolve()))
-        logger.info(
-            "[UNIVERSE][ENSURE][AUTO_RUNTIME_STORE] bot_state_dir=%s",
-            runtime_store.bot_state_dir,
-        )
+        raise ValueError("runtime_store is required for ensure_universe_built_once")
 
     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
     if env is not None:
@@ -147,7 +137,11 @@ def ensure_universe_built_once(
         as_of,
     ]
     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
-    subprocess.run(cmd, check=False)
+    bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
+    env_vars = os.environ.copy()
+    env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
+    env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
+    subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
     _, post_meta = runtime_store.load_today_universe(as_of)
     if post_meta.get("have_today"):
         log.info(

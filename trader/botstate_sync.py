@@ -607,7 +607,6 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             time.sleep(retry_sleep_sec)
             continue
 
-        staged_any = False
         for path in files:
             try:
                 if path.resolve().is_relative_to(worktree_dir.resolve()):
@@ -623,25 +622,22 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                     target.write_bytes(path.read_bytes())
                 rel_target = target.relative_to(worktree_dir)
                 _git_worktree(worktree_dir, "add", str(rel_target))
-                staged_any = True
             except Exception:
                 continue
 
-        stage_runtime_universe(worktree_dir)
+        status = git_porcelain(worktree_dir)
+        status_lines = [line for line in status.splitlines() if line.strip()]
+        if not status_lines:
+            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
+            return
+        logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
+        stage_all(worktree_dir)
+        status2 = git_porcelain(worktree_dir)
+        status2_lines = [line for line in status2.splitlines() if line.strip()]
         staged_files = _cached_diff_names(worktree_dir)
-        logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
-        staged_any = staged_any or bool(staged_files)
-        if not staged_any:
-            status = git_porcelain(worktree_dir).strip()
-            if not status:
-                logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
-            else:
-                logger.info(
-                    "[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d status=%s",
-                    message,
-                    attempt,
-                    status,
-                )
+        logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
+        if not status2_lines:
+            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
             return
 
         committed = commit_if_staged(worktree_dir, message)

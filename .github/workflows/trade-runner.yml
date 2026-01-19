@@ -205,6 +205,19 @@ jobs:
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
+      - name: Verify bot_state clean after persist
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
+        run: |
+          set -euo pipefail
+          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
+          echo "$status" | head -n 50
+          if [ -n "$status" ]; then
+            echo "::error::botstate worktree dirty after persist"
+            exit 1
+          fi
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+
   trade_tick:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
@@ -320,29 +333,6 @@ jobs:
           done
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
 
-      - name: Ensure universe exists (once per day)
-        run: |
-          set -euo pipefail
-          python - << 'PY'
-          import os
-          from pathlib import Path
-          from trader.time_utils import now_kst
-          from trader.pb1_runner import ensure_universe_built_once
-          from trader.runtime_store import RuntimeStore
-
-          as_of = now_kst().date().isoformat()
-          bot_state_dir = os.getenv("BOT_STATE_DIR") or str((Path(os.getenv("GITHUB_WORKSPACE", ".")) / "bot_state").resolve())
-          runtime_store = RuntimeStore(bot_state_dir=bot_state_dir)
-          ensure_universe_built_once(
-              runtime_store=runtime_store,
-              env=os.getenv("KIS_ENV"),
-              strategy="best_k_meta",
-              as_of=os.getenv("AS_OF") or as_of,
-              force=False,
-          )
-          print("universe preflight done", as_of, os.getenv("KIS_ENV", ""))
-          PY
-
       - name: Resolve market-aware runtime mode
         run: |
           set -euo pipefail
@@ -454,6 +444,19 @@ jobs:
           fi
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+
+      - name: Verify bot_state clean after persist
+        if: always()
+        run: |
+          set -euo pipefail
+          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
+          echo "$status" | head -n 50
+          if [ -n "$status" ]; then
+            echo "::error::botstate worktree dirty after persist"
+            exit 1
+          fi
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
@@ -582,6 +585,19 @@ jobs:
           fi
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+        env:
+          BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+
+      - name: Verify bot_state clean after persist
+        if: always()
+        run: |
+          set -euo pipefail
+          status="$(git -C "${BOTSTATE_WORKTREE_DIR}" status --porcelain)"
+          echo "$status" | head -n 50
+          if [ -n "$status" ]; then
+            echo "::error::botstate worktree dirty after persist"
+            exit 1
+          fi
         env:
           BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
 
