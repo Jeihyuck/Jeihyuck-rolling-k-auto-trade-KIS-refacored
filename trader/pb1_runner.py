@@ -79,19 +79,35 @@ def universe_build_flag(as_of: str) -> Path:
 
 
 def ensure_universe_built_once(
-    runtime_store: RuntimeStore,
+    runtime_store: RuntimeStore | None = None,
     *,
     env: str | None = None,
     strategy: str | None = None,
     as_of: str | None = None,
     force: bool = False,
 ) -> None:
-    if env is None:
-        env = os.getenv("KIS_ENV", "").strip()
-    if strategy is None:
-        strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
-    if as_of is None:
-        as_of = _get_now_kst().date().isoformat()
+    if runtime_store is None:
+        bot_state_dir = os.getenv("BOT_STATE_DIR")
+        if bot_state_dir:
+            base = Path(bot_state_dir)
+        else:
+            ws = os.getenv("GITHUB_WORKSPACE")
+            base = Path(ws) / "bot_state" if ws else Path("bot_state")
+        runtime_store = RuntimeStore(bot_state_dir=str(base.resolve()))
+        logger.info(
+            "[UNIVERSE][ENSURE][AUTO_RUNTIME_STORE] bot_state_dir=%s",
+            runtime_store.bot_state_dir,
+        )
+
+    env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
+    if env is not None:
+        env = env.strip()
+    strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
+    as_of = as_of or _get_now_kst().date().isoformat()
+
+    assert env, "env is required"
+    assert strategy, "strategy is required"
+    assert as_of, "as_of is required"
 
     log.info(
         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",

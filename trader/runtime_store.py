@@ -33,8 +33,11 @@ def universe_lkg_path() -> Path:
 
 
 class RuntimeStore:
-    def __init__(self, base_dir: Path) -> None:
+    def __init__(self, base_dir: Path | None = None, *, bot_state_dir: str | Path | None = None) -> None:
+        if base_dir is None:
+            base_dir = bot_state_dir if bot_state_dir is not None else get_botstate_root()
         self.base_dir = Path(base_dir)
+        self.bot_state_dir = self.base_dir
 
     def _normalize_rel(self, path: Path) -> Path:
         raw = Path(path)

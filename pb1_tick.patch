@@ -1,509 +1,170 @@
-diff --git a/trader/config.py b/trader/config.py
-index ddd9cdaf23bf0851a1bc2cb0bf4707cf4dc68e0b..249808dc0a13a66a63a26f19793ef5ef2c46b5f0 100644
---- a/trader/config.py
-+++ b/trader/config.py
-@@ -460,59 +460,60 @@ def _parse_hhmm(hhmm: str) -> dtime:
-     try:
-         hh, mm = hhmm.split(":")
-         return dtime(hour=int(hh), minute=int(mm))
-     except Exception:
-         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
-         return dtime(hour=14, minute=40)
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index 83e8b6daeb0b889c8d6bcda5b9fbe19d1ca7e60e..cae38982301335cfc91dae3efe63f92c3c0fca91 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -303,55 +303,65 @@ jobs:
+             ${{ runner.os }}-pip-
+ 
+       - name: Install deps
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+       - name: Precheck env (fail fast)
+         run: |
+           set -euo pipefail
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+             if [ -z "${!k:-}" ]; then
+               echo "::error::Missing required secret/env: $k"
+               exit 1
+             fi
+           done
+           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+ 
+       - name: Ensure universe exists (once per day)
+         run: |
+           set -euo pipefail
+           python - << 'PY'
+           import os
++          from pathlib import Path
+           from trader.time_utils import now_kst
+           from trader.pb1_runner import ensure_universe_built_once
++          from trader.runtime_store import RuntimeStore
+ 
+           as_of = now_kst().date().isoformat()
+-          ensure_universe_built_once(as_of=as_of)
++          bot_state_dir = os.getenv("BOT_STATE_DIR") or str((Path(os.getenv("GITHUB_WORKSPACE", ".")) / "bot_state").resolve())
++          runtime_store = RuntimeStore(bot_state_dir=bot_state_dir)
++          ensure_universe_built_once(
++              runtime_store=runtime_store,
++              env=os.getenv("KIS_ENV"),
++              strategy="best_k_meta",
++              as_of=os.getenv("AS_OF") or as_of,
++              force=False,
++          )
+           print("universe preflight done", as_of, os.getenv("KIS_ENV", ""))
+           PY
+ 
+       - name: Resolve market-aware runtime mode
+         run: |
+           set -euo pipefail
+           python - << 'PY'
+           from datetime import datetime, time
+           from zoneinfo import ZoneInfo
+           import os
+ 
+           KST = ZoneInfo("Asia/Seoul")
+           now = datetime.now(KST)
+ 
+           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
+           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+ 
+           is_weekday = now.weekday() < 5
+           in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+ 
+           mode = "LIVE" if in_market else "DIAG"
+           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
+               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
+ 
+           if not is_weekday:
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 4a4116f53aa99bfcbadb9325f421638ab72c3bfd..5125a384076388a548603cb188237bf9e042f117 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -57,63 +57,79 @@ from trader.kis_wrapper import KisAPI
+ from trader.ledger.store import LedgerStore
+ from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_today
+ from trader.reset_utils import detect_account_fp, purge_bot_state
+ from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
+ from trader.time_utils import now_kst
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ log = logger
  
  
- SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
- TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
- ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
- DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
- DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
- ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
- PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
- LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
- BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
- LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or botstate_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
- ensure_not_repo_tracked_path(LEDGER_BASE_DIR)
- BOT_STATE_RESET = _cfg_bool("BOT_STATE_RESET")
- BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH = _cfg_bool("BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH", fallback=True)
- BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS = _cfg_bool("BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS", fallback=True)
- BOT_STATE_RESET_CASH_MAX_KRW = int(_cfg("BOT_STATE_RESET_CASH_MAX_KRW") or "15000000")
- PAPER_MAX_CAPITAL_KRW = int(_cfg("PAPER_MAX_CAPITAL_KRW") or "10000000")
- PB1_CAPITAL_MODE = (_cfg("PB1_CAPITAL_MODE") or "CASH").strip().upper()
--PB1_ENTRY_CAPITAL_KRW = float(_cfg("PB1_ENTRY_CAPITAL_KRW") or "0")
-+_PB1_ENTRY_CAPITAL_RAW = float(_cfg("PB1_ENTRY_CAPITAL_KRW") or "0")
-+PB1_ENTRY_CAPITAL_KRW = _PB1_ENTRY_CAPITAL_RAW if _PB1_ENTRY_CAPITAL_RAW > 0 else None
- PB1_CASH_RESERVE_PCT = float(_cfg("PB1_CASH_RESERVE_PCT") or "0.10")
- PB1_BLOCK_PREOPEN = _cfg_bool("PB1_BLOCK_PREOPEN", fallback=True)
- 
- logger.info(
-     "[CONFIG] BOT_STATE_RESET=%s CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
-     int(BOT_STATE_RESET),
-     PB1_CAPITAL_MODE,
--    int(PB1_ENTRY_CAPITAL_KRW),
-+    int(PB1_ENTRY_CAPITAL_KRW) if PB1_ENTRY_CAPITAL_KRW is not None else None,
-     PB1_CASH_RESERVE_PCT,
- )
- MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
- MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "15:20"
- MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
- MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
- AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "15:20"
- AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
- CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
- CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
- PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
- PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
- PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
- PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
- MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
- MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
- PB1_ENTRY_WINDOW_START = _cfg("PB1_ENTRY_WINDOW_START") or "08:50"
- PB1_ENTRY_OPEN_END = _cfg("PB1_ENTRY_OPEN_END") or "09:05"
- PB1_ENTRY_WINDOW_END = _cfg("PB1_ENTRY_WINDOW_END") or "15:15"
- PB1_EXIT_WINDOW_START = _cfg("PB1_EXIT_WINDOW_START") or "15:15"
- PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
- PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:00"
- PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
- PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
- PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.95")
-diff --git a/trader/diagnostics_runner.py b/trader/diagnostics_runner.py
-index 68934929a7d0cd95ecad81e8408926ac05d41bf8..e29bf4327f301f6055ec40a052c77c88c754352d 100644
---- a/trader/diagnostics_runner.py
-+++ b/trader/diagnostics_runner.py
-@@ -153,52 +153,52 @@ def _guard_reasons(
-             injected,
-         )
-         return injected
-     if (not setup_ok) and not reasons:
-         injected = ["UNKNOWN_SETUP_FAIL"]
-         logger.warning(
-             "[SETUP-REASON-GUARD] code=%s setup_ok=%s reasons_was_empty -> injected=%s",
-             code,
-             setup_ok,
-             injected,
-         )
-         return injected
-     return reasons
- 
- 
- def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
-     path.parent.mkdir(parents=True, exist_ok=True)
-     with open(path, "w", encoding="utf-8") as f:
-         json.dump(payload, f, ensure_ascii=False, indent=2)
- 
- 
- def _load_balance(kis: Optional[KisAPI]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-     if kis is None:
-         return {}, []
-     try:
--        balance = kis.get_balance()
--        positions = balance.get("positions") or []
-+        balance = kis.get_balance_cached()
-+        positions = balance.get("output1") or []
-         return balance, positions
-     except Exception as e:
-         logger.exception("[DIAG][BALANCE] failed to fetch: %s", e)
-         return {}, []
- 
- 
- def run_diagnostics(
-     *,
-     kis: Optional[KisAPI],
-     runtime_state: Dict[str, Any],
-     selected_by_market: Dict[str, Any] | None,
- ) -> Dict[str, Any]:
-     runtime_state = runtime_state or runtime_state_store.load_state()
-     _ensure_runtime_keys(runtime_state)
-     ts = now_kst()
-     ts_iso = ts.isoformat()
- 
-     if selected_by_market is None:
-         try:
-             rebalance_payload = run_rebalance(str(get_rebalance_anchor_date()), return_by_market=True)
-             selected_by_market = rebalance_payload.get("selected_by_market") or {}
-         except Exception as e:
-             logger.exception("[DIAG][REBALANCE] failed: %s", e)
-             selected_by_market = {}
- 
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index fced519e44c41055b4a4ae78587089028c274f6a..27ecf9bfa3bce4e5453897a872091c25ea8c2393 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -78,50 +78,60 @@ def _get_json(url, params=None, timeout=(3.0, 7.0)):
-         raise NetTemporaryError()
-     except requests.exceptions.RequestException as e:
-         logger.warning("[NET:REQ_ERROR] %s %s", url, e)
-         raise NetTemporaryError()
- 
- 
- def safe_strip(val):
-     if val is None:
-         return ""
-     if isinstance(val, str):
-         return val.replace("\n", "").replace("\r", "").strip()
-     return str(val).strip()
- 
- 
- def _json_dumps(body: dict) -> str:
-     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
- 
- 
- def _deepcopy_json(value: Any) -> Any:
+ def _deepcopy_json(value):
      try:
          return copy.deepcopy(value)
      except Exception:
          return value
  
  
-+def _is_raw_balance_snapshot(snapshot: Any) -> bool:
-+    if not isinstance(snapshot, dict):
-+        return False
-+    output2 = snapshot.get("output2")
-+    if isinstance(output2, list) and output2:
-+        first = output2[0]
-+        return isinstance(first, dict) and bool(first)
-+    return False
+ def universe_build_flag(as_of: str) -> Path:
+     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
+ 
+ 
+ def ensure_universe_built_once(
+-    runtime_store: RuntimeStore,
++    runtime_store: RuntimeStore | None = None,
+     *,
+     env: str | None = None,
+     strategy: str | None = None,
+     as_of: str | None = None,
+     force: bool = False,
+ ) -> None:
+-    if env is None:
+-        env = os.getenv("KIS_ENV", "").strip()
+-    if strategy is None:
+-        strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+-    if as_of is None:
+-        as_of = _get_now_kst().date().isoformat()
++    if runtime_store is None:
++        bot_state_dir = os.getenv("BOT_STATE_DIR")
++        if bot_state_dir:
++            base = Path(bot_state_dir)
++        else:
++            ws = os.getenv("GITHUB_WORKSPACE")
++            base = Path(ws) / "bot_state" if ws else Path("bot_state")
++        runtime_store = RuntimeStore(bot_state_dir=str(base.resolve()))
++        logger.info(
++            "[UNIVERSE][ENSURE][AUTO_RUNTIME_STORE] bot_state_dir=%s",
++            runtime_store.bot_state_dir,
++        )
 +
++    env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
++    if env is not None:
++        env = env.strip()
++    strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
++    as_of = as_of or _get_now_kst().date().isoformat()
 +
- def _order_block_reason(now: datetime | None = None) -> Optional[str]:
-     now = now or now_kst()
-     state_date = _ORDER_BLOCK_STATE.get("date")
-     state_reason = _ORDER_BLOCK_STATE.get("reason")
-     if state_date and state_date != now.date():
-         _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
-         state_date, state_reason = None, None
-     if state_date == now.date() and state_reason:
-         return str(state_reason)
-     if not is_trading_day(now):
-         _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
-         return "NON_TRADING_DAY"
-     if not is_trading_window(now):
-         return "OUTSIDE_TRADING_WINDOW"
-     return None
++    assert env, "env is required"
++    assert strategy, "strategy is required"
++    assert as_of, "as_of is required"
  
+     log.info(
+         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
+         type(runtime_store).__name__,
+         env,
+         strategy,
+         as_of,
+         force,
+     )
  
- def _mark_order_blocked(reason: str, now: datetime | None = None) -> None:
-     now = now or now_kst()
-     _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
+     ok, meta = runtime_store.universe_check(as_of)
+     flag = universe_build_flag(as_of)
  
+     if not force:
+         if not ok:
+             return
  
- def _is_order_disallowed(resp: Any) -> Optional[str]:
-     if not isinstance(resp, dict):
-         return None
-@@ -1441,73 +1451,75 @@ class KisAPI:
-     def get_positions(self) -> List[Dict]:
-         """보유 종목 전체(페이징 병합)."""
-         snap = self.get_balance_cached()
-         return snap.get("output1") or []
+         if meta.get("have_today"):
+             return
  
-     def get_balance_map(self) -> Dict[str, int]:
-         pos = self.get_positions()
-         mp: Dict[str, int] = {}
-         for row in pos or []:
-             try:
-                 pdno = safe_strip(row.get("pdno"))
-                 hldg = int(float(row.get("hldg_qty", "0")))
-                 ord_psbl = int(float(row.get("ord_psbl_qty", "0")))
-                 qty = hldg if hldg > 0 else ord_psbl
-                 if pdno and qty > 0:
-                     mp[pdno] = qty
-             except Exception:
-                 continue
-         logger.info(f"[보유수량맵] {len(mp)}종목")
-         return mp
+         if flag.exists():
+             return
  
-     def get_balance_cached(self, force: bool = False, *, return_source: bool = False) -> Dict[str, object] | tuple[Dict[str, object], str]:
-         source = "api"
-         if not force and self._balance_cache is not None:
-             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
--            logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
--            source = "wrapper_cache"
--            if return_source:
--                return _deepcopy_json(self._balance_cache), source
--            return _deepcopy_json(self._balance_cache)
-+            cached = _deepcopy_json(self._balance_cache)
-+            if _is_raw_balance_snapshot(cached):
-+                logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
-+                source = "wrapper_cache"
-+                if return_source:
-+                    return cached, source
-+                return cached
-+            logger.warning("[BALANCE][CACHE] invalid_shape=1 -> refetching raw")
-+            force = True
-         logger.info("[BALANCE][CACHE] hit=False force=%s", force)
-         snap: dict = {}
-         try:
-             snap = self.inquire_balance_all()
-             cache_value = _deepcopy_json(snap)
-             self._balance_cache = cache_value
-             self._balance_cache_at = now_kst()
-         except Exception as e:
-             logger.error("[GET_BALANCE_FAIL] %s", e)
-         if return_source:
-             return _deepcopy_json(snap), source
-         return _deepcopy_json(snap)
- 
-     # --- 호환 셔임(기존 trader.py 호출 대응) ---
-     def get_balance(self) -> Dict[str, object]:
--        snap = self.get_balance_cached()
--        positions = snap.get("output1") or []
--        return {"cash": self.get_cash_balance(), "positions": positions}
-+        return self.get_balance_cached()
- 
-     def get_balance_all(self) -> Dict[str, object]:
-         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
-         return self.get_balance_cached()
- 
-     def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
-         """당일 주문/체결 조회."""
-         tr_ids = _pick_tr(self.env, "DAILY_CCLD")
-         if not tr_ids:
-             raise ValueError("KIS daily reconcile TR_ID not configured")
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-         params = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "INQR_STRT_DT": start_date,
-             "INQR_END_DT": end_date,
-             "SLL_BUY_DVSN_CD": "00",
-             "INQR_DVSN": "00",
-             "PDNO": "",
-             "CCLD_DVSN": "00",
-             "ORD_GNO_BRNO": "",
-             "ODNO": "",
-             "INQR_DVSN": "00",
-             "SORT_SQN": "00",
-         }
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index e83d87c6ba60f743ac9e8818d2b05111b66f296a..a4e2022bcb8afafc592a36d39e9a99cf743944c7 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -522,51 +522,51 @@ class PB1Engine:
-                 total += val
-         return total
- 
-     def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
-         summary = _as_first_dict(holdings_summary)
-         for key in COST_KEYS:
-             cost = self._to_float(summary.get(key))
-             if cost and cost > 0:
-                 return cost
-         total = self._sum_cost_from_rows(holdings_rows)
-         return total if total > 0 else None
- 
-     def _extract_available_cash(self, holdings_summary: dict | None) -> float | None:
-         summary = _as_first_dict(holdings_summary)
-         for key in CASH_KEYS:
-             cash = self._to_float(summary.get(key))
-             if cash is not None:
-                 return cash
-         return None
- 
-     def _parse_available_cash_snapshot(self, snapshot: dict) -> tuple[int | None, dict]:
-         summary_raw = snapshot.get("output2")
-         summary = _as_first_dict(summary_raw)
-         selected_key = None
-         cash_value = None
--        for key in ("nxdy_excc_amt", "dnca_tot_amt"):
-+        for key in ("dnca_tot_amt", "ord_psbl_cash"):
-             if key in summary:
-                 selected_key = key
-                 cash_value = self._to_float(summary.get(key))
-                 break
-         if cash_value is None:
-             tot_evlu = self._to_float(summary.get("tot_evlu_amt"))
-             scts_evlu = self._to_float(summary.get("scts_evlu_amt"))
-             if tot_evlu is not None and scts_evlu is not None:
-                 estimated = tot_evlu - scts_evlu
-                 if estimated >= 0:
-                     selected_key = "tot_evlu_minus_scts_evlu"
-                     cash_value = estimated
-         output2_keys = _extract_output2_keys(summary_raw)
-         meta = {
-             "selected_key": selected_key,
-             "output2_keys": output2_keys,
-         }
-         if cash_value is None:
-             return None, meta
-         return int(cash_value), meta
- 
-     def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
-         _log_balance_snapshot_shape(snapshot, label="input")
-         if _is_sanitized_balance_snapshot(snapshot):
-             logger.warning("[PB1][CASH][SANITIZED] detected -> force refetch raw")
-@@ -580,51 +580,58 @@ class PB1Engine:
-         orderable = None
-         if self.kis:
-             try:
-                 orderable = self.kis.get_orderable_cash_krw(force=False)
-             except Exception:
-                 orderable = None
- 
-         if isinstance(orderable, (int, float)) and orderable > 0:
-             available_cash_krw = int(orderable)
-             return snapshot, available_cash_krw, {"source": "orderable_cash", "selected_key": "ord_psbl_cash"}
- 
-         balance_resp = snapshot
-         cash, meta = self._parse_available_cash_snapshot(balance_resp)
-         if cash is not None and cash > 0:
-             return snapshot, int(cash), {**meta, "source": "balance_snapshot"}
- 
-         if self.kis:
-             try:
-                 balance_resp = self.kis.get_balance_cached(force=True)
-                 _log_balance_snapshot_shape(balance_resp, label="force_refresh")
-                 cash, meta = self._parse_available_cash_snapshot(balance_resp)
-             except Exception:
-                 cash = None
- 
-         if cash is None or cash <= 0:
--            raise RuntimeError("Balance parse failed: cannot locate usable cash fields")
-+            output2 = balance_resp.get("output2") if isinstance(balance_resp, dict) else None
-+            output2_type = type(output2).__name__
-+            output2_len = len(output2) if isinstance(output2, list) else None
-+            output2_keys = _extract_output2_keys(output2)
-+            raise RuntimeError(
-+                "Balance parse failed: cannot locate usable cash fields "
-+                f"(cache object shape type(output2)={output2_type} len={output2_len} keys(output2[0])={output2_keys})"
-+            )
- 
-         return balance_resp, int(cash), {**meta, "source": "balance_snapshot"}
- 
-     def _resolve_entry_capital(
-         self,
-         *,
-         available_cash_krw: int,
-         override_capital: float | None,
-         reserve_pct: float,
-     ) -> tuple[int, int, dict]:
-         use_override = override_capital is not None and int(override_capital) > 0
-         auto_mode = not use_override and (override_capital is None or int(override_capital) <= 0)
-         if auto_mode:
-             entry_capital = max(int(available_cash_krw * (1 - reserve_pct)), 0)
-             usable = entry_capital
-         else:
-             entry_capital = int(override_capital) if use_override else int(available_cash_krw)
-             usable = int(entry_capital * (1 - reserve_pct))
-         clamp_meta = {}
-         if (self.env or "").lower() != "real":
-             cap = min(int(available_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
-             if entry_capital > cap:
-                 before = entry_capital
-                 entry_capital = cap
-                 usable = entry_capital if auto_mode else int(entry_capital * (1 - reserve_pct))
-@@ -2133,57 +2140,58 @@ class PB1Engine:
-         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
-         self._balance_snapshot = holdings_snapshot
-         holdings_rows = holdings_snapshot.get("output1") or []
-         holdings_summary_raw = holdings_snapshot.get("output2")
-         holdings_summary = _as_first_dict(holdings_summary_raw)
-         self._holdings_summary = holdings_summary
-         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
-         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
-         reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
-         override_capital = PB1_ENTRY_CAPITAL_KRW
-         entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
-             available_cash_krw=available_cash_krw,
-             override_capital=override_capital,
-             reserve_pct=reserve_pct,
-         )
-         self.entry_capital_krw = float(entry_capital_krw)
-         self.entry_usable_krw = float(entry_usable_krw)
-         if capital_meta.get("auto"):
-             logger.info(
-                 "[PB1][CAPITAL][AUTO] entry_capital_runtime=%s source=%s reserve=%.2f",
-                 entry_capital_krw,
-                 cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
-                 reserve_pct,
-             )
-         logger.info(
--            "[PB1][CAPITAL] available_cash=%s override=%s use_override=%s -> entry_capital=%s reserve=%.2f usable=%s source=%s",
-+            "[PB1][CAPITAL] mode=%s override=%s available_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s source=%s",
-+            PB1_CAPITAL_MODE,
-+            override_capital,
-             available_cash_krw,
--            int(override_capital) if override_capital is not None else None,
--            int(capital_meta.get("use_override") or 0),
--            entry_capital_krw,
-             reserve_pct,
-             entry_usable_krw,
-+            int(capital_meta.get("use_override") or 0),
-+            entry_capital_krw,
-             cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
-         )
-         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-         if not positions and holdings_rows:
-             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
-                 env=self.env,
-                 strategy=self.STRATEGY_NAME,
-                 sid=1,
-                 mode=1,
-                 holdings=holdings_rows,
-             )
-             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
-             positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-         positions_for_exit = self._build_positions_from_kis(holdings_rows)
-         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
-         existing_positions_count = len(existing_positions)
-         slots_remaining = max(0, max_positions - existing_positions_count)
-         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
-         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
-         logger.info(
-             "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
-             max_positions,
-             target_new_positions,
-             entry_capital_krw,
-             min_order_krw,
-diff --git a/trader/run.py b/trader/run.py
-index afc10cb067c0221f90a4ad6551054e68bd5dd609..1d215f32e24079b0d41b35372aba782919c8d0e5 100644
---- a/trader/run.py
-+++ b/trader/run.py
-@@ -1,20 +1,31 @@
- from __future__ import annotations
- 
- import logging
-+import os
- import sys
- 
- import trader
- from trader import pb1_runner
-+from trader.botstate_paths import get_botstate_root
-+from trader.runtime_store import RuntimeStore
-+from trader.time_utils import now_kst
- 
- logger = logging.getLogger(__name__)
- 
- 
- def main() -> int:
-     logger.info("[IMPORT_ORIGIN] trader=%s", trader.__file__)
-     logger.info("[SYSPATH_HEAD]=%s", sys.path[:10])
-+    runtime_store = RuntimeStore(base_dir=get_botstate_root())
-+    pb1_runner.ensure_universe_built_once(
-+        runtime_store=runtime_store,
-+        env=os.getenv("KIS_ENV"),
-+        strategy=os.getenv("PB1_UNIVERSE_STRATEGY"),
-+        as_of=now_kst().date().isoformat(),
-+    )
-     pb1_runner.main()
-     return 0
- 
- 
- if __name__ == "__main__":
-     raise SystemExit(main())
+     reason = "force" if force else "auto_missing_today"
+     flag.parent.mkdir(parents=True, exist_ok=True)
 diff --git a/trader/runtime_store.py b/trader/runtime_store.py
-index 8fa3524577d022d496e2dc2218092b98ff32d94c..78e57174c418f7dfe43d97d31291d32f97582e21 100644
+index 78e57174c418f7dfe43d97d31291d32f97582e21..42534d8dbcea9225aa5c49bd71a49a3b1baed439 100644
 --- a/trader/runtime_store.py
 +++ b/trader/runtime_store.py
-@@ -1,32 +1,33 @@
- from __future__ import annotations
- 
- import json
- import logging
- import os
- from datetime import date
- from pathlib import Path
-+from typing import Any
- 
- from trader.botstate_paths import botstate_path, get_botstate_root
+@@ -11,52 +11,55 @@ from trader.botstate_paths import botstate_path, get_botstate_root
  from trader.universe.lkg_store import lkg_path
  
  logger = logging.getLogger(__name__)
@@ -527,7 +188,20 @@ index 8fa3524577d022d496e2dc2218092b98ff32d94c..78e57174c418f7dfe43d97d31291d32f
      strategy = _resolve_universe_strategy()
      return lkg_path(env, strategy)
  
-@@ -43,50 +44,63 @@ class RuntimeStore:
+ 
+ class RuntimeStore:
+-    def __init__(self, base_dir: Path) -> None:
++    def __init__(self, base_dir: Path | None = None, *, bot_state_dir: str | Path | None = None) -> None:
++        if base_dir is None:
++            base_dir = bot_state_dir if bot_state_dir is not None else get_botstate_root()
+         self.base_dir = Path(base_dir)
++        self.bot_state_dir = self.base_dir
+ 
+     def _normalize_rel(self, path: Path) -> Path:
+         raw = Path(path)
+         if raw.is_absolute():
+             try:
+                 return raw.relative_to(self.base_dir)
              except ValueError:
                  pass
          parts = raw.parts
@@ -547,397 +221,5 @@ index 8fa3524577d022d496e2dc2218092b98ff32d94c..78e57174c418f7dfe43d97d31291d32f
              self.base_dir,
              rel,
              abs_path,
-             int(exists),
-         )
-         if not exists:
-             self._log_dir_snapshot()
-         return abs_path, rel
- 
-+    def save_json(self, rel: str | Path, data: Any) -> Path:
-+        target = self.base_dir / self._normalize_rel(Path(rel))
-+        target.parent.mkdir(parents=True, exist_ok=True)
-+        target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-+        return target
-+
-+    def touch_flag(self, rel: str | Path, *, content: str = "done\n") -> Path:
-+        target = self.base_dir / self._normalize_rel(Path(rel))
-+        target.parent.mkdir(parents=True, exist_ok=True)
-+        if not target.exists():
-+            target.write_text(content, encoding="utf-8")
-+        return target
-+
-     def _log_dir_snapshot(self) -> None:
-         base = self.base_dir
-         listing: dict[str, list[str]] = {}
-         if not base.exists():
-             logger.info("[UNIVERSE][LOAD][LIST] base_dir=%s missing=1", base)
-             return
-         for child in sorted(base.iterdir()):
-             if child.is_dir():
-                 try:
-                     listing[str(child)] = [p.name for p in sorted(child.iterdir())]
-                 except Exception:
-                     listing[str(child)] = ["<unreadable>"]
-             else:
-                 listing[str(child)] = []
-         logger.info("[UNIVERSE][LOAD][LIST] base_dir=%s listing=%s", base, listing)
- 
-     def _today_path(self, as_of: str) -> Path:
-         return self.base_dir / "runtime" / "universe" / f"{as_of}.json"
- 
-     def _lkg_path(self) -> Path:
-         env = _resolve_universe_env()
-         strategy = _resolve_universe_strategy()
-         return lkg_path(env, strategy)
- 
-     def universe_check(self, as_of: str) -> tuple[bool, dict]:
-diff --git a/trader/trader.py b/trader/trader.py
-index 1e856a3be331ac8a9f0acb3427ffdbd334831cb9..6b2407582578e5696b1e112d8d31b99665fabf31 100644
---- a/trader/trader.py
-+++ b/trader/trader.py
-@@ -164,51 +164,51 @@ def main() -> None:
-         dry_run,
-         dry_run_reasons,
-         live_trading_enabled,
-         disable_live_flag.raw if disable_live_flag.raw is not None else disable_live_flag.value,
-         dry_run_flag.raw if dry_run_flag.raw is not None else dry_run_flag.value,
-         live_trading_flag.raw if live_trading_flag.raw is not None else live_trading_flag.value,
-         sorted(active_strategies) if active_strategies else [1],
-         ALLOW_ADOPT_UNMANAGED,
-         engine_disabled_reason,
-     )
-     if (not trading_day) and (not (DIAG_ENABLED and DIAGNOSTIC_FORCE_RUN)):
-         logger.warning("[TRADER] 비거래일(%s) → 즉시 종료 dry_run=%s reason=%s", now.date(), dry_run, dry_run_reason)
-         return
-     if (not trading_day) and diag_enabled:
-         logger.warning(
-             "[DIAG][TRADER] non-trading-day(%s) but running diagnostics (only=%s force_run=%s)",
-             now.date(),
-             DIAGNOSTIC_ONLY,
-             DIAGNOSTIC_FORCE_RUN,
-         )
-     runtime_state = {}
-     kis: KisAPI | None = None
-     try:
-         runtime_state = runtime_state_store.load_state()
-         kis = KisAPI()
--        balance = kis.get_balance()
-+        balance = kis.get_balance_cached()
-         runtime_state = runtime_state_store.reconcile_with_kis_balance(
-             runtime_state,
-             balance,
-             active_strategies=active_strategies,
-         )
-         runtime_state_store.save_state(runtime_state)
-         logger.info("[TRADER] runtime state reconciled")
-     except Exception:
-         logger.exception("[TRADER] runtime state reconcile failed")
-         runtime_state = runtime_state or runtime_state_store.load_state()
- 
-     if DIAGNOSTIC_ONLY:
-         from trader.diagnostics_runner import run_diagnostics
- 
-         run_diagnostics(kis=kis, runtime_state=runtime_state, selected_by_market=None)
-         logger.info("[DIAG][TRADER] diagnostic_only complete")
-         return
- 
-     diag_result = None
-     if DIAGNOSTIC_MODE:
-         try:
-             from trader.diagnostics_runner import run_diagnostics
- 
-             diag_result = run_diagnostics(
-                 kis=kis, runtime_state=runtime_state, selected_by_market=None
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 06d9aefd39ebffef0a6ba22c07959118414d2e95..b70a46eb5ec1bcd1e78e4e5cdd02962fae4b8f29 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -1,49 +1,50 @@
- from __future__ import annotations
- 
- import argparse
- import csv
- import json
- import logging
- import os
- import re
- from pathlib import Path
- from typing import Iterable
- 
- from trader.config import PB1_MIN_CANDLES
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
- from trader.db.engine import make_engine
- from trader.db.migrate import run_migrations
- from trader.db.repos import UniverseRepo
- from trader.kis_wrapper import KisAPI
- from trader.time_utils import now_kst
- from trader.universe.capabilities import providers_for_env
- from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
- from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
- from trader.universe.providers.lkg_provider import LKGProvider
- from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
--from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path
-+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
-+from trader.runtime_store import RuntimeStore
- 
- from datetime import date
- 
- 
- def _parse_as_of_date(val: str) -> date | None:
-     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-     from datetime import datetime as _datetime
- 
-     if not val:
-         return None
-     s = str(val).strip()
-     try:
-         if "-" in s:
-             return _datetime.fromisoformat(s).date()
-         if len(s) == 8 and s.isdigit():
-             return _datetime.strptime(s, "%Y%m%d").date()
-         return _datetime.fromisoformat(s).date()
-     except Exception:
-         return None
- 
- 
- def _prefer_provider_order(chain: list[str]) -> list[str]:
-     """Prefer caches first, then live providers, then static."""
-     order = {
-         "sqlite_cache": 10,
-@@ -192,76 +193,114 @@ def _sanitize_members(
-             except Exception:
-                 logger.exception("[UNIVERSE][VALIDATE][FAIL] code=%s", code)
-                 stats["insufficient_history"] += 1
-                 insufficient_history_codes.append(code)
-                 dropped.append({"code": code, "reason": "insufficient_history"})
-                 continue
-             if result.meta.get("insufficient_candles") or result.meta.get("rows", 0) < min_candles:
-                 stats["insufficient_history"] += 1
-                 insufficient_history_codes.append(code)
-                 dropped.append({"code": code, "reason": "insufficient_history"})
-                 continue
-         sanitized.append(member)
-     stats["final"] = len(sanitized)
-     return (
-         sanitized,
-         stats,
-         {
-             "invalid_format_codes": invalid_format_codes,
-             "insufficient_history_codes": insufficient_history_codes,
-             "kept": [m.get("code") for m in sanitized],
-             "dropped": dropped,
-         },
-     )
- 
- 
--def _write_runtime_universe(*, as_of_date: str, env: str, strategy: str, payload: dict | None, members: list[dict], source: str, params: dict) -> Path:
--    path = botstate_path("runtime", "universe", f"{as_of_date}.json")
--    path.parent.mkdir(parents=True, exist_ok=True)
-+def _write_runtime_universe(
-+    *,
-+    runtime_store: RuntimeStore,
-+    as_of_date: str,
-+    env: str,
-+    strategy: str,
-+    payload: dict | None,
-+    members: list[dict],
-+    source: str,
-+    params: dict,
-+) -> Path:
-     data = {
-         "as_of": as_of_date,
-         "env": env,
-         "strategy": strategy,
-         "source": source,
-         "params": params,
-         "payload": payload or {},
-         "members": members,
-     }
--    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
--    logger.info("[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s", path, len(members), source)
-+    path = runtime_store.save_json(Path("runtime") / "universe" / f"{as_of_date}.json", data)
-+    logger.info(
-+        "[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s exists_after=%s",
-+        path,
-+        len(members),
-+        source,
-+        int(path.exists()),
-+    )
-     return path
- 
- 
- def _write_universe_sanitize_report(*, as_of_date: str, keep_codes: list[str], dropped: list[dict]) -> Path:
-     path = botstate_path("runtime", f"universe_sanitize_{as_of_date}.json")
-     path.parent.mkdir(parents=True, exist_ok=True)
-     payload = {"as_of": as_of_date, "kept": keep_codes, "dropped": dropped}
-     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-     logger.info("[UNIVERSE][SANITIZE][SAVE] path=%s kept=%s dropped=%s", path, len(keep_codes), len(dropped))
-     return path
- 
- 
-+def _write_universe_drop_diagnostics(
-+    *,
-+    runtime_store: RuntimeStore,
-+    as_of_date: str,
-+    source: str,
-+    invalid_format_codes: list[str],
-+    insufficient_history_codes: list[str],
-+) -> Path:
-+    payload = {
-+        "invalid_format": list(invalid_format_codes or []),
-+        "insufficient_history": list(insufficient_history_codes or []),
-+        "source": source,
-+        "as_of": as_of_date,
-+    }
-+    path = runtime_store.save_json(Path("runtime") / "diagnostics" / f"universe_drop_{as_of_date}.json", payload)
-+    logger.info(
-+        "[UNIVERSE][SANITIZE][DIAGNOSTICS] path=%s invalid_format=%s insufficient_history=%s",
-+        path,
-+        len(payload["invalid_format"]),
-+        len(payload["insufficient_history"]),
-+    )
-+    return path
-+
-+
- def _write_seed_rows(path: Path, rows: Iterable[dict]) -> None:
-     try:
-         ensure_not_repo_tracked_path(path)
-         path.parent.mkdir(parents=True, exist_ok=True)
-         with path.open("w", encoding="utf-8", newline="") as f:
-             writer = csv.DictWriter(f, fieldnames=["code", "name"])
-             writer.writeheader()
-             for row in rows:
-                 code = str(row.get("code") or "").zfill(6)
-                 if not code:
-                     continue
-                 writer.writerow({"code": code, "name": (row.get("name") or "").strip()})
-     except Exception:
-         logger.exception("[UNIVERSE][SEED][WRITE_FAIL] path=%s", path)
-         raise
- 
- 
- def _load_static_seed() -> dict | None:
-     kospi_rows = _load_seed_rows(SEED_PATH_KOSPI)
-     kosdaq_rows = _load_seed_rows(SEED_PATH_KOSDAQ)
- 
-     members: list[dict] = []
-     markets: dict[str, list[dict]] = {}
- 
-     seen: set[str] = set()
-@@ -411,50 +450,51 @@ def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | No
- 
-     kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
-     kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
-     _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
-     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
- 
-     selected_by_market = {
-         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-     }
-     payload = _normalize_payload(
-         {
-             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-             "selected_by_market": selected_by_market,
-         }
-     )
-     params = {"as_of": as_of_date, "targets": targets}
-     members = _build_members_from_payload(selected_by_market)
-     return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
- 
- 
- def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
-     engine = make_engine()
-     run_migrations(engine)
-     repo = UniverseRepo(engine)
-+    runtime_store = RuntimeStore(base_dir=get_botstate_root())
- 
-     payload: dict | None = None
-     members: list[dict] = []
-     source = provider_override or DEFAULT_PROVIDER
-     params: dict = {"as_of": as_of_date}
-     last_reason: str | None = None
- 
-     logger.info(
-         "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
-         env,
-         strategy,
-         as_of_date,
-         provider_override or DEFAULT_PROVIDER,
-     )
- 
-     allowed_chain = providers_for_env(env)
-     if provider_override:
-         if provider_override not in allowed_chain:
-             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
-         allowed_chain = [provider_override]
-     preferred_chain = _prefer_provider_order(allowed_chain)
-     if preferred_chain != list(allowed_chain):
-         logger.info(
-             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
-             env,
-@@ -556,54 +596,59 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
-     universe_id = repo.store_universe(
-         env=env,
-         strategy=strategy,
-         as_of_date=as_of_date,
-         source=source,
-         params_json=params,
-         payload_json=payload or {},
-         members=members,
-     )
-     if universe_id:
-         logger.info(
-             "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
-             env,
-             strategy,
-             as_of_date,
-             universe_id,
-             len(members),
-             source,
-             last_reason or "n/a",
-         )
-     else:
-         logger.warning(
-             "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
-         )
-     _write_runtime_universe(
-+        runtime_store=runtime_store,
-         as_of_date=as_of_date,
-         env=env,
-         strategy=strategy,
-         payload=payload,
-         members=members,
-         source=source,
-         params=params,
-     )
-     _write_universe_sanitize_report(
-         as_of_date=as_of_date,
-         keep_codes=sanitize_detail.get("kept") or [],
-         dropped=sanitize_detail.get("dropped") or [],
-     )
--    flag = botstate_path("runtime", f"universe_build_done_{as_of_date}.flag")
--    flag.parent.mkdir(parents=True, exist_ok=True)
--    if not flag.exists():
--        flag.write_text("done\n", encoding="utf-8")
-+    _write_universe_drop_diagnostics(
-+        runtime_store=runtime_store,
-+        as_of_date=as_of_date,
-+        source=source,
-+        invalid_format_codes=sanitize_detail.get("invalid_format_codes") or [],
-+        insufficient_history_codes=sanitize_detail.get("insufficient_history_codes") or [],
-+    )
-+    runtime_store.touch_flag(Path("runtime") / f"universe_build_done_{as_of_date}.flag")
-     return universe_id
- 
- 
- def main() -> None:
-     logging.basicConfig(level=logging.INFO)
-     args = parse_args()
-     as_of = args.date or now_kst().date().isoformat()
-     build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
- 
- 
- if __name__ == "__main__":
-     main()
+
 
