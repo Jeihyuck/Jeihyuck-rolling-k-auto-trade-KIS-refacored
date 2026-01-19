@@ -34,6 +34,7 @@ from trader.config import (
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
+    PAPER_MAX_CAPITAL_KRW,
     resolve_strategy_mode,
 )
 from trader.botstate_paths import get_botstate_root
@@ -83,7 +84,12 @@ def _default_runtime_store() -> RuntimeStore:
     try:
         rs = RuntimeStore(bot_state_dir=base)
     except TypeError:
-        rs = RuntimeStore(base_dir=base)
+        try:
+            rs = RuntimeStore(base_dir=base)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize RuntimeStore with base_dir={base}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to initialize RuntimeStore with bot_state_dir={base}") from exc
     log.info("[UNIVERSE][DEFAULT_RUNTIME_STORE] bot_state_dir=%s", str(base))
     return rs
 
@@ -807,13 +813,16 @@ def run_once(
                     int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
                 )
                 dnca_total = _extract_dnca_total(balance_snapshot)
-                if (
-                    len(kis_holdings) == 0
-                    and (existing_positions_count > 0 or ledger_has_positions)
-                    and dnca_total is not None
-                    and dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW
-                ):
-                    reset_reason = "empty_kis_holdings_detected"
+                is_paper_env = (kis_env or "").lower() != "real"
+                if len(kis_holdings) == 0 and (existing_positions_count > 0 or ledger_has_positions) and dnca_total is not None:
+                    if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
+                        reset_reason = "paper_reset_detected"
+                        logger.warning(
+                            "[PB1][RESET][DETECTED] reason=paper_reset dnca_tot_amt=%s",
+                            dnca_total,
+                        )
+                    elif dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
+                        reset_reason = "empty_kis_holdings_detected"
 
         if reset_reason:
             archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"

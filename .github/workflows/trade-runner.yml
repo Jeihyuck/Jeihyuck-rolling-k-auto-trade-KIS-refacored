@@ -52,6 +52,7 @@ jobs:
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
+      PAPER_MAX_CAPITAL_KRW: "10000000"
 
       # ✅ FIX: do NOT use runner.temp (invalid in this context). Use github.workspace.
       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
@@ -223,6 +224,7 @@ jobs:
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
+      PAPER_MAX_CAPITAL_KRW: "10000000"
 
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
       COMPILE_CHECK_ENABLED: "0"
@@ -464,6 +466,7 @@ jobs:
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
+      PAPER_MAX_CAPITAL_KRW: "10000000"
 
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
       COMPILE_CHECK_ENABLED: "0"

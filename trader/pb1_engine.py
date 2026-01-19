@@ -34,6 +34,7 @@ from trader.config import (
     PB1_CAPITAL_MODE,
     PB1_ENTRY_CAPITAL_KRW,
     PB1_CASH_RESERVE_PCT,
+    PAPER_MAX_CAPITAL_KRW,
     PB1_ENTRY_WINDOW_START,
     PB1_ENTRY_OPEN_END,
     PB1_ENTRY_WINDOW_END,
@@ -109,6 +110,19 @@ def _as_first_dict(v: Any) -> Dict[str, Any]:
         logger.warning("[BALANCE] output2 unexpected type=%s using rows fallback", type(v).__name__)
         _OUTPUT2_UNEXPECTED_TYPE_LOGGED = True
     return {}
+
+
+def _extract_output2_keys(summary_raw: Any) -> list[str]:
+    if isinstance(summary_raw, list) and summary_raw:
+        row = summary_raw[0]
+        if isinstance(row, dict):
+            return list(row.keys())
+        return [f"type:{type(row).__name__}"]
+    if isinstance(summary_raw, dict):
+        return list(summary_raw.keys())
+    if summary_raw is None:
+        return []
+    return [f"type:{type(summary_raw).__name__}"]
 
 
 def _is_missing(value: float | None) -> bool:
@@ -463,6 +477,75 @@ class PB1Engine:
                 return cash
         return None
 
+    def _parse_available_cash_snapshot(self, snapshot: dict) -> tuple[int | None, dict]:
+        summary_raw = snapshot.get("output2")
+        summary = _as_first_dict(summary_raw)
+        selected_key = None
+        cash_value = None
+        for key in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt"):
+            if key in summary:
+                selected_key = key
+                cash_value = self._to_float(summary.get(key))
+                break
+        output2_keys = _extract_output2_keys(summary_raw)
+        meta = {
+            "selected_key": selected_key,
+            "output2_keys": output2_keys,
+        }
+        if cash_value is None:
+            return None, meta
+        return int(cash_value), meta
+
+    def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
+        available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
+        if available_cash_krw is None:
+            logger.warning(
+                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
+                list(snapshot.keys()),
+                cash_meta.get("output2_keys") or [],
+            )
+            if self.kis:
+                try:
+                    refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
+                    snapshot = refreshed_snapshot
+                    available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
+                except Exception as exc:
+                    raise RuntimeError("Balance refresh failed after parse error") from exc
+        if available_cash_krw is None:
+            logger.warning(
+                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
+                list(snapshot.keys()),
+                cash_meta.get("output2_keys") or [],
+            )
+            raise RuntimeError("Balance parse failed: cannot locate dnca_tot_amt/ord_psbl_cash")
+        return snapshot, available_cash_krw, cash_meta
+
+    def _resolve_entry_capital(
+        self,
+        *,
+        available_cash_krw: int,
+        override_capital: float | None,
+        reserve_pct: float,
+    ) -> tuple[int, int, dict]:
+        use_override = override_capital is not None and int(override_capital) > 0
+        entry_capital = int(override_capital) if use_override else int(available_cash_krw)
+        clamp_meta = {}
+        if (self.env or "").lower() != "real":
+            cap = min(int(available_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
+            if entry_capital > cap:
+                before = entry_capital
+                entry_capital = cap
+                clamp_meta = {"before": before, "cap": cap, "after": entry_capital}
+                logger.info(
+                    "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
+                    before,
+                    cap,
+                    entry_capital,
+                )
+        usable = int(entry_capital * (1 - reserve_pct))
+        meta = {"use_override": use_override, "clamp": clamp_meta}
+        return entry_capital, usable, meta
+
     def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
         holdings: dict[str, dict] = {}
         for row in holdings_rows or []:
@@ -487,6 +570,33 @@ class PB1Engine:
         kis_holdings = self._parse_kis_holdings(holdings_rows)
         ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
         ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+        if ledger_positions:
+            api_codes = set(kis_holdings.keys())
+            for (code, sid, mode), state in ledger_positions.items():
+                if sid != 1:
+                    continue
+                total_qty = int(state.get("total_qty") or 0)
+                if total_qty <= 0 or code in api_codes:
+                    continue
+                logger.warning(
+                    "[RECONCILE][ORPHAN] code=%s reason=ledger_only ledger_qty=%s",
+                    code,
+                    total_qty,
+                )
+                self.ledger_repo.append_event(
+                    env=self.env,
+                    run_id=self.run_id,
+                    event_type="POSITION_ORPHANED",
+                    ts=now_kst(),
+                    code=code,
+                    market=state.get("market"),
+                    sid=sid,
+                    mode=mode,
+                    qty=total_qty,
+                    ok=True,
+                    reasons=["ledger_only"],
+                    payload_json={"ledger_total_qty": total_qty},
+                )
         ledger_by_code: dict[str, dict] = {}
         for (code, sid, mode), state in ledger_positions.items():
             if sid != 1:
@@ -1928,52 +2038,32 @@ class PB1Engine:
             entry_summary_emitted = True
 
         holdings_snapshot = self._fetch_holdings_snapshot()
+        holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
+        self._balance_snapshot = holdings_snapshot
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")
         holdings_summary = _as_first_dict(holdings_summary_raw)
         self._holdings_summary = holdings_summary
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
-        available_cash_raw = None
-        holdings_summary_keys = None
-        output2_0_keys = None
-        if isinstance(holdings_summary_raw, list) and holdings_summary_raw:
-            output2_0 = holdings_summary_raw[0]
-            if isinstance(output2_0, dict):
-                output2_0_keys = list(output2_0.keys())
-                available_cash_raw = self._to_float(output2_0.get("dnca_tot_amt"))
-            else:
-                output2_0_keys = [f"type:{type(output2_0).__name__}"]
-        elif isinstance(holdings_summary_raw, dict):
-            holdings_summary_keys = list(holdings_summary_raw.keys())
-        elif holdings_summary_raw is not None:
-            holdings_summary_keys = [f"type:{type(holdings_summary_raw).__name__}"]
-        if available_cash_raw is None:
-            logger.warning(
-                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
-                holdings_summary_keys or [],
-                output2_0_keys or [],
-            )
-        available_cash_krw = int(available_cash_raw or 0)
-        override_capital = PB1_ENTRY_CAPITAL_KRW
-        if override_capital is not None and override_capital > 0:
-            entry_capital_krw = float(override_capital)
-        else:
-            entry_capital_krw = float(available_cash_krw)
         reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
-        entry_usable_krw = int(entry_capital_krw * (1 - reserve_pct))
-        self.entry_capital_krw = entry_capital_krw
-        self.entry_usable_krw = entry_usable_krw
+        override_capital = PB1_ENTRY_CAPITAL_KRW
+        entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
+            available_cash_krw=available_cash_krw,
+            override_capital=override_capital,
+            reserve_pct=reserve_pct,
+        )
+        self.entry_capital_krw = float(entry_capital_krw)
+        self.entry_usable_krw = float(entry_usable_krw)
         logger.info(
-            "[PB1][CAPITAL] available_cash=%s override=%s -> entry_capital=%s",
+            "[PB1][CAPITAL] available_cash=%s override=%s use_override=%s -> entry_capital=%s reserve=%.2f usable=%s source=%s",
             available_cash_krw,
             int(override_capital) if override_capital is not None else None,
-            int(entry_capital_krw),
-        )
-        logger.info(
-            "[PB1][CAPITAL][RESERVE] reserve_pct=%.2f usable=%s",
+            int(capital_meta.get("use_override") or 0),
+            entry_capital_krw,
             reserve_pct,
             entry_usable_krw,
+            cash_meta.get("selected_key") or "unknown",
         )
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
