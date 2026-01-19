@@ -55,31 +55,81 @@ from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
 from trader.reset_utils import detect_account_fp, purge_bot_state
-from trader.runtime_store import RuntimeStore
+from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
+log = logger
 
 
 def universe_build_flag(as_of: str) -> Path:
     return Path("bot_state/runtime") / f"universe_build_done_{as_of}.flag"
 
+def _default_runtime_store() -> RuntimeStore:
+    """
+    하위호환용: runtime_store를 외부에서 넘기지 않은 경우의 기본 생성 로직.
+    bot_state 기반으로 RuntimeStore를 만든다.
+    """
+    bot_state_dir = os.getenv("BOT_STATE_DIR", "").strip()
+    if bot_state_dir:
+        base = Path(bot_state_dir)
+    else:
+        base = Path("bot_state")
 
-def ensure_universe_built_once(as_of: str, reason: str, runtime_store: RuntimeStore) -> None:
+    from trader.runtime_store import RuntimeStore  # 실제 위치에 맞게 import 조정
+
+    try:
+        rs = RuntimeStore(bot_state_dir=base)
+    except TypeError:
+        rs = RuntimeStore(base_dir=base)
+    log.info("[UNIVERSE][DEFAULT_RUNTIME_STORE] bot_state_dir=%s", str(base))
+    return rs
+
+
+def ensure_universe_built_once(
+    runtime_store: RuntimeStore | None = None,
+    *,
+    env: str | None = None,
+    strategy: str | None = None,
+    as_of: str | None = None,
+    force: bool = False,
+) -> None:
+    if runtime_store is None:
+        runtime_store = _default_runtime_store()
+        log.warning("[UNIVERSE][COMPAT] ensure_universe_built_once() called without runtime_store -> using default")
+
+    if env is None:
+        env = os.getenv("KIS_ENV", "").strip()
+    if strategy is None:
+        strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+    if as_of is None:
+        as_of = _get_now_kst().date().isoformat()
+
+    log.info(
+        "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
+        type(runtime_store).__name__,
+        env,
+        strategy,
+        as_of,
+        force,
+    )
+
     ok, meta = runtime_store.universe_check(as_of)
     flag = universe_build_flag(as_of)
 
-    if not ok:
-        return
+    if not force:
+        if not ok:
+            return
 
-    if meta.get("have_today"):
-        return
+        if meta.get("have_today"):
+            return
 
-    if flag.exists():
-        return
+        if flag.exists():
+            return
 
+    reason = "force" if force else "auto_missing_today"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
 
@@ -88,13 +138,13 @@ def ensure_universe_built_once(as_of: str, reason: str, runtime_store: RuntimeSt
         "-m",
         "trader.universe.build",
         "--env",
-        os.getenv("KIS_ENV", ""),
+        env,
         "--strategy",
-        "best_k_meta",
+        strategy,
         "--date",
         as_of,
     ]
-    logger.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
     subprocess.run(cmd, check=False)
 
 
@@ -391,7 +441,7 @@ def run_once(
     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
     if not loop_mode:
-        ensure_universe_built_once(as_of, reason="auto_missing_today", runtime_store=runtime_store)
+        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of)
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
     if close_cancel_only:
@@ -911,11 +961,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
         loop_deadline.isoformat() if loop_deadline else "none",
         max_seconds,
     )
-    ensure_universe_built_once(
-        now_kst_value.date().isoformat(),
-        reason="auto_missing_today",
-        runtime_store=runtime_store,
-    )
+    ensure_universe_built_once(runtime_store=runtime_store, as_of=now_kst_value.date().isoformat())
     exit_reason = "unknown"
     stop_requested = {"value": False}
     balance_api_calls = 0
