@@ -98,16 +98,17 @@ def stage_all(worktree_dir: Path) -> None:
 def stage_runtime_universe(worktree_dir: Path) -> None:
     pathspecs = [
         "bot_state/runtime/universe",
+        "bot_state/runtime/diagnostics",
         "bot_state/runtime/universe_build_done_*.flag",
         "bot_state/runtime/universe_sanitize_*.json",
         "bot_state/runtime/diagnostics/universe_drop_*.json",
-        "bot_state/runtime/*.flag",
-        "bot_state/runtime/*.json",
-        "bot_state/runtime/diagnostics/*.json",
-        "bot_state/universe_lkg/**/best_k_meta/latest.json",
+        "bot_state/universe_lkg",
+        "bot_state/runtime/schema_version.txt",
+        "bot_state/runtime/runtime_meta.json",
+        "bot_state/runtime/balance_snapshot.json",
     ]
     for spec in pathspecs:
-        _git_worktree(worktree_dir, "add", "--", spec, check=False)
+        _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
 
 
 def _cached_diff_names(worktree_dir: Path) -> list[str]:
@@ -628,8 +629,9 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         status = git_porcelain(worktree_dir)
         status_lines = [line for line in status.splitlines() if line.strip()]
         if not status_lines:
-            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
+            logger.info("[PERSIST] no changes -> skip")
             return
+        stage_runtime_universe(worktree_dir)
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
         stage_all(worktree_dir)
         status2 = git_porcelain(worktree_dir)
@@ -637,7 +639,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         staged_files = _cached_diff_names(worktree_dir)
         logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
         if not status2_lines:
-            logger.info("[BOTSTATE][PERSIST] no_changes -> skip message=%s attempt=%d", message, attempt)
+            logger.info("[PERSIST] no changes -> skip")
             return
 
         committed = commit_if_staged(worktree_dir, message)
@@ -649,7 +651,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             attempt,
         )
         if not committed:
-            logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
+            logger.info("[PERSIST] no changes -> skip")
             return
 
         try:
