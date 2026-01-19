@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -13,16 +14,23 @@ from zoneinfo import ZoneInfo
 from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
+    BOT_STATE_RESET,
+    BOT_STATE_RESET_CASH_MAX_KRW,
+    BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
+    BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
     CLOSE_AUCTION_END,
     CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
     DIAGNOSTIC_ONLY,
+    LEDGER_BASE_DIR,
+    LEDGER_LOOKBACK_DAYS,
     MARKET_CLOSE_HHMM,
     MARKET_OPEN_HHMM,
     MORNING_EXIT_END,
     MORNING_EXIT_START,
     MORNING_WINDOW_END,
     MORNING_WINDOW_START,
+    PB1_BLOCK_PREOPEN,
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
@@ -30,6 +38,7 @@ from trader.config import (
 )
 from trader.botstate_paths import get_botstate_root
 from trader.botstate_sync import (
+    BotStateContext,
     acquire_lock as acquire_botstate_lock,
     compute_lock_ttl,
     persist_run_files,
@@ -42,9 +51,11 @@ from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
 from trader.kis_wrapper import KisAPI
+from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
-from trader.runtime_store import universe_check
+from trader.reset_utils import detect_account_fp, purge_bot_state
+from trader.runtime_store import RuntimeStore
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
@@ -56,8 +67,8 @@ def universe_build_flag(as_of: str) -> Path:
     return Path("bot_state/runtime") / f"universe_build_done_{as_of}.flag"
 
 
-def ensure_universe_built_once(as_of: str, reason: str) -> None:
-    ok, meta = universe_check(as_of)
+def ensure_universe_built_once(as_of: str, reason: str, runtime_store: RuntimeStore) -> None:
+    ok, meta = runtime_store.universe_check(as_of)
     flag = universe_build_flag(as_of)
 
     if not ok:
@@ -309,6 +320,43 @@ def _write_change_flag(changed: bool, reasons: list[str]) -> None:
     logger.info("[PB1][CHANGE] changed=%s reasons=%s", int(changed), reasons)
 
 
+def _runtime_meta_path(bot_state_dir: Path) -> Path:
+    return bot_state_dir / "runtime" / "runtime_meta.json"
+
+
+def _load_runtime_meta(bot_state_dir: Path) -> dict:
+    path = _runtime_meta_path(bot_state_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("[STATE][META][LOAD_FAIL] path=%s", path)
+        return {}
+
+
+def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
+    path = _runtime_meta_path(bot_state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
+    if not balance_snapshot:
+        return None
+    summary_raw = balance_snapshot.get("output2")
+    summary = summary_raw[0] if isinstance(summary_raw, list) and summary_raw else summary_raw if isinstance(summary_raw, dict) else None
+    if not isinstance(summary, dict):
+        return None
+    raw = summary.get("dnca_tot_amt")
+    if raw is None:
+        return None
+    try:
+        return int(float(str(raw).replace(",", "")))
+    except Exception:
+        return None
+
+
 def _is_urgent_persist(touched: list[Path]) -> bool:
     keywords = {"orders", "fills", "exits_intent"}
     for path in touched:
@@ -318,16 +366,16 @@ def _is_urgent_persist(touched: list[Path]) -> bool:
     return False
 
 
-def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> Path | None:
+def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateContext | None:
     worktree_dir = resolve_botstate_worktree_dir(Path.cwd())
     try:
-        setup_worktree(Path.cwd(), worktree_dir)
+        ctx = setup_worktree(Path.cwd(), worktree_dir)
     except Exception:
         logger.exception("[BOTSTATE][SETUP] failed worktree=%s", worktree_dir)
         return None
     if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
         return None
-    return worktree_dir
+    return ctx
 
 
 def run_once(
@@ -336,11 +384,14 @@ def run_once(
     engine,
     loop_mode: bool = False,
     window: WindowDecision | None = None,
+    bot_state_dir: Path | None = None,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
     as_of = now.date().isoformat()
+    resolved_bot_state_dir = bot_state_dir or get_botstate_root()
+    runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
     if not loop_mode:
-        ensure_universe_built_once(as_of, reason="auto_missing_today")
+        ensure_universe_built_once(as_of, reason="auto_missing_today", runtime_store=runtime_store)
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
     if close_cancel_only:
@@ -372,6 +423,9 @@ def run_once(
     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
 
+    if PB1_BLOCK_PREOPEN and market_window == "preopen":
+        os.environ["PB1_ENTRY_ENABLED"] = "0"
+        logger.info("[PB1][ENTRY_BLOCKED] reason=preopen_block entry_allowed=0")
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
     os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
@@ -654,7 +708,7 @@ def run_once(
     run_start_ts = time_mod.time()
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            universe_ok, universe_meta = universe_check(as_of)
+            universe_ok, universe_meta = runtime_store.universe_check(as_of)
             if not universe_ok:
                 if phase_for_log == "entry":
                     os.environ["PB1_ENTRY_ENABLED"] = "0"
@@ -673,6 +727,54 @@ def run_once(
             dry_run_reasons.append("kis_init_failed")
             dry_run = True
             _apply_env_flags(dry_run)
+
+        balance_snapshot: dict | None = None
+        balance_source: str | None = None
+        if kis:
+            try:
+                _log_balance_cache(force=False)
+                balance_snapshot, balance_source = kis.get_balance_cached(force=False, return_source=True)
+            except Exception:
+                logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
+
+        reset_reason = None
+        account_fp_now = None
+        if kis and balance_snapshot:
+            account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
+            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
+            runtime_fp = runtime_meta.get("account_fp")
+            if BOT_STATE_RESET:
+                reset_reason = "env_reset"
+            elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
+                reset_reason = "account_fp_mismatch"
+            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
+                kis_holdings = balance_snapshot.get("output1") or []
+                existing_positions = positions_repo.list_positions(kis_env or "practice", "pb1_pullback_close")
+                existing_positions_count = len([p for p in existing_positions if int(p.get("qty") or 0) > 0])
+                ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
+                ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+                ledger_has_positions = any(
+                    int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
+                )
+                dnca_total = _extract_dnca_total(balance_snapshot)
+                if (
+                    len(kis_holdings) == 0
+                    and (existing_positions_count > 0 or ledger_has_positions)
+                    and dnca_total is not None
+                    and dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW
+                ):
+                    reset_reason = "empty_kis_holdings_detected"
+
+        if reset_reason:
+            archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"
+            purge_bot_state(resolved_bot_state_dir, archive_dir, reason=reset_reason)
+            run_migrations(engine)
+            meta_payload = {"account_fp": account_fp_now} if account_fp_now else {}
+            _write_runtime_meta(resolved_bot_state_dir, meta_payload)
+        elif account_fp_now:
+            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
+            if runtime_meta.get("account_fp") != account_fp_now:
+                _write_runtime_meta(resolved_bot_state_dir, {"account_fp": account_fp_now})
 
         run_record_id = runs_repo.start_run(
             env=kis_env or "practice",
@@ -722,6 +824,8 @@ def run_once(
             env=kis_env or "practice",
             run_id=run_record_id,
             now_kst_value=now,
+            balance_snapshot=balance_snapshot,
+            balance_source=balance_source,
         )
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
@@ -781,10 +885,11 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
         max_seconds,
         ttl_buffer,
     )
-    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-    if botstate_worktree is None:
+    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+    if botstate_ctx is None:
         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
         return
+    runtime_store = RuntimeStore(base_dir=botstate_ctx.bot_state_dir)
 
     pending_touched: dict[Path, Path] = {}
     last_persist_ts = 0.0
@@ -806,7 +911,11 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
         loop_deadline.isoformat() if loop_deadline else "none",
         max_seconds,
     )
-    ensure_universe_built_once(now_kst_value.date().isoformat(), reason="auto_missing_today")
+    ensure_universe_built_once(
+        now_kst_value.date().isoformat(),
+        reason="auto_missing_today",
+        runtime_store=runtime_store,
+    )
     exit_reason = "unknown"
     stop_requested = {"value": False}
     balance_api_calls = 0
@@ -905,7 +1014,13 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
                 exit_reason = "deadline_exceeded_pre_trade"
                 break
-            touched, _did_work, metrics, last_phase, result_status = run_once(args=args, engine=engine, loop_mode=True, window=window)
+            touched, _did_work, metrics, last_phase, result_status = run_once(
+                args=args,
+                engine=engine,
+                loop_mode=True,
+                window=window,
+                bot_state_dir=botstate_ctx.bot_state_dir,
+            )
             balance_api_calls += metrics.get("balance_api_calls", 0)
             balance_cache_hits += metrics.get("balance_cache_hits", 0)
             balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
@@ -922,7 +1037,7 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
                 urgent = _is_urgent_persist(list(pending_touched.values()))
                 if urgent or (now_ts - last_persist_ts >= persist_interval):
                     persist_run_files(
-                        botstate_worktree,
+                        botstate_ctx.worktree_dir,
                         list(pending_touched.values()),
                         message=f"pb1 loop {now.isoformat()}",
                     )
@@ -936,11 +1051,11 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
             exit_reason = "shutdown"
         if pending_touched:
             persist_run_files(
-                botstate_worktree,
+                botstate_ctx.worktree_dir,
                 list(pending_touched.values()),
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
-        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
+        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
         if max_seconds > 0 and elapsed_trade > max_seconds:
             logger.warning(
                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
@@ -996,8 +1111,8 @@ def main() -> None:
         run_loop_minutes * 60,
         ttl_buffer,
     )
-    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-    if botstate_worktree is None:
+    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+    if botstate_ctx is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
         return
     signal.signal(
@@ -1008,18 +1123,24 @@ def main() -> None:
     phase_for_log = "none"
     start_ts = time_mod.time()
     try:
-        touched, _did_work, metrics, phase_for_log, _result_status = run_once(args=args, engine=engine, loop_mode=False, window=None)
+        touched, _did_work, metrics, phase_for_log, _result_status = run_once(
+            args=args,
+            engine=engine,
+            loop_mode=False,
+            window=None,
+            bot_state_dir=botstate_ctx.bot_state_dir,
+        )
         if touched:
             _write_change_flag(True, ["touched_files"])
             persist_run_files(
-                botstate_worktree,
+                botstate_ctx.worktree_dir,
                 touched,
                 message=f"pb1 run {now_kst().isoformat()}",
             )
         else:
             _write_change_flag(False, ["no_changes"])
     finally:
-        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
+        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
         elapsed = time_mod.time() - start_ts
         logger.info(
             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",

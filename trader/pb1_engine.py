@@ -17,6 +17,8 @@ from trader.config import (
     DAILY_CAPITAL,
     KOSDAQ_HARD_STOP_PCT,
     KOSPI_HARD_STOP_PCT,
+    LEDGER_BASE_DIR,
+    LEDGER_LOOKBACK_DAYS,
     PB1_ENTRY_ENABLED,
     PB1_DAY_SL_R,
     PB1_DAY_TP_R,
@@ -29,6 +31,9 @@ from trader.config import (
     PB1_USE_RISK_PARITY,
     PB1_MAX_ATR_PCT,
     PB1_MIN_VALUE20,
+    PB1_CAPITAL_MODE,
+    PB1_ENTRY_CAPITAL_KRW,
+    PB1_CASH_RESERVE_PCT,
     PB1_ENTRY_WINDOW_START,
     PB1_ENTRY_OPEN_END,
     PB1_ENTRY_WINDOW_END,
@@ -41,6 +46,7 @@ from trader.config import (
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
+from trader.ledger.store import LedgerStore
 from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
 from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
@@ -267,6 +273,8 @@ class PB1Engine:
         env: str,
         run_id: str,
         now_kst_value: datetime | None = None,
+        balance_snapshot: dict | None = None,
+        balance_source: str | None = None,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -297,7 +305,13 @@ class PB1Engine:
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
         self._balance_cost: float | None = None
-        self._balance_snapshot: dict | None = None
+        self._balance_snapshot: dict | None = balance_snapshot
+        self._balance_snapshot_source: str | None = balance_source
+        if balance_snapshot is not None:
+            if balance_source == "api":
+                self.balance_api_calls += 1
+            elif balance_source is not None:
+                self.balance_cache_hits += 1
         self._holdings_summary: Dict[str, Any] = {}
         self.filter_thresholds = self._resolve_filter_thresholds()
         self._code_name_map: Dict[str, str] = {}
@@ -306,6 +320,8 @@ class PB1Engine:
         self.entry_flag_valid = entry_flag.valid
         self.entry_flag_raw = entry_flag.raw
         self.window_internal = self._resolve_window_internal()
+        self.entry_capital_krw: float | None = None
+        self.entry_usable_krw: float | None = None
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -447,6 +463,61 @@ class PB1Engine:
                 return cash
         return None
 
+    def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
+        holdings: dict[str, dict] = {}
+        for row in holdings_rows or []:
+            code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+            qty_raw = row.get("qty") if "qty" in row else row.get("hldg_qty") or row.get("ord_psbl_qty")
+            try:
+                qty = int(float(qty_raw or 0))
+            except Exception:
+                qty = 0
+            if not code or qty <= 0:
+                continue
+            avg = self._to_float(row.get("avg_price") or row.get("pchs_avg_pric") or row.get("pchs_avg_price"))
+            holdings[code] = {
+                "code": code,
+                "qty": qty,
+                "avg_buy_price": avg,
+                "market": row.get("market") or row.get("prdt_type_cd") or row.get("mket_gb"),
+            }
+        return holdings
+
+    def _build_positions_from_kis(self, holdings_rows: Iterable[dict]) -> list[dict]:
+        kis_holdings = self._parse_kis_holdings(holdings_rows)
+        ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
+        ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
+        ledger_by_code: dict[str, dict] = {}
+        for (code, sid, mode), state in ledger_positions.items():
+            if sid != 1:
+                continue
+            existing = ledger_by_code.get(code)
+            if not existing or int(state.get("total_qty") or 0) > int(existing.get("total_qty") or 0):
+                ledger_by_code[code] = {**state, "sid": sid, "mode": mode, "code": code}
+
+        positions: list[dict] = []
+        for code, holding in kis_holdings.items():
+            ledger_state = ledger_by_code.get(code, {})
+            qty = holding.get("qty") or 0
+            avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
+            positions.append(
+                {
+                    "code": code,
+                    "sid": 1,
+                    "mode": int(ledger_state.get("mode") or 1),
+                    "qty": qty,
+                    "kis_qty": qty,
+                    "avg_buy_price": avg or None,
+                    "market": holding.get("market") or ledger_state.get("market"),
+                    "holding_days": ledger_state.get("holding_days") or 0,
+                    "first_buy_ts": ledger_state.get("first_buy_ts"),
+                    "total_cost": float(ledger_state.get("total_cost") or 0.0) or (avg * qty if avg else 0.0),
+                    "realized_pnl": ledger_state.get("realized_pnl") or 0.0,
+                    "meta_source": "kis",
+                }
+            )
+        return positions
+
     @staticmethod
     def _record_drop(
         counter: Counter[str],
@@ -516,7 +587,9 @@ class PB1Engine:
     def _fetch_holdings_snapshot(self) -> dict:
         if self._balance_snapshot is not None:
             self.balance_tick_cache_hits += 1
-            logger.info("[BALANCE][CACHE] hit=True source=tick_cache")
+            source = self._balance_snapshot_source or "tick_cache"
+            logger.info("[BALANCE][CACHE] hit=True source=%s", source)
+            self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
         if not self.kis:
             return {}
@@ -884,7 +957,11 @@ class PB1Engine:
                 cf.reasons.append("not_in_topN")
 
         # 3) 사이징: 리스크 패리티(ATR) 또는 균등
-        cap_total = float(DAILY_CAPITAL) * float(CAP_CAP)
+        cap_total = float(
+            self.entry_usable_krw
+            if self.entry_usable_krw is not None
+            else float(DAILY_CAPITAL) * float(CAP_CAP)
+        )
 
         if PB1_USE_RISK_PARITY:
             inv: List[float] = []
@@ -1289,6 +1366,25 @@ class PB1Engine:
         qty = pos.get("qty") or 0
         if qty <= 0:
             return
+        kis_qty = pos.get("kis_qty", qty) or 0
+        if kis_qty <= 0:
+            emit_event(
+                as_of=self._today,
+                event="PB1_SELL_DECISION",
+                code=str(code),
+                qty=int(qty),
+                avg_price=float(avg),
+                mark=float(avg),
+                pnl_pct=0.0,
+                should_sell=False,
+                reasons=["no_kis_holding"],
+            )
+            logger.info(
+                "[PB1][SELL][DECISION] code=%s should_sell=0 reasons=%s",
+                display_code,
+                ["no_kis_holding"],
+            )
+            return
         mark = self._mark_price(code)
         if mark is None:
             mark = self._balance_price_map.get(code)
@@ -1556,12 +1652,14 @@ class PB1Engine:
                     "sid": state.get("sid"),
                     "mode": state.get("mode"),
                     "qty": state.get("qty") or 0,
+                    "kis_qty": state.get("kis_qty") or state.get("qty") or 0,
                     "avg_buy_price": state.get("avg_buy_price"),
                     "market": state.get("market"),
                     "holding_days": state.get("holding_days") or 0,
                     "first_buy_ts": state.get("first_buy_ts"),
                     "total_cost": state.get("total_cost") or 0.0,
                     "realized_pnl": state.get("realized_pnl") or 0.0,
+                    "meta_source": state.get("meta_source"),
                 }
             )
         return enriched
@@ -1574,16 +1672,6 @@ class PB1Engine:
         marks_fallback: dict[str, float],
     ) -> list[dict]:
         holdings = list(holdings_rows or [])
-        if not positions and holdings:
-            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=1,
-                holdings=holdings,
-            )
-            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings), bootstrapped)
-            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         pos_list = self._positions_with_meta(positions)
         for pos in pos_list:
             df, _ = self._fetch_daily(pos["code"], count=120)
@@ -1777,7 +1865,7 @@ class PB1Engine:
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
         min_order_krw = float(MIN_ORDER_KRW)
-        entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
+        entry_capital_krw = 0.0
         skip_entry_scan = False
         if not entry_allowed:
             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
@@ -1839,9 +1927,6 @@ class PB1Engine:
             )
             entry_summary_emitted = True
 
-        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-        existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
-        existing_positions_count = len(existing_positions)
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")
@@ -1849,7 +1934,47 @@ class PB1Engine:
         self._holdings_summary = holdings_summary
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
-        available_cash_krw = self._extract_available_cash(holdings_summary)
+        available_cash_raw = None
+        if isinstance(holdings_summary_raw, list) and holdings_summary_raw:
+            available_cash_raw = self._to_float(holdings_summary_raw[0].get("dnca_tot_amt"))
+        elif isinstance(holdings_summary_raw, dict):
+            available_cash_raw = self._to_float(holdings_summary_raw.get("dnca_tot_amt"))
+        if available_cash_raw is None:
+            available_cash_raw = self._extract_available_cash(holdings_summary)
+        available_cash_krw = int(available_cash_raw or 0)
+        capital_mode = (PB1_CAPITAL_MODE or "CASH").upper()
+        if capital_mode == "FIXED":
+            entry_capital_krw = min(float(available_cash_krw), float(PB1_ENTRY_CAPITAL_KRW))
+        else:
+            if capital_mode != "CASH":
+                logger.warning("[PB1][CAPITAL][WARN] unknown mode=%s -> fallback=CASH", capital_mode)
+            entry_capital_krw = float(available_cash_krw)
+        reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
+        entry_usable_krw = int(entry_capital_krw * (1 - reserve_pct))
+        self.entry_capital_krw = entry_capital_krw
+        self.entry_usable_krw = entry_usable_krw
+        logger.info(
+            "[PB1][CAPITAL] mode=%s available_cash=%s entry_capital=%s reserve_pct=%.2f usable=%s",
+            capital_mode,
+            available_cash_krw,
+            int(entry_capital_krw),
+            reserve_pct,
+            entry_usable_krw,
+        )
+        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        if not positions and holdings_rows:
+            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=1,
+                holdings=holdings_rows,
+            )
+            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
+            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        positions_for_exit = self._build_positions_from_kis(holdings_rows)
+        existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
+        existing_positions_count = len(existing_positions)
         slots_remaining = max(0, max_positions - existing_positions_count)
         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
@@ -1861,18 +1986,18 @@ class PB1Engine:
             min_order_krw,
             entry_cutoff_raw,
             existing_positions_count,
-            f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
+            available_cash_krw,
             allow_add_to_existing,
         )
         holdings = list(holdings_rows or [])
         if not holdings and self.kis:
             logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
         marks_fallback: Dict[str, float] = {}
-        positions = self._run_exit_always(positions=positions, holdings_rows=holdings, marks_fallback=marks_fallback)
+        positions_for_exit = self._run_exit_always(positions=positions_for_exit, holdings_rows=holdings, marks_fallback=marks_fallback)
         open_orders = self.orders_repo.get_open_orders(self.env)
         if open_orders:
             logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
-        self._pnl_snapshot(self._positions_with_meta(positions))
+        self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
         if self.phase == "verify":
             final_status = "OK"
             final_notes = "verify_only"
@@ -2013,16 +2138,16 @@ class PB1Engine:
                     reasons.append("target_new_positions_zero")
                 if entry_capital_krw <= 0:
                     reasons.append("entry_capital_zero")
-                if available_cash_krw is not None and available_cash_krw <= 0:
+                if available_cash_krw <= 0:
                     reasons.append("available_cash_zero")
                 if min_order_krw > 0 and order_value < min_order_krw:
                     reasons.append("min_order_krw")
                 if order_value <= 0:
                     reasons.append("order_value_zero")
-                if available_cash_krw is not None and order_value > available_cash_krw:
+                if order_value > available_cash_krw:
                     reasons.append("insufficient_cash")
-                if planned_spent + order_value > float(DAILY_CAPITAL):
-                    reasons.append("daily_cap_exceeded")
+                if planned_spent + order_value > float(entry_capital_krw):
+                    reasons.append("entry_cap_exceeded")
                 if not reasons and len(orderable_candidates) >= new_position_limit:
                     reasons.append("target_new_positions_limit")
                 if reasons:
@@ -2114,7 +2239,7 @@ class PB1Engine:
                         no_orders_reasons.append("target_new_positions_zero")
                     if entry_capital_krw <= 0:
                         no_orders_reasons.append("entry_capital_zero")
-                    if available_cash_krw is not None and available_cash_krw <= 0:
+                    if available_cash_krw <= 0:
                         no_orders_reasons.append("available_cash_zero")
                     if min_order_krw > 0 and after_buyable_check_count == 0:
                         no_orders_reasons.append("min_order_krw")
@@ -2142,7 +2267,7 @@ class PB1Engine:
                     else:
                         self._place_entry(cf)
         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
-        self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
+        self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
         return RunResult(

@@ -1,163 +1,2116 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 5dce52dff6f7cd63e8d45b4bb34beeb1e433eebb..ef8fa46a83c2bd10284e27c44101256e3e5075a8 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -26,51 +26,51 @@ on:
-     - cron: "45 23 * * 0-4"
-     - cron: "*/5 0-5 * * 1-5"
-     - cron: "0-30/5 6 * * 1-5"
-     - cron: "29 6 * * 1-5"
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index c0b81cade364784fe3cbdd1f499bf4e72d4b9237..7f137b818b1bf232d2fa0504a07639b6437972a4 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -106,50 +106,59 @@ def commit_if_staged(worktree_dir: Path, message: str) -> bool:
+ def ensure_clean_before_rebase(worktree_dir: Path, message_for_autosave: str) -> None:
+     status = git_porcelain(worktree_dir)
+     files = [line.strip() for line in status.splitlines() if line.strip()]
+     dirty = bool(files)
+     logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
+     if not dirty:
+         return
+     stage_all(worktree_dir)
+     committed = commit_if_staged(worktree_dir, message_for_autosave)
+     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
  
- defaults:
-   run:
-     shell: bash
-     working-directory: repo
  
- jobs:
-   universe_build:
-     runs-on: ubuntu-latest
-     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
-     timeout-minutes: 15
+ def _git_worktree(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+     return _run(["git", "-C", str(worktree_dir), *args], check=check)
  
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
--      BOTSTATE_WORKTREE_DIR: "${{ env.RUNNER_TEMP }}/botstate_worktree_${{ github.run_id }}"
-+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
-       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
  
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ @dataclass
+ class GitSyncStatus:
+     remote: str
+     branch: str
+     remote_ref: str
+     ahead: int
+     behind: int
  
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
  
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
-           path: repo
++@dataclass
++class BotStateContext:
++    worktree_dir: Path
++    bot_state_dir: Path
++    runtime_dir: Path
++    branch: str
++    ref: str
++
++
+ def _run_git(cmd: list[str], cwd: Optional[str] = None, check: bool = True) -> Tuple[int, str]:
+     p = subprocess.run(
+         cmd,
+         cwd=cwd,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.STDOUT,
+         text=True,
+     )
+     out = (p.stdout or "").strip()
+     if check and p.returncode != 0:
+         raise RuntimeError(f"git command failed: {' '.join(cmd)}\n{out}")
+     return p.returncode, out
  
-       - name: Checkout bot-state branch
-         uses: actions/checkout@v4
-@@ -190,51 +190,51 @@ jobs:
-         working-directory: repo
-         run: |
-           set -euo pipefail
-           python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
  
-   trade_tick:
-     runs-on: ubuntu-latest
-     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
-     timeout-minutes: 8
+ def git_fetch_reset(remote: str, branch: str, cwd: str) -> GitSyncStatus:
+     """
+     Deterministic sync:
+       fetch origin <branch>
+       reset --hard origin/<branch>
+     Then compute ahead/behind vs origin/<branch>.
+     """
+     remote_ref = f"{remote}/{branch}"
+     _run_git(["git", "fetch", remote, branch], cwd=cwd, check=True)
+     _run_git(["git", "reset", "--hard", remote_ref], cwd=cwd, check=True)
+     _, cnt = _run_git(
+@@ -237,64 +246,72 @@ def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref:
+     registered = get_worktree_paths(repo_dir)
+     if wt in registered:
+         logger.info("[BOTSTATE][WORKTREE][DECISION] action=reuse dir=%s", wt)
+         return
  
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-       COMPILE_CHECK_ENABLED: "0"
-       MIGRATE_MODE: "AUTO"
-       PERSIST_MODE: "ON_CHANGE"
--      BOTSTATE_WORKTREE_DIR: "${{ env.RUNNER_TEMP }}/botstate_worktree_${{ github.run_id }}"
-+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
+     _git(repo_dir, ["git", "worktree", "prune"], check=False)
+     logger.info("[BOTSTATE][WORKTREE][DECISION] action=create dir=%s branch=%s ref=%s", wt, branch, remote_ref)
+     proc = _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=False)
+     if proc.returncode == 0:
+         logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s", wt)
+         return
  
-       # ====== ✅ repo에 이미 존재하는 secrets 이름 그대로 사용 ======
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+     logger.error(
+         "[BOTSTATE][WORKTREE][CREATE_FAIL] rc=%s stderr=%s",
+         proc.returncode,
+         (proc.stderr or "").strip(),
+     )
+     _git(repo_dir, ["git", "worktree", "remove", "--force", str(wt)], check=False)
+     shutil.rmtree(wt, ignore_errors=True)
+     _git(repo_dir, ["git", "worktree", "prune"], check=False)
  
-       # ====== ✅ 코드가 기대하는 이름으로 "매핑" (바꾸지 말고 추가만) ======
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+     _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=True)
+     logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s retried=1", wt)
  
-       # ====== ✅ 5분 tick 설계: 4분만 실행하고 빠지기 ======
-       RUN_LOOP_MINUTES: "4"
  
-       # ====== ✅ BOTSTATE LOCK: 5분 틱에 맞게 ======
-       BOTSTATE_LOCK_TTL_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
+-def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
++def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> BotStateContext:
+     base_dir = base_dir.resolve()
+     worktree_dir = worktree_dir.resolve()
+     _configure_safe_directories(base_dir, worktree_dir)
+     dirty_files = get_dirty_status_excluding(base_dir, paths_to_exclude=["bot_state", "runtime"])
+     if dirty_files:
+         raise RuntimeError(f"code worktree dirty; refusing botstate sync: {dirty_files}")
  
-       ACTIVE_STRATEGIES: "1"
-@@ -427,51 +427,51 @@ jobs:
-               exit 0
-             fi
-           fi
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+     remote = "origin"
+     remote_ref = f"{remote}/{target_branch}"
+     _run(["git", "fetch", remote, "--prune"], cwd=base_dir)
+     ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
+     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
+-    os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
++    bot_state_dir = worktree_dir / "bot_state"
++    os.environ["BOTSTATE_ROOT"] = str(bot_state_dir)
++    return BotStateContext(
++        worktree_dir=worktree_dir,
++        bot_state_dir=bot_state_dir,
++        runtime_dir=bot_state_dir / "runtime",
++        branch=target_branch,
++        ref=remote_ref,
++    )
  
-   close_cancel:
-     runs-on: ubuntu-latest
-     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
-     timeout-minutes: 8
  
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
-       COMPILE_CHECK_ENABLED: "0"
-       MIGRATE_MODE: "AUTO"
-       PERSIST_MODE: "ON_CHANGE"
--      BOTSTATE_WORKTREE_DIR: "${{ env.RUNNER_TEMP }}/botstate_worktree_${{ github.run_id }}"
-+      BOTSTATE_WORKTREE_DIR: "${{ runner.temp }}/botstate_worktree_${{ github.run_id }}"
-       PB1_CLOSE_CANCEL_ONLY: "1"
+ def _lock_path(worktree_dir: Path) -> Path:
+     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
  
-       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
  
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+     branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+     remote = "origin"
+     sync_mode = SYNC_MODE_FETCH_RESET
+     if ttl_sec is None:
+         ttl_sec, _ = compute_lock_ttl(0)
+     retry_total_sec = max(0, _lock_retry_total_sec())
+     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+     deadline_ts = time.time() + retry_total_sec
+     attempt = 0
  
-       BOTSTATE_LOCK_TTL_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
+     logger.info(
+         "[BOTSTATE][SYNC] SYNC_MODE=%s step=pre_lock_sync remote=%s branch=%s",
+         sync_mode,
+         remote,
+         branch,
+diff --git a/trader/config.py b/trader/config.py
+index 9d0b983999d0d648e6a1daa6f977aefc6c98224e..05bc512bc4a4966fe625d4316d2e2d8dd82a7f53 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -100,50 +100,58 @@ CONFIG = {
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "runtime/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "240",
+     "LEDGER_BASE_DIR": "trader_ledger",
++    "BOT_STATE_RESET": "0",
++    "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
++    "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
++    "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
++    "PB1_CAPITAL_MODE": "CASH",
++    "PB1_ENTRY_CAPITAL_KRW": "0",
++    "PB1_CASH_RESERVE_PCT": "0.10",
++    "PB1_BLOCK_PREOPEN": "1",
+     "PB1_ENTRY_ENABLED": "true",
+     "PB1_ENTRY_WINDOW_START": "08:50",
+     "PB1_ENTRY_OPEN_END": "09:05",
+     "PB1_ENTRY_WINDOW_END": "15:15",
+     "PB1_EXIT_WINDOW_START": "15:15",
+     "PB1_EXIT_WINDOW_END": "15:30",
+     "PB1_MORNING_WINDOW_END": "10:00",
+     "MORNING_WINDOW_START": "08:50",
+     "MORNING_WINDOW_END": "15:20",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+     "AFTERNOON_WINDOW_START": "15:20",
+     "AFTERNOON_WINDOW_END": "15:30",
+     "CLOSE_AUCTION_START": "15:20",
+     "CLOSE_AUCTION_END": "15:30",
+     "PB1_REQUIRE_VOLUME": "1",
+     "PB1_FORCE_ENTRY_ON_PUSH": "1",
+     "PB1_WAIT_FOR_WINDOW": "1",
+     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
+     "PB1_ALLOW_ADD_TO_EXISTING": "0",
+     "MIN_ORDER_KRW": "0",
+     "MARKET_OPEN_HHMM": "08:50",
+     "MARKET_CLOSE_HHMM": "15:30",
+     "PB1_PULLBACK_BAND_KOSPI": "3,8",
+     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
+@@ -446,50 +454,66 @@ BAD_ENTRY_MAX_MA20_DIST = 1.25  # 현재가/20MA 상한(추격매수 방지)
+ BAD_ENTRY_MAX_PULLBACK = 20.0  # 신고가 대비 눌림폭 상한(과도한 붕괴 방지)
+ BAD_ENTRY_MAX_BELOW_VWAP_RATIO = 0.7  # 분봉에서 VWAP 아래 체류 비중이 이 이상이면 BAD
+ NEUTRAL_ENTRY_SCALE = float(_cfg("NEUTRAL_ENTRY_SCALE") or "0.6")
  
-       ACTIVE_STRATEGIES: "1"
-       DAILY_CAPITAL: "250000000"
  
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
+ def _parse_hhmm(hhmm: str) -> dtime:
+     try:
+         hh, mm = hhmm.split(":")
+         return dtime(hour=int(hh), minute=int(mm))
+     except Exception:
+         logger.warning(f"[설정경고] SELL_FORCE_TIME 형식 오류 → 기본값 14:40 적용: {hhmm}")
+         return dtime(hour=14, minute=40)
+ 
+ 
+ SELL_FORCE_TIME = _parse_hhmm(SELL_FORCE_TIME_STR)
+ TIME_STOP_TIME = _parse_hhmm(TIME_STOP_HHMM)
+ ALLOW_WHEN_CLOSED = _cfg_bool("MARKET_DATA_WHEN_CLOSED")
+ DISABLE_KOSDAQ_LOOP = _cfg_bool("DISABLE_KOSDAQ_LOOP")
+ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
+ ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
+ PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
+ LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
+ BOTSTATE_LOCK_TTL_SEC = int(_cfg("BOTSTATE_LOCK_TTL_SEC") or "240")
+ LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or botstate_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
+ ensure_not_repo_tracked_path(LEDGER_BASE_DIR)
++BOT_STATE_RESET = _cfg_bool("BOT_STATE_RESET")
++BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH = _cfg_bool("BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH", fallback=True)
++BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS = _cfg_bool("BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS", fallback=True)
++BOT_STATE_RESET_CASH_MAX_KRW = int(_cfg("BOT_STATE_RESET_CASH_MAX_KRW") or "15000000")
++PB1_CAPITAL_MODE = (_cfg("PB1_CAPITAL_MODE") or "CASH").strip().upper()
++PB1_ENTRY_CAPITAL_KRW = float(_cfg("PB1_ENTRY_CAPITAL_KRW") or "0")
++PB1_CASH_RESERVE_PCT = float(_cfg("PB1_CASH_RESERVE_PCT") or "0.10")
++PB1_BLOCK_PREOPEN = _cfg_bool("PB1_BLOCK_PREOPEN", fallback=True)
++
++logger.info(
++    "[CONFIG] BOT_STATE_RESET=%s CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
++    int(BOT_STATE_RESET),
++    PB1_CAPITAL_MODE,
++    int(PB1_ENTRY_CAPITAL_KRW),
++    PB1_CASH_RESERVE_PCT,
++)
+ MORNING_WINDOW_START = _cfg("MORNING_WINDOW_START") or "08:50"
+ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "15:20"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "15:20"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:30"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:20"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+ PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
+ PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
+ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
+ PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
+ MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "08:50"
+ MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
+ PB1_ENTRY_WINDOW_START = _cfg("PB1_ENTRY_WINDOW_START") or "08:50"
+ PB1_ENTRY_OPEN_END = _cfg("PB1_ENTRY_OPEN_END") or "09:05"
+ PB1_ENTRY_WINDOW_END = _cfg("PB1_ENTRY_WINDOW_END") or "15:15"
+ PB1_EXIT_WINDOW_START = _cfg("PB1_EXIT_WINDOW_START") or "15:15"
+ PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
+ PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:00"
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.95")
+ PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.90")
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index fe1ad61fdc274477513db0303c3c9f31f0fcef98..5da1fcc818df333f8895fbbef55299f8ffd1e862 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -1,68 +1,74 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from collections import Counter
+ from dataclasses import dataclass
+ from datetime import datetime
+ from zoneinfo import ZoneInfo
+ from typing import Any, Dict, Iterable, List
+ 
+ import pandas as pd
+ 
+ from trader.botstate_paths import close_entry_orders_path
+ from trader.config import (
+     CAP_CAP,
+     DAILY_CAPITAL,
+     KOSDAQ_HARD_STOP_PCT,
+     KOSPI_HARD_STOP_PCT,
++    LEDGER_BASE_DIR,
++    LEDGER_LOOKBACK_DAYS,
+     PB1_ENTRY_ENABLED,
+     PB1_DAY_SL_R,
+     PB1_DAY_TP_R,
+     PB1_R_FLOOR_PCT,
+     PB1_TIME_STOP_DAYS,
+     PB1_REQUIRE_VOLUME,
+     PB1_MIN_CANDLES,
+     PB1_MAX_POSITIONS,
+     PB1_MIN_SCORE,
+     PB1_USE_RISK_PARITY,
+     PB1_MAX_ATR_PCT,
+     PB1_MIN_VALUE20,
++    PB1_CAPITAL_MODE,
++    PB1_ENTRY_CAPITAL_KRW,
++    PB1_CASH_RESERVE_PCT,
+     PB1_ENTRY_WINDOW_START,
+     PB1_ENTRY_OPEN_END,
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_START,
+     PB1_EXIT_WINDOW_END,
+     PB1_ALLOW_ADD_TO_EXISTING,
+     MIN_ORDER_KRW,
+     resolve_market_window,
+ )
+ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.kis_wrapper import KisAPI
++from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
+ from trader.time_utils import now_kst
+ from trader.core_utils import _round_to_tick
+ from trader.eventlog import emit_event
+ from trader.utils.env import env_bool, parse_env_flag
+ from trader.window_router import WindowDecision
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _OUTPUT2_LIST_NORMALIZED_LOGGED = False
+ _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
+ 
+ UNREALIZED_KEYS = (
+     "evlu_pfls_amt",
+     "evlu_pfls_smtl_amt",
+ )
+ RETURN_PCT_KEYS = (
+     "asst_icdc_erng_rt",
+     "evlu_pfls_rt",
+ )
+ COST_KEYS = (
+     "pchs_amt_smtl_amt",
+     "pchs_amt",
+ )
+ EVAL_KEYS = (
+@@ -245,89 +251,99 @@ def compute_window(now_kst: datetime) -> str:
+ def round_to_tick(price: float) -> int:
+     """KRX 호가단위로 올림(ceiling) 처리"""
+     return _round_to_tick(price, mode="up")
+ 
+ 
+ class PB1Engine:
+     STRATEGY_NAME = "pb1_pullback_close"
+     UNIVERSE_STRATEGY = "best_k_meta"
+ 
+     def __init__(
+         self,
+         *,
+         universe_repo: UniverseRepo,
+         orders_repo: OrdersRepo,
+         fills_repo: FillsRepo,
+         positions_repo: PositionsRepo,
+         ledger_repo: LedgerEventsRepo,
+         kis: KisAPI | None,
+         window: WindowDecision,
+         window_label: str,
+         phase: str,
+         dry_run: bool,
+         env: str,
+         run_id: str,
+         now_kst_value: datetime | None = None,
++        balance_snapshot: dict | None = None,
++        balance_source: str | None = None,
+     ) -> None:
+         self.universe_repo = universe_repo
+         self.orders_repo = orders_repo
+         self.fills_repo = fills_repo
+         self.positions_repo = positions_repo
+         self.ledger_repo = ledger_repo
+         self.kis = kis
+         self.window = window
+         self.window_label = window_label
+         self.phase = phase
+         self.dry_run = dry_run
+         self.env = env
+         self.run_id = run_id
+         self.balance_api_calls = 0
+         self.balance_cache_hits = 0
+         self.balance_tick_cache_hits = 0
+         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+         self.min_candles = int(PB1_MIN_CANDLES)
+         providers = []
+         if kis:
+             providers.append(KISOHLCVProvider(kis))
+         providers.append(KRXOHLCVProvider())
+         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
+         self._setup_reason_counter: Counter[str] = Counter()
+         self._now_kst = now_kst_value or now_kst()
+         self._today = self._now_kst.date().isoformat()
+         self._universe_as_of = None
+         self._warned_keys: set[str] = set()
+         self._balance_price_map: Dict[str, float] = {}
+         self._balance_cost: float | None = None
+-        self._balance_snapshot: dict | None = None
++        self._balance_snapshot: dict | None = balance_snapshot
++        self._balance_snapshot_source: str | None = balance_source
++        if balance_snapshot is not None:
++            if balance_source == "api":
++                self.balance_api_calls += 1
++            elif balance_source is not None:
++                self.balance_cache_hits += 1
+         self._holdings_summary: Dict[str, Any] = {}
+         self.filter_thresholds = self._resolve_filter_thresholds()
+         self._code_name_map: Dict[str, str] = {}
+         entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
+         self.entry_enabled = entry_flag.value
+         self.entry_flag_valid = entry_flag.valid
+         self.entry_flag_raw = entry_flag.raw
+         self.window_internal = self._resolve_window_internal()
++        self.entry_capital_krw: float | None = None
++        self.entry_usable_krw: float | None = None
+ 
+     def _resolve_window_internal(self) -> str:
+         internal = compute_window(self._now_kst)
+         if self.window_label in {"morning", "day"}:
+             internal = self.window_label
+         return internal
+ 
+     @staticmethod
+     def _float_env(name: str, default: float) -> float:
+         raw = os.getenv(name)
+         if raw is None:
+             return default
+         try:
+             return float(raw)
+         except ValueError:
+             logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+             return default
+ 
+     @staticmethod
+     def _int_env(name: str, default: int) -> int:
+         raw = os.getenv(name)
+         if raw is None:
+             return default
+         try:
+             return int(raw)
+@@ -425,50 +441,105 @@ class PB1Engine:
+     def _sum_cost_from_rows(self, rows: Iterable[dict]) -> float:
+         total = 0.0
+         for row in rows or []:
+             val = self._to_float(row.get("pchs_amt"))
+             if val:
+                 total += val
+         return total
+ 
+     def _extract_holdings_cost(self, holdings_rows: Iterable[dict], holdings_summary: dict | None) -> float | None:
+         summary = _as_first_dict(holdings_summary)
+         for key in COST_KEYS:
+             cost = self._to_float(summary.get(key))
+             if cost and cost > 0:
+                 return cost
+         total = self._sum_cost_from_rows(holdings_rows)
+         return total if total > 0 else None
+ 
+     def _extract_available_cash(self, holdings_summary: dict | None) -> float | None:
+         summary = _as_first_dict(holdings_summary)
+         for key in CASH_KEYS:
+             cash = self._to_float(summary.get(key))
+             if cash is not None:
+                 return cash
+         return None
+ 
++    def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
++        holdings: dict[str, dict] = {}
++        for row in holdings_rows or []:
++            code = str(row.get("pdno") or row.get("code") or "").zfill(6)
++            qty_raw = row.get("qty") if "qty" in row else row.get("hldg_qty") or row.get("ord_psbl_qty")
++            try:
++                qty = int(float(qty_raw or 0))
++            except Exception:
++                qty = 0
++            if not code or qty <= 0:
++                continue
++            avg = self._to_float(row.get("avg_price") or row.get("pchs_avg_pric") or row.get("pchs_avg_price"))
++            holdings[code] = {
++                "code": code,
++                "qty": qty,
++                "avg_buy_price": avg,
++                "market": row.get("market") or row.get("prdt_type_cd") or row.get("mket_gb"),
++            }
++        return holdings
++
++    def _build_positions_from_kis(self, holdings_rows: Iterable[dict]) -> list[dict]:
++        kis_holdings = self._parse_kis_holdings(holdings_rows)
++        ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
++        ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
++        ledger_by_code: dict[str, dict] = {}
++        for (code, sid, mode), state in ledger_positions.items():
++            if sid != 1:
++                continue
++            existing = ledger_by_code.get(code)
++            if not existing or int(state.get("total_qty") or 0) > int(existing.get("total_qty") or 0):
++                ledger_by_code[code] = {**state, "sid": sid, "mode": mode, "code": code}
++
++        positions: list[dict] = []
++        for code, holding in kis_holdings.items():
++            ledger_state = ledger_by_code.get(code, {})
++            qty = holding.get("qty") or 0
++            avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
++            positions.append(
++                {
++                    "code": code,
++                    "sid": 1,
++                    "mode": int(ledger_state.get("mode") or 1),
++                    "qty": qty,
++                    "kis_qty": qty,
++                    "avg_buy_price": avg or None,
++                    "market": holding.get("market") or ledger_state.get("market"),
++                    "holding_days": ledger_state.get("holding_days") or 0,
++                    "first_buy_ts": ledger_state.get("first_buy_ts"),
++                    "total_cost": float(ledger_state.get("total_cost") or 0.0) or (avg * qty if avg else 0.0),
++                    "realized_pnl": ledger_state.get("realized_pnl") or 0.0,
++                    "meta_source": "kis",
++                }
++            )
++        return positions
++
+     @staticmethod
+     def _record_drop(
+         counter: Counter[str],
+         examples: Dict[str, list[str]],
+         reason: str,
+         code: str,
+         *,
+         limit: int = 3,
+     ) -> None:
+         if not reason:
+             return
+         counter[reason] += 1
+         sample_list = examples.setdefault(reason, [])
+         if len(sample_list) < limit:
+             sample_list.append(code)
+ 
+     def _log_order_skip(self, cf: CandidateFeature, reasons: list[str], stage: str) -> None:
+         try:
+             self._append_ledger_event(
+                 event_type="ORDER_SKIP",
+                 code=cf.code,
+                 market=cf.market,
+                 mode=cf.mode,
+                 side="BUY",
+                 qty=cf.planned_qty,
+@@ -494,51 +565,53 @@ class PB1Engine:
+         price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
+         buyable = entry_allowed and not reasons
+         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
+         emit_event(
+             as_of=self._today,
+             event="PB1_BUY_DECISION",
+             code=cf.code,
+             market=cf.market,
+             score=float(cf.score or 0.0),
+             qty=int(cf.planned_qty or 0),
+             price=float(price or 0.0),
+             notional=float(order_value or 0.0),
+             buyable=buyable,
+             reasons=reasons_out,
+         )
+         if not buyable:
+             logger.info(
+                 "[PB1][BUY][SKIP] code=%s reasons=%s",
+                 self._display_code(cf.code),
+                 reasons_out,
+             )
+ 
+     def _fetch_holdings_snapshot(self) -> dict:
+         if self._balance_snapshot is not None:
+             self.balance_tick_cache_hits += 1
+-            logger.info("[BALANCE][CACHE] hit=True source=tick_cache")
++            source = self._balance_snapshot_source or "tick_cache"
++            logger.info("[BALANCE][CACHE] hit=True source=%s", source)
++            self._balance_snapshot_source = "tick_cache"
+             return self._balance_snapshot
+         if not self.kis:
+             return {}
+         snap, source = self.kis.get_balance_cached(return_source=True)
+         if source == "api":
+             self.balance_api_calls += 1
+         else:
+             self.balance_cache_hits += 1
+         logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+         self._balance_snapshot = snap
+         return self._balance_snapshot
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
+         return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{side.upper()}"
+ 
+     def _name_for_code(self, code: str | None) -> str | None:
+         if not code:
+             return None
+         return self._code_name_map.get(str(code).zfill(6))
+ 
+     def _display_code(self, code: str | None) -> str:
+         if not code:
+             return ""
+         name = self._name_for_code(code)
+         return f"{name}({code})" if name else str(code)
+@@ -862,51 +935,55 @@ class PB1Engine:
+                 cf.reasons.append("value20_missing")
+                 continue
+             if float(value20) < float(PB1_MIN_VALUE20):
+                 cf.setup_ok = False
+                 cf.reasons.append("liquidity_too_low")
+                 continue
+ 
+             filtered.append(cf)
+ 
+         if not filtered:
+             return candidates
+ 
+         # 2) 점수 내림차순 Top N 선택
+         filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+         max_n = max(1, int(PB1_MAX_POSITIONS))
+         selected = filtered[:max_n]
+         selected_codes = {c.code for c in selected}
+ 
+         # 선택되지 않은 나머지는 매수 제외 처리
+         for cf in ok_list:
+             if cf.code not in selected_codes and cf.setup_ok:
+                 cf.setup_ok = False
+                 cf.reasons.append("not_in_topN")
+ 
+         # 3) 사이징: 리스크 패리티(ATR) 또는 균등
+-        cap_total = float(DAILY_CAPITAL) * float(CAP_CAP)
++        cap_total = float(
++            self.entry_usable_krw
++            if self.entry_usable_krw is not None
++            else float(DAILY_CAPITAL) * float(CAP_CAP)
++        )
+ 
+         if PB1_USE_RISK_PARITY:
+             inv: List[float] = []
+             for cf in selected:
+                 atr = float(cf.features.get("atr14") or 0.0)
+                 inv.append(1.0 / max(atr, 1e-6))
+             inv_sum = sum(inv) if sum(inv) > 0 else 1.0
+             weights = [x / inv_sum for x in inv]
+         else:
+             weights = [1.0 / len(selected)] * len(selected)
+ 
+         for cf, w in zip(selected, weights):
+             close_px = float(cf.features.get("close") or 0.0)
+             if close_px <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("close_zero")
+                 continue
+ 
+             capital = cap_total * float(w)
+             qty = int(capital // close_px)
+             cf.planned_qty = max(qty, 0)
+             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+ 
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+@@ -1267,50 +1344,69 @@ class PB1Engine:
+                     "code": cf.code,
+                     "qty": cf.planned_qty,
+                     "cap_price": cap,
+                     "client_order_key": cf.client_order_key,
+                     "kis_odno": kis_odno,
+                     "created_at": now_kst().isoformat(),
+                 }
+             )
+         else:
+             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+ 
+     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
+         avg = pos.get("avg_buy_price")
+         if not avg:
+             return
+         code = pos.get("code")
+         display_code = self._display_code(code)
+         market = pos.get("market")
+         mode = pos.get("mode")
+         sid = int(pos.get("sid") or 0)
+         if sid != 1:
+             return
+         qty = pos.get("qty") or 0
+         if qty <= 0:
+             return
++        kis_qty = pos.get("kis_qty", qty) or 0
++        if kis_qty <= 0:
++            emit_event(
++                as_of=self._today,
++                event="PB1_SELL_DECISION",
++                code=str(code),
++                qty=int(qty),
++                avg_price=float(avg),
++                mark=float(avg),
++                pnl_pct=0.0,
++                should_sell=False,
++                reasons=["no_kis_holding"],
++            )
++            logger.info(
++                "[PB1][SELL][DECISION] code=%s should_sell=0 reasons=%s",
++                display_code,
++                ["no_kis_holding"],
++            )
++            return
+         mark = self._mark_price(code)
+         if mark is None:
+             mark = self._balance_price_map.get(code)
+         if mark is None:
+             mark = features.get("close") or avg
+         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
+         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
+ 
+         holding_days = pos.get("holding_days") or 0
+         stage = "EXIT"
+         decision_reasons: list[str] = []
+         should_sell = False
+         if mode == 1:
+             atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
+             r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
+             take_profit = PB1_DAY_TP_R * r_pct
+             stop_loss = PB1_DAY_SL_R * r_pct
+             if window_tag != "morning":
+                 decision_reasons = ["sell_disabled"]
+             else:
+                 stage = "DAY-EXIT"
+                 if ret_pct >= take_profit:
+                     decision_reasons.append("take_profit_hit")
+                 if ret_pct <= -stop_loss:
+                     decision_reasons.append("stop_loss_hit")
+@@ -1534,78 +1630,70 @@ class PB1Engine:
+                 sid=1,
+                 mode=mode,
+                 code=code,
+                 market=market,
+                 side="SELL",
+                 qty=qty,
+                 price=mark,
+                 fee=0.0,
+                 tax=0.0,
+                 filled_at=filled_at,
+             )
+         else:
+             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
+ 
+     def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:
+         enriched: List[Dict] = []
+         for state in positions:
+             if state.get("sid") != 1:
+                 continue
+             enriched.append(
+                 {
+                     "code": state.get("code"),
+                     "sid": state.get("sid"),
+                     "mode": state.get("mode"),
+                     "qty": state.get("qty") or 0,
++                    "kis_qty": state.get("kis_qty") or state.get("qty") or 0,
+                     "avg_buy_price": state.get("avg_buy_price"),
+                     "market": state.get("market"),
+                     "holding_days": state.get("holding_days") or 0,
+                     "first_buy_ts": state.get("first_buy_ts"),
+                     "total_cost": state.get("total_cost") or 0.0,
+                     "realized_pnl": state.get("realized_pnl") or 0.0,
++                    "meta_source": state.get("meta_source"),
+                 }
+             )
+         return enriched
+ 
+     def _run_exit_always(
+         self,
+         *,
+         positions: list[dict],
+         holdings_rows: list[dict],
+         marks_fallback: dict[str, float],
+     ) -> list[dict]:
+         holdings = list(holdings_rows or [])
+-        if not positions and holdings:
+-            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+-                env=self.env,
+-                strategy=self.STRATEGY_NAME,
+-                sid=1,
+-                mode=1,
+-                holdings=holdings,
+-            )
+-            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings), bootstrapped)
+-            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+         pos_list = self._positions_with_meta(positions)
+         for pos in pos_list:
+             df, _ = self._fetch_daily(pos["code"], count=120)
+             if df.empty:
+                 continue
+             try:
+                 features = compute_features(df, min_candles=self.min_candles)
+             except ValueError:
+                 continue
+             features["market"] = pos.get("market") or ""
+             marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
+             self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
+         return positions
+ 
+     def _load_close_entry_orders(self) -> list[dict]:
+         path = close_entry_orders_path(self._today)
+         if not path.exists():
+             logger.info("[PB1][CLOSE_CANCEL][WHY] reason_codes=%s reason_text=%s stage=%s", ["close_entry_file_missing"], "close_entry_file_missing", "PB1-CLOSE")
+             return []
+         orders: list[dict] = []
+         try:
+             for line in path.read_text(encoding="utf-8").splitlines():
+                 if not line.strip():
+                     continue
+                 orders.append(json.loads(line))
+@@ -1755,51 +1843,51 @@ class PB1Engine:
+             cost_source,
+             totals["unrealized"],
+             unrealized_source,
+             totals["realized"],
+             realized_source,
+             f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
+             return_pct_source,
+             f"{invested_return_pct:.2f}" if invested_return_pct is not None else "N/A",
+             f"{total_asset_return_pct:.2f}" if total_asset_return_pct is not None else "N/A",
+         )
+         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
+         return totals
+ 
+     def run(self) -> RunResult:
+         self._warned_keys.clear()
+         self._setup_reason_counter.clear()
+         final_status = "OK"
+         final_notes: str | None = None
+         entry_allowed = self.entry_enabled
+         entry_reason = "ok"
+         entry_summary_emitted = False
+         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
+         max_positions = int(PB1_MAX_POSITIONS)
+         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
+         min_order_krw = float(MIN_ORDER_KRW)
+-        entry_capital_krw = float(DAILY_CAPITAL) * float(CAP_CAP)
++        entry_capital_krw = 0.0
+         skip_entry_scan = False
+         if not entry_allowed:
+             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
+             entry_reason = "entry_disabled"
+         if self.phase == "verify":
+             entry_allowed = False
+             entry_reason = "phase_verify"
+         logger.info(
+             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
+             self.window_label,
+             self.window_internal,
+             self.phase,
+             self.dry_run,
+             self.env,
+         )
+         emit_event(
+             as_of=self._today,
+             event="PB1_RUN_START",
+             env=self.env,
+             window=self.window_label,
+             phase=self.phase,
+             dry_run=self.dry_run,
+             entry_enabled=self.entry_enabled,
+         )
+ 
+@@ -1817,84 +1905,121 @@ class PB1Engine:
+                 final_notes = "entry_cutoff"
+ 
+         if not entry_allowed:
+             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
+ 
+         def _emit_entry_summary(
+             setup_ok_codes: list[str] | None,
+             orderable_candidates: list[CandidateFeature] | None,
+             drop_reason_counter: Counter[str] | None,
+         ) -> None:
+             nonlocal entry_summary_emitted
+             if entry_summary_emitted:
+                 return
+             drop_reason_counter = drop_reason_counter or Counter()
+             emit_event(
+                 as_of=self._today,
+                 event="PB1_ENTRY_SUMMARY",
+                 entry_allowed=entry_allowed,
+                 entry_block_reason=entry_reason,
+                 setup_ok_count=len(setup_ok_codes or []),
+                 selected_count=len(orderable_candidates or []),
+                 top_drop_reasons=drop_reason_counter.most_common(5),
+             )
+             entry_summary_emitted = True
+ 
+-        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+-        existing_positions = [p for p in positions if int(p.get("qty") or 0) > 0]
+-        existing_positions_count = len(existing_positions)
+         holdings_snapshot = self._fetch_holdings_snapshot()
+         holdings_rows = holdings_snapshot.get("output1") or []
+         holdings_summary_raw = holdings_snapshot.get("output2")
+         holdings_summary = _as_first_dict(holdings_summary_raw)
+         self._holdings_summary = holdings_summary
+         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
+         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+-        available_cash_krw = self._extract_available_cash(holdings_summary)
++        available_cash_raw = None
++        if isinstance(holdings_summary_raw, list) and holdings_summary_raw:
++            available_cash_raw = self._to_float(holdings_summary_raw[0].get("dnca_tot_amt"))
++        elif isinstance(holdings_summary_raw, dict):
++            available_cash_raw = self._to_float(holdings_summary_raw.get("dnca_tot_amt"))
++        if available_cash_raw is None:
++            available_cash_raw = self._extract_available_cash(holdings_summary)
++        available_cash_krw = int(available_cash_raw or 0)
++        capital_mode = (PB1_CAPITAL_MODE or "CASH").upper()
++        if capital_mode == "FIXED":
++            entry_capital_krw = min(float(available_cash_krw), float(PB1_ENTRY_CAPITAL_KRW))
++        else:
++            if capital_mode != "CASH":
++                logger.warning("[PB1][CAPITAL][WARN] unknown mode=%s -> fallback=CASH", capital_mode)
++            entry_capital_krw = float(available_cash_krw)
++        reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
++        entry_usable_krw = int(entry_capital_krw * (1 - reserve_pct))
++        self.entry_capital_krw = entry_capital_krw
++        self.entry_usable_krw = entry_usable_krw
++        logger.info(
++            "[PB1][CAPITAL] mode=%s available_cash=%s entry_capital=%s reserve_pct=%.2f usable=%s",
++            capital_mode,
++            available_cash_krw,
++            int(entry_capital_krw),
++            reserve_pct,
++            entry_usable_krw,
++        )
++        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
++        if not positions and holdings_rows:
++            bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
++                env=self.env,
++                strategy=self.STRATEGY_NAME,
++                sid=1,
++                mode=1,
++                holdings=holdings_rows,
++            )
++            logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
++            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
++        positions_for_exit = self._build_positions_from_kis(holdings_rows)
++        existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
++        existing_positions_count = len(existing_positions)
+         slots_remaining = max(0, max_positions - existing_positions_count)
+         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
+         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
+         logger.info(
+             "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
+             max_positions,
+             target_new_positions,
+             entry_capital_krw,
+             min_order_krw,
+             entry_cutoff_raw,
+             existing_positions_count,
+-            f"{available_cash_krw:.0f}" if available_cash_krw is not None else "N/A",
++            available_cash_krw,
+             allow_add_to_existing,
+         )
+         holdings = list(holdings_rows or [])
+         if not holdings and self.kis:
+             logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
+         marks_fallback: Dict[str, float] = {}
+-        positions = self._run_exit_always(positions=positions, holdings_rows=holdings, marks_fallback=marks_fallback)
++        positions_for_exit = self._run_exit_always(positions=positions_for_exit, holdings_rows=holdings, marks_fallback=marks_fallback)
+         open_orders = self.orders_repo.get_open_orders(self.env)
+         if open_orders:
+             logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
+-        self._pnl_snapshot(self._positions_with_meta(positions))
++        self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
+         if self.phase == "verify":
+             final_status = "OK"
+             final_notes = "verify_only"
+             self._log_reason_summary(final_notes)
+             _emit_entry_summary([], [], Counter())
+             return RunResult(
+                 status=final_status,
+                 notes=final_notes,
+                 balance_api_calls=self.balance_api_calls,
+                 balance_cache_hits=self.balance_cache_hits,
+                 balance_tick_cache_hits=self.balance_tick_cache_hits,
+             )
+ 
+         members = self._load_universe()
+         emit_event(
+             as_of=self._today,
+             event="PB1_UNIVERSE_STATUS",
+             ok=bool(members),
+             universe_members=len(members),
+             universe_as_of=self._universe_as_of,
+         )
+         if not members:
+             note = "universe_empty"
+             logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+             self._log_reason_summary("universe_empty")
+@@ -1991,60 +2116,60 @@ class PB1Engine:
+                         cf,
+                         order_value=order_value,
+                         reasons=["today_buy_exists"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
+                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                     self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["duplicate_order"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 reasons: list[str] = []
+                 if new_position_limit <= 0:
+                     reasons.append("max_positions")
+                 if target_new_positions <= 0:
+                     reasons.append("target_new_positions_zero")
+                 if entry_capital_krw <= 0:
+                     reasons.append("entry_capital_zero")
+-                if available_cash_krw is not None and available_cash_krw <= 0:
++                if available_cash_krw <= 0:
+                     reasons.append("available_cash_zero")
+                 if min_order_krw > 0 and order_value < min_order_krw:
+                     reasons.append("min_order_krw")
+                 if order_value <= 0:
+                     reasons.append("order_value_zero")
+-                if available_cash_krw is not None and order_value > available_cash_krw:
++                if order_value > available_cash_krw:
+                     reasons.append("insufficient_cash")
+-                if planned_spent + order_value > float(DAILY_CAPITAL):
+-                    reasons.append("daily_cap_exceeded")
++                if planned_spent + order_value > float(entry_capital_krw):
++                    reasons.append("entry_cap_exceeded")
+                 if not reasons and len(orderable_candidates) >= new_position_limit:
+                     reasons.append("target_new_positions_limit")
+                 if reasons:
+                     for reason in reasons:
+                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                     self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=reasons,
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 orderable_candidates.append(cf)
+                 self._emit_buy_decision(
+                     cf,
+                     order_value=order_value,
+                     reasons=[],
+                     entry_allowed=entry_allowed,
+                     entry_reason=entry_reason,
+                 )
+                 planned_spent += order_value
+                 if len(orderable_candidates) >= new_position_limit:
+                     break
+@@ -2092,63 +2217,63 @@ class PB1Engine:
+                     self._log_reason_summary(final_notes)
+                     _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+                     return RunResult(
+                         status=final_status,
+                         notes=final_notes,
+                         balance_api_calls=self.balance_api_calls,
+                         balance_cache_hits=self.balance_cache_hits,
+                         balance_tick_cache_hits=self.balance_tick_cache_hits,
+                     )
+             if self.phase in {"entry", "trade"}:
+                 if not entry_allowed:
+                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
+                 orderable_candidates = orderable_candidates if entry_allowed else []
+                 if ok_count > 0 and not orderable_candidates:
+                     no_orders_reasons: list[str] = []
+                     if not entry_allowed:
+                         no_orders_reasons.append("entry_disabled")
+                     if skip_entry_scan:
+                         no_orders_reasons.append("entry_cutoff")
+                     if max_positions - existing_positions_count <= 0:
+                         no_orders_reasons.append("max_positions")
+                     if target_new_positions <= 0:
+                         no_orders_reasons.append("target_new_positions_zero")
+                     if entry_capital_krw <= 0:
+                         no_orders_reasons.append("entry_capital_zero")
+-                    if available_cash_krw is not None and available_cash_krw <= 0:
++                    if available_cash_krw <= 0:
+                         no_orders_reasons.append("available_cash_zero")
+                     if min_order_krw > 0 and after_buyable_check_count == 0:
+                         no_orders_reasons.append("min_order_krw")
+                     if not no_orders_reasons:
+                         no_orders_reasons.append("exhausted_candidates")
+                     final_status = "NO_TRADE"
+                     final_notes = f"no_orders:{no_orders_reasons or 'none'}"
+                     logger.info(
+                         "[PB1][NO_TRADE] reason=no_orders no_orders_reason=%s",
+                         no_orders_reasons or ["none"],
+                     )
+                     if self.phase in {"prep", "entry"}:
+                         self._log_reason_summary(final_notes)
+                         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+                         return RunResult(
+                             status=final_status,
+                             notes=final_notes,
+                             balance_api_calls=self.balance_api_calls,
+                             balance_cache_hits=self.balance_cache_hits,
+                             balance_tick_cache_hits=self.balance_tick_cache_hits,
+                         )
+                 for cf in orderable_candidates:
+                     if self.window_internal == "close":
+                         self._place_entry_close(cf)
+                     else:
+                         self._place_entry(cf)
+         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+-        self._pnl_snapshot(self._positions_with_meta(self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)))
++        self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
+         final_notes = final_notes or self._universe_as_of or "ok"
+         self._log_reason_summary(final_notes)
+         return RunResult(
+             status=final_status,
+             notes=final_notes,
+             balance_api_calls=self.balance_api_calls,
+             balance_cache_hits=self.balance_cache_hits,
+             balance_tick_cache_hits=self.balance_tick_cache_hits,
+         )
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index f3428ec2d4fc3a7d0a0cc2a7c76f5a6d9c3ad1fa..25f229f20526de8ab50807b5b1eb03613aebb6a5 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -1,85 +1,96 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import logging
+ import os
+ import subprocess
+ import signal
+ import time as time_mod
+ from datetime import datetime, time as dtime, timedelta
+ from pathlib import Path
+ from zoneinfo import ZoneInfo
+ 
+ from trader.config import (
+     AFTERNOON_WINDOW_END,
+     AFTERNOON_WINDOW_START,
++    BOT_STATE_RESET,
++    BOT_STATE_RESET_CASH_MAX_KRW,
++    BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
++    BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
+     CLOSE_AUCTION_END,
+     CLOSE_AUCTION_START,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
++    LEDGER_BASE_DIR,
++    LEDGER_LOOKBACK_DAYS,
+     MARKET_CLOSE_HHMM,
+     MARKET_OPEN_HHMM,
+     MORNING_EXIT_END,
+     MORNING_EXIT_START,
+     MORNING_WINDOW_END,
+     MORNING_WINDOW_START,
++    PB1_BLOCK_PREOPEN,
+     PB1_FORCE_ENTRY_ON_PUSH,
+     PB1_MAX_WAIT_FOR_WINDOW_MIN,
+     PB1_WAIT_FOR_WINDOW,
+     resolve_strategy_mode,
+ )
+ from trader.botstate_paths import get_botstate_root
+ from trader.botstate_sync import (
++    BotStateContext,
+     acquire_lock as acquire_botstate_lock,
+     compute_lock_ttl,
+     persist_run_files,
+     release_lock as release_botstate_lock,
+     resolve_botstate_worktree_dir,
+     setup_worktree,
+ )
+ from trader.db.engine import make_engine
+ from trader.db.lock import release_lock, try_acquire_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
+ from trader.kis_wrapper import KisAPI
++from trader.ledger.store import LedgerStore
+ from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_today
+-from trader.runtime_store import universe_check
++from trader.reset_utils import detect_account_fp, purge_bot_state
++from trader.runtime_store import RuntimeStore
+ from trader.time_utils import now_kst
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def universe_build_flag(as_of: str) -> Path:
+     return Path("bot_state/runtime") / f"universe_build_done_{as_of}.flag"
+ 
+ 
+-def ensure_universe_built_once(as_of: str, reason: str) -> None:
+-    ok, meta = universe_check(as_of)
++def ensure_universe_built_once(as_of: str, reason: str, runtime_store: RuntimeStore) -> None:
++    ok, meta = runtime_store.universe_check(as_of)
+     flag = universe_build_flag(as_of)
+ 
+     if not ok:
+         return
+ 
+     if meta.get("have_today"):
+         return
+ 
+     if flag.exists():
+         return
+ 
+     flag.parent.mkdir(parents=True, exist_ok=True)
+     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
+ 
+     cmd = [
+         "python",
+         "-m",
+         "trader.universe.build",
+         "--env",
+         os.getenv("KIS_ENV", ""),
+         "--strategy",
+         "best_k_meta",
+         "--date",
+         as_of,
+     ]
+@@ -287,113 +298,156 @@ def _collect_botstate_files(since_ts: float) -> list[Path]:
+         if not env_path:
+             continue
+         path = Path(env_path)
+         if not path.exists():
+             continue
+         try:
+             if path.stat().st_mtime >= since_ts or path not in touched:
+                 touched.append(path)
+         except FileNotFoundError:
+             continue
+     return touched
+ 
+ 
+ def _change_flag_path() -> Path:
+     cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
+     return cache_root / "changed.flag"
+ 
+ 
+ def _write_change_flag(changed: bool, reasons: list[str]) -> None:
+     flag_path = _change_flag_path()
+     flag_path.parent.mkdir(parents=True, exist_ok=True)
+     flag_path.write_text("1\n" if changed else "0\n", encoding="utf-8")
+     logger.info("[PB1][CHANGE] changed=%s reasons=%s", int(changed), reasons)
+ 
+ 
++def _runtime_meta_path(bot_state_dir: Path) -> Path:
++    return bot_state_dir / "runtime" / "runtime_meta.json"
++
++
++def _load_runtime_meta(bot_state_dir: Path) -> dict:
++    path = _runtime_meta_path(bot_state_dir)
++    if not path.exists():
++        return {}
++    try:
++        return json.loads(path.read_text(encoding="utf-8"))
++    except Exception:
++        logger.exception("[STATE][META][LOAD_FAIL] path=%s", path)
++        return {}
++
++
++def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
++    path = _runtime_meta_path(bot_state_dir)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
++
++
++def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
++    if not balance_snapshot:
++        return None
++    summary_raw = balance_snapshot.get("output2")
++    summary = summary_raw[0] if isinstance(summary_raw, list) and summary_raw else summary_raw if isinstance(summary_raw, dict) else None
++    if not isinstance(summary, dict):
++        return None
++    raw = summary.get("dnca_tot_amt")
++    if raw is None:
++        return None
++    try:
++        return int(float(str(raw).replace(",", "")))
++    except Exception:
++        return None
++
++
+ def _is_urgent_persist(touched: list[Path]) -> bool:
+     keywords = {"orders", "fills", "exits_intent"}
+     for path in touched:
+         parts = {part.lower() for part in path.parts}
+         if parts & keywords:
+             return True
+     return False
+ 
+ 
+-def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> Path | None:
++def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateContext | None:
+     worktree_dir = resolve_botstate_worktree_dir(Path.cwd())
+     try:
+-        setup_worktree(Path.cwd(), worktree_dir)
++        ctx = setup_worktree(Path.cwd(), worktree_dir)
+     except Exception:
+         logger.exception("[BOTSTATE][SETUP] failed worktree=%s", worktree_dir)
+         return None
+     if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
+         return None
+-    return worktree_dir
++    return ctx
+ 
+ 
+ def run_once(
+     *,
+     args: argparse.Namespace,
+     engine,
+     loop_mode: bool = False,
+     window: WindowDecision | None = None,
++    bot_state_dir: Path | None = None,
+ ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+     now = _get_now_kst()
+     as_of = now.date().isoformat()
++    resolved_bot_state_dir = bot_state_dir or get_botstate_root()
++    runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
+     if not loop_mode:
+-        ensure_universe_built_once(as_of, reason="auto_missing_today")
++        ensure_universe_built_once(as_of, reason="auto_missing_today", runtime_store=runtime_store)
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
+     if close_cancel_only:
+         logger.info("[PB1][MODE] close_cancel_only=Y")
+     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
+     event_name_lower = event_name.lower()
+     mode, trading_day, market_window, mode_source = resolve_strategy_mode(
+         now_kst=now,
+         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
+     )
+     effective_mode = mode
+     if smoke_enabled:
+         trading_day = True
+     logger.info(
+         "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
+         mode_source,
+         now.isoformat(),
+         trading_day,
+         market_window,
+         mode,
+     )
+     os.environ["STRATEGY_MODE"] = mode
+     diag_env_flag = (
+         env_bool("DIAGNOSTIC_FORCE_RUN", False)
+         or env_bool("DIAGNOSTIC_ONLY", DIAGNOSTIC_ONLY)
+         or env_bool("DIAGNOSTIC_MODE", DIAGNOSTIC_MODE)
+     )
+     open_dt, close_dt = _market_session(now)
+     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
+     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
+ 
++    if PB1_BLOCK_PREOPEN and market_window == "preopen":
++        os.environ["PB1_ENTRY_ENABLED"] = "0"
++        logger.info("[PB1][ENTRY_BLOCKED] reason=preopen_block entry_allowed=0")
+     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
+     os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
+     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
+     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
+     resolved_window, window_label, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
+         now=now,
+         trading_day=trading_day,
+         market_window=market_window,
+         window_override=args.window,
+         phase_seed=phase_seed,
+     )
+     if window is not None:
+         resolved_window = window
+         window_label = _resolve_window_label(market_window, window)
+         context_reasons.append("window:locked")
+     window = resolved_window
+     phase_for_log = resolved_phase
+ 
+     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
+     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
+     os.environ.setdefault("MORNING_EXIT_START", MORNING_EXIT_START)
+     os.environ.setdefault("MORNING_EXIT_END", MORNING_EXIT_END)
+     os.environ.setdefault("AFTERNOON_WINDOW_START", AFTERNOON_WINDOW_START)
+     os.environ.setdefault("AFTERNOON_WINDOW_END", AFTERNOON_WINDOW_END)
+     os.environ.setdefault("CLOSE_AUCTION_START", CLOSE_AUCTION_START)
+@@ -632,118 +686,168 @@ def run_once(
+         if diag_enabled:
+             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     lock_key = f"PB1:{kis_env_raw or 'practice'}"
+     lock_acquired = try_acquire_lock(engine, lock_key)
+     if not lock_acquired:
+         logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, owner, workflow_run_id)
+         return [], False, {}, phase_for_log, "LOCKED"
+ 
+     runs_repo = RunsRepo(engine)
+     universe_repo = UniverseRepo(engine)
+     orders_repo = OrdersRepo(engine)
+     fills_repo = FillsRepo(engine)
+     positions_repo = PositionsRepo(engine)
+     ledger_repo = LedgerEventsRepo(engine)
+ 
+     run_record_id = None
+     did_work = False
+     touched_files: list[Path] = []
+     result = None
+     run_start_ts = time_mod.time()
+     try:
+         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+-            universe_ok, universe_meta = universe_check(as_of)
++            universe_ok, universe_meta = runtime_store.universe_check(as_of)
+             if not universe_ok:
+                 if phase_for_log == "entry":
+                     os.environ["PB1_ENTRY_ENABLED"] = "0"
+                     logger.info("[PB1][ENTRY_BLOCKED] reason=universe_missing_both entry_allowed=0")
+                 logger.info("[PB1][SKIP] reason=universe_missing_both as_of=%s", as_of)
+                 logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_missing_both as_of=%s", as_of)
+         kis: KisAPI | None = None
+         try:
+             kis = KisAPI()
+             if kis.env != kis_env:
+                 dry_run_reasons.append("kis_env_mismatch")
+                 dry_run = True
+                 _apply_env_flags(dry_run)
+         except Exception:
+             logger.exception("[PB1] KIS init failed, forcing dry-run")
+             dry_run_reasons.append("kis_init_failed")
+             dry_run = True
+             _apply_env_flags(dry_run)
+ 
++        balance_snapshot: dict | None = None
++        balance_source: str | None = None
++        if kis:
++            try:
++                _log_balance_cache(force=False)
++                balance_snapshot, balance_source = kis.get_balance_cached(force=False, return_source=True)
++            except Exception:
++                logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
++
++        reset_reason = None
++        account_fp_now = None
++        if kis and balance_snapshot:
++            account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
++            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
++            runtime_fp = runtime_meta.get("account_fp")
++            if BOT_STATE_RESET:
++                reset_reason = "env_reset"
++            elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
++                reset_reason = "account_fp_mismatch"
++            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
++                kis_holdings = balance_snapshot.get("output1") or []
++                existing_positions = positions_repo.list_positions(kis_env or "practice", "pb1_pullback_close")
++                existing_positions_count = len([p for p in existing_positions if int(p.get("qty") or 0) > 0])
++                ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
++                ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
++                ledger_has_positions = any(
++                    int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
++                )
++                dnca_total = _extract_dnca_total(balance_snapshot)
++                if (
++                    len(kis_holdings) == 0
++                    and (existing_positions_count > 0 or ledger_has_positions)
++                    and dnca_total is not None
++                    and dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW
++                ):
++                    reset_reason = "empty_kis_holdings_detected"
++
++        if reset_reason:
++            archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"
++            purge_bot_state(resolved_bot_state_dir, archive_dir, reason=reset_reason)
++            run_migrations(engine)
++            meta_payload = {"account_fp": account_fp_now} if account_fp_now else {}
++            _write_runtime_meta(resolved_bot_state_dir, meta_payload)
++        elif account_fp_now:
++            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
++            if runtime_meta.get("account_fp") != account_fp_now:
++                _write_runtime_meta(resolved_bot_state_dir, {"account_fp": account_fp_now})
++
+         run_record_id = runs_repo.start_run(
+             env=kis_env or "practice",
+             strategy="pb1_pullback_close",
+             run_window=window_label,
+             phase=phase_override_arg,
+             event_name=event_name_lower,
+             dry_run=dry_run,
+             git_sha=os.getenv("GITHUB_SHA"),
+             workflow=os.getenv("GITHUB_WORKFLOW"),
+             workflow_run_id=workflow_run_id,
+             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
+             config_json={
+                 "dry_run_reasons": dry_run_reasons,
+                 "run_window": window_label,
+                 "phase": phase_override_arg,
+                 "phase_reason": phase_reason,
+             },
+         )
+         if kis:
+             try:
+                 reconcile_today(
+                     engine=engine,
+                     kis=kis,
+                     env=kis_env or "practice",
+                     run_id=run_record_id,
+                     strategy="pb1_pullback_close",
+                 )
+             except Exception as exc:
+                 if not dry_run and mode_resolved == "LIVE":
+                     logger.error("[PB1][RECONCILE][FAIL] live run halted: %s", exc)
+                     runs_repo.finish_run(run_record_id, status="FAILED", notes="reconcile_failed")
+                     return [], False, {}, phase_for_log, "RECONCILE_FAIL"
+                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+ 
+         engine_runner = PB1Engine(
+             universe_repo=universe_repo,
+             orders_repo=orders_repo,
+             fills_repo=fills_repo,
+             positions_repo=positions_repo,
+             ledger_repo=ledger_repo,
+             kis=kis,
+             window=window,
+             window_label=window_label,
+             phase=phase_override_arg,
+             dry_run=dry_run,
+             env=kis_env or "practice",
+             run_id=run_record_id,
+             now_kst_value=now,
++            balance_snapshot=balance_snapshot,
++            balance_source=balance_source,
+         )
+         if close_cancel_only:
+             result = engine_runner.run_close_cancel()
+         else:
+             result = engine_runner.run()
+         did_work = True
+         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+         touched_files = _collect_botstate_files(run_start_ts)
+     except Exception as exc:
+         logger.exception("[PB1][FAIL] unexpected error")
+         if run_record_id:
+             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+         raise
+     finally:
+         release_lock(engine, lock_key)
+     metrics = {
+         "balance_api_calls": result.balance_api_calls if result else 0,
+         "balance_cache_hits": result.balance_cache_hits if result else 0,
+         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
+     }
+     result_status = result.status if result else "UNKNOWN"
+     return touched_files, did_work, metrics, phase_for_log, result_status
+ 
+ 
+ def _run_loop(*, args: argparse.Namespace, engine) -> None:
+@@ -759,76 +863,81 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
+         persist_interval = max(120, min(persist_interval, 240))
+     logger.info(
+         "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
+         loop_interval,
+         persist_interval,
+         close_dt.isoformat(),
+         loop_max_minutes,
+         run_loop_minutes,
+     )
+     logger.info(
+         "[PB1][LOOP] start now_kst=%s max_seconds=%s",
+         now.isoformat(),
+         max_seconds,
+     )
+ 
+     total_start_ts = time_mod.monotonic()
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
+     logger.info(
+         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+         ttl_sec,
+         max_seconds,
+         ttl_buffer,
+     )
+-    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+-    if botstate_worktree is None:
++    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
++    if botstate_ctx is None:
+         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
+         return
++    runtime_store = RuntimeStore(base_dir=botstate_ctx.bot_state_dir)
+ 
+     pending_touched: dict[Path, Path] = {}
+     last_persist_ts = 0.0
+     trade_start_ts = time_mod.monotonic()
+     loop_started_ts = trade_start_ts
+     loop_deadline_ts = trade_start_ts + max_seconds if max_seconds > 0 else None
+     loop_deadline = None
+     now_kst_value = _get_now_kst()
+     if max_seconds > 0:
+         loop_deadline = now_kst_value + timedelta(seconds=max_seconds)
+     logger.info(
+         "[PB1][CLOCK] total_start=%.3f trade_start=%.3f",
+         total_start_ts,
+         trade_start_ts,
+     )
+     logger.info(
+         "[PB1][LOOP] deadline_ready now_kst=%s deadline=%s max_seconds=%s baseline=trade",
+         now_kst_value.isoformat(),
+         loop_deadline.isoformat() if loop_deadline else "none",
+         max_seconds,
+     )
+-    ensure_universe_built_once(now_kst_value.date().isoformat(), reason="auto_missing_today")
++    ensure_universe_built_once(
++        now_kst_value.date().isoformat(),
++        reason="auto_missing_today",
++        runtime_store=runtime_store,
++    )
+     exit_reason = "unknown"
+     stop_requested = {"value": False}
+     balance_api_calls = 0
+     balance_cache_hits = 0
+     balance_tick_cache_hits = 0
+     last_phase = "none"
+ 
+     def _request_stop(reason: str) -> None:
+         if stop_requested["value"]:
+             return
+         stop_requested["value"] = True
+         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
+ 
+     signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
+     try:
+         while True:
+             if stop_requested["value"]:
+                 exit_reason = "sigterm"
+                 break
+             now = _get_now_kst()
+             if now >= close_dt:
+                 logger.info("[PB1][LOOP] market closed -> exit")
+                 exit_reason = "market_closed"
+                 break
+             elapsed_seconds = time_mod.monotonic() - loop_started_ts
+@@ -883,86 +992,92 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
+                         logger.info("[PB1][LOOP] budget exhausted before sleep -> exit")
+                         exit_reason = "loop_timeout"
+                         break
+                     if sleep_for >= remaining_budget:
+                         logger.info(
+                             "[PB1][LOOP] outside window but insufficient budget -> exit "
+                             "sleep=%.0fs remaining_budget=%.0fs next=%s",
+                             sleep_for,
+                             remaining_budget,
+                             next_start.isoformat() if next_start else "unknown",
+                         )
+                         exit_reason = "outside_window_budget"
+                         break
+                 logger.info(
+                     "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
+                     sleep_for,
+                     next_start.isoformat() if next_start else "unknown",
+                 )
+                 time_mod.sleep(sleep_for)
+                 continue
+ 
+             if loop_deadline_ts and time_mod.monotonic() > loop_deadline_ts:
+                 logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
+                 exit_reason = "deadline_exceeded_pre_trade"
+                 break
+-            touched, _did_work, metrics, last_phase, result_status = run_once(args=args, engine=engine, loop_mode=True, window=window)
++            touched, _did_work, metrics, last_phase, result_status = run_once(
++                args=args,
++                engine=engine,
++                loop_mode=True,
++                window=window,
++                bot_state_dir=botstate_ctx.bot_state_dir,
++            )
+             balance_api_calls += metrics.get("balance_api_calls", 0)
+             balance_cache_hits += metrics.get("balance_cache_hits", 0)
+             balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
+             if result_status == "NO_TRADE":
+                 logger.info("[PB1][LOOP] no trade -> exit")
+                 exit_reason = "no_candidates"
+                 break
+             if touched:
+                 _write_change_flag(True, ["touched_files"])
+             for path in touched:
+                 pending_touched[path] = path
+             if pending_touched:
+                 now_ts = time_mod.monotonic()
+                 urgent = _is_urgent_persist(list(pending_touched.values()))
+                 if urgent or (now_ts - last_persist_ts >= persist_interval):
+                     persist_run_files(
+-                        botstate_worktree,
++                        botstate_ctx.worktree_dir,
+                         list(pending_touched.values()),
+                         message=f"pb1 loop {now.isoformat()}",
+                     )
+                     pending_touched.clear()
+                     last_persist_ts = now_ts
+             time_mod.sleep(loop_interval)
+     finally:
+         elapsed_trade = time_mod.monotonic() - loop_started_ts
+         elapsed_total = time_mod.monotonic() - total_start_ts
+         if exit_reason == "unknown":
+             exit_reason = "shutdown"
+         if pending_touched:
+             persist_run_files(
+-                botstate_worktree,
++                botstate_ctx.worktree_dir,
+                 list(pending_touched.values()),
+                 message=f"pb1 loop {now_kst().isoformat()}",
+             )
+-        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
++        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
+         if max_seconds > 0 and elapsed_trade > max_seconds:
+             logger.warning(
+                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
+         else:
+             logger.info(
+                 "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+@@ -974,64 +1089,70 @@ def main() -> None:
+     engine = make_engine()
+     run_migrations(engine)
+     _write_change_flag(False, ["init"])
+ 
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
+     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+     if run_loop_minutes > 0:
+         run_loop = True
+     if run_loop and not smoke_enabled:
+         _run_loop(args=args, engine=engine)
+         return
+     if smoke_enabled:
+         run_once(args=args, engine=engine, loop_mode=False, window=None)
+         return
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     ttl_sec, ttl_buffer = compute_lock_ttl(run_loop_minutes * 60)
+     logger.info(
+         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+         ttl_sec,
+         run_loop_minutes * 60,
+         ttl_buffer,
+     )
+-    botstate_worktree = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+-    if botstate_worktree is None:
++    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
++    if botstate_ctx is None:
+         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
+         return
+     signal.signal(
+         signal.SIGTERM,
+         lambda *_args: logger.warning("[PB1][SIGNAL] SIGTERM -> defer release until shutdown"),
+     )
+     metrics: dict[str, int] = {}
+     phase_for_log = "none"
+     start_ts = time_mod.time()
+     try:
+-        touched, _did_work, metrics, phase_for_log, _result_status = run_once(args=args, engine=engine, loop_mode=False, window=None)
++        touched, _did_work, metrics, phase_for_log, _result_status = run_once(
++            args=args,
++            engine=engine,
++            loop_mode=False,
++            window=None,
++            bot_state_dir=botstate_ctx.bot_state_dir,
++        )
+         if touched:
+             _write_change_flag(True, ["touched_files"])
+             persist_run_files(
+-                botstate_worktree,
++                botstate_ctx.worktree_dir,
+                 touched,
+                 message=f"pb1 run {now_kst().isoformat()}",
+             )
+         else:
+             _write_change_flag(False, ["no_changes"])
+     finally:
+-        release_botstate_lock(botstate_worktree, owner, workflow_run_id)
++        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
+         elapsed = time_mod.time() - start_ts
+         logger.info(
+             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+             elapsed,
+             run_loop_minutes * 60,
+             "none",
+             phase_for_log,
+             metrics.get("balance_api_calls", 0),
+             metrics.get("balance_cache_hits", 0),
+             metrics.get("balance_tick_cache_hits", 0),
+         )
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/trader/reset_utils.py b/trader/reset_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a559940113056f1effae8c95ad473a20896404cf
+--- /dev/null
++++ b/trader/reset_utils.py
+@@ -0,0 +1,54 @@
++from __future__ import annotations
++
++import logging
++import shutil
++from datetime import datetime
++from pathlib import Path
++
++logger = logging.getLogger(__name__)
++
++
++def detect_account_fp(kis_env: str, cano: str, acnt_prdt_cd: str, api_base_url: str) -> str:
++    return f"{kis_env}|{api_base_url}|{cano}|{acnt_prdt_cd}"
++
++
++def _unique_archive_path(archive_dir: Path, name: str) -> Path:
++    candidate = archive_dir / name
++    if not candidate.exists():
++        return candidate
++    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
++    return archive_dir / f"{name}_{stamp}"
++
++
++def purge_bot_state(bot_state_dir: Path, archive_dir: Path, reason: str) -> None:
++    archive_dir.mkdir(parents=True, exist_ok=True)
++    targets: list[Path] = []
++    for rel in ("runtime", "trader_ledger", "db"):
++        targets.append(bot_state_dir / rel)
++    for pattern in ("positions*", "*state*"):
++        targets.extend(sorted(bot_state_dir.glob(pattern)))
++
++    seen: set[Path] = set()
++    for src in targets:
++        if src in seen:
++            continue
++        seen.add(src)
++        if not src.exists():
++            continue
++        dest = _unique_archive_path(archive_dir, src.name)
++        dest.parent.mkdir(parents=True, exist_ok=True)
++        try:
++            shutil.move(str(src), str(dest))
++            logger.warning(
++                "[STATE][PURGE] reason=%s src=%s archive=%s moved=1",
++                reason,
++                src,
++                dest,
++            )
++        except Exception:
++            logger.exception(
++                "[STATE][PURGE] reason=%s src=%s archive=%s moved=0",
++                reason,
++                src,
++                dest,
++            )
+diff --git a/trader/runtime_store.py b/trader/runtime_store.py
+index ca1a53b93e99e79800972159b9a059f112ea461e..3ae1556c23ec27e8b48afb9d5823d7ceb85fc218 100644
+--- a/trader/runtime_store.py
++++ b/trader/runtime_store.py
+@@ -1,106 +1,174 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from datetime import date
+ from pathlib import Path
+ 
+-from trader.botstate_paths import botstate_path
++from trader.botstate_paths import botstate_path, get_botstate_root
+ from trader.universe.lkg_store import lkg_path
+ 
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+ 
+ def _resolve_universe_env() -> str:
+     return (os.getenv("KIS_ENV") or "practice").lower()
+ 
+ 
+ def _resolve_universe_strategy() -> str:
+     return os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+ 
+ 
+ def universe_today_path(as_of: str) -> Path:
+     return botstate_path("runtime", "universe", f"{as_of}.json")
+ 
+ 
+ def universe_lkg_path() -> Path:
+     env = _resolve_universe_env()
+     strategy = _resolve_universe_strategy()
+     return lkg_path(env, strategy)
+ 
+ 
++class RuntimeStore:
++    def __init__(self, base_dir: Path) -> None:
++        self.base_dir = Path(base_dir)
++
++    def _normalize_rel(self, path: Path) -> Path:
++        raw = Path(path)
++        if raw.is_absolute():
++            try:
++                return raw.relative_to(self.base_dir)
++            except ValueError:
++                pass
++        parts = raw.parts
++        if "bot_state" in parts:
++            idx = parts.index("bot_state")
++            return Path(*parts[idx + 1 :])
++        if parts and parts[0] == "bot_state":
++            return Path(*parts[1:])
++        return raw
++
++    def _resolve_universe_path(self, raw_path: Path) -> tuple[Path, Path]:
++        rel = self._normalize_rel(raw_path)
++        abs_path = (self.base_dir / rel).resolve()
++        exists = abs_path.exists()
++        logger.info(
++            "[UNIVERSE][LOAD] bot_state_dir=%s rel=%s abs=%s exists=%s",
++            self.base_dir,
++            rel,
++            abs_path,
++            int(exists),
++        )
++        if not exists:
++            self._log_dir_snapshot()
++        return abs_path, rel
++
++    def _log_dir_snapshot(self) -> None:
++        base = self.base_dir
++        listing: dict[str, list[str]] = {}
++        if not base.exists():
++            logger.info("[UNIVERSE][LOAD][LIST] base_dir=%s missing=1", base)
++            return
++        for child in sorted(base.iterdir()):
++            if child.is_dir():
++                try:
++                    listing[str(child)] = [p.name for p in sorted(child.iterdir())]
++                except Exception:
++                    listing[str(child)] = ["<unreadable>"]
++            else:
++                listing[str(child)] = []
++        logger.info("[UNIVERSE][LOAD][LIST] base_dir=%s listing=%s", base, listing)
++
++    def _today_path(self, as_of: str) -> Path:
++        return self.base_dir / "runtime" / "universe" / f"{as_of}.json"
++
++    def _lkg_path(self) -> Path:
++        env = _resolve_universe_env()
++        strategy = _resolve_universe_strategy()
++        return lkg_path(env, strategy)
++
++    def universe_check(self, as_of: str) -> tuple[bool, dict]:
++        today_raw = self._today_path(as_of)
++        lkg_raw = self._lkg_path()
++        today, today_rel = self._resolve_universe_path(today_raw)
++        lkg, lkg_rel = self._resolve_universe_path(lkg_raw)
++        meta = {
++            "as_of": as_of,
++            "today_path": str(today),
++            "lkg_path": str(lkg),
++            "today_rel": str(today_rel),
++            "lkg_rel": str(lkg_rel),
++            "have_today": today.exists(),
++            "have_lkg": lkg.exists(),
++        }
++        ok = meta["have_today"] or meta["have_lkg"]
++        meta["ok"] = ok
++        meta["reason"] = "today" if meta["have_today"] else ("lkg" if meta["have_lkg"] else "missing")
++        selected_path = ""
++        if ok:
++            selected_path = str(today if meta["have_today"] else lkg)
++        meta["selected_path"] = selected_path
++        members_count = 0
++        if selected_path:
++            try:
++                with Path(selected_path).open("r", encoding="utf-8") as handle:
++                    data = json.load(handle)
++                members = data.get("members") if isinstance(data, dict) else data
++                if isinstance(members, list):
++                    members_count = len(members)
++            except Exception:
++                logger.exception("[UNIVERSE][CHECK][LOAD_FAIL] path=%s", selected_path)
++        meta["members"] = members_count
++        logger.info(
++            "[UNIVERSE][CHECK] as_of=%s have_today=%s have_lkg=%s ok=%s reason=%s selected_path=%s members=%s",
++            meta["as_of"],
++            int(meta["have_today"]),
++            int(meta["have_lkg"]),
++            int(meta["ok"]),
++            meta["reason"],
++            meta["selected_path"],
++            meta["members"],
++        )
++        return ok, meta
++
++    def load_universe_for_trading(self, as_of: str) -> tuple[list[dict], dict]:
++        ok, meta = self.universe_check(as_of)
++        if not ok:
++            return [], meta
++        today = Path(meta["today_path"])
++        p = today if today.exists() else Path(meta["lkg_path"])
++        meta["selected_path"] = str(p)
++        with p.open("r", encoding="utf-8") as f:
++            data = json.load(f)
++        members = data.get("members") if isinstance(data, dict) else data
++        if not isinstance(members, list):
++            members = []
++        meta["members"] = len(members)
++        return members, meta
++
++
+ def universe_check(as_of: str) -> tuple[bool, dict]:
+-    today = universe_today_path(as_of)
+-    lkg = universe_lkg_path()
+-    meta = {
+-        "as_of": as_of,
+-        "today_path": str(today),
+-        "lkg_path": str(lkg),
+-        "have_today": today.exists(),
+-        "have_lkg": lkg.exists(),
+-    }
+-    ok = meta["have_today"] or meta["have_lkg"]
+-    meta["ok"] = ok
+-    meta["reason"] = "today" if meta["have_today"] else ("lkg" if meta["have_lkg"] else "missing")
+-    selected_path = ""
+-    if ok:
+-        selected_path = str(today if meta["have_today"] else lkg)
+-    meta["selected_path"] = selected_path
+-    members_count = 0
+-    if selected_path:
+-        try:
+-            with Path(selected_path).open("r", encoding="utf-8") as handle:
+-                data = json.load(handle)
+-            members = data.get("members") if isinstance(data, dict) else data
+-            if isinstance(members, list):
+-                members_count = len(members)
+-        except Exception:
+-            logger.exception("[UNIVERSE][CHECK][LOAD_FAIL] path=%s", selected_path)
+-    meta["members"] = members_count
+-    logger.info(
+-        "[UNIVERSE][CHECK] as_of=%s have_today=%s have_lkg=%s ok=%s reason=%s selected_path=%s members=%s",
+-        meta["as_of"],
+-        int(meta["have_today"]),
+-        int(meta["have_lkg"]),
+-        int(meta["ok"]),
+-        meta["reason"],
+-        meta["selected_path"],
+-        meta["members"],
+-    )
+-    return ok, meta
++    return RuntimeStore(get_botstate_root()).universe_check(as_of)
+ 
+ 
+ def load_universe_for_trading(as_of: str) -> tuple[list[dict], dict]:
+     """
+     Prefer today; else LKG.
+     Returns: (members, meta)
+     """
+-    ok, meta = universe_check(as_of)
+-    if not ok:
+-        return [], meta
+-
+-    today = Path(meta["today_path"])
+-    p = today if today.exists() else Path(meta["lkg_path"])
+-    meta["selected_path"] = str(p)
+-    with p.open("r", encoding="utf-8") as f:
+-        data = json.load(f)
+-    members = data.get("members") if isinstance(data, dict) else data
+-    if not isinstance(members, list):
+-        members = []
+-    meta["members"] = len(members)
+-    return members, meta
++    return RuntimeStore(get_botstate_root()).load_universe_for_trading(as_of)
+ 
+ 
+ def check_universe_ready(today: date) -> dict[str, bool]:
+     ok, meta = universe_check(today.isoformat())
+     return {
+         "db_ok": meta.get("have_today", False),
+         "lkg_ok": meta.get("have_lkg", False),
+         "ok": ok,
+     }
+ 
+ 
+ def universe_today_exists(today: date) -> bool:
+     return check_universe_ready(today)["ok"]

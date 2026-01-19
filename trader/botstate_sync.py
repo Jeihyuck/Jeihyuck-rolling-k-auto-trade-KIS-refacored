@@ -128,6 +128,15 @@ class GitSyncStatus:
     behind: int
 
 
+@dataclass
+class BotStateContext:
+    worktree_dir: Path
+    bot_state_dir: Path
+    runtime_dir: Path
+    branch: str
+    ref: str
+
+
 def _run_git(cmd: list[str], cwd: Optional[str] = None, check: bool = True) -> Tuple[int, str]:
     p = subprocess.run(
         cmd,
@@ -259,7 +268,7 @@ def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref:
     logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s retried=1", wt)
 
 
-def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> None:
+def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> BotStateContext:
     base_dir = base_dir.resolve()
     worktree_dir = worktree_dir.resolve()
     _configure_safe_directories(base_dir, worktree_dir)
@@ -272,7 +281,15 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     _run(["git", "fetch", remote, "--prune"], cwd=base_dir)
     ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
-    os.environ["BOTSTATE_ROOT"] = str(worktree_dir / "bot_state")
+    bot_state_dir = worktree_dir / "bot_state"
+    os.environ["BOTSTATE_ROOT"] = str(bot_state_dir)
+    return BotStateContext(
+        worktree_dir=worktree_dir,
+        bot_state_dir=bot_state_dir,
+        runtime_dir=bot_state_dir / "runtime",
+        branch=target_branch,
+        ref=remote_ref,
+    )
 
 
 def _lock_path(worktree_dir: Path) -> Path:
