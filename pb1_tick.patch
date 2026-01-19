@@ -1,143 +1,8 @@
-diff --git a/.gitignore b/.gitignore
-index a02893941d2167965acd13c3919494f58a003ca3..4f7adb060e8677a7736ffb7e0ad508ba76cab79a 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -1,19 +1,32 @@
- __pycache__/
- .runtime/
- **/__pycache__/
- .venv/
- .vscode/
- .idea/
- logs/
- watchlists/
- *.log
- *.json
- .env
- bot_state/state.json
- kis_token_cache.json
- fastapi.log
- _botstate/
- trader/state/
- trader/state/ohlcv_cache/
- runtime/
- bot_state/
-+
-+# Allow tracking runtime universe outputs in bot_state
-+!bot_state/
-+!bot_state/runtime/
-+!bot_state/runtime/universe/
-+!bot_state/runtime/universe/**
-+!bot_state/runtime/universe_build_done_*.flag
-+!bot_state/runtime/universe_sanitize_*.json
-+!bot_state/runtime/*.flag
-+!bot_state/runtime/*.json
-+!bot_state/runtime/diagnostics/
-+!bot_state/runtime/diagnostics/*.json
-+!bot_state/runtime/diagnostics/universe_drop_*.json
-diff --git a/bot_state/.gitignore b/bot_state/.gitignore
-index 48e65ba7dbf2eff68e7747ef485a44cfd056524a..4287afbd5674b3b671e74a115327a7c6480d7e1c 100644
---- a/bot_state/.gitignore
-+++ b/bot_state/.gitignore
-@@ -1,9 +1,18 @@
- db/
- runtime/
- trader_state/
- trader_ledger/
- universe_lkg/
- 
- runtime/ohlcv_cache/
- runtime/**.parquet
- runtime/diagnostics/
-+!runtime/
-+!runtime/universe/
-+!runtime/universe/**
-+!runtime/universe_build_done_*.flag
-+!runtime/universe_sanitize_*.json
-+!runtime/*.flag
-+!runtime/*.json
-+!runtime/diagnostics/
-+!runtime/diagnostics/universe_drop_*.json
-diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
-index 119a9ac564edd4c459c26267de89ffe4ed26279e..b9756175ddc1f309532bbe58f12064d29092a721 100644
---- a/trader/botstate_persist.py
-+++ b/trader/botstate_persist.py
-@@ -16,56 +16,61 @@ from trader.botstate_sync import (
-     resolve_botstate_worktree_dir,
-     setup_worktree,
- )
- 
- logger = logging.getLogger(__name__)
- KST = ZoneInfo("Asia/Seoul")
- 
- 
- def _add_if_exists(paths: list[Path], candidate: Path) -> None:
-     if candidate.is_file():
-         paths.append(candidate)
- 
- 
- def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
-     for path in base_dir.glob(pattern):
-         if path.is_file():
-             paths.append(path)
- 
- 
- def _collect_paths(base_dir: Path) -> list[Path]:
-     paths: list[Path] = []
-     bot_root = get_botstate_root()
-     _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
-     _add_if_exists(paths, bot_root / "runtime/state.json")
-     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
-+    _add_glob(paths, bot_root, "runtime/universe/*.json")
-+    _add_glob(paths, bot_root, "runtime/universe/**/*.json")
-+    _add_glob(paths, bot_root, "runtime/universe_build_done_*.flag")
-+    _add_glob(paths, bot_root, "runtime/universe_sanitize_*.json")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
-     _add_if_exists(paths, botstate_path("runtime", "strategy_intents.jsonl"))
-     _add_if_exists(paths, botstate_path("runtime", "strategy_intents_state.json"))
-     _add_if_exists(paths, botstate_path("runtime", "diagnostics", "diag_latest.json"))
-     _add_glob(paths, bot_root, "runtime/diagnostics/diag_*.json")
-+    _add_glob(paths, bot_root, "runtime/diagnostics/universe_drop_*.json")
-     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
-     return paths
- 
- 
- def _resolve_owner() -> str:
-     return os.getenv("GITHUB_ACTOR", "local")
- 
- 
- def _resolve_run_id() -> str:
-     return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
- 
- 
- def main() -> int:
-     parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
-     parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
-     parser.add_argument(
-         "--soft-fail",
-         action="store_true",
-         help="Log errors and exit 0 instead of failing the job",
-     )
-     args = parser.parse_args()
- 
-     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
- 
-     try:
 diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e7e540738 100644
+index 88c07379dda624ba012d576dc4dd296e7e540738..abf6ffc6a14362fb464c63f0b1389b99c0a8e767 100644
 --- a/trader/botstate_sync.py
 +++ b/trader/botstate_sync.py
-@@ -73,50 +73,69 @@ def resolve_botstate_worktree_dir(repo_dir: Path) -> Path:
- 
- 
- def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subprocess.CompletedProcess:
-     try:
-         return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
-     except subprocess.CalledProcessError as exc:
-         logger.error(
-             "[BOTSTATE][CMD-ERROR] cmd=%s cwd=%s returncode=%s stdout=%s stderr=%s",
-             exc.cmd,
+@@ -82,50 +82,51 @@ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subp
              cwd,
              exc.returncode,
              exc.stdout,
@@ -154,25 +19,26 @@ index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e
      _git_worktree(worktree_dir, "add", "-A")
  
  
-+def stage_runtime_universe(worktree_dir: Path) -> None:
-+    pathspecs = [
-+        "bot_state/runtime/universe",
-+        "bot_state/runtime/universe_build_done_*.flag",
-+        "bot_state/runtime/universe_sanitize_*.json",
-+        "bot_state/runtime/diagnostics/universe_drop_*.json",
-+        "bot_state/runtime/*.flag",
-+        "bot_state/runtime/*.json",
-+        "bot_state/runtime/diagnostics/*.json",
-+    ]
-+    for spec in pathspecs:
-+        _git_worktree(worktree_dir, "add", "--", spec, check=False)
-+
-+
-+def _cached_diff_names(worktree_dir: Path) -> list[str]:
-+    output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
-+    return [line for line in output.splitlines() if line.strip()]
-+
-+
+ def stage_runtime_universe(worktree_dir: Path) -> None:
+     pathspecs = [
+         "bot_state/runtime/universe",
+         "bot_state/runtime/universe_build_done_*.flag",
+         "bot_state/runtime/universe_sanitize_*.json",
+         "bot_state/runtime/diagnostics/universe_drop_*.json",
+         "bot_state/runtime/*.flag",
+         "bot_state/runtime/*.json",
+         "bot_state/runtime/diagnostics/*.json",
++        "bot_state/universe_lkg/**/best_k_meta/latest.json",
+     ]
+     for spec in pathspecs:
+         _git_worktree(worktree_dir, "add", "--", spec, check=False)
+ 
+ 
+ def _cached_diff_names(worktree_dir: Path) -> list[str]:
+     output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
+     return [line for line in output.splitlines() if line.strip()]
+ 
+ 
  def commit_if_staged(worktree_dir: Path, message: str) -> bool:
      diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
      if diff_proc.returncode == 0:
@@ -188,115 +54,7 @@ index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e
      logger.info("[BOTSTATE][GIT] dirty=%s files=%s", dirty, files)
      if not dirty:
          return
-     stage_all(worktree_dir)
-     committed = commit_if_staged(worktree_dir, message_for_autosave)
-     logger.info("[BOTSTATE][GIT] committed=%s msg=%s", committed, message_for_autosave)
- 
- 
- def _git_worktree(worktree_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-     return _run(["git", "-C", str(worktree_dir), *args], check=check)
- 
- 
- @dataclass
-@@ -192,76 +211,92 @@ def _configure_safe_directories(base_dir: Path, worktree_dir: Path) -> None:
- 
- def get_dirty_status_excluding(base_dir: Path, paths_to_exclude: Iterable[str] | None = None) -> list[str]:
-     excludes = [path.strip().rstrip("/") for path in (paths_to_exclude or []) if path and str(path).strip()]
-     exclude_specs = [f":(exclude){path}" for path in excludes]
-     pathspec = ["--", ".", *exclude_specs]
-     tracked_out = _run(
-         ["git", "-C", str(base_dir), "diff", "--name-status", "HEAD", *pathspec],
-         check=True,
-     ).stdout.strip()
-     untracked_out = _run(
-         ["git", "-C", str(base_dir), "ls-files", "--others", "--exclude-standard", *pathspec],
-         check=True,
-     ).stdout.strip()
-     lines: list[str] = []
-     if tracked_out:
-         lines.extend([line for line in tracked_out.splitlines() if line.strip()])
-     if untracked_out:
-         lines.extend([f"?? {line}" for line in untracked_out.splitlines() if line.strip()])
-     return lines
- 
- 
- def _git(repo_dir: Path, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-     return subprocess.run(cmd, cwd=repo_dir, check=check, text=True, capture_output=True)
- 
- 
-+def _is_valid_git_worktree(path: Path) -> bool:
-+    try:
-+        proc = subprocess.run(
-+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
-+            check=False,
-+            text=True,
-+            capture_output=True,
-+        )
-+    except Exception:
-+        return False
-+    return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
-+
-+
- def get_worktree_paths(repo_dir: Path) -> set[Path]:
-     """
-     Parse: git worktree list --porcelain
-     Return: set of worktree paths
-     """
-     out = _git(repo_dir, ["git", "worktree", "list", "--porcelain"], check=True).stdout.splitlines()
-     paths: set[Path] = set()
-     for line in out:
-         if line.startswith("worktree "):
-             p = line.split(" ", 1)[1].strip()
-             if p:
-                 paths.add(Path(p).resolve())
-     return paths
- 
- 
- def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref: str) -> None:
-     """
-     Guarantee worktree_dir is usable.
-     - If dir exists but not registered: rmtree
-     - If registered: reuse
-     - If registered but broken: remove --force then recreate
-     """
-     wt = worktree_dir.resolve()
-     registered = get_worktree_paths(repo_dir)
- 
-     if wt.exists() and wt not in registered:
-+        if _is_valid_git_worktree(wt):
-+            logger.warning("[BOTSTATE][WORKTREE][DECISION] action=adopt dir=%s registered=0", wt)
-+            return
-         logger.warning("[BOTSTATE][WORKTREE][DECISION] action=rmtree dir=%s registered=0", wt)
-         shutil.rmtree(wt, ignore_errors=True)
- 
-     registered = get_worktree_paths(repo_dir)
-     if wt in registered:
-         logger.info("[BOTSTATE][WORKTREE][DECISION] action=reuse dir=%s", wt)
-         return
- 
-     _git(repo_dir, ["git", "worktree", "prune"], check=False)
-     logger.info("[BOTSTATE][WORKTREE][DECISION] action=create dir=%s branch=%s ref=%s", wt, branch, remote_ref)
-     proc = _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=False)
-     if proc.returncode == 0:
-         logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s", wt)
-         return
- 
-     logger.error(
-         "[BOTSTATE][WORKTREE][CREATE_FAIL] rc=%s stderr=%s",
-         proc.returncode,
-         (proc.stderr or "").strip(),
-     )
-     _git(repo_dir, ["git", "worktree", "remove", "--force", str(wt)], check=False)
-     shutil.rmtree(wt, ignore_errors=True)
-     _git(repo_dir, ["git", "worktree", "prune"], check=False)
- 
-     _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=True)
-@@ -569,50 +604,54 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-             if attempt == retries:
-                 raise
-             time.sleep(retry_sleep_sec)
-             continue
- 
+@@ -609,51 +610,60 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
          staged_any = False
          for path in files:
              try:
@@ -317,12 +75,22 @@ index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e
              except Exception:
                  continue
  
-+        stage_runtime_universe(worktree_dir)
-+        staged_files = _cached_diff_names(worktree_dir)
-+        logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
-+        staged_any = staged_any or bool(staged_files)
+         stage_runtime_universe(worktree_dir)
+         staged_files = _cached_diff_names(worktree_dir)
+         logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
+         staged_any = staged_any or bool(staged_files)
          if not staged_any:
-             logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
+-            logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
++            status = git_porcelain(worktree_dir).strip()
++            if not status:
++                logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
++            else:
++                logger.info(
++                    "[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d status=%s",
++                    message,
++                    attempt,
++                    status,
++                )
              return
  
          committed = commit_if_staged(worktree_dir, message)
@@ -346,148 +114,10 @@ index 7f137b818b1bf232d2fa0504a07639b6437972a4..88c07379dda624ba012d576dc4dd296e
              )
              logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
              return
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 5125a384076388a548603cb188237bf9e042f117..bf86af508c7c1023f6f1e49833f3fd00e485780f 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -126,50 +126,61 @@ def ensure_universe_built_once(
-             return
- 
-         if meta.get("have_today"):
-             return
- 
-         if flag.exists():
-             return
- 
-     reason = "force" if force else "auto_missing_today"
-     flag.parent.mkdir(parents=True, exist_ok=True)
-     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
- 
-     cmd = [
-         "python",
-         "-m",
-         "trader.universe.build",
-         "--env",
-         env,
-         "--strategy",
-         strategy,
-         "--date",
-         as_of,
-     ]
-     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
-     subprocess.run(cmd, check=False)
-+    _, post_meta = runtime_store.load_today_universe(as_of)
-+    if post_meta.get("have_today"):
-+        log.info(
-+            "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
-+            post_meta.get("today_path"),
-+        )
-+    else:
-+        log.warning(
-+            "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
-+            post_meta.get("today_path"),
-+        )
- 
- 
- def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
-     events_dir = base_dir / "runtime" / "events"
-     events_dir.mkdir(parents=True, exist_ok=True)
-     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
-     ensure_not_repo_tracked_path(path)
-     line = json.dumps(payload, ensure_ascii=False)
-     with path.open("a", encoding="utf-8") as handle:
-         handle.write(line + "\n")
-     logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
-     return path
- 
- 
- def _handle_missing_positions_reset(
-     *,
-     balance_snapshot: dict | None,
-     env: str,
-     strategy: str,
-     run_id: str | None,
-     positions_repo: PositionsRepo,
-     ledger_repo: LedgerEventsRepo,
-     bot_state_dir: Path,
- ) -> bool:
-     if not balance_snapshot:
-diff --git a/trader/runtime_store.py b/trader/runtime_store.py
-index 42534d8dbcea9225aa5c49bd71a49a3b1baed439..2453f2c0f293cd9259fc8e6075c772ce67ae7e5e 100644
---- a/trader/runtime_store.py
-+++ b/trader/runtime_store.py
-@@ -149,49 +149,71 @@ class RuntimeStore:
-             meta["members"],
-         )
-         if not meta["have_today"] and meta["have_lkg"]:
-             logger.info(
-                 "[UNIVERSE][CHECK] today_missing -> using_lkg path=%s members=%s",
-                 meta["selected_path"],
-                 meta["members"],
-             )
-         return ok, meta
- 
-     def load_universe_for_trading(self, as_of: str) -> tuple[list[dict], dict]:
-         ok, meta = self.universe_check(as_of)
-         if not ok:
-             return [], meta
-         today = Path(meta["today_path"])
-         p = today if today.exists() else Path(meta["lkg_path"])
-         meta["selected_path"] = str(p)
-         with p.open("r", encoding="utf-8") as f:
-             data = json.load(f)
-         members = data.get("members") if isinstance(data, dict) else data
-         if not isinstance(members, list):
-             members = []
-         meta["members"] = len(members)
-         return members, meta
- 
-+    def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
-+        today_raw = self._today_path(as_of)
-+        today, today_rel = self._resolve_universe_path(today_raw)
-+        meta = {
-+            "as_of": as_of,
-+            "today_path": str(today),
-+            "today_rel": str(today_rel),
-+            "have_today": today.exists(),
-+        }
-+        members: list[dict] = []
-+        if meta["have_today"]:
-+            try:
-+                with today.open("r", encoding="utf-8") as handle:
-+                    data = json.load(handle)
-+                loaded = data.get("members") if isinstance(data, dict) else data
-+                if isinstance(loaded, list):
-+                    members = loaded
-+            except Exception:
-+                logger.exception("[UNIVERSE][LOAD_TODAY][FAIL] path=%s", today)
-+        meta["members"] = len(members)
-+        return members, meta
-+
- 
- def universe_check(as_of: str) -> tuple[bool, dict]:
-     return RuntimeStore(get_botstate_root()).universe_check(as_of)
- 
- 
- def load_universe_for_trading(as_of: str) -> tuple[list[dict], dict]:
-     """
-     Prefer today; else LKG.
-     Returns: (members, meta)
-     """
-     return RuntimeStore(get_botstate_root()).load_universe_for_trading(as_of)
- 
- 
- def check_universe_ready(today: date) -> dict[str, bool]:
-     ok, meta = universe_check(today.isoformat())
-     return {
-         "db_ok": meta.get("have_today", False),
-         "lkg_ok": meta.get("have_lkg", False),
-         "ok": ok,
-     }
- 
- 
- def universe_today_exists(today: date) -> bool:
-     return check_universe_ready(today)["ok"]
+         except RuntimeError as exc:
+             logger.warning(
+
+
 
 
 

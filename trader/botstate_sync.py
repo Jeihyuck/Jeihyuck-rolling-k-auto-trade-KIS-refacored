@@ -104,6 +104,7 @@ def stage_runtime_universe(worktree_dir: Path) -> None:
         "bot_state/runtime/*.flag",
         "bot_state/runtime/*.json",
         "bot_state/runtime/diagnostics/*.json",
+        "bot_state/universe_lkg/**/best_k_meta/latest.json",
     ]
     for spec in pathspecs:
         _git_worktree(worktree_dir, "add", "--", spec, check=False)
@@ -631,7 +632,16 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         logger.info("[BOTSTATE][GIT] staged_files=%s", staged_files)
         staged_any = staged_any or bool(staged_files)
         if not staged_any:
-            logger.info("[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d", message, attempt)
+            status = git_porcelain(worktree_dir).strip()
+            if not status:
+                logger.info("[BOTSTATE][PERSIST] no_changes message=%s attempt=%d", message, attempt)
+            else:
+                logger.info(
+                    "[BOTSTATE][PERSIST] no_staged_files message=%s attempt=%d status=%s",
+                    message,
+                    attempt,
+                    status,
+                )
             return
 
         committed = commit_if_staged(worktree_dir, message)
