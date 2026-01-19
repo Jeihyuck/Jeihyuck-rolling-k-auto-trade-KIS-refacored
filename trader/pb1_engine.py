@@ -144,6 +144,25 @@ def _is_missing(value: float | None) -> bool:
     return value is None or (isinstance(value, float) and value != value)
 
 
+def _extract_dnca_tot_amt(balance_resp: dict) -> int | None:
+    if not isinstance(balance_resp, dict):
+        return None
+    out2 = balance_resp.get("output2")
+    if isinstance(out2, list) and out2:
+        row = out2[0]
+        if isinstance(row, dict) and row:
+            value = row.get("dnca_tot_amt")
+            if value is not None and str(value).strip() != "":
+                return int(float(str(value).replace(",", "")))
+        if isinstance(row, dict) and not row:
+            return None
+    if isinstance(out2, dict) and out2:
+        value = out2.get("dnca_tot_amt")
+        if value is not None and str(value).strip() != "":
+            return int(float(str(value).replace(",", "")))
+    return None
+
+
 @dataclass
 class CandidateFeature:
     code: str
@@ -520,28 +539,35 @@ class PB1Engine:
                     snapshot = refreshed_snapshot
                 except Exception as exc:
                     raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
-        available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
-        if available_cash_krw is None:
-            logger.warning(
-                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
-                list(snapshot.keys()),
-                cash_meta.get("output2_keys") or [],
-            )
+
+        orderable = None
+        if self.kis:
+            try:
+                orderable, _meta = self.kis.get_orderable_cash(code_hint="000000", price_hint=1000)
+            except Exception:
+                orderable = None
+
+        if isinstance(orderable, (int, float)) and orderable > 0:
+            available_cash_krw = int(orderable)
+            return snapshot, available_cash_krw, {"source": "orderable_cash"}
+
+        balance_resp = snapshot
+        if self.kis:
+            try:
+                balance_resp = self.kis.get_balance_cached(force=False)
+            except Exception:
+                balance_resp = snapshot
+
+        out2 = balance_resp.get("output2")
+        if isinstance(out2, list) and out2 and isinstance(out2[0], dict) and not out2[0]:
             if self.kis:
-                try:
-                    refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
-                    snapshot = refreshed_snapshot
-                    available_cash_krw, cash_meta = self._parse_available_cash_snapshot(snapshot)
-                except Exception as exc:
-                    raise RuntimeError("Balance refresh failed after parse error") from exc
-        if available_cash_krw is None:
-            logger.warning(
-                "[PB1][CASH][PARSE_FAIL] keys=%s raw_output2_0_keys=%s",
-                list(snapshot.keys()),
-                cash_meta.get("output2_keys") or [],
-            )
+                balance_resp = self.kis.get_balance_cached(force=True)
+
+        dnca = _extract_dnca_tot_amt(balance_resp)
+        if dnca is None:
             raise RuntimeError("Balance parse failed: cannot locate dnca_tot_amt/ord_psbl_cash")
-        return snapshot, available_cash_krw, cash_meta
+
+        return snapshot, int(dnca), {"source": "balance_dnca_tot_amt"}
 
     def _resolve_entry_capital(
         self,

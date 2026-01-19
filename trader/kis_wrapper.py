@@ -16,6 +16,7 @@ import time
 import random
 import logging
 import threading
+import copy
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -90,6 +91,13 @@ def safe_strip(val):
 
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+
+
+def _deepcopy_json(value: Any) -> Any:
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
 
 
 def _order_block_reason(now: datetime | None = None) -> Optional[str]:
@@ -1425,19 +1433,20 @@ class KisAPI:
             logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
             source = "wrapper_cache"
             if return_source:
-                return self._balance_cache, source
-            return self._balance_cache
+                return _deepcopy_json(self._balance_cache), source
+            return _deepcopy_json(self._balance_cache)
         logger.info("[BALANCE][CACHE] hit=False force=%s", force)
         snap: dict = {}
         try:
             snap = self.inquire_balance_all()
-            self._balance_cache = snap
+            cache_value = _deepcopy_json(snap)
+            self._balance_cache = cache_value
             self._balance_cache_at = now_kst()
         except Exception as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
         if return_source:
-            return snap, source
-        return snap
+            return _deepcopy_json(snap), source
+        return _deepcopy_json(snap)
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:

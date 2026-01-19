@@ -7,6 +7,7 @@ import os
 import subprocess
 import signal
 import time as time_mod
+import copy
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -64,6 +65,13 @@ from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
 log = logger
+
+
+def _deepcopy_json(value):
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
 
 
 def universe_build_flag(as_of: str) -> Path:
@@ -808,6 +816,7 @@ def run_once(
             try:
                 _log_balance_cache(force=False)
                 balance_snapshot_raw, balance_source = kis.get_balance_cached(force=False, return_source=True)
+                balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
                 balance_snapshot_safe = sanitize_balance_snapshot(balance_snapshot_raw)
                 _persist_balance_snapshot(balance_snapshot_safe, resolved_bot_state_dir, as_of=now)
             except Exception:

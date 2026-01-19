@@ -15,15 +15,21 @@ class DummyLedgerRepo:
 
 
 class DummyKis:
-    def __init__(self, snapshot):
+    def __init__(self, snapshot, refreshed_snapshot=None, orderable=0):
         self.snapshot = snapshot
+        self.refreshed_snapshot = refreshed_snapshot or snapshot
+        self.orderable = orderable
         self.calls = []
 
     def get_balance_cached(self, force=False, return_source=False):
         self.calls.append(force)
+        data = self.refreshed_snapshot if force else self.snapshot
         if return_source:
-            return self.snapshot, "api"
-        return self.snapshot
+            return data, "api"
+        return data
+
+    def get_orderable_cash(self, code_hint=None, price_hint=None):
+        return self.orderable, {}
 
 
 def _make_engine(*, kis=None, ledger_repo=None, env="practice"):
@@ -57,28 +63,29 @@ def test_entry_capital_ignores_zero_override():
 
 
 def test_balance_parse_refreshes_once_on_failure():
-    snapshot = {"output2": [{"dnca_tot_amt": "10000000"}], "output1": []}
-    kis = DummyKis(snapshot)
+    snapshot = {"output2": [{}], "output1": []}
+    refreshed = {"output2": [{"dnca_tot_amt": "10000000"}], "output1": []}
+    kis = DummyKis(snapshot, refreshed_snapshot=refreshed, orderable=0)
     engine = _make_engine(kis=kis)
-    initial = {"output2": [], "output1": []}
+    initial = {"output2": [{}], "output1": []}
 
     refreshed, cash, meta = engine._resolve_holdings_snapshot_with_cash(initial)
 
     assert cash == 10_000_000
-    assert meta["selected_key"] == "dnca_tot_amt"
-    assert refreshed == snapshot
-    assert kis.calls == [True]
+    assert meta["source"] == "balance_dnca_tot_amt"
+    assert refreshed == initial
+    assert kis.calls == [False, True]
 
 
 def test_balance_parse_raises_after_failed_refresh():
-    snapshot = {"output2": [], "output1": []}
-    kis = DummyKis(snapshot)
+    snapshot = {"output2": [{}], "output1": []}
+    kis = DummyKis(snapshot, refreshed_snapshot=snapshot, orderable=0)
     engine = _make_engine(kis=kis)
 
     with pytest.raises(RuntimeError, match="Balance parse failed"):
         engine._resolve_holdings_snapshot_with_cash(snapshot)
 
-    assert kis.calls == [True]
+    assert kis.calls == [False, True]
 
 
 def test_ledger_only_positions_are_marked_orphan(monkeypatch):
