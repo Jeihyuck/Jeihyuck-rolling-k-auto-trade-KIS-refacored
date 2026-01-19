@@ -51,11 +51,11 @@ jobs:
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-      BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
       PAPER_MAX_CAPITAL_KRW: "10000000"
 
       # ✅ FIX: do NOT use runner.temp (invalid in this context). Use github.workspace.
       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+      BOT_STATE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state
       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -246,7 +246,6 @@ jobs:
       PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
-      BOT_STATE_DIR: "${{ github.workspace }}/repo/bot_state"
       PAPER_MAX_CAPITAL_KRW: "10000000"
 
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
@@ -256,6 +255,7 @@ jobs:
 
       # ✅ FIX: do NOT use runner.temp here either
       BOTSTATE_WORKTREE_DIR: "${{ github.workspace }}/_botstate_worktree/${{ github.run_id }}_${{ github.job }}"
+      BOT_STATE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}/bot_state
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}

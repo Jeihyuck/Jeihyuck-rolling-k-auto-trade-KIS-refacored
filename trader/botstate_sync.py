@@ -23,6 +23,38 @@ DEFAULT_LOCK_TTL_SEC = 240
 DEFAULT_LOCK_RETRY_SEC = 55
 DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
 DEFAULT_LOCK_BUFFER_SEC = 180
+BOTSTATE_GITIGNORE_TEXT = """\
+# --- botstate (tracked artifacts) ---
+# Keep universe artifacts, diagnostics, db, and minimal runtime meta.
+
+# Large caches MUST NOT be committed
+bot_state/runtime/ohlcv_cache/
+bot_state/runtime/ohlcv_cache/**
+
+# Optional: other noisy runtime temp (필요시 켜기)
+# bot_state/runtime/tmp/
+# bot_state/runtime/tmp/**
+
+# Python / OS noise
+.DS_Store
+__pycache__/
+*.pyc
+"""
+
+
+def ensure_botstate_gitignore(workdir: str) -> None:
+    # workdir is the botstate worktree root
+    path = os.path.join(workdir, "bot_state", ".gitignore")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    current = None
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            current = f.read()
+
+    if current != BOTSTATE_GITIGNORE_TEXT:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(BOTSTATE_GITIGNORE_TEXT)
 
 
 def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
@@ -579,6 +611,7 @@ def release_lock(worktree_dir: Path, owner: str, run_id: str) -> None:
 
 def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: str, retries: int = 3) -> None:
     worktree_dir = worktree_dir.resolve()
+    ensure_botstate_gitignore(str(worktree_dir))
     files = list(new_files)
     branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     remote = "origin"
@@ -629,6 +662,11 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         _git_worktree(worktree_dir, "add", "-A", "bot_state")
         if _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False).returncode == 0:
             logger.info("[BOTSTATE][PERSIST] no staged changes after add -A bot_state -> skip")
+            post = git_porcelain(worktree_dir)
+            if post.strip():
+                raise RuntimeError(
+                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                )
             return
         status = git_porcelain(worktree_dir)
         status_lines = [line for line in status.splitlines() if line.strip()]
@@ -641,6 +679,11 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
         if not status2_lines:
             logger.info("[PERSIST] no changes -> skip")
+            post = git_porcelain(worktree_dir)
+            if post.strip():
+                raise RuntimeError(
+                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                )
             return
 
         committed = commit_if_staged(worktree_dir, message)
@@ -653,6 +696,11 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         )
         if not committed:
             logger.info("[PERSIST] no changes -> skip")
+            post = git_porcelain(worktree_dir)
+            if post.strip():
+                raise RuntimeError(
+                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                )
             return
 
         try:
@@ -663,6 +711,11 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                 attempt,
             )
             logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+            post = git_porcelain(worktree_dir)
+            if post.strip():
+                raise RuntimeError(
+                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                )
             return
         except RuntimeError as exc:
             logger.warning(
