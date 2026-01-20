@@ -60,6 +60,7 @@ from trader.kis_wrapper import KisAPI
 from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
+from trader.reconcile_db import close_stale_positions
 from trader.reset_utils import detect_account_fp, purge_bot_state
 from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
 from trader.time_utils import now_kst
@@ -181,6 +182,8 @@ def _handle_missing_positions_reset(
     env: str,
     strategy: str,
     run_id: str | None,
+    engine,
+    kis: KisAPI | None,
     orders_count: int,
     fills_count: int,
     positions_repo: PositionsRepo,
@@ -188,6 +191,7 @@ def _handle_missing_positions_reset(
     bot_state_dir: Path,
     reset_on_missing_positions: bool,
     force_safe_exit: bool,
+    hard_reset_requested: bool,
 ) -> bool:
     if not balance_snapshot:
         return False
@@ -214,7 +218,23 @@ def _handle_missing_positions_reset(
     if not missing_codes:
         return False
     if not reset_on_missing_positions and not force_safe_exit:
-        closed_count = positions_repo.close_positions(env=env, strategy=strategy, codes=sorted(position_codes))
+        if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
+            reset_result = hard_reset_bot_state(bot_state_dir, reason="stale_db")
+            os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
+            logger.warning(
+                "[PB1][RESET][HARD_STALE_DB] env=%s missing_positions=%s result=%s",
+                env,
+                missing_codes,
+                reset_result,
+            )
+            return True
+        closed_count = close_stale_positions(
+            engine=engine,
+            env=env,
+            strategy=strategy,
+            reason="stale_db_holdings_empty",
+            ts=now_kst(),
+        )
         for code in missing_codes:
             ledger_repo.append_event(
                 env=env,
@@ -232,6 +252,20 @@ def _handle_missing_positions_reset(
                     "fills": fills_count,
                 },
             )
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            event_type="STALE_DB_SOFT_RESET",
+            ts=now_kst(),
+            ok=True,
+            reasons=["holdings_empty", "soft_close"],
+            payload_json={
+                "closed_positions": closed_count,
+                "missing_codes": missing_codes,
+                "orders": orders_count,
+                "fills": fills_count,
+            },
+        )
         emit_event(
             as_of=now_kst().date().isoformat(),
             event="stale_db_autoclosed",
@@ -252,6 +286,11 @@ def _handle_missing_positions_reset(
             missing_codes,
             closed_count,
         )
+        if kis is not None:
+            try:
+                reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
+            except Exception:
+                logger.exception("[PB1][RESET][STALE_DB] reconcile_today failed")
         return False
     closed_count = 0
     if position_codes:
@@ -590,9 +629,9 @@ def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateCo
     if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
         return None
     if BOT_STATE_HARD_RESET and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-        deleted = hard_reset_bot_state(ctx.bot_state_dir)
+        reset_result = hard_reset_bot_state(ctx.bot_state_dir, reason="session_start")
         os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
-        logger.info("[BOTSTATE][HARD_RESET][DONE] deleted=%s", deleted)
+        logger.info("[BOTSTATE][HARD_RESET][DONE] result=%s", reset_result)
     return ctx
 
 
@@ -963,7 +1002,9 @@ def run_once(
             account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
             runtime_fp = runtime_meta.get("account_fp")
-            if BOT_STATE_RESET:
+            if BOT_STATE_HARD_RESET:
+                reset_reason = None
+            elif BOT_STATE_RESET:
                 reset_reason = "env_reset"
             elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
                 reset_reason = "account_fp_mismatch"
@@ -1026,6 +1067,8 @@ def run_once(
             env=kis_env or "practice",
             strategy="pb1_pullback_close",
             run_id=run_record_id,
+            engine=engine,
+            kis=kis,
             orders_count=len(todays_orders),
             fills_count=len(todays_fills),
             positions_repo=positions_repo,
@@ -1033,6 +1076,7 @@ def run_once(
             bot_state_dir=resolved_bot_state_dir,
             reset_on_missing_positions=reset_on_missing_positions,
             force_safe_exit=force_safe_exit,
+            hard_reset_requested=BOT_STATE_HARD_RESET,
         ):
             if env_bool("PRACTICE_RESET_DAY", False):
                 os.environ["PB1_ENTRY_ENABLED"] = "0"

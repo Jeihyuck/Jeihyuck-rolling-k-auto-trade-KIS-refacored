@@ -34,6 +34,10 @@ BOTSTATE_GITIGNORE_TEXT = """\
 bot_state/runtime/ohlcv_cache/
 bot_state/runtime/ohlcv_cache/**
 
+# Runtime event logs should be tracked
+!bot_state/runtime/events/
+!bot_state/runtime/events/**
+
 # Optional: other noisy runtime temp (필요시 켜기)
 # bot_state/runtime/tmp/
 # bot_state/runtime/tmp/**
@@ -127,63 +131,93 @@ def ensure_sqlite_writable(db_path: str | Path) -> None:
         logger.warning("[DB][PERM][STAT_FAIL] path=%s", db_path, exc_info=True)
 
 
-def hard_reset_bot_state(bot_state_dir: Path) -> list[str]:
+def _is_live_trading_env() -> bool:
+    env = (os.getenv("KIS_ENV") or "").strip().lower()
+    mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+    live_flag = (os.getenv("LIVE_TRADING_ENABLED") or "").strip()
+    return env in {"live", "real", "prod", "production"} or mode == "LIVE" or live_flag == "1"
+
+
+def _reset_flag_path(bot_state_dir: Path, as_of: str) -> Path:
+    return bot_state_dir / "runtime" / "reset_flags" / f"{as_of}.json"
+
+
+def _ensure_gitkeep(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    gitkeep = path / ".gitkeep"
+    if not gitkeep.exists():
+        gitkeep.write_text("", encoding="utf-8")
+
+
+def hard_reset_bot_state(bot_state_dir: Path, *, reason: str = "manual") -> dict:
     deleted: list[str] = []
-    targets: list[Path] = []
+    skipped = False
+    now = datetime.now(tz=KST)
+    as_of = now.date().isoformat()
+    reset_flag_path = _reset_flag_path(bot_state_dir, as_of)
+    is_live = _is_live_trading_env()
+
+    if is_live and reset_flag_path.exists():
+        logger.warning("[RESET][HARD][SKIP] reason=already_reset_today flag=%s", reset_flag_path)
+        return {"skipped": True, "reason": "already_reset_today", "flag": str(reset_flag_path)}
+
     db_path = bot_state_dir / "db" / "pbcore.sqlite3"
-    targets.extend(
-        [
-            db_path,
-            db_path.with_name(f"{db_path.name}-wal"),
-            db_path.with_name(f"{db_path.name}-shm"),
-        ]
-    )
-    targets.append(bot_state_dir / "universe_lkg")
-    runtime_dir = bot_state_dir / "runtime"
-    locks_dir = bot_state_dir / "locks"
-
-    for path in targets:
+    for target in [db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")]:
         try:
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-                deleted.append(str(path))
-            elif path.exists():
-                path.unlink()
-                deleted.append(str(path))
+            if target.exists():
+                target.unlink()
+                deleted.append(str(target))
+                logger.info("[RESET][HARD] removed %s", target.name)
         except Exception:
-            logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", path, exc_info=True)
+            logger.warning("[RESET][HARD][SKIP] path=%s", target, exc_info=True)
 
+    runtime_dir = bot_state_dir / "runtime"
     if runtime_dir.exists():
-        for child in runtime_dir.iterdir():
-            if child.name in {".gitkeep", ".gitignore"}:
-                continue
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink()
-                deleted.append(str(child))
-            except Exception:
-                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", child, exc_info=True)
+        try:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+            deleted.append(str(runtime_dir))
+            logger.info("[RESET][HARD] removed runtime/")
+        except Exception:
+            logger.warning("[RESET][HARD][SKIP] path=%s", runtime_dir, exc_info=True)
 
-    if locks_dir.exists():
-        for lock_path in locks_dir.glob("*.json"):
+    for ledger_dir in [bot_state_dir / "ledger", bot_state_dir / "trader_ledger"]:
+        if ledger_dir.exists():
             try:
-                lock_path.unlink()
-                deleted.append(str(lock_path))
+                shutil.rmtree(ledger_dir, ignore_errors=True)
+                deleted.append(str(ledger_dir))
+                logger.info("[RESET][HARD] removed %s/", ledger_dir.name)
             except Exception:
-                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", lock_path, exc_info=True)
+                logger.warning("[RESET][HARD][SKIP] path=%s", ledger_dir, exc_info=True)
 
-    if runtime_dir.exists():
-        for lock_path in runtime_dir.glob("lock*.json"):
+    for extra in [bot_state_dir / "universe_lkg", bot_state_dir / "locks"]:
+        if extra.exists():
             try:
-                lock_path.unlink()
-                deleted.append(str(lock_path))
+                shutil.rmtree(extra, ignore_errors=True)
+                deleted.append(str(extra))
             except Exception:
-                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", lock_path, exc_info=True)
+                logger.warning("[RESET][HARD][SKIP] path=%s", extra, exc_info=True)
 
-    logger.info("[BOTSTATE][HARD_RESET] deleted=%s", deleted)
-    return deleted
+    _ensure_gitkeep(bot_state_dir / "runtime")
+    _ensure_gitkeep(bot_state_dir / "trader_ledger")
+    _ensure_gitkeep(bot_state_dir / "ledger")
+    (bot_state_dir / "db").mkdir(parents=True, exist_ok=True)
+
+    reset_flag_path.parent.mkdir(parents=True, exist_ok=True)
+    reset_flag_path.write_text(
+        json.dumps(
+            {
+                "ts": now.isoformat(),
+                "reason": reason,
+                "live": is_live,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    logger.info("[BOTSTATE][HARD_RESET] deleted=%s skipped=%s", deleted, skipped)
+    return {"deleted": deleted, "skipped": skipped, "flag": str(reset_flag_path)}
 
 
 def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
@@ -253,6 +287,23 @@ def _run(cmd: list[str], cwd: Path | None = None, *, check: bool = True) -> subp
             exc.stderr,
         )
         raise
+
+
+def _run_git_logged(args: list[str], cwd: Path, *, check: bool = True, label: str) -> subprocess.CompletedProcess:
+    proc = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True)
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    logger.info(
+        "[BOTSTATE][PERSIST][GIT] label=%s cmd=%s rc=%s stdout=%s stderr=%s",
+        label,
+        " ".join(args),
+        proc.returncode,
+        stdout[-800:],
+        stderr[-800:],
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git command failed ({label}): {' '.join(args)}\n{stdout}\n{stderr}")
+    return proc
 
 
 def git_porcelain(worktree_dir: Path) -> str:
@@ -617,11 +668,11 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
                     ttl_sec,
                 )
                 if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-                    deleted = hard_reset_bot_state(worktree_dir / "bot_state")
+                    reset_result = hard_reset_bot_state(worktree_dir / "bot_state", reason="lock_acquired")
                     os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
                     logger.info(
-                        "[BOTSTATE][HARD_RESET][DONE] deleted=%s stale_takeover=%s",
-                        deleted,
+                        "[BOTSTATE][HARD_RESET][DONE] result=%s stale_takeover=%s",
+                        reset_result,
                         stale_takeover,
                     )
                 return True
@@ -810,8 +861,14 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
-        _git_worktree(worktree_dir, "add", "-A", "bot_state")
-        if _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False).returncode == 0:
+        _run_git_logged(["add", "-A", "bot_state"], worktree_dir, check=True, label="add_all_bot_state")
+        status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
+        cached_names = _run_git_logged(
+            ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
+        ).stdout
+        if _run_git_logged(
+            ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
+        ).returncode == 0:
             logger.info("[BOTSTATE][PERSIST] no staged changes after add -A bot_state -> skip")
             post = git_porcelain(worktree_dir)
             if post.strip():
@@ -819,14 +876,13 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                     "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
                 )
             return
-        status = git_porcelain(worktree_dir)
         status_lines = [line for line in status.splitlines() if line.strip()]
         stage_runtime_universe(worktree_dir)
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
         stage_all(worktree_dir)
         status2 = git_porcelain(worktree_dir)
         status2_lines = [line for line in status2.splitlines() if line.strip()]
-        staged_files = _cached_diff_names(worktree_dir)
+        staged_files = [line for line in cached_names.splitlines() if line.strip()]
         logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
         if not status2_lines:
             logger.info("[PERSIST] no changes -> skip")

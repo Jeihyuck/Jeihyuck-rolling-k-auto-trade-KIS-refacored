@@ -7,12 +7,15 @@ universe_lkg/
 # ---- runtime big caches: do NOT persist to git ----
 runtime/**.parquet
 !runtime/
+!runtime/.gitkeep
 !runtime/universe/
 !runtime/universe/**
 !runtime/universe_build_done_*.flag
 !runtime/universe_sanitize_*.json
 !runtime/*.flag
 !runtime/*.json
+!runtime/events/
+!runtime/events/**
 !runtime/diagnostics/
 !runtime/diagnostics/**
 

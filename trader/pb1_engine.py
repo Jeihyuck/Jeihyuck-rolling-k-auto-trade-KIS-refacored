@@ -853,6 +853,30 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", cf.code)
 
+    def _safe_score(self, cf: CandidateFeature) -> float:
+        score_val = (
+            getattr(cf, "score", None)
+            or getattr(cf, "rank_score", None)
+            or getattr(cf, "total_score", None)
+            or cf.features.get("score")
+        )
+        if score_val is None:
+            meta = getattr(cf, "meta", None)
+            if isinstance(meta, dict):
+                score_val = meta.get("score")
+        if score_val is None:
+            logger.warning("[PB1][BUY][SCORE_MISSING] code=%s -> fallback to 0.0", cf.code)
+            return 0.0
+        try:
+            return float(score_val)
+        except Exception:
+            logger.warning(
+                "[PB1][BUY][SCORE_INVALID] code=%s raw=%s -> fallback to 0.0",
+                cf.code,
+                score_val,
+            )
+            return 0.0
+
     def _emit_buy_decision(
         self,
         cf: CandidateFeature,
@@ -880,18 +904,11 @@ class PB1Engine:
             return
         buyable = entry_allowed and not reasons
         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
-        score_val = (
-            getattr(cf, "score", None)
-            or getattr(cf, "rank_score", None)
-            or getattr(cf, "total_score", None)
-            or cf.features.get("score")
-            or 0.0
-        )
         payload = to_jsonable(
             {
                 "code": cf.code,
                 "market": cf.market,
-                "score": _to_float(score_val),
+                "score": self._safe_score(cf),
                 "qty": qty,
                 "price": _to_float(price),
                 "notional": _to_float(order_value),
