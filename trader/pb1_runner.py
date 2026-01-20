@@ -82,6 +82,47 @@ def _deepcopy_json(value):
         return value
 
 
+def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
+    """
+    DIAG에서도 1회 잔고조회(총액/주문가능/예수금)를 시도하고 로그로 남김.
+    실패해도 예외를 던지지 않는다.
+    """
+    try:
+        diag_dir = os.path.join(runtime_dir, "diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
+        if os.path.exists(flag_path):
+            return
+
+        logger.info(
+            "[DIAG][CAPITAL-CONFIG] DAILY_CAPITAL=%s PAPER_MAX_CAPITAL_KRW=%s ENTRY_BUDGET_PCT=%s RESERVE=%s",
+            os.getenv("DAILY_CAPITAL"),
+            os.getenv("PAPER_MAX_CAPITAL_KRW"),
+            os.getenv("PB1_ENTRY_BUDGET_PCT"),
+            os.getenv("RESERVE"),
+        )
+
+        try:
+            kis = kis_factory()
+            snap = kis.get_balance_snapshot_safe()
+            logger.info(
+                "[DIAG][BALANCE] total_asset_krw=%s total_eval_krw=%s cash_total_krw=%s orderable_cash_krw=%s deposit_like_krw=%s raw_keys=%s",
+                snap.get("total_asset_krw"),
+                snap.get("total_eval_krw"),
+                snap.get("cash_total_krw"),
+                snap.get("orderable_cash_krw"),
+                snap.get("deposit_like_krw"),
+                snap.get("raw_keys"),
+            )
+        except Exception as exc:
+            logger.warning("[DIAG][BALANCE][SKIP] %s", str(exc))
+
+        with open(flag_path, "w", encoding="utf-8") as handle:
+            handle.write(datetime.now().isoformat())
+    except Exception:
+        return
+
+
 def universe_build_flag(as_of: str) -> Path:
     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
 
@@ -1237,6 +1278,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 break
             now = _get_now_kst()
             if now >= close_dt:
+                if mode == "DIAG":
+                    _diag_balance_probe_once(
+                        logger=logger,
+                        runtime_dir=str(get_botstate_root() / "runtime"),
+                        kis_factory=lambda: KisAPI(),
+                    )
                 logger.info("[PB1][LOOP] market closed -> exit")
                 exit_reason = "market_closed"
                 break

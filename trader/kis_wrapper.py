@@ -1641,6 +1641,52 @@ class KisAPI:
         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
         return self.get_balance_cached()
 
+    def get_balance_snapshot_safe(self) -> dict:
+        """
+        잔고조회 결과에서 '총액/주문가능/예수금'을 최대한 안전하게 추출한다.
+        실패해도 예외를 최소화하고, 원인 확인을 위한 raw_keys를 남긴다.
+        """
+        raw = self.get_balance_cached(force=True)
+        snap = {
+            "total_asset_krw": None,
+            "total_eval_krw": None,
+            "cash_total_krw": None,
+            "orderable_cash_krw": None,
+            "deposit_like_krw": None,
+            "raw_keys": [],
+        }
+
+        if not isinstance(raw, dict):
+            return snap
+
+        snap["raw_keys"] = sorted(list(raw.keys()))
+        summary = raw.get("output2")
+        if isinstance(summary, list):
+            summary = summary[0] if summary else None
+        if not isinstance(summary, dict):
+            summary = raw
+
+        def _to_int(value):
+            try:
+                if value is None:
+                    return None
+                if isinstance(value, (int, float)):
+                    return int(value)
+                text = str(value).replace(",", "").strip()
+                return int(float(text))
+            except Exception:
+                return None
+
+        snap["cash_total_krw"] = _to_int(
+            summary.get("dnca_tot_amt") or summary.get("cash_total") or summary.get("cash")
+        )
+        snap["orderable_cash_krw"] = _to_int(summary.get("ord_psbl_cash") or summary.get("orderable_cash"))
+        snap["total_eval_krw"] = _to_int(summary.get("tot_evlu_amt") or summary.get("total_eval"))
+        snap["total_asset_krw"] = _to_int(summary.get("tot_asst_amt") or summary.get("total_asset"))
+        snap["deposit_like_krw"] = snap["cash_total_krw"]
+
+        return snap
+
     def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
         """당일 주문/체결 조회."""
         tr_ids = _pick_tr(self.env, "DAILY_CCLD")

@@ -484,18 +484,22 @@ jobs:
           echo "=== git status (workspace) ==="
           git status --porcelain || true
 
-      - name: Debug paths (where am I?)
+      - name: Debug botstate DB existence (worktree)
         if: always()
         run: |
           set -euo pipefail
-          echo "PWD=$(pwd)"
-          ls -al
-          echo "---- find bot_state anywhere ----"
-          find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate_worktree" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
-          echo "---- find pbcore.sqlite3 anywhere ----"
-          find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
-          echo "---- git root? ----"
-          git rev-parse --show-toplevel || true
+          echo "BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
+          echo "BOT_STATE_DIR=$BOT_STATE_DIR"
+          echo "PBCORE_DB_PATH=$PBCORE_DB_PATH"
+          echo "---- ls bot_state/db ----"
+          ls -la "$BOT_STATE_DIR/db" || true
+          echo "---- find pbcore.sqlite3 under worktree ----"
+          cd "$BOTSTATE_WORKTREE_DIR"
+          find . -name "pbcore.sqlite3" -maxdepth 5 -print || true
+          echo "---- stat (if exists) ----"
+          if [ -f "$PBCORE_DB_PATH" ]; then
+            stat "$PBCORE_DB_PATH" || true
+          fi
 
       - name: Persist bot_state (stage untracked + commit/push)
         if: always() && (env.PERSIST_MODE != 'OFF')

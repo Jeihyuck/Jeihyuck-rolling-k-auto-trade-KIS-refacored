@@ -149,6 +149,13 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             logger.info("[DB][MIGRATE] sqlite url=%s", url)
             schema_for_engine(engine).metadata.create_all(engine)
             _write_schema_stamp(migrations_dir)
+            if db_path:
+                logger.info(
+                    "[DB][CHECK] path=%s exists=%s size=%s",
+                    db_path,
+                    int(os.path.exists(db_path)),
+                    os.path.getsize(db_path) if os.path.exists(db_path) else -1,
+                )
             return
         logger.info("[DB][MIGRATE] external url=%s", url)
         # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
