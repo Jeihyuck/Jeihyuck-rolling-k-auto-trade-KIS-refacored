@@ -82,48 +82,106 @@ def _deepcopy_json(value):
         return value
 
 
-def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
+def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
     """
-    DIAG에서도 1회 잔고조회(총액/주문가능/예수금)를 시도하고 로그로 남김.
-    실패해도 예외를 던지지 않는다.
+    DIAG에서 잔고/예수금/주문가능을 1회만 조회하고, flag 파일로 중복 실행 방지.
+    - 전역변수/스코프 의존 금지
+    - BOT_STATE_DIR 같은 파이썬 변수 사용 금지 (환경변수도 optional fallback)
     """
-    if not runtime_dir:
-        return
+    import os
+    import json
+    import time
+
+    runtime_dir = None
     try:
-        diag_dir = os.path.join(runtime_dir, "diagnostics")
-        os.makedirs(diag_dir, exist_ok=True)
-        flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
-        if os.path.exists(flag_path):
-            return
-
-        logger.info("[DIAG][BALANCE] probe_once start runtime_dir=%s", runtime_dir)
-        logger.info(
-            "[DIAG][CAPITAL-CONFIG] DAILY_CAPITAL=%s PAPER_MAX_CAPITAL_KRW=%s ENTRY_BUDGET_PCT=%s RESERVE=%s",
-            os.getenv("DAILY_CAPITAL"),
-            os.getenv("PAPER_MAX_CAPITAL_KRW"),
-            os.getenv("PB1_ENTRY_BUDGET_PCT"),
-            os.getenv("RESERVE"),
-        )
-
-        try:
-            kis = kis_factory()
-            snap = kis.get_balance_snapshot_safe()
-            logger.info(
-                "[DIAG][BALANCE] total_asset_krw=%s total_eval_krw=%s cash_total_krw=%s orderable_cash_krw=%s deposit_like_krw=%s raw_keys=%s",
-                snap.get("total_asset_krw"),
-                snap.get("total_eval_krw"),
-                snap.get("cash_total_krw"),
-                snap.get("orderable_cash_krw"),
-                snap.get("deposit_like_krw"),
-                snap.get("raw_keys"),
-            )
-        except Exception as exc:
-            logger.warning("[DIAG][BALANCE][SKIP] %s", str(exc))
-
-        with open(flag_path, "w", encoding="utf-8") as handle:
-            handle.write(datetime.now().isoformat())
+        runtime_dir = getattr(runtime_store, "runtime_dir", None)
+        if runtime_dir is None:
+            runtime_dir = runtime_store.get_runtime_dir()
     except Exception:
+        runtime_dir = None
+
+    if not runtime_dir:
+        bot_state_dir = os.getenv("BOT_STATE_DIR") or os.getenv("STATE_DIR") or ""
+        if bot_state_dir:
+            runtime_dir = os.path.join(bot_state_dir, "runtime")
+
+    if not runtime_dir:
+        logger.warning("[DIAG][BALANCE] runtime_dir not resolved -> skip")
         return
+
+    diag_dir = os.path.join(runtime_dir, "diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
+    if os.path.exists(flag_path):
+        logger.info("[DIAG][BALANCE] already probed -> skip flag=%s", flag_path)
+        return
+
+    try:
+        with open(flag_path, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception as e:
+        logger.warning("[DIAG][BALANCE] failed to write flag: %s", e)
+
+    kis = kis_factory()
+    raw = kis.get_balance(force=True)
+
+    out2 = None
+    try:
+        out2 = (raw or {}).get("output2")
+        if isinstance(out2, list) and out2:
+            out2 = out2[0]
+    except Exception:
+        out2 = None
+
+    def _to_int(x):
+        try:
+            if x is None:
+                return None
+            s = str(x).strip().replace(",", "")
+            if s == "":
+                return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    def _pick(d, keys):
+        if not isinstance(d, dict):
+            return None
+        for k in keys:
+            if k in d:
+                v = _to_int(d.get(k))
+                if v is not None:
+                    return (k, v)
+        return None
+
+    candidates_total = [
+        "tot_evlu_amt", "evlu_amt_smtl", "tot_asst_amt", "tot_asset_amt",
+        "tot_asst_amt2", "tot_evlu_amt2"
+    ]
+    candidates_orderable = [
+        "ord_psbl_cash", "ord_psbl_amt", "nxdy_excc_amt", "dnca_tot_amt"
+    ]
+    candidates_deposit = [
+        "dnca_tot_amt", "prvs_rcdl_excc_amt", "nxdy_excc_amt", "cma_evlu_amt"
+    ]
+
+    picked_total = _pick(out2, candidates_total)
+    picked_orderable = _pick(out2, candidates_orderable)
+    picked_deposit = _pick(out2, candidates_deposit)
+
+    logger.info("[DIAG][BALANCE][RAW_KEYS] output2_keys=%s",
+                sorted(list(out2.keys())) if isinstance(out2, dict) else None)
+    logger.info("[DIAG][BALANCE][PICK] total=%s orderable=%s deposit=%s",
+                picked_total, picked_orderable, picked_deposit)
+
+    raw_path = os.path.join(diag_dir, "diag_balance_raw.json")
+    try:
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False)
+        logger.info("[DIAG][BALANCE] saved raw=%s", raw_path)
+    except Exception as e:
+        logger.warning("[DIAG][BALANCE] failed to save raw json: %s", e)
 
 
 def universe_build_flag(as_of: str) -> Path:
@@ -1260,6 +1318,21 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         max_seconds,
     )
     ensure_universe_built_once(runtime_store=runtime_store, as_of=now_kst_value.date().isoformat())
+    strategy_mode = (
+        getattr(args, "strategy_mode", None)
+        or os.getenv("EFFECTIVE_STRATEGY_MODE")
+        or os.getenv("STRATEGY_MODE")
+        or ""
+    )
+    strategy_mode = str(strategy_mode).upper()
+    kis_factory = lambda: KisAPI()
+    if strategy_mode == "DIAG":
+        logger.info("[DIAG][BALANCE] probe_once start")
+        _diag_balance_probe_once_safe(
+            logger=logger,
+            runtime_store=runtime_store,
+            kis_factory=kis_factory,
+        )
     exit_reason = "unknown"
     stop_requested = {"value": False}
     balance_api_calls = 0
@@ -1281,15 +1354,6 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 break
             now = _get_now_kst()
             if now >= close_dt:
-                strategy_mode = (
-                    os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
-                ).upper()
-                if strategy_mode == "DIAG":
-                    _diag_balance_probe_once(
-                        logger=logger,
-                        runtime_dir=str(get_botstate_root() / "runtime"),
-                        kis_factory=lambda: KisAPI(),
-                    )
                 logger.info("[PB1][LOOP] market closed -> exit")
                 exit_reason = "market_closed"
                 break
@@ -1409,15 +1473,6 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
         release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
-        strategy_mode = (
-            os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
-        ).upper()
-        if strategy_mode == "DIAG":
-            _diag_balance_probe_once(
-                logger=logger,
-                runtime_dir=os.path.join(BOT_STATE_DIR, "runtime"),
-                kis_factory=lambda: KisAPI(),
-            )
         if max_seconds > 0 and elapsed_trade > max_seconds:
             logger.warning(
                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
