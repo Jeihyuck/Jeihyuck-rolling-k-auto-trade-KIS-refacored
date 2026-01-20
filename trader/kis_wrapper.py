@@ -18,6 +18,7 @@ import logging
 import threading
 import copy
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import requests
@@ -27,6 +28,7 @@ from urllib3.util.retry import Retry
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
+from trader.botstate_paths import botstate_path
 from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
 
@@ -205,8 +207,8 @@ def _pick_tr(env: str, key: str) -> List[str]:
 
 # --- KisAPI 이하 실전 전체 로직 ---
 class KisAPI:
-    _token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
-    _cache_path = "kis_token_cache.json"
+    _token_cache = {"token": None, "expires_at": 0, "issued_at": 0}
+    _cache_path: Path | None = None
     _token_lock = threading.Lock()
 
     def should_cooldown(self, now_kst: datetime | None = None) -> bool:
@@ -290,6 +292,13 @@ class KisAPI:
             time.sleep((2 ** i) * self._safe_backoff_base + random.uniform(0, 0.2))
         raise NetTemporaryError(f"request failed after retries: {url}")
 
+    @classmethod
+    def _resolve_cache_path(cls) -> Path:
+        if cls._cache_path is None:
+            cls._cache_path = botstate_path("runtime", "kis_token.json")
+            cls._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        return cls._cache_path
+
     # ===== 토큰 처리 =====
     def get_valid_token(self):
         with KisAPI._token_lock:
@@ -297,15 +306,17 @@ class KisAPI:
             if self._token_cache["token"] and now < self._token_cache["expires_at"] - 300:
                 return self._token_cache["token"]
 
-            if os.path.exists(self._cache_path):
+            cache_path = self._resolve_cache_path()
+            if cache_path.exists():
                 try:
-                    with open(self._cache_path, "r", encoding="utf-8") as f:
+                    with open(cache_path, "r", encoding="utf-8") as f:
                         cache = json.load(f)
                     if "access_token" in cache and now < cache["expires_at"] - 300:
+                        issued_at = cache.get("issued_at", cache.get("last_issued", 0))
                         self._token_cache.update({
                             "token": cache["access_token"],
                             "expires_at": cache["expires_at"],
-                            "last_issued": cache.get("last_issued", 0),
+                            "issued_at": issued_at,
                         })
                         logger.info(
                             f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}"
@@ -314,19 +325,29 @@ class KisAPI:
                 except Exception as e:
                     logger.warning(f"[토큰캐시 읽기 실패] {e}")
 
-            if now - self._token_cache["last_issued"] < 61:
+            if now - self._token_cache["issued_at"] < 61:
                 logger.warning("[토큰] 1분 이내 재발급 시도 차단, 기존 토큰 재사용")
                 if self._token_cache["token"]:
                     return self._token_cache["token"]
                 raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
 
-            token, expires_in = self._issue_token_and_expire()
-            expires_at = now + int(expires_in)
-            self._token_cache.update({"token": token, "expires_at": expires_at, "last_issued": now})
             try:
-                with open(self._cache_path, "w", encoding="utf-8") as f:
+                token, expires_in = self._issue_token_and_expire()
+            except Exception as exc:
+                msg = str(exc)
+                if "1분당 1회" in msg or "1분 1회" in msg or "1 minute" in msg:
+                    logger.warning("[토큰] rate limit 감지 -> 65초 대기 후 재시도")
+                    time.sleep(65)
+                    token, expires_in = self._issue_token_and_expire()
+                else:
+                    raise
+            issued_at = time.time()
+            expires_at = issued_at + int(expires_in)
+            self._token_cache.update({"token": token, "expires_at": expires_at, "issued_at": issued_at})
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
                     json.dump(
-                        {"access_token": token, "expires_at": expires_at, "last_issued": now},
+                        {"access_token": token, "expires_at": expires_at, "issued_at": issued_at},
                         f,
                         ensure_ascii=False,
                     )
@@ -370,10 +391,11 @@ class KisAPI:
         """강제 토큰 재발급: 주문 실패 등에서 재시도 전에 호출."""
         try:
             with KisAPI._token_lock:
-                KisAPI._token_cache = {"token": None, "expires_at": 0, "last_issued": 0}
-                if os.path.exists(self._cache_path):
+                KisAPI._token_cache = {"token": None, "expires_at": 0, "issued_at": 0}
+                cache_path = self._resolve_cache_path()
+                if cache_path.exists():
                     try:
-                        os.remove(self._cache_path)
+                        os.remove(cache_path)
                     except Exception:
                         pass
             self.get_valid_token()

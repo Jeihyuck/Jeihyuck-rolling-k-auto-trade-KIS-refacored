@@ -873,10 +873,8 @@ def run_once(
                 dry_run = True
                 _apply_env_flags(dry_run)
         except Exception:
-            logger.exception("[PB1] KIS init failed, forcing dry-run")
-            dry_run_reasons.append("kis_init_failed")
-            dry_run = True
-            _apply_env_flags(dry_run)
+            logger.exception("[PB1] KIS init failed -> skip tick")
+            return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
 
         balance_snapshot_raw: dict | None = None
         balance_snapshot_safe: dict | None = None

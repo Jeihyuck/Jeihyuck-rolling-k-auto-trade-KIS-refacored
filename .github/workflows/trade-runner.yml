@@ -10,11 +10,19 @@ concurrency:
 on:
   push:
     branches: [ "nullim", "main" ]
+    branches-ignore: [ "bot-state" ]
+    paths-ignore:
+      - "bot_state/**"
+      - "**/bot_state/**"
 
   workflow_dispatch:
     inputs:
       EMERGENCY_UNIVERSE_BUILD:
         description: "Set to 1 to allow one-time emergency universe build when DB is missing."
+        required: false
+        default: "0"
+      BOT_STATE_HARD_RESET:
+        description: "Delete pbcore.sqlite3 + runtime + ledger and restart clean (one-shot)"
         required: false
         default: "0"
 
@@ -84,28 +92,25 @@ jobs:
           path: botstate
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          mkdir -p bot_state
-          if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ bot_state/
-          fi
-          echo "[RESTORE] repo/bot_state restored"
-
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash
         run: |
           set -euo pipefail
-          # botstate worktree dir가 이미 스텝에서 출력/결정되는 구조라면,
-          # 그 값을 파일/환경에서 읽어오거나, 여기서 확정한다.
-          # (가장 안전: workflow에서 쓰는 고정 경로 규칙을 여기서 생성)
-          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}"
+          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
           echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
           echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
+
+      - name: Restore bot_state into workspace
+        run: |
+          set -euo pipefail
+          mkdir -p "$BOT_STATE_DIR"
+          if [ -d ../botstate/bot_state ]; then
+            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
+          fi
+          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -207,20 +212,20 @@ jobs:
         if: env.SHOULD_BUILD_UNIVERSE == '1'
         run: |
           set -euo pipefail
-          SRC_WORKTREE_DIR="${BOTSTATE_WORKTREE_DIR:-${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}}"
-          SRC_BOT_STATE="${SRC_WORKTREE_DIR}/bot_state"
-          echo "[PERSIST] SRC_BOT_STATE=${SRC_BOT_STATE}"
-          test -d "${SRC_BOT_STATE}" || { echo "missing SRC_BOT_STATE"; ls -la "${SRC_WORKTREE_DIR}" || true; exit 1; }
+          echo "[PERSIST] worktree=$BOTSTATE_WORKTREE_DIR"
+          test -d "$BOTSTATE_WORKTREE_DIR/.git" -o -f "$BOTSTATE_WORKTREE_DIR/.git" || (echo "ERROR: no git metadata in worktree" && ls -la "$BOTSTATE_WORKTREE_DIR" && exit 1)
 
-          cd botstate
-          git rev-parse --is-inside-work-tree
+          git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain
+          git -C "$BOTSTATE_WORKTREE_DIR" add -A bot_state
 
-          rsync -a --delete "../${SRC_BOT_STATE}/" "./bot_state/"
-
-          git add -A bot_state
-          git status --porcelain
-          git commit -m "bot_state: universe build ${AS_OF_DATE:-$(date +%F)} (run ${GITHUB_RUN_ID})" || echo "nothing to commit"
-          git push origin HEAD:bot-state
+          if git -C "$BOTSTATE_WORKTREE_DIR" diff --cached --quiet; then
+            echo "[PERSIST] nothing to commit"
+          else
+            git -C "$BOTSTATE_WORKTREE_DIR" config user.email "actions@github.com"
+            git -C "$BOTSTATE_WORKTREE_DIR" config user.name "github-actions"
+            git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: universe build $(date -u +%F)"
+            git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
+          fi
 
       - name: Verify persisted universe (botstate)
         if: env.SHOULD_BUILD_UNIVERSE == '1'
@@ -299,18 +304,6 @@ jobs:
           ref: "bot-state"
           path: botstate
 
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          mkdir -p bot_state
-          if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ bot_state/
-          fi
-          echo "[RESTORE] repo/bot_state restored"
-          ls -al bot_state/.gitignore || true
-          ls -al bot_state/.gitkeep || true
-          git status --porcelain || true
-
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash
         run: |
@@ -324,6 +317,18 @@ jobs:
           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
+
+      - name: Restore bot_state into workspace
+        run: |
+          set -euo pipefail
+          mkdir -p "$BOT_STATE_DIR"
+          if [ -d ../botstate/bot_state ]; then
+            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
+          fi
+          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
+          ls -al "$BOT_STATE_DIR/.gitignore" || true
+          ls -al "$BOT_STATE_DIR/.gitkeep" || true
+          git status --porcelain || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -343,6 +348,15 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Hard reset bot_state (one-shot)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}" = "1" ]; then
+            echo "[RESET] hard reset bot_state"
+            python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
+          fi
+          chmod -R u+rwX "$BOT_STATE_DIR" || true
 
       - name: Precheck env (fail fast)
         run: |
@@ -552,28 +566,25 @@ jobs:
           ref: "bot-state"
           path: botstate
 
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          mkdir -p bot_state
-          if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ bot_state/
-          fi
-          echo "[RESTORE] repo/bot_state restored"
-
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash
         run: |
           set -euo pipefail
-          # botstate worktree dir가 이미 스텝에서 출력/결정되는 구조라면,
-          # 그 값을 파일/환경에서 읽어오거나, 여기서 확정한다.
-          # (가장 안전: workflow에서 쓰는 고정 경로 규칙을 여기서 생성)
-          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}"
+          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
           echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
           echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
+
+      - name: Restore bot_state into workspace
+        run: |
+          set -euo pipefail
+          mkdir -p "$BOT_STATE_DIR"
+          if [ -d ../botstate/bot_state ]; then
+            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
+          fi
+          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
 
       - name: Setup Python
         uses: actions/setup-python@v5

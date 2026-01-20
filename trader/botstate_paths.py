@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 
+BOT_STATE_DIR_ENV = "BOT_STATE_DIR"
 BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
 BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
 TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
@@ -25,6 +26,9 @@ def _is_relative_to(path: Path, base: Path) -> bool:
 
 
 def get_botstate_root() -> Path:
+    bot_state_dir = os.getenv(BOT_STATE_DIR_ENV)
+    if bot_state_dir:
+        return Path(bot_state_dir).expanduser().resolve()
     env_root = os.getenv(BOTSTATE_ROOT_ENV)
     if env_root:
         return Path(env_root).expanduser().resolve()

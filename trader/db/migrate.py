@@ -2,6 +2,7 @@ import glob
 import hashlib
 import logging
 import os
+import stat
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -13,6 +14,25 @@ from .schema import schema_for_engine
 
 logger = logging.getLogger(__name__)
 MIGRATION_VERSION = "v1"
+
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _chmod_rw(path: Path) -> None:
+    try:
+        if path.is_dir():
+            targets = [path] + list(path.rglob("*"))
+        else:
+            targets = [path]
+        for target in targets:
+            try:
+                os.chmod(target, target.stat().st_mode | stat.S_IWUSR)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
 def _schema_stamp_path() -> Path:
@@ -83,6 +103,14 @@ def _list_applied_versions(conn: sa.Connection) -> set[str]:
 
 
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
+    url = str(engine.url)
+    if config.is_sqlite_url(url):
+        db_path = Path(engine.url.database or "")
+        if db_path:
+            _ensure_dir(db_path.parent)
+            _chmod_rw(db_path.parent)
+            if db_path.exists():
+                _chmod_rw(db_path)
     if _should_skip_migrations(engine, migrations_dir):
         return
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
