@@ -1,8 +1,8 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc61156cd460c9 100644
+index 77638943694ba9b75e1669b4a4a60002f20a4d1f..36984a2692dd4b203b636c6f6e50623a26329863 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -1,44 +1,52 @@
+@@ -1,44 +1,51 @@
  name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
  
  permissions:
@@ -15,7 +15,6 @@ index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc6115
  on:
    push:
      branches: [ "nullim", "main" ]
-+    branches-ignore: [ "bot-state" ]
 +    paths-ignore:
 +      - "bot_state/**"
 +      - "**/bot_state/**"
@@ -55,7 +54,7 @@ index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc6115
      timeout-minutes: 15
  
      env:
-@@ -62,73 +70,70 @@ jobs:
+@@ -62,73 +69,70 @@ jobs:
        CANO: ${{ secrets.CANO }}
        ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
        KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
@@ -139,7 +138,7 @@ index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc6115
            as_of="$(TZ=Asia/Seoul date +%F)"
            now_kst="$(TZ=Asia/Seoul date -Iseconds)"
            echo "AS_OF_DATE=$as_of" >> "$GITHUB_ENV"
-@@ -185,64 +190,64 @@ jobs:
+@@ -185,64 +189,64 @@ jobs:
            env = (os.getenv("KIS_ENV") or "practice").lower()
            strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or "best_k_meta"
            as_of = os.getenv("AS_OF_DATE") or date.today().isoformat()
@@ -216,7 +215,7 @@ index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc6115
        TZ: Asia/Seoul
        PYTHONUNBUFFERED: "1"
        PYTHONPATH: ${{ github.workspace }}/repo
-@@ -277,95 +282,104 @@ jobs:
+@@ -277,95 +281,104 @@ jobs:
  
        RUN_LOOP_MINUTES: "4"
  
@@ -333,7 +332,7 @@ index 77638943694ba9b75e1669b4a4a60002f20a4d1f..dbb7ffdc281101eb7fb1e5c271dc6115
            KST = ZoneInfo("Asia/Seoul")
            now = datetime.now(KST)
  
-@@ -530,73 +544,70 @@ jobs:
+@@ -530,73 +543,70 @@ jobs:
        APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
        API_BASE_URL: ${{ secrets.KIS_REST_URL }}
  
@@ -1125,4 +1124,5 @@ index 0000000000000000000000000000000000000000..89c3d8ddbb343d4efc606c2027110322
 +
 +if __name__ == "__main__":
 +    main()
+
 
