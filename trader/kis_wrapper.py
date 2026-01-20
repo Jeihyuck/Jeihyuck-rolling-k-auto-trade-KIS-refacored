@@ -557,6 +557,57 @@ class KisAPI:
             self._orderable_cash_cache_at = now_kst()
         return int(max(cash, 0))
 
+    def _parse_total_cash_from_output2(self, out2: Any) -> tuple[int, dict]:
+        row = None
+        if isinstance(out2, list) and out2:
+            row = out2[0]
+        elif isinstance(out2, dict):
+            row = out2
+        else:
+            return 0, {"raw_fields": {}, "selected_key": None, "clamp_applied": False}
+
+        raw_fields = {
+            "dnca_tot_amt": row.get("dnca_tot_amt"),
+            "ord_psbl_cash": row.get("ord_psbl_cash"),
+            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+        }
+        total_cash = self._cash_to_int(row.get("dnca_tot_amt"))
+        clamp_applied = False
+        if total_cash < 0:
+            total_cash = 0
+            clamp_applied = True
+        return total_cash, {"raw_fields": raw_fields, "selected_key": "dnca_tot_amt", "clamp_applied": clamp_applied}
+
+    def get_cash_summary(self) -> dict:
+        total_cash = 0
+        order_possible = 0
+        source_total = "balance_api"
+        source_order_possible = "cash_psbl_api"
+        try:
+            balance = self.get_balance_cached(force=False)
+            out2 = balance.get("output2") if isinstance(balance, dict) else None
+            total_cash, total_meta = self._parse_total_cash_from_output2(out2)
+            logger.info("[CASH][TOTAL] dnca_tot_amt=%s", (total_meta.get("raw_fields") or {}).get("dnca_tot_amt"))
+        except Exception as exc:
+            logger.warning("[CASH][TOTAL][FAIL] err=%s", exc)
+        try:
+            order_possible = self.get_orderable_cash_krw(force=False)
+        except Exception as exc:
+            logger.warning("[CASH][PSBL][SUMMARY_FAIL] err=%s", exc)
+        usable = min(int(total_cash), int(order_possible))
+        logger.info(
+            "[CASH][SUMMARY] TOTAL_CASH_KRW=%s ORDER_POSSIBLE_CASH_KRW=%s usable=%s",
+            total_cash,
+            order_possible,
+            usable,
+        )
+        return {
+            "total_cash_krw": int(total_cash),
+            "order_possible_cash_krw": int(order_possible),
+            "source_total": source_total,
+            "source_order_possible": source_order_possible,
+        }
+
     def get_cash_available_today(self) -> int:
         """
         당일 매수 가능 예수금(가용현금) 반환.

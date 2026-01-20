@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -14,7 +15,6 @@ import pandas as pd
 from trader.botstate_paths import close_entry_orders_path
 from trader.config import (
     CAP_CAP,
-    DAILY_CAPITAL,
     KOSDAQ_HARD_STOP_PCT,
     KOSPI_HARD_STOP_PCT,
     LEDGER_BASE_DIR,
@@ -27,13 +27,16 @@ from trader.config import (
     PB1_REQUIRE_VOLUME,
     PB1_MIN_CANDLES,
     PB1_MAX_POSITIONS,
-    PB1_MIN_SCORE,
-    PB1_USE_RISK_PARITY,
+    PB1_MIN_SCORE_BASE,
+    PB1_MIN_SCORE_FLOOR,
+    PB1_MIN_SCORE_STEP,
     PB1_MAX_ATR_PCT,
     PB1_MIN_VALUE20,
     PB1_CAPITAL_MODE,
     PB1_ENTRY_CAPITAL_KRW,
     PB1_CASH_RESERVE_PCT,
+    PB1_ENTRY_BUDGET_PCT_PER_TICK,
+    PB1_MAX_POS_PCT,
     PAPER_MAX_CAPITAL_KRW,
     PB1_ENTRY_WINDOW_START,
     PB1_ENTRY_OPEN_END,
@@ -41,6 +44,12 @@ from trader.config import (
     PB1_EXIT_WINDOW_START,
     PB1_EXIT_WINDOW_END,
     PB1_ALLOW_ADD_TO_EXISTING,
+    PB1_VOL_MAX,
+    PB1_VOLU_MAX,
+    PB1_VOLU_MAX_INTRADAY,
+    PB1_PULLBACK_MIN,
+    PB1_PULLBACK_MAX,
+    PB1_REQUIRE_BOTH,
     MIN_ORDER_KRW,
     resolve_market_window,
 )
@@ -95,7 +104,9 @@ _ENTRY_BLOCK_REASON_MAP = {
     "available_cash_zero": "NO_CASH",
     "insufficient_cash": "NO_CASH",
     "entry_capital_zero": "NO_CASH",
+    "tick_budget_zero": "NO_CASH",
     "entry_cap_exceeded": "ENTRY_CAP_LIMIT",
+    "tick_budget_below_min_order": "MIN_ORDER_KRW",
     "max_positions": "MAX_POSITIONS",
     "target_new_positions_limit": "MAX_POSITIONS",
     "target_new_positions_zero": "TARGET_NEW_POSITIONS_ZERO",
@@ -115,6 +126,7 @@ _ORDER_SKIP_REASON_MAP = {
     "available_cash_zero": "ORDER_SKIP_NO_CASH",
     "insufficient_cash": "ORDER_SKIP_NO_CASH",
     "entry_capital_zero": "ORDER_SKIP_NO_CASH",
+    "tick_budget_zero": "ORDER_SKIP_NO_CASH",
     "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
     "open_order": "ORDER_SKIP_RATE_LIMIT",
     "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
@@ -451,7 +463,6 @@ class PB1Engine:
             elif balance_source is not None:
                 self.balance_cache_hits += 1
         self._holdings_summary: Dict[str, Any] = {}
-        self.filter_thresholds = self._resolve_filter_thresholds()
         self._code_name_map: Dict[str, str] = {}
         self.current_code: str | None = None
         self.top_candidates: list[dict[str, Any]] = []
@@ -460,8 +471,11 @@ class PB1Engine:
         self.entry_flag_valid = entry_flag.valid
         self.entry_flag_raw = entry_flag.raw
         self.window_internal = self._resolve_window_internal()
+        self.filter_thresholds = self._resolve_filter_thresholds()
         self.entry_capital_krw: float | None = None
         self.entry_usable_krw: float | None = None
+        self.entry_tick_budget_krw: float | None = None
+        self.target_new_positions: int | None = None
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -521,30 +535,42 @@ class PB1Engine:
         self._warned_keys.add(key)
         logger.warning(message, *args)
 
-    @staticmethod
-    def _resolve_filter_thresholds() -> FilterThresholds:
-        vol_max = PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 1.05)
-        volu_max = PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 1.10)
-        pullback_min = PB1Engine._float_env("PB1_PULLBACK_MIN", 0.02)
-        pullback_max = PB1Engine._float_env("PB1_PULLBACK_MAX", 0.18)
-        require_both = env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True)
-        return FilterThresholds(
-            vol_contraction_max=vol_max,
-            volu_contraction_max=volu_max,
-            pullback_min=pullback_min,
-            pullback_max=pullback_max,
-            require_both_contractions=require_both,
-        )
+    def _is_intraday_threshold_window(self) -> bool:
+        if self.phase not in {"prep", "entry", "trade"}:
+            return False
+        if self.window_internal not in {"morning", "day"}:
+            return False
+        try:
+            entry_end = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
+            return self._now_kst.time() <= entry_end
+        except ValueError:
+            return False
 
-    @staticmethod
-    def _resolve_strict_thresholds() -> FilterThresholds:
-        return FilterThresholds(
-            vol_contraction_max=PB1Engine._float_env("PB1_VOL_CONTRACTION_MAX", 0.95),
-            volu_contraction_max=PB1Engine._float_env("PB1_VOLU_CONTRACTION_MAX", 0.90),
-            pullback_min=PB1Engine._float_env("PB1_PULLBACK_MIN", 0.05),
-            pullback_max=PB1Engine._float_env("PB1_PULLBACK_MAX", 0.12),
-            require_both_contractions=env_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", True),
+    def _resolve_filter_thresholds(self) -> FilterThresholds:
+        intraday = self._is_intraday_threshold_window()
+        volu_max = PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX
+        thresholds = FilterThresholds(
+            vol_contraction_max=PB1_VOL_MAX,
+            volu_contraction_max=volu_max,
+            pullback_min=PB1_PULLBACK_MIN,
+            pullback_max=PB1_PULLBACK_MAX,
+            require_both_contractions=PB1_REQUIRE_BOTH,
         )
+        logger.info(
+            "[PB1][THRESHOLDS] intraday=%s phase=%s window=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+            int(intraday),
+            self.phase,
+            self.window_internal,
+            thresholds.vol_contraction_max,
+            thresholds.volu_contraction_max,
+            thresholds.pullback_min,
+            thresholds.pullback_max,
+            thresholds.require_both_contractions,
+        )
+        return thresholds
+
+    def _resolve_strict_thresholds(self) -> FilterThresholds:
+        return self.filter_thresholds
 
     def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
         for reason in reasons:
@@ -700,25 +726,28 @@ class PB1Engine:
     def _resolve_entry_capital(
         self,
         *,
-        available_cash_krw: int,
+        base_cash_krw: int,
         override_capital: float | None,
         reserve_pct: float,
     ) -> tuple[int, int, dict]:
         use_override = override_capital is not None and int(override_capital) > 0
-        auto_mode = not use_override and (override_capital is None or int(override_capital) <= 0)
-        if auto_mode:
-            entry_capital = max(int(available_cash_krw * (1 - reserve_pct)), 0)
-            usable = entry_capital
-        else:
-            entry_capital = int(override_capital) if use_override else int(available_cash_krw)
-            usable = int(entry_capital * (1 - reserve_pct))
+        usable = max(int(base_cash_krw * (1 - reserve_pct)), 0)
+        entry_capital = usable
+        if use_override:
+            entry_capital = min(entry_capital, int(override_capital))
+        cap_limit = None
+        cap_applied = False
+        if CAP_CAP and CAP_CAP > 0:
+            cap_limit = int(base_cash_krw * CAP_CAP) if CAP_CAP <= 1 else int(CAP_CAP)
+            if cap_limit > 0 and entry_capital > cap_limit:
+                entry_capital = cap_limit
+                cap_applied = True
         clamp_meta = {}
         if (self.env or "").lower() != "real":
-            cap = min(int(available_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
+            cap = min(int(base_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
             if entry_capital > cap:
                 before = entry_capital
                 entry_capital = cap
-                usable = entry_capital if auto_mode else int(entry_capital * (1 - reserve_pct))
                 clamp_meta = {"before": before, "cap": cap, "after": entry_capital}
                 logger.info(
                     "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
@@ -726,7 +755,14 @@ class PB1Engine:
                     cap,
                     entry_capital,
                 )
-        meta = {"use_override": use_override, "auto": auto_mode, "clamp": clamp_meta, "reserve_pct": reserve_pct}
+        meta = {
+            "use_override": use_override,
+            "reserve_pct": reserve_pct,
+            "cap_limit": cap_limit,
+            "cap_applied": cap_applied,
+            "clamp": clamp_meta,
+            "base_cash": base_cash_krw,
+        }
         return entry_capital, usable, meta
 
     def _parse_kis_holdings(self, holdings_rows: Iterable[dict]) -> dict[str, dict]:
@@ -1269,13 +1305,54 @@ class PB1Engine:
         )
         return len(selected_codes)
 
+    def _apply_adaptive_score_cut(
+        self,
+        candidates: List[CandidateFeature],
+        target_new_positions: int,
+    ) -> tuple[float, set[str]]:
+        ok_setups = [c for c in candidates if c.setup_ok]
+        if not ok_setups:
+            return float(PB1_MIN_SCORE_BASE), set()
+        target = min(max(1, target_new_positions), len(ok_setups)) if target_new_positions > 0 else min(1, len(ok_setups))
+        base_cut = float(PB1_MIN_SCORE_BASE)
+        floor_cut = float(PB1_MIN_SCORE_FLOOR)
+        step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+        applied_cut = base_cut
+        selected: list[CandidateFeature] = []
+        current_cut = base_cut
+        while current_cut >= floor_cut:
+            current = [
+                cf
+                for cf in ok_setups
+                if float(cf.features.get("score") or 0.0) >= current_cut or cf.features.get("score_fallback")
+            ]
+            applied_cut = current_cut
+            selected = current
+            if len(current) >= target:
+                break
+            current_cut -= step
+        if len(selected) < target:
+            ordered = sorted(ok_setups, key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+            selected = ordered[:target]
+        selected_codes = {c.code for c in selected}
+        logger.info(
+            "[PB1][SCORE_CUT] base=%.1f floor=%.1f step=%.1f target=%s ok_setups=%s after_cut=%s applied=%.1f",
+            base_cut,
+            floor_cut,
+            step,
+            target,
+            len(ok_setups),
+            len(selected_codes),
+            applied_cut,
+        )
+        return applied_cut, selected_codes
+
     def _size_positions(self, candidates: List[CandidateFeature]) -> List[CandidateFeature]:
         ok_list = [c for c in candidates if c.setup_ok]
         if not ok_list:
             return candidates
 
-        # 1) 점수 계산 + ATR/유동성 컷 + 점수 컷
-        filtered: List[CandidateFeature] = []
+        # 1) 점수 계산 + Adaptive score cut + ATR/유동성 컷
         for cf in ok_list:
             try:
                 score = float(score_setup(cf.features, cf.market))
@@ -1283,15 +1360,21 @@ class PB1Engine:
                 score = 0.0
             cf.features["score"] = score
             cf.score = score
-
-            atr_pct = cf.features.get("atr_pct")
-            value20 = cf.features.get("value20")
+        applied_cut, selected_codes = self._apply_adaptive_score_cut(
+            ok_list,
+            target_new_positions=int(self.target_new_positions or 0),
+        )
+        for cf in ok_list:
             score_fallback = bool(cf.features.get("score_fallback"))
-
-            if score < float(PB1_MIN_SCORE) and not score_fallback:
+            if cf.code not in selected_codes and not score_fallback:
                 cf.setup_ok = False
                 cf.reasons.append("score_below_cut")
+        filtered: List[CandidateFeature] = []
+        for cf in ok_list:
+            if not cf.setup_ok:
                 continue
+            atr_pct = cf.features.get("atr_pct")
+            value20 = cf.features.get("value20")
             if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
                 cf.setup_ok = False
                 cf.reasons.append("atr_pct_missing")
@@ -1326,22 +1409,32 @@ class PB1Engine:
                 cf.setup_ok = False
                 cf.reasons.append("not_in_topN")
 
-        # 3) 사이징: 리스크 패리티(ATR) 또는 균등
-        cap_total = float(
-            self.entry_usable_krw
-            if self.entry_usable_krw is not None
-            else float(DAILY_CAPITAL) * float(CAP_CAP)
-        )
+        # 3) 사이징: score 기반 가중치 + tick budget 분할
+        tick_budget = float(self.entry_tick_budget_krw or 0.0)
+        if tick_budget <= 0:
+            tick_budget = float(self.entry_usable_krw or 0.0)
+        if tick_budget <= 0:
+            logger.warning("[PB1][SIZE] skip sizing: tick_budget=0 applied_score_cut=%.1f", applied_cut)
+            return candidates
 
-        if PB1_USE_RISK_PARITY:
-            inv: List[float] = []
-            for cf in selected:
-                atr = float(cf.features.get("atr14") or 0.0)
-                inv.append(1.0 / max(atr, 1e-6))
-            inv_sum = sum(inv) if sum(inv) > 0 else 1.0
-            weights = [x / inv_sum for x in inv]
-        else:
-            weights = [1.0 / len(selected)] * len(selected)
+        max_score = max(float(cf.features.get("score") or 0.0) for cf in selected)
+        tau = 15.0
+        raw_weights = [math.exp((float(cf.features.get("score") or 0.0) - max_score) / tau) for cf in selected]
+        weight_sum = sum(raw_weights) if sum(raw_weights) > 0 else 1.0
+        weights = [w / weight_sum for w in raw_weights]
+        min_order_krw = float(MIN_ORDER_KRW)
+        max_pos_krw = tick_budget * float(PB1_MAX_POS_PCT)
+        planned_caps: Dict[str, float] = {}
+        for cf, w in zip(selected, weights):
+            raw_cap = tick_budget * float(w)
+            lower = min_order_krw if min_order_krw > 0 else 0.0
+            upper = max_pos_krw if max_pos_krw > 0 else tick_budget
+            planned_caps[cf.code] = min(max(raw_cap, lower), upper)
+        cap_sum = sum(planned_caps.values())
+        if cap_sum > tick_budget and cap_sum > 0:
+            scale = tick_budget / cap_sum
+            for code, cap in planned_caps.items():
+                planned_caps[code] = float(int(cap * scale))
 
         for cf, w in zip(selected, weights):
             close_px = float(cf.features.get("close") or 0.0)
@@ -1350,7 +1443,7 @@ class PB1Engine:
                 cf.reasons.append("close_zero")
                 continue
 
-            capital = cap_total * float(w)
+            capital = float(planned_caps.get(cf.code, 0.0))
             qty = int(capital // close_px)
             cf.planned_qty = max(qty, 0)
             cf.features["planned_cap"] = float(capital)
@@ -1361,7 +1454,7 @@ class PB1Engine:
                 cf.reasons.append("planned_qty_zero")
 
             logger.info(
-                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s",
+                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s tick_budget=%.0f",
                 cf.code,
                 float(cf.features.get("score") or 0.0),
                 float(w),
@@ -1369,6 +1462,7 @@ class PB1Engine:
                 cf.planned_qty,
                 float(cf.features.get("atr_pct") or 0.0),
                 cf.features.get("value20"),
+                tick_budget,
             )
 
         return candidates
@@ -2350,33 +2444,55 @@ class PB1Engine:
         self._holdings_summary = holdings_summary
         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+        total_cash_krw = int(available_cash_krw)
+        order_possible_cash_krw = int(available_cash_krw)
+        if self.kis:
+            try:
+                cash_summary = self.kis.get_cash_summary()
+                total_cash_krw = int(cash_summary.get("total_cash_krw") or 0)
+                order_possible_cash_krw = int(cash_summary.get("order_possible_cash_krw") or 0)
+            except Exception as exc:
+                logger.warning("[PB1][CASH][SUMMARY_FAIL] err=%s", exc)
+        if order_possible_cash_krw > 0:
+            available_cash_krw = order_possible_cash_krw
+        base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
         reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
         override_capital = PB1_ENTRY_CAPITAL_KRW
         entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
-            available_cash_krw=available_cash_krw,
+            base_cash_krw=base_cash_krw,
             override_capital=override_capital,
             reserve_pct=reserve_pct,
         )
         self.entry_capital_krw = float(entry_capital_krw)
         self.entry_usable_krw = float(entry_usable_krw)
-        if capital_meta.get("auto"):
-            logger.info(
-                "[PB1][CAPITAL][AUTO] entry_capital_runtime=%s source=%s reserve=%.2f",
-                entry_capital_krw,
-                cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
-                reserve_pct,
-            )
+        budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
+        tick_budget_krw = int(entry_capital_krw * budget_pct)
+        self.entry_tick_budget_krw = float(tick_budget_krw)
         logger.info(
-            "[PB1][CAPITAL] mode=%s override=%s available_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s source=%s",
+            "[PB1][CAPITAL] mode=%s override=%s total_cash=%s order_possible_cash=%s base_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
             PB1_CAPITAL_MODE,
             override_capital,
-            available_cash_krw,
+            total_cash_krw,
+            order_possible_cash_krw,
+            base_cash_krw,
             reserve_pct,
             entry_usable_krw,
             int(capital_meta.get("use_override") or 0),
             entry_capital_krw,
+            capital_meta.get("cap_limit"),
+            tick_budget_krw,
+            budget_pct,
             cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
         )
+        if tick_budget_krw < min_order_krw:
+            logger.warning(
+                "[PB1][ENTRY_BLOCKED] reason=tick_budget_below_min_order tick_budget=%s min_order=%s",
+                tick_budget_krw,
+                min_order_krw,
+            )
+            entry_allowed = False
+            entry_reason = "tick_budget_below_min_order"
+            skip_entry_scan = True
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -2393,9 +2509,10 @@ class PB1Engine:
         existing_positions_count = len(existing_positions)
         slots_remaining = max(0, max_positions - existing_positions_count)
         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
+        self.target_new_positions = target_new_positions
         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
         logger.info(
-            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s ADD_TO_EXISTING=%s",
+            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s TICK_BUDGET_KRW=%s ADD_TO_EXISTING=%s",
             max_positions,
             target_new_positions,
             entry_capital_krw,
@@ -2403,6 +2520,7 @@ class PB1Engine:
             entry_cutoff_raw,
             existing_positions_count,
             available_cash_krw,
+            tick_budget_krw,
             allow_add_to_existing,
         )
         holdings = list(holdings_rows or [])
@@ -2629,8 +2747,8 @@ class PB1Engine:
                     reasons.append("max_positions")
                 if target_new_positions <= 0:
                     reasons.append("target_new_positions_zero")
-                if entry_capital_krw <= 0:
-                    reasons.append("entry_capital_zero")
+                if tick_budget_krw <= 0:
+                    reasons.append("tick_budget_zero")
                 if available_cash_krw <= 0:
                     reasons.append("available_cash_zero")
                 if min_order_krw > 0 and order_value < min_order_krw:
@@ -2639,7 +2757,7 @@ class PB1Engine:
                     reasons.append("order_value_zero")
                 if order_value > available_cash_krw:
                     reasons.append("insufficient_cash")
-                if planned_spent + order_value > float(entry_capital_krw):
+                if planned_spent + order_value > float(tick_budget_krw):
                     reasons.append("entry_cap_exceeded")
                 if not reasons and len(orderable_candidates) >= new_position_limit:
                     reasons.append("target_new_positions_limit")
@@ -2736,8 +2854,8 @@ class PB1Engine:
                         no_orders_reasons.append("max_positions")
                     if target_new_positions <= 0:
                         no_orders_reasons.append("target_new_positions_zero")
-                    if entry_capital_krw <= 0:
-                        no_orders_reasons.append("entry_capital_zero")
+                    if tick_budget_krw <= 0:
+                        no_orders_reasons.append("tick_budget_zero")
                     if available_cash_krw <= 0:
                         no_orders_reasons.append("available_cash_zero")
                     if min_order_krw > 0 and after_buyable_check_count == 0:

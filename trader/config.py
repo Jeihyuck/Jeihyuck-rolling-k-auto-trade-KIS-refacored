@@ -157,9 +157,9 @@ CONFIG = {
     "MARKET_CLOSE_HHMM": "15:30",
     "PB1_PULLBACK_BAND_KOSPI": "3,8",
     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
-    "PB1_VOL_CONTRACTION_MAX": "1.05",
-    "PB1_VOLU_CONTRACTION_MAX": "1.10",
-    "PB1_PULLBACK_MIN": "0.02",
+    "PB1_VOL_CONTRACTION_MAX": "1.00",
+    "PB1_VOLU_CONTRACTION_MAX": "0.98",
+    "PB1_PULLBACK_MIN": "0.03",
     "PB1_PULLBACK_MAX": "0.18",
     "PB1_REQUIRE_BOTH_CONTRACTIONS": "1",
     "PB1_SWING_TREND_MIN": "1.05",
@@ -175,16 +175,35 @@ CONFIG = {
     "PB1_MIN_CANDLES": "60",
     # PB1 "최고 눌림목" 랭킹/사이징 튜닝
     "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
-    "PB1_MIN_SCORE": "60",             # 점수 컷(0~100)
+    "PB1_MIN_SCORE": "70",             # 점수 컷(0~100)
+    "PB1_MIN_SCORE_BASE": "70",        # Adaptive score cut 시작값
+    "PB1_MIN_SCORE_FLOOR": "55",       # Adaptive score cut 하한
+    "PB1_MIN_SCORE_STEP": "5",         # Adaptive score cut 단계
+    "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.25",
+    "PB1_MAX_POS_PCT": "0.20",
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
     "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
     "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
+    "PB1_VOL_MAX": "1.00",
+    "PB1_VOLU_MAX": "0.98",
+    "PB1_VOLU_MAX_INTRADAY": "1.05",
+    "PB1_REQUIRE_BOTH": "1",
 }
 
 
 def _cfg(key: str) -> str:
     """환경변수 > CONFIG 기본값"""
     return os.getenv(key, CONFIG.get(key, ""))
+
+
+def _cfg_with_alias(primary: str, alias: str) -> str:
+    if os.getenv(primary) is not None:
+        return os.getenv(primary, "")
+    if os.getenv(alias) is not None:
+        return os.getenv(alias, "")
+    if primary in CONFIG:
+        return CONFIG.get(primary, "")
+    return CONFIG.get(alias, "")
 
 
 def _default_bool(key: str, fallback: bool = False) -> bool:
@@ -531,8 +550,15 @@ PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
 PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:00"
 PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
 PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
-PB1_VOL_CONTRACTION_MAX = float(_cfg("PB1_VOL_CONTRACTION_MAX") or "0.95")
-PB1_VOLU_CONTRACTION_MAX = float(_cfg("PB1_VOLU_CONTRACTION_MAX") or "0.90")
+PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.00")
+PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "0.98")
+PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
+PB1_PULLBACK_MIN = float(_cfg("PB1_PULLBACK_MIN") or "0.03")
+PB1_PULLBACK_MAX = float(_cfg("PB1_PULLBACK_MAX") or "0.18")
+PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=True))
+PB1_VOL_CONTRACTION_MAX = PB1_VOL_MAX
+PB1_VOLU_CONTRACTION_MAX = PB1_VOLU_MAX
+PB1_REQUIRE_BOTH_CONTRACTIONS = PB1_REQUIRE_BOTH
 PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
 PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
 PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
@@ -547,11 +573,31 @@ PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
 
 
 PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
-PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or "60")
+PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
+PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
+PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")
+PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or str(PB1_MIN_SCORE_BASE))
+PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
+PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
 PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
 PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
+
+logger.info(
+    "[CONFIG][PB1] entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f",
+    PB1_ENTRY_BUDGET_PCT_PER_TICK,
+    PB1_MAX_POS_PCT,
+    PB1_VOL_MAX,
+    PB1_VOLU_MAX,
+    PB1_VOLU_MAX_INTRADAY,
+    PB1_PULLBACK_MIN,
+    PB1_PULLBACK_MAX,
+    int(PB1_REQUIRE_BOTH),
+    PB1_MIN_SCORE_BASE,
+    PB1_MIN_SCORE_FLOOR,
+    PB1_MIN_SCORE_STEP,
+)
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 
