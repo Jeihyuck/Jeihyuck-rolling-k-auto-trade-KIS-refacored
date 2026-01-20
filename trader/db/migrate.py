@@ -35,11 +35,36 @@ def _chmod_rw(path: Path) -> None:
 
 
 def _prepare_sqlite_path(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    _chmod_rw(db_path.parent)
-    if not db_path.exists():
-        db_path.touch()
+    ensure_sqlite_writable(db_path)
     _chmod_rw(db_path)
+
+
+def ensure_sqlite_writable(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(db_path.parent, 0o700)
+    except Exception:
+        logger.warning("[DB][PERM][DIR_CHMOD_FAIL] path=%s", db_path.parent, exc_info=True)
+
+    if db_path.exists():
+        try:
+            os.chmod(db_path, 0o600)
+        except Exception:
+            logger.warning("[DB][PERM][FILE_CHMOD_FAIL] path=%s", db_path, exc_info=True)
+    else:
+        try:
+            db_path.touch()
+            os.chmod(db_path, 0o600)
+        except Exception:
+            logger.warning("[DB][PERM][TOUCH_FAIL] path=%s", db_path, exc_info=True)
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{db_path}{suffix}")
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except Exception:
+                logger.warning("[DB][PERM][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
 
 
 def _schema_stamp_path() -> Path:

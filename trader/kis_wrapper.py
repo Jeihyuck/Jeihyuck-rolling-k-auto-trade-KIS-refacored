@@ -103,21 +103,44 @@ def _deepcopy_json(value: Any) -> Any:
         return value
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            cleaned = value.replace(",", "").strip()
+            if cleaned == "":
+                return default
+            return float(cleaned)
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    return int(safe_float(value, default=float(default)))
+
+
 def _normalize_balance_snapshot(snapshot: Any) -> dict | None:
     if not isinstance(snapshot, dict):
         return None
-    output1 = snapshot.get("output1") or []
-    if isinstance(output1, dict):
-        output1 = [output1]
-    if not isinstance(output1, list):
+    rt_cd = snapshot.get("rt_cd")
+    if rt_cd is not None and str(rt_cd) != "0":
         return None
+    output1 = snapshot.get("output1")
+    if output1 is None:
+        output1 = []
+    elif isinstance(output1, dict):
+        output1 = [output1]
+    elif not isinstance(output1, list):
+        output1 = []
     output2 = snapshot.get("output2")
     if output2 is None:
-        return None
-    if isinstance(output2, dict):
+        output2 = []
+    elif isinstance(output2, dict):
         output2 = [output2]
-    if not isinstance(output2, list):
-        return None
+    elif not isinstance(output2, list):
+        output2 = []
     normalized = dict(snapshot)
     normalized["output1"] = output1
     normalized["output2"] = output2
@@ -1315,7 +1338,7 @@ class KisAPI:
             normalized = self._normalize_cash_value(x)
             if normalized == "":
                 return 0
-            return int(float(normalized))
+            return safe_int(normalized)
         except Exception:
             return 0
 
@@ -1505,8 +1528,8 @@ class KisAPI:
         for row in pos or []:
             try:
                 pdno = safe_strip(row.get("pdno"))
-                hldg = int(float(row.get("hldg_qty", "0")))
-                ord_psbl = int(float(row.get("ord_psbl_qty", "0")))
+                hldg = safe_int(row.get("hldg_qty", "0"))
+                ord_psbl = safe_int(row.get("ord_psbl_qty", "0"))
                 qty = hldg if hldg > 0 else ord_psbl
                 if pdno and qty > 0:
                     mp[pdno] = qty
@@ -1530,7 +1553,10 @@ class KisAPI:
                 return normalized
             global _BALANCE_CACHE_INVALID_LOGGED
             if not _BALANCE_CACHE_INVALID_LOGGED:
-                reason = "output2_none" if isinstance(cached, dict) and cached.get("output2") is None else "normalize_failed"
+                if isinstance(cached, dict) and cached.get("rt_cd") not in (None, "0"):
+                    reason = f"rt_cd_{cached.get('rt_cd')}"
+                else:
+                    reason = "normalize_failed"
                 logger.warning("[BALANCE][CACHE][INVALID] reason=%s -> refetching raw", reason)
                 _BALANCE_CACHE_INVALID_LOGGED = True
             force = True
@@ -1540,7 +1566,11 @@ class KisAPI:
             snap = self.inquire_balance_all()
             normalized = _normalize_balance_snapshot(snap)
             if normalized is None:
-                logger.warning("[BALANCE][CACHE][INVALID] reason=normalize_failed source=api")
+                if isinstance(snap, dict) and snap.get("rt_cd") not in (None, "0"):
+                    reason = f"rt_cd_{snap.get('rt_cd')}"
+                else:
+                    reason = "normalize_failed"
+                logger.warning("[BALANCE][CACHE][INVALID] reason=%s source=api", reason)
             else:
                 cache_value = _deepcopy_json(normalized)
                 self._balance_cache = cache_value

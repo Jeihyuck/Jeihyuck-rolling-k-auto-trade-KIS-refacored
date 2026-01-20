@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
+from sqlalchemy.exc import OperationalError
 from sqlalchemy import Engine, and_, func, select
 
 from .schema import (
@@ -20,6 +22,8 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
+from .migrate import ensure_sqlite_writable, run_migrations
+from . import config
 from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,45 @@ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+
+
+def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
+    message = str(exc).lower()
+    if "readonly" not in message:
+        return False
+    return config.is_sqlite_url(str(engine.url))
+
+
+def _recover_sqlite_readonly(engine: Engine) -> bool:
+    url = str(engine.url)
+    if not config.is_sqlite_url(url):
+        return False
+    db_path = Path(engine.url.database or "")
+    if not db_path:
+        return False
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
+    try:
+        if db_path.exists():
+            db_path.rename(backup_path)
+            logger.warning("[DB][READONLY][BACKUP] backup=%s", backup_path)
+    except Exception:
+        logger.warning("[DB][READONLY][BACKUP_FAIL] path=%s", db_path, exc_info=True)
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{db_path}{suffix}")
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except Exception:
+                logger.warning("[DB][READONLY][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
+    try:
+        engine.dispose()
+    except Exception:
+        logger.warning("[DB][READONLY][DISPOSE_FAIL] url=%s", url, exc_info=True)
+    ensure_sqlite_writable(db_path)
+    run_migrations(engine)
+    return True
 
 
 class RunsRepo:
@@ -65,12 +108,20 @@ class RunsRepo:
         }
         stmt = sa.insert(self._schema.runs).values(**values)
         run_id = values["run_id"]
-        with self.engine.begin() as conn:
-            try:
-                res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
-                run_id = res.scalar() or run_id
-            except Exception:
-                conn.execute(stmt)
+        for attempt in range(2):
+            with self.engine.begin() as conn:
+                try:
+                    res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
+                    run_id = res.scalar() or run_id
+                    return str(run_id)
+                except OperationalError as exc:
+                    if attempt == 0 and _is_sqlite_readonly(exc, self.engine):
+                        _recover_sqlite_readonly(self.engine)
+                        continue
+                    raise
+                except Exception:
+                    conn.execute(stmt)
+                    return str(run_id)
         return str(run_id)
 
     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:

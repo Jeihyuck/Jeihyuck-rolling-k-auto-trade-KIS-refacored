@@ -263,6 +263,7 @@ class CandidateFeature:
     mode_reasons: List[str]
     client_order_key: str | None = None
     planned_qty: int = 0
+    score: float | None = None
 
 
 @dataclass
@@ -861,6 +862,12 @@ class PB1Engine:
         entry_allowed: bool,
         entry_reason: str,
     ) -> None:
+        def _to_float(value: object) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return 0.0
+
         price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
         qty = int(cf.planned_qty or 0)
         if qty < 1:
@@ -873,14 +880,21 @@ class PB1Engine:
             return
         buyable = entry_allowed and not reasons
         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
+        score_val = (
+            getattr(cf, "score", None)
+            or getattr(cf, "rank_score", None)
+            or getattr(cf, "total_score", None)
+            or cf.features.get("score")
+            or 0.0
+        )
         payload = to_jsonable(
             {
                 "code": cf.code,
                 "market": cf.market,
-                "score": float(cf.score or 0.0),
+                "score": _to_float(score_val),
                 "qty": qty,
-                "price": float(price or 0.0),
-                "notional": float(order_value or 0.0),
+                "price": _to_float(price),
+                "notional": _to_float(order_value),
                 "buyable": buyable,
                 "reasons": reasons_out,
             }
@@ -1102,6 +1116,7 @@ class PB1Engine:
             mode_reasons=list(cf.mode_reasons),
             client_order_key=cf.client_order_key,
             planned_qty=cf.planned_qty,
+            score=cf.score,
         )
 
     def _apply_thresholds(
@@ -1215,6 +1230,7 @@ class PB1Engine:
             except Exception:
                 score = 0.0
             cf.features["score"] = score
+            cf.score = score
             scored.append(cf)
 
         if not scored:
@@ -1249,6 +1265,7 @@ class PB1Engine:
             except Exception:
                 score = 0.0
             cf.features["score"] = score
+            cf.score = score
 
             atr_pct = cf.features.get("atr_pct")
             value20 = cf.features.get("value20")

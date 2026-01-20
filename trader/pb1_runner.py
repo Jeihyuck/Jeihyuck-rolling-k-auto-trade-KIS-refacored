@@ -16,6 +16,7 @@ from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
     BOT_STATE_RESET,
+    BOT_STATE_HARD_RESET,
     BOT_STATE_RESET_CASH_MAX_KRW,
     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
@@ -44,6 +45,7 @@ from trader.botstate_sync import (
     acquire_lock as acquire_botstate_lock,
     compute_lock_ttl,
     ensure_sqlite_writable,
+    hard_reset_bot_state,
     persist_run_files,
     release_lock as release_botstate_lock,
     resolve_botstate_worktree_dir,
@@ -587,6 +589,10 @@ def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateCo
         return None
     if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
         return None
+    if BOT_STATE_HARD_RESET and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
+        deleted = hard_reset_bot_state(ctx.bot_state_dir)
+        os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
+        logger.info("[BOTSTATE][HARD_RESET][DONE] deleted=%s", deleted)
     return ctx
 
 

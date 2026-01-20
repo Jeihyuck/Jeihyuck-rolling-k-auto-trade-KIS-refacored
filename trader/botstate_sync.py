@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from trader.utils.env import env_bool
+
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -23,6 +25,7 @@ DEFAULT_LOCK_TTL_SEC = 240
 DEFAULT_LOCK_RETRY_SEC = 55
 DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
 DEFAULT_LOCK_BUFFER_SEC = 180
+DEFAULT_LOCK_GRACE_SEC = 60
 BOTSTATE_GITIGNORE_TEXT = """\
 # --- botstate (tracked artifacts) ---
 # Keep universe artifacts, diagnostics, db, and minimal runtime meta.
@@ -124,6 +127,65 @@ def ensure_sqlite_writable(db_path: str | Path) -> None:
         logger.warning("[DB][PERM][STAT_FAIL] path=%s", db_path, exc_info=True)
 
 
+def hard_reset_bot_state(bot_state_dir: Path) -> list[str]:
+    deleted: list[str] = []
+    targets: list[Path] = []
+    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
+    targets.extend(
+        [
+            db_path,
+            db_path.with_name(f"{db_path.name}-wal"),
+            db_path.with_name(f"{db_path.name}-shm"),
+        ]
+    )
+    targets.append(bot_state_dir / "universe_lkg")
+    runtime_dir = bot_state_dir / "runtime"
+    locks_dir = bot_state_dir / "locks"
+
+    for path in targets:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                deleted.append(str(path))
+            elif path.exists():
+                path.unlink()
+                deleted.append(str(path))
+        except Exception:
+            logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", path, exc_info=True)
+
+    if runtime_dir.exists():
+        for child in runtime_dir.iterdir():
+            if child.name in {".gitkeep", ".gitignore"}:
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+                deleted.append(str(child))
+            except Exception:
+                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", child, exc_info=True)
+
+    if locks_dir.exists():
+        for lock_path in locks_dir.glob("*.json"):
+            try:
+                lock_path.unlink()
+                deleted.append(str(lock_path))
+            except Exception:
+                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", lock_path, exc_info=True)
+
+    if runtime_dir.exists():
+        for lock_path in runtime_dir.glob("lock*.json"):
+            try:
+                lock_path.unlink()
+                deleted.append(str(lock_path))
+            except Exception:
+                logger.warning("[BOTSTATE][HARD_RESET][SKIP] path=%s", lock_path, exc_info=True)
+
+    logger.info("[BOTSTATE][HARD_RESET] deleted=%s", deleted)
+    return deleted
+
+
 def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
     try:
         buffer_sec = int(os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)))
@@ -150,6 +212,13 @@ def _lock_retry_sleep_sec() -> int:
         return int(os.getenv("BOTSTATE_LOCK_RETRY_SLEEP_SEC", str(DEFAULT_LOCK_RETRY_SLEEP_SEC)))
     except Exception:
         return DEFAULT_LOCK_RETRY_SLEEP_SEC
+
+
+def _lock_grace_sec() -> int:
+    try:
+        return int(os.getenv("BOTSTATE_LOCK_GRACE_SEC", str(DEFAULT_LOCK_GRACE_SEC)))
+    except Exception:
+        return DEFAULT_LOCK_GRACE_SEC
 
 
 def resolve_botstate_worktree_dir(repo_dir: Path) -> Path:
@@ -446,6 +515,8 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
         ttl_sec, _ = compute_lock_ttl(0)
     retry_total_sec = max(0, _lock_retry_total_sec())
     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+    grace_sec = max(0, _lock_grace_sec())
+    hard_reset_requested = env_bool("BOT_STATE_HARD_RESET", False)
     deadline_ts = time.time() + retry_total_sec
     attempt = 0
 
@@ -496,19 +567,21 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
                     stale_takeover = True
                 else:
                     locked_until = ts + timedelta(seconds=ttl)
-                    if locked_until > now:
+                    if locked_until + timedelta(seconds=grace_sec) > now:
                         locked = True
                     else:
                         stale_takeover = True
                 if stale_takeover:
                     logger.warning(
-                        "[BOTSTATE][STALE_TAKEOVER] prev_owner=%s prev_run_id=%s prev_until=%s",
+                        "[BOTSTATE][LOCK_OVERRIDE] event=lock_stale_override prev_owner=%s prev_run_id=%s prev_until=%s grace_sec=%s now=%s",
                         current_owner,
                         current_run_id,
                         locked_until,
+                        grace_sec,
+                        now.isoformat(),
                     )
             except Exception as exc:
-                logger.warning("[BOTSTATE][STALE_TAKEOVER] reason=parse_error err=%s", exc)
+                logger.warning("[BOTSTATE][LOCK_OVERRIDE] event=lock_stale_override reason=parse_error err=%s", exc)
                 stale_takeover = True
 
         if not locked:
@@ -543,6 +616,14 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
                     run_id,
                     ttl_sec,
                 )
+                if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
+                    deleted = hard_reset_bot_state(worktree_dir / "bot_state")
+                    os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
+                    logger.info(
+                        "[BOTSTATE][HARD_RESET][DONE] deleted=%s stale_takeover=%s",
+                        deleted,
+                        stale_takeover,
+                    )
                 return True
 
             logger.warning(

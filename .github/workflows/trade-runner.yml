@@ -5,7 +5,7 @@ permissions:
 
 concurrency:
   group: trade-bot-state
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 on:
   push:
@@ -52,6 +52,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+      BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
 
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
@@ -475,7 +476,7 @@ jobs:
           git rev-parse --show-toplevel || true
 
       - name: Persist bot_state (stage untracked + commit/push)
-        if: env.PERSIST_MODE != 'OFF'
+        if: always() && (env.PERSIST_MODE != 'OFF')
         run: |
           set -euo pipefail
 
@@ -514,6 +515,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+      BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
@@ -624,7 +626,7 @@ jobs:
           LOT_STATE_PATH: bot_state/runtime/lot_state.json
 
       - name: Persist bot_state (stage untracked + commit/push)
-        if: env.PERSIST_MODE != 'OFF'
+        if: always() && (env.PERSIST_MODE != 'OFF')
         run: |
           set -euo pipefail
 
