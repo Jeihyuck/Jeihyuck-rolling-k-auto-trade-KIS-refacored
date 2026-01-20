@@ -43,6 +43,7 @@ from trader.botstate_sync import (
     BotStateContext,
     acquire_lock as acquire_botstate_lock,
     compute_lock_ttl,
+    ensure_sqlite_writable,
     persist_run_files,
     release_lock as release_botstate_lock,
     resolve_botstate_worktree_dir,
@@ -1021,7 +1022,7 @@ def run_once(
     return touched_files, did_work, metrics, phase_for_log, result_status
 
 
-def _run_loop(*, args: argparse.Namespace, engine) -> None:
+def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
@@ -1060,6 +1061,9 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
     if botstate_ctx is None:
         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
         return
+    engine = make_engine()
+    run_migrations(engine)
+    _write_change_flag(False, ["init"])
     runtime_store = RuntimeStore(base_dir=botstate_ctx.bot_state_dir)
 
     pending_touched: dict[Path, Path] = {}
@@ -1253,19 +1257,20 @@ def _run_loop(*, args: argparse.Namespace, engine) -> None:
 
 def main() -> None:
     args = parse_args()
-    engine = make_engine()
-    run_migrations(engine)
-    _write_change_flag(False, ["init"])
-
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
     if run_loop_minutes > 0:
         run_loop = True
     if run_loop and not smoke_enabled:
-        _run_loop(args=args, engine=engine)
+        _run_loop(args=args)
         return
     if smoke_enabled:
+        bot_state_dir = get_botstate_root()
+        ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
+        engine = make_engine()
+        run_migrations(engine)
+        _write_change_flag(False, ["init"])
         run_once(args=args, engine=engine, loop_mode=False, window=None)
         return
 
@@ -1282,6 +1287,9 @@ def main() -> None:
     if botstate_ctx is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
         return
+    engine = make_engine()
+    run_migrations(engine)
+    _write_change_flag(False, ["init"])
     signal.signal(
         signal.SIGTERM,
         lambda *_args: logger.warning("[PB1][SIGNAL] SIGTERM -> defer release until shutdown"),

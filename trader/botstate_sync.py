@@ -57,6 +57,73 @@ def ensure_botstate_gitignore(workdir: str) -> None:
             f.write(BOTSTATE_GITIGNORE_TEXT)
 
 
+def ensure_writable_path(path: str | Path, *, is_dir: bool) -> None:
+    target = Path(path)
+    if is_dir:
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target, 0o700)
+        except OSError:
+            logger.warning("[DB][PERM][DIR_CHMOD_FAIL] path=%s", target, exc_info=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                logger.warning("[DB][PERM][FILE_CHMOD_FAIL] path=%s", target, exc_info=True)
+    try:
+        subprocess.run(
+            ["sudo", "chown", "-R", "runner:runner", str(target)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except Exception:
+        logger.info("[DB][PERM][CHOWN_SKIP] path=%s", target, exc_info=True)
+
+
+def ensure_sqlite_writable(db_path: str | Path) -> None:
+    db_path = Path(db_path)
+    ensure_writable_path(db_path.parent, is_dir=True)
+    ensure_writable_path(db_path, is_dir=False)
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("CREATE TABLE IF NOT EXISTS __writetest (k TEXT PRIMARY KEY, v TEXT);")
+        cur.execute(
+            "INSERT OR REPLACE INTO __writetest(k,v) VALUES ('t', ?);",
+            (str(time.time()),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        db_stat = os.stat(db_path)
+        dir_stat = os.stat(db_path.parent)
+        logger.info(
+            "[DB][PERM] path=%s mode=%o uid=%s gid=%s",
+            db_path,
+            db_stat.st_mode & 0o777,
+            db_stat.st_uid,
+            db_stat.st_gid,
+        )
+        logger.info(
+            "[DB][DIR_PERM] dir=%s mode=%o uid=%s gid=%s",
+            db_path.parent,
+            dir_stat.st_mode & 0o777,
+            dir_stat.st_uid,
+            dir_stat.st_gid,
+        )
+    except OSError:
+        logger.warning("[DB][PERM][STAT_FAIL] path=%s", db_path, exc_info=True)
+
+
 def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
     try:
         buffer_sec = int(os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)))
@@ -351,6 +418,9 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
     bot_state_dir = worktree_dir / "bot_state"
+    ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
+    ensure_writable_path(bot_state_dir / "runtime", is_dir=True)
+    ensure_writable_path(bot_state_dir / "trader_ledger", is_dir=True)
     os.environ["BOTSTATE_ROOT"] = str(bot_state_dir)
     return BotStateContext(
         worktree_dir=worktree_dir,

@@ -82,6 +82,7 @@ jobs:
           fetch-depth: 0
           ref: "bot-state"
           path: botstate
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore bot_state into workspace
         run: |
@@ -202,36 +203,39 @@ jobs:
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
-      - name: Persist bot_state (stage untracked + commit/push)
+      - name: Persist bot_state (commit in botstate repo)
         if: env.SHOULD_BUILD_UNIVERSE == '1'
         run: |
           set -euo pipefail
+          SRC_WORKTREE_DIR="${BOTSTATE_WORKTREE_DIR:-${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}}"
+          SRC_BOT_STATE="${SRC_WORKTREE_DIR}/bot_state"
+          echo "[PERSIST] SRC_BOT_STATE=${SRC_BOT_STATE}"
+          test -d "${SRC_BOT_STATE}" || { echo "missing SRC_BOT_STATE"; ls -la "${SRC_WORKTREE_DIR}" || true; exit 1; }
 
-          cd "$BOTSTATE_WORKTREE_DIR"
-          echo "[PERSIST] workdir=$(pwd)"
-          git status --porcelain | head -n 50 || true
+          cd botstate
+          git rev-parse --is-inside-work-tree
 
-          python -m trader.botstate_sync persist --mode FETCH_RESET --remote origin --branch bot-state
+          rsync -a --delete "../${SRC_BOT_STATE}/" "./bot_state/"
 
-          # 1) untracked 포함 bot_state 전체 stage
           git add -A bot_state
+          git status --porcelain
+          git commit -m "bot_state: universe build ${AS_OF_DATE:-$(date +%F)} (run ${GITHUB_RUN_ID})" || echo "nothing to commit"
+          git push origin HEAD:bot-state
 
-          # 2) staged 변경이 없으면 스킵
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no staged changes -> skip"
-          else
-            git config user.email "actions@github.com"
-            git config user.name "github-actions[bot]"
-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-            git push origin HEAD:bot-state
-          fi
+      - name: Verify persisted universe (botstate)
+        if: env.SHOULD_BUILD_UNIVERSE == '1'
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+          import os
 
-          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "::error::botstate worktree dirty after persist"
-            git status --porcelain | head -n 200
-            exit 1
-          fi
+          env = (os.getenv("KIS_ENV") or "practice").lower()
+          path = f"botstate/bot_state/universe_lkg/{env}/best_k_meta/latest.json"
+          with open(path, "r", encoding="utf-8") as handle:
+              data = json.load(handle)
+          print("[VERIFY] lkg members=", len(data.get("members", [])))
+          PY
 
   trade_tick:
     runs-on: ubuntu-latest
