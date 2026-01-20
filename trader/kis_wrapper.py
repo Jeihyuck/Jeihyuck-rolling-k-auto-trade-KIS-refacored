@@ -35,6 +35,7 @@ from trader.fills import append_fill
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
 _DAILY_CAP_WARNED = False
+_BALANCE_CACHE_INVALID_LOGGED = False
 
 
 class NetTemporaryError(Exception):
@@ -102,6 +103,27 @@ def _deepcopy_json(value: Any) -> Any:
         return value
 
 
+def _normalize_balance_snapshot(snapshot: Any) -> dict | None:
+    if not isinstance(snapshot, dict):
+        return None
+    output1 = snapshot.get("output1") or []
+    if isinstance(output1, dict):
+        output1 = [output1]
+    if not isinstance(output1, list):
+        return None
+    output2 = snapshot.get("output2")
+    if output2 is None:
+        return None
+    if isinstance(output2, dict):
+        output2 = [output2]
+    if not isinstance(output2, list):
+        return None
+    normalized = dict(snapshot)
+    normalized["output1"] = output1
+    normalized["output2"] = output2
+    return normalized
+
+
 def _is_raw_balance_snapshot(snapshot: Any) -> bool:
     if not isinstance(snapshot, dict):
         return False
@@ -109,6 +131,8 @@ def _is_raw_balance_snapshot(snapshot: Any) -> bool:
     if isinstance(output2, list) and output2:
         first = output2[0]
         return isinstance(first, dict) and bool(first)
+    if isinstance(output2, dict) and output2:
+        return True
     return False
 
 
@@ -1496,21 +1520,32 @@ class KisAPI:
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
             cached = _deepcopy_json(self._balance_cache)
-            if _is_raw_balance_snapshot(cached):
+            normalized = _normalize_balance_snapshot(cached)
+            if normalized:
                 logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
+                self._balance_cache = _deepcopy_json(normalized)
                 source = "wrapper_cache"
                 if return_source:
-                    return cached, source
-                return cached
-            logger.warning("[BALANCE][CACHE] invalid_shape=1 -> refetching raw")
+                    return normalized, source
+                return normalized
+            global _BALANCE_CACHE_INVALID_LOGGED
+            if not _BALANCE_CACHE_INVALID_LOGGED:
+                reason = "output2_none" if isinstance(cached, dict) and cached.get("output2") is None else "normalize_failed"
+                logger.warning("[BALANCE][CACHE][INVALID] reason=%s -> refetching raw", reason)
+                _BALANCE_CACHE_INVALID_LOGGED = True
             force = True
         logger.info("[BALANCE][CACHE] hit=False force=%s", force)
         snap: dict = {}
         try:
             snap = self.inquire_balance_all()
-            cache_value = _deepcopy_json(snap)
-            self._balance_cache = cache_value
-            self._balance_cache_at = now_kst()
+            normalized = _normalize_balance_snapshot(snap)
+            if normalized is None:
+                logger.warning("[BALANCE][CACHE][INVALID] reason=normalize_failed source=api")
+            else:
+                cache_value = _deepcopy_json(normalized)
+                self._balance_cache = cache_value
+                self._balance_cache_at = now_kst()
+                snap = normalized
         except Exception as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
         if return_source:

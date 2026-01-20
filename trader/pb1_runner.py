@@ -61,12 +61,15 @@ from trader.reconcile_kis import reconcile_today
 from trader.reset_utils import detect_account_fp, purge_bot_state
 from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
 from trader.time_utils import now_kst
+from trader.eventlog import emit_event
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
 log = logger
+
+_WINDOW_MISMATCH_LOGGED = False
 
 
 def _deepcopy_json(value):
@@ -176,9 +179,13 @@ def _handle_missing_positions_reset(
     env: str,
     strategy: str,
     run_id: str | None,
+    orders_count: int,
+    fills_count: int,
     positions_repo: PositionsRepo,
     ledger_repo: LedgerEventsRepo,
     bot_state_dir: Path,
+    reset_on_missing_positions: bool,
+    force_safe_exit: bool,
 ) -> bool:
     if not balance_snapshot:
         return False
@@ -189,11 +196,60 @@ def _handle_missing_positions_reset(
         return False
     positions = positions_repo.list_positions(env, strategy)
     position_codes = {str(p.get("code") or "").zfill(6) for p in positions if int(p.get("qty") or 0) > 0}
+    if not position_codes:
+        return False
+    if orders_count > 0 or fills_count > 0:
+        logger.info(
+            "[PB1][RESET][SKIP] holdings_empty=1 recent_orders=%s recent_fills=%s -> no stale reset",
+            orders_count,
+            fills_count,
+        )
+        return False
     ledger_store = LedgerStore(LEDGER_BASE_DIR, env=env, run_id=run_id)
     ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
     ledger_codes = {code for (code, sid, mode) in ledger_positions.keys() if code}
     missing_codes = sorted(position_codes | ledger_codes)
     if not missing_codes:
+        return False
+    if not reset_on_missing_positions and not force_safe_exit:
+        closed_count = positions_repo.close_positions(env=env, strategy=strategy, codes=sorted(position_codes))
+        for code in missing_codes:
+            ledger_repo.append_event(
+                env=env,
+                run_id=run_id,
+                event_type="AUTO_CLOSED_STALE_KIS_EMPTY",
+                ts=now_kst(),
+                code=code,
+                sid=1,
+                mode=1,
+                ok=True,
+                reasons=["AUTO_CLOSED_STALE_KIS_EMPTY"],
+                payload_json={
+                    "source": "stale_db_autoclose",
+                    "orders": orders_count,
+                    "fills": fills_count,
+                },
+            )
+        emit_event(
+            as_of=now_kst().date().isoformat(),
+            event="stale_db_autoclosed",
+            env=env,
+            strategy=strategy,
+            kis_holdings_count=len(holdings_rows),
+            missing_codes=missing_codes,
+            ledger_position_count=len(ledger_codes),
+            db_position_count=len(position_codes),
+            closed_positions=closed_count,
+            orders=orders_count,
+            fills=fills_count,
+            reason="AUTO_CLOSED_STALE_KIS_EMPTY",
+        )
+        logger.warning(
+            "[PB1][RESET][STALE_DB] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s",
+            env,
+            missing_codes,
+            closed_count,
+        )
         return False
     closed_count = 0
     if position_codes:
@@ -259,14 +315,17 @@ def _resolve_market_context(
 
 def _resolve_window_label(market_window: str, window: WindowDecision | None) -> str:
     normalized = (market_window or "").strip().lower()
-    if normalized == "day":
-        if window and window.name != "day":
-            logger.warning(
-                "[PB1][WINDOW][WARN] market_window=day mismatch window=%s -> forcing day",
-                window.name,
-            )
-        return "day"
-    if normalized in {"morning", "afternoon", "close", "preopen", "after"}:
+    if normalized in {"morning", "day", "close", "preopen", "after", "afternoon"}:
+        if window and window.name and window.name != normalized:
+            global _WINDOW_MISMATCH_LOGGED
+            if not _WINDOW_MISMATCH_LOGGED:
+                logger.warning(
+                    "[PB1][WINDOW][WARN] market_window=%s mismatch window=%s -> forcing %s",
+                    normalized,
+                    window.name,
+                    normalized,
+                )
+                _WINDOW_MISMATCH_LOGGED = True
         return normalized
     return window.name if window else "none"
 
@@ -952,14 +1011,22 @@ def run_once(
                 "phase_reason": phase_reason,
             },
         )
+        reset_on_missing_positions = env_bool("PB1_RESET_ON_MISSING_POSITIONS", False)
+        force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
+        todays_orders = orders_repo.list_today_orders(kis_env or "practice")
+        todays_fills = fills_repo.list_today_fills(kis_env or "practice")
         if _handle_missing_positions_reset(
             balance_snapshot=balance_snapshot_raw,
             env=kis_env or "practice",
             strategy="pb1_pullback_close",
             run_id=run_record_id,
+            orders_count=len(todays_orders),
+            fills_count=len(todays_fills),
             positions_repo=positions_repo,
             ledger_repo=ledger_repo,
             bot_state_dir=resolved_bot_state_dir,
+            reset_on_missing_positions=reset_on_missing_positions,
+            force_safe_exit=force_safe_exit,
         ):
             if env_bool("PRACTICE_RESET_DAY", False):
                 os.environ["PB1_ENTRY_ENABLED"] = "0"

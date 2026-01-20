@@ -57,6 +57,17 @@ __all__ = [
 ]
 
 
+def _format_order_response_reason(resp: Dict[str, Any] | None) -> str:
+    if not isinstance(resp, dict):
+        return "ORDER_FAIL_API(no_response)"
+    rt_cd = resp.get("rt_cd")
+    if str(rt_cd) == "0":
+        return "ORDER_OK"
+    msg_cd = resp.get("msg_cd")
+    msg1 = resp.get("msg1")
+    return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
+
+
 def _normalize_entry_meta(
     *,
     code: str,
@@ -696,6 +707,15 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
         if hasattr(kis, "buy_stock_limit_guarded") and order_price and order_price > 0:  # [PATCH]
             result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price))  # [PATCH]
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
+            logger.info(
+                "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
+                code,
+                int(bool(result_limit and result_limit.get("rt_cd") == "0")),
+                _format_order_response_reason(result_limit),
+                result_limit.get("rt_cd") if isinstance(result_limit, dict) else None,
+                result_limit.get("msg_cd") if isinstance(result_limit, dict) else None,
+                result_limit.get("msg1") if isinstance(result_limit, dict) else None,
+            )
             time.sleep(2.0)
             filled = False
             if hasattr(kis, "check_filled"):
@@ -758,6 +778,15 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
         else:
             result_mkt = _with_retry(kis.buy_stock, code, qty)
         logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, order_price, result_mkt)
+        logger.info(
+            "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
+            code,
+            int(bool(result_mkt and result_mkt.get("rt_cd") == "0")),
+            _format_order_response_reason(result_mkt),
+            result_mkt.get("rt_cd") if isinstance(result_mkt, dict) else None,
+            result_mkt.get("msg_cd") if isinstance(result_mkt, dict) else None,
+            result_mkt.get("msg1") if isinstance(result_mkt, dict) else None,
+        )
         try:
             fill_price = float(result_mkt.get("output", {}).get("prdt_price", 0)) or None
         except Exception:

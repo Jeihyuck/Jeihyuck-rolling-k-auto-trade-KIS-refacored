@@ -465,6 +465,26 @@ class FillsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def list_today_fills(
+        self,
+        env: str,
+        *,
+        side: str | None = None,
+        code: str | None = None,
+    ) -> list[dict]:
+        now = now_kst()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        conditions = [self._schema.fills.c.env == env, self._schema.fills.c.filled_at >= start, self._schema.fills.c.filled_at < end]
+        if side:
+            conditions.append(self._schema.fills.c.side == side)
+        if code:
+            conditions.append(self._schema.fills.c.code == code)
+        stmt = select(self._schema.fills).where(and_(*conditions))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
     def upsert_fill(
         self,
         *,

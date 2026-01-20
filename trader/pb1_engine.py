@@ -86,6 +86,43 @@ CASH_KEYS = (
     "evlu_amt_sbst_amt",
 )
 
+_ENTRY_BLOCK_REASON_MAP = {
+    "cap_below_min_order": "MIN_ORDER_KRW",
+    "min_order_krw": "MIN_ORDER_KRW",
+    "cap_below_one_share": "MIN_ORDER_KRW",
+    "entry_cutoff": "CUTOFF",
+    "entry_disabled": "ENTRY_DISABLED",
+    "available_cash_zero": "NO_CASH",
+    "insufficient_cash": "NO_CASH",
+    "entry_capital_zero": "NO_CASH",
+    "entry_cap_exceeded": "ENTRY_CAP_LIMIT",
+    "max_positions": "MAX_POSITIONS",
+    "target_new_positions_limit": "MAX_POSITIONS",
+    "target_new_positions_zero": "TARGET_NEW_POSITIONS_ZERO",
+    "open_order": "RATE_LIMIT",
+    "today_buy_exists": "RATE_LIMIT",
+    "duplicate_order": "RATE_LIMIT",
+    "holding_position": "EXISTING_POSITION",
+    "order_value_zero": "ORDER_VALUE_ZERO",
+    "qty_zero": "QTY_ZERO",
+    "universe_empty": "UNIVERSE_EMPTY",
+}
+
+_ORDER_SKIP_REASON_MAP = {
+    "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
+    "min_order_krw": "ORDER_SKIP_MIN_ORDER",
+    "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
+    "available_cash_zero": "ORDER_SKIP_NO_CASH",
+    "insufficient_cash": "ORDER_SKIP_NO_CASH",
+    "entry_capital_zero": "ORDER_SKIP_NO_CASH",
+    "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
+    "open_order": "ORDER_SKIP_RATE_LIMIT",
+    "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
+    "duplicate_order": "ORDER_SKIP_RATE_LIMIT",
+    "entry_cutoff": "ORDER_SKIP_CUTOFF",
+    "entry_disabled": "ORDER_SKIP_DISABLED",
+}
+
 
 def _as_first_dict(v: Any) -> Dict[str, Any]:
     """
@@ -124,6 +161,29 @@ def _extract_output2_keys(summary_raw: Any) -> list[str]:
     if summary_raw is None:
         return []
     return [f"type:{type(summary_raw).__name__}"]
+
+
+def _normalize_entry_block_reasons(reasons: Iterable[str] | None) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for reason in reasons or []:
+        mapped = _ENTRY_BLOCK_REASON_MAP.get(reason, reason.upper())
+        counter[mapped] += 1
+    return counter
+
+
+def _normalize_entry_block_counts(reason_counts: Counter[str]) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for reason, count in reason_counts.items():
+        mapped = _ENTRY_BLOCK_REASON_MAP.get(reason, reason.upper())
+        counter[mapped] += count
+    return counter
+
+
+def _format_reason_counts(counter: Counter[str]) -> str:
+    if not counter:
+        return "none"
+    parts = [f"{key}:{count}" for key, count in counter.most_common()]
+    return ",".join(parts)
 
 
 def _log_balance_snapshot_shape(snapshot: Any, *, label: str) -> None:
@@ -404,8 +464,19 @@ class PB1Engine:
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
-        if self.window_label in {"morning", "day"}:
-            internal = self.window_label
+        normalized = (self.window_label or "").strip().lower()
+        label_map = {"preopen": "morning", "morning": "morning", "day": "day", "close": "close"}
+        if normalized in label_map:
+            forced = label_map[normalized]
+            if internal != forced:
+                self._warn_once(
+                    "window_mismatch",
+                    "[PB1][WINDOW][WARN] market_window=%s mismatch window=%s -> forcing %s",
+                    normalized,
+                    internal,
+                    forced,
+                )
+            return forced
         return internal
 
     @staticmethod
@@ -570,6 +641,15 @@ class PB1Engine:
         return int(cash_value), meta
 
     def _resolve_holdings_snapshot_with_cash(self, snapshot: dict) -> tuple[dict, int, dict]:
+        if isinstance(snapshot, dict) and snapshot.get("output2") is None and self.kis:
+            self._warn_once(
+                "balance_output2_none",
+                "[BALANCE][CACHE][INVALID] reason=output2_none -> refetch",
+            )
+            try:
+                snapshot = self.kis.get_balance_cached(force=True)
+            except Exception as exc:
+                raise RuntimeError("Balance refetch failed after output2 None") from exc
         _log_balance_snapshot_shape(snapshot, label="input")
         if _is_sanitized_balance_snapshot(snapshot):
             logger.warning("[PB1][CASH][SANITIZED] detected -> force refetch raw")
@@ -747,6 +827,13 @@ class PB1Engine:
             sample_list.append(code)
 
     def _log_order_skip(self, cf: CandidateFeature, reasons: list[str], stage: str) -> None:
+        reason_codes = [_ORDER_SKIP_REASON_MAP.get(reason, f"ORDER_SKIP_{reason.upper()}") for reason in reasons]
+        logger.info(
+            "[PB1][ORDER][SKIP] code=%s reason_code=%s reasons=%s",
+            self._display_code(cf.code),
+            reason_codes,
+            reasons,
+        )
         try:
             self._append_ledger_event(
                 event_type="ORDER_SKIP",
@@ -892,6 +979,20 @@ class PB1Engine:
             stage=stage,
             payload_json=payload_json or {},
         )
+
+    @staticmethod
+    def _format_order_result_reason(resp: dict | None) -> str:
+        if not isinstance(resp, dict):
+            return "ORDER_FAIL_API(no_response)"
+        if resp.get("status") == "SKIPPED":
+            skip_reason = resp.get("skip_reason") or "SKIPPED"
+            return f"ORDER_SKIP_{skip_reason}"
+        rt_cd = resp.get("rt_cd")
+        if str(rt_cd) == "0":
+            return "ORDER_OK"
+        msg_cd = resp.get("msg_cd")
+        msg1 = resp.get("msg1")
+        return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
 
     def _log_setup(self, cf: CandidateFeature) -> None:
         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
@@ -1399,12 +1500,15 @@ class PB1Engine:
             msg1=msg1,
             kis_odno=kis_odno,
         )
+        reason_code = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         logger.info(
-            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s rt_cd=%s msg_cd=%s",
+            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
             display_code,
             int(ok),
+            reason_code,
             rt_cd,
             msg_cd,
+            msg1,
         )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -1566,12 +1670,15 @@ class PB1Engine:
             msg1=msg1,
             kis_odno=kis_odno,
         )
+        reason_code = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         logger.info(
-            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s rt_cd=%s msg_cd=%s",
+            "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
             display_code,
             int(ok),
+            reason_code,
             rt_cd,
             msg_cd,
+            msg1,
         )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -1835,12 +1942,15 @@ class PB1Engine:
             msg1=msg1,
             kis_odno=kis_odno,
         )
+        reason_code = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         logger.info(
-            "[PB1][ORDER][RESULT] side=SELL code=%s ok=%s rt_cd=%s msg_cd=%s",
+            "[PB1][ORDER][RESULT] side=SELL code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
             display_code,
             int(ok),
+            reason_code,
             rt_cd,
             msg_cd,
+            msg1,
         )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -2100,6 +2210,7 @@ class PB1Engine:
         entry_allowed = self.entry_enabled
         entry_reason = "ok"
         entry_summary_emitted = False
+        entry_decision_emitted = False
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
@@ -2145,6 +2256,36 @@ class PB1Engine:
 
         if not entry_allowed:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
+
+        def _emit_entry_decision(
+            result: str,
+            *,
+            reason: str | None,
+            ok_setups: int,
+            blocked_by: Counter[str],
+            orders: int = 0,
+            total_krw: float = 0.0,
+        ) -> None:
+            nonlocal entry_decision_emitted
+            if entry_decision_emitted:
+                return
+            blocked_text = _format_reason_counts(blocked_by)
+            if result == "PLACE":
+                logger.info(
+                    "ENTRY_DECISION result=PLACE orders=%s total_krw=%.0f ok_setups=%s blocked_by=%s",
+                    orders,
+                    total_krw,
+                    ok_setups,
+                    blocked_text,
+                )
+            else:
+                logger.info(
+                    "ENTRY_DECISION result=SKIP reason=%s ok_setups=%s blocked_by=%s",
+                    reason or "UNKNOWN",
+                    ok_setups,
+                    blocked_text,
+                )
+            entry_decision_emitted = True
 
         def _emit_entry_summary(
             setup_ok_codes: list[str] | None,
@@ -2244,6 +2385,12 @@ class PB1Engine:
             final_notes = "verify_only"
             self._log_reason_summary(final_notes)
             _emit_entry_summary([], [], Counter())
+            _emit_entry_decision(
+                "SKIP",
+                reason="PHASE_VERIFY",
+                ok_setups=0,
+                blocked_by=_normalize_entry_block_reasons(["phase_verify"]),
+            )
             return RunResult(
                 status=final_status,
                 notes=final_notes,
@@ -2269,6 +2416,12 @@ class PB1Engine:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
             if self.phase in {"prep", "entry"}:
                 _emit_entry_summary([], [], Counter())
+                _emit_entry_decision(
+                    "SKIP",
+                    reason="UNIVERSE_EMPTY",
+                    ok_setups=0,
+                    blocked_by=_normalize_entry_block_reasons([entry_reason]),
+                )
                 return RunResult(
                     status="SKIPPED",
                     notes=note,
@@ -2522,6 +2675,12 @@ class PB1Engine:
                 if self.phase in {"prep", "entry"}:
                     self._log_reason_summary(final_notes)
                     _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+                    _emit_entry_decision(
+                        "SKIP",
+                        reason="NO_FINAL_SETUPS",
+                        ok_setups=ok_count,
+                        blocked_by=_normalize_entry_block_counts(drop_reason_counter),
+                    )
                     return RunResult(
                         status=final_status,
                         notes=final_notes,
@@ -2560,6 +2719,14 @@ class PB1Engine:
                     if self.phase in {"prep", "entry"}:
                         self._log_reason_summary(final_notes)
                         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+                        blocked_by = _normalize_entry_block_counts(drop_reason_counter)
+                        blocked_by.update(_normalize_entry_block_reasons(no_orders_reasons))
+                        _emit_entry_decision(
+                            "SKIP",
+                            reason="NO_ORDER_INTENTS",
+                            ok_setups=ok_count,
+                            blocked_by=blocked_by,
+                        )
                         return RunResult(
                             status=final_status,
                             notes=final_notes,
@@ -2567,12 +2734,60 @@ class PB1Engine:
                             balance_cache_hits=self.balance_cache_hits,
                             balance_tick_cache_hits=self.balance_tick_cache_hits,
                         )
+                if orderable_candidates:
+                    planned_total = sum(
+                        float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
+                        for cf in orderable_candidates
+                    )
+                    blocked_by = _normalize_entry_block_counts(drop_reason_counter)
+                    _emit_entry_decision(
+                        "PLACE",
+                        reason=None,
+                        ok_setups=ok_count,
+                        blocked_by=blocked_by,
+                        orders=len(orderable_candidates),
+                        total_krw=planned_total,
+                    )
+                else:
+                    blocked_by = _normalize_entry_block_counts(drop_reason_counter)
+                    _emit_entry_decision(
+                        "SKIP",
+                        reason=entry_reason if entry_reason != "ok" else "NO_ORDER_INTENTS",
+                        ok_setups=ok_count,
+                        blocked_by=blocked_by,
+                    )
                 for cf in orderable_candidates:
                     if self.window_internal == "close":
                         self._place_entry_close(cf)
                     else:
                         self._place_entry(cf)
         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+        if not entry_decision_emitted:
+            ok_count = len(setup_ok_codes)
+            blocked_by = _normalize_entry_block_counts(drop_reason_counter)
+            if entry_reason and entry_reason != "ok":
+                blocked_by.update(_normalize_entry_block_reasons([entry_reason]))
+            if entry_allowed and orderable_candidates:
+                planned_total = sum(
+                    float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
+                    for cf in orderable_candidates
+                )
+                _emit_entry_decision(
+                    "PLACE",
+                    reason=None,
+                    ok_setups=ok_count,
+                    blocked_by=blocked_by,
+                    orders=len(orderable_candidates),
+                    total_krw=planned_total,
+                )
+            else:
+                reason = entry_reason if entry_reason != "ok" else "NO_ORDER_INTENTS"
+                _emit_entry_decision(
+                    "SKIP",
+                    reason=reason,
+                    ok_setups=ok_count,
+                    blocked_by=blocked_by,
+                )
         self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
