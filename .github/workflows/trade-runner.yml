@@ -355,6 +355,8 @@ jobs:
             echo "[RESET] hard reset bot_state"
             python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
           fi
+          mkdir -p "$BOT_STATE_DIR/db"
+          touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
           chmod -R u+rwX "$BOT_STATE_DIR" || true
 
       - name: Precheck env (fail fast)

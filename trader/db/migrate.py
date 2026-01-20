@@ -16,10 +16,6 @@ logger = logging.getLogger(__name__)
 MIGRATION_VERSION = "v1"
 
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
 def _chmod_rw(path: Path) -> None:
     try:
         if path.is_dir():
@@ -28,11 +24,22 @@ def _chmod_rw(path: Path) -> None:
             targets = [path]
         for target in targets:
             try:
-                os.chmod(target, target.stat().st_mode | stat.S_IWUSR)
+                os.chmod(
+                    target,
+                    target.stat().st_mode | stat.S_IWUSR | stat.S_IRUSR,
+                )
             except Exception:
                 continue
     except Exception:
         pass
+
+
+def _prepare_sqlite_path(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod_rw(db_path.parent)
+    if not db_path.exists():
+        db_path.touch()
+    _chmod_rw(db_path)
 
 
 def _schema_stamp_path() -> Path:
@@ -107,10 +114,7 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     if config.is_sqlite_url(url):
         db_path = Path(engine.url.database or "")
         if db_path:
-            _ensure_dir(db_path.parent)
-            _chmod_rw(db_path.parent)
-            if db_path.exists():
-                _chmod_rw(db_path)
+            _prepare_sqlite_path(db_path)
     if _should_skip_migrations(engine, migrations_dir):
         return
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")

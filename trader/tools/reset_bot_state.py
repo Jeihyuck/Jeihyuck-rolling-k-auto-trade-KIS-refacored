@@ -18,7 +18,7 @@ def chmod_rw(root: pathlib.Path) -> None:
     for p in [root] + list(root.rglob("*")):
         try:
             m = p.stat().st_mode
-            os.chmod(p, m | stat.S_IWUSR)
+            os.chmod(p, m | stat.S_IWUSR | stat.S_IRUSR)
         except Exception:
             pass
 
@@ -35,6 +35,11 @@ def main() -> None:
     bs = pathlib.Path(args.bot_state_dir)
 
     rm(bs / "db" / "pbcore.sqlite3")
+    events_dir = bs / "runtime" / "events"
+    if events_dir.exists():
+        for path in events_dir.glob("*.jsonl"):
+            rm(path)
+    rm(events_dir)
     rm(bs / "runtime")
     rm(bs / "trader_ledger")
     rm(bs / "locks")
@@ -44,9 +49,11 @@ def main() -> None:
         (bs / "universe_lkg").mkdir(parents=True, exist_ok=True)
 
     (bs / "db").mkdir(parents=True, exist_ok=True)
+    (bs / "runtime").mkdir(parents=True, exist_ok=True)
     (bs / "runtime" / "diagnostics").mkdir(parents=True, exist_ok=True)
     (bs / "trader_ledger").mkdir(parents=True, exist_ok=True)
     (bs / "locks").mkdir(parents=True, exist_ok=True)
+    (bs / "db" / "pbcore.sqlite3").touch()
 
     chmod_rw(bs)
     print(f"[RESET] bot_state reset done: {bs}")
