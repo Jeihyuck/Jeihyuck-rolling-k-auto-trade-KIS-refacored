@@ -1,256 +1,8 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 910925c493dce93c46c2d8f9061475825972d246..f55395b7cb2d74d0e5809744e160d26c7b0446b6 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -462,62 +462,66 @@ jobs:
-             echo "[RESET][HARD][FLAG] $reset_flag"
-             cat "$reset_flag"
-           else
-             echo "::error::reset flag missing: $reset_flag"
-             exit 1
-           fi
- 
-       - name: Inspect bot_state git status (post tick)
-         if: always()
-         run: |
-           set -euo pipefail
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[BOTSTATE][GIT] workdir=$(pwd)"
-           git status --porcelain | head -n 200 || true
-           git diff --cached --name-only | head -n 200 || true
- 
-       - name: Debug bot_state contents (after run)
-         if: always()
-         run: |
-           set -euo pipefail
-           echo "=== bot_state tree ==="
-           find bot_state -maxdepth 3 -type f -print || true
-           echo "=== git status (workspace) ==="
-           git status --porcelain || true
- 
--      - name: Debug paths (where am I?)
-+      - name: Debug botstate DB existence (worktree)
-         if: always()
-         run: |
-           set -euo pipefail
--          echo "PWD=$(pwd)"
--          ls -al
--          echo "---- find bot_state anywhere ----"
--          find . -maxdepth 4 -type d -name "bot_state" -o -name "_botstate_worktree" -o -name "_botstate" -o -name "repo" -o -name "botstate" || true
--          echo "---- find pbcore.sqlite3 anywhere ----"
--          find . -maxdepth 6 -type f -name "pbcore.sqlite3" -print || true
--          echo "---- git root? ----"
--          git rev-parse --show-toplevel || true
-+          echo "BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
-+          echo "BOT_STATE_DIR=$BOT_STATE_DIR"
-+          echo "PBCORE_DB_PATH=$PBCORE_DB_PATH"
-+          echo "---- ls bot_state/db ----"
-+          ls -la "$BOT_STATE_DIR/db" || true
-+          echo "---- find pbcore.sqlite3 under worktree ----"
-+          cd "$BOTSTATE_WORKTREE_DIR"
-+          find . -name "pbcore.sqlite3" -maxdepth 5 -print || true
-+          echo "---- stat (if exists) ----"
-+          if [ -f "$PBCORE_DB_PATH" ]; then
-+            stat "$PBCORE_DB_PATH" || true
-+          fi
- 
-       - name: Persist bot_state (stage untracked + commit/push)
-         if: always() && (env.PERSIST_MODE != 'OFF')
-         run: |
-           set -euo pipefail
- 
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
- 
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
- 
-           # 1) untracked 포함 bot_state 전체 stage
-           git add -A bot_state
- 
-           # 2) staged 변경이 없으면 스킵
-           if git diff --cached --quiet; then
-             echo "[PERSIST] no staged changes -> skip"
-           else
-             git config user.email "actions@github.com"
-             git config user.name "github-actions[bot]"
-             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-             git push origin HEAD:bot-state
-           fi
- 
-diff --git a/trader/db/migrate.py b/trader/db/migrate.py
-index 0d192e858edfe7c713fc5ff0a1bd88092ccd7ec8..fa6a00d276eca22af00cd0c538e0e52610bac995 100644
---- a/trader/db/migrate.py
-+++ b/trader/db/migrate.py
-@@ -127,50 +127,57 @@ def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
-             """
-         )
-     )
- 
- 
- def _list_applied_versions(conn: sa.Connection) -> set[str]:
-     result = conn.execute(text("SELECT version FROM schema_migrations"))
-     return {row[0] for row in result}
- 
- 
- def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
-     url = str(engine.url)
-     if config.is_sqlite_url(url):
-         db_path = Path(engine.url.database or "")
-         if db_path:
-             _prepare_sqlite_path(db_path)
-     if _should_skip_migrations(engine, migrations_dir):
-         return
-     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
-     with engine.begin() as conn:
-         url = str(engine.url)
-         if config.is_sqlite_url(url):
-             logger.info("[DB][MIGRATE] sqlite url=%s", url)
-             schema_for_engine(engine).metadata.create_all(engine)
-             _write_schema_stamp(migrations_dir)
-+            if db_path:
-+                logger.info(
-+                    "[DB][CHECK] path=%s exists=%s size=%s",
-+                    db_path,
-+                    int(os.path.exists(db_path)),
-+                    os.path.getsize(db_path) if os.path.exists(db_path) else -1,
-+                )
-             return
-         logger.info("[DB][MIGRATE] external url=%s", url)
-         # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
-         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
-         _ensure_schema_migrations_table(conn)
-         applied = _list_applied_versions(conn)
- 
-         migration_files = sorted(
-             [
-                 Path(path)
-                 for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
-                 if Path(path).is_file()
-             ]
-         )
-         for path in migration_files:
-             version = path.name
-             if version in applied:
-                 continue
-             sql = path.read_text()
-             logger.info("[DB][MIGRATE] applying %s", version)
-             try:
-                 conn.execute(text(sql))
-                 conn.execute(
-                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
-                     {"version": version},
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index 72f4122b487c3246ddf59b5abe8611fe0f51cdd3..73974762be3c4487eec619af99867d9bd9a1a475 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -1619,50 +1619,96 @@ class KisAPI:
-             if normalized is None:
-                 if isinstance(snap, dict) and snap.get("rt_cd") not in (None, "0"):
-                     reason = f"rt_cd_{snap.get('rt_cd')}"
-                 else:
-                     reason = "normalize_failed"
-                 logger.warning("[BALANCE][CACHE][INVALID] reason=%s source=api", reason)
-             else:
-                 cache_value = _deepcopy_json(normalized)
-                 self._balance_cache = cache_value
-                 self._balance_cache_at = now_kst()
-                 snap = normalized
-         except Exception as e:
-             logger.error("[GET_BALANCE_FAIL] %s", e)
-         if return_source:
-             return _deepcopy_json(snap), source
-         return _deepcopy_json(snap)
- 
-     # --- 호환 셔임(기존 trader.py 호출 대응) ---
-     def get_balance(self) -> Dict[str, object]:
-         return self.get_balance_cached()
- 
-     def get_balance_all(self) -> Dict[str, object]:
-         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
-         return self.get_balance_cached()
- 
-+    def get_balance_snapshot_safe(self) -> dict:
-+        """
-+        잔고조회 결과에서 '총액/주문가능/예수금'을 최대한 안전하게 추출한다.
-+        실패해도 예외를 최소화하고, 원인 확인을 위한 raw_keys를 남긴다.
-+        """
-+        raw = self.get_balance_cached(force=True)
-+        snap = {
-+            "total_asset_krw": None,
-+            "total_eval_krw": None,
-+            "cash_total_krw": None,
-+            "orderable_cash_krw": None,
-+            "deposit_like_krw": None,
-+            "raw_keys": [],
-+        }
-+
-+        if not isinstance(raw, dict):
-+            return snap
-+
-+        snap["raw_keys"] = sorted(list(raw.keys()))
-+        summary = raw.get("output2")
-+        if isinstance(summary, list):
-+            summary = summary[0] if summary else None
-+        if not isinstance(summary, dict):
-+            summary = raw
-+
-+        def _to_int(value):
-+            try:
-+                if value is None:
-+                    return None
-+                if isinstance(value, (int, float)):
-+                    return int(value)
-+                text = str(value).replace(",", "").strip()
-+                return int(float(text))
-+            except Exception:
-+                return None
-+
-+        snap["cash_total_krw"] = _to_int(
-+            summary.get("dnca_tot_amt") or summary.get("cash_total") or summary.get("cash")
-+        )
-+        snap["orderable_cash_krw"] = _to_int(summary.get("ord_psbl_cash") or summary.get("orderable_cash"))
-+        snap["total_eval_krw"] = _to_int(summary.get("tot_evlu_amt") or summary.get("total_eval"))
-+        snap["total_asset_krw"] = _to_int(summary.get("tot_asst_amt") or summary.get("total_asset"))
-+        snap["deposit_like_krw"] = snap["cash_total_krw"]
-+
-+        return snap
-+
-     def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
-         """당일 주문/체결 조회."""
-         tr_ids = _pick_tr(self.env, "DAILY_CCLD")
-         if not tr_ids:
-             raise ValueError("KIS daily reconcile TR_ID not configured")
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-         params = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "INQR_STRT_DT": start_date,
-             "INQR_END_DT": end_date,
-             "SLL_BUY_DVSN_CD": "00",
-             "INQR_DVSN": "00",
-             "PDNO": "",
-             "CCLD_DVSN": "00",
-             "ORD_GNO_BRNO": "",
-             "ODNO": "",
-             "INQR_DVSN": "00",
-             "SORT_SQN": "00",
-         }
-         last_err: Exception | None = None
-         for tr_id in tr_ids:
-             try:
-                 headers = self._headers(tr_id)
-                 resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 0d8410ad766180b61f00573b201a5071805fb8e3..2b415aa5ed30e7ed909a709e6d98b6abf269fe3d 100644
+index 2b415aa5ed30e7ed909a709e6d98b6abf269fe3d..ffd52e6edbcaae0a6514cf881295258eec79f65a 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -60,50 +60,91 @@ from trader.kis_wrapper import KisAPI
- from trader.ledger.store import LedgerStore
- from trader.pb1_engine import PB1Engine, resolve_pb1_phase
- from trader.reconcile_kis import reconcile_today
- from trader.reconcile_db import close_stale_positions
- from trader.reset_utils import detect_account_fp, purge_bot_state
+@@ -65,57 +65,60 @@ from trader.reset_utils import detect_account_fp, purge_bot_state
  from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
  from trader.time_utils import now_kst
  from trader.eventlog import emit_event
@@ -271,73 +23,47 @@ index 0d8410ad766180b61f00573b201a5071805fb8e3..2b415aa5ed30e7ed909a709e6d98b6ab
          return value
  
  
-+def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
-+    """
-+    DIAG에서도 1회 잔고조회(총액/주문가능/예수금)를 시도하고 로그로 남김.
-+    실패해도 예외를 던지지 않는다.
-+    """
-+    try:
-+        diag_dir = os.path.join(runtime_dir, "diagnostics")
-+        os.makedirs(diag_dir, exist_ok=True)
-+        flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
-+        if os.path.exists(flag_path):
-+            return
-+
-+        logger.info(
-+            "[DIAG][CAPITAL-CONFIG] DAILY_CAPITAL=%s PAPER_MAX_CAPITAL_KRW=%s ENTRY_BUDGET_PCT=%s RESERVE=%s",
-+            os.getenv("DAILY_CAPITAL"),
-+            os.getenv("PAPER_MAX_CAPITAL_KRW"),
-+            os.getenv("PB1_ENTRY_BUDGET_PCT"),
-+            os.getenv("RESERVE"),
-+        )
-+
-+        try:
-+            kis = kis_factory()
-+            snap = kis.get_balance_snapshot_safe()
-+            logger.info(
-+                "[DIAG][BALANCE] total_asset_krw=%s total_eval_krw=%s cash_total_krw=%s orderable_cash_krw=%s deposit_like_krw=%s raw_keys=%s",
-+                snap.get("total_asset_krw"),
-+                snap.get("total_eval_krw"),
-+                snap.get("cash_total_krw"),
-+                snap.get("orderable_cash_krw"),
-+                snap.get("deposit_like_krw"),
-+                snap.get("raw_keys"),
-+            )
-+        except Exception as exc:
-+            logger.warning("[DIAG][BALANCE][SKIP] %s", str(exc))
-+
-+        with open(flag_path, "w", encoding="utf-8") as handle:
-+            handle.write(datetime.now().isoformat())
-+    except Exception:
+ def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
+     """
+     DIAG에서도 1회 잔고조회(총액/주문가능/예수금)를 시도하고 로그로 남김.
+     실패해도 예외를 던지지 않는다.
+     """
++    if not runtime_dir:
 +        return
-+
-+
- def universe_build_flag(as_of: str) -> Path:
-     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
+     try:
+         diag_dir = os.path.join(runtime_dir, "diagnostics")
+         os.makedirs(diag_dir, exist_ok=True)
+         flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
+         if os.path.exists(flag_path):
+             return
  
++        logger.info("[DIAG][BALANCE] probe_once start runtime_dir=%s", runtime_dir)
+         logger.info(
+             "[DIAG][CAPITAL-CONFIG] DAILY_CAPITAL=%s PAPER_MAX_CAPITAL_KRW=%s ENTRY_BUDGET_PCT=%s RESERVE=%s",
+             os.getenv("DAILY_CAPITAL"),
+             os.getenv("PAPER_MAX_CAPITAL_KRW"),
+             os.getenv("PB1_ENTRY_BUDGET_PCT"),
+             os.getenv("RESERVE"),
+         )
  
- def ensure_universe_built_once(
-     runtime_store: RuntimeStore | None = None,
-     *,
-     env: str | None = None,
-     strategy: str | None = None,
-     as_of: str | None = None,
-     force: bool = False,
- ) -> None:
-     if runtime_store is None:
-         raise ValueError("runtime_store is required for ensure_universe_built_once")
+         try:
+             kis = kis_factory()
+             snap = kis.get_balance_snapshot_safe()
+             logger.info(
+                 "[DIAG][BALANCE] total_asset_krw=%s total_eval_krw=%s cash_total_krw=%s orderable_cash_krw=%s deposit_like_krw=%s raw_keys=%s",
+                 snap.get("total_asset_krw"),
+                 snap.get("total_eval_krw"),
+                 snap.get("cash_total_krw"),
+                 snap.get("orderable_cash_krw"),
+                 snap.get("deposit_like_krw"),
+                 snap.get("raw_keys"),
+             )
+         except Exception as exc:
+             logger.warning("[DIAG][BALANCE][SKIP] %s", str(exc))
  
-     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
-     if env is not None:
-         env = env.strip()
-     strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
-     as_of = as_of or _get_now_kst().date().isoformat()
- 
-     assert env, "env is required"
-     assert strategy, "strategy is required"
-     assert as_of, "as_of is required"
- 
-@@ -1215,50 +1256,56 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+         with open(flag_path, "w", encoding="utf-8") as handle:
+             handle.write(datetime.now().isoformat())
+@@ -1256,51 +1259,54 @@ def _run_loop(*, args: argparse.Namespace) -> None:
          loop_deadline.isoformat() if loop_deadline else "none",
          max_seconds,
      )
@@ -363,12 +89,16 @@ index 0d8410ad766180b61f00573b201a5071805fb8e3..2b415aa5ed30e7ed909a709e6d98b6ab
                  break
              now = _get_now_kst()
              if now >= close_dt:
-+                if mode == "DIAG":
-+                    _diag_balance_probe_once(
-+                        logger=logger,
-+                        runtime_dir=str(get_botstate_root() / "runtime"),
-+                        kis_factory=lambda: KisAPI(),
-+                    )
+-                if mode == "DIAG":
++                strategy_mode = (
++                    os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
++                ).upper()
++                if strategy_mode == "DIAG":
+                     _diag_balance_probe_once(
+                         logger=logger,
+                         runtime_dir=str(get_botstate_root() / "runtime"),
+                         kis_factory=lambda: KisAPI(),
+                     )
                  logger.info("[PB1][LOOP] market closed -> exit")
                  exit_reason = "market_closed"
                  break
@@ -389,9 +119,64 @@ index 0d8410ad766180b61f00573b201a5071805fb8e3..2b415aa5ed30e7ed909a709e6d98b6ab
                      next_start = _next_window_start(
                          now,
                          [
-                             _parse_hhmm_to_time(MORNING_WINDOW_START),
-                             _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-                             _parse_hhmm_to_time(CLOSE_AUCTION_START),
-                         ],
+@@ -1381,50 +1387,59 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+                 pending_touched[path] = path
+             if pending_touched:
+                 now_ts = time_mod.monotonic()
+                 urgent = _is_urgent_persist(list(pending_touched.values()))
+                 if urgent or (now_ts - last_persist_ts >= persist_interval):
+                     persist_run_files(
+                         botstate_ctx.worktree_dir,
+                         list(pending_touched.values()),
+                         message=f"pb1 loop {now.isoformat()}",
                      )
+                     pending_touched.clear()
+                     last_persist_ts = now_ts
+             time_mod.sleep(loop_interval)
+     finally:
+         elapsed_trade = time_mod.monotonic() - loop_started_ts
+         elapsed_total = time_mod.monotonic() - total_start_ts
+         if exit_reason == "unknown":
+             exit_reason = "shutdown"
+         if pending_touched:
+             persist_run_files(
+                 botstate_ctx.worktree_dir,
+                 list(pending_touched.values()),
+                 message=f"pb1 loop {now_kst().isoformat()}",
+             )
+         release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
++        strategy_mode = (
++            os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
++        ).upper()
++        if strategy_mode == "DIAG":
++            _diag_balance_probe_once(
++                logger=logger,
++                runtime_dir=os.path.join(BOT_STATE_DIR, "runtime"),
++                kis_factory=lambda: KisAPI(),
++            )
+         if max_seconds > 0 and elapsed_trade > max_seconds:
+             logger.warning(
+                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
+         else:
+             logger.info(
+                 "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
 

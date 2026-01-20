@@ -87,6 +87,8 @@ def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
     DIAG에서도 1회 잔고조회(총액/주문가능/예수금)를 시도하고 로그로 남김.
     실패해도 예외를 던지지 않는다.
     """
+    if not runtime_dir:
+        return
     try:
         diag_dir = os.path.join(runtime_dir, "diagnostics")
         os.makedirs(diag_dir, exist_ok=True)
@@ -94,6 +96,7 @@ def _diag_balance_probe_once(logger, runtime_dir: str, kis_factory):
         if os.path.exists(flag_path):
             return
 
+        logger.info("[DIAG][BALANCE] probe_once start runtime_dir=%s", runtime_dir)
         logger.info(
             "[DIAG][CAPITAL-CONFIG] DAILY_CAPITAL=%s PAPER_MAX_CAPITAL_KRW=%s ENTRY_BUDGET_PCT=%s RESERVE=%s",
             os.getenv("DAILY_CAPITAL"),
@@ -1278,7 +1281,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 break
             now = _get_now_kst()
             if now >= close_dt:
-                if mode == "DIAG":
+                strategy_mode = (
+                    os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
+                ).upper()
+                if strategy_mode == "DIAG":
                     _diag_balance_probe_once(
                         logger=logger,
                         runtime_dir=str(get_botstate_root() / "runtime"),
@@ -1403,6 +1409,15 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 message=f"pb1 loop {now_kst().isoformat()}",
             )
         release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
+        strategy_mode = (
+            os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or ""
+        ).upper()
+        if strategy_mode == "DIAG":
+            _diag_balance_probe_once(
+                logger=logger,
+                runtime_dir=os.path.join(BOT_STATE_DIR, "runtime"),
+                kis_factory=lambda: KisAPI(),
+            )
         if max_seconds > 0 and elapsed_trade > max_seconds:
             logger.warning(
                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
