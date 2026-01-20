@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from trader.utils.json_sanitize import to_jsonable
+
 KST = ZoneInfo("Asia/Seoul")
 
 
@@ -66,7 +68,8 @@ class LedgerEvent:
     def to_jsonl(self) -> str:
         import json
 
-        return json.dumps(self.to_dict(), ensure_ascii=False)
+        payload = to_jsonable(self.to_dict())
+        return json.dumps(payload, ensure_ascii=False)
 
 
 def new_order_intent(**kwargs: Any) -> LedgerEvent:
@@ -91,4 +94,3 @@ def new_error(**kwargs: Any) -> LedgerEvent:
 
 def new_unfilled(**kwargs: Any) -> LedgerEvent:
     return LedgerEvent(event_type="UNFILLED", ok=False, **kwargs)
-

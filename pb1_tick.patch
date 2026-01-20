@@ -1,261 +1,950 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 36984a2692dd4b203b636c6f6e50623a26329863..b34f192d9fa0081d44ec606e43cafb7edaee0898 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -333,50 +333,52 @@ jobs:
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
+diff --git a/tests/test_json_sanitize.py b/tests/test_json_sanitize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55609f8fa4f819ece30287f94d00cbe4b14f9ddc
+--- /dev/null
++++ b/tests/test_json_sanitize.py
+@@ -0,0 +1,32 @@
++import json
++
++import numpy as np
++
++from trader.utils.json_sanitize import to_jsonable
++
++
++def test_numpy_scalar_to_float() -> None:
++    value = to_jsonable(np.float64(1.23))
++    assert isinstance(value, float)
++    assert value == 1.23
++
++
++def test_nan_and_inf_to_none() -> None:
++    assert to_jsonable(float("nan")) is None
++    assert to_jsonable(float("inf")) is None
++    assert to_jsonable(float("-inf")) is None
++
++
++def test_recursive_conversion() -> None:
++    payload = {
++        "features": {
++            "pullback_pct": np.float64(0.12),
++            "vol_contraction": float("nan"),
++        },
++        "tags": {"a", "b"},
++    }
++    sanitized = to_jsonable(payload)
++    assert sanitized["features"]["pullback_pct"] == 0.12
++    assert sanitized["features"]["vol_contraction"] is None
++    assert sorted(sanitized["tags"]) == ["a", "b"]
++    json.dumps(sanitized)
+diff --git a/trader/eventlog.py b/trader/eventlog.py
+index ec667b64848dccccf0f7f95dffc9c56058b26716..563afd57ed078d3f30fda0f3ce3c7d0dacb6cfc6 100644
+--- a/trader/eventlog.py
++++ b/trader/eventlog.py
+@@ -1,32 +1,37 @@
+ from __future__ import annotations
  
-       - name: Cache pip
-         uses: actions/cache@v4
-         with:
-           path: ~/.cache/pip
-           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-           restore-keys: |
-             ${{ runner.os }}-pip-
- 
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Hard reset bot_state (one-shot)
-         run: |
-           set -euo pipefail
-           if [ "${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}" = "1" ]; then
-             echo "[RESET] hard reset bot_state"
-             python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
-           fi
-+          mkdir -p "$BOT_STATE_DIR/db"
-+          touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
-           chmod -R u+rwX "$BOT_STATE_DIR" || true
- 
-       - name: Precheck env (fail fast)
-         run: |
-           set -euo pipefail
-           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-             if [ -z "${!k:-}" ]; then
-               echo "::error::Missing required secret/env: $k"
-               exit 1
-             fi
-           done
-           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
-         env:
-           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
- 
-       - name: Resolve market-aware runtime mode
-         run: |
-           set -euo pipefail
-           python - << 'PY'
-           from datetime import datetime, time
-           from zoneinfo import ZoneInfo
-           import os
- 
-           KST = ZoneInfo("Asia/Seoul")
-diff --git a/trader/db/migrate.py b/trader/db/migrate.py
-index aa2ba82f6ad43fc9beaa3f087199798a3ae9595c..4353930a3ef655383cb3f7d550ac702593c56c66 100644
---- a/trader/db/migrate.py
-+++ b/trader/db/migrate.py
-@@ -1,62 +1,69 @@
- import glob
- import hashlib
+ from datetime import datetime
+ import json
  import logging
- import os
- import stat
  from pathlib import Path
  
- import sqlalchemy as sa
- from sqlalchemy import Engine, text
++from trader.utils.json_sanitize import to_jsonable
++
+ logger = logging.getLogger(__name__)
  
- from . import config
- from .schema import schema_for_engine
  
+ def event_path(as_of: str) -> Path:
+     return Path("bot_state/runtime/events") / f"pb1_{as_of}.jsonl"
+ 
+ 
+-def emit_event(*, as_of: str, event: str, **fields) -> None:
++def emit_event(*, as_of: str, event: str, **fields) -> tuple[bool, Exception | None]:
+     """
+     Append JSON line.
+     Always safe: best-effort, never crash trading loop.
+     """
+     try:
+         p = event_path(as_of)
+         p.parent.mkdir(parents=True, exist_ok=True)
+         payload = {
+             "ts": datetime.now().isoformat(),
+             "as_of": as_of,
+             "event": event,
+             **fields,
+         }
++        payload = to_jsonable(payload)
+         with p.open("a", encoding="utf-8") as f:
+             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+-    except Exception:
++        return True, None
++    except Exception as exc:
+         logger.exception("[EVENTLOG][FAIL] event=%s", event)
++        return False, exc
+diff --git a/trader/ledger/event_types.py b/trader/ledger/event_types.py
+index 6a11e116732eeb2cb37e9fcfc85948dd93c7c3e1..e0f20df1d934cf657232e18fda98448bb7f0488f 100644
+--- a/trader/ledger/event_types.py
++++ b/trader/ledger/event_types.py
+@@ -1,40 +1,42 @@
+ from __future__ import annotations
+ 
+ """Ledger event models used for append-only JSONL persistence.
+ 
+ This module intentionally keeps the schema explicit and small so it can be
+ shared between the trading runtime and the bot-state worktree copier. Each
+ event is a dataclass with JSONL-friendly serialization helpers.
+ """
+ 
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from typing import Any, Dict, List, Optional
+ from uuid import uuid4
+ from zoneinfo import ZoneInfo
+ 
++from trader.utils.json_sanitize import to_jsonable
++
+ KST = ZoneInfo("Asia/Seoul")
+ 
+ 
+ def _ts(dt: datetime | None = None) -> datetime:
+     return (dt or datetime.now(tz=KST)).astimezone(tz=KST)
+ 
+ 
+ @dataclass
+ class LedgerEvent:
+     event_type: str
+     code: str
+     market: str
+     sid: int
+     mode: int
+     env: str
+     run_id: str
+     side: Optional[str] = None
+     qty: Optional[int] = None
+     price: Optional[float] = None
+     odno: Optional[str] = None
+     client_order_key: Optional[str] = None
+     ok: bool = True
+     reasons: List[str] = field(default_factory=list)
+     payload: Optional[Dict[str, Any]] = None
+     stage: Optional[str] = None
+@@ -44,51 +46,51 @@ class LedgerEvent:
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "event_id": self.event_id,
+             "event_type": self.event_type,
+             "ts": self.ts.isoformat(),
+             "run_id": self.run_id,
+             "env": self.env,
+             "code": str(self.code).zfill(6),
+             "market": self.market,
+             "sid": self.sid,
+             "mode": self.mode,
+             "side": self.side,
+             "qty": self.qty,
+             "price": self.price,
+             "odno": self.odno,
+             "client_order_key": self.client_order_key,
+             "ok": bool(self.ok),
+             "reasons": list(self.reasons or []),
+             "payload": self.payload or {},
+             "stage": self.stage,
+         }
+ 
+     def to_jsonl(self) -> str:
+         import json
+ 
+-        return json.dumps(self.to_dict(), ensure_ascii=False)
++        payload = to_jsonable(self.to_dict())
++        return json.dumps(payload, ensure_ascii=False)
+ 
+ 
+ def new_order_intent(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ORDER_INTENT", **kwargs)
+ 
+ 
+ def new_order_ack(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ORDER_ACK", **kwargs)
+ 
+ 
+ def new_fill(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="FILL", **kwargs)
+ 
+ 
+ def new_exit_intent(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="EXIT_INTENT", **kwargs)
+ 
+ 
+ def new_error(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="ERROR", ok=False, **kwargs)
+ 
+ 
+ def new_unfilled(**kwargs: Any) -> LedgerEvent:
+     return LedgerEvent(event_type="UNFILLED", ok=False, **kwargs)
+-
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index a4e2022bcb8afafc592a36d39e9a99cf743944c7..ac1113c08da9bb17b1dd21825bfd68ad26560c14 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -31,50 +31,51 @@ from trader.config import (
+     PB1_USE_RISK_PARITY,
+     PB1_MAX_ATR_PCT,
+     PB1_MIN_VALUE20,
+     PB1_CAPITAL_MODE,
+     PB1_ENTRY_CAPITAL_KRW,
+     PB1_CASH_RESERVE_PCT,
+     PAPER_MAX_CAPITAL_KRW,
+     PB1_ENTRY_WINDOW_START,
+     PB1_ENTRY_OPEN_END,
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_START,
+     PB1_EXIT_WINDOW_END,
+     PB1_ALLOW_ADD_TO_EXISTING,
+     MIN_ORDER_KRW,
+     resolve_market_window,
+ )
+ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.store import LedgerStore
+ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
+ from trader.time_utils import now_kst
+ from trader.core_utils import _round_to_tick
+ from trader.eventlog import emit_event
+ from trader.utils.env import env_bool, parse_env_flag
++from trader.utils.json_sanitize import to_jsonable
+ from trader.window_router import WindowDecision
  
  logger = logging.getLogger(__name__)
- MIGRATION_VERSION = "v1"
  
+ _OUTPUT2_LIST_NORMALIZED_LOGGED = False
+ _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
  
--def _ensure_dir(path: Path) -> None:
--    path.mkdir(parents=True, exist_ok=True)
--
--
- def _chmod_rw(path: Path) -> None:
-     try:
-         if path.is_dir():
-             targets = [path] + list(path.rglob("*"))
-         else:
-             targets = [path]
-         for target in targets:
-             try:
--                os.chmod(target, target.stat().st_mode | stat.S_IWUSR)
-+                os.chmod(
-+                    target,
-+                    target.stat().st_mode | stat.S_IWUSR | stat.S_IRUSR,
-+                )
-             except Exception:
-                 continue
-     except Exception:
-         pass
+ UNREALIZED_KEYS = (
+     "evlu_pfls_amt",
+     "evlu_pfls_smtl_amt",
+ )
+ RETURN_PCT_KEYS = (
+     "asst_icdc_erng_rt",
+     "evlu_pfls_rt",
+ )
+ COST_KEYS = (
+     "pchs_amt_smtl_amt",
+     "pchs_amt",
+ )
+ EVAL_KEYS = (
+     "scts_evlu_amt",
+     "evlu_amt_smtl_amt",
+     "tot_evlu_amt",
+     "nass_amt",
+ )
+@@ -369,50 +370,52 @@ class PB1Engine:
+         self.balance_tick_cache_hits = 0
+         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+         self.min_candles = int(PB1_MIN_CANDLES)
+         providers = []
+         if kis:
+             providers.append(KISOHLCVProvider(kis))
+         providers.append(KRXOHLCVProvider())
+         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
+         self._setup_reason_counter: Counter[str] = Counter()
+         self._now_kst = now_kst_value or now_kst()
+         self._today = self._now_kst.date().isoformat()
+         self._universe_as_of = None
+         self._warned_keys: set[str] = set()
+         self._balance_price_map: Dict[str, float] = {}
+         self._balance_cost: float | None = None
+         self._balance_snapshot: dict | None = balance_snapshot
+         self._balance_snapshot_source: str | None = balance_source
+         if balance_snapshot is not None:
+             if balance_source == "api":
+                 self.balance_api_calls += 1
+             elif balance_source is not None:
+                 self.balance_cache_hits += 1
+         self._holdings_summary: Dict[str, Any] = {}
+         self.filter_thresholds = self._resolve_filter_thresholds()
+         self._code_name_map: Dict[str, str] = {}
++        self.current_code: str | None = None
++        self.top_candidates: list[dict[str, Any]] = []
+         entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
+         self.entry_enabled = entry_flag.value
+         self.entry_flag_valid = entry_flag.valid
+         self.entry_flag_raw = entry_flag.raw
+         self.window_internal = self._resolve_window_internal()
+         self.entry_capital_krw: float | None = None
+         self.entry_usable_krw: float | None = None
  
+     def _resolve_window_internal(self) -> str:
+         internal = compute_window(self._now_kst)
+         if self.window_label in {"morning", "day"}:
+             internal = self.window_label
+         return internal
  
-+def _prepare_sqlite_path(db_path: Path) -> None:
-+    db_path.parent.mkdir(parents=True, exist_ok=True)
-+    _chmod_rw(db_path.parent)
-+    if not db_path.exists():
-+        db_path.touch()
-+    _chmod_rw(db_path)
-+
-+
- def _schema_stamp_path() -> Path:
-     cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
-     return cache_root / "schema_version.txt"
- 
- 
- def _compute_migration_version(migrations_dir: str) -> str:
-     hasher = hashlib.sha256()
-     hasher.update(MIGRATION_VERSION.encode("utf-8"))
-     migration_files = sorted(Path(migrations_dir).glob("*.sql"))
-     for path in migration_files:
-         hasher.update(path.name.encode("utf-8"))
+     @staticmethod
+     def _float_env(name: str, default: float) -> float:
+         raw = os.getenv(name)
+         if raw is None:
+             return default
          try:
-             hasher.update(path.read_bytes())
-         except FileNotFoundError:
-             continue
-     return hasher.hexdigest()
+             return float(raw)
+         except ValueError:
+             logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
+             return default
  
- 
- def _should_skip_migrations(engine: Engine, migrations_dir: str) -> bool:
-     mode = os.getenv("MIGRATE_MODE", "AUTO").upper()
-     if mode == "OFF":
-         logger.info("[DB][MIGRATE][SKIP] reason=disabled")
-         return True
-     if mode != "AUTO":
-         return False
-@@ -85,54 +92,51 @@ def _write_schema_stamp(migrations_dir: str) -> None:
- 
- 
- def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
-     conn.execute(
-         text(
-             """
-             CREATE TABLE IF NOT EXISTS schema_migrations (
-                 version text primary key,
-                 applied_at timestamptz default now()
+@@ -750,64 +753,87 @@ class PB1Engine:
+                 code=cf.code,
+                 market=cf.market,
+                 mode=cf.mode,
+                 side="BUY",
+                 qty=cf.planned_qty,
+                 price=float(cf.features.get("close") or 0.0),
+                 client_order_key=cf.client_order_key,
+                 ok=False,
+                 reasons=reasons,
+                 stage=stage,
+                 payload_json={"features": cf.features},
              )
-             """
+         except Exception:
+             logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", cf.code)
+ 
+     def _emit_buy_decision(
+         self,
+         cf: CandidateFeature,
+         *,
+         order_value: float,
+         reasons: list[str],
+         entry_allowed: bool,
+         entry_reason: str,
+     ) -> None:
+         price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
++        qty = int(cf.planned_qty or 0)
++        if qty < 1:
++            logger.warning(
++                "[PB1][BUY][SKIP] code=%s reason=qty_zero qty=%s cap=%.0f",
++                self._display_code(cf.code),
++                qty,
++                float(order_value or 0.0),
++            )
++            return
+         buyable = entry_allowed and not reasons
+         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
+-        emit_event(
++        payload = to_jsonable(
++            {
++                "code": cf.code,
++                "market": cf.market,
++                "score": float(cf.score or 0.0),
++                "qty": qty,
++                "price": float(price or 0.0),
++                "notional": float(order_value or 0.0),
++                "buyable": buyable,
++                "reasons": reasons_out,
++            }
++        )
++        ok, exc = emit_event(
+             as_of=self._today,
+             event="PB1_BUY_DECISION",
+-            code=cf.code,
+-            market=cf.market,
+-            score=float(cf.score or 0.0),
+-            qty=int(cf.planned_qty or 0),
+-            price=float(price or 0.0),
+-            notional=float(order_value or 0.0),
+-            buyable=buyable,
+-            reasons=reasons_out,
++            **payload,
          )
++        if not ok:
++            logger.error(
++                "[PB1][BUY][EVENT_FAIL] code=%s qty=%s cap=%.0f payload_keys=%s exc=%r",
++                cf.code,
++                qty,
++                float(order_value or 0.0),
++                sorted(payload.keys()),
++                exc,
++            )
+         if not buyable:
+             logger.info(
+                 "[PB1][BUY][SKIP] code=%s reasons=%s",
+                 self._display_code(cf.code),
+                 reasons_out,
+             )
+ 
+     def _fetch_holdings_snapshot(self) -> dict:
+         if self._balance_snapshot is not None:
+             self.balance_tick_cache_hits += 1
+             source = self._balance_snapshot_source or "tick_cache"
+             logger.info("[BALANCE][CACHE] hit=True source=%s", source)
+             self._balance_snapshot_source = "tick_cache"
+             return self._balance_snapshot
+         if not self.kis:
+             return {}
+         snap, source = self.kis.get_balance_cached(return_source=True)
+         if source == "api":
+             self.balance_api_calls += 1
+         else:
+             self.balance_cache_hits += 1
+         logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+         self._balance_snapshot = snap
+         return self._balance_snapshot
+ 
+@@ -1170,50 +1196,51 @@ class PB1Engine:
+             self.entry_usable_krw
+             if self.entry_usable_krw is not None
+             else float(DAILY_CAPITAL) * float(CAP_CAP)
+         )
+ 
+         if PB1_USE_RISK_PARITY:
+             inv: List[float] = []
+             for cf in selected:
+                 atr = float(cf.features.get("atr14") or 0.0)
+                 inv.append(1.0 / max(atr, 1e-6))
+             inv_sum = sum(inv) if sum(inv) > 0 else 1.0
+             weights = [x / inv_sum for x in inv]
+         else:
+             weights = [1.0 / len(selected)] * len(selected)
+ 
+         for cf, w in zip(selected, weights):
+             close_px = float(cf.features.get("close") or 0.0)
+             if close_px <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("close_zero")
+                 continue
+ 
+             capital = cap_total * float(w)
+             qty = int(capital // close_px)
+             cf.planned_qty = max(qty, 0)
++            cf.features["planned_cap"] = float(capital)
+             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+ 
+             if cf.planned_qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero")
+ 
+             logger.info(
+                 "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s",
+                 cf.code,
+                 float(cf.features.get("score") or 0.0),
+                 float(w),
+                 float(capital),
+                 cf.planned_qty,
+                 float(cf.features.get("atr_pct") or 0.0),
+                 cf.features.get("value20"),
+             )
+ 
+         return candidates
+ 
+     def _mark_price(self, code: str) -> float | None:
+         if self.kis:
+             try:
+                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
+                 quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
+                 if not isinstance(quote, dict):
+@@ -1395,50 +1422,51 @@ class PB1Engine:
+                 price=cf.features.get("close") or 0.0,
+                 fee=0.0,
+                 tax=0.0,
+                 filled_at=filled_at,
+                 raw_json=resp,
+             )
+             self.positions_repo.apply_fill(
+                 env=self.env,
+                 strategy=self.STRATEGY_NAME,
+                 sid=1,
+                 mode=cf.mode,
+                 code=cf.code,
+                 market=cf.market,
+                 side="BUY",
+                 qty=cf.planned_qty,
+                 price=cf.features.get("close") or 0.0,
+                 fee=0.0,
+                 tax=0.0,
+                 filled_at=filled_at,
+             )
+         else:
+             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+ 
+     def _append_close_entry_record(self, payload: dict) -> None:
+         path = close_entry_orders_path(self._today)
++        payload = to_jsonable(payload)
+         with path.open("a", encoding="utf-8") as handle:
+             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+ 
+     def _place_entry_close(self, cf: CandidateFeature) -> None:
+         display_code = self._display_code(cf.code)
+         cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
+         ref_daily_close = cf.features.get("close")
+         snap = self.kis.get_quote_snapshot(cf.code) if self.kis else {}
+         ap = snap.get("ap") if isinstance(snap, dict) else None
+         tp = snap.get("tp") if isinstance(snap, dict) else None
+         base_from = None
+         base = None
+         if ap:
+             base_from = "ap"
+             base = float(ap)
+         elif tp:
+             base_from = "tp"
+             base = float(tp)
+         reasons = ["close_entry"] + (cf.reasons or [])
+         if base is None:
+             logger.info(
+                 "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%s cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
+                 display_code,
+                 base_from or "none",
+                 base,
+@@ -2043,50 +2071,52 @@ class PB1Engine:
+         total_asset_return_pct = self._to_float(self._holdings_summary.get("asst_icdc_erng_rt"))
+ 
+         realized_source = "ledger" if totals["realized"] != 0.0 else "none"
+ 
+         logger.info(
+             "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s invested_return_pct=%s total_asset_return_pct=%s",
+             self._universe_as_of or "none",
+             totals["market_value"],
+             totals["cost"],
+             cost_source,
+             totals["unrealized"],
+             unrealized_source,
+             totals["realized"],
+             realized_source,
+             f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
+             return_pct_source,
+             f"{invested_return_pct:.2f}" if invested_return_pct is not None else "N/A",
+             f"{total_asset_return_pct:.2f}" if total_asset_return_pct is not None else "N/A",
+         )
+         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
+         return totals
+ 
+     def run(self) -> RunResult:
+         self._warned_keys.clear()
+         self._setup_reason_counter.clear()
++        self.current_code = None
++        self.top_candidates = []
+         final_status = "OK"
+         final_notes: str | None = None
+         entry_allowed = self.entry_enabled
+         entry_reason = "ok"
+         entry_summary_emitted = False
+         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
+         max_positions = int(PB1_MAX_POSITIONS)
+         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
+         min_order_krw = float(MIN_ORDER_KRW)
+         entry_capital_krw = 0.0
+         skip_entry_scan = False
+         if not entry_allowed:
+             logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
+             entry_reason = "entry_disabled"
+         if self.phase == "verify":
+             entry_allowed = False
+             entry_reason = "phase_verify"
+         logger.info(
+             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
+             self.window_label,
+             self.window_internal,
+             self.phase,
+             self.dry_run,
+             self.env,
+         )
+@@ -2254,71 +2284,136 @@ class PB1Engine:
+         selected_thresholds = self.filter_thresholds
+         all_reason_counts: Counter[str] = Counter()
+         tiers_tried: list[str] = []
+         setup_ok_codes: list[str] = []
+         drop_reason_counter: Counter[str] = Counter()
+         drop_examples: Dict[str, list[str]] = {}
+         after_risk_check_count = 0
+         after_buyable_check_count = 0
+         after_dedup_count = 0
+         orderable_candidates: list[CandidateFeature] = []
+         if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
+             candidates = self._compute_candidates(members)
+             (
+                 candidates,
+                 selected_tier,
+                 selected_thresholds,
+                 all_reason_counts,
+                 tiers_tried,
+             ) = self._select_candidates_with_fallback(candidates)
+             if not any(c.setup_ok for c in candidates):
+                 self._apply_score_fallback(candidates)
+             setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+             candidates = self._size_positions(candidates)
+             ok_after_risk = [c for c in candidates if c.setup_ok]
+             after_risk_check_count = len(ok_after_risk)
++            self.top_candidates = [
++                {
++                    "code": cf.code,
++                    "cap": float(cf.features.get("planned_cap") or 0.0),
++                    "qty": int(cf.planned_qty or 0),
++                }
++                for cf in ok_after_risk
++            ]
+             dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
+             for cf in candidates:
+                 if cf.code in dropped_after_risk:
+                     for reason in cf.reasons or ["unspecified_fail"]:
+                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+ 
+             new_position_limit = target_new_positions
+             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
+             open_orders = self.orders_repo.get_open_orders(self.env)
+             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+             today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+             today_buy_codes = {row.get("code") for row in today_orders if row.get("code")}
+             today_spent = 0.0
+             for row in today_orders:
+                 qty = float(row.get("qty") or 0)
+                 limit_price = row.get("limit_price")
+                 if limit_price is None:
+                     limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
+                 today_spent += qty * float(limit_price or 0.0)
+             planned_spent = today_spent
+             for cf in ok_after_risk:
++                self.current_code = cf.code
++                close_price = float(cf.features.get("close") or 0.0)
++                planned_cap = float(cf.features.get("planned_cap") or (close_price * float(cf.planned_qty or 0)))
++                if cf.planned_qty <= 0:
++                    self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)
++                    logger.info(
++                        "[PB1][SKIP] code=%s reason=qty_zero cap=%.0f close=%.0f min_order=%.0f",
++                        cf.code,
++                        planned_cap,
++                        close_price,
++                        min_order_krw,
++                    )
++                    self._log_order_skip(cf, ["qty_zero"], "PB1-CLOSE")
++                    self._emit_buy_decision(
++                        cf,
++                        order_value=0.0,
++                        reasons=["qty_zero"],
++                        entry_allowed=entry_allowed,
++                        entry_reason=entry_reason,
++                    )
++                    continue
++                if min_order_krw > 0 and planned_cap < min_order_krw:
++                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_min_order", cf.code)
++                    logger.info(
++                        "[PB1][SKIP] code=%s reason=cap_below_min_order cap=%.0f close=%.0f min_order=%.0f",
++                        cf.code,
++                        planned_cap,
++                        close_price,
++                        min_order_krw,
++                    )
++                    self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
++                    self._emit_buy_decision(
++                        cf,
++                        order_value=close_price * float(cf.planned_qty or 0),
++                        reasons=["cap_below_min_order"],
++                        entry_allowed=entry_allowed,
++                        entry_reason=entry_reason,
++                    )
++                    continue
++                if close_price > 0 and planned_cap < close_price:
++                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_one_share", cf.code)
++                    logger.info(
++                        "[PB1][SKIP] code=%s reason=cap_below_one_share cap=%.0f close=%.0f min_order=%.0f",
++                        cf.code,
++                        planned_cap,
++                        close_price,
++                        min_order_krw,
++                    )
++                    self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
++                    self._emit_buy_decision(
++                        cf,
++                        order_value=close_price * float(cf.planned_qty or 0),
++                        reasons=["cap_below_one_share"],
++                        entry_allowed=entry_allowed,
++                        entry_reason=entry_reason,
++                    )
++                    continue
+                 order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
+                 if not allow_add_to_existing and cf.code in held_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
+                     self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["holding_position"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if cf.code in open_buy_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
+                     self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["open_order"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if cf.code in today_buy_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index dac3a784c431975cb44d0f64dd399b33dce52fd8..2ae7d607e0485474402cc70cecb85ea3b6a30939 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -40,50 +40,51 @@ from trader.config import (
+ )
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+ from trader.botstate_sync import (
+     BotStateContext,
+     acquire_lock as acquire_botstate_lock,
+     compute_lock_ttl,
+     ensure_sqlite_writable,
+     persist_run_files,
+     release_lock as release_botstate_lock,
+     resolve_botstate_worktree_dir,
+     setup_worktree,
+ )
+ from trader.balance_utils import sanitize_balance_snapshot
+ from trader.db.engine import make_engine
+ from trader.db.lock import release_lock, try_acquire_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.store import LedgerStore
+ from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_today
+ from trader.reset_utils import detect_account_fp, purge_bot_state
+ from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
+ from trader.time_utils import now_kst
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
++from trader.utils.json_sanitize import to_jsonable
+ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ log = logger
+ 
+ 
+ def _deepcopy_json(value):
+     try:
+         return copy.deepcopy(value)
+     except Exception:
+         return value
+ 
+ 
+ def universe_build_flag(as_of: str) -> Path:
+     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
+ 
+ 
+ def ensure_universe_built_once(
+     runtime_store: RuntimeStore | None = None,
+     *,
+     env: str | None = None,
+     strategy: str | None = None,
+     as_of: str | None = None,
+     force: bool = False,
+ ) -> None:
+@@ -139,50 +140,51 @@ def ensure_universe_built_once(
+     ]
+     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+     bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
+     env_vars = os.environ.copy()
+     env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
+     env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
+     subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
+     _, post_meta = runtime_store.load_today_universe(as_of)
+     if post_meta.get("have_today"):
+         log.info(
+             "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+             post_meta.get("today_path"),
+         )
+     else:
+         log.warning(
+             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+             post_meta.get("today_path"),
+         )
+ 
+ 
+ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+     events_dir = base_dir / "runtime" / "events"
+     events_dir.mkdir(parents=True, exist_ok=True)
+     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
+     ensure_not_repo_tracked_path(path)
++    payload = to_jsonable(payload)
+     line = json.dumps(payload, ensure_ascii=False)
+     with path.open("a", encoding="utf-8") as handle:
+         handle.write(line + "\n")
+     logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
+     return path
+ 
+ 
+ def _handle_missing_positions_reset(
+     *,
+     balance_snapshot: dict | None,
+     env: str,
+     strategy: str,
+     run_id: str | None,
+     positions_repo: PositionsRepo,
+     ledger_repo: LedgerEventsRepo,
+     bot_state_dir: Path,
+ ) -> bool:
+     if not balance_snapshot:
+         return False
+     holdings_rows = balance_snapshot.get("output1") or []
+     kis_codes = {str(row.get("pdno") or row.get("code") or "").zfill(6) for row in holdings_rows}
+     kis_codes = {code for code in kis_codes if code}
+     if kis_codes:
+         return False
+     positions = positions_repo.list_positions(env, strategy)
+@@ -272,50 +274,51 @@ def _resolve_window_label(market_window: str, window: WindowDecision | None) ->
+ def _parse_hhmm_to_time(hhmm: str) -> dtime:
+     hh, mm = hhmm.split(":")
+     return dtime(hour=int(hh), minute=int(mm))
+ 
+ 
+ def _next_window_start(now: datetime, window_starts: list[dtime]) -> datetime | None:
+     sorted_starts = sorted(window_starts)
+     for start in sorted_starts:
+         if now.time() < start:
+             return now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+     return None
+ 
+ 
+ def _market_session(now: datetime) -> tuple[datetime, datetime]:
+     open_t = _parse_hhmm_to_time(MARKET_OPEN_HHMM)
+     close_t = _parse_hhmm_to_time(MARKET_CLOSE_HHMM)
+     return (
+         now.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0),
+         now.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0),
      )
  
  
- def _list_applied_versions(conn: sa.Connection) -> set[str]:
-     result = conn.execute(text("SELECT version FROM schema_migrations"))
-     return {row[0] for row in result}
+ def _parse_now_override(raw: str | None, label: str) -> datetime | None:
+     if not raw:
+         return None
++    engine_runner: PB1Engine | None = None
+     try:
+         dt = datetime.fromisoformat(raw)
+         if dt.tzinfo is None:
+             dt = dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+         else:
+             dt = dt.astimezone(ZoneInfo("Asia/Seoul"))
+         return dt
+     except Exception:
+         logger.warning("[PB1][SMOKE] invalid %s=%s", label, raw)
+         return None
  
  
- def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
-     url = str(engine.url)
-     if config.is_sqlite_url(url):
-         db_path = Path(engine.url.database or "")
-         if db_path:
--            _ensure_dir(db_path.parent)
--            _chmod_rw(db_path.parent)
--            if db_path.exists():
--                _chmod_rw(db_path)
-+            _prepare_sqlite_path(db_path)
-     if _should_skip_migrations(engine, migrations_dir):
-         return
-     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
-     with engine.begin() as conn:
-         url = str(engine.url)
-         if config.is_sqlite_url(url):
-             logger.info("[DB][MIGRATE] sqlite url=%s", url)
-             schema_for_engine(engine).metadata.create_all(engine)
-             _write_schema_stamp(migrations_dir)
-             return
-         logger.info("[DB][MIGRATE] external url=%s", url)
-         # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
-         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
-         _ensure_schema_migrations_table(conn)
-         applied = _list_applied_versions(conn)
+ def _get_now_kst() -> datetime:
+     override = _parse_now_override(os.getenv("NOW_KST_OVERRIDE"), "NOW_KST_OVERRIDE")
+     if override:
+         return override
+     simulated = _parse_now_override(os.getenv("PB1_SIMULATE_NOW_KST"), "PB1_SIMULATE_NOW_KST")
+     if simulated:
+         return simulated
+     return now_kst()
  
-         migration_files = sorted(
-             [
-                 Path(path)
-                 for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
-                 if Path(path).is_file()
-             ]
+ 
+ def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt: datetime, allow_wait: bool, max_wait_s: int, smoke_enabled: bool) -> tuple[str, datetime | None]:
+     if smoke_enabled:
+         return "smoke", None
+@@ -984,50 +987,61 @@ def run_once(
+             universe_repo=universe_repo,
+             orders_repo=orders_repo,
+             fills_repo=fills_repo,
+             positions_repo=positions_repo,
+             ledger_repo=ledger_repo,
+             kis=kis,
+             window=window,
+             window_label=window_label,
+             phase=phase_override_arg,
+             dry_run=dry_run,
+             env=kis_env or "practice",
+             run_id=run_record_id,
+             now_kst_value=now,
+             balance_snapshot=balance_snapshot_raw,
+             balance_source=balance_source,
          )
-         for path in migration_files:
-             version = path.name
-diff --git a/trader/tools/reset_bot_state.py b/trader/tools/reset_bot_state.py
-index 89c3d8ddbb343d4efc606c20271103220ef92ceb..9f391cefbac2451383e7726d3c5e1fb2ee0cbdfb 100644
---- a/trader/tools/reset_bot_state.py
-+++ b/trader/tools/reset_bot_state.py
-@@ -1,56 +1,63 @@
- import argparse
- import os
- import pathlib
- import shutil
- import stat
+         if close_cancel_only:
+             result = engine_runner.run_close_cancel()
+         else:
+             result = engine_runner.run()
+         did_work = True
+         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+         touched_files = _collect_botstate_files(run_start_ts)
+     except Exception as exc:
+         logger.exception("[PB1][FAIL] unexpected error")
++        phase_context = phase_for_log or phase_override_arg or "unknown"
++        window_context = window_label or "unknown"
++        current_code = engine_runner.current_code if engine_runner else None
++        top_candidates = engine_runner.top_candidates if engine_runner else []
++        logger.error(
++            "[PB1][FAIL][CONTEXT] phase=%s window=%s current_code=%s top_candidates=%s",
++            phase_context,
++            window_context,
++            current_code,
++            top_candidates,
++        )
+         if run_record_id:
+             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+         raise
+     finally:
+         release_lock(engine, lock_key)
+     metrics = {
+         "balance_api_calls": result.balance_api_calls if result else 0,
+         "balance_cache_hits": result.balance_cache_hits if result else 0,
+         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
+     }
+     result_status = result.status if result else "UNKNOWN"
+     return touched_files, did_work, metrics, phase_for_log, result_status
  
  
- def rm(path: pathlib.Path) -> None:
-     p = pathlib.Path(path)
-     if p.is_symlink() or p.is_file():
-         p.unlink(missing_ok=True)
-     elif p.is_dir():
-         shutil.rmtree(p, ignore_errors=True)
- 
- 
- def chmod_rw(root: pathlib.Path) -> None:
-     root = pathlib.Path(root)
-     for p in [root] + list(root.rglob("*")):
-         try:
-             m = p.stat().st_mode
--            os.chmod(p, m | stat.S_IWUSR)
-+            os.chmod(p, m | stat.S_IWUSR | stat.S_IRUSR)
-         except Exception:
-             pass
- 
- 
- def main() -> None:
-     ap = argparse.ArgumentParser()
-     ap.add_argument("--bot-state-dir", required=True)
-     ap.add_argument("--keep-universe-lkg", type=int, default=1)
-     ap.add_argument("--yes", action="store_true")
-     args = ap.parse_args()
-     if not args.yes:
-         raise SystemExit("Add --yes to proceed")
- 
-     bs = pathlib.Path(args.bot_state_dir)
- 
-     rm(bs / "db" / "pbcore.sqlite3")
-+    events_dir = bs / "runtime" / "events"
-+    if events_dir.exists():
-+        for path in events_dir.glob("*.jsonl"):
-+            rm(path)
-+    rm(events_dir)
-     rm(bs / "runtime")
-     rm(bs / "trader_ledger")
-     rm(bs / "locks")
-     rm(bs / "state.json")
- 
-     if args.keep_universe_lkg:
-         (bs / "universe_lkg").mkdir(parents=True, exist_ok=True)
- 
-     (bs / "db").mkdir(parents=True, exist_ok=True)
-+    (bs / "runtime").mkdir(parents=True, exist_ok=True)
-     (bs / "runtime" / "diagnostics").mkdir(parents=True, exist_ok=True)
-     (bs / "trader_ledger").mkdir(parents=True, exist_ok=True)
-     (bs / "locks").mkdir(parents=True, exist_ok=True)
-+    (bs / "db" / "pbcore.sqlite3").touch()
- 
-     chmod_rw(bs)
-     print(f"[RESET] bot_state reset done: {bs}")
- 
- 
- if __name__ == "__main__":
-     main()
+ def _run_loop(*, args: argparse.Namespace) -> None:
+     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
+     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
+     loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
+     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+     now = _get_now_kst()
+     _, close_dt = _market_session(now)
+     max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
+     if run_loop_minutes > 0:
+         loop_max_minutes = run_loop_minutes
+         persist_interval = max(120, min(persist_interval, 240))
+diff --git a/trader/utils/json_sanitize.py b/trader/utils/json_sanitize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91f1a6e03e1b243a1d5e762d80f051351d04e1ef
+--- /dev/null
++++ b/trader/utils/json_sanitize.py
+@@ -0,0 +1,39 @@
++from __future__ import annotations
++
++from datetime import date, datetime
++import math
++from typing import Any
++
++import numpy as np
++
++
++def is_bad_float(value: Any) -> bool:
++    if not isinstance(value, float):
++        return False
++    return math.isnan(value) or math.isinf(value)
++
++
++def _is_numpy_scalar(value: Any) -> bool:
++    return isinstance(value, np.generic)
++
++
++def to_jsonable(obj: Any) -> Any:
++    if obj is None or isinstance(obj, (str, int, bool)):
++        return obj
++    if isinstance(obj, float):
++        return None if is_bad_float(obj) else obj
++    if isinstance(obj, (datetime, date)):
++        return obj.isoformat()
++    if _is_numpy_scalar(obj):
++        return to_jsonable(obj.item())
++    if isinstance(obj, dict):
++        sanitized: dict[Any, Any] = {}
++        for key, value in obj.items():
++            sanitized_key = to_jsonable(key)
++            if not isinstance(sanitized_key, (str, int, float, bool)) and sanitized_key is not None:
++                sanitized_key = str(sanitized_key)
++            sanitized[sanitized_key] = to_jsonable(value)
++        return sanitized
++    if isinstance(obj, (list, tuple, set)):
++        return [to_jsonable(item) for item in obj]
++    return str(obj)

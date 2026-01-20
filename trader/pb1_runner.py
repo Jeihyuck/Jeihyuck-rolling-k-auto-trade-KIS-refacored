@@ -62,6 +62,7 @@ from trader.reset_utils import detect_account_fp, purge_bot_state
 from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
 from trader.time_utils import now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
     events_dir.mkdir(parents=True, exist_ok=True)
     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
     ensure_not_repo_tracked_path(path)
+    payload = to_jsonable(payload)
     line = json.dumps(payload, ensure_ascii=False)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
@@ -294,6 +296,7 @@ def _market_session(now: datetime) -> tuple[datetime, datetime]:
 def _parse_now_override(raw: str | None, label: str) -> datetime | None:
     if not raw:
         return None
+    engine_runner: PB1Engine | None = None
     try:
         dt = datetime.fromisoformat(raw)
         if dt.tzinfo is None:
@@ -1006,6 +1009,17 @@ def run_once(
         touched_files = _collect_botstate_files(run_start_ts)
     except Exception as exc:
         logger.exception("[PB1][FAIL] unexpected error")
+        phase_context = phase_for_log or phase_override_arg or "unknown"
+        window_context = window_label or "unknown"
+        current_code = engine_runner.current_code if engine_runner else None
+        top_candidates = engine_runner.top_candidates if engine_runner else []
+        logger.error(
+            "[PB1][FAIL][CONTEXT] phase=%s window=%s current_code=%s top_candidates=%s",
+            phase_context,
+            window_context,
+            current_code,
+            top_candidates,
+        )
         if run_record_id:
             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
         raise

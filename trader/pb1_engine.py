@@ -53,6 +53,7 @@ from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
 from trader.eventlog import emit_event
 from trader.utils.env import env_bool, parse_env_flag
+from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 
 logger = logging.getLogger(__name__)
@@ -391,6 +392,8 @@ class PB1Engine:
         self._holdings_summary: Dict[str, Any] = {}
         self.filter_thresholds = self._resolve_filter_thresholds()
         self._code_name_map: Dict[str, str] = {}
+        self.current_code: str | None = None
+        self.top_candidates: list[dict[str, Any]] = []
         entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
         self.entry_enabled = entry_flag.value
         self.entry_flag_valid = entry_flag.valid
@@ -772,20 +775,43 @@ class PB1Engine:
         entry_reason: str,
     ) -> None:
         price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
+        qty = int(cf.planned_qty or 0)
+        if qty < 1:
+            logger.warning(
+                "[PB1][BUY][SKIP] code=%s reason=qty_zero qty=%s cap=%.0f",
+                self._display_code(cf.code),
+                qty,
+                float(order_value or 0.0),
+            )
+            return
         buyable = entry_allowed and not reasons
         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
-        emit_event(
+        payload = to_jsonable(
+            {
+                "code": cf.code,
+                "market": cf.market,
+                "score": float(cf.score or 0.0),
+                "qty": qty,
+                "price": float(price or 0.0),
+                "notional": float(order_value or 0.0),
+                "buyable": buyable,
+                "reasons": reasons_out,
+            }
+        )
+        ok, exc = emit_event(
             as_of=self._today,
             event="PB1_BUY_DECISION",
-            code=cf.code,
-            market=cf.market,
-            score=float(cf.score or 0.0),
-            qty=int(cf.planned_qty or 0),
-            price=float(price or 0.0),
-            notional=float(order_value or 0.0),
-            buyable=buyable,
-            reasons=reasons_out,
+            **payload,
         )
+        if not ok:
+            logger.error(
+                "[PB1][BUY][EVENT_FAIL] code=%s qty=%s cap=%.0f payload_keys=%s exc=%r",
+                cf.code,
+                qty,
+                float(order_value or 0.0),
+                sorted(payload.keys()),
+                exc,
+            )
         if not buyable:
             logger.info(
                 "[PB1][BUY][SKIP] code=%s reasons=%s",
@@ -1192,6 +1218,7 @@ class PB1Engine:
             capital = cap_total * float(w)
             qty = int(capital // close_px)
             cf.planned_qty = max(qty, 0)
+            cf.features["planned_cap"] = float(capital)
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
 
             if cf.planned_qty <= 0:
@@ -1417,6 +1444,7 @@ class PB1Engine:
 
     def _append_close_entry_record(self, payload: dict) -> None:
         path = close_entry_orders_path(self._today)
+        payload = to_jsonable(payload)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -2065,6 +2093,8 @@ class PB1Engine:
     def run(self) -> RunResult:
         self._warned_keys.clear()
         self._setup_reason_counter.clear()
+        self.current_code = None
+        self.top_candidates = []
         final_status = "OK"
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
@@ -2276,6 +2306,14 @@ class PB1Engine:
             candidates = self._size_positions(candidates)
             ok_after_risk = [c for c in candidates if c.setup_ok]
             after_risk_check_count = len(ok_after_risk)
+            self.top_candidates = [
+                {
+                    "code": cf.code,
+                    "cap": float(cf.features.get("planned_cap") or 0.0),
+                    "qty": int(cf.planned_qty or 0),
+                }
+                for cf in ok_after_risk
+            ]
             dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
             for cf in candidates:
                 if cf.code in dropped_after_risk:
@@ -2297,6 +2335,63 @@ class PB1Engine:
                 today_spent += qty * float(limit_price or 0.0)
             planned_spent = today_spent
             for cf in ok_after_risk:
+                self.current_code = cf.code
+                close_price = float(cf.features.get("close") or 0.0)
+                planned_cap = float(cf.features.get("planned_cap") or (close_price * float(cf.planned_qty or 0)))
+                if cf.planned_qty <= 0:
+                    self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)
+                    logger.info(
+                        "[PB1][SKIP] code=%s reason=qty_zero cap=%.0f close=%.0f min_order=%.0f",
+                        cf.code,
+                        planned_cap,
+                        close_price,
+                        min_order_krw,
+                    )
+                    self._log_order_skip(cf, ["qty_zero"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=0.0,
+                        reasons=["qty_zero"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                if min_order_krw > 0 and planned_cap < min_order_krw:
+                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_min_order", cf.code)
+                    logger.info(
+                        "[PB1][SKIP] code=%s reason=cap_below_min_order cap=%.0f close=%.0f min_order=%.0f",
+                        cf.code,
+                        planned_cap,
+                        close_price,
+                        min_order_krw,
+                    )
+                    self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=close_price * float(cf.planned_qty or 0),
+                        reasons=["cap_below_min_order"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                if close_price > 0 and planned_cap < close_price:
+                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_one_share", cf.code)
+                    logger.info(
+                        "[PB1][SKIP] code=%s reason=cap_below_one_share cap=%.0f close=%.0f min_order=%.0f",
+                        cf.code,
+                        planned_cap,
+                        close_price,
+                        min_order_krw,
+                    )
+                    self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=close_price * float(cf.planned_qty or 0),
+                        reasons=["cap_below_one_share"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
                 order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                 if not allow_add_to_existing and cf.code in held_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)

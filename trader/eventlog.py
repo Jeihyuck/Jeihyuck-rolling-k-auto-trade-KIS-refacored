@@ -5,6 +5,8 @@ import json
 import logging
 from pathlib import Path
 
+from trader.utils.json_sanitize import to_jsonable
+
 logger = logging.getLogger(__name__)
 
 
@@ -12,7 +14,7 @@ def event_path(as_of: str) -> Path:
     return Path("bot_state/runtime/events") / f"pb1_{as_of}.jsonl"
 
 
-def emit_event(*, as_of: str, event: str, **fields) -> None:
+def emit_event(*, as_of: str, event: str, **fields) -> tuple[bool, Exception | None]:
     """
     Append JSON line.
     Always safe: best-effort, never crash trading loop.
@@ -26,7 +28,10 @@ def emit_event(*, as_of: str, event: str, **fields) -> None:
             "event": event,
             **fields,
         }
+        payload = to_jsonable(payload)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
+        return True, None
+    except Exception as exc:
         logger.exception("[EVENTLOG][FAIL] event=%s", event)
+        return False, exc
