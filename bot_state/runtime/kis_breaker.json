@@ -1,0 +1,10 @@
+{
+  "endpoints": {
+    "GET /uapi/domestic-stock/v1/trading/inquire-psbl-order": {
+      "failures": []
+    },
+    "POST /uapi/domestic-stock/v1/trading/order-cash": {
+      "failures": []
+    }
+  }
+}
