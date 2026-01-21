@@ -874,6 +874,8 @@ def run_once(
     bot_state_dir: Path | None = None,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
     as_of = now.date().isoformat()
     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
@@ -1256,6 +1258,14 @@ def run_once(
         if entry_cutoff_raw:
             try:
                 cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
+                cutoff_dt = datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
+                logger.info(
+                    "[PB1][TIME] now_kst=%s cutoff=%s close=%s phase=%s",
+                    now.isoformat(),
+                    cutoff_dt.isoformat(),
+                    close_dt.isoformat(),
+                    resolved_phase,
+                )
                 if now.time() > cutoff_time:
                     entry_allowed_this_tick = False
                     entry_block_reason = entry_block_reason or "entry_cutoff"

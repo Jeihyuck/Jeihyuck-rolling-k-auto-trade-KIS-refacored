@@ -960,6 +960,37 @@ class KisAPI:
         quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
         return quote
 
+    def get_price_only(self, code: str, *, attempts: int = 2) -> dict:
+        try:
+            price = self.get_last_price(code, attempts=attempts)
+        except Exception:
+            return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+        return {"ask": None, "bid": None, "prpr": price, "last": price, "fallback_used": "price_only"}
+
+    def get_quote_safe(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
+        quote: dict | None = None
+        try:
+            quote = self.get_price_quote(code, diag_mode=diag_mode, attempts=attempts)
+        except Exception as exc:
+            if diag_mode:
+                logger.warning("[KIS][QUOTE][WARN] code=%s err=%s", code, repr(exc))
+                return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+            raise
+        if not isinstance(quote, dict):
+            return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+        ask = quote.get("ask")
+        bid = quote.get("bid")
+        prpr = quote.get("prpr") or quote.get("stck_prpr") or quote.get("last")
+        quote.setdefault("prpr", prpr)
+        if ask is not None or bid is not None:
+            quote["fallback_used"] = "quote"
+            return quote
+        if prpr is not None:
+            price_only = self.get_price_only(code, attempts=attempts)
+            if price_only.get("prpr") is not None:
+                return price_only
+        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
         return self.get_last_price(code)

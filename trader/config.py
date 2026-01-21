@@ -372,6 +372,7 @@ def _resolve_min_order_krw() -> float:
         value = 100000.0
     if STRATEGY_MODE == "LIVE" and value < 50000:
         raise RuntimeError(f"MIN_ORDER_KRW too low for LIVE mode: {value}")
+    logger.info("[CONFIG] MIN_ORDER_KRW=%s (sizing_floor)", value)
     return value
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -100,6 +99,9 @@ _ENTRY_BLOCK_REASON_MAP = {
     "cap_below_min_order": "MIN_ORDER_KRW",
     "min_order_krw": "MIN_ORDER_KRW",
     "cap_below_one_share": "MIN_ORDER_KRW",
+    "planned_qty_zero_or_min_order": "MIN_ORDER_KRW",
+    "unaffordable_min1share": "MIN_ORDER_KRW",
+    "order_price_missing": "PRICE_MISSING",
     "entry_cutoff": "CUTOFF",
     "entry_disabled": "ENTRY_DISABLED",
     "available_cash_zero": "NO_CASH",
@@ -124,6 +126,9 @@ _ORDER_SKIP_REASON_MAP = {
     "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
     "min_order_krw": "ORDER_SKIP_MIN_ORDER",
     "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
+    "planned_qty_zero_or_min_order": "ORDER_SKIP_MIN_ORDER",
+    "unaffordable_min1share": "ORDER_SKIP_MIN_ORDER",
+    "order_price_missing": "ORDER_SKIP_PRICE_MISSING",
     "available_cash_zero": "ORDER_SKIP_NO_CASH",
     "insufficient_cash": "ORDER_SKIP_NO_CASH",
     "entry_capital_zero": "ORDER_SKIP_NO_CASH",
@@ -281,6 +286,7 @@ class CandidateFeature:
     mode_reasons: List[str]
     client_order_key: str | None = None
     planned_qty: int = 0
+    planned_value: float = 0.0
     score: float | None = None
 
 
@@ -484,6 +490,7 @@ class PB1Engine:
         self.entry_usable_krw: float | None = None
         self.entry_tick_budget_krw: float | None = None
         self.target_new_positions: int | None = None
+        self._budget_plan_meta: dict[str, Any] | None = None
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -1375,8 +1382,8 @@ class PB1Engine:
         for cf in ok_list:
             score_fallback = bool(cf.features.get("score_fallback"))
             if cf.code not in selected_codes and not score_fallback:
-                cf.setup_ok = False
                 cf.reasons.append("score_below_cut")
+                cf.features["score_below_cut"] = True
         filtered: List[CandidateFeature] = []
         for cf in ok_list:
             if not cf.setup_ok:
@@ -1405,19 +1412,11 @@ class PB1Engine:
         if not filtered:
             return candidates
 
-        # 2) 점수 내림차순 Top N 선택
+        # 2) 점수 내림차순 정렬
         filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
-        max_n = max(1, int(PB1_MAX_POSITIONS))
-        selected = filtered[:max_n]
-        selected_codes = {c.code for c in selected}
+        ranked = filtered
 
-        # 선택되지 않은 나머지는 매수 제외 처리
-        for cf in ok_list:
-            if cf.code not in selected_codes and cf.setup_ok:
-                cf.setup_ok = False
-                cf.reasons.append("not_in_topN")
-
-        # 3) 사이징: score 기반 가중치 + tick budget 분할
+        # 3) 사이징: tick budget 분할 + 1주 가능 필터
         tick_budget = float(self.entry_tick_budget_krw or 0.0)
         if tick_budget <= 0:
             tick_budget = float(self.entry_usable_krw or 0.0)
@@ -1425,53 +1424,57 @@ class PB1Engine:
             logger.warning("[PB1][SIZE] skip sizing: tick_budget=0 applied_score_cut=%.1f", applied_cut)
             return candidates
 
-        max_score = max(float(cf.features.get("score") or 0.0) for cf in selected)
-        tau = 15.0
-        raw_weights = [math.exp((float(cf.features.get("score") or 0.0) - max_score) / tau) for cf in selected]
-        weight_sum = sum(raw_weights) if sum(raw_weights) > 0 else 1.0
-        weights = [w / weight_sum for w in raw_weights]
         min_order_krw = float(MIN_ORDER_KRW)
         max_pos_krw = tick_budget * float(PB1_MAX_POS_PCT)
-        planned_caps: Dict[str, float] = {}
-        for cf, w in zip(selected, weights):
-            raw_cap = tick_budget * float(w)
-            lower = min_order_krw if min_order_krw > 0 else 0.0
-            upper = max_pos_krw if max_pos_krw > 0 else tick_budget
-            planned_caps[cf.code] = min(max(raw_cap, lower), upper)
-        cap_sum = sum(planned_caps.values())
-        if cap_sum > tick_budget and cap_sum > 0:
-            scale = tick_budget / cap_sum
-            for code, cap in planned_caps.items():
-                planned_caps[code] = float(int(cap * scale))
-
-        for cf, w in zip(selected, weights):
-            close_px = float(cf.features.get("close") or 0.0)
-            if close_px <= 0:
+        for cf in ranked:
+            daily_close = self._to_float(cf.features.get("close"))
+            quote = self.kis.get_quote_safe(cf.code, diag_mode=True) if self.kis else {}
+            if isinstance(quote, dict) and quote.get("fallback_used") not in {None, "none", "quote"}:
+                logger.info(
+                    "[PB1][PRICE][FALLBACK] code=%s used=%s px=%s",
+                    cf.code,
+                    quote.get("fallback_used"),
+                    quote.get("prpr") or quote.get("last"),
+                )
+            order_px, source = self._calc_order_price(cf.code, quote, daily_close)
+            if order_px is None:
                 cf.setup_ok = False
-                cf.reasons.append("close_zero")
+                cf.reasons.append("order_price_missing")
                 continue
+            if source and source != "ask":
+                logger.info("[PB1][PRICE][FALLBACK] code=%s used=%s px=%.2f", cf.code, source, order_px)
+            cf.features["order_price"] = float(order_px)
+            cf.features["order_price_source"] = source or "unknown"
 
-            capital = float(planned_caps.get(cf.code, 0.0))
-            qty = int(capital // close_px)
-            cf.planned_qty = max(qty, 0)
-            cf.features["planned_cap"] = float(capital)
+        buyables, budget_meta, budget_drop_reasons = self._build_budget_plan(
+            ranked,
+            tick_budget=tick_budget,
+            target_new_positions=int(self.target_new_positions or 0),
+            min_order_krw=min_order_krw,
+            max_pos_krw=max_pos_krw,
+        )
+        self._budget_plan_meta = budget_meta
+
+        for cf in buyables:
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
-
-            if cf.planned_qty <= 0:
-                cf.setup_ok = False
-                cf.reasons.append("planned_qty_zero")
-
             logger.info(
-                "[PB1][RANK] code=%s score=%.1f w=%.3f cap=%.0f qty=%s atr_pct=%.2f value20=%s tick_budget=%.0f",
+                "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f value20=%s tick_budget=%.0f",
                 cf.code,
                 float(cf.features.get("score") or 0.0),
-                float(w),
-                float(capital),
+                float(cf.features.get("planned_cap") or 0.0),
                 cf.planned_qty,
+                cf.planned_value,
                 float(cf.features.get("atr_pct") or 0.0),
                 cf.features.get("value20"),
                 tick_budget,
             )
+
+        for cf in ranked:
+            if cf not in buyables and cf.setup_ok:
+                cf.setup_ok = False
+                if "planned_qty_zero_or_min_order" not in cf.reasons:
+                    cf.reasons.append("planned_qty_zero_or_min_order")
+                    budget_drop_reasons["planned_qty_zero_or_min_order"] += 1
 
         return candidates
 
@@ -1479,7 +1482,7 @@ class PB1Engine:
         if self.kis:
             try:
                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
-                quote = self.kis.get_price_quote(code, diag_mode=diag_mode)
+                quote = self.kis.get_quote_safe(code, diag_mode=diag_mode)
                 if not isinstance(quote, dict):
                     self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
                     return None
@@ -1523,6 +1526,104 @@ class PB1Engine:
             return float(ohlcv_close), "ohlcv_close"
         logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
         return None, None
+
+    def _calc_order_price(
+        self,
+        code: str,
+        quote: dict | None,
+        daily_close: float | None,
+    ) -> tuple[float | None, str | None]:
+        ask = self._to_float((quote or {}).get("ask"))
+        prpr = self._to_float((quote or {}).get("prpr") or (quote or {}).get("stck_prpr") or (quote or {}).get("last"))
+        close = self._to_float(daily_close)
+        if ask and ask > 0:
+            return ask, "ask"
+        if prpr and prpr > 0:
+            return prpr, "prpr"
+        if close and close > 0:
+            return close, "daily_close"
+        logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
+        return None, None
+
+    def _build_budget_plan(
+        self,
+        ranked: list[CandidateFeature],
+        *,
+        tick_budget: float,
+        target_new_positions: int,
+        min_order_krw: float,
+        max_pos_krw: float,
+    ) -> tuple[list[CandidateFeature], dict[str, Any], Counter[str]]:
+        affordable: list[CandidateFeature] = []
+        drop_reasons: Counter[str] = Counter()
+        for cf in ranked:
+            px = self._to_float(cf.features.get("order_price"))
+            if not px or px <= 0:
+                cf.setup_ok = False
+                cf.reasons.append("order_price_missing")
+                drop_reasons["order_price_missing"] += 1
+                continue
+            need = max(px, min_order_krw)
+            if need <= tick_budget:
+                affordable.append(cf)
+            else:
+                cf.setup_ok = False
+                cf.reasons.append("unaffordable_min1share")
+                drop_reasons["unaffordable_min1share"] += 1
+
+        if not affordable:
+            meta = {"reason": "no_affordable_candidates"}
+            logger.info(
+                "[PB1][BUDGET_PLAN] effective_target=0 cap=0 affordable=0 drop_reasons=%s",
+                drop_reasons.most_common(3),
+            )
+            return [], meta, drop_reasons
+
+        effective_target = min(max(target_new_positions, 1), len(affordable))
+        buyables: list[CandidateFeature] = []
+        while effective_target >= 1:
+            cap = tick_budget / effective_target
+            cap = max(cap, min_order_krw)
+            upper = max_pos_krw if max_pos_krw > 0 else tick_budget
+            cap = min(cap, upper)
+            buyables = []
+            planned_drop: Counter[str] = Counter()
+            for cf in affordable:
+                px = self._to_float(cf.features.get("order_price")) or 0.0
+                qty = int(cap // px) if px > 0 else 0
+                planned_value = float(qty * px)
+                if qty >= 1 and planned_value >= min_order_krw:
+                    cf.planned_qty = qty
+                    cf.planned_value = planned_value
+                    cf.features["planned_cap"] = float(cap)
+                    cf.features["planned_value"] = planned_value
+                    buyables.append(cf)
+                else:
+                    cf.setup_ok = False
+                    cf.reasons.append("planned_qty_zero_or_min_order")
+                    planned_drop["planned_qty_zero_or_min_order"] += 1
+            if buyables:
+                meta = {"effective_target": effective_target, "cap": cap}
+                drop_reasons.update(planned_drop)
+                logger.info(
+                    "[PB1][BUDGET_PLAN] effective_target=%s cap=%.0f affordable=%s buyable=%s drop_reasons=%s",
+                    effective_target,
+                    cap,
+                    len(affordable),
+                    len(buyables),
+                    drop_reasons.most_common(3),
+                )
+                return buyables, meta, drop_reasons
+            drop_reasons.update(planned_drop)
+            effective_target -= 1
+
+        meta = {"reason": "cannot_make_valid_qty"}
+        logger.info(
+            "[PB1][BUDGET_PLAN] effective_target=0 cap=0 affordable=%s drop_reasons=%s",
+            len(affordable),
+            drop_reasons.most_common(3),
+        )
+        return [], meta, drop_reasons
 
     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
         marks: Dict[str, float] = {}
@@ -2523,13 +2624,10 @@ class PB1Engine:
         )
         if tick_budget_krw < min_order_krw:
             logger.warning(
-                "[PB1][ENTRY_BLOCKED] reason=tick_budget_below_min_order tick_budget=%s min_order=%s",
+                "[PB1][BUDGET_PLAN][WARN] tick_budget_below_min_order tick_budget=%s min_order=%s",
                 tick_budget_krw,
                 min_order_krw,
             )
-            entry_allowed = False
-            entry_reason = "tick_budget_below_min_order"
-            skip_entry_scan = True
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -2646,7 +2744,11 @@ class PB1Engine:
                 self._apply_score_fallback(candidates)
             setup_ok_codes = [c.code for c in candidates if c.setup_ok]
             candidates = self._size_positions(candidates)
-            ok_after_risk = [c for c in candidates if c.setup_ok]
+            ok_after_risk = sorted(
+                [c for c in candidates if c.setup_ok],
+                key=lambda c: float(c.features.get("score") or 0.0),
+                reverse=True,
+            )
             after_risk_check_count = len(ok_after_risk)
             self.top_candidates = [
                 {
@@ -2663,6 +2765,8 @@ class PB1Engine:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
 
             new_position_limit = target_new_positions
+            if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
+                new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             open_orders = self.orders_repo.get_open_orders(self.env)
             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
@@ -2679,7 +2783,8 @@ class PB1Engine:
             for cf in ok_after_risk:
                 self.current_code = cf.code
                 close_price = float(cf.features.get("close") or 0.0)
-                planned_cap = float(cf.features.get("planned_cap") or (close_price * float(cf.planned_qty or 0)))
+                order_price = float(cf.features.get("order_price") or close_price or 0.0)
+                planned_cap = float(cf.features.get("planned_cap") or (order_price * float(cf.planned_qty or 0)))
                 if cf.planned_qty <= 0:
                     self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)
                     logger.info(
@@ -2710,13 +2815,13 @@ class PB1Engine:
                     self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
-                        order_value=close_price * float(cf.planned_qty or 0),
+                        order_value=order_price * float(cf.planned_qty or 0),
                         reasons=["cap_below_min_order"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
-                if close_price > 0 and planned_cap < close_price:
+                if order_price > 0 and planned_cap < order_price:
                     self._record_drop(drop_reason_counter, drop_examples, "cap_below_one_share", cf.code)
                     logger.info(
                         "[PB1][SKIP] code=%s reason=cap_below_one_share cap=%.0f close=%.0f min_order=%.0f",
@@ -2728,13 +2833,13 @@ class PB1Engine:
                     self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
-                        order_value=close_price * float(cf.planned_qty or 0),
+                        order_value=order_price * float(cf.planned_qty or 0),
                         reasons=["cap_below_one_share"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
-                order_value = float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
+                order_value = order_price * float(cf.planned_qty or 0)
                 if not allow_add_to_existing and cf.code in held_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
                     self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
