@@ -1,0 +1,11 @@
+{
+  "invalid_format": [],
+  "insufficient_history": [
+    "476830",
+    "491000",
+    "388210",
+    "486990"
+  ],
+  "source": "fdr_marketcap_top",
+  "as_of": "2026-01-19"
+}
