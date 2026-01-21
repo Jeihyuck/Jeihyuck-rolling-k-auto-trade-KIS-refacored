@@ -11,3 +11,7 @@ runtime/**
 # Large caches must not be committed
 runtime/ohlcv_cache/
 runtime/ohlcv_cache/**
+
+# --- never commit these ---
+archive/
+db/*.readonly.bak.*

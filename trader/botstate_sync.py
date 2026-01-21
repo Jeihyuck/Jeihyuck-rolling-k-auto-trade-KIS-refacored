@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple, List
 from zoneinfo import ZoneInfo
 
 from trader.utils.env import env_bool
@@ -45,6 +46,10 @@ bot_state/runtime/**
 # Large caches MUST NOT be committed
 bot_state/runtime/ohlcv_cache/
 bot_state/runtime/ohlcv_cache/**
+
+# Never commit archive/ or readonly backups
+bot_state/archive/
+bot_state/db/*.readonly.bak.*
 
 # Python / OS noise
 .DS_Store
@@ -328,6 +333,38 @@ def stage_runtime_universe(worktree_dir: Path) -> None:
     ]
     for spec in pathspecs:
         _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
+
+
+def _safe_rm(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+    except Exception:
+        logger.info("[BOTSTATE][PERSIST][CLEANUP_SKIP] path=%s", path, exc_info=True)
+
+
+def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
+    _git_worktree(worktree_dir, "reset", check=False)
+    bot_state_dir = worktree_dir / "bot_state"
+    to_add: list[str] = []
+    for root, _, files in os.walk(bot_state_dir):
+        for name in files:
+            rel = Path(root, name).relative_to(worktree_dir).as_posix()
+            for pattern in allow_patterns:
+                if fnmatch.fnmatch(rel, pattern):
+                    to_add.append(rel)
+                    break
+    if to_add:
+        _git_worktree(worktree_dir, "add", "--", *to_add, check=False)
+
+    _safe_rm(worktree_dir / "bot_state" / "archive")
+    db_dir = worktree_dir / "bot_state" / "db"
+    if db_dir.is_dir():
+        for entry in db_dir.iterdir():
+            if ".readonly.bak." in entry.name:
+                _safe_rm(entry)
 
 
 def _cached_diff_names(worktree_dir: Path) -> list[str]:
@@ -870,7 +907,16 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
-        stage_runtime_universe(worktree_dir)
+        allow_patterns = [
+            "bot_state/db/pbcore.sqlite3",
+            "bot_state/runtime/universe/*.json",
+            "bot_state/universe_lkg/**/latest.json",
+            "bot_state/runtime/balance_snapshot.json",
+            "bot_state/runtime/events/*.jsonl",
+            "bot_state/runtime/schema_version.txt",
+            "bot_state/runtime/runtime_meta.json",
+        ]
+        _stage_allowlist(worktree_dir, allow_patterns)
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
         cached_names = _run_git_logged(
             ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
@@ -878,11 +924,12 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         if _run_git_logged(
             ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
         ).returncode == 0:
-            logger.info("[BOTSTATE][PERSIST] no staged changes after add -A bot_state -> skip")
+            logger.info("[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip")
             post = git_porcelain(worktree_dir)
             if post.strip():
-                raise RuntimeError(
-                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                logger.warning(
+                    "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
+                    post,
                 )
             return
         status_lines = [line for line in status.splitlines() if line.strip()]
@@ -895,8 +942,9 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             logger.info("[PERSIST] no changes -> skip")
             post = git_porcelain(worktree_dir)
             if post.strip():
-                raise RuntimeError(
-                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                logger.warning(
+                    "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
+                    post,
                 )
             return
 
@@ -912,8 +960,9 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             logger.info("[PERSIST] no changes -> skip")
             post = git_porcelain(worktree_dir)
             if post.strip():
-                raise RuntimeError(
-                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                logger.warning(
+                    "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
+                    post,
                 )
             return
 
@@ -927,8 +976,17 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
             post = git_porcelain(worktree_dir)
             if post.strip():
-                raise RuntimeError(
-                    "botstate worktree dirty after persist (A plan). Remaining changes:\n" + post
+                _safe_rm(worktree_dir / "bot_state" / "archive")
+                db_dir = worktree_dir / "bot_state" / "db"
+                if db_dir.is_dir():
+                    for entry in db_dir.iterdir():
+                        if ".readonly.bak." in entry.name:
+                            _safe_rm(entry)
+                post = git_porcelain(worktree_dir)
+            if post.strip():
+                logger.warning(
+                    "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after cleanup:\n%s",
+                    post,
                 )
             return
         except RuntimeError as exc:

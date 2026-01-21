@@ -2,8 +2,10 @@ import glob
 import hashlib
 import logging
 import os
+import sqlite3
 import stat
 from pathlib import Path
+from typing import Iterable
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
@@ -14,6 +16,42 @@ from .schema import schema_for_engine
 
 logger = logging.getLogger(__name__)
 MIGRATION_VERSION = "v1"
+REQUIRED_TABLES = ("runs",)
+
+
+def _sqlite_has_table(db_path: Path, table_name: str) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (table_name,),
+            )
+            row = cur.fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _db_file_size(db_path: Path) -> int:
+    try:
+        return db_path.stat().st_size
+    except Exception:
+        return 0
+
+
+def _must_bootstrap_sqlite(db_path: Path, required_tables: Iterable[str]) -> bool:
+    if _db_file_size(db_path) == 0:
+        return True
+    for table in required_tables:
+        if not _sqlite_has_table(db_path, table):
+            return True
+    return False
 
 
 def _chmod_rw(path: Path) -> None:
@@ -136,10 +174,27 @@ def _list_applied_versions(conn: sa.Connection) -> set[str]:
 
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     url = str(engine.url)
+    db_path = None
     if config.is_sqlite_url(url):
         db_path = Path(engine.url.database or "")
         if db_path:
             _prepare_sqlite_path(db_path)
+        if db_path and _must_bootstrap_sqlite(db_path, REQUIRED_TABLES):
+            logger.warning(
+                "[DB][MIGRATE][BOOTSTRAP] reason=missing_required_tables path=%s size=%s",
+                db_path,
+                _db_file_size(db_path),
+            )
+            schema_for_engine(engine).metadata.create_all(engine)
+            _write_schema_stamp(migrations_dir)
+            if db_path:
+                logger.info(
+                    "[DB][CHECK] path=%s exists=%s size=%s",
+                    db_path,
+                    int(os.path.exists(db_path)),
+                    os.path.getsize(db_path) if os.path.exists(db_path) else -1,
+                )
+            return
     if _should_skip_migrations(engine, migrations_dir):
         return
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")

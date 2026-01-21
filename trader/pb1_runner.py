@@ -46,6 +46,8 @@ from trader.config import (
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
     PAPER_MAX_CAPITAL_KRW,
+    PAPER_RESET_AUTO_PURGE,
+    PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
 )
 from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
@@ -1193,6 +1195,7 @@ def run_once(
     ledger_repo = LedgerEventsRepo(engine)
 
     run_record_id = None
+    engine_runner: PB1Engine | None = None
     did_work = False
     touched_files: list[Path] = []
     result = None
@@ -1275,6 +1278,7 @@ def run_once(
 
         reset_reason = None
         account_fp_now = None
+        dnca_total = None
         if kis and balance_snapshot_raw:
             account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
@@ -1306,6 +1310,36 @@ def run_once(
                     elif dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
                         reset_reason = "empty_kis_holdings_detected"
 
+        if reset_reason:
+            if reset_reason == "paper_reset_detected":
+                if (kis_env or "").lower() == "practice" and PAPER_RESET_EVENT_ONLY_IN_PRACTICE:
+                    _write_account_reset_event(
+                        resolved_bot_state_dir,
+                        {
+                            "ts": now.isoformat(),
+                            "env": kis_env or "practice",
+                            "strategy": "pb1_pullback_close",
+                            "reason": reset_reason,
+                            "action": "event_only",
+                            "dnca_total": dnca_total,
+                        },
+                    )
+                    logger.warning("[PB1][RESET] paper_reset_detected in practice -> event_only")
+                    reset_reason = None
+                elif not PAPER_RESET_AUTO_PURGE:
+                    _write_account_reset_event(
+                        resolved_bot_state_dir,
+                        {
+                            "ts": now.isoformat(),
+                            "env": kis_env or "practice",
+                            "strategy": "pb1_pullback_close",
+                            "reason": reset_reason,
+                            "action": "event_only",
+                            "dnca_total": dnca_total,
+                        },
+                    )
+                    logger.warning("[PB1][RESET] paper_reset_detected -> auto_purge disabled event_only")
+                    reset_reason = None
         if reset_reason:
             archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"
             purge_bot_state(resolved_bot_state_dir, archive_dir, reason=reset_reason)
