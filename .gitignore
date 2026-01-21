@@ -27,6 +27,8 @@ bot_state/
 !bot_state/runtime/universe_sanitize_*.json
 !bot_state/runtime/*.flag
 !bot_state/runtime/*.json
+!bot_state/runtime/events/
+!bot_state/runtime/events/*.jsonl
 !bot_state/runtime/diagnostics/
 !bot_state/runtime/diagnostics/*.json
 !bot_state/runtime/diagnostics/universe_drop_*.json

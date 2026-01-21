@@ -6,7 +6,7 @@ from typing import Any
 
 from trader.config import MARKET_MAP
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo
-from trader.kis_wrapper import KisAPI
+from trader.kis_wrapper import KisAPI, KisTemporaryError
 from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
@@ -71,9 +71,13 @@ def _normalize_code(value: Any) -> str:
     return str(value or "").strip().zfill(6)
 
 
-def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strategy: str) -> dict[str, int]:
+def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strategy: str) -> dict[str, object]:
     today = now_kst().strftime("%Y%m%d")
-    resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
+    try:
+        resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
+    except KisTemporaryError as exc:
+        logger.warning("[RECONCILE][DEGRADED] temporary error: %s", exc)
+        return {"ok": False, "reason": "temporary", "err": str(exc)}
     rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
     if isinstance(rows, dict):
         rows = [rows]
@@ -150,4 +154,4 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
         payload_json={"orders": order_count, "fills": fill_count},
     )
     logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
-    return {"orders": order_count, "fills": fill_count}
+    return {"ok": True, "orders": order_count, "fills": fill_count}

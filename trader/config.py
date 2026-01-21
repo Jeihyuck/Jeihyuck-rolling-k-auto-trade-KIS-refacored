@@ -132,6 +132,10 @@ CONFIG = {
     "PB1_ENTRY_CAPITAL_KRW": "0",
     "PB1_CASH_RESERVE_PCT": "0.10",
     "PB1_BLOCK_PREOPEN": "1",
+    "PB1_ENTRY_ALLOW_PREOPEN": "0",
+    "PB1_PREOPEN_START": "08:45",
+    "PB1_PREOPEN_END": "09:00",
+    "PB1_REQUIRE_BALANCE_FOR_ENTRY": "1",
     "PB1_ENTRY_ENABLED": "true",
     "PB1_ENTRY_WINDOW_START": "08:50",
     "PB1_ENTRY_OPEN_END": "09:05",
@@ -519,6 +523,10 @@ _PB1_ENTRY_CAPITAL_RAW = float(_cfg("PB1_ENTRY_CAPITAL_KRW") or "0")
 PB1_ENTRY_CAPITAL_KRW = _PB1_ENTRY_CAPITAL_RAW if _PB1_ENTRY_CAPITAL_RAW > 0 else None
 PB1_CASH_RESERVE_PCT = float(_cfg("PB1_CASH_RESERVE_PCT") or "0.10")
 PB1_BLOCK_PREOPEN = _cfg_bool("PB1_BLOCK_PREOPEN", fallback=True)
+PB1_ENTRY_ALLOW_PREOPEN = _cfg_bool("PB1_ENTRY_ALLOW_PREOPEN", fallback=False)
+PB1_PREOPEN_START = _cfg("PB1_PREOPEN_START") or "08:45"
+PB1_PREOPEN_END = _cfg("PB1_PREOPEN_END") or "09:00"
+PB1_REQUIRE_BALANCE_FOR_ENTRY = _cfg_bool("PB1_REQUIRE_BALANCE_FOR_ENTRY", fallback=True)
 
 logger.info(
     "[CONFIG] BOT_STATE_RESET=%s HARD_RESET=%s CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
@@ -620,15 +628,15 @@ def resolve_market_window(now: datetime, trading_day: bool) -> str:
         now = now.replace(tzinfo=KST)
     if not trading_day:
         return "after"
-    open_time = _parse_hhmm(PB1_ENTRY_WINDOW_START)
-    entry_open_end = _parse_hhmm(PB1_ENTRY_OPEN_END)
+    preopen_start = _parse_hhmm(PB1_PREOPEN_START)
+    preopen_end = _parse_hhmm(PB1_PREOPEN_END)
     morning_end = _parse_hhmm(PB1_MORNING_WINDOW_END)
     entry_end = _parse_hhmm(PB1_ENTRY_WINDOW_END)
     exit_end = _parse_hhmm(PB1_EXIT_WINDOW_END)
     now_time = now.time()
-    if open_time <= now_time < entry_open_end:
+    if preopen_start <= now_time < preopen_end:
         return "preopen"
-    if entry_open_end <= now_time < morning_end:
+    if preopen_end <= now_time < morning_end:
         return "morning"
     if morning_end <= now_time < entry_end:
         return "day"

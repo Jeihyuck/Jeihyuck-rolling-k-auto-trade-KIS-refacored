@@ -15,6 +15,8 @@ MORNING_EXIT_START = time.fromisoformat(os.getenv("MORNING_EXIT_START", "09:00")
 MORNING_EXIT_END = time.fromisoformat(os.getenv("MORNING_EXIT_END", "09:20"))
 CLOSE_AUCTION_START = time.fromisoformat(os.getenv("CLOSE_AUCTION_START", "15:20"))
 CLOSE_AUCTION_END = time.fromisoformat(os.getenv("CLOSE_AUCTION_END", "15:30"))
+PREOPEN_START = time.fromisoformat(os.getenv("PB1_PREOPEN_START", "08:45"))
+PREOPEN_END = time.fromisoformat(os.getenv("PB1_PREOPEN_END", "09:00"))
 
 
 @dataclass
@@ -44,6 +46,8 @@ def decide_window(now: datetime | None = None, override: str = "auto") -> Option
             return WindowDecision(name="afternoon", phase=phase)
         return None
 
+    if in_window(now, PREOPEN_START, PREOPEN_END):
+        return WindowDecision(name="preopen", phase="entry")
     if in_window(now, MORNING_WINDOW_START, MORNING_WINDOW_END):
         phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"
         return WindowDecision(name="morning", phase=phase)

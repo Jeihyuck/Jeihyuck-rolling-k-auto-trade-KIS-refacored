@@ -266,6 +266,10 @@ jobs:
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
       PERSIST_MODE: "ON_CHANGE"
+      PB1_ENTRY_ALLOW_PREOPEN: "1"
+      PB1_PREOPEN_START: "08:45"
+      PB1_PREOPEN_END: "09:00"
+      PB1_REQUIRE_BALANCE_FOR_ENTRY: "1"
 
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
@@ -384,6 +388,8 @@ jobs:
 
           KST = ZoneInfo("Asia/Seoul")
           now = datetime.now(KST)
+          preopen_start = time.fromisoformat(os.getenv("PB1_PREOPEN_START", "08:45"))
+          preopen_end = time.fromisoformat(os.getenv("PB1_PREOPEN_END", "09:00"))
 
           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
@@ -399,9 +405,9 @@ jobs:
               window = "after"
           else:
               now_t = now.time()
-              if time(8, 50) <= now_t < time(9, 5):
+              if preopen_start <= now_t < preopen_end:
                   window = "preopen"
-              elif time(9, 5) <= now_t < time(10, 0):
+              elif preopen_end <= now_t < time(10, 0):
                   window = "morning"
               elif time(10, 0) <= now_t < time(15, 15):
                   window = "day"

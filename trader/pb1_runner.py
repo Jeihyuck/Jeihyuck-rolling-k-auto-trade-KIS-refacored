@@ -33,6 +33,10 @@ from trader.config import (
     MORNING_WINDOW_END,
     MORNING_WINDOW_START,
     PB1_BLOCK_PREOPEN,
+    PB1_ENTRY_ALLOW_PREOPEN,
+    PB1_PREOPEN_END,
+    PB1_PREOPEN_START,
+    PB1_REQUIRE_BALANCE_FOR_ENTRY,
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
@@ -56,7 +60,7 @@ from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
-from trader.kis_wrapper import KisAPI
+from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
@@ -73,6 +77,10 @@ logger = logging.getLogger(__name__)
 log = logger
 
 _WINDOW_MISMATCH_LOGGED = False
+
+BALANCE_STATE_OK = "OK"
+BALANCE_STATE_EMPTY = "EMPTY"
+BALANCE_STATE_UNKNOWN = "UNKNOWN"
 
 
 def _deepcopy_json(value):
@@ -195,6 +203,7 @@ def ensure_universe_built_once(
     strategy: str | None = None,
     as_of: str | None = None,
     force: bool = False,
+    allow_missing: bool = False,
 ) -> None:
     if runtime_store is None:
         raise ValueError("runtime_store is required for ensure_universe_built_once")
@@ -222,7 +231,7 @@ def ensure_universe_built_once(
     flag = universe_build_flag(as_of)
 
     if not force:
-        if not ok:
+        if not ok and not allow_missing:
             return
 
         if meta.get("have_today"):
@@ -458,7 +467,7 @@ def _resolve_market_context(
 
 def _resolve_window_label(market_window: str, window: WindowDecision | None) -> str:
     normalized = (market_window or "").strip().lower()
-    if normalized in {"morning", "day", "close", "preopen", "after", "afternoon"}:
+    if normalized in {"morning", "day", "close", "preopen", "after", "afternoon", "off"}:
         if window and window.name and window.name != normalized:
             global _WINDOW_MISMATCH_LOGGED
             if not _WINDOW_MISMATCH_LOGGED:
@@ -519,6 +528,19 @@ def _get_now_kst() -> datetime:
     if simulated:
         return simulated
     return now_kst()
+
+
+def detect_window(now_kst_value: datetime, preopen_start: str = "08:45", preopen_end: str = "09:00") -> str:
+    t = now_kst_value.time()
+    ps = dtime.fromisoformat(preopen_start)
+    pe = dtime.fromisoformat(preopen_end)
+    if ps <= t < pe:
+        return "preopen"
+    if dtime(9, 0) <= t < dtime(15, 20):
+        return "morning"
+    if dtime(15, 20) <= t <= dtime(15, 30):
+        return "close"
+    return "off"
 
 
 def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt: datetime, allow_wait: bool, max_wait_s: int, smoke_enabled: bool) -> tuple[str, datetime | None]:
@@ -712,6 +734,22 @@ def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
         return None
 
 
+def _is_balance_empty(balance_snapshot: dict | None) -> bool:
+    if not balance_snapshot:
+        return False
+    rows = balance_snapshot.get("output1") or []
+    if not rows:
+        return True
+    for row in rows:
+        try:
+            qty = int(float(str(row.get("hldg_qty") or row.get("ord_psbl_qty") or "0").replace(",", "")))
+        except Exception:
+            qty = 0
+        if qty > 0:
+            return False
+    return True
+
+
 def _is_urgent_persist(touched: list[Path]) -> bool:
     keywords = {"orders", "fills", "exits_intent"}
     for path in touched:
@@ -749,8 +787,6 @@ def run_once(
     as_of = now.date().isoformat()
     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
-    if not loop_mode:
-        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of)
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
     if close_cancel_only:
@@ -761,6 +797,15 @@ def run_once(
         now_kst=now,
         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
     )
+    auto_window = detect_window(now, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
+    if auto_window != market_window:
+        logger.info(
+            "[PB1][WINDOW][AUTO] now_kst=%s env_window=%s auto_window=%s -> using auto",
+            now.isoformat(),
+            market_window,
+            auto_window,
+        )
+        market_window = auto_window
     effective_mode = mode
     if smoke_enabled:
         trading_day = True
@@ -781,10 +826,17 @@ def run_once(
     open_dt, close_dt = _market_session(now)
     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
+    if not loop_mode:
+        allow_missing = market_window == "preopen"
+        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
 
-    if PB1_BLOCK_PREOPEN and market_window == "preopen":
-        os.environ["PB1_ENTRY_ENABLED"] = "0"
-        logger.info("[PB1][ENTRY_BLOCKED] reason=preopen_block entry_allowed=0")
+    if market_window == "preopen":
+        if PB1_ENTRY_ALLOW_PREOPEN:
+            os.environ["PB1_ENTRY_ENABLED"] = "1"
+            logger.info("[PB1][ENTRY_ALLOW] reason=preopen_allow entry_allowed=1")
+        elif PB1_BLOCK_PREOPEN:
+            os.environ["PB1_ENTRY_ENABLED"] = "0"
+            logger.info("[PB1][ENTRY_BLOCKED] reason=preopen_block entry_allowed=0")
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
     os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
@@ -1088,6 +1140,7 @@ def run_once(
         balance_snapshot_raw: dict | None = None
         balance_snapshot_safe: dict | None = None
         balance_source: str | None = None
+        balance_state = BALANCE_STATE_UNKNOWN
         if kis:
             try:
                 _log_balance_cache(force=False)
@@ -1095,8 +1148,25 @@ def run_once(
                 balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
                 balance_snapshot_safe = sanitize_balance_snapshot(balance_snapshot_raw)
                 _persist_balance_snapshot(balance_snapshot_safe, resolved_bot_state_dir, as_of=now)
+                balance_state = BALANCE_STATE_EMPTY if _is_balance_empty(balance_snapshot_raw) else BALANCE_STATE_OK
+            except KisBalanceUnavailable as exc:
+                balance_state = BALANCE_STATE_UNKNOWN
+                logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
             except Exception:
+                balance_state = BALANCE_STATE_UNKNOWN
                 logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
+        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
+            os.environ["PB1_ENTRY_ENABLED"] = "0"
+            entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=False)
+            logger.warning(
+                "[PB1][ENTRY_BLOCKED] reason=balance_unknown entry_allowed=0 require_balance=%s",
+                int(PB1_REQUIRE_BALANCE_FOR_ENTRY),
+            )
+        logger.info(
+            "[PB1][BALANCE][STATE] state=%s source=%s",
+            balance_state,
+            balance_source,
+        )
 
         reset_reason = None
         account_fp_now = None
@@ -1164,42 +1234,56 @@ def run_once(
         force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
         todays_orders = orders_repo.list_today_orders(kis_env or "practice")
         todays_fills = fills_repo.list_today_fills(kis_env or "practice")
-        if _handle_missing_positions_reset(
-            balance_snapshot=balance_snapshot_raw,
-            env=kis_env or "practice",
-            strategy="pb1_pullback_close",
-            run_id=run_record_id,
-            engine=engine,
-            kis=kis,
-            orders_count=len(todays_orders),
-            fills_count=len(todays_fills),
-            positions_repo=positions_repo,
-            ledger_repo=ledger_repo,
-            bot_state_dir=resolved_bot_state_dir,
-            reset_on_missing_positions=reset_on_missing_positions,
-            force_safe_exit=force_safe_exit,
-            hard_reset_requested=BOT_STATE_HARD_RESET,
-        ):
-            if env_bool("PRACTICE_RESET_DAY", False):
-                os.environ["PB1_ENTRY_ENABLED"] = "0"
-                logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
-            runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
+        if balance_state != BALANCE_STATE_UNKNOWN:
+            if _handle_missing_positions_reset(
+                balance_snapshot=balance_snapshot_raw,
+                env=kis_env or "practice",
+                strategy="pb1_pullback_close",
+                run_id=run_record_id,
+                engine=engine,
+                kis=kis,
+                orders_count=len(todays_orders),
+                fills_count=len(todays_fills),
+                positions_repo=positions_repo,
+                ledger_repo=ledger_repo,
+                bot_state_dir=resolved_bot_state_dir,
+                reset_on_missing_positions=reset_on_missing_positions,
+                force_safe_exit=force_safe_exit,
+                hard_reset_requested=BOT_STATE_HARD_RESET,
+            ):
+                if env_bool("PRACTICE_RESET_DAY", False):
+                    os.environ["PB1_ENTRY_ENABLED"] = "0"
+                    logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
+                runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
+                touched_files = _collect_botstate_files(run_start_ts)
+                return touched_files, True, {}, phase_for_log, "RESET_ABORT"
+        else:
+            logger.warning("[PB1][BALANCE][UNKNOWN] skip reset/reconcile")
+        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
+            logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
+            runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             touched_files = _collect_botstate_files(run_start_ts)
-            return touched_files, True, {}, phase_for_log, "RESET_ABORT"
-        if kis:
+            return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+        if kis and balance_state != BALANCE_STATE_UNKNOWN:
             try:
-                reconcile_today(
+                reconcile_result = reconcile_today(
                     engine=engine,
                     kis=kis,
                     env=kis_env or "practice",
                     run_id=run_record_id,
                     strategy="pb1_pullback_close",
                 )
+                if not reconcile_result.get("ok", True):
+                    logger.warning(
+                        "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
+                        reconcile_result.get("reason"),
+                        reconcile_result.get("err"),
+                    )
+            except KisTemporaryError as exc:
+                logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
             except Exception as exc:
                 if not dry_run and mode_resolved == "LIVE":
-                    logger.error("[PB1][RECONCILE][FAIL] live run halted: %s", exc)
-                    runs_repo.finish_run(run_record_id, status="FAILED", notes="reconcile_failed")
-                    return [], False, {}, phase_for_log, "RECONCILE_FAIL"
+                    logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
         engine_runner = PB1Engine(
@@ -1317,7 +1401,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         loop_deadline.isoformat() if loop_deadline else "none",
         max_seconds,
     )
-    ensure_universe_built_once(runtime_store=runtime_store, as_of=now_kst_value.date().isoformat())
+    loop_window = detect_window(now_kst_value, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
+    ensure_universe_built_once(
+        runtime_store=runtime_store,
+        as_of=now_kst_value.date().isoformat(),
+        allow_missing=loop_window == "preopen",
+    )
     strategy_mode = (
         getattr(args, "strategy_mode", None)
         or os.getenv("EFFECTIVE_STRATEGY_MODE")

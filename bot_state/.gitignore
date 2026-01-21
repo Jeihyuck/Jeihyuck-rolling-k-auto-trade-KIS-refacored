@@ -15,7 +15,7 @@ runtime/**.parquet
 !runtime/*.flag
 !runtime/*.json
 !runtime/events/
-!runtime/events/**
+!runtime/events/*.jsonl
 !runtime/diagnostics/
 !runtime/diagnostics/**
 

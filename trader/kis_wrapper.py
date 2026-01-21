@@ -38,9 +38,24 @@ _DAILY_CAP_WARNED = False
 _BALANCE_CACHE_INVALID_LOGGED = False
 
 
-class NetTemporaryError(Exception):
+class KisTemporaryError(Exception):
+    """429/5xx/timeout 등 재시도 가능한 오류."""
+
+
+class KisAuthError(Exception):
+    """401/403 인증 오류."""
+
+
+class KisPermanentError(Exception):
+    """기타 4xx 등 영구 오류."""
+
+
+class KisBalanceUnavailable(KisTemporaryError):
+    """잔고 조회 실패."""
+
+
+class NetTemporaryError(KisTemporaryError):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
-    pass
 
 
 class DataEmptyError(Exception):
@@ -56,10 +71,11 @@ class DataShortError(Exception):
 def _build_session():
     s = requests.Session()
     retry = Retry(
-        total=6, connect=5, read=5, status=3,
-        backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
+        total=0, connect=0, read=0, status=0,
+        backoff_factor=0,
+        status_forcelist=[],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
     s.mount("https://", adapter)
@@ -281,6 +297,8 @@ class KisAPI:
         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
         self._safe_attempts = 5
         self._safe_backoff_base = 0.2
+        self._safe_backoff_cap = 8.0
+        self._safe_max_seconds = 240.0
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
         self._recent_sells: Dict[str, float] = {}
@@ -319,15 +337,30 @@ class KisAPI:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
-        attempts = self._safe_attempts
+        attempts = max(self._safe_attempts, 5)
+        start_ts = time.monotonic()
+        auth_refreshed = False
         for i in range(1, attempts + 1):
             try:
-                return self.session.request(
+                resp = self.session.request(
                     method,
                     url,
                     timeout=kwargs.pop("timeout", (3.0, 7.0)),
                     **kwargs,
                 )
+                status = resp.status_code
+                if status in (401, 403):
+                    if not auth_refreshed and "/oauth2/token" not in url:
+                        auth_refreshed = True
+                        logger.warning("[NET:AUTH] status=%s url=%s -> refresh token", status, url)
+                        self.refresh_token()
+                        continue
+                    raise KisAuthError(f"HTTP {status} for {url}")
+                if status in (429, 500, 502, 503, 504):
+                    raise KisTemporaryError(f"HTTP {status} for {url}")
+                if 400 <= status < 500:
+                    raise KisPermanentError(f"HTTP {status} for {url}")
+                return resp
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 self._reset_session()
@@ -335,9 +368,20 @@ class KisAPI:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 if i in (1, 2):  # 초기 2회엔 세션 리셋도 수행
                     self._reset_session()
-            # backoff
-            time.sleep((2 ** i) * self._safe_backoff_base + random.uniform(0, 0.2))
-        raise NetTemporaryError(f"request failed after retries: {url}")
+            except KisTemporaryError as e:
+                logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
+                if i in (1, 2):
+                    self._reset_session()
+            except KisAuthError:
+                raise
+            except KisPermanentError:
+                raise
+            if time.monotonic() - start_ts >= self._safe_max_seconds:
+                break
+            sleep_base = self._safe_backoff_base * (2 ** (i - 1))
+            sleep_cap = min(self._safe_backoff_cap, sleep_base)
+            time.sleep(random.uniform(0, sleep_cap))
+        raise KisTemporaryError(f"request failed after retries: {url}")
 
     @classmethod
     def _resolve_cache_path(cls) -> Path:
@@ -1524,27 +1568,40 @@ class KisAPI:
         all_rows: List[dict] = []
         out2_last = None  # 🔸 요약 블록(예수금 등) → '첫 페이지' 것만 유지
         empty_cnt = 0
+        last_error: Exception | None = None
         while True:
             try:
                 j = self._inquire_balance_page(fk, nk)
             except Exception as e:
                 logger.error("[잔고조회 예외] %s", e)
+                last_error = e
                 if empty_cnt < max_empty_retry:
                     empty_cnt += 1
                     time.sleep(0.7)
                     continue
-                break
+                raise KisBalanceUnavailable(str(e)) from e
 
             logger.info(f"[잔고조회 응답] {j}")
 
             rows = j.get("output1") or []
             if not rows:
+                out2 = j.get("output2")
+                rt_cd = str(j.get("rt_cd") or "0")
+                if out2 is not None and rt_cd == "0":
+                    if out2_last is None:
+                        out2_last = out2
+                    fk = (j.get("ctx_area_fk100") or "").strip()
+                    nk = (j.get("ctx_area_nk100") or "").strip()
+                    break
                 empty_cnt += 1
                 if empty_cnt <= max_empty_retry:
                     time.sleep(0.6)
                     continue
                 else:
-                    break
+                    detail = "empty_response"
+                    if last_error:
+                        detail = f"{detail}:{last_error}"
+                    raise KisBalanceUnavailable(detail)
             empty_cnt = 0
             all_rows.extend(rows)
 
@@ -1627,8 +1684,15 @@ class KisAPI:
                 self._balance_cache = cache_value
                 self._balance_cache_at = now_kst()
                 snap = normalized
+        except KisBalanceUnavailable as e:
+            logger.error("[GET_BALANCE_FAIL] %s", e)
+            raise
+        except KisTemporaryError as e:
+            logger.error("[GET_BALANCE_FAIL] %s", e)
+            raise KisBalanceUnavailable(str(e)) from e
         except Exception as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
+            raise KisBalanceUnavailable(str(e)) from e
         if return_source:
             return _deepcopy_json(snap), source
         return _deepcopy_json(snap)
