@@ -25,6 +25,7 @@ import requests
 import pytz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlparse
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
@@ -36,6 +37,17 @@ logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
 _DAILY_CAP_WARNED = False
 _BALANCE_CACHE_INVALID_LOGGED = False
+_KIS_BREAKER_LOCK = threading.Lock()
+_KIS_BREAKER_STATE: dict | None = None
+_KIS_BREAKER_PATH: Path | None = None
+_KIS_BREAKER_WINDOW_SEC = int(os.getenv("KIS_BREAKER_WINDOW_SEC", "300") or "300")
+_KIS_BREAKER_THRESHOLD = int(os.getenv("KIS_BREAKER_THRESHOLD", "10") or "10")
+_KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
+_KIS_TEMP_ERROR_CODES: set[str] = {
+    code.strip()
+    for code in (os.getenv("KIS_TEMP_ERROR_CODES") or "").split(",")
+    if code.strip()
+}
 
 
 class KisTemporaryError(Exception):
@@ -119,6 +131,84 @@ def _deepcopy_json(value: Any) -> Any:
         return value
 
 
+def _resolve_breaker_path() -> Path:
+    global _KIS_BREAKER_PATH
+    if _KIS_BREAKER_PATH is None:
+        _KIS_BREAKER_PATH = botstate_path("runtime", "kis_breaker.json")
+        _KIS_BREAKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return _KIS_BREAKER_PATH
+
+
+def _load_breaker_state() -> dict:
+    global _KIS_BREAKER_STATE
+    if _KIS_BREAKER_STATE is not None:
+        return _KIS_BREAKER_STATE
+    path = _resolve_breaker_path()
+    if path.exists():
+        try:
+            _KIS_BREAKER_STATE = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            _KIS_BREAKER_STATE = None
+    if not isinstance(_KIS_BREAKER_STATE, dict):
+        _KIS_BREAKER_STATE = {"endpoints": {}}
+    return _KIS_BREAKER_STATE
+
+
+def _save_breaker_state(state: dict) -> None:
+    path = _resolve_breaker_path()
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _breaker_key(method: str, url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path or url
+    return f"{method.upper()} {path}"
+
+
+def _breaker_check(method: str, url: str) -> tuple[bool, float | None]:
+    key = _breaker_key(method, url)
+    now_ts = time.time()
+    with _KIS_BREAKER_LOCK:
+        state = _load_breaker_state()
+        entry = state.get("endpoints", {}).get(key, {})
+        open_until = entry.get("open_until")
+        if isinstance(open_until, (int, float)) and now_ts < open_until:
+            return True, float(open_until)
+    return False, None
+
+
+def _breaker_record_temp_failure(method: str, url: str) -> None:
+    key = _breaker_key(method, url)
+    now_ts = time.time()
+    with _KIS_BREAKER_LOCK:
+        state = _load_breaker_state()
+        entry = state.setdefault("endpoints", {}).setdefault(key, {})
+        failures = entry.get("failures") or []
+        if not isinstance(failures, list):
+            failures = []
+        window_start = now_ts - _KIS_BREAKER_WINDOW_SEC
+        failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts >= window_start]
+        failures.append(now_ts)
+        entry["failures"] = failures
+        if len(failures) >= _KIS_BREAKER_THRESHOLD:
+            entry["open_until"] = now_ts + _KIS_BREAKER_OPEN_SEC
+        state["endpoints"][key] = entry
+        _save_breaker_state(state)
+
+
+def _breaker_record_success(method: str, url: str) -> None:
+    key = _breaker_key(method, url)
+    with _KIS_BREAKER_LOCK:
+        state = _load_breaker_state()
+        entry = state.get("endpoints", {}).get(key)
+        if not entry:
+            return
+        entry["failures"] = []
+        entry.pop("open_until", None)
+        state["endpoints"][key] = entry
+        _save_breaker_state(state)
+
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -152,11 +242,11 @@ def _normalize_balance_snapshot(snapshot: Any) -> dict | None:
         output1 = []
     output2 = snapshot.get("output2")
     if output2 is None:
-        output2 = []
-    elif isinstance(output2, dict):
-        output2 = [output2]
-    elif not isinstance(output2, list):
-        output2 = []
+        output2 = {}
+    elif isinstance(output2, list):
+        output2 = output2[0] if output2 and isinstance(output2[0], dict) else {}
+    elif not isinstance(output2, dict):
+        output2 = {}
     normalized = dict(snapshot)
     normalized["output1"] = output1
     normalized["output2"] = output2
@@ -296,8 +386,7 @@ class KisAPI:
 
         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
         self._safe_attempts = 5
-        self._safe_backoff_base = 0.2
-        self._safe_backoff_cap = 8.0
+        self._safe_backoff_seq = [0.4, 0.8, 1.6, 2.5, 4.0]
         self._safe_max_seconds = 240.0
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
@@ -340,6 +429,15 @@ class KisAPI:
         attempts = max(self._safe_attempts, 5)
         start_ts = time.monotonic()
         auth_refreshed = False
+        breaker_open, breaker_until = _breaker_check(method, url)
+        if breaker_open:
+            logger.warning(
+                "[NET:FAST_FAIL] breaker=open method=%s url=%s until=%.0f",
+                method,
+                url,
+                breaker_until or 0,
+            )
+            raise KisTemporaryError(f"FAST_FAIL breaker open for {url}")
         for i in range(1, attempts + 1):
             try:
                 resp = self.session.request(
@@ -358,29 +456,42 @@ class KisAPI:
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
                     raise KisTemporaryError(f"HTTP {status} for {url}")
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = None
+                if isinstance(body, dict):
+                    msg_cd = str(body.get("msg_cd") or "").strip()
+                    msg_text = str(body.get("msg1") or "").lower()
+                    if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
+                    if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연")):
+                        raise KisTemporaryError("BODY_TEMP_ERROR msg1")
                 if 400 <= status < 500:
                     raise KisPermanentError(f"HTTP {status} for {url}")
+                _breaker_record_success(method, url)
                 return resp
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
+                _breaker_record_temp_failure(method, url)
                 self._reset_session()
             except requests.exceptions.RequestException as e:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
-                if i in (1, 2):  # 초기 2회엔 세션 리셋도 수행
-                    self._reset_session()
+                _breaker_record_temp_failure(method, url)
+                self._reset_session()
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
-                if i in (1, 2):
-                    self._reset_session()
+                _breaker_record_temp_failure(method, url)
+                self._reset_session()
             except KisAuthError:
                 raise
             except KisPermanentError:
                 raise
             if time.monotonic() - start_ts >= self._safe_max_seconds:
                 break
-            sleep_base = self._safe_backoff_base * (2 ** (i - 1))
-            sleep_cap = min(self._safe_backoff_cap, sleep_base)
-            time.sleep(random.uniform(0, sleep_cap))
+            delay = self._safe_backoff_seq[min(i - 1, len(self._safe_backoff_seq) - 1)]
+            jitter = random.uniform(0.0, min(0.2, delay * 0.2))
+            time.sleep(delay + jitter)
         raise KisTemporaryError(f"request failed after retries: {url}")
 
     @classmethod
@@ -1539,6 +1650,10 @@ class KisAPI:
         if not tr_list:
             raise RuntimeError("BALANCE TR 미구성")
         tr = tr_list[0]
+        if os.getenv("KIS_FORCE_500_BALANCE", "0") == "1":
+            logger.warning("[BALANCE][FORCE_500] env=KIS_FORCE_500_BALANCE=1 -> simulate temp error")
+            _breaker_record_temp_failure("GET", url)
+            raise KisTemporaryError("forced_500_balance")
         headers = self._headers(tr)
         params = {
             "CANO": self.CANO,
@@ -1646,8 +1761,18 @@ class KisAPI:
         logger.info(f"[보유수량맵] {len(mp)}종목")
         return mp
 
-    def get_balance_cached(self, force: bool = False, *, return_source: bool = False) -> Dict[str, object] | tuple[Dict[str, object], str]:
+    def get_balance_cached(
+        self,
+        force: bool = False,
+        *,
+        return_source: bool = False,
+        return_raw: bool = False,
+    ) -> Dict[str, object] | tuple[Dict[str, object], str] | tuple[Dict[str, object], str, Dict[str, object]]:
         source = "api"
+        raw_snapshot: Dict[str, object] | None = None
+        if os.getenv("KIS_FORCE_500_BALANCE", "0") == "1":
+            logger.warning("[BALANCE][FORCE_500] env=KIS_FORCE_500_BALANCE=1 -> skip cache and raise")
+            raise KisTemporaryError("forced_500_balance")
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
             cached = _deepcopy_json(self._balance_cache)
@@ -1656,6 +1781,8 @@ class KisAPI:
                 logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
                 self._balance_cache = _deepcopy_json(normalized)
                 source = "wrapper_cache"
+                if return_source and return_raw:
+                    return normalized, source, _deepcopy_json(normalized)
                 if return_source:
                     return normalized, source
                 return normalized
@@ -1672,6 +1799,7 @@ class KisAPI:
         snap: dict = {}
         try:
             snap = self.inquire_balance_all()
+            raw_snapshot = _deepcopy_json(snap)
             normalized = _normalize_balance_snapshot(snap)
             if normalized is None:
                 if isinstance(snap, dict) and snap.get("rt_cd") not in (None, "0"):
@@ -1693,9 +1821,12 @@ class KisAPI:
         except Exception as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
+        snap_copy = _deepcopy_json(snap)
+        if return_source and return_raw:
+            return snap_copy, source, _deepcopy_json(raw_snapshot or snap_copy)
         if return_source:
-            return _deepcopy_json(snap), source
-        return _deepcopy_json(snap)
+            return snap_copy, source
+        return snap_copy
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
     def get_balance(self) -> Dict[str, object]:

@@ -32,6 +32,11 @@ def universe_lkg_path() -> Path:
     return lkg_path(env, strategy)
 
 
+def balance_snapshot_path(base_dir: Path | None = None) -> Path:
+    root = base_dir or get_botstate_root()
+    return Path(root) / "runtime" / "balance_snapshot.json"
+
+
 class RuntimeStore:
     def __init__(self, base_dir: Path | None = None, *, bot_state_dir: str | Path | None = None) -> None:
         if base_dir is None:
@@ -74,6 +79,35 @@ class RuntimeStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return target
+
+    def save_balance_snapshot(
+        self,
+        *,
+        raw_snapshot: dict,
+        normalized_snapshot: dict,
+        source: str,
+        timestamp_kst: str,
+    ) -> Path:
+        payload = {
+            "timestamp_kst": timestamp_kst,
+            "source": source,
+            "raw": raw_snapshot,
+            "normalized": normalized_snapshot,
+        }
+        path = balance_snapshot_path(self.base_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def load_balance_snapshot(self) -> dict | None:
+        path = balance_snapshot_path(self.base_dir)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("[BALANCE][SNAPSHOT][LOAD_FAIL] path=%s", path)
+            return None
 
     def touch_flag(self, rel: str | Path, *, content: str = "done\n") -> Path:
         target = self.base_dir / self._normalize_rel(Path(rel))

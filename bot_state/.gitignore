@@ -1,26 +1,13 @@
-db/
 runtime/
-trader_state/
-trader_ledger/
-universe_lkg/
+runtime/**
 
-# ---- runtime big caches: do NOT persist to git ----
-runtime/**.parquet
-!runtime/
-!runtime/.gitkeep
+!runtime/events/
+!runtime/events/**
 !runtime/universe/
 !runtime/universe/**
-!runtime/universe_build_done_*.flag
-!runtime/universe_sanitize_*.json
-!runtime/*.flag
-!runtime/*.json
-!runtime/events/
-!runtime/events/*.jsonl
-!runtime/diagnostics/
-!runtime/diagnostics/**
+!runtime/balance_snapshot.json
+!runtime/schema_version.txt
 
-# ------------------------------
-# runtime cache: DO NOT persist
-# ------------------------------
+# Large caches must not be committed
 runtime/ohlcv_cache/
 runtime/ohlcv_cache/**

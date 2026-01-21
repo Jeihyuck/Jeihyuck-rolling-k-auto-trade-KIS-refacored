@@ -32,10 +32,15 @@ from trader.config import (
     MORNING_EXIT_START,
     MORNING_WINDOW_END,
     MORNING_WINDOW_START,
-    PB1_BLOCK_PREOPEN,
-    PB1_ENTRY_ALLOW_PREOPEN,
+    PB1_ALLOW_PREOPEN_ENTRY,
     PB1_PREOPEN_END,
+    PB1_PREOPEN_MAX_NEW_POSITIONS,
+    PB1_PREOPEN_REQUIRE_BALANCE,
     PB1_PREOPEN_START,
+    PB1_ENTRY_ENABLED,
+    PB1_ENTRY_WINDOW_END,
+    PB1_EXIT_WINDOW_END,
+    PB1_MORNING_WINDOW_END,
     PB1_REQUIRE_BALANCE_FOR_ENTRY,
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
@@ -55,7 +60,6 @@ from trader.botstate_sync import (
     resolve_botstate_worktree_dir,
     setup_worktree,
 )
-from trader.balance_utils import sanitize_balance_snapshot
 from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
@@ -77,9 +81,10 @@ logger = logging.getLogger(__name__)
 log = logger
 
 _WINDOW_MISMATCH_LOGGED = False
+_CURRENT_BOTSTATE: dict | None = None
 
 BALANCE_STATE_OK = "OK"
-BALANCE_STATE_EMPTY = "EMPTY"
+BALANCE_STATE_STALE_OK = "STALE_OK"
 BALANCE_STATE_UNKNOWN = "UNKNOWN"
 
 
@@ -88,6 +93,70 @@ def _deepcopy_json(value):
         return copy.deepcopy(value)
     except Exception:
         return value
+
+
+def _balance_snapshot_ttl_sec() -> int:
+    return _parse_int_env("PB1_BALANCE_SNAPSHOT_TTL_SEC", 120)
+
+
+def _load_stale_balance_snapshot(runtime_store: RuntimeStore, now: datetime) -> tuple[dict | None, str | None]:
+    payload = runtime_store.load_balance_snapshot()
+    if not payload:
+        return None, None
+    ts_raw = payload.get("timestamp_kst")
+    if not ts_raw:
+        return None, None
+    try:
+        ts = datetime.fromisoformat(ts_raw)
+    except ValueError:
+        return None, None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    age_sec = (now - ts).total_seconds()
+    if age_sec > _balance_snapshot_ttl_sec():
+        return None, None
+    snapshot = payload.get("normalized") or payload.get("raw")
+    if not isinstance(snapshot, dict):
+        return None, None
+    return snapshot, "snapshot"
+
+
+def get_balance_state(
+    *,
+    kis: KisAPI,
+    runtime_store: RuntimeStore,
+    now: datetime,
+) -> tuple[str, dict | None, str | None]:
+    try:
+        balance_snapshot_raw, balance_source, raw_snapshot = kis.get_balance_cached(
+            force=False,
+            return_source=True,
+            return_raw=True,
+        )
+        balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
+        raw_snapshot = _deepcopy_json(raw_snapshot)
+        if not isinstance(balance_snapshot_raw, dict):
+            raise KisBalanceUnavailable("balance_snapshot_not_dict")
+        if not isinstance(balance_snapshot_raw.get("output1"), list):
+            raise KisBalanceUnavailable("balance_output1_not_list")
+        if not isinstance(balance_snapshot_raw.get("output2"), dict):
+            raise KisBalanceUnavailable("balance_output2_not_dict")
+        runtime_store.save_balance_snapshot(
+            raw_snapshot=raw_snapshot or balance_snapshot_raw,
+            normalized_snapshot=balance_snapshot_raw,
+            source="api" if balance_source == "api" else "cache",
+            timestamp_kst=now.isoformat(),
+        )
+        return BALANCE_STATE_OK, balance_snapshot_raw, balance_source
+    except KisBalanceUnavailable as exc:
+        logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
+    except Exception:
+        logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
+
+    stale_snapshot, stale_source = _load_stale_balance_snapshot(runtime_store, now)
+    if stale_snapshot:
+        return BALANCE_STATE_STALE_OK, stale_snapshot, stale_source
+    return BALANCE_STATE_UNKNOWN, None, None
 
 
 def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
@@ -534,11 +603,17 @@ def detect_window(now_kst_value: datetime, preopen_start: str = "08:45", preopen
     t = now_kst_value.time()
     ps = dtime.fromisoformat(preopen_start)
     pe = dtime.fromisoformat(preopen_end)
+    morning_start = dtime.fromisoformat("09:00")
+    morning_end = dtime.fromisoformat(PB1_MORNING_WINDOW_END)
+    day_end = dtime.fromisoformat(PB1_ENTRY_WINDOW_END)
+    close_end = dtime.fromisoformat(PB1_EXIT_WINDOW_END)
     if ps <= t < pe:
         return "preopen"
-    if dtime(9, 0) <= t < dtime(15, 20):
+    if morning_start <= t < morning_end:
         return "morning"
-    if dtime(15, 20) <= t <= dtime(15, 30):
+    if morning_end <= t < day_end:
+        return "day"
+    if day_end <= t <= close_end:
         return "close"
     return "off"
 
@@ -624,7 +699,12 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PB1 close pullback runner")
-    parser.add_argument("--window", default="auto", choices=["auto", "morning", "afternoon"], help="Execution window override")
+    parser.add_argument(
+        "--window",
+        default="auto",
+        choices=["auto", "preopen", "morning", "day", "close"],
+        help="Execution window override",
+    )
     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
     return parser.parse_args()
 
@@ -702,22 +782,6 @@ def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _balance_snapshot_path(bot_state_dir: Path) -> Path:
-    return bot_state_dir / "runtime" / "balance_snapshot.json"
-
-
-def _persist_balance_snapshot(balance_snapshot: dict, bot_state_dir: Path, *, as_of: datetime | None = None) -> None:
-    if not balance_snapshot:
-        return
-    path = _balance_snapshot_path(bot_state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "as_of": (as_of or now_kst()).isoformat(),
-        "balance": balance_snapshot,
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
     if not balance_snapshot:
         return None
@@ -775,6 +839,30 @@ def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateCo
     return ctx
 
 
+def _register_botstate_ctx(ctx: BotStateContext, owner: str, run_id: str) -> None:
+    global _CURRENT_BOTSTATE
+    _CURRENT_BOTSTATE = {
+        "worktree_dir": ctx.worktree_dir,
+        "owner": owner,
+        "run_id": run_id,
+    }
+
+
+def _release_botstate_lock_best_effort(reason: str) -> None:
+    global _CURRENT_BOTSTATE
+    if not _CURRENT_BOTSTATE:
+        return
+    try:
+        release_botstate_lock(
+            _CURRENT_BOTSTATE["worktree_dir"],
+            _CURRENT_BOTSTATE["owner"],
+            _CURRENT_BOTSTATE["run_id"],
+        )
+        logger.warning("[BOTSTATE][LOCK][RELEASE] reason=%s ok=1", reason)
+    except Exception as exc:
+        logger.warning("[BOTSTATE][LOCK][RELEASE_FAIL] reason=%s err=%s", reason, exc)
+
+
 def run_once(
     *,
     args: argparse.Namespace,
@@ -830,15 +918,7 @@ def run_once(
         allow_missing = market_window == "preopen"
         ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
 
-    if market_window == "preopen":
-        if PB1_ENTRY_ALLOW_PREOPEN:
-            os.environ["PB1_ENTRY_ENABLED"] = "1"
-            logger.info("[PB1][ENTRY_ALLOW] reason=preopen_allow entry_allowed=1")
-        elif PB1_BLOCK_PREOPEN:
-            os.environ["PB1_ENTRY_ENABLED"] = "0"
-            logger.info("[PB1][ENTRY_BLOCKED] reason=preopen_block entry_allowed=0")
-    entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
-    os.environ["PB1_ENTRY_ENABLED"] = "1" if entry_flag.value else "0"
+    entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
     resolved_window, window_label, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
@@ -1027,12 +1107,12 @@ def run_once(
         and event_name_lower == "push"
         and args.phase == "auto"
         and not force_phase_env
-        and window.name == "afternoon"
+        and window.name == "day"
         and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
     ):
         try:
-            start = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_START}")
-            end = datetime.fromisoformat(f"{now.date()}T{AFTERNOON_WINDOW_END}")
+            start = datetime.fromisoformat(f"{now.date()}T{PB1_MORNING_WINDOW_END}")
+            end = datetime.fromisoformat(f"{now.date()}T{PB1_ENTRY_WINDOW_END}")
             in_afternoon = start.time() <= now.time() < end.time()
         except Exception:
             in_afternoon = False
@@ -1122,7 +1202,6 @@ def run_once(
             universe_ok, universe_meta = runtime_store.universe_check(as_of)
             if not universe_ok:
                 if phase_for_log == "entry":
-                    os.environ["PB1_ENTRY_ENABLED"] = "0"
                     logger.info("[PB1][ENTRY_BLOCKED] reason=universe_missing_both entry_allowed=0")
                 logger.info("[PB1][SKIP] reason=universe_missing_both as_of=%s", as_of)
                 logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_missing_both as_of=%s", as_of)
@@ -1138,35 +1217,61 @@ def run_once(
             return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
 
         balance_snapshot_raw: dict | None = None
-        balance_snapshot_safe: dict | None = None
         balance_source: str | None = None
         balance_state = BALANCE_STATE_UNKNOWN
         if kis:
-            try:
-                _log_balance_cache(force=False)
-                balance_snapshot_raw, balance_source = kis.get_balance_cached(force=False, return_source=True)
-                balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
-                balance_snapshot_safe = sanitize_balance_snapshot(balance_snapshot_raw)
-                _persist_balance_snapshot(balance_snapshot_safe, resolved_bot_state_dir, as_of=now)
-                balance_state = BALANCE_STATE_EMPTY if _is_balance_empty(balance_snapshot_raw) else BALANCE_STATE_OK
-            except KisBalanceUnavailable as exc:
-                balance_state = BALANCE_STATE_UNKNOWN
-                logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
-            except Exception:
-                balance_state = BALANCE_STATE_UNKNOWN
-                logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
-        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
-            os.environ["PB1_ENTRY_ENABLED"] = "0"
-            entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=False)
-            logger.warning(
-                "[PB1][ENTRY_BLOCKED] reason=balance_unknown entry_allowed=0 require_balance=%s",
-                int(PB1_REQUIRE_BALANCE_FOR_ENTRY),
+            _log_balance_cache(force=False)
+            balance_state, balance_snapshot_raw, balance_source = get_balance_state(
+                kis=kis,
+                runtime_store=runtime_store,
+                now=now,
             )
         logger.info(
             "[PB1][BALANCE][STATE] state=%s source=%s",
             balance_state,
             balance_source,
         )
+        if balance_state == BALANCE_STATE_STALE_OK:
+            logger.warning("[PB1][BALANCE][STALE_OK] using recent snapshot for exits")
+
+        user_entry_enabled = bool(entry_flag.value)
+        entry_allowed_this_tick = user_entry_enabled
+        entry_block_reason = None
+        if not user_entry_enabled:
+            entry_allowed_this_tick = False
+            entry_block_reason = "entry_disabled"
+        if balance_state == BALANCE_STATE_UNKNOWN:
+            entry_allowed_this_tick = False
+            entry_block_reason = entry_block_reason or "balance_unknown"
+        elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK:
+            entry_allowed_this_tick = False
+            entry_block_reason = entry_block_reason or "balance_stale"
+        if window_label not in {"preopen", "morning", "day"}:
+            entry_allowed_this_tick = False
+            entry_block_reason = entry_block_reason or "window_blocked"
+        entry_cutoff_raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
+        if entry_cutoff_raw:
+            try:
+                cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
+                if now.time() > cutoff_time:
+                    entry_allowed_this_tick = False
+                    entry_block_reason = entry_block_reason or "entry_cutoff"
+            except ValueError:
+                logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s", entry_cutoff_raw)
+
+        if market_window == "preopen":
+            if not PB1_ALLOW_PREOPEN_ENTRY:
+                entry_allowed_this_tick = False
+                entry_block_reason = entry_block_reason or "preopen_block"
+            elif PB1_PREOPEN_REQUIRE_BALANCE and balance_state != BALANCE_STATE_OK:
+                entry_allowed_this_tick = False
+                entry_block_reason = entry_block_reason or "balance_unknown"
+
+        if not entry_allowed_this_tick:
+            logger.info(
+                "[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0",
+                entry_block_reason or "unknown",
+            )
 
         reset_reason = None
         account_fp_now = None
@@ -1234,7 +1339,7 @@ def run_once(
         force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
         todays_orders = orders_repo.list_today_orders(kis_env or "practice")
         todays_fills = fills_repo.list_today_fills(kis_env or "practice")
-        if balance_state != BALANCE_STATE_UNKNOWN:
+        if balance_state == BALANCE_STATE_OK:
             if _handle_missing_positions_reset(
                 balance_snapshot=balance_snapshot_raw,
                 env=kis_env or "practice",
@@ -1252,19 +1357,18 @@ def run_once(
                 hard_reset_requested=BOT_STATE_HARD_RESET,
             ):
                 if env_bool("PRACTICE_RESET_DAY", False):
-                    os.environ["PB1_ENTRY_ENABLED"] = "0"
                     logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
                 runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
                 touched_files = _collect_botstate_files(run_start_ts)
                 return touched_files, True, {}, phase_for_log, "RESET_ABORT"
         else:
-            logger.warning("[PB1][BALANCE][UNKNOWN] skip reset/reconcile")
+            logger.warning("[PB1][BALANCE][DEGRADED] state=%s -> skip reset/reconcile", balance_state)
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             touched_files = _collect_botstate_files(run_start_ts)
             return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
-        if kis and balance_state != BALANCE_STATE_UNKNOWN:
+        if kis and balance_state == BALANCE_STATE_OK:
             try:
                 reconcile_result = reconcile_today(
                     engine=engine,
@@ -1302,6 +1406,9 @@ def run_once(
             now_kst_value=now,
             balance_snapshot=balance_snapshot_raw,
             balance_source=balance_source,
+            entry_allowed_this_tick=entry_allowed_this_tick,
+            entry_block_reason=entry_block_reason,
+            preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
         )
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
@@ -1376,6 +1483,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     if botstate_ctx is None:
         logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
         return
+    _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
     engine = make_engine()
     run_migrations(engine)
     _write_change_flag(False, ["init"])
@@ -1435,7 +1543,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         stop_requested["value"] = True
         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
 
-    signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
+    signal.signal(signal.SIGTERM, lambda *_args: (_request_stop("SIGTERM"), _release_botstate_lock_best_effort("SIGTERM")))
+    signal.signal(signal.SIGINT, lambda *_args: (_request_stop("SIGINT"), _release_botstate_lock_best_effort("SIGINT")))
     try:
         while True:
             if stop_requested["value"]:
@@ -1464,8 +1573,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         now,
                         [
                             _parse_hhmm_to_time(MORNING_WINDOW_START),
-                            _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-                            _parse_hhmm_to_time(CLOSE_AUCTION_START),
+                            _parse_hhmm_to_time(PB1_MORNING_WINDOW_END),
+                            _parse_hhmm_to_time(PB1_ENTRY_WINDOW_END),
                         ],
                     )
                     logger.info(
@@ -1479,8 +1588,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     now,
                     [
                         _parse_hhmm_to_time(MORNING_WINDOW_START),
-                        _parse_hhmm_to_time(AFTERNOON_WINDOW_START),
-                        _parse_hhmm_to_time(CLOSE_AUCTION_START),
+                        _parse_hhmm_to_time(PB1_MORNING_WINDOW_END),
+                        _parse_hhmm_to_time(PB1_ENTRY_WINDOW_END),
                     ],
                 )
                 if next_start:
@@ -1622,12 +1731,17 @@ def main() -> None:
     if botstate_ctx is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
         return
+    _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
     engine = make_engine()
     run_migrations(engine)
     _write_change_flag(False, ["init"])
     signal.signal(
         signal.SIGTERM,
-        lambda *_args: logger.warning("[PB1][SIGNAL] SIGTERM -> defer release until shutdown"),
+        lambda *_args: _release_botstate_lock_best_effort("SIGTERM"),
+    )
+    signal.signal(
+        signal.SIGINT,
+        lambda *_args: _release_botstate_lock_best_effort("SIGINT"),
     )
     metrics: dict[str, int] = {}
     phase_for_log = "none"

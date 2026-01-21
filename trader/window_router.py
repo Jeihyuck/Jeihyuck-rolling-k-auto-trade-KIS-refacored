@@ -7,10 +7,12 @@ from typing import Optional
 
 KST = timezone(timedelta(hours=9))
 
-MORNING_WINDOW_START = time.fromisoformat(os.getenv("MORNING_WINDOW_START", "08:50"))
-MORNING_WINDOW_END = time.fromisoformat(os.getenv("MORNING_WINDOW_END", "15:20"))
-AFTERNOON_WINDOW_START = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_START", "15:20"))
-AFTERNOON_WINDOW_END = time.fromisoformat(os.getenv("AFTERNOON_WINDOW_END", "15:30"))
+MORNING_WINDOW_START = time.fromisoformat(os.getenv("MORNING_WINDOW_START", "09:00"))
+MORNING_WINDOW_END = time.fromisoformat(os.getenv("PB1_MORNING_WINDOW_END", "10:30"))
+DAY_WINDOW_START = MORNING_WINDOW_END
+DAY_WINDOW_END = time.fromisoformat(os.getenv("PB1_ENTRY_WINDOW_END", "15:15"))
+CLOSE_WINDOW_START = DAY_WINDOW_END
+CLOSE_WINDOW_END = time.fromisoformat(os.getenv("PB1_EXIT_WINDOW_END", "15:30"))
 MORNING_EXIT_START = time.fromisoformat(os.getenv("MORNING_EXIT_START", "09:00"))
 MORNING_EXIT_END = time.fromisoformat(os.getenv("MORNING_EXIT_END", "09:20"))
 CLOSE_AUCTION_START = time.fromisoformat(os.getenv("CLOSE_AUCTION_START", "15:20"))
@@ -40,10 +42,14 @@ def decide_window(now: datetime | None = None, override: str = "auto") -> Option
             phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"
             return WindowDecision(name="morning", phase=phase)
         return None
-    if override == "afternoon":
-        if in_window(now, AFTERNOON_WINDOW_START, AFTERNOON_WINDOW_END):
+    if override in {"day", "afternoon"}:
+        if in_window(now, DAY_WINDOW_START, DAY_WINDOW_END):
             phase = "trade"
-            return WindowDecision(name="afternoon", phase=phase)
+            return WindowDecision(name="day", phase=phase)
+        return None
+    if override == "close":
+        if in_window(now, CLOSE_WINDOW_START, CLOSE_WINDOW_END):
+            return WindowDecision(name="close", phase="exit")
         return None
 
     if in_window(now, PREOPEN_START, PREOPEN_END):
@@ -51,9 +57,10 @@ def decide_window(now: datetime | None = None, override: str = "auto") -> Option
     if in_window(now, MORNING_WINDOW_START, MORNING_WINDOW_END):
         phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"
         return WindowDecision(name="morning", phase=phase)
-    if in_window(now, AFTERNOON_WINDOW_START, AFTERNOON_WINDOW_END):
-        phase = "trade"
-        return WindowDecision(name="afternoon", phase=phase)
+    if in_window(now, DAY_WINDOW_START, DAY_WINDOW_END):
+        return WindowDecision(name="day", phase="trade")
+    if in_window(now, CLOSE_WINDOW_START, CLOSE_WINDOW_END):
+        return WindowDecision(name="close", phase="exit")
     return None
 
 

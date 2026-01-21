@@ -34,6 +34,8 @@ def _make_engine(kis=None):
         dry_run=True,
         env="practice",
         run_id="test",
+        entry_allowed_this_tick=True,
+        entry_block_reason=None,
     )
 
 

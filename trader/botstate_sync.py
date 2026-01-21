@@ -22,25 +22,29 @@ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
 SYNC_MODE_FETCH_RESET = "FETCH_RESET"
 BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
 DEFAULT_LOCK_TTL_SEC = 240
-DEFAULT_LOCK_RETRY_SEC = 55
-DEFAULT_LOCK_RETRY_SLEEP_SEC = 5
+DEFAULT_LOCK_RETRY_SEC = 70
+DEFAULT_LOCK_RETRY_SLEEP_SEC = 3
 DEFAULT_LOCK_BUFFER_SEC = 180
 DEFAULT_LOCK_GRACE_SEC = 60
 BOTSTATE_GITIGNORE_TEXT = """\
 # --- botstate (tracked artifacts) ---
-# Keep universe artifacts, diagnostics, db, and minimal runtime meta.
+# Keep minimal runtime artifacts only.
+
+# Ignore runtime by default
+bot_state/runtime/
+bot_state/runtime/**
+
+# Allowlist runtime artifacts
+!bot_state/runtime/events/
+!bot_state/runtime/events/**
+!bot_state/runtime/universe/
+!bot_state/runtime/universe/**
+!bot_state/runtime/balance_snapshot.json
+!bot_state/runtime/schema_version.txt
 
 # Large caches MUST NOT be committed
 bot_state/runtime/ohlcv_cache/
 bot_state/runtime/ohlcv_cache/**
-
-# Runtime event logs should be tracked
-!bot_state/runtime/events/
-!bot_state/runtime/events/**
-
-# Optional: other noisy runtime temp (필요시 켜기)
-# bot_state/runtime/tmp/
-# bot_state/runtime/tmp/**
 
 # Python / OS noise
 .DS_Store
@@ -316,15 +320,11 @@ def stage_all(worktree_dir: Path) -> None:
 
 def stage_runtime_universe(worktree_dir: Path) -> None:
     pathspecs = [
+        "bot_state/db/pbcore.sqlite3",
+        "bot_state/runtime/events",
         "bot_state/runtime/universe",
-        "bot_state/runtime/diagnostics",
-        "bot_state/runtime/universe_build_done_*.flag",
-        "bot_state/runtime/universe_sanitize_*.json",
-        "bot_state/runtime/diagnostics/universe_drop_*.json",
-        "bot_state/universe_lkg",
-        "bot_state/runtime/schema_version.txt",
-        "bot_state/runtime/runtime_meta.json",
         "bot_state/runtime/balance_snapshot.json",
+        "bot_state/runtime/schema_version.txt",
     ]
     for spec in pathspecs:
         _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
@@ -635,6 +635,15 @@ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | Non
                 logger.warning("[BOTSTATE][LOCK_OVERRIDE] event=lock_stale_override reason=parse_error err=%s", exc)
                 stale_takeover = True
 
+        if locked and current_owner == owner and current_run_id == run_id:
+            logger.info(
+                "[BOTSTATE][LOCK_REUSE] owner=%s run_id=%s locked_until=%s",
+                owner,
+                run_id,
+                locked_until.isoformat() if locked_until else "unknown",
+            )
+            return True
+
         if not locked:
             lock_payload = {
                 "owner": owner,
@@ -861,7 +870,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
-        _run_git_logged(["add", "-A", "bot_state"], worktree_dir, check=True, label="add_all_bot_state")
+        stage_runtime_universe(worktree_dir)
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
         cached_names = _run_git_logged(
             ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
@@ -877,9 +886,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                 )
             return
         status_lines = [line for line in status.splitlines() if line.strip()]
-        stage_runtime_universe(worktree_dir)
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
-        stage_all(worktree_dir)
         status2 = git_porcelain(worktree_dir)
         status2_lines = [line for line in status2.splitlines() if line.strip()]
         staged_files = [line for line in cached_names.splitlines() if line.strip()]

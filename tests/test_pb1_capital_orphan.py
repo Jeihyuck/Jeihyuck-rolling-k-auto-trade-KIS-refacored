@@ -49,6 +49,8 @@ def _make_engine(*, kis=None, ledger_repo=None, env="practice"):
         dry_run=True,
         env=env,
         run_id="test",
+        entry_allowed_this_tick=True,
+        entry_block_reason=None,
     )
 
 

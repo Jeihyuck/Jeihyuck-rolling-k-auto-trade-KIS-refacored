@@ -19,7 +19,6 @@ from trader.config import (
     KOSPI_HARD_STOP_PCT,
     LEDGER_BASE_DIR,
     LEDGER_LOOKBACK_DAYS,
-    PB1_ENTRY_ENABLED,
     PB1_DAY_SL_R,
     PB1_DAY_TP_R,
     PB1_R_FLOOR_PCT,
@@ -44,6 +43,8 @@ from trader.config import (
     PB1_EXIT_WINDOW_START,
     PB1_EXIT_WINDOW_END,
     PB1_ALLOW_ADD_TO_EXISTING,
+    PB1_PREOPEN_ORDER_TYPE,
+    PB1_PREOPEN_LIMIT_BUFFER_PCT,
     PB1_VOL_MAX,
     PB1_VOLU_MAX,
     PB1_VOLU_MAX_INTRADAY,
@@ -61,7 +62,7 @@ from trader.strategies.pb1_pullback_close import choose_mode, compute_features, 
 from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
 from trader.eventlog import emit_event
-from trader.utils.env import env_bool, parse_env_flag
+from trader.utils.env import env_bool
 from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 
@@ -227,10 +228,15 @@ def _log_balance_snapshot_shape(snapshot: Any, *, label: str) -> None:
 
 
 def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
-    output2 = snapshot.get("output2") or []
-    if not isinstance(output2, list) or not output2:
+    output2 = snapshot.get("output2")
+    if isinstance(output2, list):
+        if not output2:
+            return False
+        first = output2[0]
+    elif isinstance(output2, dict):
+        first = output2
+    else:
         return False
-    first = output2[0]
     if not isinstance(first, dict):
         return False
     if len(first.keys()) == 0:
@@ -425,6 +431,9 @@ class PB1Engine:
         now_kst_value: datetime | None = None,
         balance_snapshot: dict | None = None,
         balance_source: str | None = None,
+        entry_allowed_this_tick: bool = True,
+        entry_block_reason: str | None = None,
+        preopen_max_new_positions: int = 0,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -466,10 +475,9 @@ class PB1Engine:
         self._code_name_map: Dict[str, str] = {}
         self.current_code: str | None = None
         self.top_candidates: list[dict[str, Any]] = []
-        entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
-        self.entry_enabled = entry_flag.value
-        self.entry_flag_valid = entry_flag.valid
-        self.entry_flag_raw = entry_flag.raw
+        self.entry_enabled = bool(entry_allowed_this_tick)
+        self.entry_block_reason = entry_block_reason
+        self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
         self.window_internal = self._resolve_window_internal()
         self.filter_thresholds = self._resolve_filter_thresholds()
         self.entry_capital_krw: float | None = None
@@ -1501,12 +1509,25 @@ class PB1Engine:
                 self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
         return None
 
+    def _resolve_price_with_fallback(self, code: str, *, ohlcv_close: float | None = None) -> tuple[float | None, str | None]:
+        price = self._mark_price(code)
+        if price is not None:
+            return price, "quote"
+        if code in self._balance_price_map:
+            fallback_price = self._balance_price_map.get(code)
+            if fallback_price:
+                logger.info("[PB1][PRICE][FALLBACK] code=%s source=balance_prpr", code)
+                return float(fallback_price), "balance_prpr"
+        if ohlcv_close is not None and ohlcv_close > 0:
+            logger.info("[PB1][PRICE][FALLBACK] code=%s source=ohlcv_close", code)
+            return float(ohlcv_close), "ohlcv_close"
+        logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
+        return None, None
+
     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
         marks: Dict[str, float] = {}
         for code in codes:
-            px = self._mark_price(code)
-            if px is None:
-                px = self._balance_price_map.get(code) or fallback.get(code)
+            px, source = self._resolve_price_with_fallback(code, ohlcv_close=fallback.get(code))
             if px is not None:
                 marks[code] = px
         return marks
@@ -1528,6 +1549,19 @@ class PB1Engine:
             features_snapshot,
             "PB1-CLOSE",
         )
+        order_type = "MARKET"
+        limit_price = cf.features.get("close")
+        if (self.window_label or "").lower() == "preopen" and PB1_PREOPEN_ORDER_TYPE == "LIMIT":
+            base_price, _source = self._resolve_price_with_fallback(
+                cf.code,
+                ohlcv_close=self._to_float(cf.features.get("close")),
+            )
+            if not base_price:
+                logger.info("[PB1][ENTRY][SKIP] code=%s reason=price_unavailable", display_code)
+                return
+            buffer_pct = max(float(PB1_PREOPEN_LIMIT_BUFFER_PCT), 0.0)
+            limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
+            order_type = "LIMIT"
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -1538,9 +1572,9 @@ class PB1Engine:
                 code=cf.code,
                 market=cf.market,
                 side="BUY",
-                ord_type="MARKET",
+                ord_type=order_type,
                 qty=cf.planned_qty,
-                limit_price=cf.features.get("close"),
+                limit_price=limit_price,
                 stage="PB1-CLOSE",
                 client_order_key=cf.client_order_key or "",
                 request_json={"features": cf.features, "reasons": cf.reasons},
@@ -1857,11 +1891,12 @@ class PB1Engine:
                 ["no_kis_holding"],
             )
             return
-        mark = self._mark_price(code)
+        mark, _source = self._resolve_price_with_fallback(
+            code,
+            ohlcv_close=self._to_float(features.get("close") or avg),
+        )
         if mark is None:
-            mark = self._balance_price_map.get(code)
-        if mark is None:
-            mark = features.get("close") or avg
+            mark = avg
         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
 
@@ -2336,7 +2371,7 @@ class PB1Engine:
         final_status = "OK"
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
-        entry_reason = "ok"
+        entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
         entry_summary_emitted = False
         entry_decision_emitted = False
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
@@ -2345,9 +2380,10 @@ class PB1Engine:
         min_order_krw = float(MIN_ORDER_KRW)
         entry_capital_krw = 0.0
         skip_entry_scan = False
+        if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
+            target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
         if not entry_allowed:
-            logger.warning("[PB1][ENTRY_DISABLED] PB1_ENTRY_ENABLED=%s raw=%s valid=%s -> skip new entries", entry_allowed, self.entry_flag_raw, self.entry_flag_valid)
-            entry_reason = "entry_disabled"
+            logger.warning("[PB1][ENTRY_DISABLED] entry_allowed=0 reason=%s -> skip new entries", entry_reason)
         if self.phase == "verify":
             entry_allowed = False
             entry_reason = "phase_verify"
@@ -2367,6 +2403,7 @@ class PB1Engine:
             phase=self.phase,
             dry_run=self.dry_run,
             entry_enabled=self.entry_enabled,
+            entry_block_reason=entry_reason if not entry_allowed else None,
         )
 
         if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
