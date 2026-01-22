@@ -156,16 +156,21 @@ def _write_schema_stamp(migrations_dir: str) -> None:
 
 
 def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
-    conn.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version text primary key,
-                applied_at timestamptz default now()
-            )
-            """
+    if conn.dialect.name == "sqlite":
+        ddl = """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    )
+        """
+    else:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version text primary key,
+            applied_at timestamptz default now()
+        )
+        """
+    conn.exec_driver_sql(ddl)
 
 
 def _list_applied_versions(conn: sa.Connection) -> set[str]:
