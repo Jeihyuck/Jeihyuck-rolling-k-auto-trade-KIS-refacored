@@ -116,6 +116,17 @@ class RuntimeStore:
             target.write_text(content, encoding="utf-8")
         return target
 
+    def write_status_last_db_write(self, *, run_id: str | None, reason: str, ts: str) -> Path:
+        payload = {
+            "run_id": run_id,
+            "reason": reason,
+            "ts": ts,
+        }
+        target = self.base_dir / "runtime" / "status" / "last_db_write.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return target
+
     def _log_dir_snapshot(self) -> None:
         base = self.base_dir
         listing: dict[str, list[str]] = {}

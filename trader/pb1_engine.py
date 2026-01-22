@@ -3140,6 +3140,7 @@ class PB1Engine:
         entry_summary_emitted = False
         entry_decision_emitted = False
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
+        entry_phase = self.phase in {"prep", "entry"}
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
         min_order_krw = float(MIN_ORDER_KRW)
@@ -3268,7 +3269,7 @@ class PB1Engine:
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         total_cash_krw = int(available_cash_krw)
         order_possible_cash_krw = int(available_cash_krw)
-        if self.kis:
+        if self.kis and entry_phase:
             try:
                 cash_summary = self.kis.get_cash_summary()
                 total_cash_krw = int(cash_summary.get("total_cash_krw") or 0)
@@ -3278,40 +3279,46 @@ class PB1Engine:
         if order_possible_cash_krw > 0:
             available_cash_krw = order_possible_cash_krw
         base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
-        reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
-        override_capital = PB1_ENTRY_CAPITAL_KRW
-        entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
-            base_cash_krw=base_cash_krw,
-            override_capital=override_capital,
-            reserve_pct=reserve_pct,
-        )
-        self.entry_capital_krw = float(entry_capital_krw)
-        self.entry_usable_krw = float(entry_usable_krw)
-        budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
-        tick_budget_krw = int(entry_capital_krw * budget_pct)
-        self.entry_tick_budget_krw = float(tick_budget_krw)
-        logger.info(
-            "[PB1][CAPITAL] mode=%s override=%s total_cash=%s order_possible_cash=%s base_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
-            PB1_CAPITAL_MODE,
-            override_capital,
-            total_cash_krw,
-            order_possible_cash_krw,
-            base_cash_krw,
-            reserve_pct,
-            entry_usable_krw,
-            int(capital_meta.get("use_override") or 0),
-            entry_capital_krw,
-            capital_meta.get("cap_limit"),
-            tick_budget_krw,
-            budget_pct,
-            cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
-        )
-        if tick_budget_krw < min_order_krw:
-            logger.warning(
-                "[PB1][BUDGET_PLAN][WARN] tick_budget_below_min_order tick_budget=%s min_order=%s",
-                tick_budget_krw,
-                min_order_krw,
+        if entry_phase:
+            reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
+            override_capital = PB1_ENTRY_CAPITAL_KRW
+            entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
+                base_cash_krw=base_cash_krw,
+                override_capital=override_capital,
+                reserve_pct=reserve_pct,
             )
+            self.entry_capital_krw = float(entry_capital_krw)
+            self.entry_usable_krw = float(entry_usable_krw)
+            budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
+            tick_budget_krw = int(entry_capital_krw * budget_pct)
+            self.entry_tick_budget_krw = float(tick_budget_krw)
+            logger.info(
+                "[PB1][CAPITAL] mode=%s override=%s total_cash=%s order_possible_cash=%s base_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
+                PB1_CAPITAL_MODE,
+                override_capital,
+                total_cash_krw,
+                order_possible_cash_krw,
+                base_cash_krw,
+                reserve_pct,
+                entry_usable_krw,
+                int(capital_meta.get("use_override") or 0),
+                entry_capital_krw,
+                capital_meta.get("cap_limit"),
+                tick_budget_krw,
+                budget_pct,
+                cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
+            )
+            if tick_budget_krw < min_order_krw:
+                logger.warning(
+                    "[PB1][BUDGET_PLAN][WARN] tick_budget_below_min_order tick_budget=%s min_order=%s",
+                    tick_budget_krw,
+                    min_order_krw,
+                )
+        else:
+            self.entry_capital_krw = 0.0
+            self.entry_usable_krw = float(available_cash_krw)
+            self.entry_tick_budget_krw = 0.0
+            tick_budget_krw = 0.0
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -3358,6 +3365,15 @@ class PB1Engine:
             logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
         marks_fallback: Dict[str, float] = {}
         positions_for_exit = self._run_exit_always(positions=positions_for_exit, holdings_rows=holdings, marks_fallback=marks_fallback)
+        if self.phase == "exit":
+            logger.info("[PB1][EXIT] entry_skipped=1")
+            return RunResult(
+                status=final_status,
+                notes=final_notes or "exit_phase",
+                balance_api_calls=self.balance_api_calls,
+                balance_cache_hits=self.balance_cache_hits,
+                balance_tick_cache_hits=self.balance_tick_cache_hits,
+            )
         open_orders = self.orders_repo.get_open_orders(self.env)
         if open_orders:
             logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))

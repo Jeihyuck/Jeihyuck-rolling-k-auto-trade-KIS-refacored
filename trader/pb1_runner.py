@@ -57,6 +57,7 @@ from trader.botstate_sync import (
     compute_lock_ttl,
     ensure_sqlite_writable,
     hard_reset_bot_state,
+    persist_or_fail,
     persist_run_files,
     release_lock as release_botstate_lock,
     resolve_botstate_worktree_dir,
@@ -835,6 +836,10 @@ def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_last_db_write(runtime_store: RuntimeStore, *, run_id: str | None, reason: str, now: datetime) -> Path:
+    return runtime_store.write_status_last_db_write(run_id=run_id, reason=reason, ts=now.isoformat())
+
+
 def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
     if not balance_snapshot:
         return None
@@ -876,6 +881,10 @@ def _is_urgent_persist(touched: list[Path]) -> bool:
     return False
 
 
+def should_degrade(remaining_s: float) -> bool:
+    return remaining_s < 60
+
+
 def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateContext | None:
     worktree_dir = resolve_botstate_worktree_dir(Path.cwd())
     try:
@@ -901,6 +910,13 @@ def _register_botstate_ctx(ctx: BotStateContext, owner: str, run_id: str) -> Non
     }
 
 
+def _persist_botstate_or_fail(touched: list[Path], *, message: str) -> None:
+    if not _CURRENT_BOTSTATE:
+        logger.warning("[BOTSTATE][PERSIST][SKIP] reason=no_ctx")
+        return
+    persist_or_fail(_CURRENT_BOTSTATE["worktree_dir"], touched, message=message)
+
+
 def _release_botstate_lock_best_effort(reason: str) -> None:
     global _CURRENT_BOTSTATE
     if not _CURRENT_BOTSTATE:
@@ -923,10 +939,14 @@ def run_once(
     loop_mode: bool = False,
     window: WindowDecision | None = None,
     bot_state_dir: Path | None = None,
+    max_seconds: int = 0,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
     if now.tzinfo is None:
         now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    tick_start_ts = time_mod.monotonic()
+    deadline_ts = tick_start_ts + max_seconds if max_seconds > 0 else None
+    run_start_ts = time_mod.time()
     as_of = now.date().isoformat()
     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
@@ -969,10 +989,6 @@ def run_once(
     open_dt, close_dt = _market_session(now)
     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
-    if not loop_mode:
-        allow_missing = market_window == "preopen"
-        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
-
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
@@ -1210,6 +1226,102 @@ def run_once(
         context_reasons or ["none"],
     )
 
+    def _remaining_seconds() -> float:
+        if deadline_ts is None:
+            return float("inf")
+        return max(0.0, deadline_ts - time_mod.monotonic())
+
+    remaining_s = _remaining_seconds()
+    exit_short_circuit = phase_for_log == "exit" or window_label == "close"
+    if exit_short_circuit:
+        logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
+        lock_key = f"PB1:{kis_env_raw or 'practice'}"
+        if not try_acquire_lock(engine, lock_key):
+            logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, os.getenv("GITHUB_ACTOR", "local"), os.getenv("GITHUB_RUN_ID", "local"))
+            return [], False, {}, phase_for_log, "LOCKED"
+        kis = None
+        try:
+            kis = KisAPI()
+        except Exception:
+            logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
+        run_id = os.getenv("GITHUB_RUN_ID", "local")
+        try:
+            if kis:
+                try:
+                    reconcile_today(
+                        engine=engine,
+                        kis=kis,
+                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        run_id=run_id,
+                        strategy="pb1_pullback_close",
+                    )
+                except Exception:
+                    logger.exception("[PB1][EXIT_SHORTCIRCUIT] reconcile_today failed")
+            try:
+                close_stale_positions(
+                    engine=engine,
+                    env=(os.getenv("KIS_ENV") or "practice").lower(),
+                    strategy="pb1_pullback_close",
+                    reason="exit_phase",
+                    ts=now,
+                )
+            except Exception:
+                logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
+            _write_last_db_write(runtime_store, run_id=run_id, reason="exit_shortcircuit", now=now)
+            touched_files = _collect_botstate_files(run_start_ts)
+            if touched_files:
+                _persist_botstate_or_fail(touched_files, message=f"pb1 exit {now.isoformat()}")
+            logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
+            return touched_files, True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
+        finally:
+            release_lock(engine, lock_key)
+
+    if should_degrade(remaining_s):
+        logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
+        lock_key = f"PB1:{kis_env_raw or 'practice'}"
+        if not try_acquire_lock(engine, lock_key):
+            logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, os.getenv("GITHUB_ACTOR", "local"), os.getenv("GITHUB_RUN_ID", "local"))
+            return [], False, {}, phase_for_log, "LOCKED"
+        kis = None
+        try:
+            kis = KisAPI()
+        except Exception:
+            logger.exception("[PB1][DEGRADED] KIS init failed")
+        run_id = os.getenv("GITHUB_RUN_ID", "local")
+        try:
+            if kis:
+                try:
+                    reconcile_today(
+                        engine=engine,
+                        kis=kis,
+                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        run_id=run_id,
+                        strategy="pb1_pullback_close",
+                    )
+                except Exception:
+                    logger.exception("[PB1][DEGRADED] reconcile_today failed")
+            try:
+                close_stale_positions(
+                    engine=engine,
+                    env=(os.getenv("KIS_ENV") or "practice").lower(),
+                    strategy="pb1_pullback_close",
+                    reason="budget_degraded",
+                    ts=now,
+                )
+            except Exception:
+                logger.exception("[PB1][DEGRADED] close_stale_positions failed")
+            _write_last_db_write(runtime_store, run_id=run_id, reason="budget_degraded", now=now)
+            touched_files = _collect_botstate_files(run_start_ts)
+            if touched_files:
+                _persist_botstate_or_fail(touched_files, message=f"pb1 degrade {now.isoformat()}")
+            return touched_files, True, {}, phase_for_log, "DEGRADED_BUDGET"
+        finally:
+            release_lock(engine, lock_key)
+
+    if not loop_mode:
+        allow_missing = market_window == "preopen"
+        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
+
     logger.info(
         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
         event_name_lower or "unknown",
@@ -1252,7 +1364,7 @@ def run_once(
     did_work = False
     touched_files: list[Path] = []
     result = None
-    run_start_ts = time_mod.time()
+    db_write_reasons: list[str] = []
     universe_ctx: UniverseContext | None = None
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
@@ -1464,6 +1576,7 @@ def run_once(
                 "phase_reason": phase_reason,
             },
         )
+        db_write_reasons.append("run_start")
         reset_on_missing_positions = env_bool("PB1_RESET_ON_MISSING_POSITIONS", False)
         force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
         todays_orders = orders_repo.list_today_orders(kis_env or "practice")
@@ -1488,6 +1601,8 @@ def run_once(
                 if env_bool("PRACTICE_RESET_DAY", False):
                     logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
                 runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
+                db_write_reasons.append("reset_abort")
+                _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="reset_abort", now=now)
                 touched_files = _collect_botstate_files(run_start_ts)
                 return touched_files, True, {}, phase_for_log, "RESET_ABORT"
         else:
@@ -1495,6 +1610,8 @@ def run_once(
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
+            db_write_reasons.append("balance_degraded")
+            _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="balance_degraded", now=now)
             touched_files = _collect_botstate_files(run_start_ts)
             return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
         if kis and balance_state == BALANCE_STATE_OK:
@@ -1506,6 +1623,7 @@ def run_once(
                     run_id=run_record_id,
                     strategy="pb1_pullback_close",
                 )
+                db_write_reasons.append("reconcile")
                 if not reconcile_result.get("ok", True):
                     logger.warning(
                         "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
@@ -1546,6 +1664,13 @@ def run_once(
             result = engine_runner.run()
         did_work = True
         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
+        db_write_reasons.append("run_finish")
+        _write_last_db_write(
+            runtime_store,
+            run_id=str(run_record_id),
+            reason=",".join(db_write_reasons),
+            now=now,
+        )
         touched_files = _collect_botstate_files(run_start_ts)
     except Exception as exc:
         logger.exception("[PB1][FAIL] unexpected error")
@@ -1562,6 +1687,7 @@ def run_once(
         )
         if run_record_id:
             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+            _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="failed", now=now)
         raise
     finally:
         release_lock(engine, lock_key)
@@ -1759,12 +1885,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
                 exit_reason = "deadline_exceeded_pre_trade"
                 break
+            remaining_budget_s = 0
+            if loop_deadline_ts:
+                remaining_budget_s = max(0, int(loop_deadline_ts - time_mod.monotonic()))
             touched, _did_work, metrics, last_phase, result_status = run_once(
                 args=args,
                 engine=engine,
                 loop_mode=True,
                 window=window,
                 bot_state_dir=botstate_ctx.bot_state_dir,
+                max_seconds=remaining_budget_s,
             )
             balance_api_calls += metrics.get("balance_api_calls", 0)
             balance_cache_hits += metrics.get("balance_cache_hits", 0)
@@ -1883,6 +2013,7 @@ def main() -> None:
             loop_mode=False,
             window=None,
             bot_state_dir=botstate_ctx.bot_state_dir,
+            max_seconds=run_loop_minutes * 60,
         )
         if touched:
             _write_change_flag(True, ["touched_files"])

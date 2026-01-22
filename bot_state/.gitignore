@@ -3,6 +3,8 @@ runtime/**
 
 !runtime/events/
 !runtime/events/**
+!runtime/status/
+!runtime/status/**
 !runtime/universe/
 !runtime/universe/**
 !runtime/balance_snapshot.json

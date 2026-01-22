@@ -385,9 +385,9 @@ class KisAPI:
         self.session = _build_session()
 
         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
-        self._safe_attempts = 5
-        self._safe_backoff_seq = [0.4, 0.8, 1.6, 2.5, 4.0]
-        self._safe_max_seconds = 240.0
+        self._safe_attempts = 3
+        self._safe_backoff_seq = [0.5, 1.5]
+        self._safe_max_seconds = 18.0
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
         self._recent_sells: Dict[str, float] = {}
@@ -426,9 +426,10 @@ class KisAPI:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
-        attempts = max(self._safe_attempts, 5)
+        attempts = max(self._safe_attempts, 1)
         start_ts = time.monotonic()
         auth_refreshed = False
+        reset_done = False
         breaker_open, breaker_until = _breaker_check(method, url)
         if breaker_open:
             logger.warning(
@@ -474,18 +475,21 @@ class KisAPI:
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                if reset_on_error:
+                if reset_on_error and not reset_done:
                     self._reset_session()
+                    reset_done = True
             except requests.exceptions.RequestException as e:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                if reset_on_error:
+                if reset_on_error and not reset_done:
                     self._reset_session()
+                    reset_done = True
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                if reset_on_error:
+                if reset_on_error and not reset_done:
                     self._reset_session()
+                    reset_done = True
             except KisAuthError:
                 raise
             except KisPermanentError:
@@ -635,6 +639,7 @@ class KisAPI:
         code = safe_strip(code_hint) or "005930"
         cash_meta: dict = {"source": "psbl_order", "raw_fields": {}, "selected_key": None, "clamp_applied": False}
         cash = 0
+        cache_stale = False
         try:
             resp = self._inquire_psbl_order(code, price_hint)
             cash, meta = self._parse_cash_from_psbl_order(resp)
@@ -647,7 +652,18 @@ class KisAPI:
                 raw_fields.get("ord_psbl_amt"),
             )
         except Exception as e:
+            cache_stale = True
             logger.warning("[CASH][PSBL][FAIL] code=%s err=%s", code, e)
+            if self._orderable_cash_cache:
+                cash = int(self._orderable_cash_cache)
+                cash_meta["source"] = "psbl_order_cache"
+                logger.warning(
+                    "[CASH][PSBL][FALLBACK_CACHE] value=%s age=%.1fs",
+                    cash,
+                    (now_kst() - (self._orderable_cash_cache_at or now_kst())).total_seconds()
+                    if self._orderable_cash_cache_at
+                    else -1.0,
+                )
         if cash <= 0:
             try:
                 j = self.inquire_balance_all()
@@ -673,10 +689,19 @@ class KisAPI:
             logger.warning("[CASH][ORDERABLE][FALLBACK_LAST] live=%s → use last=%s", cash, self._last_cash)
             cash = self._last_cash
             cash_meta["source"] = f"{cash_meta.get('source', 'unknown')}_cache"
+            cache_stale = True
         cash_meta["clamp_applied"] = clamp_applied
         cash_meta.setdefault("raw_fields", {})
         if cash > 0:
             self._last_cash = cash
+            if not cache_stale:
+                self._orderable_cash_cache = cash
+                self._orderable_cash_cache_at = now_kst()
+        self._write_orderable_cash_status(
+            cache_stale=cache_stale,
+            source=str(cash_meta.get("source") or "unknown"),
+            value=int(cash),
+        )
         logger.info(
             "[CASH][ORDERABLE] value=%s source=%s clamp=%s",
             cash,
@@ -698,6 +723,7 @@ class KisAPI:
                 return int(self._orderable_cash_cache)
         logger.info("[CASH][PSBL][CACHE] hit=False force=%s", force)
         cash = 0
+        cache_stale = False
         try:
             resp = self._inquire_psbl_order("005930", 1000)
             cash, meta = self._parse_cash_from_psbl_order(resp)
@@ -708,11 +734,22 @@ class KisAPI:
                 raw_fields.get("ord_psbl_amt"),
             )
         except Exception as exc:
+            cache_stale = True
             logger.warning("[CASH][PSBL][KRW][FAIL] err=%s", exc)
+            if self._orderable_cash_cache is not None:
+                cached = int(self._orderable_cash_cache)
+                self._write_orderable_cash_status(cache_stale=True, source="psbl_order_cache", value=cached)
+                return cached
+            self._write_orderable_cash_status(cache_stale=True, source="psbl_order_fail", value=0)
             return 0
         if cash > 0:
             self._orderable_cash_cache = cash
             self._orderable_cash_cache_at = now_kst()
+        self._write_orderable_cash_status(
+            cache_stale=cache_stale,
+            source="psbl_order",
+            value=int(cash),
+        )
         return int(max(cash, 0))
 
     def _parse_total_cash_from_output2(self, out2: Any) -> tuple[int, dict]:
@@ -1649,6 +1686,20 @@ class KisAPI:
             cash = 0
             clamp_applied = True
         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+
+    def _write_orderable_cash_status(self, *, cache_stale: bool, source: str, value: int) -> None:
+        try:
+            path = botstate_path("runtime", "status", "orderable_cash.json")
+            payload = {
+                "ts": now_kst().isoformat(),
+                "cache_stale": cache_stale,
+                "source": source,
+                "value": int(value),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            logger.warning("[CASH][STATUS][FAIL] cache_stale=%s source=%s", cache_stale, source, exc_info=True)
 
     def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
         """주문가능조회 호출."""

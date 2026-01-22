@@ -38,6 +38,8 @@ bot_state/runtime/**
 # Allowlist runtime artifacts
 !bot_state/runtime/events/
 !bot_state/runtime/events/**
+!bot_state/runtime/status/
+!bot_state/runtime/status/**
 !bot_state/runtime/universe/
 !bot_state/runtime/universe/**
 !bot_state/runtime/balance_snapshot.json
@@ -49,6 +51,7 @@ bot_state/runtime/ohlcv_cache/**
 
 # Never commit archive/ or readonly backups
 bot_state/archive/
+bot_state/db/*.bak*
 bot_state/db/*.readonly.bak.*
 
 # Python / OS noise
@@ -56,6 +59,23 @@ bot_state/db/*.readonly.bak.*
 __pycache__/
 *.pyc
 """
+
+ALLOWLIST_PATTERNS = [
+    "bot_state/db/pbcore.sqlite3",
+    "bot_state/runtime/events/*.jsonl",
+    "bot_state/runtime/status/*.json",
+    "bot_state/runtime/universe/*.json",
+    "bot_state/universe_lkg/**/latest.json",
+    "bot_state/runtime/balance_snapshot.json",
+    "bot_state/runtime/schema_version.txt",
+    "bot_state/runtime/runtime_meta.json",
+]
+
+CLEAN_PATTERNS = [
+    "bot_state/archive/**",
+    "bot_state/runtime/ohlcv_cache/**",
+    "bot_state/db/*.bak*",
+]
 
 
 def ensure_botstate_gitignore(workdir: str) -> None:
@@ -324,14 +344,7 @@ def stage_all(worktree_dir: Path) -> None:
 
 
 def stage_runtime_universe(worktree_dir: Path) -> None:
-    pathspecs = [
-        "bot_state/db/pbcore.sqlite3",
-        "bot_state/runtime/events",
-        "bot_state/runtime/universe",
-        "bot_state/runtime/balance_snapshot.json",
-        "bot_state/runtime/schema_version.txt",
-    ]
-    for spec in pathspecs:
+    for spec in ALLOWLIST_PATTERNS:
         _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
 
 
@@ -402,6 +415,47 @@ def _clean_non_allowlisted_changes(
 def _cached_diff_names(worktree_dir: Path) -> list[str]:
     output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
     return [line for line in output.splitlines() if line.strip()]
+
+
+def _safe_stat(path: Path) -> tuple[float, int] | None:
+    try:
+        stat = path.stat()
+        return stat.st_mtime, stat.st_size
+    except FileNotFoundError:
+        return None
+
+
+def _latest_event_mtime(events_dir: Path) -> float | None:
+    if not events_dir.exists():
+        return None
+    latest = None
+    for entry in events_dir.glob("*.jsonl"):
+        try:
+            mtime = entry.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        latest = mtime if latest is None else max(latest, mtime)
+    return latest
+
+
+def _normalize_botstate_rel(path: Path) -> str | None:
+    parts = path.parts
+    if "bot_state" in parts:
+        idx = parts.index("bot_state")
+        return Path(*parts[idx:]).as_posix()
+    if parts and parts[0] == "bot_state":
+        return Path(*parts).as_posix()
+    return None
+
+
+def _allowlist_changed(new_files: Iterable[Path], patterns: list[str]) -> bool:
+    for path in new_files:
+        rel = _normalize_botstate_rel(path)
+        if not rel:
+            continue
+        if any(fnmatch.fnmatch(rel, pattern) for pattern in patterns):
+            return True
+    return False
 
 
 def commit_if_staged(worktree_dir: Path, message: str) -> bool:
@@ -897,6 +951,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
     remote = "origin"
     sync_mode = SYNC_MODE_FETCH_RESET
     retry_sleep_sec = max(1, _lock_retry_sleep_sec())
+    allowlist_changed = _allowlist_changed(files, ALLOWLIST_PATTERNS)
 
     for attempt in range(1, retries + 1):
         try:
@@ -921,6 +976,21 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             time.sleep(retry_sleep_sec)
             continue
 
+        db_path = worktree_dir / "bot_state" / "db" / "pbcore.sqlite3"
+        events_dir = worktree_dir / "bot_state" / "runtime" / "events"
+        db_stat = _safe_stat(db_path)
+        events_latest = _latest_event_mtime(events_dir)
+        status_pre = _run_git_logged(
+            ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_pre"
+        ).stdout
+        logger.info(
+            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s status_lines=%s",
+            allowlist_changed,
+            db_stat,
+            events_latest,
+            [line for line in status_pre.splitlines() if line.strip()][:50],
+        )
+
         for path in files:
             try:
                 if path.resolve().is_relative_to(worktree_dir.resolve()):
@@ -939,34 +1009,20 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             except Exception:
                 continue
 
-        allow_patterns = [
-            "bot_state/db/pbcore.sqlite3",
-            "bot_state/runtime/universe/*.json",
-            "bot_state/universe_lkg/**/latest.json",
-            "bot_state/runtime/balance_snapshot.json",
-            "bot_state/runtime/events/*.jsonl",
-            "bot_state/runtime/schema_version.txt",
-            "bot_state/runtime/runtime_meta.json",
-        ]
-        _stage_allowlist(worktree_dir, allow_patterns)
+        _stage_allowlist(worktree_dir, ALLOWLIST_PATTERNS)
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
         status_lines = [line for line in status.splitlines() if line.strip()]
-        clean_patterns = [
-            "bot_state/archive/**",
-            "bot_state/runtime/ohlcv_cache/**",
-            "bot_state/db/*.bak*",
-        ]
         reverted_deleted, cleaned_untracked = _clean_non_allowlisted_changes(
             worktree_dir,
             status_lines,
-            clean_patterns,
+            CLEAN_PATTERNS,
         )
         if reverted_deleted or cleaned_untracked:
             logger.info(
                 "[BOTSTATE][PERSIST][CLEAN] reverted_deleted=%s cleaned_untracked=%s patterns=%s",
                 reverted_deleted,
                 cleaned_untracked,
-                clean_patterns,
+                CLEAN_PATTERNS,
             )
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_post").stdout
         cached_names = _run_git_logged(
@@ -975,13 +1031,26 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         if _run_git_logged(
             ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
         ).returncode == 0:
-            logger.info("[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip")
+            has_recent_db = False
+            if db_stat:
+                db_mtime = db_stat[0]
+                has_recent_db = (time.time() - db_mtime) < 600
+            has_recent_events = False
+            if events_latest is not None:
+                has_recent_events = (time.time() - events_latest) < 600
+            require_persist = allowlist_changed or has_recent_db or has_recent_events
+            logger.info(
+                "[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip require_persist=%s",
+                require_persist,
+            )
             post = git_porcelain(worktree_dir)
             if post.strip():
                 logger.warning(
                     "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
                     post,
                 )
+            if require_persist:
+                raise RuntimeError("PERSIST_REQUIRED_BUT_EMPTY_STAGE")
             return
         status_lines = [line for line in status.splitlines() if line.strip()]
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
@@ -1069,6 +1138,10 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         time.sleep(retry_sleep_sec)
 
     logger.info("[BOTSTATE][PERSIST] files=%s message=%s", len(files), message)
+
+
+def persist_or_fail(worktree_dir: Path, new_files: Iterable[Path], message: str, retries: int = 3) -> None:
+    persist_run_files(worktree_dir, new_files, message, retries=retries)
 
 
 def push_retry(
