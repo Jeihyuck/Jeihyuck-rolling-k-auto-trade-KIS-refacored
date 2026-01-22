@@ -1,0 +1,12 @@
+ALTER TABLE positions ADD COLUMN setup_id TEXT;
+ALTER TABLE positions ADD COLUMN tight_low REAL;
+ALTER TABLE positions ADD COLUMN base_high REAL;
+ALTER TABLE positions ADD COLUMN entry_price REAL;
+ALTER TABLE positions ADD COLUMN r_value REAL;
+ALTER TABLE positions ADD COLUMN tp1_done INTEGER DEFAULT 0;
+ALTER TABLE positions ADD COLUMN tp2_done INTEGER DEFAULT 0;
+ALTER TABLE positions ADD COLUMN trail_mode TEXT;
+ALTER TABLE positions ADD COLUMN last_trail_stop REAL;
+ALTER TABLE positions ADD COLUMN cooldown_until TEXT;
+ALTER TABLE positions ADD COLUMN regime_at_entry TEXT;
+ALTER TABLE positions ADD COLUMN risk_mult_at_entry REAL;

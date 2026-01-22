@@ -695,6 +695,34 @@ class PositionsRepo:
             rows = conn.execute(stmt).mappings().all()
             return [dict(r) for r in rows]
 
+    def get_position(self, *, env: str, strategy: str, sid: int, mode: int, code: str) -> dict | None:
+        stmt = select(self._schema.positions).where(
+            and_(
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+            )
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+            return dict(row) if row else None
+
+    def list_positions_by_codes(self, *, env: str, strategy: str, codes: list[str]) -> list[dict]:
+        if not codes:
+            return []
+        stmt = select(self._schema.positions).where(
+            and_(
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.code.in_(codes),
+            )
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+            return [dict(r) for r in rows]
+
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
         if not codes:
             return 0
@@ -713,6 +741,34 @@ class PositionsRepo:
         with self.engine.begin() as conn:
             result = conn.execute(stmt)
             return int(result.rowcount or 0)
+
+    def update_position_fields(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        sid: int,
+        mode: int,
+        code: str,
+        fields: dict,
+    ) -> None:
+        if not fields:
+            return
+        stmt = (
+            sa.update(self._schema.positions)
+            .where(
+                and_(
+                    self._schema.positions.c.env == env,
+                    self._schema.positions.c.strategy == strategy,
+                    self._schema.positions.c.sid == sid,
+                    self._schema.positions.c.mode == mode,
+                    self._schema.positions.c.code == code,
+                )
+            )
+            .values(**fields, updated_at=func.now())
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
 
     def apply_fill(
         self,

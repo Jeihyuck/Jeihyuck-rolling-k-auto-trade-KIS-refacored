@@ -9,11 +9,31 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from trader.config import PB1_MIN_CANDLES
+import numpy as np
+import pandas as pd
+
+from trader.config import (
+    MAX_GAP_UP_PCT,
+    MAX_INTRADAY_RANGE_PCT,
+    MAX_SPREAD_PROXY_BPS,
+    MIN_AVG_VALUE_KRW,
+    PB1_MIN_CANDLES,
+    RS_BENCHMARK,
+    RS_COMPOSITE_W1,
+    RS_COMPOSITE_W2,
+    RS_LOOKBACK_DAYS,
+    RS_LOOKBACK2_DAYS,
+    RS_MIN_PCTILE,
+    UNIVERSE_POOL_SIZE,
+    VCP_LOOKBACK,
+    VCP_MIN_SCORE,
+)
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
+from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
+from trader.factors.rs_rank import rank_rs
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
@@ -23,6 +43,7 @@ from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
 from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
 from trader.runtime_store import RuntimeStore
+from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
 
 from datetime import date
 
@@ -137,6 +158,107 @@ def _dedup(seq: Iterable[str]) -> list[str]:
             seen.add(val)
             uniq.append(val)
     return uniq
+
+
+def _trend_template_ok(df: pd.DataFrame) -> bool:
+    if df is None or len(df) < 200:
+        return False
+    close = df["close"]
+    ma50 = close.rolling(50).mean().iloc[-1]
+    ma150 = close.rolling(150).mean().iloc[-1]
+    ma200 = close.rolling(200).mean().iloc[-1]
+    ma200_slope = ma200 - close.rolling(200).mean().iloc[-21] if len(close) >= 221 else float("nan")
+    if not (close.iloc[-1] > ma50 > ma150 > ma200):
+        return False
+    if not (ma200_slope > 0):
+        return False
+    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else float("nan")
+    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else float("nan")
+    if not (np.isfinite(hi_52w) and close.iloc[-1] >= hi_52w * 0.75):
+        return False
+    if not (np.isfinite(lo_52w) and close.iloc[-1] >= lo_52w * 1.30):
+        return False
+    return True
+
+
+def _apply_minervini_filters(members: list[dict], ohlcv_provider: ChainOHLCVProvider) -> list[dict]:
+    if not members:
+        return []
+    bench_df = ohlcv_provider.get_ohlcv(RS_BENCHMARK, 260).df if ohlcv_provider else None
+    bench_close = bench_df["close"] if bench_df is not None and not bench_df.empty else pd.Series(dtype=float)
+    price_map: dict[str, pd.Series] = {}
+    member_meta: dict[str, dict] = {}
+
+    for member in members[:UNIVERSE_POOL_SIZE]:
+        code = str(member.get("code") or "").zfill(6)
+        result = ohlcv_provider.get_ohlcv(code, 260) if ohlcv_provider else None
+        df = result.df if result and result.df is not None else pd.DataFrame()
+        if df.empty:
+            continue
+        df = df.sort_values("date")
+        price_map[code] = df["close"].reset_index(drop=True)
+        vcp_score = score_vcp(df, VCP_LOOKBACK, VolContractRules(), PriceTightRules())
+        pivot_info = find_pivot(df)
+        liq_ok = liquidity_filter(df, MIN_AVG_VALUE_KRW)
+        gap_ok = gap_filter(df, MAX_GAP_UP_PCT)
+        spread_ok = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
+        range_ok = range_filter(df, MAX_INTRADAY_RANGE_PCT)
+        trend_ok = _trend_template_ok(df)
+        member_meta[code] = {
+            "vcp_score": vcp_score,
+            "pivot": pivot_info.get("pivot_price"),
+            "tight_low": pivot_info.get("tight_low"),
+            "base_high": pivot_info.get("base_high"),
+            "liq_ok": liq_ok,
+            "gap_ok": gap_ok,
+            "spread_ok": spread_ok,
+            "range_ok": range_ok,
+            "trend_ok": trend_ok,
+        }
+
+    rs_ranked = rank_rs(
+        price_map,
+        bench_close,
+        lookback_days=RS_LOOKBACK_DAYS,
+        lookback2_days=RS_LOOKBACK2_DAYS,
+        w1=RS_COMPOSITE_W1,
+        w2=RS_COMPOSITE_W2,
+    )
+    rs_map = {row["ticker"]: row for row in rs_ranked.to_dict(orient="records")}
+    filtered: list[dict] = []
+    for member in members[:UNIVERSE_POOL_SIZE]:
+        code = str(member.get("code") or "").zfill(6)
+        meta = member_meta.get(code)
+        if not meta:
+            continue
+        rs_row = rs_map.get(code, {})
+        rs_pctile = float(rs_row.get("pctile") or 0.0) * 100.0
+        rs_comp = rs_row.get("composite")
+        vcp_ok = is_vcp_ready(meta.get("vcp_score", 0), VCP_MIN_SCORE)
+        if not (meta.get("liq_ok") and meta.get("gap_ok") and meta.get("spread_ok") and meta.get("range_ok")):
+            continue
+        if not meta.get("trend_ok"):
+            continue
+        if rs_pctile < RS_MIN_PCTILE:
+            continue
+        if not vcp_ok:
+            continue
+        meta_json = dict(member.get("meta_json") or {})
+        meta_json.update(
+            {
+                "rs_pctile": rs_pctile,
+                "rs_comp": rs_comp,
+                "vcp_score": meta.get("vcp_score"),
+                "pivot": meta.get("pivot"),
+                "tight_low": meta.get("tight_low"),
+                "base_high": meta.get("base_high"),
+                "trend_ok": True,
+                "liq_ok": True,
+            }
+        )
+        member["meta_json"] = meta_json
+        filtered.append(member)
+    return filtered
 
 
 def _load_seed_rows(path: Path) -> list[dict]:
@@ -602,6 +724,17 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             len(insufficient_codes),
             insufficient_codes[: min(5, len(insufficient_codes))],
         )
+
+    if ohlcv_provider and members:
+        filtered = _apply_minervini_filters(members, ohlcv_provider)
+        logger.info(
+            "[UNIVERSE][MINERVINI_FILTER] before=%s after=%s rs_min_pctile=%s vcp_min_score=%s",
+            len(members),
+            len(filtered),
+            RS_MIN_PCTILE,
+            VCP_MIN_SCORE,
+        )
+        members = filtered
 
     universe_id = repo.store_universe(
         env=env,

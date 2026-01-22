@@ -9,19 +9,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
 
+import numpy as np
 import pandas as pd
 
 from trader.botstate_paths import close_entry_orders_path
 from trader.config import (
     CAP_CAP,
-    KOSDAQ_HARD_STOP_PCT,
-    KOSPI_HARD_STOP_PCT,
     LEDGER_BASE_DIR,
     LEDGER_LOOKBACK_DAYS,
-    PB1_DAY_SL_R,
-    PB1_DAY_TP_R,
-    PB1_R_FLOOR_PCT,
-    PB1_TIME_STOP_DAYS,
     PB1_REQUIRE_VOLUME,
     PB1_MIN_CANDLES,
     PB1_MAX_POSITIONS,
@@ -51,13 +46,71 @@ from trader.config import (
     PB1_PULLBACK_MAX,
     PB1_REQUIRE_BOTH,
     MIN_ORDER_KRW,
+    MINERVINI_ADD_ON_R,
+    MINERVINI_BREAKOUT_VOL_MULT,
+    MINERVINI_HEAVY_VOL_MULT,
+    MINERVINI_INITIAL_STOP_PCT,
+    MINERVINI_MAX_EXTENSION_PIVOT,
+    MINERVINI_MAX_PYRAMID,
+    MINERVINI_RS_MIN,
+    MINERVINI_TIME_STOP_DAYS,
+    ATR_WINDOW,
+    ATR_MULT,
+    BREAKOUT_VOL_MULT,
+    ENTRY_MODE,
+    FAILED_BREAKOUT_EXIT_DAYS,
+    INITIAL_STOP_MODE,
+    MAX_GAP_UP_PCT,
+    MAX_INTRADAY_RANGE_PCT,
+    MAX_SPREAD_PROXY_BPS,
+    MIN_AVG_VALUE_KRW,
+    REENTRY_COOLDOWN_DAYS,
+    REGIME_INDEX,
+    REGIME_MA_FAST,
+    REGIME_MA_SLOW,
+    REGIME_MAX_RISK,
+    REGIME_MID_RISK,
+    REGIME_MIN_RISK,
+    REGIME_MODE,
+    RISK_PER_TRADE_PCT,
+    RS_BENCHMARK,
+    RS_COMPOSITE_W1,
+    RS_COMPOSITE_W2,
+    RS_LOOKBACK_DAYS,
+    RS_LOOKBACK2_DAYS,
+    RS_MIN_PCTILE,
+    TAKE_PROFIT_R1,
+    TAKE_PROFIT_R2,
+    TP1_SELL_PCT,
+    TP2_SELL_PCT,
+    TRAIL_MODE,
+    TRAIL_STEP_AFTER_R,
+    UNIVERSE_POOL_SIZE,
+    VCP_LOOKBACK,
+    VCP_MIN_SCORE,
     resolve_market_window,
 )
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.ledger.store import LedgerStore
-from trader.strategies.pb1_pullback_close import choose_mode, compute_features, score_setup
+from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
+from trader.factors.regime import get_regime, risk_multiplier
+from trader.factors.rs_rank import rank_rs
+from trader.positioning.minervini_risk import calc_initial_stop, calc_position_size, update_exits
+from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
+from trader.strategies.pb1_minervini_v2 import (
+    MinerviniConfig,
+    compute_features,
+    compute_pivot,
+    detect_vcp,
+    entry_trigger,
+    evaluate_filters,
+    initial_stop,
+    risk_position_size,
+    score_setup,
+    update_trailing_stop,
+)
 from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
 from trader.eventlog import emit_event
@@ -252,10 +305,6 @@ def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
     return all(isinstance(value, str) and value == "****" for value in values)
 
 
-def _is_missing(value: float | None) -> bool:
-    return value is None or (isinstance(value, float) and value != value)
-
-
 def _extract_dnca_tot_amt(balance_resp: dict) -> int | None:
     if not isinstance(balance_resp, dict):
         return None
@@ -319,62 +368,6 @@ class FilterThresholds:
         return FilterThresholds(**data)
 
 
-def evaluate_filters(
-    features: Dict[str, float],
-    market: str,
-    thresholds: FilterThresholds,
-    *,
-    require_volume: bool,
-) -> tuple[bool, List[str]]:
-    reasons: List[str] = []
-    close = features.get("close")
-    ma20 = features.get("ma20")
-    ma50 = features.get("ma50")
-    pullback = features.get("pullback_pct")
-    vol_c = features.get("vol_contraction")
-    volu_c = features.get("volu_contraction")
-    slope = features.get("ma20_slope")
-    volume_missing = bool(features.get("volume_missing"))
-
-    if volume_missing and require_volume:
-        reasons.append("volume_missing")
-    if close is None or ma20 is None or ma50 is None:
-        reasons.append("missing_ma")
-    else:
-        if not (close > ma20 and close > ma50):
-            reasons.append("close_below_ma")
-    if slope is None or slope <= 0:
-        reasons.append("ma20_slope_nonpos")
-
-    if pullback is None:
-        reasons.append("pullback_missing")
-    else:
-        low = thresholds.pullback_min
-        high = thresholds.pullback_max
-        if high <= 1.0:
-            low *= 100.0
-            high *= 100.0
-        if not (low <= pullback <= high):
-            reasons.append("pullback_out_of_band")
-
-    vol_c_missing = _is_missing(vol_c)
-    volu_missing = _is_missing(volu_c)
-    if thresholds.require_both_contractions:
-        if vol_c_missing or vol_c > thresholds.vol_contraction_max:
-            reasons.append("vol_contraction_fail")
-        if not volume_missing and (volu_missing or volu_c > thresholds.volu_contraction_max):
-            reasons.append("volu_contraction_fail")
-    else:
-        vol_c_ok = (not vol_c_missing) and vol_c <= thresholds.vol_contraction_max
-        volu_ok = volume_missing or ((not volu_missing) and volu_c <= thresholds.volu_contraction_max)
-        if not (vol_c_ok or volu_ok):
-            reasons.append("vol_contraction_fail")
-            if not volume_missing:
-                reasons.append("volu_contraction_fail")
-
-    return (len(reasons) == 0, reasons)
-
-
 def resolve_pb1_phase(
     now: datetime,
     trading_day: bool,
@@ -382,13 +375,13 @@ def resolve_pb1_phase(
 ) -> tuple[str, str, str]:
     force_raw = (force_phase_env or "").strip().lower()
     if force_raw:
-        if force_raw in {"entry", "exit", "verify"}:
+        if force_raw in {"entry", "exit", "verify", "manage", "idle"}:
             window = resolve_market_window(now, trading_day)
             return force_raw, "force", window
         logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
     window = resolve_market_window(now, trading_day)
     if not trading_day:
-        return "exit", "auto_non_trading_day", window
+        return "idle", "auto_non_trading_day", window
     entry_start = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_START, "%H:%M").time(), now.tzinfo)
     entry_open_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_OPEN_END, "%H:%M").time(), now.tzinfo)
     entry_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time(), now.tzinfo)
@@ -400,7 +393,7 @@ def resolve_pb1_phase(
         return "entry", "auto_day", window
     if exit_start <= now <= exit_end:
         return "exit", "auto_close", window
-    return "exit", "auto_outside_window", window
+    return "manage", "auto_manage", window
 
 
 def compute_window(now_kst: datetime) -> str:
@@ -458,6 +451,17 @@ class PB1Engine:
         self.balance_tick_cache_hits = 0
         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
         self.min_candles = int(PB1_MIN_CANDLES)
+        self.minervini_config = MinerviniConfig(
+            rs_min_percentile=RS_MIN_PCTILE / 100.0,
+            min_dollar_vol_50d=PB1_MIN_VALUE20,
+            breakout_vol_mult_20=BREAKOUT_VOL_MULT,
+            max_extension_from_pivot=MINERVINI_MAX_EXTENSION_PIVOT,
+            initial_stop_pct=MINERVINI_INITIAL_STOP_PCT,
+            risk_pct_of_equity=RISK_PER_TRADE_PCT / 100.0,
+            max_pyramid_levels=MINERVINI_MAX_PYRAMID,
+            add_on_R=MINERVINI_ADD_ON_R,
+            heavy_volume_mult=MINERVINI_HEAVY_VOL_MULT,
+        )
         providers = []
         if kis:
             providers.append(KISOHLCVProvider(kis))
@@ -551,7 +555,7 @@ class PB1Engine:
         logger.warning(message, *args)
 
     def _is_intraday_threshold_window(self) -> bool:
-        if self.phase not in {"prep", "entry", "trade"}:
+        if self.phase not in {"prep", "entry"}:
             return False
         if self.window_internal not in {"morning", "day"}:
             return False
@@ -800,8 +804,17 @@ class PB1Engine:
             }
         return holdings
 
-    def _build_positions_from_kis(self, holdings_rows: Iterable[dict]) -> list[dict]:
+    def _build_positions_from_kis(
+        self,
+        holdings_rows: Iterable[dict],
+        positions_rows: Iterable[dict],
+    ) -> list[dict]:
         kis_holdings = self._parse_kis_holdings(holdings_rows)
+        positions_by_code = {
+            str(row.get("code") or "").zfill(6): row
+            for row in positions_rows or []
+            if row.get("code")
+        }
         ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
         ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
         if ledger_positions:
@@ -842,6 +855,7 @@ class PB1Engine:
         positions: list[dict] = []
         for code, holding in kis_holdings.items():
             ledger_state = ledger_by_code.get(code, {})
+            pos_state = positions_by_code.get(code, {})
             qty = holding.get("qty") or 0
             avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
             positions.append(
@@ -858,6 +872,28 @@ class PB1Engine:
                     "total_cost": float(ledger_state.get("total_cost") or 0.0) or (avg * qty if avg else 0.0),
                     "realized_pnl": ledger_state.get("realized_pnl") or 0.0,
                     "meta_source": "kis",
+                    "entry_ts": pos_state.get("entry_ts"),
+                    "initial_stop": pos_state.get("initial_stop"),
+                    "stop_price": pos_state.get("stop_price"),
+                    "max_price": pos_state.get("max_price"),
+                    "pyramid_level": pos_state.get("pyramid_level"),
+                    "pivot": pos_state.get("pivot"),
+                    "last_add_price": pos_state.get("last_add_price"),
+                    "last_stop_update_ts": pos_state.get("last_stop_update_ts"),
+                    "partial_exit_level": pos_state.get("partial_exit_level"),
+                    "base_id": pos_state.get("base_id"),
+                    "setup_id": pos_state.get("setup_id"),
+                    "tight_low": pos_state.get("tight_low"),
+                    "base_high": pos_state.get("base_high"),
+                    "entry_price": pos_state.get("entry_price"),
+                    "r_value": pos_state.get("r_value"),
+                    "tp1_done": pos_state.get("tp1_done"),
+                    "tp2_done": pos_state.get("tp2_done"),
+                    "trail_mode": pos_state.get("trail_mode"),
+                    "last_trail_stop": pos_state.get("last_trail_stop"),
+                    "cooldown_until": pos_state.get("cooldown_until"),
+                    "regime_at_entry": pos_state.get("regime_at_entry"),
+                    "risk_mult_at_entry": pos_state.get("risk_mult_at_entry"),
                 }
             )
         return positions
@@ -1087,10 +1123,24 @@ class PB1Engine:
             cf.market,
             cf.mode,
             cf.reasons or ["n/a"],
-            {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction"]},
+            {
+                k: cf.features.get(k)
+                for k in [
+                    "close",
+                    "ma50",
+                    "ma150",
+                    "ma200",
+                    "ma200_slope",
+                    "hi_52w",
+                    "lo_52w",
+                    "dollar_vol_50",
+                    "pivot",
+                    "rs_percentile",
+                ]
+            },
         )
 
-    def _fetch_daily(self, code: str, count: int = 120) -> tuple[pd.DataFrame, Dict]:
+    def _fetch_daily(self, code: str, count: int = 260) -> tuple[pd.DataFrame, Dict]:
         try:
             result = self.ohlcv_provider.get_ohlcv(code, count)
         except Exception:
@@ -1105,11 +1155,15 @@ class PB1Engine:
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
         candidates: List[CandidateFeature] = []
+        required_candles = max(self.min_candles, 252)
+        bench_df, _ = self._fetch_daily(RS_BENCHMARK, count=260)
+        bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
+        rs_prices: dict[str, pd.Series] = {}
         for m in members:
             code = str(m.get("code") or "").zfill(6)
             market = m.get("market") or ""
             try:
-                df, meta = self._fetch_daily(code, count=120)
+                df, meta = self._fetch_daily(code, count=260)
                 if df.empty:
                     reasons = ["data_empty"]
                     cf = CandidateFeature(
@@ -1123,7 +1177,7 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     continue
-                if len(df) < self.min_candles:
+                if len(df) < required_candles:
                     reasons = ["insufficient_candles"]
                     cf = CandidateFeature(
                         code=code,
@@ -1137,7 +1191,7 @@ class PB1Engine:
                     candidates.append(cf)
                     continue
                 try:
-                    features = compute_features(df, min_candles=self.min_candles)
+                    features = compute_features(df)
                 except ValueError:
                     reasons = ["insufficient_candles"]
                     cf = CandidateFeature(
@@ -1151,25 +1205,70 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     continue
+                vcp_score = score_vcp(
+                    df,
+                    VCP_LOOKBACK,
+                    VolContractRules(),
+                    PriceTightRules(),
+                )
+                pivot_info = find_pivot(df)
+                pivot = pivot_info.get("pivot_price")
+                vcp_info = detect_vcp(df, self.minervini_config)
                 features["market"] = market
                 features["volume_missing"] = bool(meta.get("volume_missing"))
                 features["data_ok"] = True
-                if features.get("volume_missing"):
-                    features["volu_contraction"] = None
-                mode, mode_reasons = choose_mode(features)
+                features["vcp_ok"] = bool(vcp_info.get("vcp_ok") or is_vcp_ready(vcp_score, VCP_MIN_SCORE))
+                features["vcp_score"] = float(vcp_score)
+                features["vcp_contractions"] = vcp_info.get("contractions")
+                pivot_val = float(pivot) if pivot and np.isfinite(pivot) else float("nan")
+                features["pivot"] = pivot_val
+                features["pivot_scan"] = pivot_val
+                features["pivot_age"] = pivot_info.get("pivot_date")
+                features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
+                features["tight_low"] = pivot_info.get("tight_low")
+                features["base_high"] = pivot_info.get("base_high")
+                features["liq_ok"] = liquidity_filter(df, MIN_AVG_VALUE_KRW)
+                features["gap_ok"] = gap_filter(df, MAX_GAP_UP_PCT)
+                features["spread_ok"] = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
+                features["range_ok"] = range_filter(df, MAX_INTRADAY_RANGE_PCT)
                 cf = CandidateFeature(
                     code=code,
                     market=market,
                     features=features,
                     setup_ok=False,
                     reasons=[],
-                    mode=mode,
-                    mode_reasons=mode_reasons,
+                    mode=1,
+                    mode_reasons=["minervini_default"],
                 )
                 candidates.append(cf)
+                rs_prices[code] = df["close"].reset_index(drop=True)
             except Exception:
                 logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                 continue
+        if not candidates:
+            return candidates
+        rs_rank = rank_rs(
+            rs_prices,
+            bench_close,
+            lookback_days=RS_LOOKBACK_DAYS,
+            lookback2_days=RS_LOOKBACK2_DAYS,
+            w1=RS_COMPOSITE_W1,
+            w2=RS_COMPOSITE_W2,
+        )
+        rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
+        for i, cf in enumerate(candidates):
+            rs_row = rs_map.get(cf.code, {})
+            rs_p = float(rs_row.get("pctile") or 0.0)
+            cf.features["rs_percentile"] = rs_p
+            cf.features["rs_pctile"] = rs_p * 100.0
+            cf.features["rs_comp"] = rs_row.get("composite")
+            vcp_info = {
+                "score": cf.features.get("vcp_score"),
+                "vcp_ok": cf.features.get("vcp_ok"),
+                "contractions": cf.features.get("vcp_contractions"),
+            }
+            cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
+            cf.features["score"] = cf.score
         return candidates
 
     @staticmethod
@@ -1195,6 +1294,7 @@ class PB1Engine:
         log_results: bool,
     ) -> List[CandidateFeature]:
         evaluated: List[CandidateFeature] = []
+        cfg = self.minervini_config
         for cf in candidates:
             clone = self._clone_candidate(cf)
             data_ok = bool(clone.features.get("data_ok"))
@@ -1203,9 +1303,15 @@ class PB1Engine:
                     self._log_setup(clone)
                 evaluated.append(clone)
                 continue
-            ok, reasons = evaluate_filters(clone.features, clone.market, thresholds, require_volume=self.require_volume)
-            if clone.features.get("volume_missing") and "volume_missing" not in reasons and self.require_volume:
-                reasons.append("volume_missing")
+            ok, reasons = evaluate_filters(clone.features, cfg)
+            if not clone.features.get("liq_ok", True):
+                reasons.append("liquidity_fail")
+            if not clone.features.get("spread_ok", True):
+                reasons.append("spread_fail")
+            if not clone.features.get("range_ok", True):
+                reasons.append("range_fail")
+            if not clone.features.get("gap_ok", True):
+                reasons.append("gap_fail")
             if ok:
                 reasons = []
             elif not reasons:
@@ -1294,7 +1400,13 @@ class PB1Engine:
             if not cf.features.get("data_ok"):
                 continue
             try:
-                score = float(score_setup(cf.features, cf.market))
+                rs_p = float(cf.features.get("rs_percentile") or 0.0)
+                vcp_info = {
+                    "score": cf.features.get("vcp_score"),
+                    "vcp_ok": cf.features.get("vcp_ok"),
+                    "contractions": cf.features.get("vcp_contractions"),
+                }
+                score = float(score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config))
             except Exception:
                 score = 0.0
             cf.features["score"] = score
@@ -1370,7 +1482,13 @@ class PB1Engine:
         # 1) 점수 계산 + Adaptive score cut + ATR/유동성 컷
         for cf in ok_list:
             try:
-                score = float(score_setup(cf.features, cf.market))
+                rs_p = float(cf.features.get("rs_percentile") or 0.0)
+                vcp_info = {
+                    "score": cf.features.get("vcp_score"),
+                    "vcp_ok": cf.features.get("vcp_ok"),
+                    "contractions": cf.features.get("vcp_contractions"),
+                }
+                score = float(score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config))
             except Exception:
                 score = 0.0
             cf.features["score"] = score
@@ -1441,21 +1559,76 @@ class PB1Engine:
                 cf.setup_ok = False
                 cf.reasons.append("order_price_missing")
                 continue
+            last_price = self._to_float(quote.get("last") or quote.get("prpr") or quote.get("stck_prpr"))
+            last_volume = self._to_float(quote.get("acml_vol") or quote.get("stck_vol") or quote.get("stck_trqu") or quote.get("volume"))
+            if last_price:
+                cf.features["last_price"] = float(last_price)
+            if last_volume:
+                cf.features["last_volume"] = float(last_volume)
             if source and source != "ask":
                 logger.info("[PB1][PRICE][FALLBACK] code=%s used=%s px=%.2f", cf.code, source, order_px)
             cf.features["order_price"] = float(order_px)
             cf.features["order_price_source"] = source or "unknown"
 
-        buyables, budget_meta, budget_drop_reasons = self._build_budget_plan(
-            ranked,
-            tick_budget=tick_budget,
-            target_new_positions=int(self.target_new_positions or 0),
-            min_order_krw=min_order_krw,
-            max_pos_krw=max_pos_krw,
-        )
-        self._budget_plan_meta = budget_meta
-
-        for cf in buyables:
+        equity_krw = float(getattr(self, "_equity_krw", 0.0) or 0.0)
+        if equity_krw <= 0:
+            equity_krw = float(self.entry_usable_krw or 0.0)
+        risk_mult = float(getattr(self, "_regime_risk_mult", 1.0))
+        risk_krw = equity_krw * (float(RISK_PER_TRADE_PCT) / 100.0) * risk_mult
+        target_new_positions = max(1, int(self.target_new_positions or len(ranked) or 1))
+        per_position_budget = min(max_pos_krw, tick_budget / target_new_positions) if tick_budget > 0 else max_pos_krw
+        self._budget_plan_meta = {"risk_krw": risk_krw, "per_position_budget": per_position_budget}
+        for cf in ranked:
+            if not cf.setup_ok:
+                continue
+            order_px = self._to_float(cf.features.get("order_price")) or 0.0
+            if order_px <= 0:
+                cf.setup_ok = False
+                cf.reasons.append("order_price_missing")
+                continue
+            df, _ = self._fetch_daily(cf.code, count=260)
+            if df.empty:
+                cf.setup_ok = False
+                cf.reasons.append("stop_calc_fail")
+                continue
+            pivot_val = cf.features.get("pivot")
+            tight_low = cf.features.get("tight_low")
+            atr_val = cf.features.get("atr14")
+            stop0 = calc_initial_stop(
+                pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                tight_low=float(tight_low) if tight_low is not None else None,
+                atr=float(atr_val) if atr_val is not None else None,
+                mode=INITIAL_STOP_MODE,
+                entry=order_px,
+                atr_mult=ATR_MULT,
+            )
+            per_share_risk = order_px - stop0
+            if per_share_risk <= 0:
+                cf.setup_ok = False
+                cf.reasons.append("risk_invalid")
+                continue
+            budget_cap = min(per_position_budget, max_pos_krw)
+            qty = calc_position_size(
+                equity=equity_krw,
+                risk_pct=float(RISK_PER_TRADE_PCT),
+                entry=order_px,
+                stop=stop0,
+                risk_mult=risk_mult,
+            )
+            if budget_cap > 0:
+                qty = min(qty, int(budget_cap // order_px))
+            if min_order_krw > 0 and qty * order_px < min_order_krw:
+                qty = 0
+            if qty <= 0:
+                cf.setup_ok = False
+                cf.reasons.append("planned_qty_zero_or_min_order")
+                continue
+            cf.planned_qty = qty
+            cf.planned_value = float(qty * order_px)
+            cf.features["planned_cap"] = float(budget_cap)
+            cf.features["planned_value"] = cf.planned_value
+            cf.features["initial_stop"] = float(stop0)
+            cf.features["stop_price"] = float(stop0)
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
             logger.info(
                 "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f value20=%s tick_budget=%.0f",
@@ -1468,13 +1641,6 @@ class PB1Engine:
                 cf.features.get("value20"),
                 tick_budget,
             )
-
-        for cf in ranked:
-            if cf not in buyables and cf.setup_ok:
-                cf.setup_ok = False
-                if "planned_qty_zero_or_min_order" not in cf.reasons:
-                    cf.reasons.append("planned_qty_zero_or_min_order")
-                    budget_drop_reasons["planned_qty_zero_or_min_order"] += 1
 
         return candidates
 
@@ -1641,7 +1807,22 @@ class PB1Engine:
     def _place_entry(self, cf: CandidateFeature) -> None:
         display_code = self._display_code(cf.code)
         reasons = cf.reasons or []
-        features_snapshot = {k: cf.features.get(k) for k in ["close", "ma20", "ma50", "pullback_pct", "vol_contraction", "volu_contraction", "score"]}
+        features_snapshot = {
+            k: cf.features.get(k)
+            for k in [
+                "close",
+                "ma50",
+                "ma150",
+                "ma200",
+                "ma200_slope",
+                "hi_52w",
+                "lo_52w",
+                "dollar_vol_50",
+                "pivot",
+                "rs_percentile",
+                "score",
+            ]
+        }
         logger.info(
             "[PB1][ENTRY][WHY] code=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
             display_code,
@@ -1650,8 +1831,9 @@ class PB1Engine:
             features_snapshot,
             "PB1-CLOSE",
         )
-        order_type = "MARKET"
-        limit_price = cf.features.get("close")
+        order_type = "LIMIT"
+        entry_price = float(cf.features.get("entry_price") or cf.features.get("close") or 0.0)
+        limit_price = round_to_tick(entry_price * 1.003) if entry_price > 0 else cf.features.get("close")
         if (self.window_label or "").lower() == "preopen" and PB1_PREOPEN_ORDER_TYPE == "LIMIT":
             base_price, _source = self._resolve_price_with_fallback(
                 cf.code,
@@ -1663,6 +1845,7 @@ class PB1Engine:
             buffer_pct = max(float(PB1_PREOPEN_LIMIT_BUFFER_PCT), 0.0)
             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
             order_type = "LIMIT"
+        record_price = float(limit_price or entry_price or 0.0)
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -1695,7 +1878,7 @@ class PB1Engine:
                     mode=cf.mode,
                     side="BUY",
                     qty=cf.planned_qty,
-                    price=float(cf.features.get("close") or 0.0),
+                    price=record_price,
                     client_order_key=cf.client_order_key,
                     ok=False,
                     reasons=["duplicate_order"],
@@ -1712,7 +1895,7 @@ class PB1Engine:
                 mode=cf.mode,
                 side="BUY",
                 qty=cf.planned_qty,
-                price=float(cf.features.get("close") or 0.0),
+                price=record_price,
                 client_order_key=cf.client_order_key,
                 ok=True,
                 reasons=["entry"] + (cf.reasons or []),
@@ -1736,14 +1919,17 @@ class PB1Engine:
             side="BUY",
             code=cf.code,
             qty=cf.planned_qty,
-            price=float(cf.features.get("close") or 0.0),
-            order_type="MARKET",
+            price=float(limit_price or 0.0),
+            order_type=order_type,
             client_order_key=cf.client_order_key,
         )
         resp = None
         kis_odno = None
         try:
-            resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
+            if order_type == "LIMIT":
+                resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, float(limit_price))
+            else:
+                resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
@@ -1786,7 +1972,7 @@ class PB1Engine:
                 market=cf.market,
                 side="BUY",
                 qty=cf.planned_qty,
-                price=cf.features.get("close") or 0.0,
+                price=record_price,
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
@@ -1801,13 +1987,161 @@ class PB1Engine:
                 market=cf.market,
                 side="BUY",
                 qty=cf.planned_qty,
-                price=cf.features.get("close") or 0.0,
+                price=record_price,
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
             )
+            entry_price = float(record_price or 0.0)
+            base_id = f"{cf.code}:{self._today}:{cf.features.get('pivot')}"
+            r_value = entry_price - float(cf.features.get("stop_price") or 0.0)
+            fields = {
+                "entry_ts": filled_at.isoformat(),
+                "initial_stop": cf.features.get("initial_stop"),
+                "stop_price": cf.features.get("stop_price"),
+                "max_price": entry_price if entry_price > 0 else None,
+                "pyramid_level": 0,
+                "pivot": cf.features.get("pivot"),
+                "last_add_price": entry_price if entry_price > 0 else None,
+                "partial_exit_level": 0,
+                "base_id": base_id,
+                "setup_id": base_id,
+                "tight_low": cf.features.get("tight_low"),
+                "base_high": cf.features.get("base_high"),
+                "entry_price": entry_price if entry_price > 0 else None,
+                "r_value": r_value if r_value > 0 else None,
+                "tp1_done": 0,
+                "tp2_done": 0,
+                "trail_mode": TRAIL_MODE,
+                "last_trail_stop": cf.features.get("stop_price"),
+                "regime_at_entry": (self._regime or {}).get("regime"),
+                "risk_mult_at_entry": getattr(self, "_regime_risk_mult", None),
+            }
+            self.positions_repo.update_position_fields(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=cf.mode,
+                code=cf.code,
+                fields=fields,
+            )
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+
+    def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
+        code = pos.get("code")
+        if not code or qty <= 0:
+            return
+        display_code = self._display_code(code)
+        mode = int(pos.get("mode") or 1)
+        pyramid_level = int(pos.get("pyramid_level") or 0)
+        client_key = self._client_order_key(code, mode, "BUY", f"add{pyramid_level + 1}", "PB1")
+        limit_price = round_to_tick(price * 1.003) if price > 0 else price
+        fill_price = float(limit_price or price or 0.0)
+        try:
+            order_id, created = self.orders_repo.create_intent_idempotent(
+                env=self.env,
+                run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=mode,
+                code=code,
+                market=pos.get("market"),
+                side="BUY",
+                ord_type="LIMIT",
+                qty=qty,
+                limit_price=limit_price,
+                stage="PB1-ADD",
+                client_order_key=client_key,
+                request_json={"reasons": ["pyramid_add"], "price": price, "level": pyramid_level + 1},
+                status="CREATED",
+            )
+        except Exception:
+            logger.exception("[PB1][ADD][DB_FAIL] code=%s", display_code)
+            if not self.dry_run:
+                raise
+            return
+        if not created:
+            logger.info("[PB1][ADD][SKIP] code=%s reason=duplicate_order", display_code)
+            return
+        if self.dry_run:
+            logger.info("[PB1][ADD-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+            return
+        if not self.kis:
+            logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
+            return
+        emit_event(
+            as_of=self._today,
+            event="ORDER_SUBMIT",
+            side="BUY",
+            code=code,
+            qty=qty,
+            price=float(limit_price),
+            order_type="LIMIT",
+            client_order_key=client_key,
+        )
+        resp = None
+        kis_odno = None
+        try:
+            resp = self.kis.buy_stock_limit(code, qty, float(limit_price))
+            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+        except Exception:
+            logger.exception("[PB1][ADD][FAIL] code=%s", display_code)
+        self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        if ok:
+            self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            filled_at = now_kst()
+            self.fills_repo.upsert_fill(
+                env=self.env,
+                run_id=self.run_id,
+                order_id=order_id,
+                kis_odno=kis_odno,
+                trade_id=None,
+                code=code,
+                market=pos.get("market"),
+                side="BUY",
+                qty=qty,
+                price=fill_price,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+                raw_json=resp,
+            )
+            self.positions_repo.apply_fill(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=mode,
+                code=code,
+                market=pos.get("market"),
+                side="BUY",
+                qty=qty,
+                price=fill_price,
+                fee=0.0,
+                tax=0.0,
+                filled_at=filled_at,
+            )
+            updated_level = pyramid_level + 1
+            entry_price = float(pos.get("avg_buy_price") or fill_price)
+            stop_price = float(pos.get("stop_price") or pos.get("initial_stop") or 0.0)
+            if entry_price > 0:
+                stop_price = max(stop_price, entry_price * 0.995)
+            self.positions_repo.update_position_fields(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=1,
+                mode=mode,
+                code=code,
+                fields={
+                    "pyramid_level": updated_level,
+                    "last_add_price": fill_price,
+                    "stop_price": stop_price if stop_price > 0 else None,
+                    "last_stop_update_ts": filled_at.isoformat(),
+                },
+            )
+        else:
+            self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
 
     def _append_close_entry_record(self, payload: dict) -> None:
         path = close_entry_orders_path(self._today)
@@ -1959,7 +2293,7 @@ class PB1Engine:
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
 
-    def _plan_exit_event(self, pos: Dict, features: Dict[str, float], window_tag: str) -> None:
+    def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> None:
         avg = pos.get("avg_buy_price")
         if not avg:
             return
@@ -2000,56 +2334,127 @@ class PB1Engine:
             mark = avg
         ret_pct = ((mark - avg) / avg) * 100 if avg else 0.0
         client_key = self._client_order_key(code, mode, "SELL", window_tag, "exit")
+        stop_price = pos.get("stop_price")
+        if stop_price is None:
+            stop_price = pos.get("initial_stop")
+        max_price = pos.get("max_price")
+        new_max = max(float(max_price or 0.0), float(mark or 0.0))
+        fields: dict[str, float | int | str | None] = {"max_price": new_max}
+        if stop_price is not None and pos.get("stop_price") is None:
+            fields["stop_price"] = stop_price
+        if avg:
+            feats_for_trail = {**features, "stop_price": stop_price, "initial_stop": pos.get("initial_stop")}
+            trail_stop, trail_reasons = update_trailing_stop(float(avg), new_max, df, feats_for_trail, self.minervini_config)
+            if trail_stop and trail_stop > float(stop_price or 0.0):
+                fields["stop_price"] = trail_stop
+                fields["last_stop_update_ts"] = now_kst().isoformat()
+                stop_price = trail_stop
+        if fields:
+            self.positions_repo.update_position_fields(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=sid,
+                mode=mode,
+                code=code,
+                fields=fields,
+            )
 
-        holding_days = pos.get("holding_days") or 0
         stage = "EXIT"
         decision_reasons: list[str] = []
         should_sell = False
-        if mode == 1:
-            atr_pct = ((features.get("atr14") or 0.0) / avg) * 100
-            r_pct = max(PB1_R_FLOOR_PCT, atr_pct)
-            take_profit = PB1_DAY_TP_R * r_pct
-            stop_loss = PB1_DAY_SL_R * r_pct
-            if window_tag != "morning":
-                decision_reasons = ["sell_disabled"]
-            else:
-                stage = "DAY-EXIT"
-                if ret_pct >= take_profit:
-                    decision_reasons.append("take_profit_hit")
-                if ret_pct <= -stop_loss:
-                    decision_reasons.append("stop_loss_hit")
-                if decision_reasons:
-                    should_sell = True
-                else:
-                    decision_reasons = ["time_stop"]
-                    should_sell = True
+        last_volume = features.get("last_volume")
+        vol50 = features.get("vol50")
+        heavy_volume = bool(
+            last_volume is not None
+            and vol50 is not None
+            and np.isfinite(last_volume)
+            and np.isfinite(vol50)
+            and vol50 > 0
+            and last_volume >= vol50 * self.minervini_config.heavy_volume_mult
+        )
+        partial_level = int(pos.get("partial_exit_level") or 0)
+        if stop_price is not None and mark <= float(stop_price):
+            decision_reasons = ["STOP_HIT"]
+            should_sell = True
+            stage = "STOP"
+        elif window_tag != "close":
+            decision_reasons = ["sell_disabled"]
         else:
-            hard_stop = KOSDAQ_HARD_STOP_PCT if market == "KOSDAQ" else KOSPI_HARD_STOP_PCT
-            if ret_pct <= -hard_stop:
-                stage = "HARD-STOP"
-                if window_tag not in {"morning", "close"}:
-                    decision_reasons = ["sell_disabled"]
-                else:
-                    decision_reasons = ["stop_loss_hit"]
-                    should_sell = True
+            close_px = features.get("close")
+            ma50 = features.get("ma50")
+            ma20 = features.get("ma20")
+            entry_price = float(pos.get("entry_price") or avg)
+            r_value = float(pos.get("r_value") or (entry_price - float(stop_price or 0.0)))
+            failed_breakout = False
+            pivot = pos.get("pivot")
+            entry_ts = pos.get("entry_ts")
+            if pivot and close_px is not None and entry_ts:
+                try:
+                    entry_date = datetime.fromisoformat(str(entry_ts)).date()
+                    if (self._now_kst.date() - entry_date).days <= FAILED_BREAKOUT_EXIT_DAYS and close_px < float(pivot):
+                        failed_breakout = True
+                except ValueError:
+                    failed_breakout = False
+            state = {
+                "entry_price": entry_price,
+                "stop_price": float(stop_price or 0.0),
+                "r_value": r_value,
+                "qty": qty,
+                "tp1_done": bool(pos.get("tp1_done")),
+                "tp2_done": bool(pos.get("tp2_done")),
+                "last_trail_stop": pos.get("last_trail_stop"),
+            }
+            orders = update_exits(
+                state,
+                last_price=float(mark),
+                ma20=float(ma20) if ma20 is not None else None,
+                atr=float(features.get("atr14") or 0.0),
+                take_profit_r1=TAKE_PROFIT_R1,
+                take_profit_r2=TAKE_PROFIT_R2,
+                tp1_pct=TP1_SELL_PCT,
+                tp2_pct=TP2_SELL_PCT,
+                trail_mode=TRAIL_MODE,
+                trail_step_after_r=TRAIL_STEP_AFTER_R,
+                failed_breakout_days=FAILED_BREAKOUT_EXIT_DAYS,
+                failed_breakout=failed_breakout,
+            )
+            if close_px is not None and ma50 is not None and close_px < ma50 and heavy_volume:
+                decision_reasons = ["ma50_break_heavy_volume"]
+                should_sell = True
+                stage = "MA50_BREAK"
+            elif int(pos.get("holding_days") or 0) >= int(MINERVINI_TIME_STOP_DAYS) and ret_pct < 2.0:
+                decision_reasons = ["time_stop"]
+                should_sell = True
+                stage = "TIME_STOP"
+            elif heavy_volume and ret_pct >= 25.0 and partial_level < 1:
+                decision_reasons = ["climax_partial"]
+                should_sell = True
+                stage = "PARTIAL1"
+            elif orders:
+                order = orders[0]
+                decision_reasons = [order.reason]
+                should_sell = True
+                stage = order.reason
+                qty = min(qty, order.qty)
+                fields = {}
+                if order.reason == "TP1":
+                    fields["tp1_done"] = 1
+                if order.reason == "TP2":
+                    fields["tp2_done"] = 1
+                if state.get("stop_price") and state.get("stop_price") != stop_price:
+                    fields["stop_price"] = state.get("stop_price")
+                    fields["last_trail_stop"] = state.get("last_trail_stop")
+                if fields:
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=sid,
+                        mode=mode,
+                        code=code,
+                        fields=fields,
+                    )
             else:
-                if window_tag != "close":
-                    decision_reasons = ["sell_disabled"]
-                else:
-                    close_px = features.get("close")
-                    ma20 = features.get("ma20")
-                    if holding_days >= PB1_TIME_STOP_DAYS:
-                        stage = "TIME-STOP"
-                        decision_reasons = ["time_stop"]
-                        should_sell = True
-                    elif close_px is not None and ma20 is not None and close_px < ma20:
-                        stage = "MA20-TRAIL"
-                        decision_reasons = ["trailing_stop_hit"]
-                        should_sell = True
-                    else:
-                        decision_reasons = ["ok_hold"]
-        if not decision_reasons:
-            decision_reasons = ["ok_hold"]
+                decision_reasons = ["ok_hold"]
 
         emit_event(
             as_of=self._today,
@@ -2071,6 +2476,30 @@ class PB1Engine:
 
         if not should_sell:
             return
+
+        if stage.startswith("PARTIAL"):
+            sell_qty = max(1, int(qty * 0.5))
+            qty = min(qty, sell_qty)
+            fields = {"partial_exit_level": partial_level + 1}
+            self.positions_repo.update_position_fields(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=sid,
+                mode=mode,
+                code=code,
+                fields=fields,
+            )
+
+        if decision_reasons and decision_reasons[0] in {"STOP_HIT", "FAILED_BREAKOUT"}:
+            cooldown_until = (self._now_kst.date().isoformat() if REENTRY_COOLDOWN_DAYS <= 0 else (self._now_kst.date() + pd.Timedelta(days=REENTRY_COOLDOWN_DAYS)).date().isoformat())
+            self.positions_repo.update_position_fields(
+                env=self.env,
+                strategy=self.STRATEGY_NAME,
+                sid=sid,
+                mode=mode,
+                code=code,
+                fields={"cooldown_until": cooldown_until},
+            )
 
         if self._should_block_order(client_key):
             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
@@ -2164,7 +2593,7 @@ class PB1Engine:
             ret_pct,
             reasons,
             ", ".join(reasons),
-            holding_days,
+            pos.get("holding_days") or 0,
             stage,
         )
         if self.dry_run:
@@ -2271,6 +2700,28 @@ class PB1Engine:
                     "total_cost": state.get("total_cost") or 0.0,
                     "realized_pnl": state.get("realized_pnl") or 0.0,
                     "meta_source": state.get("meta_source"),
+                    "entry_ts": state.get("entry_ts"),
+                    "initial_stop": state.get("initial_stop"),
+                    "stop_price": state.get("stop_price"),
+                    "max_price": state.get("max_price"),
+                    "pyramid_level": state.get("pyramid_level"),
+                    "pivot": state.get("pivot"),
+                    "last_add_price": state.get("last_add_price"),
+                    "last_stop_update_ts": state.get("last_stop_update_ts"),
+                    "partial_exit_level": state.get("partial_exit_level"),
+                    "base_id": state.get("base_id"),
+                    "setup_id": state.get("setup_id"),
+                    "tight_low": state.get("tight_low"),
+                    "base_high": state.get("base_high"),
+                    "entry_price": state.get("entry_price"),
+                    "r_value": state.get("r_value"),
+                    "tp1_done": state.get("tp1_done"),
+                    "tp2_done": state.get("tp2_done"),
+                    "trail_mode": state.get("trail_mode"),
+                    "last_trail_stop": state.get("last_trail_stop"),
+                    "cooldown_until": state.get("cooldown_until"),
+                    "regime_at_entry": state.get("regime_at_entry"),
+                    "risk_mult_at_entry": state.get("risk_mult_at_entry"),
                 }
             )
         return enriched
@@ -2285,16 +2736,17 @@ class PB1Engine:
         holdings = list(holdings_rows or [])
         pos_list = self._positions_with_meta(positions)
         for pos in pos_list:
-            df, _ = self._fetch_daily(pos["code"], count=120)
+            df, _ = self._fetch_daily(pos["code"], count=260)
             if df.empty:
                 continue
             try:
-                features = compute_features(df, min_candles=self.min_candles)
+                features = compute_features(df)
             except ValueError:
                 continue
             features["market"] = pos.get("market") or ""
             marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
-            self._plan_exit_event(pos, features, "morning" if self.window_internal == "morning" else "close")
+            window_tag = "close" if self.window_internal == "close" else "manage"
+            self._plan_exit_event(pos, features, df, window_tag)
         return positions
 
     def _load_close_entry_orders(self) -> list[dict]:
@@ -2488,6 +2940,9 @@ class PB1Engine:
         if self.phase == "verify":
             entry_allowed = False
             entry_reason = "phase_verify"
+        if self.phase in {"manage", "exit", "idle"}:
+            entry_allowed = False
+            entry_reason = f"phase_{self.phase}"
         logger.info(
             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
             self.window_label,
@@ -2496,6 +2951,23 @@ class PB1Engine:
             self.dry_run,
             self.env,
         )
+        regime = {"regime": "UNKNOWN"}
+        risk_mult = float(REGIME_MIN_RISK)
+        regime_df, _ = self._fetch_daily(REGIME_INDEX, count=max(REGIME_MA_SLOW + 5, 260))
+        if not regime_df.empty:
+            regime = get_regime(regime_df["close"], REGIME_MA_FAST, REGIME_MA_SLOW)
+            risk_mult = risk_multiplier(
+                regime,
+                REGIME_MODE,
+                max_risk=REGIME_MAX_RISK,
+                mid_risk=REGIME_MID_RISK,
+                min_risk=REGIME_MIN_RISK,
+            )
+        self._regime = regime
+        self._regime_risk_mult = risk_mult
+        if risk_mult <= 0.0 and REGIME_MODE.upper() == "STRICT":
+            entry_allowed = False
+            entry_reason = "regime_risk_off"
         emit_event(
             as_of=self._today,
             event="PB1_RUN_START",
@@ -2507,7 +2979,7 @@ class PB1Engine:
             entry_block_reason=entry_reason if not entry_allowed else None,
         )
 
-        if self.phase in {"prep", "entry", "trade"} and self._now_kst > entry_cutoff_dt:
+        if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             skip_entry_scan = True
             entry_allowed = False
             entry_reason = "entry_cutoff"
@@ -2639,9 +3111,16 @@ class PB1Engine:
             )
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
             positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-        positions_for_exit = self._build_positions_from_kis(holdings_rows)
+        cooldown_map: dict[str, str] = {
+            str(p.get("code") or "").zfill(6): str(p.get("cooldown_until"))
+            for p in positions
+            if p.get("cooldown_until")
+        }
+        positions_for_exit = self._build_positions_from_kis(holdings_rows, positions)
         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
         existing_positions_count = len(existing_positions)
+        positions_cost = sum(float(p.get("total_cost") or 0.0) for p in positions_for_exit)
+        self._equity_krw = float(available_cash_krw) + positions_cost
         slots_remaining = max(0, max_positions - existing_positions_count)
         target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
         self.target_new_positions = target_new_positions
@@ -2731,7 +3210,7 @@ class PB1Engine:
         after_buyable_check_count = 0
         after_dedup_count = 0
         orderable_candidates: list[CandidateFeature] = []
-        if self.phase in {"prep", "entry", "trade"} and not skip_entry_scan:
+        if self.phase in {"prep", "entry"} and not skip_entry_scan:
             candidates = self._compute_candidates(members)
             (
                 candidates,
@@ -2873,6 +3352,18 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
+                cooldown_until = cooldown_map.get(cf.code)
+                if cooldown_until and str(cooldown_until) >= self._today:
+                    self._record_drop(drop_reason_counter, drop_examples, "cooldown_active", cf.code)
+                    self._log_order_skip(cf, ["cooldown_active"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["cooldown_active"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
                     self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
@@ -2884,6 +3375,88 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
+                if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
+                    self._record_drop(drop_reason_counter, drop_examples, "entry_mode_close_only", cf.code)
+                    self._log_order_skip(cf, ["entry_mode_close_only"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["entry_mode_close_only"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
+                    self._record_drop(drop_reason_counter, drop_examples, "entry_mode_intraday_only", cf.code)
+                    self._log_order_skip(cf, ["entry_mode_intraday_only"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["entry_mode_intraday_only"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
+                last_volume = float(cf.features.get("last_volume") or 0.0)
+                trigger_ok, trigger_info = entry_trigger(
+                    cf.features,
+                    last_price=last_price,
+                    last_volume=last_volume,
+                    cfg=self.minervini_config,
+                )
+                if not trigger_ok:
+                    cf.features["entry_trigger"] = trigger_info
+                    self._record_drop(drop_reason_counter, drop_examples, "pivot_breakout_fail", cf.code)
+                    self._log_order_skip(cf, ["pivot_breakout_fail"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["pivot_breakout_fail"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                df, _ = self._fetch_daily(cf.code, count=260)
+                if df.empty:
+                    self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
+                    self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["stop_calc_fail"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                entry_price = last_price
+                pivot_val = cf.features.get("pivot")
+                tight_low = cf.features.get("tight_low")
+                atr_val = cf.features.get("atr14")
+                stop0 = calc_initial_stop(
+                    pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                    tight_low=float(tight_low) if tight_low is not None else None,
+                    atr=float(atr_val) if atr_val is not None else None,
+                    mode=INITIAL_STOP_MODE,
+                    entry=entry_price,
+                    atr_mult=ATR_MULT,
+                )
+                if stop0 >= entry_price:
+                    self._record_drop(drop_reason_counter, drop_examples, "stop_above_entry", cf.code)
+                    self._log_order_skip(cf, ["stop_above_entry"], "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=["stop_above_entry"],
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    continue
+                cf.features["entry_price"] = float(entry_price)
+                cf.features["initial_stop"] = float(stop0)
+                cf.features["stop_price"] = float(stop0)
+                if isinstance(trigger_info, dict) and trigger_info.get("pivot") is not None:
+                    cf.features["pivot_triggered"] = float(trigger_info.get("pivot"))
                 reasons: list[str] = []
                 if new_position_limit <= 0:
                     reasons.append("max_positions")
@@ -2982,7 +3555,7 @@ class PB1Engine:
                         balance_cache_hits=self.balance_cache_hits,
                         balance_tick_cache_hits=self.balance_tick_cache_hits,
                     )
-            if self.phase in {"entry", "trade"}:
+            if self.phase in {"entry"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
                 orderable_candidates = orderable_candidates if entry_allowed else []
@@ -3055,6 +3628,65 @@ class PB1Engine:
                         self._place_entry_close(cf)
                     else:
                         self._place_entry(cf)
+                if entry_allowed and self.phase == "entry" and allow_add_to_existing:
+                    remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
+                    for pos in existing_positions:
+                        code = pos.get("code")
+                        if not code or remaining_budget <= 0:
+                            continue
+                        if code in open_buy_codes or code in today_buy_codes:
+                            continue
+                        pyramid_level = int(pos.get("pyramid_level") or 0)
+                        if pyramid_level >= int(self.minervini_config.max_pyramid_levels):
+                            continue
+                        entry_price = float(pos.get("avg_buy_price") or 0.0)
+                        initial_stop = pos.get("initial_stop")
+                        if not entry_price or initial_stop is None:
+                            continue
+                        initial_stop = float(initial_stop)
+                        r_value = entry_price - initial_stop
+                        if r_value <= 0:
+                            continue
+                        mark, _source = self._resolve_price_with_fallback(code)
+                        if mark is None:
+                            continue
+                        last_add_price = float(pos.get("last_add_price") or entry_price)
+                        if mark < entry_price + float(self.minervini_config.add_on_R) * r_value:
+                            continue
+                        if mark > last_add_price * (1.0 + float(self.minervini_config.add_on_max_extension)):
+                            continue
+                        df, _ = self._fetch_daily(code, count=260)
+                        if df.empty:
+                            continue
+                        feats = compute_features(df)
+                        vol20 = feats.get("vol20")
+                        last_volume = feats.get("last_volume")
+                        if vol20 is None or last_volume is None or not np.isfinite(vol20) or not np.isfinite(last_volume):
+                            continue
+                        if last_volume < vol20 * self.minervini_config.breakout_vol_mult_20:
+                            continue
+                        stop_price = float(pos.get("stop_price") or initial_stop)
+                        risk_krw = float(self._equity_krw or 0.0) * float(self.minervini_config.risk_pct_of_equity) * float(
+                            self.minervini_config.add_on_size_frac
+                        )
+                        max_cap = min(remaining_budget, float(PB1_MAX_POS_PCT) * float(tick_budget_krw))
+                        qty_risk = risk_position_size(
+                            entry_price=float(mark),
+                            stop_price=stop_price,
+                            risk_krw=risk_krw,
+                            max_capital_krw=max_cap,
+                            min_order_krw=min_order_krw,
+                        )
+                        qty_base = int(float(pos.get("qty") or 0) * float(self.minervini_config.add_on_size_frac))
+                        qty_add = max(1, min(qty_risk, qty_base))
+                        order_value = qty_add * float(mark)
+                        if qty_add <= 0 or (min_order_krw > 0 and order_value < min_order_krw):
+                            continue
+                        if order_value > available_cash_krw:
+                            continue
+                        self._place_add_on(pos, qty=qty_add, price=float(mark))
+                        planned_spent += order_value
+                        remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
         if not entry_decision_emitted:
             ok_count = len(setup_ok_codes)

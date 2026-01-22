@@ -197,6 +197,56 @@ CONFIG = {
     "PB1_VOLU_MAX": "0.98",
     "PB1_VOLU_MAX_INTRADAY": "1.05",
     "PB1_REQUIRE_BOTH": "1",
+    # Minervini v2 tuning
+    "MINERVINI_RS_MIN": "0.80",
+    "MINERVINI_MAX_PYRAMID": "3",
+    "MINERVINI_ADD_ON_R": "1.5",
+    "MINERVINI_BREAKOUT_VOL_MULT": "1.5",
+    "MINERVINI_MAX_EXTENSION_PIVOT": "0.05",
+    "MINERVINI_INITIAL_STOP_PCT": "0.075",
+    "MINERVINI_TIME_STOP_DAYS": "20",
+    "MINERVINI_HEAVY_VOL_MULT": "1.5",
+    # Minervini Pro universe/RS
+    "UNIVERSE_POOL_SIZE": "200",
+    "RS_BENCHMARK": "229200",
+    "RS_LOOKBACK_DAYS": "63",
+    "RS_LOOKBACK2_DAYS": "126",
+    "RS_MIN_PCTILE": "80",
+    "RS_COMPOSITE_W1": "0.6",
+    "RS_COMPOSITE_W2": "0.4",
+    # Market regime
+    "REGIME_INDEX": "229200",
+    "REGIME_MODE": "STRICT",
+    "REGIME_MA_FAST": "50",
+    "REGIME_MA_SLOW": "200",
+    "REGIME_BREADTH_WINDOW": "20",
+    "REGIME_MAX_RISK": "1.0",
+    "REGIME_MID_RISK": "0.6",
+    "REGIME_MIN_RISK": "0.0",
+    # VCP/trigger
+    "VCP_LOOKBACK": "120",
+    "VCP_MIN_SCORE": "70",
+    "PIVOT_BUFFER_PCT": "0.15",
+    "BREAKOUT_VOL_MULT": "1.5",
+    "ENTRY_MODE": "BOTH",
+    # Liquidity/gap/slippage
+    "MIN_AVG_VALUE_KRW": "300000000",
+    "MAX_INTRADAY_RANGE_PCT": "12",
+    "MAX_GAP_UP_PCT": "6",
+    "MAX_SPREAD_PROXY_BPS": "80",
+    # Risk/exit/step-up stop
+    "RISK_PER_TRADE_PCT": "0.5",
+    "INITIAL_STOP_MODE": "TIGHTLOW",
+    "ATR_WINDOW": "14",
+    "ATR_MULT": "2.5",
+    "TAKE_PROFIT_R1": "2.0",
+    "TP1_SELL_PCT": "0.33",
+    "TAKE_PROFIT_R2": "3.0",
+    "TP2_SELL_PCT": "0.33",
+    "TRAIL_MODE": "MA20",
+    "TRAIL_STEP_AFTER_R": "1.5",
+    "FAILED_BREAKOUT_EXIT_DAYS": "2",
+    "REENTRY_COOLDOWN_DAYS": "10",
 }
 
 
@@ -594,6 +644,59 @@ KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
 PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
 PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
 PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
+MINERVINI_RS_MIN = float(_cfg("MINERVINI_RS_MIN") or "0.80")
+MINERVINI_MAX_PYRAMID = int(_cfg("MINERVINI_MAX_PYRAMID") or "3")
+MINERVINI_ADD_ON_R = float(_cfg("MINERVINI_ADD_ON_R") or "1.5")
+MINERVINI_BREAKOUT_VOL_MULT = float(_cfg("MINERVINI_BREAKOUT_VOL_MULT") or "1.5")
+MINERVINI_MAX_EXTENSION_PIVOT = float(_cfg("MINERVINI_MAX_EXTENSION_PIVOT") or "0.05")
+MINERVINI_INITIAL_STOP_PCT = float(_cfg("MINERVINI_INITIAL_STOP_PCT") or "0.075")
+MINERVINI_TIME_STOP_DAYS = int(_cfg("MINERVINI_TIME_STOP_DAYS") or "20")
+MINERVINI_HEAVY_VOL_MULT = float(_cfg("MINERVINI_HEAVY_VOL_MULT") or "1.5")
+UNIVERSE_POOL_SIZE = int(_cfg("UNIVERSE_POOL_SIZE") or "200")
+
+
+def _normalize_index_code(raw: str | None, fallback: str) -> str:
+    value = (raw or "").strip()
+    if value.isdigit() and len(value) == 6:
+        return value
+    return fallback
+
+
+RS_BENCHMARK = _normalize_index_code(_cfg("RS_BENCHMARK"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
+RS_LOOKBACK_DAYS = int(_cfg("RS_LOOKBACK_DAYS") or "63")
+RS_LOOKBACK2_DAYS = int(_cfg("RS_LOOKBACK2_DAYS") or "126")
+RS_MIN_PCTILE = float(_cfg("RS_MIN_PCTILE") or "80")
+RS_COMPOSITE_W1 = float(_cfg("RS_COMPOSITE_W1") or "0.6")
+RS_COMPOSITE_W2 = float(_cfg("RS_COMPOSITE_W2") or "0.4")
+REGIME_INDEX = _normalize_index_code(_cfg("REGIME_INDEX"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
+REGIME_MODE = _cfg("REGIME_MODE") or "STRICT"
+REGIME_MA_FAST = int(_cfg("REGIME_MA_FAST") or "50")
+REGIME_MA_SLOW = int(_cfg("REGIME_MA_SLOW") or "200")
+REGIME_BREADTH_WINDOW = int(_cfg("REGIME_BREADTH_WINDOW") or "20")
+REGIME_MAX_RISK = float(_cfg("REGIME_MAX_RISK") or "1.0")
+REGIME_MID_RISK = float(_cfg("REGIME_MID_RISK") or "0.6")
+REGIME_MIN_RISK = float(_cfg("REGIME_MIN_RISK") or "0.0")
+VCP_LOOKBACK = int(_cfg("VCP_LOOKBACK") or "120")
+VCP_MIN_SCORE = int(_cfg("VCP_MIN_SCORE") or "70")
+PIVOT_BUFFER_PCT = float(_cfg("PIVOT_BUFFER_PCT") or "0.15")
+BREAKOUT_VOL_MULT = float(_cfg("BREAKOUT_VOL_MULT") or "1.5")
+ENTRY_MODE = (_cfg("ENTRY_MODE") or "BOTH").strip().upper()
+MIN_AVG_VALUE_KRW = float(_cfg("MIN_AVG_VALUE_KRW") or "300000000")
+MAX_INTRADAY_RANGE_PCT = float(_cfg("MAX_INTRADAY_RANGE_PCT") or "12")
+MAX_GAP_UP_PCT = float(_cfg("MAX_GAP_UP_PCT") or "6")
+MAX_SPREAD_PROXY_BPS = float(_cfg("MAX_SPREAD_PROXY_BPS") or "80")
+RISK_PER_TRADE_PCT = float(_cfg_with_alias("RISK_PER_TRADE_PCT", "MINERVINI_RISK_PCT") or "0.5")
+INITIAL_STOP_MODE = (_cfg("INITIAL_STOP_MODE") or "TIGHTLOW").strip().upper()
+ATR_WINDOW = int(_cfg("ATR_WINDOW") or "14")
+ATR_MULT = float(_cfg("ATR_MULT") or "2.5")
+TAKE_PROFIT_R1 = float(_cfg("TAKE_PROFIT_R1") or "2.0")
+TP1_SELL_PCT = float(_cfg("TP1_SELL_PCT") or "0.33")
+TAKE_PROFIT_R2 = float(_cfg("TAKE_PROFIT_R2") or "3.0")
+TP2_SELL_PCT = float(_cfg("TP2_SELL_PCT") or "0.33")
+TRAIL_MODE = (_cfg("TRAIL_MODE") or "MA20").strip().upper()
+TRAIL_STEP_AFTER_R = float(_cfg("TRAIL_STEP_AFTER_R") or "1.5")
+FAILED_BREAKOUT_EXIT_DAYS = int(_cfg("FAILED_BREAKOUT_EXIT_DAYS") or "2")
+REENTRY_COOLDOWN_DAYS = int(_cfg("REENTRY_COOLDOWN_DAYS") or "10")
 
 
 PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
@@ -621,6 +724,20 @@ logger.info(
     PB1_MIN_SCORE_BASE,
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,
+)
+logger.info(
+    "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
+    UNIVERSE_POOL_SIZE,
+    RS_BENCHMARK,
+    RS_LOOKBACK_DAYS,
+    RS_LOOKBACK2_DAYS,
+    RS_MIN_PCTILE,
+    REGIME_INDEX,
+    REGIME_MODE,
+    VCP_LOOKBACK,
+    VCP_MIN_SCORE,
+    ENTRY_MODE,
+    RISK_PER_TRADE_PCT,
 )
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"

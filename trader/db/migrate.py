@@ -1,5 +1,6 @@
 import glob
 import hashlib
+import re
 import logging
 import os
 import sqlite3
@@ -172,6 +173,25 @@ def _list_applied_versions(conn: sa.Connection) -> set[str]:
     return {row[0] for row in result}
 
 
+def _sqlite_column_names(conn: sa.Connection, table: str) -> set[str]:
+    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    return {row[1] for row in rows if len(row) > 1}
+
+
+def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
+    cleaned = statement.strip()
+    if not cleaned:
+        return
+    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", cleaned, re.IGNORECASE)
+    if match:
+        table, column = match.group(1), match.group(2)
+        existing = _sqlite_column_names(conn, table)
+        if column in existing:
+            logger.info("[DB][MIGRATE][SQLITE] skip existing column table=%s column=%s", table, column)
+            return
+    conn.execute(text(cleaned))
+
+
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     url = str(engine.url)
     db_path = None
@@ -202,7 +222,33 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
         url = str(engine.url)
         if config.is_sqlite_url(url):
             logger.info("[DB][MIGRATE] sqlite url=%s", url)
-            schema_for_engine(engine).metadata.create_all(engine)
+            _ensure_schema_migrations_table(conn)
+            applied = _list_applied_versions(conn)
+            migration_files = sorted(
+                [
+                    Path(path)
+                    for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+                    if Path(path).is_file()
+                ]
+            )
+            for path in migration_files:
+                version = path.name
+                if version in applied:
+                    continue
+                sql = path.read_text()
+                logger.info("[DB][MIGRATE] applying %s", version)
+                try:
+                    statements = [stmt for stmt in sql.split(";") if stmt.strip()]
+                    for statement in statements:
+                        _apply_sqlite_statement(conn, statement)
+                    conn.execute(
+                        text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                        {"version": version},
+                    )
+                except Exception as exc:
+                    snippet = " ".join(sql.split())[:2000]
+                    logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
+                    raise
             _write_schema_stamp(migrations_dir)
             if db_path:
                 logger.info(
