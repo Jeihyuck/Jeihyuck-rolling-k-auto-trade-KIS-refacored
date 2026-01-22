@@ -187,6 +187,18 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
         return
+    head = cleaned.lstrip().upper()
+    if head.startswith("DO $$") or head.startswith("DO\n$$") or head.startswith("DO\t$$"):
+        exec_sqls = re.findall(r"(?is)\bEXECUTE\s+'([^']+)'\s*;?", cleaned)
+        for sql in exec_sqls:
+            sql = sql.strip().rstrip(";")
+            if not sql:
+                continue
+            try:
+                conn.exec_driver_sql(sql)
+            except Exception:
+                pass
+        return
     probe = cleaned
     probe = re.sub(r"(?ms)^\s*(--[^\n]*\n\s*)+", "", probe)
     probe = re.sub(r"(?s)^\s*/\*.*?\*/\s*", "", probe)
