@@ -187,8 +187,18 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
         return
-    if re.match(r"(?is)^\s*CREATE\s+EXTENSION\b", cleaned):
+    probe = cleaned
+    probe = re.sub(r"(?ms)^\s*(--[^\n]*\n\s*)+", "", probe)
+    probe = re.sub(r"(?s)^\s*/\*.*?\*/\s*", "", probe)
+    if re.match(r"(?is)^\s*CREATE\s+EXTENSION\b", probe):
         return
+    if re.search(r"(?im)^\s*CREATE\s+EXTENSION\b.*?$", cleaned):
+        cleaned2 = re.sub(r"(?im)^\s*CREATE\s+EXTENSION\b.*?;\s*", "", cleaned)
+        cleaned2 = re.sub(r"(?im)^\s*CREATE\s+EXTENSION\b.*?$", "", cleaned2).strip()
+        if not cleaned2:
+            return
+        cleaned = cleaned2
+        probe = cleaned
     repl = cleaned
     repl = re.sub(r"(?i)\btimestamptz\b", "TEXT", repl)
     repl = re.sub(r"(?i)\bdouble\s+precision\b", "REAL", repl)
