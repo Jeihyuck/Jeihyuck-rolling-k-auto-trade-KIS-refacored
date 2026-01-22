@@ -166,8 +166,8 @@ def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
     else:
         ddl = """
         CREATE TABLE IF NOT EXISTS schema_migrations (
-            version text primary key,
-            applied_at timestamptz default now()
+            version TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
         """
     conn.exec_driver_sql(ddl)
@@ -235,7 +235,48 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
         if column in existing:
             logger.info("[DB][MIGRATE][SQLITE] skip existing column table=%s column=%s", table, column)
             return
-    conn.exec_driver_sql(repl)
+    try:
+        conn.exec_driver_sql(repl)
+    except Exception as exc:
+        if _should_ignore_sqlite_error(exc):
+            logger.info("[DB][MIGRATE][SQLITE] ignore error=%s statement=%s", exc, repl)
+            return
+        raise
+
+
+def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
+    cleaned = statement.strip()
+    if not cleaned:
+        return
+    try:
+        conn.exec_driver_sql(cleaned)
+    except Exception as exc:
+        if _should_ignore_pg_error(exc):
+            logger.info("[DB][MIGRATE][PG] ignore error=%s statement=%s", exc, cleaned)
+            return
+        raise
+
+
+def _should_ignore_sqlite_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "duplicate column name" in message:
+        return True
+    if "no such column" in message:
+        return True
+    if "already exists" in message and ("table" in message or "index" in message):
+        return True
+    return False
+
+
+def _should_ignore_pg_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "column" in message and ("already exists" in message or "does not exist" in message):
+        return True
+    if "relation" in message and "already exists" in message:
+        return True
+    if "duplicate_table" in message or "duplicate_column" in message:
+        return True
+    return False
 
 
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
@@ -305,8 +346,6 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
                 )
             return
         logger.info("[DB][MIGRATE] external url=%s", url)
-        # Ensure pgcrypto exists before any migration that uses gen_random_uuid().
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
         _ensure_schema_migrations_table(conn)
         applied = _list_applied_versions(conn)
 
@@ -324,7 +363,9 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             sql = path.read_text()
             logger.info("[DB][MIGRATE] applying %s", version)
             try:
-                conn.execute(text(sql))
+                statements = [stmt for stmt in sql.split(";") if stmt.strip()]
+                for statement in statements:
+                    _apply_pg_statement(conn, statement)
                 conn.execute(
                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
                     {"version": version},
