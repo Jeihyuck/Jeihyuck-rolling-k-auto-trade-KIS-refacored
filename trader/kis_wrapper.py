@@ -420,7 +420,7 @@ class KisAPI:
         except Exception as e:
             logger.warning("[NET] session reset failed: %s", e)
 
-    def _safe_request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
@@ -474,15 +474,18 @@ class KisAPI:
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                self._reset_session()
+                if reset_on_error:
+                    self._reset_session()
             except requests.exceptions.RequestException as e:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                self._reset_session()
+                if reset_on_error:
+                    self._reset_session()
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
-                self._reset_session()
+                if reset_on_error:
+                    self._reset_session()
             except KisAuthError:
                 raise
             except KisPermanentError:
@@ -1915,6 +1918,9 @@ class KisAPI:
 
     def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
         """당일 주문/체결 조회."""
+        def _empty_daily_ccld(reason: str) -> dict:
+            return {"rt_cd": "-1", "msg": reason, "output1": [], "output2": []}
+
         tr_ids = _pick_tr(self.env, "DAILY_CCLD")
         if not tr_ids:
             raise ValueError("KIS daily reconcile TR_ID not configured")
@@ -1933,16 +1939,69 @@ class KisAPI:
             "INQR_DVSN": "00",
             "SORT_SQN": "00",
         }
+        retryable_statuses = {500, 502, 503, 504}
+        backoff_seq = [0.5, 1.0, 2.0]
         last_err: Exception | None = None
-        for tr_id in tr_ids:
-            try:
-                headers = self._headers(tr_id)
-                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
-                return resp.json()
-            except Exception as exc:
-                last_err = exc
-                logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
-        raise Exception(f"reconcile_daily_failed: {last_err}")
+        for attempt in range(1, len(backoff_seq) + 1):
+            for tr_id in tr_ids:
+                try:
+                    headers = self._headers(tr_id)
+                    resp = self.session.request(
+                        "GET",
+                        url,
+                        headers=headers,
+                        params=params,
+                        timeout=(3.0, 7.0),
+                    )
+                    status = resp.status_code
+                    if status in (401, 403):
+                        logger.warning("[RECONCILE][AUTH] status=%s tr_id=%s -> refresh token", status, tr_id)
+                        self.refresh_token()
+                        raise KisTemporaryError(f"AUTH_REFRESH {status}")
+                    if status in retryable_statuses:
+                        raise KisTemporaryError(f"HTTP {status}")
+                    if 400 <= status < 500:
+                        raise KisPermanentError(f"HTTP {status} for {url}")
+                    return resp.json()
+                except requests.exceptions.Timeout as exc:
+                    last_err = exc
+                    logger.warning(
+                        "[RECONCILE][TEMP] attempt=%s tr_id=%s err=timeout",
+                        attempt,
+                        tr_id,
+                    )
+                except KisTemporaryError as exc:
+                    last_err = exc
+                    retryable = any(token in str(exc) for token in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "timeout"))
+                    logger.warning(
+                        "[RECONCILE][TEMP] attempt=%s tr_id=%s err=%s retryable=%s",
+                        attempt,
+                        tr_id,
+                        exc,
+                        int(retryable),
+                    )
+                    if not retryable:
+                        return _empty_daily_ccld("TEMP_FAIL")
+                except KisPermanentError as exc:
+                    last_err = exc
+                    logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
+                    return _empty_daily_ccld("PERM_FAIL")
+                except requests.exceptions.RequestException as exc:
+                    last_err = exc
+                    logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
+                    return _empty_daily_ccld("REQ_FAIL")
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
+                    return _empty_daily_ccld("TEMP_FAIL")
+            if attempt < len(backoff_seq):
+                backoff = backoff_seq[attempt - 1]
+                jitter = random.uniform(0.0, min(0.2, backoff * 0.2))
+                time.sleep(backoff + jitter)
+        if last_err:
+            logger.warning("[RECONCILE][DEGRADED] daily_ccld_failed err=%s", last_err)
+        self._reset_session()
+        return _empty_daily_ccld("TEMP_FAIL")
 
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도

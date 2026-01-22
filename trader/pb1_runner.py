@@ -463,7 +463,7 @@ def _handle_missing_positions_reset(
             engine=engine,
             env=env,
             strategy=strategy,
-            reason="stale_db_holdings_empty",
+            reason="STALE_DB_BUT_KIS_EMPTY",
             ts=now_kst(),
         )
         for code in missing_codes:
@@ -489,12 +489,13 @@ def _handle_missing_positions_reset(
             event_type="STALE_DB_SOFT_RESET",
             ts=now_kst(),
             ok=True,
-            reasons=["holdings_empty", "soft_close"],
+            reasons=["holdings_empty", "soft_close", "orphan_marked"],
             payload_json={
                 "closed_positions": closed_count,
                 "missing_codes": missing_codes,
                 "orders": orders_count,
                 "fills": fills_count,
+                "reason": "STALE_DB_BUT_KIS_EMPTY",
             },
         )
         emit_event(
@@ -512,10 +513,11 @@ def _handle_missing_positions_reset(
             reason="AUTO_CLOSED_STALE_KIS_EMPTY",
         )
         logger.warning(
-            "[PB1][RESET][STALE_DB] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s",
+            "[PB1][RESET][STALE_DB] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s reason=%s",
             env,
             missing_codes,
             closed_count,
+            "STALE_DB_BUT_KIS_EMPTY",
         )
         if kis is not None:
             try:

@@ -25,6 +25,11 @@ from trader.config import (
     PB1_MIN_SCORE_STEP,
     PB1_MAX_ATR_PCT,
     PB1_MIN_VALUE20,
+    PB1_FAILMODE_SOFT,
+    PB1_MIN_CANDIDATES,
+    PB1_RELAX_MAX_PASSES,
+    PB1_SPREAD_HARD_MAX_PCT,
+    PB1_GAP_HARD_MAX_PCT,
     PB1_CAPITAL_MODE,
     PB1_ENTRY_CAPITAL_KRW,
     PB1_CASH_RESERVE_PCT,
@@ -1216,6 +1221,43 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     continue
+                close_val = features.get("close")
+                ma200_val = features.get("ma200")
+                scale_ratio = None
+                if close_val and ma200_val and np.isfinite(close_val) and np.isfinite(ma200_val) and ma200_val != 0:
+                    scale_ratio = float(close_val) / float(ma200_val)
+                if scale_ratio is not None and (scale_ratio > 3.5 or scale_ratio < 0.3):
+                    reasons = ["price_scale_outlier"]
+                    cf = CandidateFeature(
+                        code=code,
+                        market=market,
+                        features={
+                            "reasons": reasons,
+                            "data_ok": False,
+                            "scale_ratio": scale_ratio,
+                            "close": close_val,
+                            "ma200": ma200_val,
+                        },
+                        setup_ok=False,
+                        reasons=reasons,
+                        mode=1,
+                        mode_reasons=["default_day_mode"],
+                    )
+                    candidates.append(cf)
+                    continue
+                gap_pct = None
+                if len(df) >= 2:
+                    prev_close = float(df["close"].iloc[-2])
+                    open_price = float(df["open"].iloc[-1])
+                    if prev_close > 0:
+                        gap_pct = (open_price - prev_close) / prev_close * 100.0
+                spread_pct = None
+                range_pct = None
+                if len(df) >= 1:
+                    spread_proxy = (df["high"] - df["low"]) / df["close"].replace(0, np.nan) * 100.0
+                    spread_pct = float(spread_proxy.tail(20).mean()) if len(spread_proxy) else None
+                    range_proxy = (df["high"] - df["low"]) / df["close"] * 100.0
+                    range_pct = float(range_proxy.tail(20).mean()) if len(range_proxy) else None
                 vcp_score = score_vcp(
                     df,
                     VCP_LOOKBACK,
@@ -1238,6 +1280,9 @@ class PB1Engine:
                 features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
                 features["tight_low"] = pivot_info.get("tight_low")
                 features["base_high"] = pivot_info.get("base_high")
+                features["gap_pct"] = gap_pct
+                features["spread_pct"] = spread_pct
+                features["range_pct"] = range_pct
                 features["liq_ok"] = liquidity_filter(df, MIN_AVG_VALUE_KRW)
                 features["gap_ok"] = gap_filter(df, MAX_GAP_UP_PCT)
                 features["spread_ok"] = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
@@ -1302,7 +1347,11 @@ class PB1Engine:
         candidates: List[CandidateFeature],
         thresholds: FilterThresholds,
         *,
+        min_score: float,
         log_results: bool,
+        soft_mode: bool,
+        spread_hard_max_pct: float,
+        gap_hard_max_pct: float,
     ) -> List[CandidateFeature]:
         evaluated: List[CandidateFeature] = []
         cfg = self.minervini_config
@@ -1315,6 +1364,7 @@ class PB1Engine:
                 evaluated.append(clone)
                 continue
             ok, reasons = evaluate_filters(clone.features, cfg)
+            hard_reasons: list[str] = []
             if not clone.features.get("liq_ok", True):
                 reasons.append("liquidity_fail")
             if not clone.features.get("spread_ok", True):
@@ -1323,12 +1373,52 @@ class PB1Engine:
                 reasons.append("range_fail")
             if not clone.features.get("gap_ok", True):
                 reasons.append("gap_fail")
-            if ok:
-                reasons = []
-            elif not reasons:
-                reasons = ["unspecified_fail"]
-            clone.setup_ok = ok
-            clone.reasons = reasons
+
+            hard_reason_set = {"missing_ma", "illiquid", "liquidity_fail", "price_scale_outlier"}
+            for reason in reasons:
+                if reason in hard_reason_set:
+                    hard_reasons.append(reason)
+
+            spread_pct = self._to_float(clone.features.get("spread_pct"))
+            gap_pct = self._to_float(clone.features.get("gap_pct"))
+            if spread_hard_max_pct and spread_pct is not None and spread_pct > spread_hard_max_pct:
+                hard_reasons.append("spread_fail")
+            if gap_hard_max_pct and gap_pct is not None and gap_pct > gap_hard_max_pct:
+                hard_reasons.append("gap_fail")
+
+            soft_reasons = [r for r in reasons if r not in hard_reason_set]
+
+            base_score = 0.0
+            try:
+                rs_p = float(clone.features.get("rs_percentile") or 0.0)
+                vcp_info = {
+                    "score": clone.features.get("vcp_score"),
+                    "vcp_ok": clone.features.get("vcp_ok"),
+                    "contractions": clone.features.get("vcp_contractions"),
+                }
+                base_score = float(score_setup(clone.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=cfg))
+            except Exception:
+                base_score = 0.0
+            normalized_score = self._normalize_setup_score(base_score)
+            adjusted_score = self._apply_soft_penalties(normalized_score, soft_reasons)
+            clone.features["score_raw"] = normalized_score
+            clone.features["score"] = adjusted_score
+            clone.score = adjusted_score
+
+            score_ok = adjusted_score >= float(min_score)
+            if not score_ok:
+                soft_reasons.append("score_below_min")
+
+            must_fail = bool(hard_reasons) or not score_ok or (not soft_mode and not ok)
+            if must_fail:
+                clone.setup_ok = False
+                clone.reasons = hard_reasons + soft_reasons if soft_reasons or hard_reasons else ["unspecified_fail"]
+            else:
+                clone.setup_ok = True
+                clone.reasons = []
+                if soft_reasons:
+                    clone.features["soft_flags"] = soft_reasons
+
             if log_results:
                 self._log_setup(clone)
             evaluated.append(clone)
@@ -1345,10 +1435,53 @@ class PB1Engine:
                 counts[reason] += 1
         return counts
 
+    @staticmethod
+    def _normalize_setup_score(raw_score: float) -> float:
+        try:
+            return float(min(100.0, max(0.0, raw_score)))
+        except Exception:
+            return 0.0
+
+    def _apply_soft_penalties(self, base_score: float, reasons: Iterable[str]) -> float:
+        penalties = {
+            "trend_template_fail": 12.0,
+            "ma200_not_rising": 8.0,
+            "rs_below_min": 15.0,
+            "vcp_fail": 8.0,
+            "spread_fail": 10.0,
+            "gap_fail": 6.0,
+            "range_fail": 6.0,
+        }
+        penalty = 0.0
+        for reason in reasons or []:
+            penalty += penalties.get(reason, 0.0)
+        return max(0.0, base_score - penalty)
+
+    def _log_fail_reason_breakdown(self, candidates: Iterable[CandidateFeature], note: str | None = None) -> None:
+        counts: Counter[str] = Counter()
+        combos: Counter[str] = Counter()
+        for cf in candidates:
+            if cf.setup_ok:
+                continue
+            reasons = cf.reasons or ["unspecified_fail"]
+            for reason in reasons:
+                counts[reason] += 1
+            combo = "+".join(sorted(set(reasons)))
+            if combo:
+                combos[combo] += 1
+        if not counts:
+            return
+        logger.info(
+            "[PB1][FAIL_REASONS] counts=%s top_combos=%s%s",
+            counts.most_common(10),
+            combos.most_common(5),
+            f" note={note}" if note else "",
+        )
+
     def _select_candidates_with_fallback(
         self,
         candidates: List[CandidateFeature],
-    ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str]]:
+    ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str], int, float, bool]:
         strict_thresholds = self._resolve_strict_thresholds()
         medium_thresholds = self.filter_thresholds.with_overrides(
             vol_contraction_max=1.00,
@@ -1374,36 +1507,96 @@ class PB1Engine:
         selected_thresholds = tiers[-1][1]
         tiers_tried: list[str] = []
         all_reason_counts: Counter[str] = Counter()
+        relax_passes_used = 0
+        applied_min_score = float(PB1_MIN_SCORE_BASE)
+        applied_require_both = bool(PB1_REQUIRE_BOTH)
 
-        for tier_name, thresholds in tiers:
-            tiers_tried.append(tier_name)
-            evaluated = self._apply_thresholds(candidates, thresholds, log_results=False)
-            ok_count = len([c for c in evaluated if c.setup_ok])
-            reason_counts = self._collect_reason_counts(evaluated)
-            all_reason_counts.update(reason_counts)
-            logger.info(
-                "[PB1][CANDIDATES] tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
-                tier_name,
-                ok_count,
-                len(evaluated),
-                thresholds.vol_contraction_max,
-                thresholds.volu_contraction_max,
-                thresholds.pullback_min,
-                thresholds.pullback_max,
-                thresholds.require_both_contractions,
-            )
-            if ok_count > 0:
-                selected_candidates = self._apply_thresholds(candidates, thresholds, log_results=True)
+        min_score_values: list[float] = []
+        current = float(PB1_MIN_SCORE_BASE)
+        floor = float(PB1_MIN_SCORE_FLOOR)
+        step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+        max_passes = max(1, int(PB1_RELAX_MAX_PASSES))
+        while current >= floor and len(min_score_values) < max_passes:
+            min_score_values.append(current)
+            current -= step
+        if not min_score_values:
+            min_score_values = [float(PB1_MIN_SCORE_BASE)]
+
+        relax_passes: list[tuple[float, bool, str]] = [(score, bool(PB1_REQUIRE_BOTH), "score_relax") for score in min_score_values]
+        if PB1_REQUIRE_BOTH and len(relax_passes) < max_passes + 1:
+            relax_passes.append((min_score_values[-1], False, "require_both_off"))
+
+        for min_score, require_both, relax_label in relax_passes:
+            relax_passes_used += 1
+            applied_min_score = min_score
+            applied_require_both = require_both
+            for tier_name, thresholds in tiers:
+                tiers_tried.append(f"{tier_name}:{relax_label}")
+                adjusted = thresholds.with_overrides(require_both_contractions=require_both)
+                evaluated = self._apply_thresholds(
+                    candidates,
+                    adjusted,
+                    min_score=min_score,
+                    log_results=False,
+                    soft_mode=PB1_FAILMODE_SOFT,
+                    spread_hard_max_pct=float(PB1_SPREAD_HARD_MAX_PCT),
+                    gap_hard_max_pct=float(PB1_GAP_HARD_MAX_PCT),
+                )
+                ok_count = len([c for c in evaluated if c.setup_ok])
+                reason_counts = self._collect_reason_counts(evaluated)
+                all_reason_counts.update(reason_counts)
+                logger.info(
+                    "[PB1][CANDIDATES] tier=%s pass=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s min_score:%.1f}",
+                    tier_name,
+                    relax_label,
+                    ok_count,
+                    len(evaluated),
+                    adjusted.vol_contraction_max,
+                    adjusted.volu_contraction_max,
+                    adjusted.pullback_min,
+                    adjusted.pullback_max,
+                    adjusted.require_both_contractions,
+                    min_score,
+                )
+                if ok_count > 0:
+                    selected_candidates = self._apply_thresholds(
+                        candidates,
+                        adjusted,
+                        min_score=min_score,
+                        log_results=True,
+                        soft_mode=PB1_FAILMODE_SOFT,
+                        spread_hard_max_pct=float(PB1_SPREAD_HARD_MAX_PCT),
+                        gap_hard_max_pct=float(PB1_GAP_HARD_MAX_PCT),
+                    )
+                    selected_tier = tier_name
+                    selected_thresholds = adjusted
+                    break
+                selected_candidates = evaluated
                 selected_tier = tier_name
-                selected_thresholds = thresholds
+                selected_thresholds = adjusted
+            if selected_candidates and any(c.setup_ok for c in selected_candidates):
                 break
-            selected_candidates = evaluated
-            selected_tier = tier_name
-            selected_thresholds = thresholds
 
         if selected_candidates and all(c.setup_ok is False for c in selected_candidates):
-            selected_candidates = self._apply_thresholds(candidates, selected_thresholds, log_results=True)
-        return selected_candidates, selected_tier, selected_thresholds, all_reason_counts, tiers_tried
+            selected_candidates = self._apply_thresholds(
+                candidates,
+                selected_thresholds,
+                min_score=applied_min_score,
+                log_results=True,
+                soft_mode=PB1_FAILMODE_SOFT,
+                spread_hard_max_pct=float(PB1_SPREAD_HARD_MAX_PCT),
+                gap_hard_max_pct=float(PB1_GAP_HARD_MAX_PCT),
+            )
+        return (
+            selected_candidates,
+            selected_tier,
+            selected_thresholds,
+            all_reason_counts,
+            tiers_tried,
+            relax_passes_used,
+            applied_min_score,
+            applied_require_both,
+        )
 
     def _apply_score_fallback(self, candidates: List[CandidateFeature]) -> int:
         scored: list[CandidateFeature] = []
@@ -1429,7 +1622,8 @@ class PB1Engine:
 
         scored.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
         max_n = max(1, int(PB1_MAX_POSITIONS))
-        selected = scored[:max_n]
+        min_n = max(1, int(PB1_MIN_CANDIDATES))
+        selected = scored[: min(max_n, max(min_n, 1))]
         selected_codes = {c.code for c in selected}
         for cf in candidates:
             if cf.code in selected_codes:
@@ -3140,7 +3334,11 @@ class PB1Engine:
         positions_cost = sum(float(p.get("total_cost") or 0.0) for p in positions_for_exit)
         self._equity_krw = float(available_cash_krw) + positions_cost
         slots_remaining = max(0, max_positions - existing_positions_count)
-        target_new_positions = max(0, min(target_new_positions_raw, slots_remaining))
+        target_new_positions = min(target_new_positions_raw, slots_remaining)
+        if slots_remaining > 0:
+            target_new_positions = max(1, target_new_positions)
+        else:
+            target_new_positions = 0
         self.target_new_positions = target_new_positions
         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
         logger.info(
@@ -3227,6 +3425,9 @@ class PB1Engine:
         selected_thresholds = self.filter_thresholds
         all_reason_counts: Counter[str] = Counter()
         tiers_tried: list[str] = []
+        relax_passes_used = 0
+        applied_min_score = float(PB1_MIN_SCORE_BASE)
+        applied_require_both = bool(PB1_REQUIRE_BOTH)
         setup_ok_codes: list[str] = []
         drop_reason_counter: Counter[str] = Counter()
         drop_examples: Dict[str, list[str]] = {}
@@ -3242,6 +3443,9 @@ class PB1Engine:
                 selected_thresholds,
                 all_reason_counts,
                 tiers_tried,
+                relax_passes_used,
+                applied_min_score,
+                applied_require_both,
             ) = self._select_candidates_with_fallback(candidates)
             if not any(c.setup_ok for c in candidates):
                 self._apply_score_fallback(candidates)
@@ -3267,7 +3471,7 @@ class PB1Engine:
                     for reason in cf.reasons or ["unspecified_fail"]:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
 
-            new_position_limit = target_new_positions
+            new_position_limit = min(target_new_positions, len(ok_after_risk)) if ok_after_risk else target_new_positions
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
@@ -3529,17 +3733,19 @@ class PB1Engine:
 
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
-                "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+                "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s relax_passes=%s min_score=%.1f require_both=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f}",
                 len(members),
                 len(candidates),
                 selected_tier,
                 ok_count,
                 len(candidates),
+                relax_passes_used,
+                applied_min_score,
+                applied_require_both,
                 selected_thresholds.vol_contraction_max,
                 selected_thresholds.volu_contraction_max,
                 selected_thresholds.pullback_min,
                 selected_thresholds.pullback_max,
-                selected_thresholds.require_both_contractions,
             )
             logger.info(
                 "[PB1][CANDIDATES][SNAPSHOT] setup_ok_count=%s setup_ok_sample=%s after_risk_check_count=%s after_buyable_check_count=%s after_dedup_count=%s drop_reasons_topN=%s drop_examples=%s",
@@ -3551,16 +3757,35 @@ class PB1Engine:
                 drop_reason_counter.most_common(3),
                 {k: v for k, v in drop_examples.items() if v},
             )
+            summary_reason = "OK"
+            if ok_count == 0:
+                summary_reason = "NO_CANDIDATES_AFTER_RELAX"
+            elif ok_count > 0 and not orderable_candidates:
+                summary_reason = "NO_ORDERABLE_CANDIDATES"
+            logger.info(
+                "[PB1][RUN][SUMMARY] universe=%s candidates=%s relax_passes=%s selected=%s reason=%s cash_total=%s usable=%s tick_budget=%s",
+                len(members),
+                len(candidates),
+                relax_passes_used,
+                len(orderable_candidates),
+                summary_reason,
+                total_cash_krw,
+                entry_usable_krw,
+                tick_budget_krw,
+            )
+            self._log_fail_reason_breakdown(candidates, note="post_filter")
             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
                 top_reasons = all_reason_counts.most_common(3)
                 final_status = "NO_TRADE"
                 final_notes = f"no_candidates:{top_reasons or 'none'}"
                 logger.info(
-                    "[PB1][NO_TRADE] reason=no_candidates tiers_tried=%s tier=%s total=%s top_reasons=%s",
+                    "[PB1][NO_TRADE] reason=no_candidates tiers_tried=%s tier=%s total=%s relax_passes=%s min_score=%.1f top_reasons=%s",
                     tiers_tried or ["none"],
                     selected_tier,
                     len(candidates),
+                    relax_passes_used,
+                    applied_min_score,
                     top_reasons or "none",
                 )
                 if self.phase in {"prep", "entry"}:

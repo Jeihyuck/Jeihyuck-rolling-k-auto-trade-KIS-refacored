@@ -14,10 +14,19 @@ def close_stale_positions(*, engine, env: str, strategy: str, reason: str, ts: d
     has_status = "status" in columns
     has_reason = "closed_reason" in columns
     has_closed_ts = "closed_ts" in columns
+    status_value = "SOFT_CLOSED"
+    if reason in {"stale_db_holdings_empty", "STALE_DB_BUT_KIS_EMPTY"}:
+        status_value = "ORPHAN"
     with engine.begin() as conn:
         if has_status:
-            set_parts = ["status = :status", "updated_at = CURRENT_TIMESTAMP"]
-            params = {"status": "CLOSED_STALE", "env": env, "strategy": strategy}
+            set_parts = [
+                "status = :status",
+                "qty = 0",
+                "avg_buy_price = NULL",
+                "total_cost = 0.0",
+                "updated_at = CURRENT_TIMESTAMP",
+            ]
+            params = {"status": status_value, "env": env, "strategy": strategy}
             if has_reason:
                 set_parts.append("closed_reason = :reason")
                 params["reason"] = reason
@@ -46,10 +55,11 @@ def close_stale_positions(*, engine, env: str, strategy: str, reason: str, ts: d
             result = conn.execute(stmt, {"env": env, "strategy": strategy})
     count = int(result.rowcount or 0)
     logger.warning(
-        "[STALE_DB][SOFT_CLOSE] env=%s strategy=%s rows=%s status_supported=%s",
+        "[STALE_DB][SOFT_CLOSE] env=%s strategy=%s rows=%s status=%s reason=%s",
         env,
         strategy,
         count,
-        has_status,
+        status_value,
+        reason,
     )
     return count

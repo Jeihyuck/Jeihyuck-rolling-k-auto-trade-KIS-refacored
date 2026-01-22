@@ -188,6 +188,11 @@ CONFIG = {
     "PB1_MIN_SCORE_BASE": "70",        # Adaptive score cut 시작값
     "PB1_MIN_SCORE_FLOOR": "55",       # Adaptive score cut 하한
     "PB1_MIN_SCORE_STEP": "5",         # Adaptive score cut 단계
+    "PB1_FAILMODE_SOFT": "1",
+    "PB1_MIN_CANDIDATES": "3",
+    "PB1_RELAX_MAX_PASSES": "3",
+    "PB1_SPREAD_HARD_MAX_PCT": "0",
+    "PB1_GAP_HARD_MAX_PCT": "0",
     "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.25",
     "PB1_MAX_POS_PCT": "0.20",
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
@@ -704,6 +709,11 @@ PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
 PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
 PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")
 PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or str(PB1_MIN_SCORE_BASE))
+PB1_FAILMODE_SOFT = env_bool("PB1_FAILMODE_SOFT", default=True)
+PB1_MIN_CANDIDATES = int(_cfg("PB1_MIN_CANDIDATES") or "3")
+PB1_RELAX_MAX_PASSES = int(_cfg("PB1_RELAX_MAX_PASSES") or "3")
+PB1_SPREAD_HARD_MAX_PCT = float(_cfg("PB1_SPREAD_HARD_MAX_PCT") or "0")
+PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
 PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
 PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
@@ -712,7 +722,7 @@ PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 
 logger.info(
-    "[CONFIG][PB1] entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f",
+    "[CONFIG][PB1] entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
     PB1_ENTRY_BUDGET_PCT_PER_TICK,
     PB1_MAX_POS_PCT,
     PB1_VOL_MAX,
@@ -724,6 +734,9 @@ logger.info(
     PB1_MIN_SCORE_BASE,
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,
+    int(PB1_FAILMODE_SOFT),
+    PB1_RELAX_MAX_PASSES,
+    PB1_MIN_CANDIDATES,
 )
 logger.info(
     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",

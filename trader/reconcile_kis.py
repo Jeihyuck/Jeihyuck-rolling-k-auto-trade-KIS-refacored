@@ -73,11 +73,16 @@ def _normalize_code(value: Any) -> str:
 
 def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strategy: str) -> dict[str, object]:
     today = now_kst().strftime("%Y%m%d")
+    degraded_reason: str | None = None
     try:
         resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
     except KisTemporaryError as exc:
         logger.warning("[RECONCILE][DEGRADED] temporary error: %s", exc)
-        return {"ok": False, "reason": "temporary", "err": str(exc)}
+        degraded_reason = "temporary"
+        resp = {"output1": [], "output2": []}
+    if not isinstance(resp, dict):
+        degraded_reason = degraded_reason or "invalid_response"
+        resp = {"output1": [], "output2": []}
     rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
     if isinstance(rows, dict):
         rows = [rows]
@@ -144,14 +149,17 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
             )
             fill_count += 1
 
+    reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
+    if degraded_reason:
+        reasons.append(f"degraded:{degraded_reason}")
     ledger_repo.append_event(
         env=env,
         run_id=run_id,
         event_type="RECONCILE",
         ts=now_kst(),
         ok=True,
-        reasons=[f"orders:{order_count}", f"fills:{fill_count}"],
-        payload_json={"orders": order_count, "fills": fill_count},
+        reasons=reasons,
+        payload_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
     )
     logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
-    return {"ok": True, "orders": order_count, "fills": fill_count}
+    return {"ok": True, "orders": order_count, "fills": fill_count, "degraded": degraded_reason}

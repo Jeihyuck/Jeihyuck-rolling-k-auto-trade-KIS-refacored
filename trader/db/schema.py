@@ -193,6 +193,9 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("regime_at_entry", sa.Text, nullable=True),
         sa.Column("risk_mult_at_entry", sa.Float, nullable=True),
         sa.Column("last_trade_at", sa.DateTime(timezone=True)),
+        sa.Column("status", sa.String, nullable=True),
+        sa.Column("closed_reason", sa.String, nullable=True),
+        sa.Column("closed_ts", sa.DateTime(timezone=True)),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
     )
