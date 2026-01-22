@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from trader.botstate_paths import botstate_path, get_botstate_root
 from trader.botstate_sync import (
     acquire_lock,
+    BotStatePersistError,
     persist_run_files,
     release_lock,
     resolve_botstate_worktree_dir,
@@ -90,7 +91,15 @@ def main() -> int:
             if not files:
                 logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
                 return 0
-            persist_run_files(worktree_dir, files, args.message)
+            try:
+                persist_run_files(worktree_dir, files, args.message)
+            except BotStatePersistError as exc:
+                if exc.require_persist and not exc.dirty_by_stat:
+                    logger.warning(
+                        "[BOTSTATE][PERSIST][EMPTY_STAGE][WARN] require_persist=1 dirty_by_stat=0 -> skip"
+                    )
+                    return 0
+                raise
             return 0
         finally:
             release_lock(worktree_dir, owner=owner, run_id=run_id)

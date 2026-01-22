@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any
+from pathlib import Path
 
 from trader.config import MARKET_MAP
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
+from trader.reconcile_db import evaluate_stale_db_guard
 from trader.kis_wrapper import KisAPI, KisTemporaryError
 from trader.time_utils import now_kst
 
@@ -89,6 +91,7 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
     ledger_repo = LedgerEventsRepo(engine)
+    reconcile_repo = ReconcileLogRepo(engine)
 
     order_count = 0
     fill_count = 0
@@ -162,4 +165,101 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
         payload_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
     )
     logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
+    reconcile_repo.append_log(
+        env=env,
+        strategy=strategy,
+        tick_ts=now_kst(),
+        action="reconcile_today",
+        details_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
+    )
     return {"ok": True, "orders": order_count, "fills": fill_count, "degraded": degraded_reason}
+
+
+def reconcile_kis(
+    *,
+    engine,
+    kis: KisAPI,
+    env: str,
+    run_id: str | None,
+    strategy: str,
+    tick_ts: datetime,
+    balance_snapshot: dict | None = None,
+    bot_state_dir: str | None = None,
+) -> dict[str, object]:
+    holdings_error = None
+    holdings_rows: list[dict] = []
+    try:
+        snapshot = balance_snapshot or kis.get_balance_cached(force=True)
+        holdings_rows = snapshot.get("output1") or []
+    except KisTemporaryError as exc:
+        holdings_error = str(exc)
+        holdings_rows = []
+    except Exception as exc:
+        holdings_error = str(exc)
+        holdings_rows = []
+
+    reconcile_result = reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
+    orders_count = int(reconcile_result.get("orders") or 0)
+    fills_count = int(reconcile_result.get("fills") or 0)
+
+    positions_repo = PositionsRepo(engine)
+    restored = positions_repo.restore_missing_from_holdings(
+        env=env,
+        strategy=strategy,
+        sid=1,
+        mode=1,
+        holdings=holdings_rows,
+    )
+    if restored:
+        logger.warning("[RECONCILE][POSITIONS][RESTORE] env=%s restored=%s", env, restored)
+
+    guard_result = None
+    guard_reason = None
+    allow_purge = None
+    if bot_state_dir:
+        allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
+            bot_state_dir=Path(bot_state_dir),
+            tick_ts=tick_ts,
+            kis_holdings_empty=len(holdings_rows) == 0,
+            orders_count=orders_count,
+            fills_count=fills_count,
+            had_kis_error=holdings_error is not None,
+        )
+        if allow_purge:
+            logger.warning(
+                "[RECONCILE][STALE_DB_GUARD] allow_purge=1 empty_streak=%s",
+                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
+            )
+        else:
+            logger.info(
+                "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=%s empty_streak=%s",
+                guard_reason,
+                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
+            )
+
+    reconcile_repo = ReconcileLogRepo(engine)
+    reconcile_repo.append_log(
+        env=env,
+        strategy=strategy,
+        tick_ts=tick_ts,
+        action="reconcile_kis",
+        details_json={
+            "orders": orders_count,
+            "fills": fills_count,
+            "holdings": len(holdings_rows),
+            "restored_positions": restored,
+            "holdings_error": holdings_error,
+            "guard_reason": guard_reason,
+            "allow_purge": allow_purge,
+        },
+    )
+    reconcile_result.update(
+        {
+            "holdings": len(holdings_rows),
+            "restored_positions": restored,
+            "holdings_error": holdings_error,
+            "guard_reason": guard_reason,
+            "allow_purge": allow_purge,
+        }
+    )
+    return reconcile_result

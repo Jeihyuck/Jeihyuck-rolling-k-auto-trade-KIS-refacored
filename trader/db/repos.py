@@ -10,6 +10,8 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import Engine, and_, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
     FILLS,
@@ -354,6 +356,7 @@ class OrdersRepo:
                 .values(
                     status="SUBMITTED",
                     kis_odno=kis_odno,
+                    broker_order_id=kis_odno or client_order_key,
                     response_json=response_json,
                     submitted_at=func.now(),
                     updated_at=func.now(),
@@ -368,6 +371,7 @@ class OrdersRepo:
                 .values(
                     status="ACKED",
                     response_json=response_json,
+                    broker_order_id=kis_odno,
                     acked_at=func.now(),
                     updated_at=func.now(),
                 )
@@ -451,6 +455,7 @@ class OrdersRepo:
         acked_at: datetime | None,
     ) -> str:
         db_url = str(self.engine.url)
+        broker_order_id = kis_odno or client_order_key
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -468,47 +473,49 @@ class OrdersRepo:
             "client_order_key": client_order_key,
             "status": status,
             "kis_odno": kis_odno,
+            "broker_order_id": broker_order_id,
             "request_json": request_json or {},
             "response_json": response_json or {},
             "submitted_at": submitted_at,
             "acked_at": acked_at,
         }
+        conflict_cols = ["env", "broker_order_id"] if broker_order_id else ["env", "client_order_key"]
+        update_cols = {
+            "status": status,
+            "kis_odno": kis_odno,
+            "broker_order_id": broker_order_id,
+            "response_json": response_json or {},
+            "request_json": request_json or {},
+            "submitted_at": submitted_at,
+            "acked_at": acked_at,
+            "updated_at": func.now(),
+        }
+        insert_stmt: sa.Insert
+        if self.engine.dialect.name == "postgresql":
+            insert_stmt = pg_insert(self._schema.orders).values(**payload)
+        else:
+            insert_stmt = sqlite_insert(self._schema.orders).values(**payload)
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=conflict_cols,
+            set_=update_cols,
+        ).returning(self._schema.orders.c.order_id)
         with self.engine.begin() as conn:
-            existing = None
-            if kis_odno:
-                existing = conn.execute(
-                    select(self._schema.orders.c.order_id).where(
-                        and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno)
-                    )
-                ).scalar()
-            if not existing:
-                existing = conn.execute(
-                    select(self._schema.orders.c.order_id).where(
-                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
-                    )
-                ).scalar()
-            if existing:
-                conn.execute(
-                    sa.update(self._schema.orders)
-                    .where(self._schema.orders.c.order_id == existing)
-                    .values(
-                        status=status,
-                        kis_odno=kis_odno,
-                        response_json=response_json or {},
-                        request_json=request_json or {},
-                        submitted_at=submitted_at,
-                        acked_at=acked_at,
-                        updated_at=func.now(),
-                    )
-                )
-                return str(existing)
-            stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
             try:
                 res = conn.execute(stmt)
-                return str(res.scalar())
+                order_id = res.scalar()
+                if order_id:
+                    return str(order_id)
             except Exception:
-                conn.execute(sa.insert(self._schema.orders).values(**payload))
-                return str(payload["order_id"])
+                pass
+            existing = conn.execute(
+                select(self._schema.orders.c.order_id).where(
+                    and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.client_order_key == client_order_key,
+                    )
+                )
+            ).scalar()
+            return str(existing or payload["order_id"])
 
 
 class FillsRepo:
@@ -555,60 +562,63 @@ class FillsRepo:
         raw_json: dict | None,
     ) -> str:
         db_url = str(self.engine.url)
+        broker_fill_id = trade_id or None
+        payload = {
+            "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+            "env": env,
+            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+            "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
+            "kis_odno": kis_odno,
+            "trade_id": trade_id,
+            "broker_fill_id": broker_fill_id,
+            "code": code,
+            "market": market,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "fee": fee,
+            "tax": tax,
+            "filled_at": filled_at,
+            "raw_json": raw_json or {},
+        }
+        conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
+            "env",
+            "kis_odno",
+            "code",
+            "side",
+            "qty",
+            "price",
+            "filled_at",
+        ]
+        update_cols = {
+            "raw_json": raw_json or {},
+            "broker_fill_id": broker_fill_id,
+        }
+        insert_stmt: sa.Insert
+        if self.engine.dialect.name == "postgresql":
+            insert_stmt = pg_insert(self._schema.fills).values(**payload)
+        else:
+            insert_stmt = sqlite_insert(self._schema.fills).values(**payload)
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=conflict_cols,
+            set_=update_cols,
+        ).returning(self._schema.fills.c.fill_id)
         with self.engine.begin() as conn:
-            fill_id = None
+            try:
+                res = conn.execute(stmt)
+                fill_id = res.scalar()
+                if fill_id:
+                    return str(fill_id)
+            except Exception:
+                pass
+            existing = None
             if trade_id:
-                fill_id = conn.execute(
+                existing = conn.execute(
                     select(self._schema.fills.c.fill_id).where(
                         and_(self._schema.fills.c.env == env, self._schema.fills.c.trade_id == trade_id)
                     )
                 ).scalar()
-            if not fill_id and kis_odno:
-                fill_id = conn.execute(
-                    select(self._schema.fills.c.fill_id).where(
-                        and_(
-                            self._schema.fills.c.env == env,
-                            self._schema.fills.c.kis_odno == kis_odno,
-                            self._schema.fills.c.code == code,
-                            self._schema.fills.c.side == side,
-                            self._schema.fills.c.qty == qty,
-                            self._schema.fills.c.price == price,
-                            self._schema.fills.c.filled_at == filled_at,
-                        )
-                    )
-                ).scalar()
-            if fill_id:
-                conn.execute(
-                    sa.update(self._schema.fills)
-                    .where(self._schema.fills.c.fill_id == fill_id)
-                    .values(raw_json=raw_json or {}),
-                )
-                return str(fill_id)
-
-            payload = {
-                "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-                "env": env,
-                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-                "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
-                "kis_odno": kis_odno,
-                "trade_id": trade_id,
-                "code": code,
-                "market": market,
-                "side": side,
-                "qty": qty,
-                "price": price,
-                "fee": fee,
-                "tax": tax,
-                "filled_at": filled_at,
-                "raw_json": raw_json or {},
-            }
-            stmt = sa.insert(self._schema.fills).values(**payload).returning(self._schema.fills.c.fill_id)
-            try:
-                res = conn.execute(stmt)
-                return str(res.scalar())
-            except Exception:
-                conn.execute(sa.insert(self._schema.fills).values(**payload))
-                return str(payload["fill_id"])
+            return str(existing or payload["fill_id"])
 
 
 class LedgerEventsRepo:
@@ -908,7 +918,91 @@ class PositionsRepo:
                         total_cost=total_cost or 0.0,
                         realized_pnl=0.0,
                         last_trade_at=None,
+                        status="OPEN",
+                        last_reconciled_at=func.now(),
                     )
                 )
                 count += 1
         return count
+
+    def restore_missing_from_holdings(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        sid: int,
+        mode: int,
+        holdings: Iterable[dict],
+    ) -> int:
+        restored = 0
+        with self.engine.begin() as conn:
+            for row in holdings or []:
+                try:
+                    code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+                    qty = int(float(row.get("hldg_qty") or row.get("qty") or 0))
+                    if qty <= 0 or not code:
+                        continue
+                    avg_price = float(row.get("pchs_avg_pric") or row.get("pchs_avg_price") or row.get("avg_price") or 0.0)
+                    total_cost = float(row.get("pchs_amt") or row.get("total_cost") or avg_price * qty)
+                    market = row.get("prdt_type_cd") or row.get("market") or row.get("mket_gb")
+                except Exception:
+                    continue
+                existing = conn.execute(
+                    select(self._schema.positions.c.position_id).where(
+                        and_(
+                            self._schema.positions.c.env == env,
+                            self._schema.positions.c.strategy == strategy,
+                            self._schema.positions.c.sid == sid,
+                            self._schema.positions.c.mode == mode,
+                            self._schema.positions.c.code == code,
+                        )
+                    )
+                ).scalar()
+                if existing:
+                    continue
+                conn.execute(
+                    sa.insert(self._schema.positions).values(
+                        position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        env=env,
+                        strategy=strategy,
+                        sid=sid,
+                        mode=mode,
+                        code=code,
+                        market=market,
+                        qty=qty,
+                        avg_buy_price=avg_price or None,
+                        total_cost=total_cost or 0.0,
+                        realized_pnl=0.0,
+                        last_trade_at=None,
+                        status="OPEN",
+                        last_reconciled_at=func.now(),
+                    )
+                )
+                restored += 1
+        return restored
+
+
+class ReconcileLogRepo:
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+
+    def append_log(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        tick_ts: datetime,
+        action: str,
+        details_json: dict | None,
+    ) -> None:
+        payload = {
+            "env": env,
+            "strategy": strategy,
+            "tick_ts": tick_ts,
+            "action": action,
+            "details_json": details_json or {},
+        }
+        stmt = sa.insert(self._schema.reconcile_log).values(**payload)
+        with self.engine.begin() as conn:
+            conn.execute(stmt)

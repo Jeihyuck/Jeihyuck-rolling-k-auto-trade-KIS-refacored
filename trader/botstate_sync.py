@@ -78,6 +78,22 @@ CLEAN_PATTERNS = [
 ]
 
 
+@dataclass(frozen=True)
+class DirtyStatSnapshot:
+    db: tuple[float, int] | None
+    events: tuple[int, float | None, int]
+    universe: tuple[int, float | None, int]
+    last_seen_positions: tuple[float, int] | None
+    positions_snapshot: tuple[float, int] | None
+
+
+class BotStatePersistError(RuntimeError):
+    def __init__(self, message: str, *, require_persist: bool, dirty_by_stat: bool) -> None:
+        super().__init__(message)
+        self.require_persist = require_persist
+        self.dirty_by_stat = dirty_by_stat
+
+
 def ensure_botstate_gitignore(workdir: str) -> None:
     # workdir is the botstate worktree root
     path = os.path.join(workdir, "bot_state", ".gitignore")
@@ -436,6 +452,69 @@ def _latest_event_mtime(events_dir: Path) -> float | None:
             continue
         latest = mtime if latest is None else max(latest, mtime)
     return latest
+
+
+def _collect_dir_stats(base_dir: Path, pattern: str) -> tuple[int, float | None, int]:
+    count = 0
+    latest_mtime = None
+    total_size = 0
+    if not base_dir.exists():
+        return 0, None, 0
+    for entry in base_dir.glob(pattern):
+        try:
+            stat = entry.stat()
+        except FileNotFoundError:
+            continue
+        count += 1
+        total_size += stat.st_size
+        latest_mtime = stat.st_mtime if latest_mtime is None else max(latest_mtime, stat.st_mtime)
+    return count, latest_mtime, total_size
+
+
+def _collect_dirty_stats(worktree_dir: Path) -> DirtyStatSnapshot:
+    bot_state_dir = worktree_dir / "bot_state"
+    db_stat = _safe_stat(bot_state_dir / "db" / "pbcore.sqlite3")
+    events_stats = _collect_dir_stats(bot_state_dir / "runtime" / "events", "*.jsonl")
+    universe_stats = _collect_dir_stats(bot_state_dir / "runtime" / "universe", "*.json")
+    last_seen_positions = _safe_stat(bot_state_dir / "runtime" / "last_seen_positions.json")
+    positions_snapshot = _safe_stat(bot_state_dir / "runtime" / "positions_snapshot.json")
+    return DirtyStatSnapshot(
+        db=db_stat,
+        events=events_stats,
+        universe=universe_stats,
+        last_seen_positions=last_seen_positions,
+        positions_snapshot=positions_snapshot,
+    )
+
+
+def _force_stage_dirty_files(worktree_dir: Path) -> None:
+    to_add: list[str] = []
+    bot_state_dir = worktree_dir / "bot_state"
+    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
+    if db_path.exists():
+        to_add.append(db_path.relative_to(worktree_dir).as_posix())
+    for entry in (bot_state_dir / "runtime" / "events").glob("*.jsonl"):
+        to_add.append(entry.relative_to(worktree_dir).as_posix())
+    for entry in (bot_state_dir / "runtime" / "universe").glob("*.json"):
+        to_add.append(entry.relative_to(worktree_dir).as_posix())
+    for name in ("last_seen_positions.json", "positions_snapshot.json"):
+        path = bot_state_dir / "runtime" / name
+        if path.exists():
+            to_add.append(path.relative_to(worktree_dir).as_posix())
+    if to_add:
+        _git_worktree(worktree_dir, "add", "-f", "--", *sorted(set(to_add)), check=False)
+
+
+def evaluate_persist_guard(*, require_persist: bool, dirty_by_stat: bool) -> str:
+    if not require_persist:
+        return "ok"
+    if dirty_by_stat:
+        raise BotStatePersistError(
+            "PERSIST_REQUIRED_BUT_EMPTY_STAGE",
+            require_persist=require_persist,
+            dirty_by_stat=dirty_by_stat,
+        )
+    return "warn"
 
 
 def _normalize_botstate_rel(path: Path) -> str | None:
@@ -978,16 +1057,18 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
 
         db_path = worktree_dir / "bot_state" / "db" / "pbcore.sqlite3"
         events_dir = worktree_dir / "bot_state" / "runtime" / "events"
+        pre_stats = _collect_dirty_stats(worktree_dir)
         db_stat = _safe_stat(db_path)
         events_latest = _latest_event_mtime(events_dir)
         status_pre = _run_git_logged(
             ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_pre"
         ).stdout
         logger.info(
-            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s status_lines=%s",
+            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s dirty_stats=%s status_lines=%s",
             allowlist_changed,
             db_stat,
             events_latest,
+            pre_stats,
             [line for line in status_pre.splitlines() if line.strip()][:50],
         )
 
@@ -1010,6 +1091,16 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                 continue
 
         _stage_allowlist(worktree_dir, ALLOWLIST_PATTERNS)
+        post_stats = _collect_dirty_stats(worktree_dir)
+        dirty_by_stat = pre_stats != post_stats
+        if dirty_by_stat:
+            _force_stage_dirty_files(worktree_dir)
+        logger.info(
+            "[BOTSTATE][PERSIST][STAT] dirty_by_stat=%s pre=%s post=%s",
+            dirty_by_stat,
+            pre_stats,
+            post_stats,
+        )
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
         status_lines = [line for line in status.splitlines() if line.strip()]
         reverted_deleted, cleaned_untracked = _clean_non_allowlisted_changes(
@@ -1038,7 +1129,7 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             has_recent_events = False
             if events_latest is not None:
                 has_recent_events = (time.time() - events_latest) < 600
-            require_persist = allowlist_changed or has_recent_db or has_recent_events
+            require_persist = allowlist_changed or has_recent_db or has_recent_events or dirty_by_stat
             logger.info(
                 "[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip require_persist=%s",
                 require_persist,
@@ -1050,7 +1141,14 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
                     post,
                 )
             if require_persist:
-                raise RuntimeError("PERSIST_REQUIRED_BUT_EMPTY_STAGE")
+                logger.warning(
+                    "[BOTSTATE][PERSIST][EMPTY_STAGE] require_persist=1 dirty_by_stat=%s",
+                    dirty_by_stat,
+                )
+                outcome = evaluate_persist_guard(require_persist=require_persist, dirty_by_stat=dirty_by_stat)
+                if outcome == "warn":
+                    logger.warning("[BOTSTATE][PERSIST][EMPTY_STAGE] dirty_by_stat=0 -> skip")
+                    return
             return
         status_lines = [line for line in status.splitlines() if line.strip()]
         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])

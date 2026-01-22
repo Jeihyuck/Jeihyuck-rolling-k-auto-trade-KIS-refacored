@@ -66,11 +66,19 @@ from trader.botstate_sync import (
 from trader.db.engine import make_engine
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
+from trader.db.repos import (
+    FillsRepo,
+    LedgerEventsRepo,
+    OrdersRepo,
+    PositionsRepo,
+    ReconcileLogRepo,
+    RunsRepo,
+    UniverseRepo,
+)
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
-from trader.reconcile_kis import reconcile_today
+from trader.reconcile_kis import reconcile_kis, reconcile_today
 from trader.reconcile_db import close_stale_positions
 from trader.reset_utils import (
     detect_account_fp,
@@ -424,6 +432,8 @@ def _handle_missing_positions_reset(
     reset_on_missing_positions: bool,
     force_safe_exit: bool,
     hard_reset_requested: bool,
+    allow_stale_purge: bool | None,
+    stale_guard_reason: str | None,
 ) -> bool:
     if not balance_snapshot:
         return False
@@ -441,6 +451,12 @@ def _handle_missing_positions_reset(
             "[PB1][RESET][SKIP] holdings_empty=1 recent_orders=%s recent_fills=%s -> no stale reset",
             orders_count,
             fills_count,
+        )
+        return False
+    if allow_stale_purge is False:
+        logger.info(
+            "[PB1][RESET][SKIP] holdings_empty=1 stale_guard=%s -> no stale reset",
+            stale_guard_reason or "guard_block",
         )
         return False
     ledger_store = LedgerStore(LEDGER_BASE_DIR, env=env, run_id=run_id)
@@ -946,6 +962,12 @@ def run_once(
         now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
     tick_start_ts = time_mod.monotonic()
     deadline_ts = tick_start_ts + max_seconds if max_seconds > 0 else None
+    persist_budget_sec = _parse_int_env("PB1_PERSIST_BUDGET_SEC", 30)
+    if max_seconds > 0:
+        persist_budget_sec = max(5, min(persist_budget_sec, max_seconds))
+    else:
+        persist_budget_sec = max(5, persist_budget_sec)
+    trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
     run_start_ts = time_mod.time()
     as_of = now.date().isoformat()
     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
@@ -1449,6 +1471,33 @@ def run_once(
                 entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "balance_unknown"
 
+        if deadline_ts:
+            remaining_budget = deadline_ts - time_mod.monotonic()
+            if remaining_budget <= persist_budget_sec:
+                entry_allowed_this_tick = False
+                entry_block_reason = entry_block_reason or "timeout_budget"
+                logger.warning(
+                    "[PB1][TIMEOUT][ENTRY_BLOCKED] remaining=%.1fs persist_budget=%s trade_budget=%s",
+                    remaining_budget,
+                    persist_budget_sec,
+                    trade_budget_sec,
+                )
+
+        if kis and getattr(kis, "safe_mode", False):
+            entry_allowed_this_tick = False
+            entry_block_reason = entry_block_reason or "safe_mode"
+            logger.warning("[PB1][SAFE_MODE] entry_allowed=0")
+            try:
+                ReconcileLogRepo(engine).append_log(
+                    env=kis_env or "practice",
+                    strategy="pb1_pullback_close",
+                    tick_ts=now,
+                    action="safe_mode_entry_block",
+                    details_json={"reason": "safe_mode"},
+                )
+            except Exception:
+                logger.warning("[PB1][SAFE_MODE][RECONCILE_LOG][FAIL]", exc_info=True)
+
         if not entry_allowed_this_tick:
             logger.info(
                 "[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0",
@@ -1579,6 +1628,33 @@ def run_once(
         db_write_reasons.append("run_start")
         reset_on_missing_positions = env_bool("PB1_RESET_ON_MISSING_POSITIONS", False)
         force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
+        reconcile_result: dict | None = None
+        if kis:
+            try:
+                reconcile_result = reconcile_kis(
+                    engine=engine,
+                    kis=kis,
+                    env=kis_env or "practice",
+                    run_id=run_record_id,
+                    strategy="pb1_pullback_close",
+                    tick_ts=now,
+                    balance_snapshot=balance_snapshot_raw,
+                    bot_state_dir=str(resolved_bot_state_dir),
+                )
+                db_write_reasons.append("reconcile")
+                if not reconcile_result.get("ok", True):
+                    logger.warning(
+                        "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
+                        reconcile_result.get("reason"),
+                        reconcile_result.get("err"),
+                    )
+            except KisTemporaryError as exc:
+                logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
+            except Exception as exc:
+                if not dry_run and mode_resolved == "LIVE":
+                    logger.error("[PB1][RECONCILE][FAIL] %s", exc)
+                logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+
         todays_orders = orders_repo.list_today_orders(kis_env or "practice")
         todays_fills = fills_repo.list_today_fills(kis_env or "practice")
         if balance_state == BALANCE_STATE_OK:
@@ -1597,6 +1673,8 @@ def run_once(
                 reset_on_missing_positions=reset_on_missing_positions,
                 force_safe_exit=force_safe_exit,
                 hard_reset_requested=BOT_STATE_HARD_RESET,
+                allow_stale_purge=(reconcile_result or {}).get("allow_purge"),
+                stale_guard_reason=(reconcile_result or {}).get("guard_reason"),
             ):
                 if env_bool("PRACTICE_RESET_DAY", False):
                     logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
@@ -1614,28 +1692,6 @@ def run_once(
             _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="balance_degraded", now=now)
             touched_files = _collect_botstate_files(run_start_ts)
             return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
-        if kis and balance_state == BALANCE_STATE_OK:
-            try:
-                reconcile_result = reconcile_today(
-                    engine=engine,
-                    kis=kis,
-                    env=kis_env or "practice",
-                    run_id=run_record_id,
-                    strategy="pb1_pullback_close",
-                )
-                db_write_reasons.append("reconcile")
-                if not reconcile_result.get("ok", True):
-                    logger.warning(
-                        "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
-                        reconcile_result.get("reason"),
-                        reconcile_result.get("err"),
-                    )
-            except KisTemporaryError as exc:
-                logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
-            except Exception as exc:
-                if not dry_run and mode_resolved == "LIVE":
-                    logger.error("[PB1][RECONCILE][FAIL] %s", exc)
-                logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,

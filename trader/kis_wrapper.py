@@ -400,12 +400,51 @@ class KisAPI:
         self._orderable_cash_cache: Optional[int] = None
         self._orderable_cash_cache_at: Optional[datetime] = None
         self._orderable_cash_cache_ttl_sec = 5.0
+        self.safe_mode = False
+        self._load_safe_mode_state()
 
         self.token = self.get_valid_token()
         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
+
+    def _safe_mode_path(self) -> Path:
+        path = botstate_path("runtime", "status", "kis_safe_mode.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _load_safe_mode_state(self) -> None:
+        ttl_sec = int(os.getenv("KIS_SAFE_MODE_TTL_SEC", "300") or "300")
+        path = self._safe_mode_path()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            ts_raw = payload.get("ts")
+            if not ts_raw:
+                return
+            ts = datetime.fromisoformat(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=pytz.timezone("Asia/Seoul"))
+            age = (now_kst() - ts).total_seconds()
+            if age <= ttl_sec:
+                self.safe_mode = True
+        except Exception:
+            logger.warning("[SAFE_MODE][LOAD_FAIL]", exc_info=True)
+
+    def _set_safe_mode(self, *, reason: str, err: Exception | None = None) -> None:
+        self.safe_mode = True
+        try:
+            payload = {
+                "ts": now_kst().isoformat(),
+                "reason": reason,
+                "err": str(err) if err else None,
+            }
+            path = self._safe_mode_path()
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            logger.warning("[SAFE_MODE][WRITE_FAIL]", exc_info=True)
 
     # ===== [NEW] 안전요청 & 세션리셋 =====
     def _reset_session(self):
@@ -1724,9 +1763,22 @@ class KisAPI:
             "OVRS_ICLD_YN": "N",
         }
         self._limiter.wait("psbl-order")
-        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
-        data = resp.json()
-        return data
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
+                return resp.json()
+            except KisTemporaryError as exc:
+                last_exc = exc
+                logger.warning("[PSBL_ORDER][RETRY] attempt=%s err=%s", attempt, exc)
+                if attempt >= 3:
+                    self._set_safe_mode(reason="psbl_order_temp_error", err=exc)
+                    logger.error("[PSBL_ORDER][SAFE_MODE] entry_blocked=1 err=%s", exc)
+                    raise
+                time.sleep(0.5 * attempt)
+        if last_exc:
+            raise last_exc
+        raise KisTemporaryError("psbl_order_failed")
 
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
         """잔고 1페이지 호출(예외는 상위에서 처리)."""

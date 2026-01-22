@@ -39,6 +39,7 @@ class SchemaTables:
     fills: sa.Table
     positions: sa.Table
     ledger_events: sa.Table
+    reconcile_log: sa.Table
     uses_native_uuid: bool
 
 
@@ -115,6 +116,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("client_order_key", sa.String, nullable=False),
         sa.Column("status", sa.String, nullable=False, default="INTENT"),
         sa.Column("kis_odno", sa.String),
+        sa.Column("broker_order_id", sa.String),
         sa.Column("request_json", sa.JSON, nullable=False, default=dict),
         sa.Column("response_json", sa.JSON),
         sa.Column("submitted_at", sa.DateTime(timezone=True)),
@@ -122,6 +124,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.UniqueConstraint("env", "client_order_key", name="uq_orders_env_client_order_key"),
+        sa.UniqueConstraint("env", "broker_order_id", name="uq_orders_env_broker_order_id"),
     )
 
     fills = sa.Table(
@@ -133,6 +136,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("order_id", uuid_type, sa.ForeignKey("orders.order_id")),
         sa.Column("kis_odno", sa.String),
         sa.Column("trade_id", sa.String),
+        sa.Column("broker_fill_id", sa.String),
         sa.Column("code", sa.String, nullable=False),
         sa.Column("market", sa.String),
         sa.Column("side", sa.String, nullable=False),
@@ -144,6 +148,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("raw_json", sa.JSON, nullable=False, default=dict),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.UniqueConstraint("env", "trade_id", name="uq_fills_env_trade_id"),
+        sa.UniqueConstraint("env", "broker_fill_id", name="uq_fills_env_broker_fill_id"),
         sa.UniqueConstraint(
             "env",
             "kis_odno",
@@ -196,6 +201,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("status", sa.String, nullable=True),
         sa.Column("closed_reason", sa.String, nullable=True),
         sa.Column("closed_ts", sa.DateTime(timezone=True)),
+        sa.Column("last_reconciled_at", sa.DateTime(timezone=True)),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
     )
@@ -224,6 +230,17 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
+    reconcile_log = sa.Table(
+        "reconcile_log",
+        metadata,
+        sa.Column("env", sa.String, nullable=False),
+        sa.Column("strategy", sa.String, nullable=False),
+        sa.Column("tick_ts", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("action", sa.String, nullable=False),
+        sa.Column("details_json", sa.JSON, nullable=False, default=dict),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+
     return SchemaTables(
         database_url=database_url,
         metadata=metadata,
@@ -234,6 +251,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         fills=fills,
         positions=positions,
         ledger_events=ledger_events,
+        reconcile_log=reconcile_log,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -268,3 +286,4 @@ ORDERS = DEFAULT_SCHEMA.orders
 FILLS = DEFAULT_SCHEMA.fills
 POSITIONS = DEFAULT_SCHEMA.positions
 LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
+RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
