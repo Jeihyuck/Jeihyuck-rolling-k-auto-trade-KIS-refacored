@@ -209,6 +209,11 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
     repl = re.sub(r"(?is)'\{\}'\s*::\s*jsonb", "'{}'", repl)
     repl = re.sub(r"(?is)gen_random_uuid\(\)\s*::\s*text", "lower(hex(randomblob(16)))", repl)
     repl = re.sub(r"(?is)\bgen_random_uuid\(\)", "lower(hex(randomblob(16)))", repl)
+    repl = re.sub(
+        r"(?is)DEFAULT\s+lower\(hex\(randomblob\(16\)\)\)",
+        "DEFAULT (lower(hex(randomblob(16))))",
+        repl,
+    )
     repl = re.sub(r"(?is)::\s*text\b", "", repl)
     repl = re.sub(r"(?is)::\s*jsonb\b", "", repl)
     match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", repl, re.IGNORECASE)
