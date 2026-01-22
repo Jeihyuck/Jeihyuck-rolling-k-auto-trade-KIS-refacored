@@ -187,14 +187,28 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
         return
-    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", cleaned, re.IGNORECASE)
+    if re.match(r"(?is)^\s*CREATE\s+EXTENSION\b", cleaned):
+        return
+    repl = cleaned
+    repl = re.sub(r"(?i)\btimestamptz\b", "TEXT", repl)
+    repl = re.sub(r"(?i)\bdouble\s+precision\b", "REAL", repl)
+    repl = re.sub(r"(?i)\bjsonb\b", "TEXT", repl)
+    repl = re.sub(r"(?i)\bboolean\b", "INTEGER", repl)
+    repl = re.sub(r"(?i)\bnow\(\)", "CURRENT_TIMESTAMP", repl)
+    repl = re.sub(r"(?is)'\{\}'\s*::\s*TEXT", "'{}'", repl)
+    repl = re.sub(r"(?is)'\{\}'\s*::\s*jsonb", "'{}'", repl)
+    repl = re.sub(r"(?is)gen_random_uuid\(\)\s*::\s*text", "lower(hex(randomblob(16)))", repl)
+    repl = re.sub(r"(?is)\bgen_random_uuid\(\)", "lower(hex(randomblob(16)))", repl)
+    repl = re.sub(r"(?is)::\s*text\b", "", repl)
+    repl = re.sub(r"(?is)::\s*jsonb\b", "", repl)
+    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", repl, re.IGNORECASE)
     if match:
         table, column = match.group(1), match.group(2)
         existing = _sqlite_column_names(conn, table)
         if column in existing:
             logger.info("[DB][MIGRATE][SQLITE] skip existing column table=%s column=%s", table, column)
             return
-    conn.execute(text(cleaned))
+    conn.exec_driver_sql(repl)
 
 
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:

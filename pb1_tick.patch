@@ -1,57 +1,17 @@
 diff --git a/trader/db/migrate.py b/trader/db/migrate.py
-index ba09b4952cdfcd7c01325338f5ea87c61f9b9375..4ca02b4503982fe09210a929e175f0c87ce437a8 100644
+index 4ca02b4503982fe09210a929e175f0c87ce437a8..d910b4d10ff81cc72ae226b62467831193189f98 100644
 --- a/trader/db/migrate.py
 +++ b/trader/db/migrate.py
-@@ -134,60 +134,65 @@ def _should_skip_migrations(engine: Engine, migrations_dir: str) -> bool:
-     stamp_path = _schema_stamp_path()
-     if not stamp_path.exists():
-         return False
-     db_exists = True
-     url = str(engine.url)
-     if config.is_sqlite_url(url):
-         db_path = Path(engine.url.database or "")
-         db_exists = db_path.exists()
-     if not db_exists:
-         return False
-     stamp_version = stamp_path.read_text(encoding="utf-8").strip()
-     current_version = _compute_migration_version(migrations_dir)
-     if stamp_version == current_version:
-         logger.info("[DB][MIGRATE][SKIP] reason=up_to_date")
-         return True
-     return False
- 
- 
- def _write_schema_stamp(migrations_dir: str) -> None:
-     stamp_path = _schema_stamp_path()
-     stamp_path.parent.mkdir(parents=True, exist_ok=True)
-     stamp_path.write_text(_compute_migration_version(migrations_dir), encoding="utf-8")
- 
- 
- def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
--    conn.execute(
--        text(
--            """
--            CREATE TABLE IF NOT EXISTS schema_migrations (
--                version text primary key,
--                applied_at timestamptz default now()
--            )
--            """
-+    if conn.dialect.name == "sqlite":
-+        ddl = """
-+        CREATE TABLE IF NOT EXISTS schema_migrations (
-+            version TEXT PRIMARY KEY,
-+            applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-+        )
-+        """
-+    else:
-+        ddl = """
-+        CREATE TABLE IF NOT EXISTS schema_migrations (
-+            version text primary key,
-+            applied_at timestamptz default now()
+@@ -165,58 +165,72 @@ def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
+         """
+     else:
+         ddl = """
+         CREATE TABLE IF NOT EXISTS schema_migrations (
+             version text primary key,
+             applied_at timestamptz default now()
          )
--    )
-+        """
-+    conn.exec_driver_sql(ddl)
+         """
+     conn.exec_driver_sql(ddl)
  
  
  def _list_applied_versions(conn: sa.Connection) -> set[str]:
@@ -68,12 +28,52 @@ index ba09b4952cdfcd7c01325338f5ea87c61f9b9375..4ca02b4503982fe09210a929e175f0c8
      cleaned = statement.strip()
      if not cleaned:
          return
-     match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", cleaned, re.IGNORECASE)
+-    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", cleaned, re.IGNORECASE)
++    if re.match(r"(?is)^\s*CREATE\s+EXTENSION\b", cleaned):
++        return
++    repl = cleaned
++    repl = re.sub(r"(?i)\btimestamptz\b", "TEXT", repl)
++    repl = re.sub(r"(?i)\bdouble\s+precision\b", "REAL", repl)
++    repl = re.sub(r"(?i)\bjsonb\b", "TEXT", repl)
++    repl = re.sub(r"(?i)\bboolean\b", "INTEGER", repl)
++    repl = re.sub(r"(?i)\bnow\(\)", "CURRENT_TIMESTAMP", repl)
++    repl = re.sub(r"(?is)'\{\}'\s*::\s*TEXT", "'{}'", repl)
++    repl = re.sub(r"(?is)'\{\}'\s*::\s*jsonb", "'{}'", repl)
++    repl = re.sub(r"(?is)gen_random_uuid\(\)\s*::\s*text", "lower(hex(randomblob(16)))", repl)
++    repl = re.sub(r"(?is)\bgen_random_uuid\(\)", "lower(hex(randomblob(16)))", repl)
++    repl = re.sub(r"(?is)::\s*text\b", "", repl)
++    repl = re.sub(r"(?is)::\s*jsonb\b", "", repl)
++    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", repl, re.IGNORECASE)
      if match:
          table, column = match.group(1), match.group(2)
          existing = _sqlite_column_names(conn, table)
          if column in existing:
              logger.info("[DB][MIGRATE][SQLITE] skip existing column table=%s column=%s", table, column)
              return
-     conn.execute(text(cleaned))
+-    conn.execute(text(cleaned))
++    conn.exec_driver_sql(repl)
  
+ 
+ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
+     url = str(engine.url)
+     db_path = None
+     if config.is_sqlite_url(url):
+         db_path = Path(engine.url.database or "")
+         if db_path:
+             _prepare_sqlite_path(db_path)
+         if db_path and _must_bootstrap_sqlite(db_path, REQUIRED_TABLES):
+             logger.warning(
+                 "[DB][MIGRATE][BOOTSTRAP] reason=missing_required_tables path=%s size=%s",
+                 db_path,
+                 _db_file_size(db_path),
+             )
+             schema_for_engine(engine).metadata.create_all(engine)
+             _write_schema_stamp(migrations_dir)
+             if db_path:
+                 logger.info(
+                     "[DB][CHECK] path=%s exists=%s size=%s",
+                     db_path,
+                     int(os.path.exists(db_path)),
+                     os.path.getsize(db_path) if os.path.exists(db_path) else -1,
+                 )
+             return
