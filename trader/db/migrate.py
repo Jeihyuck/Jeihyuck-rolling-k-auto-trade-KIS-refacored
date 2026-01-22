@@ -10,6 +10,7 @@ from typing import Iterable
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import OperationalError
 
 from . import config
 from .schema import schema_for_engine
@@ -18,6 +19,35 @@ from .schema import schema_for_engine
 logger = logging.getLogger(__name__)
 MIGRATION_VERSION = "v1"
 REQUIRED_TABLES = ("runs",)
+
+
+def _strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
+    out_lines = []
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("--"):
+            continue
+        if "--" in line:
+            line = line.split("--", 1)[0]
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
+def _is_sqlite_benign(err_msg: str) -> bool:
+    lowered = err_msg.lower()
+    return any(
+        token in lowered
+        for token in (
+            "duplicate column name",
+            "no such column",
+            "already exists",
+            "duplicate table",
+            "duplicate index",
+        )
+    )
 
 
 def _sqlite_has_table(db_path: Path, table_name: str) -> bool:
@@ -237,9 +267,10 @@ def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
             return
     try:
         conn.exec_driver_sql(repl)
-    except Exception as exc:
-        if _should_ignore_sqlite_error(exc):
-            logger.info("[DB][MIGRATE][SQLITE] ignore error=%s statement=%s", exc, repl)
+    except OperationalError as exc:
+        msg = str(getattr(exc, "orig", exc))
+        if _is_sqlite_benign(msg):
+            logger.warning("[DB][MIGRATE][SQLITE][BENIGN_SKIP] %s | %s", msg, repl[:200])
             return
         raise
 
@@ -255,17 +286,6 @@ def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
             logger.info("[DB][MIGRATE][PG] ignore error=%s statement=%s", exc, cleaned)
             return
         raise
-
-
-def _should_ignore_sqlite_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    if "duplicate column name" in message:
-        return True
-    if "no such column" in message:
-        return True
-    if "already exists" in message and ("table" in message or "index" in message):
-        return True
-    return False
 
 
 def _should_ignore_pg_error(exc: Exception) -> bool:
@@ -322,7 +342,7 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
                 version = path.name
                 if version in applied:
                     continue
-                sql = path.read_text()
+                sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
                 logger.info("[DB][MIGRATE] applying %s", version)
                 try:
                     statements = [stmt for stmt in sql.split(";") if stmt.strip()]
@@ -360,7 +380,7 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             version = path.name
             if version in applied:
                 continue
-            sql = path.read_text()
+            sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
             logger.info("[DB][MIGRATE] applying %s", version)
             try:
                 statements = [stmt for stmt in sql.split(";") if stmt.strip()]
