@@ -68,10 +68,17 @@ from trader.db.migrate import run_migrations
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.ledger.store import LedgerStore
-from trader.pb1_engine import PB1Engine, resolve_pb1_phase
+from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_today
 from trader.reconcile_db import close_stale_positions
-from trader.reset_utils import detect_account_fp, purge_bot_state
+from trader.reset_utils import (
+    detect_account_fp,
+    load_reset_guard,
+    purge_bot_state,
+    record_purge_event,
+    should_purge_on_empty_kis_holdings,
+    update_reset_guard_from_balance,
+)
 from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
 from trader.time_utils import now_kst
 from trader.eventlog import emit_event
@@ -101,26 +108,29 @@ def _balance_snapshot_ttl_sec() -> int:
     return _parse_int_env("PB1_BALANCE_SNAPSHOT_TTL_SEC", 120)
 
 
-def _load_stale_balance_snapshot(runtime_store: RuntimeStore, now: datetime) -> tuple[dict | None, str | None]:
+def _load_stale_balance_snapshot(
+    runtime_store: RuntimeStore,
+    now: datetime,
+) -> tuple[dict | None, str | None, datetime | None]:
     payload = runtime_store.load_balance_snapshot()
     if not payload:
-        return None, None
+        return None, None, None
     ts_raw = payload.get("timestamp_kst")
     if not ts_raw:
-        return None, None
+        return None, None, None
     try:
         ts = datetime.fromisoformat(ts_raw)
     except ValueError:
-        return None, None
+        return None, None, None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=ZoneInfo("Asia/Seoul"))
     age_sec = (now - ts).total_seconds()
     if age_sec > _balance_snapshot_ttl_sec():
-        return None, None
+        return None, None, None
     snapshot = payload.get("normalized") or payload.get("raw")
     if not isinstance(snapshot, dict):
-        return None, None
-    return snapshot, "snapshot"
+        return None, None, None
+    return snapshot, "snapshot", ts
 
 
 def get_balance_state(
@@ -149,14 +159,24 @@ def get_balance_state(
             source="api" if balance_source == "api" else "cache",
             timestamp_kst=now.isoformat(),
         )
+        update_reset_guard_from_balance(
+            runtime_store.base_dir,
+            now_kst=now,
+            kis_output1=balance_snapshot_raw.get("output1") or [],
+        )
         return BALANCE_STATE_OK, balance_snapshot_raw, balance_source
     except KisBalanceUnavailable as exc:
         logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
     except Exception:
         logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
 
-    stale_snapshot, stale_source = _load_stale_balance_snapshot(runtime_store, now)
+    stale_snapshot, stale_source, stale_ts = _load_stale_balance_snapshot(runtime_store, now)
     if stale_snapshot:
+        update_reset_guard_from_balance(
+            runtime_store.base_dir,
+            now_kst=stale_ts or now,
+            kis_output1=stale_snapshot.get("output1") or [],
+        )
         return BALANCE_STATE_STALE_OK, stale_snapshot, stale_source
     return BALANCE_STATE_UNKNOWN, None, None
 
@@ -343,6 +363,35 @@ def ensure_universe_built_once(
             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
             post_meta.get("today_path"),
         )
+
+
+def _load_universe_context(
+    *,
+    runtime_store: RuntimeStore,
+    as_of: str,
+    env: str,
+    strategy: str,
+) -> UniverseContext:
+    members, meta = runtime_store.load_universe_for_trading(as_of)
+    if not isinstance(members, list) or not members:
+        ensure_universe_built_once(
+            runtime_store=runtime_store,
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            force=True,
+            allow_missing=False,
+        )
+        members, meta = runtime_store.load_universe_for_trading(as_of)
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"Universe missing/empty: cannot trade as_of={as_of} path={meta.get('selected_path')}")
+    universe_as_of = meta.get("as_of") or (members[0].get("as_of_date") if members else None)
+    return UniverseContext(
+        as_of_date=universe_as_of,
+        members=members,
+        selected_path=meta.get("selected_path"),
+        meta=meta,
+    )
 
 
 def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
@@ -1202,14 +1251,20 @@ def run_once(
     touched_files: list[Path] = []
     result = None
     run_start_ts = time_mod.time()
+    universe_ctx: UniverseContext | None = None
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            universe_ok, universe_meta = runtime_store.universe_check(as_of)
-            if not universe_ok:
-                if phase_for_log == "entry":
-                    logger.info("[PB1][ENTRY_BLOCKED] reason=universe_missing_both entry_allowed=0")
-                logger.info("[PB1][SKIP] reason=universe_missing_both as_of=%s", as_of)
-                logger.info("[PB1][EXIT_FORCE_RUN] reason=universe_missing_both as_of=%s", as_of)
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            try:
+                universe_ctx = _load_universe_context(
+                    runtime_store=runtime_store,
+                    as_of=as_of,
+                    env=kis_env or "practice",
+                    strategy=universe_strategy,
+                )
+            except RuntimeError as exc:
+                logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
+                raise
         kis: KisAPI | None = None
         try:
             kis = KisAPI()
@@ -1301,24 +1356,51 @@ def run_once(
                 reset_reason = "account_fp_mismatch"
             elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
                 kis_holdings = balance_snapshot_raw.get("output1") or []
-                existing_positions = positions_repo.list_positions(kis_env or "practice", "pb1_pullback_close")
-                existing_positions_count = len([p for p in existing_positions if int(p.get("qty") or 0) > 0])
                 ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
                 ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-                ledger_has_positions = any(
-                    int(state.get("total_qty") or 0) > 0 for state in ledger_positions.values()
+                ledger_positions_count = sum(
+                    1 for state in ledger_positions.values() if int(state.get("total_qty") or 0) > 0
                 )
                 dnca_total = _extract_dnca_total(balance_snapshot_raw)
+                reset_guard = load_reset_guard(resolved_bot_state_dir)
+                last_seen_positions_count = reset_guard.get("last_seen_positions_count")
+                last_balance_had_positions = reset_guard.get("last_balance_had_positions")
+                should_purge, purge_reason = should_purge_on_empty_kis_holdings(
+                    kis_output1=kis_holdings,
+                    ledger_positions_count=ledger_positions_count,
+                    last_seen_positions_count=last_seen_positions_count,
+                    last_balance_had_positions=last_balance_had_positions,
+                    now_kst=now,
+                    reason_ctx=reset_guard,
+                )
                 is_paper_env = (kis_env or "").lower() != "real"
-                if len(kis_holdings) == 0 and (existing_positions_count > 0 or ledger_has_positions) and dnca_total is not None:
+                if len(kis_holdings) == 0:
                     if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
                         reset_reason = "paper_reset_detected"
                         logger.warning(
                             "[PB1][RESET][DETECTED] reason=paper_reset dnca_tot_amt=%s",
                             dnca_total,
                         )
-                    elif dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
+                    elif not should_purge:
+                        logger.info(
+                            "[STATE][PURGE][SKIP] reason=%s kis_holdings_count=%s ledger_positions_count=%s last_seen_positions_count=%s last_balance_had_positions=%s",
+                            purge_reason,
+                            len(kis_holdings),
+                            ledger_positions_count,
+                            last_seen_positions_count,
+                            last_balance_had_positions,
+                        )
+                    elif dnca_total is None or dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
                         reset_reason = "empty_kis_holdings_detected"
+                    else:
+                        logger.info(
+                            "[STATE][PURGE][SKIP] reason=dnca_total_above_threshold kis_holdings_count=%s ledger_positions_count=%s last_seen_positions_count=%s last_balance_had_positions=%s dnca_total=%s",
+                            len(kis_holdings),
+                            ledger_positions_count,
+                            last_seen_positions_count,
+                            last_balance_had_positions,
+                            dnca_total,
+                        )
 
         if reset_reason:
             if reset_reason == "paper_reset_detected":
@@ -1356,6 +1438,7 @@ def run_once(
             run_migrations(engine)
             meta_payload = {"account_fp": account_fp_now} if account_fp_now else {}
             _write_runtime_meta(resolved_bot_state_dir, meta_payload)
+            record_purge_event(resolved_bot_state_dir, now_kst=now, reason=reset_reason)
         elif account_fp_now:
             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
             if runtime_meta.get("account_fp") != account_fp_now:
@@ -1453,6 +1536,7 @@ def run_once(
             entry_allowed_this_tick=entry_allowed_this_tick,
             entry_block_reason=entry_block_reason,
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
+            universe_context=universe_ctx,
         )
         if close_cancel_only:
             result = engine_runner.run_close_cancel()

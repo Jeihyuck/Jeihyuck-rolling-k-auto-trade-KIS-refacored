@@ -367,6 +367,38 @@ def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
                 _safe_rm(entry)
 
 
+def _parse_porcelain_path(line: str) -> tuple[str, str]:
+    status = line[:2]
+    path = line[3:].strip()
+    if "->" in path:
+        path = path.split("->")[-1].strip()
+    return status, path
+
+
+def _clean_non_allowlisted_changes(
+    worktree_dir: Path,
+    status_lines: list[str],
+    patterns: list[str],
+) -> tuple[int, int]:
+    reverted_deleted = 0
+    cleaned_untracked = 0
+    for line in status_lines:
+        if not line.strip():
+            continue
+        status, path = _parse_porcelain_path(line)
+        if not path:
+            continue
+        if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns):
+            continue
+        if status == "??":
+            _git_worktree(worktree_dir, "clean", "-fd", "--", path, check=False)
+            cleaned_untracked += 1
+        else:
+            _git_worktree(worktree_dir, "restore", "--staged", "--worktree", "--", path, check=False)
+            reverted_deleted += 1
+    return reverted_deleted, cleaned_untracked
+
+
 def _cached_diff_names(worktree_dir: Path) -> list[str]:
     output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
     return [line for line in output.splitlines() if line.strip()]
@@ -918,6 +950,25 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         ]
         _stage_allowlist(worktree_dir, allow_patterns)
         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
+        status_lines = [line for line in status.splitlines() if line.strip()]
+        clean_patterns = [
+            "bot_state/archive/**",
+            "bot_state/runtime/ohlcv_cache/**",
+            "bot_state/db/*.bak*",
+        ]
+        reverted_deleted, cleaned_untracked = _clean_non_allowlisted_changes(
+            worktree_dir,
+            status_lines,
+            clean_patterns,
+        )
+        if reverted_deleted or cleaned_untracked:
+            logger.info(
+                "[BOTSTATE][PERSIST][CLEAN] reverted_deleted=%s cleaned_untracked=%s patterns=%s",
+                reverted_deleted,
+                cleaned_untracked,
+                clean_patterns,
+            )
+        status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_post").stdout
         cached_names = _run_git_logged(
             ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
         ).stdout

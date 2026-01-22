@@ -349,6 +349,14 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class UniverseContext:
+    as_of_date: str | None
+    members: list[dict]
+    selected_path: str | None = None
+    meta: dict | None = None
+
+
+@dataclass(frozen=True)
 class FilterThresholds:
     vol_contraction_max: float
     volu_contraction_max: float
@@ -433,6 +441,7 @@ class PB1Engine:
         entry_allowed_this_tick: bool = True,
         entry_block_reason: str | None = None,
         preopen_max_new_positions: int = 0,
+        universe_context: UniverseContext | None = None,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -471,6 +480,8 @@ class PB1Engine:
         self._now_kst = now_kst_value or now_kst()
         self._today = self._now_kst.date().isoformat()
         self._universe_as_of = None
+        self._universe_path: str | None = None
+        self._universe_context = universe_context
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
         self._balance_cost: float | None = None
@@ -2800,13 +2811,20 @@ class PB1Engine:
         )
 
     def _load_universe(self) -> list[dict]:
-        today = self._now_kst.date().isoformat()
-        members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
-        self._universe_as_of = today if members else None
-        if not members:
-            members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
-            if members:
-                self._universe_as_of = members[0].get("as_of_date")
+        if self._universe_context is not None:
+            members = list(self._universe_context.members or [])
+            self._universe_as_of = self._universe_context.as_of_date or (
+                members[0].get("as_of_date") if members else None
+            )
+            self._universe_path = self._universe_context.selected_path
+        else:
+            today = self._now_kst.date().isoformat()
+            members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
+            self._universe_as_of = today if members else None
+            if not members:
+                members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
+                if members:
+                    self._universe_as_of = members[0].get("as_of_date")
         self._code_name_map = {
             str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
             for m in members or []
@@ -3175,7 +3193,13 @@ class PB1Engine:
         )
         if not members:
             note = "universe_empty"
-            logger.warning("[PB1][UNIVERSE][EMPTY] env=%s strategy=%s", self.env, self.UNIVERSE_STRATEGY)
+            logger.error(
+                "[PB1][UNIVERSE][EMPTY] env=%s strategy=%s path=%s members_count=%s action_required=universe_build",
+                self.env,
+                self.UNIVERSE_STRATEGY,
+                self._universe_path,
+                len(members),
+            )
             self._log_reason_summary("universe_empty")
             entry_reason = "universe_empty"
             entry_allowed = False
