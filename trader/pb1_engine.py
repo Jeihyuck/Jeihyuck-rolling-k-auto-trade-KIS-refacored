@@ -49,7 +49,11 @@ from trader.config import (
     PB1_VOLU_MAX_INTRADAY,
     PB1_PULLBACK_MIN,
     PB1_PULLBACK_MAX,
+    PB1_ENTRY_MODE,
     PB1_REQUIRE_BOTH,
+    PB1_REQUIRE_BOTH_CONTRACTIONS,
+    PB1_LOG_ENTRY_GATE,
+    PB1_LOG_DROP_REASONS_TOPN,
     MIN_ORDER_KRW,
     MINERVINI_ADD_ON_R,
     MINERVINI_BREAKOUT_VOL_MULT,
@@ -487,6 +491,11 @@ class PB1Engine:
         self._setup_reason_counter: Counter[str] = Counter()
         self._now_kst = now_kst_value or now_kst()
         self._today = self._now_kst.date().isoformat()
+        self.entry_mode = PB1_ENTRY_MODE
+        self.entry_require_both = bool(PB1_REQUIRE_BOTH)
+        self.log_entry_gate = bool(PB1_LOG_ENTRY_GATE)
+        self.drop_reasons_topn = int(PB1_LOG_DROP_REASONS_TOPN)
+        self.debug = env_bool("DEBUG", False)
         self._universe_as_of = None
         self._universe_path: str | None = None
         self._universe_context = universe_context
@@ -512,6 +521,7 @@ class PB1Engine:
         self.entry_capital_krw: float | None = None
         self.entry_usable_krw: float | None = None
         self.entry_tick_budget_krw: float | None = None
+        self.entry_reserve_krw: float | None = None
         self.target_new_positions: int | None = None
         self._budget_plan_meta: dict[str, Any] | None = None
 
@@ -592,7 +602,7 @@ class PB1Engine:
             volu_contraction_max=volu_max,
             pullback_min=PB1_PULLBACK_MIN,
             pullback_max=PB1_PULLBACK_MAX,
-            require_both_contractions=PB1_REQUIRE_BOTH,
+            require_both_contractions=PB1_REQUIRE_BOTH_CONTRACTIONS,
         )
         logger.info(
             "[PB1][THRESHOLDS] intraday=%s phase=%s window=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
@@ -991,6 +1001,7 @@ class PB1Engine:
         reasons: list[str],
         entry_allowed: bool,
         entry_reason: str,
+        stage: str | None = None,
     ) -> None:
         def _to_float(value: object) -> float:
             try:
@@ -1038,9 +1049,18 @@ class PB1Engine:
             )
         if not buyable:
             logger.info(
-                "[PB1][BUY][SKIP] code=%s reasons=%s",
+                "[PB1][BUY][SKIP] code=%s reasons=%s stage=%s",
                 self._display_code(cf.code),
                 reasons_out,
+                stage or "PB1-CLOSE",
+            )
+        else:
+            logger.info(
+                "[PB1][BUY][INTENT] code=%s qty=%s price=%s reason=%s",
+                self._display_code(cf.code),
+                qty,
+                _to_float(price),
+                "entry_ok",
             )
 
     def _fetch_holdings_snapshot(self) -> dict:
@@ -1082,6 +1102,63 @@ class PB1Engine:
             enriched.append(f"name:{name}")
         return enriched
 
+    def _entry_gate(self, *, pullback_ok: bool, breakout_ok: bool) -> tuple[bool, list[str]]:
+        mode = (self.entry_mode or "BOTH").strip().upper()
+        require_both = bool(self.entry_require_both)
+        reasons: list[str] = []
+
+        if mode == "PULLBACK":
+            entry_ok = bool(pullback_ok)
+            if not entry_ok:
+                reasons.append("pullback_fail")
+            return entry_ok, reasons
+
+        if mode == "BREAKOUT":
+            entry_ok = bool(breakout_ok)
+            if not entry_ok:
+                reasons.append("pivot_breakout_fail")
+            return entry_ok, reasons
+
+        if require_both:
+            entry_ok = bool(pullback_ok and breakout_ok)
+            if not pullback_ok:
+                reasons.append("pullback_fail")
+            if not breakout_ok:
+                reasons.append("pivot_breakout_fail")
+            if not entry_ok:
+                reasons.append("require_both_fail")
+            return entry_ok, reasons
+
+        entry_ok = bool(pullback_ok or breakout_ok)
+        if not entry_ok:
+            if not pullback_ok:
+                reasons.append("pullback_fail")
+            if not breakout_ok:
+                reasons.append("pivot_breakout_fail")
+            reasons.append("require_either_fail")
+        return entry_ok, reasons
+
+    def _log_entry_gate(self, *, code: str, pullback_ok: bool, breakout_ok: bool, entry_ok: bool) -> None:
+        if not self.log_entry_gate:
+            return
+        logger.info(
+            "[PB1][ENTRY_GATE] code=%s pullback_ok=%s breakout_ok=%s entry_mode=%s require_both=%s entry_ok=%s",
+            self._display_code(code),
+            int(bool(pullback_ok)),
+            int(bool(breakout_ok)),
+            self.entry_mode,
+            int(bool(self.entry_require_both)),
+            int(bool(entry_ok)),
+        )
+
+    def _log_buyable_gate(self, *, code: str, ok: bool, reasons: list[str]) -> None:
+        logger.info(
+            "[PB1][BUYABLE_GATE] code=%s ok=%s reasons=%s",
+            self._display_code(code),
+            int(bool(ok)),
+            reasons or ["ok"],
+        )
+
     def _append_ledger_event(
         self,
         *,
@@ -1098,24 +1175,34 @@ class PB1Engine:
         stage: str | None,
         payload_json: dict | None = None,
     ) -> None:
-        self.ledger_repo.append_event(
-            env=self.env,
-            run_id=self.run_id,
-            event_type=event_type,
-            ts=now_kst(),
-            code=code,
-            market=market,
-            sid=1,
-            mode=mode,
-            side=side,
-            qty=qty,
-            price=price,
-            client_order_key=client_order_key,
-            ok=ok,
-            reasons=self._with_name_reason(reasons, code),
-            stage=stage,
-            payload_json=payload_json or {},
-        )
+        try:
+            self.ledger_repo.append_event(
+                env=self.env,
+                run_id=self.run_id,
+                event_type=event_type,
+                ts=now_kst(),
+                code=code,
+                market=market,
+                sid=1,
+                mode=mode,
+                side=side,
+                qty=qty,
+                price=price,
+                client_order_key=client_order_key,
+                ok=ok,
+                reasons=self._with_name_reason(reasons, code),
+                stage=stage,
+                payload_json=payload_json or {},
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PB1][LEDGER][FAIL] event=%s code=%s err=%s",
+                event_type,
+                self._display_code(code),
+                repr(exc),
+            )
+            if self.debug:
+                logger.exception("[PB1][LEDGER][FAIL_TRACE]")
 
     @staticmethod
     def _format_order_result_reason(resp: dict | None) -> str:
@@ -1554,7 +1641,7 @@ class PB1Engine:
         all_reason_counts: Counter[str] = Counter()
         relax_passes_used = 0
         applied_min_score = float(PB1_MIN_SCORE_BASE)
-        applied_require_both = bool(PB1_REQUIRE_BOTH)
+        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
 
         min_score_values: list[float] = []
         current = float(PB1_MIN_SCORE_BASE)
@@ -1567,8 +1654,10 @@ class PB1Engine:
         if not min_score_values:
             min_score_values = [float(PB1_MIN_SCORE_BASE)]
 
-        relax_passes: list[tuple[float, bool, str]] = [(score, bool(PB1_REQUIRE_BOTH), "score_relax") for score in min_score_values]
-        if PB1_REQUIRE_BOTH and len(relax_passes) < max_passes + 1:
+        relax_passes: list[tuple[float, bool, str]] = [
+            (score, bool(PB1_REQUIRE_BOTH_CONTRACTIONS), "score_relax") for score in min_score_values
+        ]
+        if PB1_REQUIRE_BOTH_CONTRACTIONS and len(relax_passes) < max_passes + 1:
             relax_passes.append((min_score_values[-1], False, "require_both_off"))
 
         for min_score, require_both, relax_label in relax_passes:
@@ -1758,21 +1847,30 @@ class PB1Engine:
                 continue
             atr_pct = cf.features.get("atr_pct")
             value20 = cf.features.get("value20")
-            if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
+            risk_reasons: list[str] = []
+            atr_missing = atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct)
+            value_missing = value20 is None or (isinstance(value20, float) and value20 != value20)
+            if atr_missing:
+                risk_reasons.append("atr_pct_missing")
+            elif float(atr_pct) > float(PB1_MAX_ATR_PCT):
+                risk_reasons.append("atr_pct_too_high")
+            if value_missing:
+                risk_reasons.append("value20_missing")
+            elif float(value20) < float(PB1_MIN_VALUE20):
+                risk_reasons.append("liquidity_too_low")
+
+            logger.info(
+                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr_pct=%s atr_pct_max=%s",
+                self._display_code(cf.code),
+                int(not risk_reasons),
+                risk_reasons or ["ok"],
+                float(atr_pct) if atr_pct is not None else None,
+                float(PB1_MAX_ATR_PCT),
+            )
+
+            if risk_reasons:
                 cf.setup_ok = False
-                cf.reasons.append("atr_pct_missing")
-                continue
-            if float(atr_pct) > float(PB1_MAX_ATR_PCT):
-                cf.setup_ok = False
-                cf.reasons.append("atr_pct_too_high")
-                continue
-            if value20 is None or (isinstance(value20, float) and value20 != value20):
-                cf.setup_ok = False
-                cf.reasons.append("value20_missing")
-                continue
-            if float(value20) < float(PB1_MIN_VALUE20):
-                cf.setup_ok = False
-                cf.reasons.append("liquidity_too_low")
+                cf.reasons.extend(risk_reasons)
                 continue
 
             filtered.append(cf)
@@ -1869,6 +1967,34 @@ class PB1Engine:
                 qty = min(qty, int(budget_cap // order_px))
             if min_order_krw > 0 and qty * order_px < min_order_krw:
                 qty = 0
+            reserve_krw = float(self.entry_reserve_krw or 0.0)
+            usable_cash = float(self.entry_usable_krw or 0.0)
+            sizing_reasons: list[str] = []
+            if qty <= 0:
+                if tick_budget <= 0:
+                    sizing_reasons.append("tick_budget_zero")
+                if min_order_krw > 0 and tick_budget > 0 and min_order_krw > tick_budget:
+                    sizing_reasons.append("min_order_krw_gt_tick_budget")
+                if order_px > 0 and tick_budget > 0 and order_px > tick_budget:
+                    sizing_reasons.append("price_gt_tick_budget")
+                if min_order_krw > 0 and order_px > 0 and order_px > min_order_krw:
+                    sizing_reasons.append("price_gt_min_order")
+                if reserve_krw > 0:
+                    sizing_reasons.append("reserve_applied")
+                if not sizing_reasons:
+                    sizing_reasons.append("planned_qty_zero_or_min_order")
+            logger.info(
+                "[PB1][SIZING] code=%s cash_usable=%s tick_budget=%s reserve=%s px=%s qty=%s min_order_krw=%s ok=%s reason=%s",
+                self._display_code(cf.code),
+                usable_cash,
+                tick_budget,
+                reserve_krw,
+                order_px,
+                qty,
+                min_order_krw,
+                int(qty > 0),
+                sizing_reasons or ["ok"],
+            )
             if qty <= 0:
                 cf.setup_ok = False
                 cf.reasons.append("planned_qty_zero_or_min_order")
@@ -3428,7 +3554,7 @@ class PB1Engine:
                 entry_block_reason=entry_reason,
                 setup_ok_count=len(setup_ok_codes or []),
                 selected_count=len(orderable_candidates or []),
-                top_drop_reasons=drop_reason_counter.most_common(5),
+                top_drop_reasons=drop_reason_counter.most_common(self.drop_reasons_topn),
             )
             entry_summary_emitted = True
 
@@ -3463,6 +3589,7 @@ class PB1Engine:
             )
             self.entry_capital_krw = float(entry_capital_krw)
             self.entry_usable_krw = float(entry_usable_krw)
+            self.entry_reserve_krw = max(0.0, float(base_cash_krw) - float(entry_usable_krw))
             budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
             tick_budget_krw = int(entry_capital_krw * budget_pct)
             self.entry_tick_budget_krw = float(tick_budget_krw)
@@ -3492,6 +3619,7 @@ class PB1Engine:
             self.entry_capital_krw = 0.0
             self.entry_usable_krw = float(available_cash_krw)
             self.entry_tick_budget_krw = 0.0
+            self.entry_reserve_krw = 0.0
             tick_budget_krw = 0.0
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
@@ -3617,7 +3745,7 @@ class PB1Engine:
         tiers_tried: list[str] = []
         relax_passes_used = 0
         applied_min_score = float(PB1_MIN_SCORE_BASE)
-        applied_require_both = bool(PB1_REQUIRE_BOTH)
+        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
         setup_ok_codes: list[str] = []
         drop_reason_counter: Counter[str] = Counter()
         drop_examples: Dict[str, list[str]] = {}
@@ -3709,6 +3837,7 @@ class PB1Engine:
                         close_price,
                         min_order_krw,
                     )
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["qty_zero"])
                     self._log_order_skip(cf, ["qty_zero"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3727,6 +3856,7 @@ class PB1Engine:
                         close_price,
                         min_order_krw,
                     )
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_min_order"])
                     self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3745,6 +3875,7 @@ class PB1Engine:
                         close_price,
                         min_order_krw,
                     )
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_one_share"])
                     self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3757,6 +3888,7 @@ class PB1Engine:
                 order_value = order_price * float(cf.planned_qty or 0)
                 if not allow_add_to_existing and cf.code in held_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["holding_position"])
                     self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3768,6 +3900,7 @@ class PB1Engine:
                     continue
                 if cf.code in open_buy_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["open_order"])
                     self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3779,6 +3912,7 @@ class PB1Engine:
                     continue
                 if cf.code in today_buy_codes:
                     self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["today_buy_exists"])
                     self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3791,6 +3925,7 @@ class PB1Engine:
                 cooldown_until = cooldown_map.get(cf.code)
                 if cooldown_until and str(cooldown_until) >= self._today:
                     self._record_drop(drop_reason_counter, drop_examples, "cooldown_active", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cooldown_active"])
                     self._log_order_skip(cf, ["cooldown_active"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3802,6 +3937,7 @@ class PB1Engine:
                     continue
                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["duplicate_order"])
                     self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3813,6 +3949,7 @@ class PB1Engine:
                     continue
                 if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_close_only", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_close_only"])
                     self._log_order_skip(cf, ["entry_mode_close_only"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3824,6 +3961,7 @@ class PB1Engine:
                     continue
                 if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_intraday_only", cf.code)
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_intraday_only"])
                     self._log_order_skip(cf, ["entry_mode_intraday_only"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -3833,6 +3971,7 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
+                self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
                 last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
                 last_volume = float(cf.features.get("last_volume") or 0.0)
                 trigger_ok, trigger_info = entry_trigger(
@@ -3841,14 +3980,27 @@ class PB1Engine:
                     last_volume=last_volume,
                     cfg=self.minervini_config,
                 )
-                if not trigger_ok:
-                    cf.features["entry_trigger"] = trigger_info
-                    self._record_drop(drop_reason_counter, drop_examples, "pivot_breakout_fail", cf.code)
-                    self._log_order_skip(cf, ["pivot_breakout_fail"], "PB1-CLOSE")
+                pullback_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
+                entry_ok, entry_reasons = self._entry_gate(
+                    pullback_ok=pullback_ok,
+                    breakout_ok=trigger_ok,
+                )
+                self._log_entry_gate(
+                    code=cf.code,
+                    pullback_ok=pullback_ok,
+                    breakout_ok=trigger_ok,
+                    entry_ok=entry_ok,
+                )
+                if not entry_ok:
+                    if not trigger_ok:
+                        cf.features["entry_trigger"] = trigger_info
+                    for reason in entry_reasons:
+                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                    self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["pivot_breakout_fail"],
+                        reasons=entry_reasons or ["entry_gate_fail"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
@@ -3962,7 +4114,7 @@ class PB1Engine:
                 after_risk_check_count,
                 after_buyable_check_count,
                 after_dedup_count,
-                drop_reason_counter.most_common(3),
+                drop_reason_counter.most_common(self.drop_reasons_topn),
                 {k: v for k, v in drop_examples.items() if v},
             )
             summary_reason = "OK"

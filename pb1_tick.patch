@@ -1,299 +1,385 @@
-diff --git a/tests/test_universe_build_empty_ok.py b/tests/test_universe_build_empty_ok.py
-index 213654a2105bdca37c77157a295e81809f440262..65fe444541702e03ac5f8ec6d0f01897e4c99928 100644
---- a/tests/test_universe_build_empty_ok.py
-+++ b/tests/test_universe_build_empty_ok.py
-@@ -1,24 +1,24 @@
- import os
- from importlib import reload
+diff --git a/trader/config.py b/trader/config.py
+index da3764a71388efd1a78432dd34f8a37fca991cbc..2933483fc27552b37d5c4b2df167460b632c39c8 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -120,50 +120,54 @@ CONFIG = {
+     "STATE_PATH": "runtime/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "240",
+     "LEDGER_BASE_DIR": "trader_ledger",
+     "BOT_STATE_RESET": "0",
+     "BOT_STATE_HARD_RESET": "0",
+     "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
+     "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
+     "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
+     "PAPER_RESET_AUTO_PURGE": "0",
+     "PAPER_RESET_EVENT_ONLY_IN_PRACTICE": "1",
+     "PB1_CAPITAL_MODE": "CASH",
+     "PB1_ENTRY_CAPITAL_KRW": "0",
+     "PB1_CASH_RESERVE_PCT": "0.10",
+     "PB1_ALLOW_PREOPEN_ENTRY": "0",
+     "PB1_PREOPEN_START": "08:45",
+     "PB1_PREOPEN_END": "09:00",
+     "PB1_PREOPEN_REQUIRE_BALANCE": "1",
+     "PB1_PREOPEN_MAX_NEW_POSITIONS": "0",
+     "PB1_PREOPEN_ORDER_TYPE": "LIMIT",
+     "PB1_PREOPEN_LIMIT_BUFFER_PCT": "0.3",
+     "PB1_REQUIRE_BALANCE_FOR_ENTRY": "1",
+     "PB1_ENTRY_ENABLED": "true",
++    "PB1_ENTRY_MODE": "BOTH",
++    "PB1_REQUIRE_BOTH": "1",
++    "PB1_LOG_ENTRY_GATE": "1",
++    "PB1_LOG_DROP_REASONS_TOPN": "10",
+     "PB1_ENTRY_WINDOW_START": "09:00",
+     "PB1_ENTRY_OPEN_END": "09:05",
+     "PB1_ENTRY_WINDOW_END": "15:15",
+     "PB1_EXIT_WINDOW_START": "15:15",
+     "PB1_EXIT_WINDOW_END": "15:30",
+     "PB1_MORNING_WINDOW_END": "10:30",
+     "MORNING_WINDOW_START": "09:00",
+     "MORNING_WINDOW_END": "10:30",
+     "MORNING_EXIT_START": "09:00",
+     "MORNING_EXIT_END": "09:20",
+     "AFTERNOON_WINDOW_START": "10:30",
+     "AFTERNOON_WINDOW_END": "15:15",
+     "CLOSE_AUCTION_START": "15:15",
+     "CLOSE_AUCTION_END": "15:30",
+     "PB1_REQUIRE_VOLUME": "1",
+     "PB1_FORCE_ENTRY_ON_PUSH": "1",
+     "PB1_WAIT_FOR_WINDOW": "1",
+     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
+     "PB1_ALLOW_ADD_TO_EXISTING": "0",
+     "MIN_ORDER_KRW": "0",
+     "MARKET_OPEN_HHMM": "09:00",
+     "MARKET_CLOSE_HHMM": "15:30",
+     "PB1_PULLBACK_BAND_KOSPI": "3,8",
+     "PB1_PULLBACK_BAND_KOSDAQ": "4,10",
+     "PB1_VOL_CONTRACTION_MAX": "1.00",
+@@ -175,55 +179,55 @@ CONFIG = {
+     "PB1_SWING_VOL_CONTRACTION_MAX": "0.80",
+     "PB1_SWING_VOLU_CONTRACTION_MAX": "0.75",
+     "PB1_R_FLOOR_PCT": "2.0",
+     "PB1_DAY_TP_R": "0.8",
+     "PB1_DAY_SL_R": "0.6",
+     "KOSPI_HARD_STOP_PCT": "7.0",
+     "KOSDAQ_HARD_STOP_PCT": "8.0",
+     "PB1_SWING_TRAIL_MA": "20",
+     "PB1_TIME_STOP_DAYS": "10",
+     "PB1_MIN_CANDLES": "60",
+     # PB1 "최고 눌림목" 랭킹/사이징 튜닝
+     "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
+     "PB1_MIN_SCORE": "70",             # 점수 컷(0~100)
+     "PB1_MIN_SCORE_BASE": "70",        # Adaptive score cut 시작값
+     "PB1_MIN_SCORE_FLOOR": "55",       # Adaptive score cut 하한
+     "PB1_MIN_SCORE_STEP": "5",         # Adaptive score cut 단계
+     "PB1_FAILMODE_SOFT": "1",
+     "PB1_MIN_CANDIDATES": "3",
+     "PB1_RELAX_MAX_PASSES": "3",
+     "PB1_SPREAD_HARD_MAX_PCT": "0",
+     "PB1_GAP_HARD_MAX_PCT": "0",
+     "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.25",
+     "PB1_MAX_POS_PCT": "0.20",
+     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
+     "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
++    "PB1_ATR_PCT_MAX": "6.0",
+     "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
+     "PB1_VOL_MAX": "1.00",
+     "PB1_VOLU_MAX": "0.98",
+     "PB1_VOLU_MAX_INTRADAY": "1.05",
+-    "PB1_REQUIRE_BOTH": "1",
+     # Minervini v2 tuning
+     "MINERVINI_RS_MIN": "0.80",
+     "MINERVINI_MAX_PYRAMID": "3",
+     "MINERVINI_ADD_ON_R": "1.5",
+     "MINERVINI_BREAKOUT_VOL_MULT": "1.5",
+     "MINERVINI_MAX_EXTENSION_PIVOT": "0.05",
+     "MINERVINI_INITIAL_STOP_PCT": "0.075",
+     "MINERVINI_TIME_STOP_DAYS": "20",
+     "MINERVINI_HEAVY_VOL_MULT": "1.5",
+     # Minervini Pro universe/RS
+     "UNIVERSE_POOL_SIZE": "200",
+     "RS_BENCHMARK": "229200",
+     "RS_LOOKBACK_DAYS": "63",
+     "RS_LOOKBACK2_DAYS": "126",
+     "RS_MIN_PCTILE": "80",
+     "RS_COMPOSITE_W1": "0.6",
+     "RS_COMPOSITE_W2": "0.4",
+     # Market regime
+     "REGIME_INDEX": "229200",
+     "REGIME_MODE": "STRICT",
+     "REGIME_MA_FAST": "50",
+     "REGIME_MA_SLOW": "200",
+     "REGIME_BREADTH_WINDOW": "20",
+     "REGIME_MAX_RISK": "1.0",
+     "REGIME_MID_RISK": "0.6",
+@@ -612,54 +616,58 @@ MORNING_WINDOW_END = _cfg("MORNING_WINDOW_END") or "10:30"
+ MORNING_EXIT_START = _cfg("MORNING_EXIT_START") or "09:00"
+ MORNING_EXIT_END = _cfg("MORNING_EXIT_END") or "09:20"
+ AFTERNOON_WINDOW_START = _cfg("AFTERNOON_WINDOW_START") or "10:30"
+ AFTERNOON_WINDOW_END = _cfg("AFTERNOON_WINDOW_END") or "15:15"
+ CLOSE_AUCTION_START = _cfg("CLOSE_AUCTION_START") or "15:15"
+ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
+ PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
+ PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
+ PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
+ PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
+ MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "09:00"
+ MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
+ PB1_ENTRY_WINDOW_START = _cfg("PB1_ENTRY_WINDOW_START") or "09:00"
+ PB1_ENTRY_OPEN_END = _cfg("PB1_ENTRY_OPEN_END") or "09:05"
+ PB1_ENTRY_WINDOW_END = _cfg("PB1_ENTRY_WINDOW_END") or "15:15"
+ PB1_EXIT_WINDOW_START = _cfg("PB1_EXIT_WINDOW_START") or "15:15"
+ PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
+ PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:30"
+ PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
+ PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
+ PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.00")
+ PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "0.98")
+ PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
+ PB1_PULLBACK_MIN = float(_cfg("PB1_PULLBACK_MIN") or "0.03")
+ PB1_PULLBACK_MAX = float(_cfg("PB1_PULLBACK_MAX") or "0.18")
+-PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=True))
++PB1_ENTRY_MODE = (_cfg("PB1_ENTRY_MODE") or "BOTH").strip().upper()
++if PB1_ENTRY_MODE not in {"PULLBACK", "BREAKOUT", "BOTH"}:
++    logger.warning("[CONFIG] PB1_ENTRY_MODE invalid=%s -> fallback=BOTH", PB1_ENTRY_MODE)
++    PB1_ENTRY_MODE = "BOTH"
++PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH", fallback=True))
++PB1_REQUIRE_BOTH_CONTRACTIONS = _cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=PB1_REQUIRE_BOTH)
+ PB1_VOL_CONTRACTION_MAX = PB1_VOL_MAX
+ PB1_VOLU_CONTRACTION_MAX = PB1_VOLU_MAX
+-PB1_REQUIRE_BOTH_CONTRACTIONS = PB1_REQUIRE_BOTH
+ PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
+ PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
+ PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
+ PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
+ PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
+ PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
+ KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
+ KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
+ PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
+ PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
+ PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
+ MINERVINI_RS_MIN = float(_cfg("MINERVINI_RS_MIN") or "0.80")
+ MINERVINI_MAX_PYRAMID = int(_cfg("MINERVINI_MAX_PYRAMID") or "3")
+ MINERVINI_ADD_ON_R = float(_cfg("MINERVINI_ADD_ON_R") or "1.5")
+ MINERVINI_BREAKOUT_VOL_MULT = float(_cfg("MINERVINI_BREAKOUT_VOL_MULT") or "1.5")
+ MINERVINI_MAX_EXTENSION_PIVOT = float(_cfg("MINERVINI_MAX_EXTENSION_PIVOT") or "0.05")
+ MINERVINI_INITIAL_STOP_PCT = float(_cfg("MINERVINI_INITIAL_STOP_PCT") or "0.075")
+ MINERVINI_TIME_STOP_DAYS = int(_cfg("MINERVINI_TIME_STOP_DAYS") or "20")
+ MINERVINI_HEAVY_VOL_MULT = float(_cfg("MINERVINI_HEAVY_VOL_MULT") or "1.5")
+ UNIVERSE_POOL_SIZE = int(_cfg("UNIVERSE_POOL_SIZE") or "200")
  
- import pytest
  
- from trader.universe import build
- 
- 
- @pytest.fixture(autouse=True)
- def reset_env(tmp_path, monkeypatch):
-     db_url = f"sqlite:///{tmp_path}/test.db"
-     monkeypatch.setenv("DATABASE_URL", db_url)
-     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
-     yield
- 
- 
- def test_build_universe_succeeds_on_empty_payload(monkeypatch):
-     monkeypatch.setattr(
-         build,
-         "run_rebalance",
-         lambda as_of_date, return_by_market=True: {"selected": [], "selected_stocks": [], "selected_by_market": {}},
-     )
--    result = build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
--    assert result is None or isinstance(result, str)
-+    with pytest.raises(RuntimeError, match="universe_members_empty"):
-+        build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
-diff --git a/tests/test_universe_lkg_sqlite_fallback.py b/tests/test_universe_lkg_sqlite_fallback.py
-index 6dd7f1b5f8a43988bf3492cebf1bee3a742a225f..24dbd1b20cc180645c7991ed0d37409559e80e4c 100644
---- a/tests/test_universe_lkg_sqlite_fallback.py
-+++ b/tests/test_universe_lkg_sqlite_fallback.py
-@@ -80,50 +80,51 @@ def _install_sa_stub() -> None:
- 
-     sa_engine = types.ModuleType("sqlalchemy.engine")
-     sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
-     sa_engine.Engine = _DummyEngine
-     sys.modules["sqlalchemy.engine"] = sa_engine
-     sys.modules["sqlalchemy.engine.url"] = sa_engine.url
-     sys.modules["sqlalchemy"] = sa
+ def _normalize_index_code(raw: str | None, fallback: str) -> str:
+     value = (raw or "").strip()
+     if value.isdigit() and len(value) == 6:
+@@ -695,64 +703,68 @@ INITIAL_STOP_MODE = (_cfg("INITIAL_STOP_MODE") or "TIGHTLOW").strip().upper()
+ ATR_WINDOW = int(_cfg("ATR_WINDOW") or "14")
+ ATR_MULT = float(_cfg("ATR_MULT") or "2.5")
+ TAKE_PROFIT_R1 = float(_cfg("TAKE_PROFIT_R1") or "2.0")
+ TP1_SELL_PCT = float(_cfg("TP1_SELL_PCT") or "0.33")
+ TAKE_PROFIT_R2 = float(_cfg("TAKE_PROFIT_R2") or "3.0")
+ TP2_SELL_PCT = float(_cfg("TP2_SELL_PCT") or "0.33")
+ TRAIL_MODE = (_cfg("TRAIL_MODE") or "MA20").strip().upper()
+ TRAIL_STEP_AFTER_R = float(_cfg("TRAIL_STEP_AFTER_R") or "1.5")
+ FAILED_BREAKOUT_EXIT_DAYS = int(_cfg("FAILED_BREAKOUT_EXIT_DAYS") or "2")
+ REENTRY_COOLDOWN_DAYS = int(_cfg("REENTRY_COOLDOWN_DAYS") or "10")
  
  
- _install_sa_stub()
+ PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
+ PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
+ PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
+ PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")
+ PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or str(PB1_MIN_SCORE_BASE))
+ PB1_FAILMODE_SOFT = env_bool("PB1_FAILMODE_SOFT", default=True)
+ PB1_MIN_CANDIDATES = int(_cfg("PB1_MIN_CANDIDATES") or "3")
+ PB1_RELAX_MAX_PASSES = int(_cfg("PB1_RELAX_MAX_PASSES") or "3")
+ PB1_SPREAD_HARD_MAX_PCT = float(_cfg("PB1_SPREAD_HARD_MAX_PCT") or "0")
+ PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
+ PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
+ PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
+ PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
+-PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
++PB1_MAX_ATR_PCT = float(_cfg_with_alias("PB1_MAX_ATR_PCT", "PB1_ATR_PCT_MAX") or "6.0")
+ PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
+ PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
++PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
++PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
  
- from trader.db.engine import make_engine
- from trader.db.repos import UniverseRepo
- 
- 
- def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
-     db_url = f"sqlite:///{tmp_path}/pbcore.db"
-     lkg_root = tmp_path / "lkg"
-     sqlite_cache = tmp_path / "cache.sqlite3"
-     monkeypatch.setenv("DATABASE_URL", db_url)
-     monkeypatch.setenv("USING_EXTERNAL_DB", "0")
-     monkeypatch.setenv("UNIVERSE_LKG_ROOT", str(lkg_root))
-     monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
-     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
-     monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
-+    monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
- 
-     from trader.universe import lkg_store
- 
-     importlib.reload(lkg_store)
-     from trader.universe import build as build_module
- 
-     importlib.reload(build_module)
- 
-     stored: dict = {}
- 
-     class FakeUniverseRepo:
-         def __init__(self, engine):
-             self.engine = engine
- 
-         def store_universe(self, env, strategy, as_of_date, source, params_json, payload_json, members):
-             stored[(env, strategy)] = {
-                 "universe": {
-                     "universe_id": "fake-id",
-                     "env": env,
-                     "strategy": strategy,
-                     "as_of_date": as_of_date,
-                     "source": source,
-                     "params_json": params_json,
-                     "payload_json": payload_json,
-                 },
-diff --git a/tests/test_universe_runtime_outputs.py b/tests/test_universe_runtime_outputs.py
-index d8a334278843b67b4c1a9c43e91ced70f9273172..168e92463102ab9f9804b26ee2e075d04dff5260 100644
---- a/tests/test_universe_runtime_outputs.py
-+++ b/tests/test_universe_runtime_outputs.py
-@@ -1,32 +1,33 @@
- from pathlib import Path
- 
- from trader.universe import build
- 
- 
- def test_universe_build_writes_runtime_files(tmp_path, monkeypatch):
-     bot_state_dir = tmp_path / "bot_state"
-     bot_state_dir.mkdir(parents=True, exist_ok=True)
-     monkeypatch.setenv("BOTSTATE_ROOT", str(bot_state_dir))
-     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
-     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
-+    monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
- 
-     seed_payload = {
-         "payload": {
-             "selected": ["000001"],
-             "selected_by_market": {"KOSPI": [{"code": "000001", "rank": 1}]},
-         },
-         "members": [{"code": "000001", "market": "KOSPI"}],
-         "source": "seed_static",
-         "params": {"as_of": "2025-01-01"},
-     }
-     monkeypatch.setattr(build, "_load_static_seed", lambda: seed_payload)
- 
-     build.build_universe(as_of_date="2025-01-01", env="practice", strategy="best_k_meta", provider_override="seed_static")
- 
-     runtime_universe = bot_state_dir / "runtime" / "universe" / "2025-01-01.json"
-     runtime_sanitize = bot_state_dir / "runtime" / "universe_sanitize_2025-01-01.json"
-     runtime_flag = bot_state_dir / "runtime" / "universe_build_done_2025-01-01.flag"
- 
-     assert runtime_universe.exists()
-     assert runtime_sanitize.exists()
-     assert runtime_flag.exists()
-diff --git a/trader/minervini/__init__.py b/trader/minervini/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..1eb6d18357dcb2600a3725a3f39bf194a593bd6e
---- /dev/null
-+++ b/trader/minervini/__init__.py
-@@ -0,0 +1,2 @@
-+"""Minervini screening utilities."""
-+
-diff --git a/trader/minervini/report.py b/trader/minervini/report.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..8c321ca2df12790e6852cee279c9db1b4c32ae5f
---- /dev/null
-+++ b/trader/minervini/report.py
-@@ -0,0 +1,125 @@
-+from __future__ import annotations
-+
-+import json
-+import logging
-+from collections import Counter
-+from dataclasses import asdict, is_dataclass
-+from pathlib import Path
-+from typing import Iterable
-+
-+from trader.botstate_paths import botstate_path
-+from trader.time_utils import now_kst
-+
-+logger = logging.getLogger(__name__)
-+
-+_REASON_MAP = {
-+    "rs_below_min": "RS_BELOW",
-+    "trend_template_fail": "REGIME_FAIL",
-+    "ma200_not_rising": "REGIME_FAIL",
-+    "illiquid": "LIQ_FAIL",
-+    "liquidity_fail": "LIQ_FAIL",
-+    "gap_fail": "GAP_FAIL",
-+    "spread_fail": "SPREAD_FAIL",
-+    "range_fail": "RANGE_FAIL",
-+    "vcp_fail": "VCP_LOW",
-+    "score_below_min": "SCORE_BELOW_MIN",
-+    "score_below_cut": "SCORE_BELOW_CUT",
-+    "price_scale_outlier": "PRICE_SCALE_OUTLIER",
-+    "insufficient_candles": "INSUFFICIENT_CANDLES",
-+    "data_empty": "DATA_MISSING",
-+    "planned_qty_zero_or_min_order": "MIN_ORDER_FAIL",
-+    "atr_pct_too_high": "ATR_TOO_HIGH",
-+    "liquidity_too_low": "LIQ_TOO_LOW",
-+}
-+
-+
-+def _map_reason_codes(reasons: Iterable[str] | None) -> list[str]:
-+    mapped = []
-+    for reason in reasons or []:
-+        mapped.append(_REASON_MAP.get(reason, str(reason).upper()))
-+    if not mapped:
-+        mapped = ["UNSPECIFIED_FAIL"]
-+    return mapped
-+
-+
-+def _cfg_snapshot(cfg: object) -> dict:
-+    if is_dataclass(cfg):
-+        return asdict(cfg)
-+    if hasattr(cfg, "__dict__"):
-+        return dict(cfg.__dict__)
-+    return {"value": str(cfg)}
-+
-+
-+def _candidate_attr(candidate: object, name: str, default=None):
-+    if hasattr(candidate, name):
-+        return getattr(candidate, name)
-+    if isinstance(candidate, dict):
-+        return candidate.get(name, default)
-+    return default
-+
-+
-+def run_minervini_report(
-+    universe_members: list[dict],
-+    cfg: object,
-+    *,
-+    as_of: str | None = None,
-+    candidates: list[object] | None = None,
-+    report_dir: str | Path | None = None,
-+) -> str | None:
-+    as_of = as_of or now_kst().date().isoformat()
-+    report_root = Path(report_dir) if report_dir else botstate_path("runtime", "reports", "minervini", as_of)
-+    report_root.mkdir(parents=True, exist_ok=True)
-+    report_path = report_root / "minervini_report.json"
-+
-+    name_map = {
-+        str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
-+        for m in universe_members
-+    }
-+
-+    candidates_payload: list[dict] = []
-+    rejected_payload: list[dict] = []
-+    reason_counts: Counter[str] = Counter()
-+
-+    for cf in candidates or []:
-+        code = str(_candidate_attr(cf, "code", "") or "").zfill(6)
-+        setup_ok = bool(_candidate_attr(cf, "setup_ok", False))
-+        reasons = _candidate_attr(cf, "reasons", None)
-+        score = _candidate_attr(cf, "score", None)
-+        if setup_ok:
-+            candidates_payload.append({"code": code, "name": name_map.get(code), "score": score})
-+            continue
-+        mapped_reasons = _map_reason_codes(reasons)
-+        for reason in mapped_reasons:
-+            reason_counts[reason] += 1
-+        rejected_payload.append(
-+            {
-+                "code": code,
-+                "name": name_map.get(code),
-+                "reasons": mapped_reasons,
-+            }
-+        )
-+
-+    payload = {
-+        "input_members": len(universe_members),
-+        "candidates": candidates_payload,
-+        "rejected": rejected_payload,
-+        "reason_counts": dict(reason_counts),
-+        "cfg_snapshot": _cfg_snapshot(cfg),
-+    }
-+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-+
-+    logger.info(
-+        "[MINERVINI][STATS] input=%s candidates=%s rejected=%s",
-+        len(universe_members),
-+        len(candidates_payload),
-+        len(rejected_payload),
-+    )
-+    summary_text = " ".join([f"{key}={count}" for key, count in reason_counts.most_common(10)]) or "(none)"
-+    logger.info("[MINERVINI][REJECT_SUMMARY] %s", summary_text)
-+    logger.info(
-+        "[MINERVINI][REPORT] path=%s candidates=%s rejected=%s",
-+        report_path,
-+        len(candidates_payload),
-+        len(rejected_payload),
-+    )
-+    return str(report_path)
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index d985c4eb0ae92e86a728b8eb7c4ae2e48ac88ed8..d7840e65e875a7344ff270816b6fd485a7345cb7 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -1,40 +1,40 @@
- from __future__ import annotations
- 
- import json
- import logging
- import os
- from collections import Counter
- from dataclasses import dataclass
- from datetime import datetime
- from zoneinfo import ZoneInfo
- from typing import Any, Dict, Iterable, List
- 
- import numpy as np
- import pandas as pd
- 
--from trader.botstate_paths import botstate_path, close_entry_orders_path
-+from trader.botstate_paths import close_entry_orders_path
- from trader.config import (
-     CAP_CAP,
-     LEDGER_BASE_DIR,
-     LEDGER_LOOKBACK_DAYS,
-     PB1_REQUIRE_VOLUME,
-     PB1_MIN_CANDLES,
-     PB1_MAX_POSITIONS,
+ logger.info(
+-    "[CONFIG][PB1] entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
++    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
++    PB1_ENTRY_MODE,
++    int(PB1_REQUIRE_BOTH),
+     PB1_ENTRY_BUDGET_PCT_PER_TICK,
+     PB1_MAX_POS_PCT,
+     PB1_VOL_MAX,
+     PB1_VOLU_MAX,
+     PB1_VOLU_MAX_INTRADAY,
+     PB1_PULLBACK_MIN,
+     PB1_PULLBACK_MAX,
+-    int(PB1_REQUIRE_BOTH),
++    int(PB1_REQUIRE_BOTH_CONTRACTIONS),
      PB1_MIN_SCORE_BASE,
      PB1_MIN_SCORE_FLOOR,
      PB1_MIN_SCORE_STEP,
-     PB1_MAX_ATR_PCT,
+     int(PB1_FAILMODE_SOFT),
+     PB1_RELAX_MAX_PASSES,
+     PB1_MIN_CANDIDATES,
+ )
+ logger.info(
+     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
+     UNIVERSE_POOL_SIZE,
+     RS_BENCHMARK,
+     RS_LOOKBACK_DAYS,
+     RS_LOOKBACK2_DAYS,
+     RS_MIN_PCTILE,
+     REGIME_INDEX,
+     REGIME_MODE,
+     VCP_LOOKBACK,
+     VCP_MIN_SCORE,
+     ENTRY_MODE,
+     RISK_PER_TRADE_PCT,
+ )
+ # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
+ STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
+ 
+ def _this_iso_week_key(now=None):
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 22dc79ff3479518d8b4b0e1fc6253e3f3071890d..85d17c3c395431bcf2272895d90f96e74a690e0e 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -5,50 +5,51 @@ import logging
+ import os
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional
+ from uuid import UUID, uuid4
+ 
+ import sqlalchemy as sa
+ from sqlalchemy.exc import OperationalError
+ from sqlalchemy import Engine, and_, func, select
+ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ 
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+     UNIVERSE,
+     UNIVERSE_MEMBERS,
+     schema_for_engine,
+     uuid_value_for_url,
+ )
+ from .migrate import ensure_sqlite_writable, run_migrations
+ from . import config
+ from trader.time_utils import now_kst
++from trader.utils.json_sanitize import json_safe
+ 
+ logger = logging.getLogger(__name__)
+ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
+ 
+ 
+ def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
+     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+ 
+ 
+ def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
+     message = str(exc).lower()
+     if "readonly" not in message:
+         return False
+     return config.is_sqlite_url(str(engine.url))
+ 
+ 
+ def _recover_sqlite_readonly(engine: Engine) -> bool:
+     url = str(engine.url)
+     if not config.is_sqlite_url(url):
+         return False
+     db_path = Path(engine.url.database or "")
+     if not db_path:
+         return False
+     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+     backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
+@@ -626,69 +627,70 @@ class LedgerEventsRepo:
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def append_event(
+         self,
+         *,
+         env: str,
+         run_id: str | None,
+         event_type: str,
+         ts: datetime,
+         code: str | None = None,
+         market: str | None = None,
+         sid: int | None = None,
+         mode: int | None = None,
+         side: str | None = None,
+         qty: int | None = None,
+         price: float | None = None,
+         kis_odno: str | None = None,
+         client_order_key: str | None = None,
+         ok: bool = True,
+         reasons: list[str] | None = None,
+         stage: str | None = None,
+         payload_json: dict | None = None,
+     ) -> str:
+         db_url = str(self.engine.url)
++        safe_payload_json = json_safe(payload_json) if payload_json is not None else {}
+         payload = {
+             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "event_type": event_type,
+             "ts": ts,
+             "code": code,
+             "market": market,
+             "sid": sid,
+             "mode": mode,
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "kis_odno": kis_odno,
+             "client_order_key": client_order_key,
+             "ok": ok,
+             "reasons": reasons or [],
+             "stage": stage,
+-            "payload_json": payload_json or {},
++            "payload_json": safe_payload_json,
+         }
+         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
+                 return str(res.scalar())
+             except Exception:
+                 conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
+                 return str(payload["ledger_event_id"])
+ 
+ 
+ class PositionsRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
+         stmt = select(self._schema.positions).where(
+             and_(
+                 self._schema.positions.c.env == env,
+                 self._schema.positions.c.strategy == strategy,
+                 self._schema.positions.c.sid == sid,
+                 self._schema.positions.c.mode == mode,
+                 self._schema.positions.c.code == code,
+             )
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index d7840e65e875a7344ff270816b6fd485a7345cb7..c8dca128ed9bed7bc9507692d576143dac5d00bb 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -27,51 +27,55 @@ from trader.config import (
      PB1_MIN_VALUE20,
      PB1_FAILMODE_SOFT,
      PB1_MIN_CANDIDATES,
@@ -308,239 +394,844 @@ index d985c4eb0ae92e86a728b8eb7c4ae2e48ac88ed8..d7840e65e875a7344ff270816b6fd485
      PAPER_MAX_CAPITAL_KRW,
      PB1_ENTRY_WINDOW_START,
      PB1_ENTRY_OPEN_END,
-@@ -81,50 +81,51 @@ from trader.config import (
-     RS_BENCHMARK,
-     RS_COMPOSITE_W1,
-     RS_COMPOSITE_W2,
-     RS_LOOKBACK_DAYS,
-     RS_LOOKBACK2_DAYS,
-     RS_MIN_PCTILE,
-     TAKE_PROFIT_R1,
-     TAKE_PROFIT_R2,
-     TP1_SELL_PCT,
-     TP2_SELL_PCT,
-     TRAIL_MODE,
-     TRAIL_STEP_AFTER_R,
-     UNIVERSE_POOL_SIZE,
-     VCP_LOOKBACK,
-     VCP_MIN_SCORE,
-     resolve_market_window,
- )
- from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
- from trader.kis_wrapper import KisAPI
- from trader.ledger.store import LedgerStore
- from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
- from trader.factors.regime import get_regime, risk_multiplier
- from trader.factors.rs_rank import rank_rs
- from trader.positioning.minervini_risk import calc_initial_stop, calc_position_size, update_exits
-+from trader.minervini.report import run_minervini_report
- from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
- from trader.strategies.pb1_minervini_v2 import (
-     MinerviniConfig,
-     compute_features,
-     compute_pivot,
-     detect_vcp,
-     entry_trigger,
-     evaluate_filters,
-     initial_stop,
-     risk_position_size,
-     score_setup,
-     update_trailing_stop,
- )
- from trader.time_utils import now_kst
- from trader.core_utils import _round_to_tick
- from trader.reasons import ReasonCode
- from trader.eventlog import emit_event
- from trader.utils.env import env_bool
- from trader.utils.json_sanitize import to_jsonable
- from trader.window_router import WindowDecision
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_START,
+     PB1_EXIT_WINDOW_END,
+     PB1_ALLOW_ADD_TO_EXISTING,
+     PB1_PREOPEN_ORDER_TYPE,
+     PB1_PREOPEN_LIMIT_BUFFER_PCT,
+     PB1_VOL_MAX,
+     PB1_VOLU_MAX,
+     PB1_VOLU_MAX_INTRADAY,
+     PB1_PULLBACK_MIN,
+     PB1_PULLBACK_MAX,
++    PB1_ENTRY_MODE,
+     PB1_REQUIRE_BOTH,
++    PB1_REQUIRE_BOTH_CONTRACTIONS,
++    PB1_LOG_ENTRY_GATE,
++    PB1_LOG_DROP_REASONS_TOPN,
+     MIN_ORDER_KRW,
+     MINERVINI_ADD_ON_R,
+     MINERVINI_BREAKOUT_VOL_MULT,
+     MINERVINI_HEAVY_VOL_MULT,
+     MINERVINI_INITIAL_STOP_PCT,
+     MINERVINI_MAX_EXTENSION_PIVOT,
+     MINERVINI_MAX_PYRAMID,
+     MINERVINI_RS_MIN,
+     MINERVINI_TIME_STOP_DAYS,
+     ATR_WINDOW,
+     ATR_MULT,
+     BREAKOUT_VOL_MULT,
+     ENTRY_MODE,
+     FAILED_BREAKOUT_EXIT_DAYS,
+     INITIAL_STOP_MODE,
+     MAX_GAP_UP_PCT,
+     MAX_INTRADAY_RANGE_PCT,
+     MAX_SPREAD_PROXY_BPS,
+     MIN_AVG_VALUE_KRW,
+     REENTRY_COOLDOWN_DAYS,
+     REGIME_INDEX,
+     REGIME_MA_FAST,
+     REGIME_MA_SLOW,
+     REGIME_MAX_RISK,
+     REGIME_MID_RISK,
+@@ -465,75 +469,81 @@ class PB1Engine:
+         self.run_id = run_id
+         self.balance_api_calls = 0
+         self.balance_cache_hits = 0
+         self.balance_tick_cache_hits = 0
+         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
+         self.min_candles = int(PB1_MIN_CANDLES)
+         self.minervini_config = MinerviniConfig(
+             rs_min_percentile=RS_MIN_PCTILE / 100.0,
+             min_dollar_vol_50d=PB1_MIN_VALUE20,
+             breakout_vol_mult_20=BREAKOUT_VOL_MULT,
+             max_extension_from_pivot=MINERVINI_MAX_EXTENSION_PIVOT,
+             initial_stop_pct=MINERVINI_INITIAL_STOP_PCT,
+             risk_pct_of_equity=RISK_PER_TRADE_PCT / 100.0,
+             max_pyramid_levels=MINERVINI_MAX_PYRAMID,
+             add_on_R=MINERVINI_ADD_ON_R,
+             heavy_volume_mult=MINERVINI_HEAVY_VOL_MULT,
+         )
+         providers = []
+         if kis:
+             providers.append(KISOHLCVProvider(kis))
+         providers.append(KRXOHLCVProvider())
+         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
+         self._setup_reason_counter: Counter[str] = Counter()
+         self._now_kst = now_kst_value or now_kst()
+         self._today = self._now_kst.date().isoformat()
++        self.entry_mode = PB1_ENTRY_MODE
++        self.entry_require_both = bool(PB1_REQUIRE_BOTH)
++        self.log_entry_gate = bool(PB1_LOG_ENTRY_GATE)
++        self.drop_reasons_topn = int(PB1_LOG_DROP_REASONS_TOPN)
++        self.debug = env_bool("DEBUG", False)
+         self._universe_as_of = None
+         self._universe_path: str | None = None
+         self._universe_context = universe_context
+         self._warned_keys: set[str] = set()
+         self._balance_price_map: Dict[str, float] = {}
+         self._balance_cost: float | None = None
+         self._balance_snapshot: dict | None = balance_snapshot
+         self._balance_snapshot_source: str | None = balance_source
+         if balance_snapshot is not None:
+             if balance_source == "api":
+                 self.balance_api_calls += 1
+             elif balance_source is not None:
+                 self.balance_cache_hits += 1
+         self._holdings_summary: Dict[str, Any] = {}
+         self._code_name_map: Dict[str, str] = {}
+         self.current_code: str | None = None
+         self.top_candidates: list[dict[str, Any]] = []
+         self.entry_enabled = bool(entry_allowed_this_tick)
+         self.entry_block_reason = entry_block_reason
+         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
+         self.window_internal = self._resolve_window_internal()
+         self.filter_thresholds = self._resolve_filter_thresholds()
+         self.entry_capital_krw: float | None = None
+         self.entry_usable_krw: float | None = None
+         self.entry_tick_budget_krw: float | None = None
++        self.entry_reserve_krw: float | None = None
+         self.target_new_positions: int | None = None
+         self._budget_plan_meta: dict[str, Any] | None = None
  
- logger = logging.getLogger(__name__)
- 
- _OUTPUT2_LIST_NORMALIZED_LOGGED = False
- _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
-@@ -1456,179 +1457,50 @@ class PB1Engine:
-             "data_empty": "DATA_MISSING",
-             "planned_qty_zero_or_min_order": "MIN_ORDER_FAIL",
-             "atr_pct_too_high": "ATR_TOO_HIGH",
-             "liquidity_too_low": "LIQ_TOO_LOW",
-         }
-         mapped = []
-         for reason in reasons or []:
-             mapped.append(mapping.get(reason, str(reason).upper()))
-         if not mapped:
-             mapped = ["UNSPECIFIED_FAIL"]
-         return mapped
- 
-     @staticmethod
-     def _exit_reason_code(reason: str) -> str:
-         mapping = {
-             "STOP_HIT": ReasonCode.EXIT_STOP_LOSS,
-             "FAILED_BREAKOUT": ReasonCode.EXIT_STOP_LOSS,
-             "TP1": ReasonCode.EXIT_TP_PARTIAL,
-             "TP2": ReasonCode.EXIT_TP_PARTIAL,
-             "climax_partial": ReasonCode.EXIT_TP_PARTIAL,
-             "time_stop": ReasonCode.EXIT_TIME,
-             "ma50_break_heavy_volume": ReasonCode.EXIT_REGIME,
-         }
-         return mapping.get(reason, ReasonCode.EXIT_TRAIL)
- 
--    def _log_minervini_stats(
--        self,
--        *,
--        pool_count: int,
--        candidates: list[CandidateFeature],
--        final_candidates: list[CandidateFeature],
--    ) -> None:
--        liq_pass = 0
--        rs_pass = 0
--        vcp_pass = 0
--        for cf in candidates:
--            if not cf.features.get("data_ok"):
--                continue
--            if all(
--                [
--                    cf.features.get("liq_ok"),
--                    cf.features.get("gap_ok"),
--                    cf.features.get("spread_ok"),
--                    cf.features.get("range_ok"),
--                ]
--            ):
--                liq_pass += 1
--            rs_pctile = cf.features.get("rs_pctile")
--            if rs_pctile is not None and float(rs_pctile) >= float(RS_MIN_PCTILE):
--                rs_pass += 1
--            vcp_score = cf.features.get("vcp_score")
--            if is_vcp_ready(vcp_score or 0.0, VCP_MIN_SCORE):
--                vcp_pass += 1
--        regime_pass = liq_pass if float(getattr(self, "_regime_risk_mult", 1.0)) > 0 else 0
--        logger.info(
--            "[MINERVINI][STATS] pool=%s liq_pass=%s regime_pass=%s rs_pass=%s vcp_pass=%s final=%s",
--            pool_count,
--            liq_pass,
--            regime_pass,
--            rs_pass,
--            vcp_pass,
--            len(final_candidates),
--        )
--
--    def _write_minervini_report(
--        self,
--        *,
--        as_of: str,
--        members: list[dict],
--        candidates: list[CandidateFeature],
--        final_candidates: list[CandidateFeature],
--        selected_thresholds: FilterThresholds,
--        applied_min_score: float,
--        applied_require_both: bool,
--        tiers_tried: list[str],
--        relax_passes_used: int,
--    ) -> str | None:
--        report_dir = botstate_path("runtime", "reports", "minervini", as_of)
--        report_dir.mkdir(parents=True, exist_ok=True)
--        report_path = report_dir / "minervini_report.json"
--
--        candidates_payload: list[dict] = []
--        rejected_payload: list[dict] = []
--        reason_counts: Counter[str] = Counter()
--
--        name_map = {
--            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
--            for m in members
--        }
--
--        for cf in candidates:
--            metrics = {
--                "rs_pctile": cf.features.get("rs_pctile"),
--                "rs_comp": cf.features.get("rs_comp"),
--                "vcp_score": cf.features.get("vcp_score"),
--                "vcp_ok": cf.features.get("vcp_ok"),
--                "pivot": cf.features.get("pivot"),
--                "close": cf.features.get("close"),
--                "ma50": cf.features.get("ma50"),
--                "ma150": cf.features.get("ma150"),
--                "ma200": cf.features.get("ma200"),
--                "atr_pct": cf.features.get("atr_pct"),
--                "value20": cf.features.get("value20"),
--            }
--            if cf.setup_ok:
--                candidates_payload.append(
--                    {
--                        "code": cf.code,
--                        "name": name_map.get(cf.code),
--                        "score": float(cf.features.get("score") or 0.0),
--                        "metrics": metrics,
--                    }
--                )
--            else:
--                mapped_reasons = self._map_minervini_reasons(cf.reasons)
--                for reason in mapped_reasons:
--                    reason_counts[reason] += 1
--                rejected_payload.append(
--                    {
--                        "code": cf.code,
--                        "name": name_map.get(cf.code),
--                        "reasons": mapped_reasons,
--                        "metrics": metrics,
--                    }
--                )
--
--        params = {
--            "thresholds": {
--                "vol_max": selected_thresholds.vol_contraction_max,
--                "volu_max": selected_thresholds.volu_contraction_max,
--                "pullback_min": selected_thresholds.pullback_min,
--                "pullback_max": selected_thresholds.pullback_max,
--                "require_both": selected_thresholds.require_both_contractions,
--            },
--            "min_score": applied_min_score,
--            "require_both": applied_require_both,
--            "tiers_tried": tiers_tried,
--            "relax_passes_used": relax_passes_used,
--            "config": self.minervini_config.__dict__,
--        }
--
--        payload = {
--            "as_of": as_of,
--            "pool": len(members),
--            "final": len(final_candidates),
--            "benchmark": RS_BENCHMARK,
--            "params": params,
--            "candidates": candidates_payload,
--            "rejected": rejected_payload,
--            "reason_counts": dict(reason_counts),
--        }
--        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
--        logger.info("[MINERVINI][REPORT] path=%s candidates=%s rejected=%s", report_path, len(candidates_payload), len(rejected_payload))
--        return str(report_path)
+     def _resolve_window_internal(self) -> str:
+         internal = compute_window(self._now_kst)
+         normalized = (self.window_label or "").strip().lower()
+         label_map = {"preopen": "morning", "morning": "morning", "day": "day", "close": "close"}
+         if normalized in label_map:
+             forced = label_map[normalized]
+             if internal != forced:
+                 self._warn_once(
+                     "window_mismatch",
+                     "[PB1][WINDOW][WARN] market_window=%s mismatch window=%s -> forcing %s",
+                     normalized,
+                     internal,
+                     forced,
+                 )
+             return forced
+         return internal
  
      @staticmethod
-     def _normalize_setup_score(raw_score: float) -> float:
+     def _float_env(name: str, default: float) -> float:
+         raw = os.getenv(name)
+         if raw is None:
+             return default
+@@ -570,51 +580,51 @@ class PB1Engine:
+     def _warn_once(self, key: str, message: str, *args: object) -> None:
+         if key in self._warned_keys:
+             return
+         self._warned_keys.add(key)
+         logger.warning(message, *args)
+ 
+     def _is_intraday_threshold_window(self) -> bool:
+         if self.phase not in {"prep", "entry"}:
+             return False
+         if self.window_internal not in {"morning", "day"}:
+             return False
          try:
-             return float(min(100.0, max(0.0, raw_score)))
+             entry_end = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
+             return self._now_kst.time() <= entry_end
+         except ValueError:
+             return False
+ 
+     def _resolve_filter_thresholds(self) -> FilterThresholds:
+         intraday = self._is_intraday_threshold_window()
+         volu_max = PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX
+         thresholds = FilterThresholds(
+             vol_contraction_max=PB1_VOL_MAX,
+             volu_contraction_max=volu_max,
+             pullback_min=PB1_PULLBACK_MIN,
+             pullback_max=PB1_PULLBACK_MAX,
+-            require_both_contractions=PB1_REQUIRE_BOTH,
++            require_both_contractions=PB1_REQUIRE_BOTH_CONTRACTIONS,
+         )
+         logger.info(
+             "[PB1][THRESHOLDS] intraday=%s phase=%s window=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
+             int(intraday),
+             self.phase,
+             self.window_internal,
+             thresholds.vol_contraction_max,
+             thresholds.volu_contraction_max,
+             thresholds.pullback_min,
+             thresholds.pullback_max,
+             thresholds.require_both_contractions,
+         )
+         return thresholds
+ 
+     def _resolve_strict_thresholds(self) -> FilterThresholds:
+         return self.filter_thresholds
+ 
+     def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
+         for reason in reasons:
+             if not reason:
+                 continue
+             self._setup_reason_counter[reason] += 1
+ 
+     def _log_reason_summary(self, note: str | None = None) -> None:
+         if not self._setup_reason_counter:
+@@ -969,175 +979,252 @@ class PB1Engine:
+         if score_val is None:
+             meta = getattr(cf, "meta", None)
+             if isinstance(meta, dict):
+                 score_val = meta.get("score")
+         if score_val is None:
+             logger.warning("[PB1][BUY][SCORE_MISSING] code=%s -> fallback to 0.0", cf.code)
+             return 0.0
+         try:
+             return float(score_val)
          except Exception:
+             logger.warning(
+                 "[PB1][BUY][SCORE_INVALID] code=%s raw=%s -> fallback to 0.0",
+                 cf.code,
+                 score_val,
+             )
              return 0.0
  
-     def _apply_soft_penalties(self, base_score: float, reasons: Iterable[str]) -> float:
-         penalties = {
-             "trend_template_fail": 12.0,
-             "ma200_not_rising": 8.0,
-             "rs_below_min": 15.0,
-             "vcp_fail": 8.0,
-             "spread_fail": 10.0,
-             "gap_fail": 6.0,
-             "range_fail": 6.0,
-         }
-         penalty = 0.0
-         for reason in reasons or []:
-             penalty += penalties.get(reason, 0.0)
-         return max(0.0, base_score - penalty)
+     def _emit_buy_decision(
+         self,
+         cf: CandidateFeature,
+         *,
+         order_value: float,
+         reasons: list[str],
+         entry_allowed: bool,
+         entry_reason: str,
++        stage: str | None = None,
+     ) -> None:
+         def _to_float(value: object) -> float:
+             try:
+                 return float(value)
+             except Exception:
+                 return 0.0
  
-     def _log_fail_reason_breakdown(self, candidates: Iterable[CandidateFeature], note: str | None = None) -> None:
-         counts: Counter[str] = Counter()
-@@ -3754,88 +3626,75 @@ class PB1Engine:
+         price = cf.features.get("cap_price") or cf.features.get("close") or 0.0
+         qty = int(cf.planned_qty or 0)
+         if qty < 1:
+             logger.warning(
+                 "[PB1][BUY][SKIP] code=%s reason=qty_zero qty=%s cap=%.0f",
+                 self._display_code(cf.code),
+                 qty,
+                 float(order_value or 0.0),
+             )
+             return
+         buyable = entry_allowed and not reasons
+         reasons_out = reasons if reasons else (["ok"] if entry_allowed else [entry_reason])
+         payload = to_jsonable(
+             {
+                 "code": cf.code,
+                 "market": cf.market,
+                 "score": self._safe_score(cf),
+                 "qty": qty,
+                 "price": _to_float(price),
+                 "notional": _to_float(order_value),
+                 "buyable": buyable,
+                 "reasons": reasons_out,
+             }
+         )
+         ok, exc = emit_event(
+             as_of=self._today,
+             event="PB1_BUY_DECISION",
+             **payload,
+         )
+         if not ok:
+             logger.error(
+                 "[PB1][BUY][EVENT_FAIL] code=%s qty=%s cap=%.0f payload_keys=%s exc=%r",
+                 cf.code,
+                 qty,
+                 float(order_value or 0.0),
+                 sorted(payload.keys()),
+                 exc,
+             )
+         if not buyable:
+             logger.info(
+-                "[PB1][BUY][SKIP] code=%s reasons=%s",
++                "[PB1][BUY][SKIP] code=%s reasons=%s stage=%s",
+                 self._display_code(cf.code),
+                 reasons_out,
++                stage or "PB1-CLOSE",
++            )
++        else:
++            logger.info(
++                "[PB1][BUY][INTENT] code=%s qty=%s price=%s reason=%s",
++                self._display_code(cf.code),
++                qty,
++                _to_float(price),
++                "entry_ok",
+             )
+ 
+     def _fetch_holdings_snapshot(self) -> dict:
+         if self._balance_snapshot is not None:
+             self.balance_tick_cache_hits += 1
+             source = self._balance_snapshot_source or "tick_cache"
+             logger.info("[BALANCE][CACHE] hit=True source=%s", source)
+             self._balance_snapshot_source = "tick_cache"
+             return self._balance_snapshot
+         if not self.kis:
+             return {}
+         snap, source = self.kis.get_balance_cached(return_source=True)
+         if source == "api":
+             self.balance_api_calls += 1
+         else:
+             self.balance_cache_hits += 1
+         logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+         self._balance_snapshot = snap
+         return self._balance_snapshot
+ 
+     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
+         return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{side.upper()}"
+ 
+     def _name_for_code(self, code: str | None) -> str | None:
+         if not code:
+             return None
+         return self._code_name_map.get(str(code).zfill(6))
+ 
+     def _display_code(self, code: str | None) -> str:
+         if not code:
+             return ""
+         name = self._name_for_code(code)
+         return f"{name}({code})" if name else str(code)
+ 
+     def _with_name_reason(self, reasons: list[str] | None, code: str | None) -> list[str]:
+         enriched = list(reasons or [])
+         name = self._name_for_code(code)
+         if name:
+             enriched.append(f"name:{name}")
+         return enriched
+ 
++    def _entry_gate(self, *, pullback_ok: bool, breakout_ok: bool) -> tuple[bool, list[str]]:
++        mode = (self.entry_mode or "BOTH").strip().upper()
++        require_both = bool(self.entry_require_both)
++        reasons: list[str] = []
++
++        if mode == "PULLBACK":
++            entry_ok = bool(pullback_ok)
++            if not entry_ok:
++                reasons.append("pullback_fail")
++            return entry_ok, reasons
++
++        if mode == "BREAKOUT":
++            entry_ok = bool(breakout_ok)
++            if not entry_ok:
++                reasons.append("pivot_breakout_fail")
++            return entry_ok, reasons
++
++        if require_both:
++            entry_ok = bool(pullback_ok and breakout_ok)
++            if not pullback_ok:
++                reasons.append("pullback_fail")
++            if not breakout_ok:
++                reasons.append("pivot_breakout_fail")
++            if not entry_ok:
++                reasons.append("require_both_fail")
++            return entry_ok, reasons
++
++        entry_ok = bool(pullback_ok or breakout_ok)
++        if not entry_ok:
++            if not pullback_ok:
++                reasons.append("pullback_fail")
++            if not breakout_ok:
++                reasons.append("pivot_breakout_fail")
++            reasons.append("require_either_fail")
++        return entry_ok, reasons
++
++    def _log_entry_gate(self, *, code: str, pullback_ok: bool, breakout_ok: bool, entry_ok: bool) -> None:
++        if not self.log_entry_gate:
++            return
++        logger.info(
++            "[PB1][ENTRY_GATE] code=%s pullback_ok=%s breakout_ok=%s entry_mode=%s require_both=%s entry_ok=%s",
++            self._display_code(code),
++            int(bool(pullback_ok)),
++            int(bool(breakout_ok)),
++            self.entry_mode,
++            int(bool(self.entry_require_both)),
++            int(bool(entry_ok)),
++        )
++
++    def _log_buyable_gate(self, *, code: str, ok: bool, reasons: list[str]) -> None:
++        logger.info(
++            "[PB1][BUYABLE_GATE] code=%s ok=%s reasons=%s",
++            self._display_code(code),
++            int(bool(ok)),
++            reasons or ["ok"],
++        )
++
+     def _append_ledger_event(
+         self,
+         *,
+         event_type: str,
+         code: str | None,
+         market: str | None,
+         mode: int | None,
+         side: str | None,
+         qty: int | None,
+         price: float | None,
+         client_order_key: str | None,
+         ok: bool,
+         reasons: list[str] | None,
+         stage: str | None,
+         payload_json: dict | None = None,
+     ) -> None:
+-        self.ledger_repo.append_event(
+-            env=self.env,
+-            run_id=self.run_id,
+-            event_type=event_type,
+-            ts=now_kst(),
+-            code=code,
+-            market=market,
+-            sid=1,
+-            mode=mode,
+-            side=side,
+-            qty=qty,
+-            price=price,
+-            client_order_key=client_order_key,
+-            ok=ok,
+-            reasons=self._with_name_reason(reasons, code),
+-            stage=stage,
+-            payload_json=payload_json or {},
+-        )
++        try:
++            self.ledger_repo.append_event(
++                env=self.env,
++                run_id=self.run_id,
++                event_type=event_type,
++                ts=now_kst(),
++                code=code,
++                market=market,
++                sid=1,
++                mode=mode,
++                side=side,
++                qty=qty,
++                price=price,
++                client_order_key=client_order_key,
++                ok=ok,
++                reasons=self._with_name_reason(reasons, code),
++                stage=stage,
++                payload_json=payload_json or {},
++            )
++        except Exception as exc:
++            logger.warning(
++                "[PB1][LEDGER][FAIL] event=%s code=%s err=%s",
++                event_type,
++                self._display_code(code),
++                repr(exc),
++            )
++            if self.debug:
++                logger.exception("[PB1][LEDGER][FAIL_TRACE]")
+ 
+     @staticmethod
+     def _format_order_result_reason(resp: dict | None) -> str:
+         if not isinstance(resp, dict):
+             return "ORDER_FAIL_API(no_response)"
+         if resp.get("status") == "SKIPPED":
+             skip_reason = resp.get("skip_reason") or "SKIPPED"
+             return f"ORDER_SKIP_{skip_reason}"
+         rt_cd = resp.get("rt_cd")
+         if str(rt_cd) == "0":
+             return "ORDER_OK"
+         msg_cd = resp.get("msg_cd")
+         msg1 = resp.get("msg1")
+         return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         if not cf.setup_ok:
+             self._record_setup_reasons(cf.reasons or ["unspecified_fail"])
+         logger.info(
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+@@ -1532,65 +1619,67 @@ class PB1Engine:
+             vol_contraction_max=1.00,
+             volu_contraction_max=1.00,
+             pullback_min=0.03,
+             pullback_max=0.15,
+             require_both_contractions=True,
+         )
+         loose_thresholds = self.filter_thresholds.with_overrides(
+             vol_contraction_max=1.10,
+             volu_contraction_max=1.10,
+             pullback_min=0.02,
+             pullback_max=0.18,
+             require_both_contractions=False,
+         )
+         tiers = [
+             ("tier1", strict_thresholds),
+             ("tier2", medium_thresholds),
+             ("tier3", loose_thresholds),
+         ]
+         selected_candidates: List[CandidateFeature] = []
+         selected_tier = tiers[-1][0]
+         selected_thresholds = tiers[-1][1]
+         tiers_tried: list[str] = []
+         all_reason_counts: Counter[str] = Counter()
+         relax_passes_used = 0
+         applied_min_score = float(PB1_MIN_SCORE_BASE)
+-        applied_require_both = bool(PB1_REQUIRE_BOTH)
++        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
+ 
+         min_score_values: list[float] = []
+         current = float(PB1_MIN_SCORE_BASE)
+         floor = float(PB1_MIN_SCORE_FLOOR)
+         step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+         max_passes = max(1, int(PB1_RELAX_MAX_PASSES))
+         while current >= floor and len(min_score_values) < max_passes:
+             min_score_values.append(current)
+             current -= step
+         if not min_score_values:
+             min_score_values = [float(PB1_MIN_SCORE_BASE)]
+ 
+-        relax_passes: list[tuple[float, bool, str]] = [(score, bool(PB1_REQUIRE_BOTH), "score_relax") for score in min_score_values]
+-        if PB1_REQUIRE_BOTH and len(relax_passes) < max_passes + 1:
++        relax_passes: list[tuple[float, bool, str]] = [
++            (score, bool(PB1_REQUIRE_BOTH_CONTRACTIONS), "score_relax") for score in min_score_values
++        ]
++        if PB1_REQUIRE_BOTH_CONTRACTIONS and len(relax_passes) < max_passes + 1:
+             relax_passes.append((min_score_values[-1], False, "require_both_off"))
+ 
+         for min_score, require_both, relax_label in relax_passes:
+             relax_passes_used += 1
+             applied_min_score = min_score
+             applied_require_both = require_both
+             for tier_name, thresholds in tiers:
+                 tiers_tried.append(f"{tier_name}:{relax_label}")
+                 adjusted = thresholds.with_overrides(require_both_contractions=require_both)
+                 evaluated = self._apply_thresholds(
+                     candidates,
+                     adjusted,
+                     min_score=min_score,
+                     log_results=False,
+                     soft_mode=PB1_FAILMODE_SOFT,
+                     spread_hard_max_pct=float(PB1_SPREAD_HARD_MAX_PCT),
+                     gap_hard_max_pct=float(PB1_GAP_HARD_MAX_PCT),
+                 )
+                 ok_count = len([c for c in evaluated if c.setup_ok])
+                 reason_counts = self._collect_reason_counts(evaluated)
+                 all_reason_counts.update(reason_counts)
+                 logger.info(
+                     "[PB1][CANDIDATES] tier=%s pass=%s ok=%s total=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s min_score:%.1f}",
+                     tier_name,
+                     relax_label,
+@@ -1736,65 +1825,74 @@ class PB1Engine:
+                 vcp_info = {
+                     "score": cf.features.get("vcp_score"),
+                     "vcp_ok": cf.features.get("vcp_ok"),
+                     "contractions": cf.features.get("vcp_contractions"),
+                 }
+                 score = float(score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config))
+             except Exception:
+                 score = 0.0
+             cf.features["score"] = score
+             cf.score = score
+         applied_cut, selected_codes = self._apply_adaptive_score_cut(
+             ok_list,
+             target_new_positions=int(self.target_new_positions or 0),
+         )
+         for cf in ok_list:
+             score_fallback = bool(cf.features.get("score_fallback"))
+             if cf.code not in selected_codes and not score_fallback:
+                 cf.reasons.append("score_below_cut")
+                 cf.features["score_below_cut"] = True
+         filtered: List[CandidateFeature] = []
+         for cf in ok_list:
+             if not cf.setup_ok:
+                 continue
+             atr_pct = cf.features.get("atr_pct")
+             value20 = cf.features.get("value20")
+-            if atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct):
+-                cf.setup_ok = False
+-                cf.reasons.append("atr_pct_missing")
+-                continue
+-            if float(atr_pct) > float(PB1_MAX_ATR_PCT):
+-                cf.setup_ok = False
+-                cf.reasons.append("atr_pct_too_high")
+-                continue
+-            if value20 is None or (isinstance(value20, float) and value20 != value20):
+-                cf.setup_ok = False
+-                cf.reasons.append("value20_missing")
+-                continue
+-            if float(value20) < float(PB1_MIN_VALUE20):
++            risk_reasons: list[str] = []
++            atr_missing = atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct)
++            value_missing = value20 is None or (isinstance(value20, float) and value20 != value20)
++            if atr_missing:
++                risk_reasons.append("atr_pct_missing")
++            elif float(atr_pct) > float(PB1_MAX_ATR_PCT):
++                risk_reasons.append("atr_pct_too_high")
++            if value_missing:
++                risk_reasons.append("value20_missing")
++            elif float(value20) < float(PB1_MIN_VALUE20):
++                risk_reasons.append("liquidity_too_low")
++
++            logger.info(
++                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr_pct=%s atr_pct_max=%s",
++                self._display_code(cf.code),
++                int(not risk_reasons),
++                risk_reasons or ["ok"],
++                float(atr_pct) if atr_pct is not None else None,
++                float(PB1_MAX_ATR_PCT),
++            )
++
++            if risk_reasons:
+                 cf.setup_ok = False
+-                cf.reasons.append("liquidity_too_low")
++                cf.reasons.extend(risk_reasons)
+                 continue
+ 
+             filtered.append(cf)
+ 
+         if not filtered:
+             return candidates
+ 
+         # 2) 점수 내림차순 정렬
+         filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+         ranked = filtered
+ 
+         # 3) 사이징: tick budget 분할 + 1주 가능 필터
+         tick_budget = float(self.entry_tick_budget_krw or 0.0)
+         if tick_budget <= 0:
+             tick_budget = float(self.entry_usable_krw or 0.0)
+         if tick_budget <= 0:
+             logger.warning("[PB1][SIZE] skip sizing: tick_budget=0 applied_score_cut=%.1f", applied_cut)
+             return candidates
+ 
+         min_order_krw = float(MIN_ORDER_KRW)
+         max_pos_krw = tick_budget * float(PB1_MAX_POS_PCT)
+         for cf in ranked:
+             daily_close = self._to_float(cf.features.get("close"))
+             quote = self.kis.get_quote_safe(cf.code, diag_mode=True) if self.kis else {}
+             if isinstance(quote, dict) and quote.get("fallback_used") not in {None, "none", "quote"}:
+@@ -1847,50 +1945,78 @@ class PB1Engine:
+             stop0 = calc_initial_stop(
+                 pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                 tight_low=float(tight_low) if tight_low is not None else None,
+                 atr=float(atr_val) if atr_val is not None else None,
+                 mode=INITIAL_STOP_MODE,
+                 entry=order_px,
+                 atr_mult=ATR_MULT,
+             )
+             per_share_risk = order_px - stop0
+             if per_share_risk <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("risk_invalid")
+                 continue
+             budget_cap = min(per_position_budget, max_pos_krw)
+             qty = calc_position_size(
+                 equity=equity_krw,
+                 risk_pct=float(RISK_PER_TRADE_PCT),
+                 entry=order_px,
+                 stop=stop0,
+                 risk_mult=risk_mult,
+             )
+             if budget_cap > 0:
+                 qty = min(qty, int(budget_cap // order_px))
+             if min_order_krw > 0 and qty * order_px < min_order_krw:
+                 qty = 0
++            reserve_krw = float(self.entry_reserve_krw or 0.0)
++            usable_cash = float(self.entry_usable_krw or 0.0)
++            sizing_reasons: list[str] = []
++            if qty <= 0:
++                if tick_budget <= 0:
++                    sizing_reasons.append("tick_budget_zero")
++                if min_order_krw > 0 and tick_budget > 0 and min_order_krw > tick_budget:
++                    sizing_reasons.append("min_order_krw_gt_tick_budget")
++                if order_px > 0 and tick_budget > 0 and order_px > tick_budget:
++                    sizing_reasons.append("price_gt_tick_budget")
++                if min_order_krw > 0 and order_px > 0 and order_px > min_order_krw:
++                    sizing_reasons.append("price_gt_min_order")
++                if reserve_krw > 0:
++                    sizing_reasons.append("reserve_applied")
++                if not sizing_reasons:
++                    sizing_reasons.append("planned_qty_zero_or_min_order")
++            logger.info(
++                "[PB1][SIZING] code=%s cash_usable=%s tick_budget=%s reserve=%s px=%s qty=%s min_order_krw=%s ok=%s reason=%s",
++                self._display_code(cf.code),
++                usable_cash,
++                tick_budget,
++                reserve_krw,
++                order_px,
++                qty,
++                min_order_krw,
++                int(qty > 0),
++                sizing_reasons or ["ok"],
++            )
+             if qty <= 0:
+                 cf.setup_ok = False
+                 cf.reasons.append("planned_qty_zero_or_min_order")
+                 continue
+             cf.planned_qty = qty
+             cf.planned_value = float(qty * order_px)
+             cf.features["planned_cap"] = float(budget_cap)
+             cf.features["planned_value"] = cf.planned_value
+             cf.features["initial_stop"] = float(stop0)
+             cf.features["stop_price"] = float(stop0)
+             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+             logger.info(
+                 "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f value20=%s tick_budget=%.0f",
+                 cf.code,
+                 float(cf.features.get("score") or 0.0),
+                 float(cf.features.get("planned_cap") or 0.0),
+                 cf.planned_qty,
+                 cf.planned_value,
+                 float(cf.features.get("atr_pct") or 0.0),
+                 cf.features.get("value20"),
+                 tick_budget,
+             )
+ 
+         return candidates
+ 
+@@ -3406,114 +3532,116 @@ class PB1Engine:
+             else:
+                 logger.info(
+                     "ENTRY_DECISION result=SKIP reason=%s ok_setups=%s blocked_by=%s",
+                     reason or "UNKNOWN",
+                     ok_setups,
+                     blocked_text,
+                 )
+             entry_decision_emitted = True
+ 
+         def _emit_entry_summary(
+             setup_ok_codes: list[str] | None,
+             orderable_candidates: list[CandidateFeature] | None,
+             drop_reason_counter: Counter[str] | None,
+         ) -> None:
+             nonlocal entry_summary_emitted
+             if entry_summary_emitted:
+                 return
+             drop_reason_counter = drop_reason_counter or Counter()
+             emit_event(
+                 as_of=self._today,
+                 event="PB1_ENTRY_SUMMARY",
+                 entry_allowed=entry_allowed,
+                 entry_block_reason=entry_reason,
+                 setup_ok_count=len(setup_ok_codes or []),
+                 selected_count=len(orderable_candidates or []),
+-                top_drop_reasons=drop_reason_counter.most_common(5),
++                top_drop_reasons=drop_reason_counter.most_common(self.drop_reasons_topn),
+             )
+             entry_summary_emitted = True
+ 
+         holdings_snapshot = self._fetch_holdings_snapshot()
+         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
+         self._balance_snapshot = holdings_snapshot
+         holdings_rows = holdings_snapshot.get("output1") or []
+         holdings_summary_raw = holdings_snapshot.get("output2")
+         holdings_summary = _as_first_dict(holdings_summary_raw)
+         self._holdings_summary = holdings_summary
+         self._balance_price_map = self._extract_holdings_prices(holdings_rows)
+         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
+         total_cash_krw = int(available_cash_krw)
+         order_possible_cash_krw = int(available_cash_krw)
+         if self.kis and entry_phase:
+             try:
+                 cash_summary = self.kis.get_cash_summary()
+                 total_cash_krw = int(cash_summary.get("total_cash_krw") or 0)
+                 order_possible_cash_krw = int(cash_summary.get("order_possible_cash_krw") or 0)
+             except Exception as exc:
+                 logger.warning("[PB1][CASH][SUMMARY_FAIL] err=%s", exc)
+         if order_possible_cash_krw > 0:
+             available_cash_krw = order_possible_cash_krw
+         base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
+         if entry_phase:
+             reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
+             override_capital = PB1_ENTRY_CAPITAL_KRW
+             entry_capital_krw, entry_usable_krw, capital_meta = self._resolve_entry_capital(
+                 base_cash_krw=base_cash_krw,
+                 override_capital=override_capital,
+                 reserve_pct=reserve_pct,
+             )
+             self.entry_capital_krw = float(entry_capital_krw)
+             self.entry_usable_krw = float(entry_usable_krw)
++            self.entry_reserve_krw = max(0.0, float(base_cash_krw) - float(entry_usable_krw))
+             budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
+             tick_budget_krw = int(entry_capital_krw * budget_pct)
+             self.entry_tick_budget_krw = float(tick_budget_krw)
+             logger.info(
+                 "[PB1][CAPITAL] mode=%s override=%s total_cash=%s order_possible_cash=%s base_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
+                 PB1_CAPITAL_MODE,
+                 override_capital,
+                 total_cash_krw,
+                 order_possible_cash_krw,
+                 base_cash_krw,
+                 reserve_pct,
+                 entry_usable_krw,
+                 int(capital_meta.get("use_override") or 0),
+                 entry_capital_krw,
+                 capital_meta.get("cap_limit"),
+                 tick_budget_krw,
+                 budget_pct,
+                 cash_meta.get("selected_key") or cash_meta.get("source") or "unknown",
+             )
+             if tick_budget_krw < min_order_krw:
+                 logger.warning(
+                     "[PB1][BUDGET_PLAN][WARN] tick_budget_below_min_order tick_budget=%s min_order=%s",
+                     tick_budget_krw,
+                     min_order_krw,
+                 )
+         else:
+             self.entry_capital_krw = 0.0
+             self.entry_usable_krw = float(available_cash_krw)
+             self.entry_tick_budget_krw = 0.0
++            self.entry_reserve_krw = 0.0
+             tick_budget_krw = 0.0
+         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+         if not positions and holdings_rows:
+             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
+                 env=self.env,
+                 strategy=self.STRATEGY_NAME,
+                 sid=1,
+                 mode=1,
+                 holdings=holdings_rows,
+             )
+             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
+             positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+         cooldown_map: dict[str, str] = {
+             str(p.get("code") or "").zfill(6): str(p.get("cooldown_until"))
+             for p in positions
+             if p.get("cooldown_until")
+         }
+         positions_for_exit = self._build_positions_from_kis(holdings_rows, positions)
+         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
+         existing_positions_count = len(existing_positions)
+         positions_cost = sum(float(p.get("total_cost") or 0.0) for p in positions_for_exit)
+         self._equity_krw = float(available_cash_krw) + positions_cost
+         slots_remaining = max(0, max_positions - existing_positions_count)
+         target_new_positions = min(target_new_positions_raw, slots_remaining)
+         if slots_remaining > 0:
+@@ -3595,51 +3723,51 @@ class PB1Engine:
+             if self.phase in {"prep", "entry"}:
+                 _emit_entry_summary([], [], Counter())
+                 _emit_entry_decision(
+                     "SKIP",
+                     reason="UNIVERSE_EMPTY",
+                     ok_setups=0,
+                     blocked_by=_normalize_entry_block_reasons([entry_reason]),
+                 )
+                 return RunResult(
+                     status="SKIPPED",
+                     notes=note,
+                     balance_api_calls=self.balance_api_calls,
+                     balance_cache_hits=self.balance_cache_hits,
+                     balance_tick_cache_hits=self.balance_tick_cache_hits,
+                 )
+             skip_entry_scan = True
+ 
+         code_market = {m.get("code"): m.get("market") for m in members}
+         candidates: List[CandidateFeature] = []
+         selected_tier = "tier1"
+         selected_thresholds = self.filter_thresholds
+         all_reason_counts: Counter[str] = Counter()
+         tiers_tried: list[str] = []
+         relax_passes_used = 0
+         applied_min_score = float(PB1_MIN_SCORE_BASE)
+-        applied_require_both = bool(PB1_REQUIRE_BOTH)
++        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
+         setup_ok_codes: list[str] = []
+         drop_reason_counter: Counter[str] = Counter()
+         drop_examples: Dict[str, list[str]] = {}
+         after_risk_check_count = 0
+         after_buyable_check_count = 0
          after_dedup_count = 0
          orderable_candidates: list[CandidateFeature] = []
          minervini_report_path: str | None = None
@@ -561,68 +1252,7 @@ index d985c4eb0ae92e86a728b8eb7c4ae2e48ac88ed8..d7840e65e875a7344ff270816b6fd485
              setup_ok_codes = [c.code for c in candidates if c.setup_ok]
              candidates = self._size_positions(candidates)
              ok_after_risk = sorted(
-                 [c for c in candidates if c.setup_ok],
-                 key=lambda c: float(c.features.get("score") or 0.0),
-                 reverse=True,
-             )
-             after_risk_check_count = len(ok_after_risk)
--            self._log_minervini_stats(
--                pool_count=len(members),
--                candidates=candidates,
--                final_candidates=ok_after_risk,
--            )
--            reject_summary = Counter()
--            for cf in candidates:
--                if cf.setup_ok:
--                    continue
--                for reason in self._map_minervini_reasons(cf.reasons):
--                    reject_summary[reason] += 1
--            summary_text = " ".join([f"{key}={count}" for key, count in reject_summary.most_common(10)]) or "(none)"
--            logger.info("[MINERVINI][REJECT_SUMMARY] %s", summary_text)
-             candidate_codes = [cf.code for cf in ok_after_risk]
-             logger.info(
-                 "[MINERVINI][CANDIDATES] n=%s codes=%s",
-                 len(candidate_codes),
-                 ", ".join(candidate_codes) if candidate_codes else "(no candidates)",
-             )
--            minervini_report_path = self._write_minervini_report(
-+            minervini_report_path = run_minervini_report(
-+                members,
-+                self.minervini_config,
-                 as_of=self._today,
--                members=members,
-                 candidates=candidates,
--                final_candidates=ok_after_risk,
--                selected_thresholds=selected_thresholds,
--                applied_min_score=applied_min_score,
--                applied_require_both=applied_require_both,
--                tiers_tried=tiers_tried,
--                relax_passes_used=relax_passes_used,
-             )
-             self.top_candidates = [
-                 {
-                     "code": cf.code,
-                     "cap": float(cf.features.get("planned_cap") or 0.0),
-                     "qty": int(cf.planned_qty or 0),
-                 }
-                 for cf in ok_after_risk
-             ]
-+            if not ok_after_risk:
-+                logger.info(
-+                    "[TRADE][SKIP] reason=NO_CANDIDATES report_path=%s",
-+                    minervini_report_path or "none",
-+                )
-             dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
-             for cf in candidates:
-                 if cf.code in dropped_after_risk:
-                     for reason in cf.reasons or ["unspecified_fail"]:
-                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
- 
-             new_position_limit = min(target_new_positions, len(ok_after_risk)) if ok_after_risk else target_new_positions
-             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
-                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
-             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
-             open_orders = self.orders_repo.get_open_orders(self.env)
+@@ -3687,190 +3815,214 @@ class PB1Engine:
              open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
              today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
              today_buy_codes = {row.get("code") for row in today_orders if row.get("code")}
@@ -637,658 +1267,333 @@ index d985c4eb0ae92e86a728b8eb7c4ae2e48ac88ed8..d7840e65e875a7344ff270816b6fd485
              for cf in ok_after_risk:
                  self.current_code = cf.code
                  close_price = float(cf.features.get("close") or 0.0)
-diff --git a/trader/runtime_store.py b/trader/runtime_store.py
-index 9f0ea96a8f26290cf96bdc4f3df054fcfb3ce201..8c66d17caeacd8ed9998640eac6af4c0b276d2f1 100644
---- a/trader/runtime_store.py
-+++ b/trader/runtime_store.py
-@@ -1,40 +1,42 @@
+                 order_price = float(cf.features.get("order_price") or close_price or 0.0)
+                 planned_cap = float(cf.features.get("planned_cap") or (order_price * float(cf.planned_qty or 0)))
+                 if cf.planned_qty <= 0:
+                     self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)
+                     logger.info(
+                         "[PB1][SKIP] code=%s reason=qty_zero cap=%.0f close=%.0f min_order=%.0f",
+                         cf.code,
+                         planned_cap,
+                         close_price,
+                         min_order_krw,
+                     )
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["qty_zero"])
+                     self._log_order_skip(cf, ["qty_zero"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=0.0,
+                         reasons=["qty_zero"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if min_order_krw > 0 and planned_cap < min_order_krw:
+                     self._record_drop(drop_reason_counter, drop_examples, "cap_below_min_order", cf.code)
+                     logger.info(
+                         "[PB1][SKIP] code=%s reason=cap_below_min_order cap=%.0f close=%.0f min_order=%.0f",
+                         cf.code,
+                         planned_cap,
+                         close_price,
+                         min_order_krw,
+                     )
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_min_order"])
+                     self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_price * float(cf.planned_qty or 0),
+                         reasons=["cap_below_min_order"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if order_price > 0 and planned_cap < order_price:
+                     self._record_drop(drop_reason_counter, drop_examples, "cap_below_one_share", cf.code)
+                     logger.info(
+                         "[PB1][SKIP] code=%s reason=cap_below_one_share cap=%.0f close=%.0f min_order=%.0f",
+                         cf.code,
+                         planned_cap,
+                         close_price,
+                         min_order_krw,
+                     )
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_one_share"])
+                     self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_price * float(cf.planned_qty or 0),
+                         reasons=["cap_below_one_share"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 order_value = order_price * float(cf.planned_qty or 0)
+                 if not allow_add_to_existing and cf.code in held_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["holding_position"])
+                     self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["holding_position"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if cf.code in open_buy_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["open_order"])
+                     self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["open_order"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if cf.code in today_buy_codes:
+                     self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["today_buy_exists"])
+                     self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["today_buy_exists"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 cooldown_until = cooldown_map.get(cf.code)
+                 if cooldown_until and str(cooldown_until) >= self._today:
+                     self._record_drop(drop_reason_counter, drop_examples, "cooldown_active", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cooldown_active"])
+                     self._log_order_skip(cf, ["cooldown_active"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["cooldown_active"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
+                     self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["duplicate_order"])
+                     self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["duplicate_order"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
+                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_close_only", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_close_only"])
+                     self._log_order_skip(cf, ["entry_mode_close_only"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["entry_mode_close_only"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
+                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_intraday_only", cf.code)
++                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_intraday_only"])
+                     self._log_order_skip(cf, ["entry_mode_intraday_only"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["entry_mode_intraday_only"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
++                self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
+                 last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
+                 last_volume = float(cf.features.get("last_volume") or 0.0)
+                 trigger_ok, trigger_info = entry_trigger(
+                     cf.features,
+                     last_price=last_price,
+                     last_volume=last_volume,
+                     cfg=self.minervini_config,
+                 )
+-                if not trigger_ok:
+-                    cf.features["entry_trigger"] = trigger_info
+-                    self._record_drop(drop_reason_counter, drop_examples, "pivot_breakout_fail", cf.code)
+-                    self._log_order_skip(cf, ["pivot_breakout_fail"], "PB1-CLOSE")
++                pullback_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
++                entry_ok, entry_reasons = self._entry_gate(
++                    pullback_ok=pullback_ok,
++                    breakout_ok=trigger_ok,
++                )
++                self._log_entry_gate(
++                    code=cf.code,
++                    pullback_ok=pullback_ok,
++                    breakout_ok=trigger_ok,
++                    entry_ok=entry_ok,
++                )
++                if not entry_ok:
++                    if not trigger_ok:
++                        cf.features["entry_trigger"] = trigger_info
++                    for reason in entry_reasons:
++                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
++                    self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+-                        reasons=["pivot_breakout_fail"],
++                        reasons=entry_reasons or ["entry_gate_fail"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 df, _ = self._fetch_daily(cf.code, count=260)
+                 if df.empty:
+                     self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
+                     self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
+                     self._emit_buy_decision(
+                         cf,
+                         order_value=order_value,
+                         reasons=["stop_calc_fail"],
+                         entry_allowed=entry_allowed,
+                         entry_reason=entry_reason,
+                     )
+                     continue
+                 entry_price = last_price
+                 pivot_val = cf.features.get("pivot")
+                 tight_low = cf.features.get("tight_low")
+                 atr_val = cf.features.get("atr14")
+                 stop0 = calc_initial_stop(
+                     pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                     tight_low=float(tight_low) if tight_low is not None else None,
+                     atr=float(atr_val) if atr_val is not None else None,
+                     mode=INITIAL_STOP_MODE,
+@@ -3940,51 +4092,51 @@ class PB1Engine:
+             after_dedup_count = len(orderable_candidates)
+ 
+             ok_count = len([c for c in candidates if c.setup_ok])
+             logger.info(
+                 "[PB1][CANDIDATES][SUMMARY] universe=%s scanned=%s selected_tier=%s ok=%s total=%s relax_passes=%s min_score=%.1f require_both=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f}",
+                 len(members),
+                 len(candidates),
+                 selected_tier,
+                 ok_count,
+                 len(candidates),
+                 relax_passes_used,
+                 applied_min_score,
+                 applied_require_both,
+                 selected_thresholds.vol_contraction_max,
+                 selected_thresholds.volu_contraction_max,
+                 selected_thresholds.pullback_min,
+                 selected_thresholds.pullback_max,
+             )
+             logger.info(
+                 "[PB1][CANDIDATES][SNAPSHOT] setup_ok_count=%s setup_ok_sample=%s after_risk_check_count=%s after_buyable_check_count=%s after_dedup_count=%s drop_reasons_topN=%s drop_examples=%s",
+                 len(setup_ok_codes),
+                 setup_ok_codes[:3],
+                 after_risk_check_count,
+                 after_buyable_check_count,
+                 after_dedup_count,
+-                drop_reason_counter.most_common(3),
++                drop_reason_counter.most_common(self.drop_reasons_topn),
+                 {k: v for k, v in drop_examples.items() if v},
+             )
+             summary_reason = "OK"
+             if ok_count == 0:
+                 summary_reason = "NO_CANDIDATES_AFTER_RELAX"
+             elif ok_count > 0 and not orderable_candidates:
+                 summary_reason = "NO_ORDERABLE_CANDIDATES"
+             logger.info(
+                 "[PB1][RUN][SUMMARY] universe=%s candidates=%s relax_passes=%s selected=%s reason=%s cash_total=%s usable=%s tick_budget=%s",
+                 len(members),
+                 len(candidates),
+                 relax_passes_used,
+                 len(orderable_candidates),
+                 summary_reason,
+                 total_cash_krw,
+                 entry_usable_krw,
+                 tick_budget_krw,
+             )
+             self._log_fail_reason_breakdown(candidates, note="post_filter")
+             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
+             if not candidates or ok_count == 0:
+                 top_reasons = all_reason_counts.most_common(3)
+                 final_status = "NO_TRADE"
+                 final_notes = f"no_candidates:{top_reasons or 'none'}"
+                 logger.info(
+diff --git a/trader/utils/json_sanitize.py b/trader/utils/json_sanitize.py
+index 91f1a6e03e1b243a1d5e762d80f051351d04e1ef..ea175d3f3481782425fc9b45a3ba1fa90570d71e 100644
+--- a/trader/utils/json_sanitize.py
++++ b/trader/utils/json_sanitize.py
+@@ -1,39 +1,66 @@
  from __future__ import annotations
  
- import json
- import logging
- import os
- from datetime import date
- from pathlib import Path
+ from datetime import date, datetime
++from decimal import Decimal
+ import math
  from typing import Any
  
- from trader.botstate_paths import botstate_path, get_botstate_root
-+from trader.config import UNIVERSE_POOL_SIZE
- from trader.universe.lkg_store import lkg_path
- 
- logger = logging.getLogger(__name__)
- 
- DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
-+MIN_UNIVERSE_MEMBERS = int(os.getenv("MIN_UNIVERSE_MEMBERS", str(UNIVERSE_POOL_SIZE)))
- 
- def _resolve_universe_env() -> str:
-     return (os.getenv("KIS_ENV") or "practice").lower()
+ import numpy as np
  
  
- def _resolve_universe_strategy() -> str:
-     return os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+ def is_bad_float(value: Any) -> bool:
+     if not isinstance(value, float):
+         return False
+     return math.isnan(value) or math.isinf(value)
  
  
- def universe_today_path(as_of: str) -> Path:
-     return botstate_path("runtime", "universe", f"{as_of}.json")
+ def _is_numpy_scalar(value: Any) -> bool:
+     return isinstance(value, np.generic)
  
  
- def universe_lkg_path() -> Path:
-     env = _resolve_universe_env()
-     strategy = _resolve_universe_strategy()
-     return lkg_path(env, strategy)
- 
- 
- def balance_snapshot_path(base_dir: Path | None = None) -> Path:
-     root = base_dir or get_botstate_root()
-     return Path(root) / "runtime" / "balance_snapshot.json"
- 
- 
- class RuntimeStore:
-@@ -213,96 +215,108 @@ class RuntimeStore:
-         members = data.get("members") if isinstance(data, dict) else data
-         if not isinstance(members, list):
-             members = []
-         meta["members"] = len(members)
-         return members, meta
- 
-     def ensure_universe(
-         self,
-         *,
-         as_of: str,
-         env: str,
-         strategy: str,
-         provider_override: str | None = None,
-     ) -> dict:
-         ok, meta = self.universe_check(as_of)
-         if not ok:
-             return meta
-         today_members = int(meta.get("members") or 0)
-         if today_members > 0:
-             return meta
-         if not meta.get("have_today"):
-             return meta
- 
-         flag_rel = Path("runtime") / "status" / f"universe_rebuild_{as_of}.flag"
-         flag = self.base_dir / flag_rel
--        if flag.exists():
-+        if flag.exists() and today_members > 0:
-             logger.info("[UNIVERSE][REBUILD_SKIP] as_of=%s flag=%s", as_of, flag)
-             return meta
- 
-         logger.info("[UNIVERSE][EMPTY_FATAL] today_universe_members=0 -> rebuild_once")
--        self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
-         try:
-             from trader.universe import build as universe_build
-         except Exception:
-             logger.exception("[UNIVERSE][REBUILD_FAIL] import_error=1")
-             return meta
- 
-         prev_bot_state = os.environ.get("BOT_STATE_DIR")
-         os.environ["BOT_STATE_DIR"] = str(self.base_dir)
-         os.environ.setdefault("BOTSTATE_ROOT", str(self.base_dir))
-         try:
-             universe_build.build_universe(
-                 as_of_date=as_of,
-                 env=env,
-                 strategy=strategy,
-                 provider_override=provider_override,
-             )
+ def to_jsonable(obj: Any) -> Any:
+     if obj is None or isinstance(obj, (str, int, bool)):
+         return obj
+     if isinstance(obj, float):
+         return None if is_bad_float(obj) else obj
+     if isinstance(obj, (datetime, date)):
+         return obj.isoformat()
+     if _is_numpy_scalar(obj):
+         return to_jsonable(obj.item())
+     if isinstance(obj, dict):
+         sanitized: dict[Any, Any] = {}
+         for key, value in obj.items():
+             sanitized_key = to_jsonable(key)
+             if not isinstance(sanitized_key, (str, int, float, bool)) and sanitized_key is not None:
+                 sanitized_key = str(sanitized_key)
+             sanitized[sanitized_key] = to_jsonable(value)
+         return sanitized
+     if isinstance(obj, (list, tuple, set)):
+         return [to_jsonable(item) for item in obj]
+     return str(obj)
++
++
++def json_safe(value: Any) -> Any:
++    if value is None:
++        return None
++    if hasattr(value, "isoformat") and callable(getattr(value, "isoformat")):
++        try:
++            return value.isoformat()
 +        except Exception:
-+            logger.exception("[UNIVERSE][REBUILD_FAIL] build_error=1")
-         finally:
-             if prev_bot_state is None:
-                 os.environ.pop("BOT_STATE_DIR", None)
-             else:
-                 os.environ["BOT_STATE_DIR"] = prev_bot_state
- 
-         members, post_meta = self.load_today_universe(as_of)
-+        today_path = Path(post_meta.get("today_path") or "")
-         source = None
-         try:
--            today_path = Path(post_meta.get("today_path") or "")
-             if today_path.exists():
-                 data = json.loads(today_path.read_text(encoding="utf-8"))
-                 if isinstance(data, dict):
-                     source = data.get("source")
-         except Exception:
-             logger.exception("[UNIVERSE][REBUILD][LOAD_FAIL] as_of=%s", as_of)
-         if members:
-             logger.info(
-                 "[UNIVERSE][REBUILD_DONE] members=%s provider=%s",
-                 len(members),
-                 source or "unknown",
-             )
-+            if len(members) >= MIN_UNIVERSE_MEMBERS:
-+                self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
-         else:
-             logger.warning("[UNIVERSE][REBUILD_FAILED] members=0 -> skip trading")
-+            if today_path.exists():
-+                try:
-+                    today_path.unlink()
-+                    logger.info("[UNIVERSE][EMPTY_FATAL] removed_empty_today path=%s", today_path)
-+                except Exception:
-+                    logger.exception("[UNIVERSE][EMPTY_FATAL] failed_remove_today path=%s", today_path)
-+            post_ok, post_meta = self.universe_check(as_of)
-+            if post_ok:
-+                return post_meta
-         post_meta["members"] = len(members)
-         return post_meta
- 
-     def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
-         today_raw = self._today_path(as_of)
-         today, today_rel = self._resolve_universe_path(today_raw)
-         meta = {
-             "as_of": as_of,
-             "today_path": str(today),
-             "today_rel": str(today_rel),
-             "have_today": today.exists(),
-         }
-         members: list[dict] = []
-         if meta["have_today"]:
-             try:
-                 with today.open("r", encoding="utf-8") as handle:
-                     data = json.load(handle)
-                 loaded = data.get("members") if isinstance(data, dict) else data
-                 if isinstance(loaded, list):
-                     members = loaded
-             except Exception:
-                 logger.exception("[UNIVERSE][LOAD_TODAY][FAIL] path=%s", today)
-         meta["members"] = len(members)
-         return members, meta
- 
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index 1d005293f24edcd678f9662c7c65af34d3190520..e9be1a35076ac6cf50a9bc625eba0f77d9a3eef0 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -1,106 +1,87 @@
- from __future__ import annotations
- 
- import argparse
- import csv
- import json
- import logging
- import os
- import re
- from pathlib import Path
- from typing import Iterable
- 
--import numpy as np
--import pandas as pd
- 
- from trader.config import (
--    MAX_GAP_UP_PCT,
--    MAX_INTRADAY_RANGE_PCT,
--    MAX_SPREAD_PROXY_BPS,
--    MIN_AVG_VALUE_KRW,
-     PB1_MIN_CANDLES,
--    RS_BENCHMARK,
--    RS_COMPOSITE_W1,
--    RS_COMPOSITE_W2,
--    RS_LOOKBACK_DAYS,
--    RS_LOOKBACK2_DAYS,
--    RS_MIN_PCTILE,
--    UNIVERSE_POOL_SIZE,
--    VCP_LOOKBACK,
--    VCP_MIN_SCORE,
- )
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
- from trader.db.engine import make_engine
- from trader.db.migrate import run_migrations
- from trader.db.repos import UniverseRepo
--from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
--from trader.factors.rs_rank import rank_rs
- from trader.kis_wrapper import KisAPI
- from trader.time_utils import now_kst
- from trader.universe.capabilities import providers_for_env
- from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
- from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
- from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
- from trader.universe.providers.lkg_provider import LKGProvider
- from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
- from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
- from trader.runtime_store import RuntimeStore
--from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
- 
- from datetime import date
- 
- 
- def _parse_as_of_date(val: str) -> date | None:
-     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-     from datetime import datetime as _datetime
- 
-     if not val:
-         return None
-     s = str(val).strip()
-     try:
-         if "-" in s:
-             return _datetime.fromisoformat(s).date()
-         if len(s) == 8 and s.isdigit():
-             return _datetime.strptime(s, "%Y%m%d").date()
-         return _datetime.fromisoformat(s).date()
-     except Exception:
-         return None
- 
- 
- def _prefer_provider_order(chain: list[str]) -> list[str]:
--    """Prefer caches first, then live providers, then static."""
--    order = {
--        "sqlite_cache": 10,
--        "lkg": 20,
--        # live providers
--        "fdr_kospi100_kosdaq100": 30,
--        "fdr_marketcap_top": 31,
--        "kis_marketcap_top": 31,
--        # ultimate fallback
--        "seed_static": 90,
--    }
--    return sorted(list(chain), key=lambda p: (order.get(p, 50), p))
-+    """Prefer live providers first, then static, then caches."""
-+    preferred = [
-+        "fdr_kospi100_kosdaq100",
-+        "fdr_marketcap_top",
-+        "seed_static",
-+        "lkg",
-+        "sqlite_cache",
-+    ]
-+    ordered = [name for name in preferred if name in chain]
-+    tail = [name for name in chain if name not in ordered]
-+    return ordered + tail
- 
- logger = logging.getLogger(__name__)
- 
- FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
- 
- 
- def _resolve_bot_state_dir() -> Path:
-     raw = os.getenv("BOT_STATE_DIR", "").strip()
-     if raw:
-         return Path(raw).expanduser().resolve()
-     return get_botstate_root()
- 
- 
- def _resolve_seed_dir() -> Path:
-     default_dir = _resolve_bot_state_dir() / "universe_lkg"
-     seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", str(default_dir)))
-     seed_dir.mkdir(parents=True, exist_ok=True)
-     return seed_dir
- 
- 
- SEED_DIR = _resolve_seed_dir()
- SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
- SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
- TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
- DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
-@@ -140,149 +121,50 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
-             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-             if not code:
-                 continue
-             members.append(
-                 {
-                     "code": code,
-                     "market": market,
-                     "weight": row.get("weight") or row.get("target_weight") or row.get("weight_pct"),
-                     "rank": row.get("rank") or idx + 1,
-                     "meta_json": row,
-                 }
-             )
-     return members
- 
- 
- def _dedup(seq: Iterable[str]) -> list[str]:
-     seen: set[str] = set()
-     uniq: list[str] = []
-     for val in seq:
-         if val not in seen:
-             seen.add(val)
-             uniq.append(val)
-     return uniq
- 
- 
--def _trend_template_ok(df: pd.DataFrame) -> bool:
--    if df is None or len(df) < 200:
--        return False
--    close = df["close"]
--    ma50 = close.rolling(50).mean().iloc[-1]
--    ma150 = close.rolling(150).mean().iloc[-1]
--    ma200 = close.rolling(200).mean().iloc[-1]
--    ma200_slope = ma200 - close.rolling(200).mean().iloc[-21] if len(close) >= 221 else float("nan")
--    if not (close.iloc[-1] > ma50 > ma150 > ma200):
--        return False
--    if not (ma200_slope > 0):
--        return False
--    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else float("nan")
--    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else float("nan")
--    if not (np.isfinite(hi_52w) and close.iloc[-1] >= hi_52w * 0.75):
--        return False
--    if not (np.isfinite(lo_52w) and close.iloc[-1] >= lo_52w * 1.30):
--        return False
--    return True
--
--
--def _apply_minervini_filters(members: list[dict], ohlcv_provider: ChainOHLCVProvider) -> list[dict]:
--    if not members:
--        return []
--    bench_df = ohlcv_provider.get_ohlcv(RS_BENCHMARK, 260).df if ohlcv_provider else None
--    bench_close = bench_df["close"] if bench_df is not None and not bench_df.empty else pd.Series(dtype=float)
--    price_map: dict[str, pd.Series] = {}
--    member_meta: dict[str, dict] = {}
--
--    for member in members[:UNIVERSE_POOL_SIZE]:
--        code = str(member.get("code") or "").zfill(6)
--        result = ohlcv_provider.get_ohlcv(code, 260) if ohlcv_provider else None
--        df = result.df if result and result.df is not None else pd.DataFrame()
--        if df.empty:
--            continue
--        df = df.sort_values("date")
--        price_map[code] = df["close"].reset_index(drop=True)
--        vcp_score = score_vcp(df, VCP_LOOKBACK, VolContractRules(), PriceTightRules())
--        pivot_info = find_pivot(df)
--        liq_ok = liquidity_filter(df, MIN_AVG_VALUE_KRW)
--        gap_ok = gap_filter(df, MAX_GAP_UP_PCT)
--        spread_ok = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
--        range_ok = range_filter(df, MAX_INTRADAY_RANGE_PCT)
--        trend_ok = _trend_template_ok(df)
--        member_meta[code] = {
--            "vcp_score": vcp_score,
--            "pivot": pivot_info.get("pivot_price"),
--            "tight_low": pivot_info.get("tight_low"),
--            "base_high": pivot_info.get("base_high"),
--            "liq_ok": liq_ok,
--            "gap_ok": gap_ok,
--            "spread_ok": spread_ok,
--            "range_ok": range_ok,
--            "trend_ok": trend_ok,
--        }
--
--    rs_ranked = rank_rs(
--        price_map,
--        bench_close,
--        lookback_days=RS_LOOKBACK_DAYS,
--        lookback2_days=RS_LOOKBACK2_DAYS,
--        w1=RS_COMPOSITE_W1,
--        w2=RS_COMPOSITE_W2,
--    )
--    rs_map = {row["ticker"]: row for row in rs_ranked.to_dict(orient="records")}
--    filtered: list[dict] = []
--    for member in members[:UNIVERSE_POOL_SIZE]:
--        code = str(member.get("code") or "").zfill(6)
--        meta = member_meta.get(code)
--        if not meta:
--            continue
--        rs_row = rs_map.get(code, {})
--        rs_pctile = float(rs_row.get("pctile") or 0.0) * 100.0
--        rs_comp = rs_row.get("composite")
--        vcp_ok = is_vcp_ready(meta.get("vcp_score", 0), VCP_MIN_SCORE)
--        if not (meta.get("liq_ok") and meta.get("gap_ok") and meta.get("spread_ok") and meta.get("range_ok")):
--            continue
--        if not meta.get("trend_ok"):
--            continue
--        if rs_pctile < RS_MIN_PCTILE:
--            continue
--        if not vcp_ok:
--            continue
--        meta_json = dict(member.get("meta_json") or {})
--        meta_json.update(
--            {
--                "rs_pctile": rs_pctile,
--                "rs_comp": rs_comp,
--                "vcp_score": meta.get("vcp_score"),
--                "pivot": meta.get("pivot"),
--                "tight_low": meta.get("tight_low"),
--                "base_high": meta.get("base_high"),
--                "trend_ok": True,
--                "liq_ok": True,
--            }
--        )
--        member["meta_json"] = meta_json
--        filtered.append(member)
--    return filtered
- 
- 
- def _load_seed_rows(path: Path) -> list[dict]:
-     if not path.exists():
-         return []
-     rows: list[dict] = []
-     try:
-         with path.open(encoding="utf-8") as f:
-             # CSV with header: code,name
-             reader = csv.DictReader(f)
-             has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
-             if has_code_header:
-                 for row in reader:
-                     code = str(row.get("code") or "").strip()
-                     if not code:
-                         continue
-                     rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
-             else:
-                 f.seek(0)
-                 for line in f:
-                     code = line.strip()
-                     if code:
-                         rows.append({"code": code.zfill(6), "name": None})
-     except Exception:
-         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
-@@ -616,104 +498,112 @@ def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict |
-     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
- 
-     selected_by_market = {
-         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-     }
-     payload = _normalize_payload(
-         {
-             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-             "selected_by_market": selected_by_market,
-         }
-     )
-     params = {"as_of": as_of_date, "target": target}
-     members = _build_members_from_payload(selected_by_market)
-     return (
-         {
-             "payload": payload,
-             "members": members,
-             "source": "fdr_kospi100_kosdaq100",
-             "params": params,
-         },
-         "fdr_kospi100_kosdaq100",
-     )
- 
- 
--def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
-+def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> list[dict]:
-     engine = make_engine()
-     run_migrations(engine)
-     repo = UniverseRepo(engine)
-     bot_state_dir = _resolve_bot_state_dir()
-     os.environ.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
-     runtime_store = RuntimeStore(base_dir=bot_state_dir)
- 
-     payload: dict | None = None
-     members: list[dict] = []
-     source = provider_override or DEFAULT_PROVIDER
-     params: dict = {"as_of": as_of_date}
-     last_reason: str | None = None
- 
-     logger.info(
-         "[UNIVERSE][BUILD][START] env=%s strategy=%s as_of=%s provider=%s",
-         env,
-         strategy,
-         as_of_date,
-         provider_override or DEFAULT_PROVIDER,
-     )
- 
-     allowed_chain = providers_for_env(env)
-     if provider_override:
-         if provider_override not in allowed_chain:
-             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
-         allowed_chain = [provider_override]
-     preferred_chain = _prefer_provider_order(allowed_chain)
-     if preferred_chain != list(allowed_chain):
-         logger.info(
-             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
-             env,
-             strategy,
-             allowed_chain,
-             preferred_chain,
-         )
-     else:
-         logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
- 
-     kis_provider: KISMarketcapTopProvider | None = None
-     if "kis_marketcap_top" in allowed_chain:
-         try:
-             kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
-         except Exception as exc:
-             last_reason = f"kis_init_fail:{exc}"
-             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
- 
-     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
-     sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
- 
-+    today = now_kst().date()
-+    as_of_day = _parse_as_of_date(as_of_date) or today
-     for provider_name in preferred_chain:
-         result: dict | None = None
-         reason: str | None = None
- 
-+        if as_of_day == today and provider_name in {"sqlite_cache", "lkg"}:
-+            logger.info(
-+                "[UNIVERSE][PROVIDER][SKIP] provider=%s reason=today_requires_fresh",
-+                provider_name,
-+            )
-+            continue
-         if provider_name == "fdr_kospi100_kosdaq100":
-             result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
-         elif provider_name == "fdr_marketcap_top":
-             result, reason = _build_from_fdr(as_of_date, TARGETS)
-         elif provider_name == "kis_marketcap_top":
-             if not kis_provider:
-                 reason = last_reason or "kis_provider_unavailable"
-             else:
-                 result, reason = _build_from_kis(kis_provider, as_of_date)
-         elif provider_name == "lkg":
-             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
-             reason = "lkg_hit" if result else "lkg_miss"
-         elif provider_name == "sqlite_cache":
-             if sqlite_provider:
-                 result = _fallback_from_sqlite(
-                     sqlite_provider,
-                     env=env,
-                     strategy=strategy,
-                     reference_as_of=as_of_date,
-                     max_age_days=FALLBACK_MAX_AGE_DAYS,
-                 )
-             reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
-         elif provider_name == "seed_static":
-             result = _load_static_seed()
-             reason = "seed_static" if result else "seed_missing"
-@@ -745,95 +635,82 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
-     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
-     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
-     members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
-     logger.info(
-         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
-         stats["total_raw"],
-         stats["invalid_format"],
-         stats["insufficient_history"],
-         stats["final"],
-     )
-     invalid_codes = sanitize_detail.get("invalid_format_codes") or []
-     insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
-     if invalid_codes:
-         logger.info(
-             "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
-             len(invalid_codes),
-             invalid_codes[: min(5, len(invalid_codes))],
-         )
-     if insufficient_codes:
-         logger.info(
-             "[UNIVERSE][DROP] reason=insufficient_history count=%s sample=%s",
-             len(insufficient_codes),
-             insufficient_codes[: min(5, len(insufficient_codes))],
-         )
- 
--    if ohlcv_provider and members:
--        filtered = _apply_minervini_filters(members, ohlcv_provider)
--        logger.info(
--            "[UNIVERSE][MINERVINI_FILTER] before=%s after=%s rs_min_pctile=%s vcp_min_score=%s",
--            len(members),
--            len(filtered),
--            RS_MIN_PCTILE,
--            VCP_MIN_SCORE,
--        )
--        members = filtered
-+    if not members:
-+        logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
-+        raise RuntimeError("universe_members_empty")
- 
--    universe_id = repo.store_universe(
-+    repo.store_universe(
-         env=env,
-         strategy=strategy,
-         as_of_date=as_of_date,
-         source=source,
-         params_json=params,
-         payload_json=payload or {},
-         members=members,
-     )
--    if universe_id:
--        logger.info(
--            "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s universe_id=%s members=%s source=%s reason=%s",
--            env,
--            strategy,
--            as_of_date,
--            universe_id,
--            len(members),
--            source,
--            last_reason or "n/a",
--        )
--    else:
--        logger.warning(
--            "[UNIVERSE][SKIPPED_DB] env=%s strategy=%s as_of=%s members=%s", env, strategy, as_of_date, len(members)
--        )
-+    logger.info(
-+        "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",
-+        env,
-+        strategy,
-+        as_of_date,
-+        len(members),
-+        source,
-+        last_reason or "n/a",
-+    )
-     _write_runtime_universe(
-         runtime_store=runtime_store,
-         as_of_date=as_of_date,
-         env=env,
-         strategy=strategy,
-         payload=payload,
-         members=members,
-         source=source,
-         params=params,
-     )
-     _write_universe_sanitize_report(
-         as_of_date=as_of_date,
-         keep_codes=sanitize_detail.get("kept") or [],
-         dropped=sanitize_detail.get("dropped") or [],
-     )
-     _write_universe_drop_diagnostics(
-         runtime_store=runtime_store,
-         as_of_date=as_of_date,
-         source=source,
-         invalid_format_codes=sanitize_detail.get("invalid_format_codes") or [],
-         insufficient_history_codes=sanitize_detail.get("insufficient_history_codes") or [],
-     )
-     runtime_store.touch_flag(Path("runtime") / f"universe_build_done_{as_of_date}.flag")
--    return universe_id
-+    return members
- 
- 
- def main() -> None:
-     logging.basicConfig(level=logging.INFO)
-     args = parse_args()
-     as_of = args.date or now_kst().date().isoformat()
-     build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
- 
- 
- if __name__ == "__main__":
-     main()
++            pass
++    if hasattr(value, "item") and callable(getattr(value, "item")):
++        try:
++            return value.item()
++        except Exception:
++            pass
++    if isinstance(value, (str, int, float, bool)):
++        return value
++    if isinstance(value, (datetime, date)):
++        return value.isoformat()
++    if isinstance(value, Decimal):
++        return float(value)
++    if isinstance(value, dict):
++        return {str(key): json_safe(val) for key, val in value.items()}
++    if isinstance(value, (list, tuple, set)):
++        return [json_safe(item) for item in value]
++    return str(value)
+

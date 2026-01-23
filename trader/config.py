@@ -142,6 +142,10 @@ CONFIG = {
     "PB1_PREOPEN_LIMIT_BUFFER_PCT": "0.3",
     "PB1_REQUIRE_BALANCE_FOR_ENTRY": "1",
     "PB1_ENTRY_ENABLED": "true",
+    "PB1_ENTRY_MODE": "BOTH",
+    "PB1_REQUIRE_BOTH": "1",
+    "PB1_LOG_ENTRY_GATE": "1",
+    "PB1_LOG_DROP_REASONS_TOPN": "10",
     "PB1_ENTRY_WINDOW_START": "09:00",
     "PB1_ENTRY_OPEN_END": "09:05",
     "PB1_ENTRY_WINDOW_END": "15:15",
@@ -197,11 +201,11 @@ CONFIG = {
     "PB1_MAX_POS_PCT": "0.20",
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
     "PB1_MAX_ATR_PCT": "6.0",           # ATR% 상한 (과변동 종목 제외)
+    "PB1_ATR_PCT_MAX": "6.0",
     "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
     "PB1_VOL_MAX": "1.00",
     "PB1_VOLU_MAX": "0.98",
     "PB1_VOLU_MAX_INTRADAY": "1.05",
-    "PB1_REQUIRE_BOTH": "1",
     # Minervini v2 tuning
     "MINERVINI_RS_MIN": "0.80",
     "MINERVINI_MAX_PYRAMID": "3",
@@ -634,10 +638,14 @@ PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX")
 PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
 PB1_PULLBACK_MIN = float(_cfg("PB1_PULLBACK_MIN") or "0.03")
 PB1_PULLBACK_MAX = float(_cfg("PB1_PULLBACK_MAX") or "0.18")
-PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=True))
+PB1_ENTRY_MODE = (_cfg("PB1_ENTRY_MODE") or "BOTH").strip().upper()
+if PB1_ENTRY_MODE not in {"PULLBACK", "BREAKOUT", "BOTH"}:
+    logger.warning("[CONFIG] PB1_ENTRY_MODE invalid=%s -> fallback=BOTH", PB1_ENTRY_MODE)
+    PB1_ENTRY_MODE = "BOTH"
+PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH", fallback=True))
+PB1_REQUIRE_BOTH_CONTRACTIONS = _cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=PB1_REQUIRE_BOTH)
 PB1_VOL_CONTRACTION_MAX = PB1_VOL_MAX
 PB1_VOLU_CONTRACTION_MAX = PB1_VOLU_MAX
-PB1_REQUIRE_BOTH_CONTRACTIONS = PB1_REQUIRE_BOTH
 PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
 PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
 PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
@@ -717,12 +725,16 @@ PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
 PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
 PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
-PB1_MAX_ATR_PCT = float(_cfg("PB1_MAX_ATR_PCT") or "6.0")
+PB1_MAX_ATR_PCT = float(_cfg_with_alias("PB1_MAX_ATR_PCT", "PB1_ATR_PCT_MAX") or "6.0")
 PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
+PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
+PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
 
 logger.info(
-    "[CONFIG][PB1] entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
+    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
+    PB1_ENTRY_MODE,
+    int(PB1_REQUIRE_BOTH),
     PB1_ENTRY_BUDGET_PCT_PER_TICK,
     PB1_MAX_POS_PCT,
     PB1_VOL_MAX,
@@ -730,7 +742,7 @@ logger.info(
     PB1_VOLU_MAX_INTRADAY,
     PB1_PULLBACK_MIN,
     PB1_PULLBACK_MAX,
-    int(PB1_REQUIRE_BOTH),
+    int(PB1_REQUIRE_BOTH_CONTRACTIONS),
     PB1_MIN_SCORE_BASE,
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,

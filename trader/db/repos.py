@@ -27,6 +27,7 @@ from .schema import (
 from .migrate import ensure_sqlite_writable, run_migrations
 from . import config
 from trader.time_utils import now_kst
+from trader.utils.json_sanitize import json_safe
 
 logger = logging.getLogger(__name__)
 ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
@@ -648,6 +649,7 @@ class LedgerEventsRepo:
         payload_json: dict | None = None,
     ) -> str:
         db_url = str(self.engine.url)
+        safe_payload_json = json_safe(payload_json) if payload_json is not None else {}
         payload = {
             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -666,7 +668,7 @@ class LedgerEventsRepo:
             "ok": ok,
             "reasons": reasons or [],
             "stage": stage,
-            "payload_json": payload_json or {},
+            "payload_json": safe_payload_json,
         }
         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
         with self.engine.begin() as conn:
