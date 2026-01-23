@@ -1,413 +1,193 @@
-diff --git a/migrations/0009_universe_snapshot.sql b/migrations/0009_universe_snapshot.sql
+diff --git a/tests/test_json_safe.py b/tests/test_json_safe.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..57fdfc2a2131b91f461c146cf7363d9d80edff3f
+index 0000000000000000000000000000000000000000..9f5b8dc8bcb77b96045ee8148f886ccb39387a46
 --- /dev/null
-+++ b/migrations/0009_universe_snapshot.sql
-@@ -0,0 +1,36 @@
-+-- Universe snapshot tables with current pointer
++++ b/tests/test_json_safe.py
+@@ -0,0 +1,67 @@
++import json
++import sys
++from datetime import date, datetime
++from decimal import Decimal
++from pathlib import Path
 +
-+ALTER TABLE universe_members RENAME TO universe_members_legacy;
-+ALTER TABLE universe RENAME TO universe_legacy;
++import numpy as np
++import pandas as pd
++import sqlalchemy as sa
 +
-+CREATE TABLE IF NOT EXISTS universe_runs (
-+  run_id TEXT PRIMARY KEY,
-+  strategy TEXT NOT NULL,
-+  provider TEXT NOT NULL,
-+  as_of DATE NOT NULL,
-+  created_ts TEXT NOT NULL
-+);
++sys.path.append(str(Path(__file__).resolve().parents[1]))
 +
-+CREATE UNIQUE INDEX IF NOT EXISTS ux_universe_runs_key
-+ON universe_runs(strategy, provider, as_of);
-+
-+CREATE TABLE IF NOT EXISTS universe_members (
-+  run_id TEXT NOT NULL,
-+  stock_code TEXT NOT NULL,
-+  name TEXT,
-+  market TEXT,
-+  rank INTEGER,
-+  market_cap REAL,
-+  reason TEXT,
-+  PRIMARY KEY (run_id, stock_code),
-+  FOREIGN KEY (run_id) REFERENCES universe_runs(run_id) ON DELETE CASCADE
-+);
-+
-+CREATE INDEX IF NOT EXISTS ix_universe_members_code ON universe_members(stock_code);
-+
-+CREATE TABLE IF NOT EXISTS universe_current (
-+  strategy TEXT PRIMARY KEY,
-+  run_id TEXT NOT NULL,
-+  updated_ts TEXT NOT NULL,
-+  FOREIGN KEY (run_id) REFERENCES universe_runs(run_id) ON DELETE RESTRICT
-+);
-diff --git a/migrations/0010_purge_218410.sql b/migrations/0010_purge_218410.sql
-new file mode 100644
-index 0000000000000000000000000000000000000000..291f106927f31ded4fb374732169dabfb2ea6e21
---- /dev/null
-+++ b/migrations/0010_purge_218410.sql
-@@ -0,0 +1 @@
-+DELETE FROM universe_members WHERE stock_code='218410';
-diff --git a/tests/test_db_uuid_types.py b/tests/test_db_uuid_types.py
-index 52a1ca15e747e4c02ae84cd5890fccb7d202a3a5..1e26ed90c1803f00a374fb8d88c57daf5f6c7f00 100644
---- a/tests/test_db_uuid_types.py
-+++ b/tests/test_db_uuid_types.py
-@@ -1,17 +1,17 @@
- import sqlalchemy as sa
- 
- from trader.db.schema import schema_for_url
- 
- 
- def test_universe_id_uses_string_for_postgres():
-     url = "postgresql+psycopg://user:pass@localhost:5432/db"
-     schema = schema_for_url(url)
--    col_type = schema.universe.c.universe_id.type
-+    col_type = schema.universe_runs.c.run_id.type
-     assert isinstance(col_type, sa.String)
- 
- 
- def test_universe_id_uses_string_for_sqlite():
-     url = "sqlite:///./dev.db"
-     schema = schema_for_url(url)
--    col_type = schema.universe.c.universe_id.type
-+    col_type = schema.universe_runs.c.run_id.type
-     assert isinstance(col_type, sa.String)
-diff --git a/tests/test_pretrade_validation_skip.py b/tests/test_pretrade_validation_skip.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..0700d9d7da4064eff3655281dd28e700e7445553
---- /dev/null
-+++ b/tests/test_pretrade_validation_skip.py
-@@ -0,0 +1,48 @@
-+from trader.pb1_engine import PB1Engine
-+from trader.window_router import WindowDecision
-+
-+
-+class DummyLedgerRepo:
-+    def __init__(self) -> None:
-+        self.events: list[dict] = []
-+
-+    def append_event(self, **payload) -> None:
-+        self.events.append(payload)
-+
-+
-+class FakeKis:
-+    def get_quote_safe(self, code: str, diag_mode: bool = False):
-+        return {"rt_cd": "1"}
-+
-+
-+def test_pretrade_validation_skips_untradeable():
-+    ledger_repo = DummyLedgerRepo()
-+    engine = PB1Engine(
-+        universe_repo=object(),
-+        orders_repo=object(),
-+        fills_repo=object(),
-+        positions_repo=object(),
-+        ledger_repo=ledger_repo,
-+        kis=FakeKis(),
-+        window=WindowDecision(name="day", phase="trade"),
-+        window_label="day",
-+        phase="trade",
-+        dry_run=True,
-+        env="practice",
-+        run_id="run-1",
-+    )
-+
-+    ok = engine._pretrade_check(
-+        code="218410",
-+        market="KOSDAQ",
-+        mode=1,
-+        side="BUY",
-+        qty=10,
-+        price=1000.0,
-+        client_order_key="test",
-+        stage="PB1-CLOSE",
-+    )
-+
-+    assert ok is False
-+    assert ledger_repo.events
-+    assert ledger_repo.events[0]["event_type"] == "ORDER_SKIP"
-diff --git a/tests/test_universe_build_empty_ok.py b/tests/test_universe_build_empty_ok.py
-index 65fe444541702e03ac5f8ec6d0f01897e4c99928..56089cbb07344ed33ce241cee20d8ec79faa99da 100644
---- a/tests/test_universe_build_empty_ok.py
-+++ b/tests/test_universe_build_empty_ok.py
-@@ -1,24 +1,25 @@
- import os
- from importlib import reload
- 
- import pytest
- 
- from trader.universe import build
- 
- 
- @pytest.fixture(autouse=True)
- def reset_env(tmp_path, monkeypatch):
-     db_url = f"sqlite:///{tmp_path}/test.db"
-     monkeypatch.setenv("DATABASE_URL", db_url)
-     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
-+    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
-     yield
- 
- 
- def test_build_universe_succeeds_on_empty_payload(monkeypatch):
-     monkeypatch.setattr(
-         build,
-         "run_rebalance",
-         lambda as_of_date, return_by_market=True: {"selected": [], "selected_stocks": [], "selected_by_market": {}},
-     )
-     with pytest.raises(RuntimeError, match="universe_members_empty"):
-         build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
-diff --git a/tests/test_universe_current_pointer.py b/tests/test_universe_current_pointer.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..a6ae5271e9236bb617751a21539744a772fdf787
---- /dev/null
-+++ b/tests/test_universe_current_pointer.py
-@@ -0,0 +1,35 @@
-+from trader.db.engine import make_engine
++from trader.db.json_safe import json_sanitize
 +from trader.db.migrate import run_migrations
-+from trader.db.repos import UniverseRepo
++from trader.db.repos import OrdersRepo
++from trader.db.schema import ORDERS
 +
 +
-+def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
++def test_json_sanitize_handles_complex_types() -> None:
++    payload = {
++        "ts": pd.Timestamp("2023-01-01"),
++        "dt": datetime(2023, 1, 1, 12, 30, 45),
++        "d": date(2023, 1, 1),
++        "dec": Decimal("12.34"),
++        "np_int": np.int64(7),
++        "np_float": np.float64(3.14),
++        "bad": float("nan"),
++    }
++    sanitized = json_sanitize(payload)
++    assert isinstance(sanitized["ts"], str)
++    assert isinstance(sanitized["dt"], str)
++    assert isinstance(sanitized["d"], str)
++    assert sanitized["dec"] == 12.34
++    assert sanitized["np_int"] == 7
++    assert sanitized["np_float"] == 3.14
++    assert sanitized["bad"] is None
++    json.dumps(sanitized)
++
++
++def test_create_intent_sanitizes_request_json(tmp_path) -> None:
 +    db_url = f"sqlite:///{tmp_path}/test.db"
-+    monkeypatch.setenv("DATABASE_URL", db_url)
-+
-+    engine = make_engine()
++    engine = sa.create_engine(db_url)
 +    run_migrations(engine)
-+    repo = UniverseRepo(engine)
 +
-+    repo.store_universe_snapshot(
++    repo = OrdersRepo(engine)
++    order_id, created = repo.create_intent_idempotent(
 +        env="practice",
-+        strategy="best_k_meta",
-+        as_of_date="2025-01-01",
-+        provider="seed_static",
-+        members=[{"code": "218410", "market": "KOSDAQ"}],
-+        reason="legacy",
++        run_id=None,
++        strategy="pb1_pullback_close",
++        sid=1,
++        mode=1,
++        code="005930",
++        market="KOSPI",
++        side="BUY",
++        ord_type="LIMIT",
++        qty=1,
++        limit_price=100.0,
++        stage="PB1-CLOSE",
++        client_order_key="practice:pb1:test",
++        request_json={"ts": pd.Timestamp("2023-01-01")},
 +    )
-+    repo.store_universe_snapshot(
-+        env="practice",
-+        strategy="best_k_meta",
-+        as_of_date="2025-01-02",
-+        provider="seed_static",
-+        members=[{"code": "005930", "market": "KOSPI"}],
-+        reason="current",
-+    )
++    assert created is True
 +
-+    members = repo.get_current_universe_members("practice", "best_k_meta")
-+    codes = [m.get("code") for m in members]
++    with engine.begin() as conn:
++        count = conn.execute(sa.select(sa.func.count()).select_from(ORDERS)).scalar()
++    assert count == 1
++    assert order_id
+diff --git a/trader/db/engine.py b/trader/db/engine.py
+index 281516ecbdee1964f92a5173a74cc9ba90957626..95f91ccaaeb82e05e4eae78982d954857bf08c14 100644
+--- a/trader/db/engine.py
++++ b/trader/db/engine.py
+@@ -1,12 +1,21 @@
+-from sqlalchemy import Engine, create_engine
++from sqlalchemy import Engine, create_engine, event
+ 
+ from . import config
+ 
+ 
+ def make_engine(database_url: str | None = None) -> Engine:
+     url = database_url or config.get_database_url()
+     kwargs = {}
+     if not config.is_sqlite_url(url):
+         kwargs["pool_pre_ping"] = True
+     engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
++    if config.is_sqlite_url(url):
++        @event.listens_for(engine, "connect")
++        def _set_sqlite_pragma(dbapi_conn, _connection_record) -> None:
++            cursor = dbapi_conn.cursor()
++            cursor.execute("PRAGMA foreign_keys=ON;")
++            cursor.execute("PRAGMA journal_mode=WAL;")
++            cursor.execute("PRAGMA synchronous=NORMAL;")
++            cursor.execute("PRAGMA busy_timeout=5000;")
++            cursor.close()
+     return engine
+diff --git a/trader/db/json_safe.py b/trader/db/json_safe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f94e4b5b46f59d8f19ef82c1d0714f6be71dc603
+--- /dev/null
++++ b/trader/db/json_safe.py
+@@ -0,0 +1,66 @@
++from __future__ import annotations
 +
-+    assert "005930" in codes
-+    assert "218410" not in codes
-diff --git a/tests/test_universe_lkg_sqlite_fallback.py b/tests/test_universe_lkg_sqlite_fallback.py
-index 24dbd1b20cc180645c7991ed0d37409559e80e4c..8a7208e5042065c05476378c991d2b7e0acbd2f8 100644
---- a/tests/test_universe_lkg_sqlite_fallback.py
-+++ b/tests/test_universe_lkg_sqlite_fallback.py
-@@ -81,95 +81,90 @@ def _install_sa_stub() -> None:
-     sa_engine = types.ModuleType("sqlalchemy.engine")
-     sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
-     sa_engine.Engine = _DummyEngine
-     sys.modules["sqlalchemy.engine"] = sa_engine
-     sys.modules["sqlalchemy.engine.url"] = sa_engine.url
-     sys.modules["sqlalchemy"] = sa
- 
- 
- _install_sa_stub()
- 
- from trader.db.engine import make_engine
- from trader.db.repos import UniverseRepo
- 
- 
- def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
-     db_url = f"sqlite:///{tmp_path}/pbcore.db"
-     lkg_root = tmp_path / "lkg"
-     sqlite_cache = tmp_path / "cache.sqlite3"
-     monkeypatch.setenv("DATABASE_URL", db_url)
-     monkeypatch.setenv("USING_EXTERNAL_DB", "0")
-     monkeypatch.setenv("UNIVERSE_LKG_ROOT", str(lkg_root))
-     monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
-     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
-     monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
-     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
-+    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
- 
-     from trader.universe import lkg_store
- 
-     importlib.reload(lkg_store)
-     from trader.universe import build as build_module
- 
-     importlib.reload(build_module)
- 
-     stored: dict = {}
- 
-     class FakeUniverseRepo:
-         def __init__(self, engine):
-             self.engine = engine
- 
--        def store_universe(self, env, strategy, as_of_date, source, params_json, payload_json, members):
-+        def store_universe_snapshot(self, *, env, strategy, as_of_date, provider, members, reason=None):
-             stored[(env, strategy)] = {
-                 "universe": {
--                    "universe_id": "fake-id",
-+                    "run_id": "fake-id",
-                     "env": env,
-                     "strategy": strategy,
--                    "as_of_date": as_of_date,
--                    "source": source,
--                    "params_json": params_json,
--                    "payload_json": payload_json,
-+                    "as_of": as_of_date,
-+                    "provider": provider,
-+                    "reason": reason,
-                 },
-                 "members": list(members),
-             }
-             return "fake-id"
- 
--        def get_latest_universe(self, env, strategy, max_age_days=10):
--            row = stored.get((env, strategy))
--            if not row:
--                return None
--            return row["universe"], row["members"]
-+        def cleanup_old_runs(self, *, retain_days=30):
++import json
++import math
++from datetime import date, datetime
++from decimal import Decimal
++from typing import Any
++
++
++def _is_pandas_timestamp(value: Any) -> bool:
++    return value.__class__.__name__ in ("Timestamp", "NaTType")
++
++
++def _to_iso(value: Any) -> str:
++    if hasattr(value, "isoformat"):
++        return value.isoformat()
++    return str(value)
++
++
++def json_sanitize(obj: Any) -> Any:
++    """
++    JSON으로 안전하게 저장 가능한 타입만 남기도록 재귀 변환.
++    - pandas.Timestamp -> ISO string
++    - datetime/date -> ISO string
++    - numpy scalar -> python scalar
++    - Decimal -> float(또는 str 선택 가능)
++    - NaN/Inf -> None
++    """
++    if obj is None:
++        return None
++
++    if _is_pandas_timestamp(obj):
++        s = str(obj)
++        return None if s == "NaT" else _to_iso(obj)
++
++    if isinstance(obj, (datetime, date)):
++        return obj.isoformat()
++
++    if isinstance(obj, Decimal):
++        return float(obj)
++
++    if isinstance(obj, (bool, int, str)):
++        return obj
++
++    if isinstance(obj, float):
++        if math.isnan(obj) or math.isinf(obj):
 +            return None
- 
-     build_module.UniverseRepo = FakeUniverseRepo
-     build_module.make_engine = lambda *args, **kwargs: None
-     build_module.run_migrations = lambda *args, **kwargs: None
- 
-     lkg_payload = {
-         "payload": {
-             "selected": ["000001", "000002"],
-             "selected_by_market": {
-                 "KOSPI": [{"code": "000001", "rank": 1, "name": "foo"}],
-                 "KOSDAQ": [{"code": "000002", "rank": 1, "name": "bar"}],
-             },
-         },
-         "members": [
-             {"code": "000001", "market": "KOSPI", "rank": 1, "meta_json": {}},
-             {"code": "000002", "market": "KOSDAQ", "rank": 1, "meta_json": {}},
-         ],
-         "params": {"as_of": "2024-01-02"},
-     }
-     lkg_store.save_lkg("practice", "best_k_meta", lkg_payload)
- 
-     def fail_fetch(*_, **__):
-         raise json.JSONDecodeError("bad", "{}", 0)
- 
-     monkeypatch.setattr(build_module, "fetch_with_rollback", fail_fetch)
- 
-     build_module.build_universe(as_of_date=date(2024, 1, 3).isoformat(), env="practice", strategy="best_k_meta")
- 
-     latest = stored.get(("practice", "best_k_meta"))
-     assert latest is not None
-     universe_row = latest["universe"]
-     members = latest["members"]
--    assert universe_row.get("source") == "fallback:lkg"
-+    assert universe_row.get("provider") == "fallback:lkg"
-     assert len(members) == 2
--import sys
--import types
-diff --git a/tests/test_universe_runtime_outputs.py b/tests/test_universe_runtime_outputs.py
-index 168e92463102ab9f9804b26ee2e075d04dff5260..12c84ab675b7cbc1646a8317ac9bff85620165b2 100644
---- a/tests/test_universe_runtime_outputs.py
-+++ b/tests/test_universe_runtime_outputs.py
-@@ -1,33 +1,34 @@
- from pathlib import Path
- 
- from trader.universe import build
- 
- 
- def test_universe_build_writes_runtime_files(tmp_path, monkeypatch):
-     bot_state_dir = tmp_path / "bot_state"
-     bot_state_dir.mkdir(parents=True, exist_ok=True)
-     monkeypatch.setenv("BOTSTATE_ROOT", str(bot_state_dir))
-     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
-     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
-     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
-+    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
- 
-     seed_payload = {
-         "payload": {
-             "selected": ["000001"],
-             "selected_by_market": {"KOSPI": [{"code": "000001", "rank": 1}]},
-         },
-         "members": [{"code": "000001", "market": "KOSPI"}],
-         "source": "seed_static",
-         "params": {"as_of": "2025-01-01"},
-     }
-     monkeypatch.setattr(build, "_load_static_seed", lambda: seed_payload)
- 
-     build.build_universe(as_of_date="2025-01-01", env="practice", strategy="best_k_meta", provider_override="seed_static")
- 
-     runtime_universe = bot_state_dir / "runtime" / "universe" / "2025-01-01.json"
-     runtime_sanitize = bot_state_dir / "runtime" / "universe_sanitize_2025-01-01.json"
-     runtime_flag = bot_state_dir / "runtime" / "universe_build_done_2025-01-01.flag"
- 
-     assert runtime_universe.exists()
-     assert runtime_sanitize.exists()
-     assert runtime_flag.exists()
-diff --git a/trader/db/__init__.py b/trader/db/__init__.py
-index 10f3d7da6cf12cfd877836e46ab86d806d90897d..84ffdaa6221f18816806f67440dedfd7e00eb941 100644
---- a/trader/db/__init__.py
-+++ b/trader/db/__init__.py
-@@ -1,39 +1,41 @@
- """
- Database utilities for the PB-Core v2 backend.
- """
- 
- from .config import get_database_url, get_db_echo, is_sqlite_url
- from .engine import make_engine
- from .schema import (
-     FILLS,
-     LEDGER_EVENTS,
-     ORDERS,
-     POSITIONS,
-     RUNS,
--    UNIVERSE,
-+    UNIVERSE_CURRENT,
-     UNIVERSE_MEMBERS,
-+    UNIVERSE_RUNS,
-     METADATA,
- )
- 
- 
- def run_migrations(engine, migrations_dir: str = "migrations"):
-     from .migrate import run_migrations as _rm
- 
-     return _rm(engine, migrations_dir=migrations_dir)
- 
- 
- __all__ = [
-     "get_database_url",
-     "get_db_echo",
-     "is_sqlite_url",
-     "make_engine",
-     "run_migrations",
-     "FILLS",
-     "LEDGER_EVENTS",
-     "ORDERS",
-     "POSITIONS",
-     "RUNS",
--    "UNIVERSE",
-+    "UNIVERSE_CURRENT",
-     "UNIVERSE_MEMBERS",
-+    "UNIVERSE_RUNS",
-     "METADATA",
- ]
++        return obj
++
++    if isinstance(obj, dict):
++        return {str(k): json_sanitize(v) for k, v in obj.items()}
++
++    if isinstance(obj, (list, tuple, set)):
++        return [json_sanitize(v) for v in obj]
++
++    if hasattr(obj, "item") and callable(getattr(obj, "item")):
++        try:
++            return json_sanitize(obj.item())
++        except Exception:
++            pass
++
++    return str(obj)
++
++
++def json_dumps_safe(obj: Any) -> str:
++    return json.dumps(json_sanitize(obj), ensure_ascii=False, separators=(",", ":"))
 diff --git a/trader/db/repos.py b/trader/db/repos.py
-index 85d17c3c395431bcf2272895d90f96e74a690e0e..adc33e575600a6f8f1a04eeef119ae952425ef95 100644
+index adc33e575600a6f8f1a04eeef119ae952425ef95..dfd2769b0ccc1a7b47ece177ee2382e5f437b49a 100644
 --- a/trader/db/repos.py
 +++ b/trader/db/repos.py
-@@ -1,48 +1,49 @@
+@@ -1,104 +1,144 @@
  from __future__ import annotations
  
  from datetime import datetime, timedelta
  import logging
  import os
  from pathlib import Path
++import time
  from typing import Any, Dict, Iterable, List, Optional
  from uuid import UUID, uuid4
  
  import sqlalchemy as sa
- from sqlalchemy.exc import OperationalError
+-from sqlalchemy.exc import OperationalError
++from sqlalchemy.exc import OperationalError, StatementError
  from sqlalchemy import Engine, and_, func, select
  from sqlalchemy.dialects.sqlite import insert as sqlite_insert
  from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -418,17 +198,17 @@ index 85d17c3c395431bcf2272895d90f96e74a690e0e..adc33e575600a6f8f1a04eeef119ae95
      ORDERS,
      POSITIONS,
      RUNS,
--    UNIVERSE,
      UNIVERSE_MEMBERS,
-+    UNIVERSE_CURRENT,
-+    UNIVERSE_RUNS,
+     UNIVERSE_CURRENT,
+     UNIVERSE_RUNS,
      schema_for_engine,
      uuid_value_for_url,
  )
  from .migrate import ensure_sqlite_writable, run_migrations
  from . import config
  from trader.time_utils import now_kst
- from trader.utils.json_sanitize import json_safe
+-from trader.utils.json_sanitize import json_safe
++from trader.db.json_safe import json_sanitize
  
  logger = logging.getLogger(__name__)
  ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
@@ -447,270 +227,101 @@ index 85d17c3c395431bcf2272895d90f96e74a690e0e..adc33e575600a6f8f1a04eeef119ae95
  
  def _recover_sqlite_readonly(engine: Engine) -> bool:
      url = str(engine.url)
-@@ -119,198 +120,182 @@ class RunsRepo:
-                     return str(run_id)
-                 except OperationalError as exc:
-                     if attempt == 0 and _is_sqlite_readonly(exc, self.engine):
-                         _recover_sqlite_readonly(self.engine)
-                         continue
-                     raise
-                 except Exception:
-                     conn.execute(stmt)
-                     return str(run_id)
-         return str(run_id)
+     if not config.is_sqlite_url(url):
+         return False
+     db_path = Path(engine.url.database or "")
+     if not db_path:
+         return False
+     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+     backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
+     try:
+         if db_path.exists():
+             db_path.rename(backup_path)
+             logger.warning("[DB][READONLY][BACKUP] backup=%s", backup_path)
+     except Exception:
+         logger.warning("[DB][READONLY][BACKUP_FAIL] path=%s", db_path, exc_info=True)
  
-     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.runs)
-                 .where(self._schema.runs.c.run_id == run_id)
-                 .values(status=status, finished_at=func.now(), notes=notes),
-             )
+     for suffix in ("-wal", "-shm"):
+         sidecar = Path(f"{db_path}{suffix}")
+         if sidecar.exists():
+             try:
+                 sidecar.unlink()
+             except Exception:
+                 logger.warning("[DB][READONLY][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
+     try:
+         engine.dispose()
+     except Exception:
+         logger.warning("[DB][READONLY][DISPOSE_FAIL] url=%s", url, exc_info=True)
+     ensure_sqlite_writable(db_path)
+     run_migrations(engine)
+     return True
  
  
- class UniverseRepo:
++def execute_with_retry(conn, stmt, payload=None, retries: int = 5, base_sleep: float = 0.2):
++    last_exc: OperationalError | None = None
++    for attempt in range(retries):
++        try:
++            if payload is None:
++                return conn.execute(stmt)
++            return conn.execute(stmt, payload)
++        except OperationalError as exc:
++            last_exc = exc
++            msg = str(exc).lower()
++            if "database is locked" in msg or "busy" in msg:
++                time.sleep(base_sleep * (2 ** attempt))
++                continue
++            raise
++    if last_exc:
++        raise last_exc
++    raise OperationalError("database is locked", params=None, orig=None)
++
++
++def _collect_json_type_paths(value: Any, *, path: str = "request_json", limit: int = 50) -> list[str]:
++    results: list[str] = []
++
++    def _walk(node: Any, prefix: str) -> None:
++        if len(results) >= limit:
++            return
++        if isinstance(node, dict):
++            for key, val in node.items():
++                _walk(val, f"{prefix}.{key}")
++            return
++        if isinstance(node, (list, tuple, set)):
++            for idx, val in enumerate(node):
++                _walk(val, f"{prefix}[{idx}]")
++            return
++        results.append(f"{prefix}:{type(node).__name__}")
++
++    _walk(value, path)
++    return results
++
++
+ class RunsRepo:
      def __init__(self, engine: Engine):
          self.engine = engine
          self._schema = schema_for_engine(engine)
  
--    def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
-+    def _strategy_key(self, env: str, strategy: str) -> str:
-+        return f"{env}:{strategy}"
-+
-+    def _fetch_members_for_run(self, run_id: str, *, env: str, strategy: str) -> list[dict]:
-         stmt = (
-             select(
--                self._schema.universe_members.c.code,
-+                self._schema.universe_members.c.stock_code,
-+                self._schema.universe_members.c.name,
-                 self._schema.universe_members.c.market,
--                self._schema.universe_members.c.weight,
-                 self._schema.universe_members.c.rank,
--                self._schema.universe_members.c.meta_json,
--                self._schema.universe.c.as_of_date,
--                self._schema.universe.c.strategy,
--                self._schema.universe.c.env,
-+                self._schema.universe_members.c.market_cap,
-+                self._schema.universe_members.c.reason,
-+                self._schema.universe_runs.c.as_of,
-+                self._schema.universe_runs.c.provider,
-             )
-             .select_from(
-                 self._schema.universe_members.join(
--                    self._schema.universe, self._schema.universe_members.c.universe_id == self._schema.universe.c.universe_id
-+                    self._schema.universe_runs,
-+                    self._schema.universe_members.c.run_id == self._schema.universe_runs.c.run_id,
-                 )
-             )
--            .where(self._schema.universe_members.c.universe_id == universe_id)
--            .order_by(self._schema.universe_members.c.rank.nullsfirst(), self._schema.universe_members.c.universe_member_id)
-+            .where(self._schema.universe_members.c.run_id == run_id)
-+            .order_by(self._schema.universe_members.c.rank.nullsfirst())
-         )
-         with self.engine.begin() as conn:
-             rows = conn.execute(stmt).mappings().all()
--            return [dict(row) for row in rows]
--
--    def get_universe_members(self, env: str, strategy: str, as_of_date: str) -> list[dict]:
--        stmt = (
--            select(self._schema.universe.c.universe_id)
--            .where(
--                and_(
--                    self._schema.universe.c.env == env,
--                    self._schema.universe.c.strategy == strategy,
--                    self._schema.universe.c.as_of_date == as_of_date,
--                )
--            )
--            .order_by(self._schema.universe.c.created_at.desc())
--            .limit(1)
--        )
-+            results: list[dict] = []
-+            for row in rows:
-+                payload = dict(row)
-+                payload["code"] = payload.pop("stock_code")
-+                payload["as_of_date"] = payload.pop("as_of")
-+                payload["env"] = env
-+                payload["strategy"] = strategy
-+                results.append(payload)
-+            return results
-+
-+    def get_current_universe_members(self, env: str, strategy: str) -> list[dict]:
-+        strategy_key = self._strategy_key(env, strategy)
-+        stmt = select(self._schema.universe_current.c.run_id).where(self._schema.universe_current.c.strategy == strategy_key)
-         with self.engine.begin() as conn:
--            universe_id = conn.execute(stmt).scalar()
--        if not universe_id:
-+            run_id = conn.execute(stmt).scalar()
-+        if not run_id:
-             return []
--        return self._fetch_members_for_universe(str(universe_id))
-+        return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
- 
--    def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
--        stmt = (
--            select(self._schema.universe.c.universe_id)
--            .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
--            .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
--            .limit(1)
--        )
--        with self.engine.begin() as conn:
--            universe_id = conn.execute(stmt).scalar()
--        if not universe_id:
--            return []
--        return self._fetch_members_for_universe(str(universe_id))
--
--    def get_latest_universe(
--        self, env: str, strategy: str, *, max_age_days: int = 10
--    ) -> tuple[dict, list[dict]] | None:
--        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
--        stmt = (
--            select(self._schema.universe)
--            .where(
--                and_(
--                    self._schema.universe.c.env == env,
--                    self._schema.universe.c.strategy == strategy,
--                    self._schema.universe.c.created_at >= cutoff,
--                )
--            )
--            .order_by(self._schema.universe.c.created_at.desc())
--            .limit(1)
--        )
--        with self.engine.begin() as conn:
--            row = conn.execute(stmt).mappings().first()
--        if not row:
--            return None
--        universe_id = str(row.get("universe_id"))
--        return dict(row), self._fetch_members_for_universe(universe_id)
--
--    def store_universe(
-+    def store_universe_snapshot(
+     def start_run(
          self,
-+        *,
          env: str,
          strategy: str,
-         as_of_date: str,
--        source: str,
--        params_json: dict,
--        payload_json: dict,
-+        provider: str,
-         members: Iterable[dict],
-+        reason: str | None = None,
-     ) -> str | None:
-         members_list = list(members)
-         db_url = str(self.engine.url)
--        values = {
--            "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
--            "env": env,
--            "strategy": strategy,
--            "as_of_date": as_of_date,
--            "source": source,
--            "params_json": params_json or {},
--            "payload_json": payload_json or {},
--        }
-+        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
-+        strategy_key = self._strategy_key(env, strategy)
-         try:
-             with self.engine.begin() as conn:
-                 existing = conn.execute(
--                    select(self._schema.universe.c.universe_id).where(
-+                    select(self._schema.universe_runs.c.run_id).where(
-                         and_(
--                            self._schema.universe.c.env == env,
--                            self._schema.universe.c.strategy == strategy,
--                            self._schema.universe.c.as_of_date == as_of_date,
-+                            self._schema.universe_runs.c.strategy == strategy_key,
-+                            self._schema.universe_runs.c.provider == provider,
-+                            self._schema.universe_runs.c.as_of == as_of_date,
-                         )
-                     )
-                 ).scalar()
--                universe_id = existing or values["universe_id"]
-                 if existing:
--                    conn.execute(
--                        sa.update(self._schema.universe)
--                        .where(self._schema.universe.c.universe_id == existing)
--                        .values(source=source, params_json=params_json or {}, payload_json=payload_json or {}, created_at=func.now()),
-+                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
-+                conn.execute(
-+                    sa.insert(self._schema.universe_runs).values(
-+                        run_id=run_id,
-+                        strategy=strategy_key,
-+                        provider=provider,
-+                        as_of=as_of_date,
-+                        created_ts=now_kst().isoformat(),
-                     )
-+                )
-+                for rank, member in enumerate(members_list, start=1):
-+                    meta = member.get("meta_json") or {}
-                     conn.execute(
--                        sa.delete(self._schema.universe_members).where(self._schema.universe_members.c.universe_id == existing)
-+                        sa.insert(self._schema.universe_members).values(
-+                            run_id=uuid_value_for_url(db_url, run_id),
-+                            stock_code=str(member.get("code") or "").zfill(6),
-+                            name=member.get("name") or meta.get("name"),
-+                            market=member.get("market"),
-+                            rank=member.get("rank") if member.get("rank") is not None else rank,
-+                            market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
-+                            reason=member.get("reason") or reason,
-+                        )
-+                    )
-+                if self.engine.dialect.name == "postgresql":
-+                    insert_stmt = pg_insert(self._schema.universe_current).values(
-+                        strategy=strategy_key,
-+                        run_id=uuid_value_for_url(db_url, run_id),
-+                        updated_ts=now_kst().isoformat(),
-                     )
-                 else:
--                    res = conn.execute(
--                        sa.insert(self._schema.universe)
--                        .values(**values)
--                        .returning(self._schema.universe.c.universe_id)
-+                    insert_stmt = sqlite_insert(self._schema.universe_current).values(
-+                        strategy=strategy_key,
-+                        run_id=uuid_value_for_url(db_url, run_id),
-+                        updated_ts=now_kst().isoformat(),
-                     )
--                    universe_id = res.scalar() or universe_id
--                fk_universe_id = uuid_value_for_url(db_url, universe_id)
--                for rank, m in enumerate(members_list, start=1):
--                    conn.execute(
--                        sa.insert(self._schema.universe_members).values(
--                            universe_member_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
--                            universe_id=fk_universe_id,
--                            code=str(m.get("code") or "").zfill(6),
--                            market=m.get("market"),
--                            weight=m.get("weight"),
--                            rank=m.get("rank") if m.get("rank") is not None else rank,
--                            meta_json=m.get("meta_json") or {},
--                        )
-+                conn.execute(
-+                    insert_stmt.on_conflict_do_update(
-+                        index_elements=[self._schema.universe_current.c.strategy],
-+                        set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
-                     )
--            return str(universe_id)
-+                )
-+            return str(run_id)
-         except Exception:
-             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
-             if ALLOW_UNIVERSE_DB_FAIL:
-                 return None
-             raise
- 
-+    def cleanup_old_runs(self, *, retain_days: int = 30) -> None:
-+        cutoff = (now_kst() - timedelta(days=retain_days)).isoformat()
-+        with self.engine.begin() as conn:
-+            current_runs = select(self._schema.universe_current.c.run_id)
-+            conn.execute(
-+                sa.delete(self._schema.universe_runs).where(
-+                    and_(
-+                        self._schema.universe_runs.c.created_ts < cutoff,
-+                        self._schema.universe_runs.c.run_id.not_in(current_runs),
-+                    )
-+                )
-+            )
-+
- 
+         run_window: str | None,
+         phase: str,
+         event_name: str,
+         dry_run: bool,
+         git_sha: str | None,
+         workflow: str | None,
+         workflow_run_id: str | None,
+         workflow_attempt: int | None,
+         config_json: dict | None,
+     ) -> str:
+         values = {
+             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+             "env": env,
+             "strategy": strategy,
+             "run_window": run_window,
+             "phase": phase,
+@@ -278,127 +318,145 @@ class UniverseRepo:
  class OrdersRepo:
      def __init__(self, engine: Engine):
          self.engine = engine
@@ -735,249 +346,383 @@ index 85d17c3c395431bcf2272895d90f96e74a690e0e..adc33e575600a6f8f1a04eeef119ae95
          *,
          status: str = "CREATED",
      ) -> tuple[str, bool]:
-diff --git a/trader/db/schema.py b/trader/db/schema.py
-index 9808054299eee7adcdbea63f3ddafc1b188cac8f..75957e46e0f49a6581bffbd6668e44797edd4479 100644
---- a/trader/db/schema.py
-+++ b/trader/db/schema.py
-@@ -11,112 +11,120 @@ from sqlalchemy import Engine
+         db_url = str(self.engine.url)
++        original_request_json = request_json
+         payload = {
+             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "strategy": strategy,
+             "sid": sid,
+             "mode": mode,
+             "code": code,
+             "market": market,
+             "side": side,
+             "ord_type": ord_type,
+             "qty": qty,
+             "limit_price": limit_price,
+             "stage": stage,
+             "client_order_key": client_order_key,
+             "status": status,
+             "request_json": request_json or {},
+         }
++        payload = dict(payload)
++        if "request_json" in payload:
++            payload["request_json"] = json_sanitize(payload["request_json"])
+         with self.engine.begin() as conn:
+             existing = conn.execute(
+                 select(self._schema.orders.c.order_id).where(
+                     and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+                 )
+             ).scalar()
+             if existing:
+                 return str(existing), False
+             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
+             try:
+-                res = conn.execute(stmt)
++                res = execute_with_retry(conn, stmt)
+                 return str(res.scalar()), True
++            except StatementError as exc:
++                if original_request_json is not None:
++                    type_paths = _collect_json_type_paths(original_request_json)
++                    logger.warning(
++                        "[DB][ORDER_INTENT][REQUEST_JSON_TYPES] env=%s key=%s types=%s",
++                        env,
++                        client_order_key,
++                        type_paths,
++                    )
++                raise exc
+             except Exception:
+-                conn.execute(sa.insert(self._schema.orders).values(**payload))
++                execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
+                 return str(payload["order_id"]), True
  
- from . import config
+     def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
++        safe_response_json = json_sanitize(response_json or {})
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.orders)
+                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                 .values(
+                     status="SUBMITTED",
+                     kis_odno=kis_odno,
+                     broker_order_id=kis_odno or client_order_key,
+-                    response_json=response_json,
++                    response_json=safe_response_json,
+                     submitted_at=func.now(),
+                     updated_at=func.now(),
+                 )
+             )
  
+     def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
++        safe_response_json = json_sanitize(response_json or {})
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.orders)
+                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
+                 .values(
+                     status="ACKED",
+-                    response_json=response_json,
++                    response_json=safe_response_json,
+                     broker_order_id=kis_odno,
+                     acked_at=func.now(),
+                     updated_at=func.now(),
+                 )
+             )
  
- def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
-     # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
-     return sa.String()
+     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
++        safe_error_payload = json_sanitize(error_payload or {})
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.orders)
+                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+-                .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
++                .values(status="ERROR", response_json=safe_error_payload, updated_at=func.now()),
+             )
  
+     def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
++        safe_response_json = json_sanitize(response_json or {})
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.orders)
+                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+-                .values(status="CANCELLED", response_json=response_json or {}, updated_at=func.now()),
++                .values(status="CANCELLED", response_json=safe_response_json, updated_at=func.now()),
+             )
  
- def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
-     try:
-         if value is None:
-             return str(uuid4())
-         if isinstance(value, UUID):
-             return str(value)
-         return str(UUID(str(value)))
-     except Exception:
-         return str(uuid4())
+     def get_open_orders(self, env: str) -> list[dict]:
+         stmt = select(self._schema.orders).where(
+             and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
+         )
+         with self.engine.begin() as conn:
+             rows = conn.execute(stmt).mappings().all()
+             return [dict(r) for r in rows]
  
+     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
+         stmt = select(self._schema.orders.c.order_id).where(
+             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+         )
+         with self.engine.begin() as conn:
+             return conn.execute(stmt).scalar() is not None
  
- @dataclass(frozen=True)
- class SchemaTables:
-     database_url: str
-     metadata: sa.MetaData
-     runs: sa.Table
--    universe: sa.Table
-+    universe_runs: sa.Table
-     universe_members: sa.Table
-+    universe_current: sa.Table
-     orders: sa.Table
-     fills: sa.Table
-     positions: sa.Table
-     ledger_events: sa.Table
-     reconcile_log: sa.Table
-     uses_native_uuid: bool
+     def list_today_orders(
+         self,
+         env: str,
+         *,
+         side: str | None = None,
+         code: str | None = None,
+         status_exclude: Iterable[str] | None = ("ERROR",),
+     ) -> list[dict]:
+@@ -420,80 +478,82 @@ class OrdersRepo:
+     def upsert_reconciled_order(
+         self,
+         *,
+         env: str,
+         run_id: str | None,
+         strategy: str,
+         sid: int,
+         mode: int,
+         code: str,
+         market: str | None,
+         side: str,
+         ord_type: str,
+         qty: int,
+         limit_price: float | None,
+         stage: str | None,
+         client_order_key: str,
+         kis_odno: str | None,
+         status: str,
+         request_json: dict | None,
+         response_json: dict | None,
+         submitted_at: datetime | None,
+         acked_at: datetime | None,
+     ) -> str:
+         db_url = str(self.engine.url)
+         broker_order_id = kis_odno or client_order_key
++        safe_request_json = json_sanitize(request_json or {})
++        safe_response_json = json_sanitize(response_json or {})
+         payload = {
+             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "strategy": strategy,
+             "sid": sid,
+             "mode": mode,
+             "code": code,
+             "market": market,
+             "side": side,
+             "ord_type": ord_type,
+             "qty": qty,
+             "limit_price": limit_price,
+             "stage": stage,
+             "client_order_key": client_order_key,
+             "status": status,
+             "kis_odno": kis_odno,
+             "broker_order_id": broker_order_id,
+-            "request_json": request_json or {},
+-            "response_json": response_json or {},
++            "request_json": safe_request_json,
++            "response_json": safe_response_json,
+             "submitted_at": submitted_at,
+             "acked_at": acked_at,
+         }
+         conflict_cols = ["env", "broker_order_id"] if broker_order_id else ["env", "client_order_key"]
+         update_cols = {
+             "status": status,
+             "kis_odno": kis_odno,
+             "broker_order_id": broker_order_id,
+-            "response_json": response_json or {},
+-            "request_json": request_json or {},
++            "response_json": safe_response_json,
++            "request_json": safe_request_json,
+             "submitted_at": submitted_at,
+             "acked_at": acked_at,
+             "updated_at": func.now(),
+         }
+         insert_stmt: sa.Insert
+         if self.engine.dialect.name == "postgresql":
+             insert_stmt = pg_insert(self._schema.orders).values(**payload)
+         else:
+             insert_stmt = sqlite_insert(self._schema.orders).values(**payload)
+         stmt = insert_stmt.on_conflict_do_update(
+             index_elements=conflict_cols,
+             set_=update_cols,
+         ).returning(self._schema.orders.c.order_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
+                 order_id = res.scalar()
+                 if order_id:
+                     return str(order_id)
+             except Exception:
+                 pass
+             existing = conn.execute(
+                 select(self._schema.orders.c.order_id).where(
+                     and_(
+                         self._schema.orders.c.env == env,
+@@ -527,79 +587,80 @@ class FillsRepo:
+         stmt = select(self._schema.fills).where(and_(*conditions))
+         with self.engine.begin() as conn:
+             rows = conn.execute(stmt).mappings().all()
+         return [dict(r) for r in rows]
  
+     def upsert_fill(
+         self,
+         *,
+         env: str,
+         run_id: str | None,
+         order_id: str | None,
+         kis_odno: str | None,
+         trade_id: str | None,
+         code: str,
+         market: str | None,
+         side: str,
+         qty: int,
+         price: float,
+         fee: float,
+         tax: float,
+         filled_at: datetime,
+         raw_json: dict | None,
+     ) -> str:
+         db_url = str(self.engine.url)
+         broker_fill_id = trade_id or None
++        safe_raw_json = json_sanitize(raw_json or {})
+         payload = {
+             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
+             "kis_odno": kis_odno,
+             "trade_id": trade_id,
+             "broker_fill_id": broker_fill_id,
+             "code": code,
+             "market": market,
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "fee": fee,
+             "tax": tax,
+             "filled_at": filled_at,
+-            "raw_json": raw_json or {},
++            "raw_json": safe_raw_json,
+         }
+         conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
+             "env",
+             "kis_odno",
+             "code",
+             "side",
+             "qty",
+             "price",
+             "filled_at",
+         ]
+         update_cols = {
+-            "raw_json": raw_json or {},
++            "raw_json": safe_raw_json,
+             "broker_fill_id": broker_fill_id,
+         }
+         insert_stmt: sa.Insert
+         if self.engine.dialect.name == "postgresql":
+             insert_stmt = pg_insert(self._schema.fills).values(**payload)
+         else:
+             insert_stmt = sqlite_insert(self._schema.fills).values(**payload)
+         stmt = insert_stmt.on_conflict_do_update(
+             index_elements=conflict_cols,
+             set_=update_cols,
+         ).returning(self._schema.fills.c.fill_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
+                 fill_id = res.scalar()
+                 if fill_id:
+                     return str(fill_id)
+             except Exception:
+                 pass
+             existing = None
+             if trade_id:
+                 existing = conn.execute(
+                     select(self._schema.fills.c.fill_id).where(
+                         and_(self._schema.fills.c.env == env, self._schema.fills.c.trade_id == trade_id)
+                     )
+@@ -612,51 +673,51 @@ class LedgerEventsRepo:
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
  
- def _build_schema(database_url: str) -> SchemaTables:
-     metadata = sa.MetaData()
-     uuid_type = _uuid_type_for_url(database_url)
-     uses_native_uuid = False
- 
-     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
-         return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
- 
-     runs = sa.Table(
-         "runs",
-         metadata,
-         uuid_col("run_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("run_window", sa.String),
-         sa.Column("phase", sa.String),
-         sa.Column("event_name", sa.String),
-         sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
-         sa.Column("git_sha", sa.String),
-         sa.Column("workflow", sa.String),
-         sa.Column("workflow_run_id", sa.String),
-         sa.Column("workflow_attempt", sa.Integer),
-         sa.Column("config_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("status", sa.String, nullable=False, default="STARTED"),
-         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-         sa.Column("finished_at", sa.DateTime(timezone=True)),
-         sa.Column("notes", sa.Text),
-     )
- 
--    universe = sa.Table(
--        "universe",
-+    universe_runs = sa.Table(
-+        "universe_runs",
-         metadata,
--        uuid_col("universe_id", primary_key=True),
--        sa.Column("env", sa.String, nullable=False),
-         sa.Column("strategy", sa.String, nullable=False),
--        sa.Column("as_of_date", sa.String, nullable=False),
--        sa.Column("source", sa.String, nullable=False),
--        sa.Column("params_json", sa.JSON, nullable=False, default=dict),
--        sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
--        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+        sa.Column("provider", sa.String, nullable=False),
-+        sa.Column("as_of", sa.Date, nullable=False),
-+        sa.Column("created_ts", sa.Text, nullable=False),
-+        uuid_col("run_id", primary_key=True),
-+        sa.UniqueConstraint("strategy", "provider", "as_of", name="ux_universe_runs_key"),
-     )
- 
-     universe_members = sa.Table(
-         "universe_members",
-         metadata,
--        uuid_col("universe_member_id", primary_key=True),
--        sa.Column("universe_id", uuid_type, sa.ForeignKey("universe.universe_id"), nullable=False),
--        sa.Column("code", sa.String, nullable=False),
-+        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
-+        sa.Column("stock_code", sa.String, nullable=False),
-+        sa.Column("name", sa.String),
-         sa.Column("market", sa.String),
--        sa.Column("weight", sa.Float),
-         sa.Column("rank", sa.Integer),
--        sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
-+        sa.Column("market_cap", sa.Float),
-+        sa.Column("reason", sa.String),
-+        sa.PrimaryKeyConstraint("run_id", "stock_code"),
-+    )
+     def append_event(
+         self,
+         *,
+         env: str,
+         run_id: str | None,
+         event_type: str,
+         ts: datetime,
+         code: str | None = None,
+         market: str | None = None,
+         sid: int | None = None,
+         mode: int | None = None,
+         side: str | None = None,
+         qty: int | None = None,
+         price: float | None = None,
+         kis_odno: str | None = None,
+         client_order_key: str | None = None,
+         ok: bool = True,
+         reasons: list[str] | None = None,
+         stage: str | None = None,
+         payload_json: dict | None = None,
+     ) -> str:
+         db_url = str(self.engine.url)
+-        safe_payload_json = json_safe(payload_json) if payload_json is not None else {}
++        safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
+         payload = {
+             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "event_type": event_type,
+             "ts": ts,
+             "code": code,
+             "market": market,
+             "sid": sid,
+             "mode": mode,
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "kis_odno": kis_odno,
+             "client_order_key": client_order_key,
+             "ok": ok,
+             "reasons": reasons or [],
+             "stage": stage,
+             "payload_json": safe_payload_json,
+         }
+         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
+                 return str(res.scalar())
+diff --git a/trader/diagnostics/spool.py b/trader/diagnostics/spool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f32da1f5aa5135d8449ad4ab4a8109d5312d623
+--- /dev/null
++++ b/trader/diagnostics/spool.py
+@@ -0,0 +1,16 @@
++import os
++from datetime import datetime
 +
-+    universe_current = sa.Table(
-+        "universe_current",
-+        metadata,
-+        sa.Column("strategy", sa.String, primary_key=True),
-+        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
-+        sa.Column("updated_ts", sa.Text, nullable=False),
-     )
- 
-     orders = sa.Table(
-         "orders",
-         metadata,
-         uuid_col("order_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("sid", sa.Integer, nullable=False),
-         sa.Column("mode", sa.Integer, nullable=False),
-         sa.Column("code", sa.String, nullable=False),
-         sa.Column("market", sa.String),
-         sa.Column("side", sa.String, nullable=False),
-         sa.Column("ord_type", sa.String, nullable=False),
-         sa.Column("qty", sa.Integer, nullable=False),
-         sa.Column("limit_price", sa.Float),
-         sa.Column("stage", sa.String),
-         sa.Column("client_order_key", sa.String, nullable=False),
-         sa.Column("status", sa.String, nullable=False, default="INTENT"),
-         sa.Column("kis_odno", sa.String),
-         sa.Column("broker_order_id", sa.String),
-         sa.Column("request_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("response_json", sa.JSON),
-         sa.Column("submitted_at", sa.DateTime(timezone=True)),
-@@ -223,67 +231,69 @@ def _build_schema(database_url: str) -> SchemaTables:
-         sa.Column("price", sa.Float),
-         sa.Column("kis_odno", sa.String),
-         sa.Column("client_order_key", sa.String),
-         sa.Column("ok", sa.Boolean, nullable=False, default=True),
-         sa.Column("reasons", sa.JSON, nullable=False, default=list),
-         sa.Column("stage", sa.String),
-         sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-     )
- 
-     reconcile_log = sa.Table(
-         "reconcile_log",
-         metadata,
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("tick_ts", sa.DateTime(timezone=True), nullable=False),
-         sa.Column("action", sa.String, nullable=False),
-         sa.Column("details_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-     )
- 
-     return SchemaTables(
-         database_url=database_url,
-         metadata=metadata,
-         runs=runs,
--        universe=universe,
-+        universe_runs=universe_runs,
-         universe_members=universe_members,
-+        universe_current=universe_current,
-         orders=orders,
-         fills=fills,
-         positions=positions,
-         ledger_events=ledger_events,
-         reconcile_log=reconcile_log,
-         uses_native_uuid=uses_native_uuid,
-     )
- 
- 
- _SCHEMA_CACHE: dict[str, SchemaTables] = {}
- 
- 
- @lru_cache(maxsize=None)
- def schema_for_url(database_url: str) -> SchemaTables:
-     normalized = str(database_url)
-     if normalized not in _SCHEMA_CACHE:
-         _SCHEMA_CACHE[normalized] = _build_schema(normalized)
-     return _SCHEMA_CACHE[normalized]
- 
- 
- def schema_for_engine(engine: Engine) -> SchemaTables:
-     return schema_for_url(str(engine.url))
- 
- 
- def metadata_for_url(database_url: str) -> sa.MetaData:
-     return schema_for_url(database_url).metadata
- 
- 
- DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
- DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
- 
- METADATA = DEFAULT_SCHEMA.metadata
- RUNS = DEFAULT_SCHEMA.runs
--UNIVERSE = DEFAULT_SCHEMA.universe
-+UNIVERSE_RUNS = DEFAULT_SCHEMA.universe_runs
- UNIVERSE_MEMBERS = DEFAULT_SCHEMA.universe_members
-+UNIVERSE_CURRENT = DEFAULT_SCHEMA.universe_current
- ORDERS = DEFAULT_SCHEMA.orders
- FILLS = DEFAULT_SCHEMA.fills
- POSITIONS = DEFAULT_SCHEMA.positions
- LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
- RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
++from trader.db.json_safe import json_dumps_safe
++
++
++def spool_event(kind: str, data: dict, base_dir: str = "trader/state/spool") -> None:
++    os.makedirs(base_dir, exist_ok=True)
++    filename = os.path.join(base_dir, f"{kind}_{datetime.utcnow().date().isoformat()}.jsonl")
++    payload = {
++        "ts": datetime.utcnow().isoformat(),
++        "kind": kind,
++        "data": data,
++    }
++    with open(filename, "a", encoding="utf-8") as handle:
++        handle.write(json_dumps_safe(payload) + "\n")
 diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index 485aa593b3382d71f2487c98513437e60356eac0..50d6dac9d60ea06803845260435d94eb979783f6 100644
+index 50d6dac9d60ea06803845260435d94eb979783f6..47871de75d3f1b5d1aafb8eac5296e01d6f33461 100644
 --- a/trader/pb1_engine.py
 +++ b/trader/pb1_engine.py
-@@ -82,50 +82,51 @@ from trader.config import (
-     REGIME_MID_RISK,
-     REGIME_MIN_RISK,
-     REGIME_MODE,
-     RISK_PER_TRADE_PCT,
-     RS_BENCHMARK,
-     RS_COMPOSITE_W1,
-     RS_COMPOSITE_W2,
-     RS_LOOKBACK_DAYS,
-     RS_LOOKBACK2_DAYS,
-     RS_MIN_PCTILE,
-     TAKE_PROFIT_R1,
-     TAKE_PROFIT_R2,
-     TP1_SELL_PCT,
-     TP2_SELL_PCT,
-     TRAIL_MODE,
-     TRAIL_STEP_AFTER_R,
-     UNIVERSE_POOL_SIZE,
-     VCP_LOOKBACK,
-     VCP_MIN_SCORE,
-     resolve_market_window,
- )
- from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
- from trader.kis_wrapper import KisAPI
- from trader.ledger.store import LedgerStore
-+from trader.universe.validation import validate_tradeable
+@@ -108,50 +108,51 @@ from trader.universe.validation import validate_tradeable
  from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
  from trader.factors.regime import get_regime, risk_multiplier
  from trader.factors.rs_rank import rank_rs
@@ -1003,752 +748,188 @@ index 485aa593b3382d71f2487c98513437e60356eac0..50d6dac9d60ea06803845260435d94eb
  from trader.utils.env import env_bool
  from trader.utils.json_sanitize import to_jsonable
  from trader.window_router import WindowDecision
-@@ -2174,50 +2175,87 @@ class PB1Engine:
-                 return buyables, meta, drop_reasons
-             drop_reasons.update(planned_drop)
-             effective_target -= 1
++from trader.diagnostics.spool import spool_event
  
-         meta = {"reason": "cannot_make_valid_qty"}
-         logger.info(
-             "[PB1][BUDGET_PLAN] effective_target=0 cap=0 affordable=%s drop_reasons=%s",
-             len(affordable),
-             drop_reasons.most_common(3),
-         )
-         return [], meta, drop_reasons
+ logger = logging.getLogger(__name__)
  
-     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
-         marks: Dict[str, float] = {}
-         for code in codes:
-             px, source = self._resolve_price_with_fallback(code, ohlcv_close=fallback.get(code))
-             if px is not None:
-                 marks[code] = px
-         return marks
+ _OUTPUT2_LIST_NORMALIZED_LOGGED = False
+ _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
  
-     def _should_block_order(self, client_order_key: str) -> bool:
-         if not client_order_key:
-             return True
-         return self.orders_repo.has_client_order_key(self.env, client_order_key)
+ UNREALIZED_KEYS = (
+     "evlu_pfls_amt",
+     "evlu_pfls_smtl_amt",
+ )
+ RETURN_PCT_KEYS = (
+     "asst_icdc_erng_rt",
+     "evlu_pfls_rt",
+ )
+ COST_KEYS = (
+     "pchs_amt_smtl_amt",
+     "pchs_amt",
+ )
+ EVAL_KEYS = (
+     "scts_evlu_amt",
+     "evlu_amt_smtl_amt",
+     "tot_evlu_amt",
+     "nass_amt",
+ )
+ CASH_KEYS = (
+@@ -1199,50 +1200,56 @@ class PB1Engine:
+                 event_type=event_type,
+                 ts=now_kst(),
+                 code=code,
+                 market=market,
+                 sid=1,
+                 mode=mode,
+                 side=side,
+                 qty=qty,
+                 price=price,
+                 client_order_key=client_order_key,
+                 ok=ok,
+                 reasons=self._with_name_reason(reasons, code),
+                 stage=stage,
+                 payload_json=payload_json or {},
+             )
+         except Exception as exc:
+             logger.warning(
+                 "[PB1][LEDGER][FAIL] event=%s code=%s err=%s",
+                 event_type,
+                 self._display_code(code),
+                 repr(exc),
+             )
+             if self.debug:
+                 logger.exception("[PB1][LEDGER][FAIL_TRACE]")
  
-+    def _pretrade_check(
-+        self,
-+        *,
-+        code: str,
-+        market: str | None,
-+        mode: int | None,
-+        side: str,
-+        qty: int | None,
-+        price: float | None,
-+        client_order_key: str | None,
-+        stage: str,
-+    ) -> bool:
-+        if not self.kis:
-+            return False
-+        ok, reason = validate_tradeable(self.kis, code)
-+        if ok:
-+            return True
-+        display_code = self._display_code(code)
-+        logger.warning("[PB1][PRETRADE][SKIP] code=%s reason=%s stage=%s", display_code, reason, stage)
++    def _spool_db_fail(self, kind: str, payload: dict) -> None:
 +        try:
-+            self._append_ledger_event(
-+                event_type="ORDER_SKIP",
-+                code=code,
-+                market=market,
-+                mode=mode,
-+                side=side,
-+                qty=qty,
-+                price=price,
-+                client_order_key=client_order_key,
-+                ok=False,
-+                reasons=[f"pretrade:{reason}"],
-+                stage=stage,
-+            )
-+        except Exception:
-+            logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
-+        return False
++            spool_event(kind, payload)
++        except Exception as exc:
++            logger.exception("[PB1][DB_FAIL][SPOOL_FAIL] kind=%s err=%s", kind, exc)
 +
-     def _place_entry(self, cf: CandidateFeature) -> None:
-         display_code = self._display_code(cf.code)
+     @staticmethod
+     def _format_order_result_reason(resp: dict | None) -> str:
+         if not isinstance(resp, dict):
+             return "ORDER_FAIL_API(no_response)"
+         if resp.get("status") == "SKIPPED":
+             skip_reason = resp.get("skip_reason") or "SKIPPED"
+             return f"ORDER_SKIP_{skip_reason}"
+         rt_cd = resp.get("rt_cd")
+         if str(rt_cd) == "0":
+             return "ORDER_OK"
+         msg_cd = resp.get("msg_cd")
+         msg1 = resp.get("msg1")
+         return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
+ 
+     def _log_setup(self, cf: CandidateFeature) -> None:
+         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
+         if not cf.setup_ok:
+             self._record_setup_reasons(cf.reasons or ["unspecified_fail"])
          logger.info(
-             "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f",
-             display_code,
-             self._code_name_map.get(cf.code),
-             ReasonCode.ENTRY_BREAKOUT,
-             float(cf.features.get("score") or 0.0),
-             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
-             float(cf.features.get("stop_price") or 0.0),
-             float(RISK_PER_TRADE_PCT),
-             cf.planned_qty,
-             float(cf.features.get("planned_cap") or 0.0),
-         )
-         reasons = cf.reasons or []
-         features_snapshot = {
-             k: cf.features.get(k)
-             for k in [
-                 "close",
-                 "ma50",
-                 "ma150",
-                 "ma200",
-                 "ma200_slope",
-                 "hi_52w",
-                 "lo_52w",
-@@ -2302,50 +2340,61 @@ class PB1Engine:
-                 price=record_price,
-                 client_order_key=cf.client_order_key,
-                 ok=True,
-                 reasons=["entry"] + (cf.reasons or []),
-                 stage="PB1-CLOSE",
-                 payload_json={"features": cf.features},
-             )
-         except Exception:
-             logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-         if self.dry_run:
-             logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
-             logger.info(
-                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                 display_code,
-                 order_id,
-                 cf.planned_qty,
-                 float(limit_price or entry_price or 0.0),
-             )
-             return
-         if not self.kis:
-             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
-             return
-+        if not self._pretrade_check(
-+            code=cf.code,
-+            market=cf.market,
-+            mode=cf.mode,
-+            side="BUY",
-+            qty=cf.planned_qty,
-+            price=record_price,
-+            client_order_key=cf.client_order_key,
-+            stage="PB1-CLOSE",
-+        ):
-+            return
-         emit_event(
-             as_of=self._today,
-             event="ORDER_SUBMIT",
-             side="BUY",
-             code=cf.code,
-             qty=cf.planned_qty,
-             price=float(limit_price or 0.0),
-             order_type=order_type,
-             client_order_key=cf.client_order_key,
-         )
-         resp = None
-         kis_odno = None
-         try:
-             if order_type == "LIMIT":
-                 resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, float(limit_price))
-             else:
-                 resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
-             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-         except Exception:
-             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
-         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
-         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
-         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
-         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-@@ -2489,50 +2538,61 @@ class PB1Engine:
-                 client_order_key=client_key,
-                 request_json={"reasons": ["pyramid_add"], "price": price, "level": pyramid_level + 1},
-                 status="CREATED",
-             )
-         except Exception:
-             logger.exception("[PB1][ADD][DB_FAIL] code=%s", display_code)
-             if not self.dry_run:
-                 raise
-             return
-         if not created:
-             logger.info("[PB1][ADD][SKIP] code=%s reason=duplicate_order", display_code)
-             return
-         if self.dry_run:
-             logger.info("[PB1][ADD-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
-             logger.info(
-                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                 display_code,
-                 order_id,
-                 qty,
-                 float(limit_price or price or 0.0),
-             )
-             return
-         if not self.kis:
-             logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
-             return
-+        if not self._pretrade_check(
-+            code=code,
-+            market=pos.get("market"),
-+            mode=mode,
-+            side="BUY",
-+            qty=qty,
-+            price=fill_price,
-+            client_order_key=client_key,
-+            stage="PB1-ADD",
-+        ):
-+            return
-         emit_event(
-             as_of=self._today,
-             event="ORDER_SUBMIT",
-             side="BUY",
-             code=code,
-             qty=qty,
-             price=float(limit_price),
-             order_type="LIMIT",
-             client_order_key=client_key,
-         )
-         resp = None
-         kis_odno = None
-         try:
-             resp = self.kis.buy_stock_limit(code, qty, float(limit_price))
-             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-         except Exception:
-             logger.exception("[PB1][ADD][FAIL] code=%s", display_code)
-         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+             "%s code=%s market=%s mode=%s reasons=%s features=%s",
+             prefix,
+             cf.code,
+             cf.market,
+             cf.mode,
+             cf.reasons or ["n/a"],
+@@ -2266,73 +2273,96 @@ class PB1Engine:
+             ]
+         }
          logger.info(
-             "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
+             "[PB1][ENTRY][WHY] code=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
              display_code,
-             kis_odno or order_id,
-             qty,
-             float(limit_price or price or 0.0),
-@@ -2685,50 +2745,61 @@ class PB1Engine:
-                 raise
-             return
-         if not created:
-             logger.info("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=duplicate_order", display_code)
-             return
-         if self.dry_run:
-             logger.info(
-                 "[PB1][CLOSE_ENTRY-DRY] code=%s qty=%s cap=%s key=%s order_id=%s",
-                 display_code,
-                 cf.planned_qty,
-                 cap,
-                 cf.client_order_key,
-                 order_id,
-             )
-             logger.info(
-                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                 display_code,
-                 order_id,
-                 cf.planned_qty,
-                 float(cap or 0.0),
-             )
-             return
-         if not self.kis:
-             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
-             return
-+        if not self._pretrade_check(
-+            code=cf.code,
-+            market=cf.market,
-+            mode=cf.mode,
-+            side="BUY",
-+            qty=cf.planned_qty,
-+            price=float(cap or 0.0),
-+            client_order_key=cf.client_order_key,
-+            stage="PB1-CLOSE",
-+        ):
-+            return
-         emit_event(
-             as_of=self._today,
-             event="ORDER_SUBMIT",
-             side="BUY",
-             code=cf.code,
-             qty=cf.planned_qty,
-             price=float(cap),
-             order_type="LIMIT",
-             client_order_key=cf.client_order_key,
-         )
-         resp = None
-         kis_odno = None
-         try:
-             resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
-             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-         except Exception:
-             logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
-         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
-         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
-         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
-         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-         emit_event(
-             as_of=self._today,
-             event="ORDER_RESULT",
-@@ -3086,50 +3157,61 @@ class PB1Engine:
-         logger.info(
-             "[PB1][EXIT][WHY] code=%s qty=%s mark=%s avg=%s ret_pct=%.2f exit_reason_codes=%s exit_reason_text=%s holding_days=%s stage=%s",
-             display_code,
-             qty,
-             mark,
-             avg,
-             ret_pct,
              reasons,
              ", ".join(reasons),
-             pos.get("holding_days") or 0,
-             stage,
+             features_snapshot,
+             "PB1-CLOSE",
          )
-         if self.dry_run:
-             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
-             logger.info(
-                 "[TRADE][ORDER][SELL] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                 display_code,
-                 order_id,
-                 qty,
-                 float(mark or 0.0),
+         order_type = "LIMIT"
+         entry_price = float(cf.features.get("entry_price") or cf.features.get("close") or 0.0)
+         limit_price = round_to_tick(entry_price * 1.003) if entry_price > 0 else cf.features.get("close")
+         if (self.window_label or "").lower() == "preopen" and PB1_PREOPEN_ORDER_TYPE == "LIMIT":
+             base_price, _source = self._resolve_price_with_fallback(
+                 cf.code,
+                 ohlcv_close=self._to_float(cf.features.get("close")),
              )
-             return
-         if not self.kis:
-             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
-             return
-+        if not self._pretrade_check(
-+            code=code,
-+            market=market,
-+            mode=mode,
-+            side="SELL",
-+            qty=qty,
-+            price=float(mark or 0.0),
-+            client_order_key=client_key,
-+            stage=stage,
-+        ):
-+            return
-         emit_event(
-             as_of=self._today,
-             event="ORDER_SUBMIT",
-             side="SELL",
-             code=code,
-             qty=qty,
-             price=float(mark),
-             order_type="MARKET",
-             client_order_key=client_key,
-         )
-         resp = None
-         kis_odno = None
+             if not base_price:
+                 logger.info("[PB1][ENTRY][SKIP] code=%s reason=price_unavailable", display_code)
+                 return
+             buffer_pct = max(float(PB1_PREOPEN_LIMIT_BUFFER_PCT), 0.0)
+             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
+             order_type = "LIMIT"
+         record_price = float(limit_price or entry_price or 0.0)
++        request_payload = {"features": cf.features, "reasons": cf.reasons}
          try:
-             resp = self.kis.sell_stock_market(code, qty)
-             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-         except Exception:
-             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
-         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
-         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
-         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
-         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
-         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-         emit_event(
-             as_of=self._today,
-             event="ORDER_RESULT",
-@@ -3306,59 +3388,54 @@ class PB1Engine:
-             logger.info(
-                 "[PB1][CLOSE_CANCEL][WHY] code=%s qty=%s reason_codes=%s reason_text=%s stage=%s",
-                 self._display_code(code),
-                 qty,
-                 ["close_cancel"],
-                 "close_cancel",
-                 row.get("stage") or "PB1-CLOSE",
+             order_id, created = self.orders_repo.create_intent_idempotent(
+                 env=self.env,
+                 run_id=self.run_id,
+                 strategy=self.STRATEGY_NAME,
+                 sid=1,
+                 mode=cf.mode,
+                 code=cf.code,
+                 market=cf.market,
+                 side="BUY",
+                 ord_type=order_type,
+                 qty=cf.planned_qty,
+                 limit_price=limit_price,
+                 stage="PB1-CLOSE",
+                 client_order_key=cf.client_order_key or "",
+-                request_json={"features": cf.features, "reasons": cf.reasons},
++                request_json=request_payload,
+                 status="CREATED",
              )
-             self.orders_repo.mark_cancelled(self.env, client_key, response_json={"reason": "close_cancel"})
-         return RunResult(
-             status="OK",
-             notes="close_cancel_only",
-             balance_api_calls=self.balance_api_calls,
-             balance_cache_hits=self.balance_cache_hits,
-             balance_tick_cache_hits=self.balance_tick_cache_hits,
-         )
- 
-     def _load_universe(self) -> list[dict]:
-         if self._universe_context is not None:
-             members = list(self._universe_context.members or [])
-             self._universe_as_of = self._universe_context.as_of_date or (
-                 members[0].get("as_of_date") if members else None
-             )
-             self._universe_path = self._universe_context.selected_path
-         else:
--            today = self._now_kst.date().isoformat()
--            members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
--            self._universe_as_of = today if members else None
--            if not members:
--                members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
--                if members:
--                    self._universe_as_of = members[0].get("as_of_date")
-+            members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
-+            self._universe_as_of = members[0].get("as_of_date") if members else None
-         self._code_name_map = {
--            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
-+            str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
-             for m in members or []
-             if m.get("code")
-         }
-         return members
- 
-     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
-         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
-         marks = self._fetch_marks([p["code"] for p in positions], fallback)
-         totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
-         for pos in positions:
-             qty = pos.get("qty") or 0
-             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
-             market_value = float(mark) * qty
-             cost = float(pos.get("total_cost") or 0.0)
-             totals["market_value"] += market_value
-             totals["cost"] += cost
-             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
-             totals["unrealized"] += market_value - cost
- 
-         summary_mv = None
-         for key in EVAL_KEYS:
-             summary_mv = self._to_float(self._holdings_summary.get(key))
-             if summary_mv is not None:
-                 break
-         summary_cash = None
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 4bb9c0281ea4b740180264ab7b4c7f3fad07554d..9815c7a81017f98d3c47b8d558e247673c9155a2 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -725,57 +725,57 @@ def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt
- 
- def _log_balance_cache(force: bool) -> None:
-     logger.info("[BALANCE][CACHE] hit=%s", not force)
- 
- 
- def _run_smoke(engine, kis_env: str, now: datetime) -> None:
-     token_ok = balance_ok = universe_ok = pretrade_ok = False
-     kis: KisAPI | None = None
-     members: list[dict] = []
-     try:
-         kis = KisAPI()
-         token_ok = True
-     except Exception as exc:
-         logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
- 
-     if kis:
-         try:
-             _log_balance_cache(force=True)
-             snap = kis.get_balance_cached(force=True)
-             balance_ok = bool(snap)
-         except Exception:
-             logger.exception("[SMOKE][FAIL] balance")
- 
-     repo = UniverseRepo(engine)
-     try:
--        members = repo.get_latest_universe_members(kis_env, "best_k_meta")
-+        members = repo.get_current_universe_members(kis_env, "best_k_meta")
-         if not members:
-             if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
-                 from trader.universe import build as universe_build
- 
-                 universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
--                members = repo.get_latest_universe_members(kis_env, "best_k_meta")
-+                members = repo.get_current_universe_members(kis_env, "best_k_meta")
-             else:
-                 logger.info("[UNIVERSE][SKIP] forbidden during trade path")
-         universe_ok = bool(members)
-     except Exception:
-         logger.exception("[SMOKE][FAIL] universe")
- 
-     if kis:
-         try:
-             code = members[0]["code"] if members else "005930"
-             quote = kis.get_price_quote(code, diag_mode=True, attempts=1)
-             pretrade_ok = bool(quote)
-         except Exception:
-             logger.exception("[SMOKE][FAIL] pretrade")
- 
-     status = token_ok and balance_ok and universe_ok and pretrade_ok
-     if status:
-         logger.info(
-             "[SMOKE][PASS] token=%s balance=%s universe=%s pretrade=%s",
-             token_ok,
-             balance_ok,
-             universe_ok,
-             pretrade_ok,
-         )
-     else:
-         logger.warning(
-diff --git a/trader/universe/build.py b/trader/universe/build.py
-index e9be1a35076ac6cf50a9bc625eba0f77d9a3eef0..b6995781c7cd0d317d8aa4d5c891340281a93bf2 100644
---- a/trader/universe/build.py
-+++ b/trader/universe/build.py
-@@ -3,50 +3,51 @@ from __future__ import annotations
- import argparse
- import csv
- import json
- import logging
- import os
- import re
- from pathlib import Path
- from typing import Iterable
- 
- 
- from trader.config import (
-     PB1_MIN_CANDLES,
- )
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
- from trader.db.engine import make_engine
- from trader.db.migrate import run_migrations
- from trader.db.repos import UniverseRepo
- from trader.kis_wrapper import KisAPI
- from trader.time_utils import now_kst
- from trader.universe.capabilities import providers_for_env
- from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
- from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
- from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
- from trader.universe.providers.lkg_provider import LKGProvider
- from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
-+from trader.universe.validation import validate_listed_and_tradeable
- from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
- from trader.runtime_store import RuntimeStore
- 
- from datetime import date
- 
- 
- def _parse_as_of_date(val: str) -> date | None:
-     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
-     from datetime import datetime as _datetime
- 
-     if not val:
-         return None
-     s = str(val).strip()
-     try:
-         if "-" in s:
-             return _datetime.fromisoformat(s).date()
-         if len(s) == 8 and s.isdigit():
-             return _datetime.strptime(s, "%Y%m%d").date()
-         return _datetime.fromisoformat(s).date()
-     except Exception:
-         return None
- 
- 
- def _prefer_provider_order(chain: list[str]) -> list[str]:
-     """Prefer live providers first, then static, then caches."""
-@@ -121,50 +122,70 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
-             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
-             if not code:
-                 continue
-             members.append(
-                 {
-                     "code": code,
-                     "market": market,
-                     "weight": row.get("weight") or row.get("target_weight") or row.get("weight_pct"),
-                     "rank": row.get("rank") or idx + 1,
-                     "meta_json": row,
-                 }
-             )
-     return members
- 
- 
- def _dedup(seq: Iterable[str]) -> list[str]:
-     seen: set[str] = set()
-     uniq: list[str] = []
-     for val in seq:
-         if val not in seen:
-             seen.add(val)
-             uniq.append(val)
-     return uniq
- 
- 
-+def _filter_tradeable_members(
-+    members: list[dict],
-+    *,
-+    kis: KisAPI | None,
-+) -> tuple[list[dict], list[dict]]:
-+    if not kis:
-+        logger.warning("[UNIVERSE][TRADEABLE][SKIP] kis_unavailable=1")
-+        return members, []
-+    kept: list[dict] = []
-+    dropped: list[dict] = []
-+    for member in members:
-+        code = str(member.get("code") or "").zfill(6)
-+        ok, reason = validate_listed_and_tradeable(kis, code)
-+        if ok:
-+            kept.append(member)
-+            continue
-+        dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
-+    return kept, dropped
-+
-+
- 
- 
- def _load_seed_rows(path: Path) -> list[dict]:
-     if not path.exists():
-         return []
-     rows: list[dict] = []
-     try:
-         with path.open(encoding="utf-8") as f:
-             # CSV with header: code,name
-             reader = csv.DictReader(f)
-             has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
-             if has_code_header:
-                 for row in reader:
-                     code = str(row.get("code") or "").strip()
-                     if not code:
-                         continue
-                     rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
-             else:
-                 f.seek(0)
-                 for line in f:
-                     code = line.strip()
-                     if code:
-                         rows.append({"code": code.zfill(6), "name": None})
-     except Exception:
-         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
-@@ -635,63 +656,83 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
-     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
-     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
-     members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
-     logger.info(
-         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
-         stats["total_raw"],
-         stats["invalid_format"],
-         stats["insufficient_history"],
-         stats["final"],
-     )
-     invalid_codes = sanitize_detail.get("invalid_format_codes") or []
-     insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
-     if invalid_codes:
-         logger.info(
-             "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
-             len(invalid_codes),
-             invalid_codes[: min(5, len(invalid_codes))],
-         )
-     if insufficient_codes:
-         logger.info(
-             "[UNIVERSE][DROP] reason=insufficient_history count=%s sample=%s",
-             len(insufficient_codes),
-             insufficient_codes[: min(5, len(insufficient_codes))],
-         )
- 
-+    validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
-+    kis_validator: KisAPI | None = None
-+    if validate_kis:
-+        try:
-+            kis_validator = kis_provider.kis if kis_provider else KisAPI(env=env)
+-        except Exception:
+-            logger.exception("[PB1][ENTRY][DB_FAIL] code=%s", display_code)
+-            if not self.dry_run:
 +        except Exception as exc:
-+            logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
-+            kis_validator = None
-+    if validate_kis:
-+        members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
-+        if dropped_tradeable:
-+            stats["not_tradeable"] = len(dropped_tradeable)
-+            sanitize_detail["dropped"].extend(dropped_tradeable)
-+            sanitize_detail["kept"] = [m.get("code") for m in members]
-+            logger.info(
-+                "[UNIVERSE][DROP] reason=not_tradeable count=%s sample=%s",
-+                len(dropped_tradeable),
-+                dropped_tradeable[: min(5, len(dropped_tradeable))],
-+            )
-+
-     if not members:
-         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
-         raise RuntimeError("universe_members_empty")
- 
--    repo.store_universe(
-+    repo.store_universe_snapshot(
-         env=env,
-         strategy=strategy,
-         as_of_date=as_of_date,
--        source=source,
--        params_json=params,
--        payload_json=payload or {},
-+        provider=source,
-         members=members,
-+        reason=last_reason,
-     )
-+    repo.cleanup_old_runs(retain_days=int(os.getenv("UNIVERSE_RETENTION_DAYS", "30")))
-     logger.info(
-         "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",
-         env,
-         strategy,
-         as_of_date,
-         len(members),
-         source,
-         last_reason or "n/a",
-     )
-     _write_runtime_universe(
-         runtime_store=runtime_store,
-         as_of_date=as_of_date,
-         env=env,
-         strategy=strategy,
-         payload=payload,
-         members=members,
-         source=source,
-         params=params,
-     )
-     _write_universe_sanitize_report(
-         as_of_date=as_of_date,
-         keep_codes=sanitize_detail.get("kept") or [],
-         dropped=sanitize_detail.get("dropped") or [],
-     )
-     _write_universe_drop_diagnostics(
-diff --git a/trader/universe/validation.py b/trader/universe/validation.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..9b0711e332a636514113208ec6d2aa6bbf3a5645
---- /dev/null
-+++ b/trader/universe/validation.py
-@@ -0,0 +1,65 @@
-+from __future__ import annotations
-+
-+import logging
-+from typing import Any
-+
-+from trader.kis_wrapper import KisAPI
-+
-+logger = logging.getLogger(__name__)
-+
-+_TRADE_BLOCK_KEYS = (
-+    "trht_yn",
-+    "trht",
-+    "trading_halt",
-+    "trade_halt",
-+    "trade_stop_yn",
-+    "halted",
-+)
-+
-+
-+def _is_truthy(value: Any) -> bool:
-+    if isinstance(value, bool):
-+        return value
-+    if value is None:
-+        return False
-+    return str(value).strip().lower() in {"y", "yes", "true", "1"}
-+
-+
-+def _extract_price(quote: dict) -> float:
-+    raw = quote.get("raw") if isinstance(quote, dict) else None
-+    price = (
-+        quote.get("prpr")
-+        or quote.get("stck_prpr")
-+        or quote.get("last")
-+        or (raw.get("stck_prpr") if isinstance(raw, dict) else None)
-+    )
-+    try:
-+        return float(price)
-+    except Exception:
-+        return 0.0
-+
-+
-+def validate_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
-+    if not code:
-+        return False, "missing_code"
-+    code = str(code).zfill(6)
-+    try:
-+        quote = kis.get_quote_safe(code, diag_mode=True)
-+    except Exception as exc:  # pragma: no cover - external failure
-+        return False, f"quote_fail:{exc}"
-+    if not isinstance(quote, dict):
-+        return False, "quote_missing"
-+    rt_cd = quote.get("rt_cd")
-+    if rt_cd is not None and str(rt_cd) != "0":
-+        return False, f"rt_cd_{rt_cd}"
-+    raw = quote.get("raw") if isinstance(quote, dict) else None
-+    for key in _TRADE_BLOCK_KEYS:
-+        if _is_truthy(quote.get(key)) or (isinstance(raw, dict) and _is_truthy(raw.get(key))):
-+            return False, f"halted:{key}"
-+    if _extract_price(quote) <= 0:
-+        return False, "price_unavailable"
-+    return True, "ok"
-+
-+
-+def validate_listed_and_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
-+    return validate_tradeable(kis, code)
++            policy = os.getenv("DB_FAIL_POLICY", "halt").lower()
++            logger.exception("[PB1][ENTRY][DB_FAIL] code=%s policy=%s err=%s", display_code, policy, exc)
++            if policy == "best_effort":
++                self._spool_db_fail(
++                    "entry_intent",
++                    {
++                        "env": self.env,
++                        "run_id": self.run_id,
++                        "strategy": self.STRATEGY_NAME,
++                        "sid": 1,
++                        "mode": cf.mode,
++                        "code": cf.code,
++                        "market": cf.market,
++                        "side": "BUY",
++                        "ord_type": order_type,
++                        "qty": cf.planned_qty,
++                        "limit_price": limit_price,
++                        "stage": "PB1-CLOSE",
++                        "client_order_key": cf.client_order_key,
++                        "request_json": request_payload,
++                    },
++                )
++                order_id = cf.client_order_key or "DB_FAIL"
++                created = True
++            else:
+                 raise
+-            return
+         if not created:
+             try:
+                 self._append_ledger_event(
+                     event_type="ORDER_SKIP",
+                     code=cf.code,
+                     market=cf.market,
+                     mode=cf.mode,
+                     side="BUY",
+                     qty=cf.planned_qty,
+                     price=record_price,
+                     client_order_key=cf.client_order_key,
+                     ok=False,
+                     reasons=["duplicate_order"],
+                     stage="PB1-CLOSE",
+                 )
+             except Exception:
+                 logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", display_code)
+             return
+         try:
+             self._append_ledger_event(
+                 event_type="ORDER_INTENT",
+                 code=cf.code,
+                 market=cf.market,
+                 mode=cf.mode,
+                 side="BUY",

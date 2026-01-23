@@ -130,6 +130,7 @@ from trader.eventlog import emit_event
 from trader.utils.env import env_bool
 from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
+from trader.diagnostics.spool import spool_event
 
 logger = logging.getLogger(__name__)
 
@@ -1221,6 +1222,12 @@ class PB1Engine:
             if self.debug:
                 logger.exception("[PB1][LEDGER][FAIL_TRACE]")
 
+    def _spool_db_fail(self, kind: str, payload: dict) -> None:
+        try:
+            spool_event(kind, payload)
+        except Exception as exc:
+            logger.exception("[PB1][DB_FAIL][SPOOL_FAIL] kind=%s err=%s", kind, exc)
+
     @staticmethod
     def _format_order_result_reason(resp: dict | None) -> str:
         if not isinstance(resp, dict):
@@ -2288,6 +2295,7 @@ class PB1Engine:
             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
             order_type = "LIMIT"
         record_price = float(limit_price or entry_price or 0.0)
+        request_payload = {"features": cf.features, "reasons": cf.reasons}
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -2303,14 +2311,36 @@ class PB1Engine:
                 limit_price=limit_price,
                 stage="PB1-CLOSE",
                 client_order_key=cf.client_order_key or "",
-                request_json={"features": cf.features, "reasons": cf.reasons},
+                request_json=request_payload,
                 status="CREATED",
             )
-        except Exception:
-            logger.exception("[PB1][ENTRY][DB_FAIL] code=%s", display_code)
-            if not self.dry_run:
+        except Exception as exc:
+            policy = os.getenv("DB_FAIL_POLICY", "halt").lower()
+            logger.exception("[PB1][ENTRY][DB_FAIL] code=%s policy=%s err=%s", display_code, policy, exc)
+            if policy == "best_effort":
+                self._spool_db_fail(
+                    "entry_intent",
+                    {
+                        "env": self.env,
+                        "run_id": self.run_id,
+                        "strategy": self.STRATEGY_NAME,
+                        "sid": 1,
+                        "mode": cf.mode,
+                        "code": cf.code,
+                        "market": cf.market,
+                        "side": "BUY",
+                        "ord_type": order_type,
+                        "qty": cf.planned_qty,
+                        "limit_price": limit_price,
+                        "stage": "PB1-CLOSE",
+                        "client_order_key": cf.client_order_key,
+                        "request_json": request_payload,
+                    },
+                )
+                order_id = cf.client_order_key or "DB_FAIL"
+                created = True
+            else:
                 raise
-            return
         if not created:
             try:
                 self._append_ledger_event(

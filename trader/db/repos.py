@@ -4,11 +4,12 @@ from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy import Engine, and_, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -28,7 +29,7 @@ from .schema import (
 from .migrate import ensure_sqlite_writable, run_migrations
 from . import config
 from trader.time_utils import now_kst
-from trader.utils.json_sanitize import json_safe
+from trader.db.json_safe import json_sanitize
 
 logger = logging.getLogger(__name__)
 ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
@@ -75,6 +76,45 @@ def _recover_sqlite_readonly(engine: Engine) -> bool:
     ensure_sqlite_writable(db_path)
     run_migrations(engine)
     return True
+
+
+def execute_with_retry(conn, stmt, payload=None, retries: int = 5, base_sleep: float = 0.2):
+    last_exc: OperationalError | None = None
+    for attempt in range(retries):
+        try:
+            if payload is None:
+                return conn.execute(stmt)
+            return conn.execute(stmt, payload)
+        except OperationalError as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "database is locked" in msg or "busy" in msg:
+                time.sleep(base_sleep * (2 ** attempt))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise OperationalError("database is locked", params=None, orig=None)
+
+
+def _collect_json_type_paths(value: Any, *, path: str = "request_json", limit: int = 50) -> list[str]:
+    results: list[str] = []
+
+    def _walk(node: Any, prefix: str) -> None:
+        if len(results) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, val in node.items():
+                _walk(val, f"{prefix}.{key}")
+            return
+        if isinstance(node, (list, tuple, set)):
+            for idx, val in enumerate(node):
+                _walk(val, f"{prefix}[{idx}]")
+            return
+        results.append(f"{prefix}:{type(node).__name__}")
+
+    _walk(value, path)
+    return results
 
 
 class RunsRepo:
@@ -300,6 +340,7 @@ class OrdersRepo:
         status: str = "CREATED",
     ) -> tuple[str, bool]:
         db_url = str(self.engine.url)
+        original_request_json = request_json
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -318,6 +359,9 @@ class OrdersRepo:
             "status": status,
             "request_json": request_json or {},
         }
+        payload = dict(payload)
+        if "request_json" in payload:
+            payload["request_json"] = json_sanitize(payload["request_json"])
         with self.engine.begin() as conn:
             existing = conn.execute(
                 select(self._schema.orders.c.order_id).where(
@@ -328,13 +372,24 @@ class OrdersRepo:
                 return str(existing), False
             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
             try:
-                res = conn.execute(stmt)
+                res = execute_with_retry(conn, stmt)
                 return str(res.scalar()), True
+            except StatementError as exc:
+                if original_request_json is not None:
+                    type_paths = _collect_json_type_paths(original_request_json)
+                    logger.warning(
+                        "[DB][ORDER_INTENT][REQUEST_JSON_TYPES] env=%s key=%s types=%s",
+                        env,
+                        client_order_key,
+                        type_paths,
+                    )
+                raise exc
             except Exception:
-                conn.execute(sa.insert(self._schema.orders).values(**payload))
+                execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
                 return str(payload["order_id"]), True
 
     def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
+        safe_response_json = json_sanitize(response_json or {})
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
@@ -343,20 +398,21 @@ class OrdersRepo:
                     status="SUBMITTED",
                     kis_odno=kis_odno,
                     broker_order_id=kis_odno or client_order_key,
-                    response_json=response_json,
+                    response_json=safe_response_json,
                     submitted_at=func.now(),
                     updated_at=func.now(),
                 )
             )
 
     def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
+        safe_response_json = json_sanitize(response_json or {})
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
                 .values(
                     status="ACKED",
-                    response_json=response_json,
+                    response_json=safe_response_json,
                     broker_order_id=kis_odno,
                     acked_at=func.now(),
                     updated_at=func.now(),
@@ -364,19 +420,21 @@ class OrdersRepo:
             )
 
     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
+        safe_error_payload = json_sanitize(error_payload or {})
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
+                .values(status="ERROR", response_json=safe_error_payload, updated_at=func.now()),
             )
 
     def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
+        safe_response_json = json_sanitize(response_json or {})
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                .values(status="CANCELLED", response_json=response_json or {}, updated_at=func.now()),
+                .values(status="CANCELLED", response_json=safe_response_json, updated_at=func.now()),
             )
 
     def get_open_orders(self, env: str) -> list[dict]:
@@ -442,6 +500,8 @@ class OrdersRepo:
     ) -> str:
         db_url = str(self.engine.url)
         broker_order_id = kis_odno or client_order_key
+        safe_request_json = json_sanitize(request_json or {})
+        safe_response_json = json_sanitize(response_json or {})
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -460,8 +520,8 @@ class OrdersRepo:
             "status": status,
             "kis_odno": kis_odno,
             "broker_order_id": broker_order_id,
-            "request_json": request_json or {},
-            "response_json": response_json or {},
+            "request_json": safe_request_json,
+            "response_json": safe_response_json,
             "submitted_at": submitted_at,
             "acked_at": acked_at,
         }
@@ -470,8 +530,8 @@ class OrdersRepo:
             "status": status,
             "kis_odno": kis_odno,
             "broker_order_id": broker_order_id,
-            "response_json": response_json or {},
-            "request_json": request_json or {},
+            "response_json": safe_response_json,
+            "request_json": safe_request_json,
             "submitted_at": submitted_at,
             "acked_at": acked_at,
             "updated_at": func.now(),
@@ -549,6 +609,7 @@ class FillsRepo:
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
+        safe_raw_json = json_sanitize(raw_json or {})
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -565,7 +626,7 @@ class FillsRepo:
             "fee": fee,
             "tax": tax,
             "filled_at": filled_at,
-            "raw_json": raw_json or {},
+            "raw_json": safe_raw_json,
         }
         conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
             "env",
@@ -577,7 +638,7 @@ class FillsRepo:
             "filled_at",
         ]
         update_cols = {
-            "raw_json": raw_json or {},
+            "raw_json": safe_raw_json,
             "broker_fill_id": broker_fill_id,
         }
         insert_stmt: sa.Insert
@@ -634,7 +695,7 @@ class LedgerEventsRepo:
         payload_json: dict | None = None,
     ) -> str:
         db_url = str(self.engine.url)
-        safe_payload_json = json_safe(payload_json) if payload_json is not None else {}
+        safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
         payload = {
             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
