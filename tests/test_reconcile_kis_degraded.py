@@ -1,7 +1,9 @@
+import os
 import sys
 from pathlib import Path
 
 import sqlalchemy as sa
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -11,7 +13,9 @@ from trader.reconcile_kis import reconcile_today
 
 
 def test_reconcile_today_returns_ok_on_temp_error(tmp_path):
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
     engine = sa.create_engine(db_url)
     METADATA.create_all(engine)
 

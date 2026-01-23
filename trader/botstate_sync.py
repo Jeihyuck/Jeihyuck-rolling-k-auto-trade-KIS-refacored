@@ -58,6 +58,14 @@ bot_state/db/**
 bot_state/db/*.bak*
 bot_state/db/*.readonly.bak.*
 
+# Runtime DB artifacts (should never be created)
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
 # Python / OS noise
 .DS_Store
 __pycache__/
@@ -144,47 +152,6 @@ def ensure_writable_path(path: str | Path, *, is_dir: bool) -> None:
         logger.info("[DB][PERM][CHOWN_SKIP] path=%s", target, exc_info=True)
 
 
-def ensure_sqlite_writable(db_path: str | Path) -> None:
-    db_path = Path(db_path)
-    ensure_writable_path(db_path.parent, is_dir=True)
-    ensure_writable_path(db_path, is_dir=False)
-
-    import sqlite3
-
-    conn = sqlite3.connect(str(db_path), timeout=30)
-    try:
-        cur = conn.cursor()
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("CREATE TABLE IF NOT EXISTS __writetest (k TEXT PRIMARY KEY, v TEXT);")
-        cur.execute(
-            "INSERT OR REPLACE INTO __writetest(k,v) VALUES ('t', ?);",
-            (str(time.time()),),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    try:
-        db_stat = os.stat(db_path)
-        dir_stat = os.stat(db_path.parent)
-        logger.info(
-            "[DB][PERM] path=%s mode=%o uid=%s gid=%s",
-            db_path,
-            db_stat.st_mode & 0o777,
-            db_stat.st_uid,
-            db_stat.st_gid,
-        )
-        logger.info(
-            "[DB][DIR_PERM] dir=%s mode=%o uid=%s gid=%s",
-            db_path.parent,
-            dir_stat.st_mode & 0o777,
-            dir_stat.st_uid,
-            dir_stat.st_gid,
-        )
-    except OSError:
-        logger.warning("[DB][PERM][STAT_FAIL] path=%s", db_path, exc_info=True)
-
-
 def _is_live_trading_env() -> bool:
     env = (os.getenv("KIS_ENV") or "").strip().lower()
     mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
@@ -215,16 +182,6 @@ def hard_reset_bot_state(bot_state_dir: Path, *, reason: str = "manual") -> dict
         logger.warning("[RESET][HARD][SKIP] reason=already_reset_today flag=%s", reset_flag_path)
         return {"skipped": True, "reason": "already_reset_today", "flag": str(reset_flag_path)}
 
-    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
-    for target in [db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")]:
-        try:
-            if target.exists():
-                target.unlink()
-                deleted.append(str(target))
-                logger.info("[RESET][HARD] removed %s", target.name)
-        except Exception:
-            logger.warning("[RESET][HARD][SKIP] path=%s", target, exc_info=True)
-
     runtime_dir = bot_state_dir / "runtime"
     if runtime_dir.exists():
         try:
@@ -254,8 +211,6 @@ def hard_reset_bot_state(bot_state_dir: Path, *, reason: str = "manual") -> dict
     _ensure_gitkeep(bot_state_dir / "runtime")
     _ensure_gitkeep(bot_state_dir / "trader_ledger")
     _ensure_gitkeep(bot_state_dir / "ledger")
-    (bot_state_dir / "db").mkdir(parents=True, exist_ok=True)
-
     reset_flag_path.parent.mkdir(parents=True, exist_ok=True)
     reset_flag_path.write_text(
         json.dumps(
@@ -752,7 +707,6 @@ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot
     ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
     bot_state_dir = worktree_dir / "bot_state"
-    ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
     ensure_writable_path(bot_state_dir / "runtime", is_dir=True)
     ensure_writable_path(bot_state_dir / "trader_ledger", is_dir=True)
     os.environ["BOTSTATE_ROOT"] = str(bot_state_dir)

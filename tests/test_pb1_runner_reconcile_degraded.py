@@ -1,8 +1,10 @@
 from types import SimpleNamespace
+import os
 import sys
 from pathlib import Path
 
 import sqlalchemy as sa
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -14,7 +16,9 @@ from trader.window_router import WindowDecision
 
 
 def test_run_once_continues_after_reconcile_temp_error(tmp_path, monkeypatch):
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
     engine = sa.create_engine(db_url)
     run_migrations(engine)
 
@@ -75,7 +79,6 @@ def test_run_once_continues_after_reconcile_temp_error(tmp_path, monkeypatch):
         lambda **_kwargs: (pb1_runner.BALANCE_STATE_OK, dummy_kis.get_balance_cached(), "stub"),
     )
     monkeypatch.setattr(pb1_runner, "get_botstate_root", lambda: tmp_path)
-    monkeypatch.setattr(pb1_runner, "ensure_sqlite_writable", lambda *_args, **_kwargs: None)
 
     args = SimpleNamespace(window="auto", phase="entry", target_branch="bot-state")
 

@@ -34,7 +34,6 @@ def main() -> None:
 
     bs = pathlib.Path(args.bot_state_dir)
 
-    rm(bs / "db" / "pbcore.sqlite3")
     events_dir = bs / "runtime" / "events"
     if events_dir.exists():
         for path in events_dir.glob("*.jsonl"):
@@ -48,13 +47,10 @@ def main() -> None:
     if args.keep_universe_lkg:
         (bs / "universe_lkg").mkdir(parents=True, exist_ok=True)
 
-    (bs / "db").mkdir(parents=True, exist_ok=True)
     (bs / "runtime").mkdir(parents=True, exist_ok=True)
     (bs / "runtime" / "diagnostics").mkdir(parents=True, exist_ok=True)
     (bs / "trader_ledger").mkdir(parents=True, exist_ok=True)
     (bs / "locks").mkdir(parents=True, exist_ok=True)
-    (bs / "db" / "pbcore.sqlite3").touch()
-
     chmod_rw(bs)
     print(f"[RESET] bot_state reset done: {bs}")
 

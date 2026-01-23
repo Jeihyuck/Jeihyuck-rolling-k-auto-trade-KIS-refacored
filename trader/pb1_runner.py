@@ -56,7 +56,6 @@ from trader.botstate_sync import (
     BotStateContext,
     acquire_lock as acquire_botstate_lock,
     compute_lock_ttl,
-    ensure_sqlite_writable,
     hard_reset_bot_state,
     persist_or_fail,
     persist_run_files,
@@ -65,6 +64,7 @@ from trader.botstate_sync import (
     setup_worktree,
 )
 from trader.db.engine import make_engine
+from trader.db.health import assert_db_ready
 from trader.db.lock import release_lock, try_acquire_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
@@ -2094,6 +2094,7 @@ def _exit_code_for_status(status: str) -> int:
 
 def main() -> int:
     args = parse_args()
+    assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
@@ -2105,7 +2106,6 @@ def main() -> int:
         return 0
     if smoke_enabled:
         bot_state_dir = get_botstate_root()
-        ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
         engine = make_engine()
         run_migrations(engine)
         _write_change_flag(False, ["init"])

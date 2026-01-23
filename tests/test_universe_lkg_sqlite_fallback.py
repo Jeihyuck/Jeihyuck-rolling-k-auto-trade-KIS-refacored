@@ -93,15 +93,10 @@ from trader.db.repos import UniverseRepo
 
 
 def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
-    db_url = f"sqlite:///{tmp_path}/pbcore.db"
     lkg_root = tmp_path / "lkg"
-    sqlite_cache = tmp_path / "cache.sqlite3"
-    monkeypatch.setenv("DATABASE_URL", db_url)
-    monkeypatch.setenv("USING_EXTERNAL_DB", "0")
+    monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
     monkeypatch.setenv("UNIVERSE_LKG_ROOT", str(lkg_root))
-    monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
-    monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
 

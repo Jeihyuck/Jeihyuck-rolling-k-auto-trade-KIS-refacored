@@ -1,139 +1,1155 @@
-diff --git a/.gitignore b/.gitignore
-index acc2bba1909cd9abad6b4fe71c3692cd56ee3744..f7e1310015a69071b3afb078c63b9dd79b11601b 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -1,34 +1,46 @@
- __pycache__/
- .runtime/
- **/__pycache__/
- .venv/
- .vscode/
- .idea/
- logs/
- watchlists/
- *.log
- *.json
- .env
- bot_state/state.json
- kis_token_cache.json
- fastapi.log
- _botstate/
- trader/state/
- trader/state/ohlcv_cache/
- runtime/
- bot_state/
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index 8a71dacd311d824a26842b23f60f45e469bde97c..b02b8c1d9c2f5f3a63e3fc7f4fbf54feb120f4da 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -34,51 +34,51 @@ on:
+     - cron: "*/5 0-5 * * 1-5"
+     # KST 15:00~15:30  => UTC 06:00~06:30 (Mon~Fri UTC)
+     - cron: "0-30/5 6 * * 1-5"
+     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
+     - cron: "29 6 * * 1-5"
  
-+# Local/Runtime DB artifacts (NEVER COMMIT)
+ defaults:
+   run:
+     shell: bash
+     working-directory: repo
+ 
+ jobs:
+   universe_build:
+     runs-on: ubuntu-latest
+     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
+     timeout-minutes: 15
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
++      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+     steps:
+       - name: Checkout code (always run nullim code)
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "nullim"
+@@ -235,51 +235,51 @@ jobs:
+           import json
+           import os
+ 
+           env = (os.getenv("KIS_ENV") or "practice").lower()
+           path = f"botstate/bot_state/universe_lkg/{env}/best_k_meta/latest.json"
+           with open(path, "r", encoding="utf-8") as handle:
+               data = json.load(handle)
+           print("[VERIFY] lkg members=", len(data.get("members", [])))
+           PY
+ 
+   trade_tick:
+     runs-on: ubuntu-latest
+     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
+     timeout-minutes: 25
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+ 
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
++      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
+       PERSIST_MODE: "ON_CHANGE"
+       PB1_ALLOW_PREOPEN_ENTRY: "1"
+       PB1_PREOPEN_START: "08:45"
+       PB1_PREOPEN_END: "09:00"
+       PB1_REQUIRE_BALANCE_FOR_ENTRY: "1"
+       PB1_PREOPEN_REQUIRE_BALANCE: "1"
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+@@ -439,152 +439,135 @@ jobs:
+               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
+               f.write(f"MARKET_WINDOW={window}\n")
+               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+           PY
+ 
+       - name: Compile check (gated)
+         if: env.COMPILE_CHECK_ENABLED == '1'
+         run: |
+           set -euo pipefail
+           python -m compileall trader
+ 
+       - name: Configure git identity for botstate commits
+         run: |
+           git config --global user.email "actions@github.com"
+           git config --global user.name "github-actions[bot]"
+ 
+       - name: Run PB1 (auto window) - should exit within 4 minutes
+         run: |
+           set -euo pipefail
+           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+           python -m trader.run --window auto --phase auto
+         env:
+           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
+           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
+           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
+-          PBCORE_DB_PATH: ${{ env.BOT_STATE_DIR }}/db/pbcore.sqlite3
++          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+           STATE_PATH: bot_state/runtime/state.json
+           LOT_STATE_PATH: bot_state/runtime/lot_state.json
+           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
+           LIVE_TRADING_ENABLED: "1"
+ 
+       - name: Verify hard reset markers (workflow_dispatch)
+         if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
+         run: |
+           set -euo pipefail
+           reset_flag="$BOT_STATE_DIR/runtime/reset_flags/$(TZ=Asia/Seoul date +%F).json"
+           if [ -f "$reset_flag" ]; then
+             echo "[RESET][HARD][FLAG] $reset_flag"
+             cat "$reset_flag"
+           else
+             echo "::error::reset flag missing: $reset_flag"
+             exit 1
+           fi
+ 
+       - name: Inspect bot_state git status (post tick)
+         if: always()
+         run: |
+           set -euo pipefail
+           cd "$BOTSTATE_WORKTREE_DIR"
+           echo "[BOTSTATE][GIT] workdir=$(pwd)"
+           git status --porcelain | head -n 200 || true
+           git diff --cached --name-only | head -n 200 || true
+ 
+       - name: Debug bot_state contents (after run)
+         if: always()
+         run: |
+           set -euo pipefail
+           echo "=== bot_state tree ==="
+           find bot_state -maxdepth 3 -type f -print || true
+           echo "=== git status (workspace) ==="
+           git status --porcelain || true
+ 
+-      - name: Debug botstate DB existence (worktree)
+-        if: always()
+-        run: |
+-          set -euo pipefail
+-          echo "BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
+-          echo "BOT_STATE_DIR=$BOT_STATE_DIR"
+-          echo "PBCORE_DB_PATH=$PBCORE_DB_PATH"
+-          echo "---- ls bot_state/db ----"
+-          ls -la "$BOT_STATE_DIR/db" || true
+-          echo "---- find pbcore.sqlite3 under worktree ----"
+-          cd "$BOTSTATE_WORKTREE_DIR"
+-          find . -name "pbcore.sqlite3" -maxdepth 5 -print || true
+-          echo "---- stat (if exists) ----"
+-          if [ -f "$PBCORE_DB_PATH" ]; then
+-            stat "$PBCORE_DB_PATH" || true
+-          fi
+-
+       - name: Persist bot_state (stage untracked + commit/push)
+         if: always() && (env.PERSIST_MODE != 'OFF')
+         run: |
+           set -euo pipefail
+ 
+           cd "$BOTSTATE_WORKTREE_DIR"
+           echo "[PERSIST] workdir=$(pwd)"
+           git status --porcelain | head -n 50 || true
+ 
+           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+ 
+           # 1) untracked 포함 bot_state 전체 stage
+           git add -A bot_state
+ 
+           # 2) staged 변경이 없으면 스킵
+           if git diff --cached --quiet; then
+             echo "[PERSIST] no staged changes -> skip"
+           else
+             git config user.email "actions@github.com"
+             git config user.name "github-actions[bot]"
+             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+             git push origin HEAD:bot-state
+           fi
+ 
+           # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
+           if [[ -n "$(git status --porcelain)" ]]; then
+             echo "::error::botstate worktree dirty after persist"
+             git status --porcelain | head -n 200
+             exit 1
+           fi
+ 
+   close_cancel:
+     runs-on: ubuntu-latest
+     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
+     timeout-minutes: 15
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+ 
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
++      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
+       PERSIST_MODE: "ON_CHANGE"
+ 
+       PB1_CLOSE_CANCEL_ONLY: "1"
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+       BOTSTATE_LOCK_TTL_SEC: "1500"
+@@ -644,51 +627,51 @@ jobs:
+         with:
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+           restore-keys: |
+             ${{ runner.os }}-pip-
+ 
+       - name: Install deps
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+       - name: Configure git identity for botstate commits
+         run: |
+           git config --global user.email "actions@github.com"
+           git config --global user.name "github-actions[bot]"
+ 
+       - name: Run PB1 close-cancel (auto window)
+         run: |
+           set -euo pipefail
+           python -m trader.pb1_runner --window auto --phase auto
+         env:
+           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
+           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
+           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
+-          PBCORE_DB_PATH: ${{ env.BOT_STATE_DIR }}/db/pbcore.sqlite3
++          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+           STATE_PATH: bot_state/runtime/state.json
+           LOT_STATE_PATH: bot_state/runtime/lot_state.json
+ 
+       - name: Persist bot_state (stage untracked + commit/push)
+         if: always() && (env.PERSIST_MODE != 'OFF')
+         run: |
+           set -euo pipefail
+ 
+           cd "$BOTSTATE_WORKTREE_DIR"
+           echo "[PERSIST] workdir=$(pwd)"
+           git status --porcelain | head -n 50 || true
+ 
+           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+ 
+           # 1) untracked 포함 bot_state 전체 stage
+           git add -A bot_state
+ 
+           # 2) staged 변경이 없으면 스킵
+           if git diff --cached --quiet; then
+             echo "[PERSIST] no staged changes -> skip"
+           else
+             git config user.email "actions@github.com"
+             git config user.name "github-actions[bot]"
+             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+             git push origin HEAD:bot-state
+diff --git a/README.md b/README.md
+index 6f67d9c25be9c930c10ed122abf791b68ef6ee71..a9a5d9194981aaaed9b576bb91be80854a9775f3 100644
+--- a/README.md
++++ b/README.md
+@@ -45,28 +45,28 @@ Key log markers for grep:
+ - `[DATA-HEALTH] code=... reasons=[...]`
+ - `[SETUP-BAD] ... reasons=['...']` (never empty on failures)
+ - `[ORPHAN]` / `[UNKNOWN]` aggregates
+ - `[DIAG][DUMP] path=...`
+ 
+ ## Strategy intent mode (single-account multi-strategy)
+ - A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
+ - All five strategies (`breakout`~`volatility`) are present but **disabled by default**: `ENABLED_STRATEGIES=""` means no strategies run, and missing weights are treated as zero even when listed.
+ - Enable a subset for testing, e.g. `ENABLED_STRATEGIES="momentum"` with optional weights `STRATEGY_WEIGHTS="momentum=0.10"`. Keep `STRATEGY_MODE=INTENT_ONLY` and `STRATEGY_DRY_RUN=true` (defaults) to avoid any KIS orders.
+ - PortfolioManager order: strategies → KOSPI → KOSDAQ. During isolated testing use `DISABLE_KOSPI_ENGINE=true` or `DISABLE_KOSDAQ_LOOP=true` to skip respective engines.
+ - State sync scripts in `scripts/state_pull_plain.sh` and `scripts/state_push_plain.sh` now copy the intent log/cursor alongside `trader/state/state.json` into the `bot-state` branch.
+ 
+ ## CI and live-trading safeguards
+ - CI (pull_request) runs set `DISABLE_LIVE_TRADING=true` so all KIS API calls are blocked and only static checks execute.
+ - The live trading workflow is restricted to the `main` branch and triggers only via schedule or manual dispatch with the branch guard enabled.
+ 
+ ## PB1 운영 가이드 (종가 눌림목 클로즈 매수)
+ - **윈도우**: 오전 08:50~11:00 KST(09:00~09:20 청산 전용), 오후 14:00~15:30 KST(15:20~15:30 신규 진입 전용). 윈도우 밖에서는 즉시 종료한다.
+ - **모드**: 매수 시 `mode=1`(DAY) 또는 `mode=2`(SWING)으로 고정해 원장에 남긴다. DAY는 다음날 09:00~09:20에 시간청산(+R 기반 익절/손절), SWING은 -7%/-8% 하드스톱, MA20 트레일, 10거래일 타임스톱을 따른다.
+ - **원장 경로**: 모든 이벤트는 `bot_state/trader_ledger/<kind>/<YYYY-MM-DD>/run_<run_id>.jsonl`(orders_intent/orders_ack/fills/exits_intent/errors)과 `bot_state/trader_ledger/reports/<YYYY-MM-DD>/pnl_snapshot.json`에 append-only로 남는다. 평균원가(가중평균)로 평단/수익률%를 재구성한다.
+ - **DRY_RUN/LIVE**: `STRATEGY_MODE=INTENT_ONLY`+`DRY_RUN=1`이면 주문 호출 없이 ledger에 intent만 적재하며, LIVE(모의/실전)는 동일 로직으로 주문 수행 후 fill을 기록한다. `ENABLE_BREAKOUT=false`가 기본이며 돌파 신규 진입 경로는 차단된다.
+ - **실행 방법**: `python -m trader.trader --window auto --phase auto --target-branch bot-state` (GitHub Actions `pb1-runner.yml`는 5분 간격으로 오전/오후 윈도우를 모두 커버).
+ 
+ ## Smoke commands
+ ```
+-DATABASE_URL=sqlite:///./dev.db python -m trader.db.migrate
+-DATABASE_URL=sqlite:///./dev.db python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
++PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.db.migrate
++PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
+ ```
+diff --git a/bot_state/.gitignore b/bot_state/.gitignore
+index b2710ccfc8130061d6c84d35d7ac7903c0e990a9..2aea5219a281b7dbc17a4e2d32710510be3da32b 100644
+--- a/bot_state/.gitignore
++++ b/bot_state/.gitignore
+@@ -1,20 +1,28 @@
+ runtime/
+ runtime/**
+ 
+ !runtime/events/
+ !runtime/events/**
+ !runtime/status/
+ !runtime/status/**
+ !runtime/universe/
+ !runtime/universe/**
+ !runtime/balance_snapshot.json
+ !runtime/schema_version.txt
+ 
+ # Large caches must not be committed
+ runtime/ohlcv_cache/
+ runtime/ohlcv_cache/**
+ 
+ # --- never commit these ---
+ archive/
+ db/*.readonly.bak.*
+ db/*.bak*
++
++# Runtime DB artifacts (should never be created)
 +**/*.sqlite3
 +**/*.sqlite3-wal
 +**/*.sqlite3-shm
 +**/*.db
 +**/*.db-wal
 +**/*.db-shm
+diff --git a/migrations/0001_pbcore.sql b/migrations/0001_pbcore.sql
+index 2ddb7cf5a1f6220b327316f7d5722d28f5cee4df..20550a7ca35487ab9b9d1a20a99e432e1d637539 100644
+--- a/migrations/0001_pbcore.sql
++++ b/migrations/0001_pbcore.sql
+@@ -1,27 +1,26 @@
+ -- PB-Core v2 base schema
+--- Enum placeholders as TEXT to keep compatibility with sqlite tests.
+ 
+ CREATE TABLE IF NOT EXISTS runs (
+     run_id TEXT PRIMARY KEY,
+     env TEXT NOT NULL,
+     strategy TEXT NOT NULL,
+     run_window TEXT,
+     phase TEXT,
+     event_name TEXT,
+     dry_run INTEGER NOT NULL DEFAULT 0,
+     git_sha TEXT,
+     workflow TEXT,
+     workflow_run_id TEXT,
+     workflow_attempt INTEGER,
+     config_json TEXT NOT NULL DEFAULT '{}',
+     status TEXT NOT NULL DEFAULT 'STARTED',
+     started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+     finished_at TEXT,
+     notes TEXT
+ );
+ 
+ CREATE TABLE IF NOT EXISTS universe (
+     universe_id TEXT PRIMARY KEY,
+     env TEXT NOT NULL,
+     strategy TEXT NOT NULL,
+     as_of_date TEXT NOT NULL,
+diff --git a/tests/test_db_uuid_types.py b/tests/test_db_uuid_types.py
+index 1e26ed90c1803f00a374fb8d88c57daf5f6c7f00..6feb8f0839bbe4e917dd725c0aad473e599255d2 100644
+--- a/tests/test_db_uuid_types.py
++++ b/tests/test_db_uuid_types.py
+@@ -1,17 +1,11 @@
+ import sqlalchemy as sa
+ 
+ from trader.db.schema import schema_for_url
+ 
+ 
+ def test_universe_id_uses_string_for_postgres():
+     url = "postgresql+psycopg://user:pass@localhost:5432/db"
+     schema = schema_for_url(url)
+     col_type = schema.universe_runs.c.run_id.type
+     assert isinstance(col_type, sa.String)
+ 
+-
+-def test_universe_id_uses_string_for_sqlite():
+-    url = "sqlite:///./dev.db"
+-    schema = schema_for_url(url)
+-    col_type = schema.universe_runs.c.run_id.type
+-    assert isinstance(col_type, sa.String)
+diff --git a/tests/test_idempotency.py b/tests/test_idempotency.py
+index aa49fa3aba7577db7ff0d0d3337c8e0790ada7e8..b75e22294c80a5801c64731db649070064a6db61 100644
+--- a/tests/test_idempotency.py
++++ b/tests/test_idempotency.py
+@@ -1,40 +1,44 @@
++import os
+ import sys
+ from pathlib import Path
+ 
+ import sqlalchemy as sa
+ from datetime import datetime
++import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import OrdersRepo, FillsRepo
+ from trader.db.schema import ORDERS, FILLS
+ 
+ 
+ def test_orders_upsert_idempotent(tmp_path):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
+     engine = sa.create_engine(db_url)
+     run_migrations(engine)
+ 
+     repo = OrdersRepo(engine)
+     repo.upsert_reconciled_order(
+         env="practice",
+         run_id=None,
+         strategy="pb1_pullback_close",
+         sid=1,
+         mode=1,
+         code="005930",
+         market="KOSPI",
+         side="BUY",
+         ord_type="RECONCILED",
+         qty=1,
+         limit_price=100.0,
+         stage="RECONCILE",
+         client_order_key="practice:pb1:000",
+         kis_odno="KIS123",
+         status="ACKED",
+         request_json={},
+         response_json={},
+         submitted_at=None,
+         acked_at=None,
+     )
+@@ -43,51 +47,53 @@ def test_orders_upsert_idempotent(tmp_path):
+         run_id=None,
+         strategy="pb1_pullback_close",
+         sid=1,
+         mode=1,
+         code="005930",
+         market="KOSPI",
+         side="BUY",
+         ord_type="RECONCILED",
+         qty=1,
+         limit_price=100.0,
+         stage="RECONCILE",
+         client_order_key="practice:pb1:000",
+         kis_odno="KIS123",
+         status="ACKED",
+         request_json={},
+         response_json={},
+         submitted_at=None,
+         acked_at=None,
+     )
+     with engine.begin() as conn:
+         count = conn.execute(sa.select(sa.func.count()).select_from(ORDERS)).scalar()
+     assert count == 1
+ 
+ 
+ def test_fills_upsert_idempotent(tmp_path):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
+     engine = sa.create_engine(db_url)
+     run_migrations(engine)
+ 
+     repo = FillsRepo(engine)
+     repo.upsert_fill(
+         env="practice",
+         run_id=None,
+         order_id=None,
+         kis_odno="KIS123",
+         trade_id="TRD-1",
+         code="005930",
+         market="KOSPI",
+         side="BUY",
+         qty=1,
+         price=100.0,
+         fee=0.0,
+         tax=0.0,
+         filled_at=datetime.utcnow(),
+         raw_json={},
+     )
+     repo.upsert_fill(
+         env="practice",
+         run_id=None,
+         order_id=None,
+         kis_odno="KIS123",
+diff --git a/tests/test_json_safe.py b/tests/test_json_safe.py
+index 9f5b8dc8bcb77b96045ee8148f886ccb39387a46..a5918591c0ef69f969d049dacf2df4ded92383c4 100644
+--- a/tests/test_json_safe.py
++++ b/tests/test_json_safe.py
+@@ -1,66 +1,70 @@
+ import json
++import os
+ import sys
+ from datetime import date, datetime
+ from decimal import Decimal
+ from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+ import sqlalchemy as sa
++import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ from trader.db.json_safe import json_sanitize
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import OrdersRepo
+ from trader.db.schema import ORDERS
+ 
+ 
+ def test_json_sanitize_handles_complex_types() -> None:
+     payload = {
+         "ts": pd.Timestamp("2023-01-01"),
+         "dt": datetime(2023, 1, 1, 12, 30, 45),
+         "d": date(2023, 1, 1),
+         "dec": Decimal("12.34"),
+         "np_int": np.int64(7),
+         "np_float": np.float64(3.14),
+         "bad": float("nan"),
+     }
+     sanitized = json_sanitize(payload)
+     assert isinstance(sanitized["ts"], str)
+     assert isinstance(sanitized["dt"], str)
+     assert isinstance(sanitized["d"], str)
+     assert sanitized["dec"] == 12.34
+     assert sanitized["np_int"] == 7
+     assert sanitized["np_float"] == 3.14
+     assert sanitized["bad"] is None
+     json.dumps(sanitized)
+ 
+ 
+ def test_create_intent_sanitizes_request_json(tmp_path) -> None:
+-    db_url = f"sqlite:///{tmp_path}/test.db"
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
+     engine = sa.create_engine(db_url)
+     run_migrations(engine)
+ 
+     repo = OrdersRepo(engine)
+     order_id, created = repo.create_intent_idempotent(
+         env="practice",
+         run_id=None,
+         strategy="pb1_pullback_close",
+         sid=1,
+         mode=1,
+         code="005930",
+         market="KOSPI",
+         side="BUY",
+         ord_type="LIMIT",
+         qty=1,
+         limit_price=100.0,
+         stage="PB1-CLOSE",
+         client_order_key="practice:pb1:test",
+         request_json={"ts": pd.Timestamp("2023-01-01")},
+     )
+     assert created is True
+ 
+     with engine.begin() as conn:
+         count = conn.execute(sa.select(sa.func.count()).select_from(ORDERS)).scalar()
+     assert count == 1
+diff --git a/tests/test_pb1_practice_reset.py b/tests/test_pb1_practice_reset.py
+index c5c9f983671726d57826e244e3153f9350d787e6..c67dc18f56981b2e10636f65be5c92ea4a4fad4f 100644
+--- a/tests/test_pb1_practice_reset.py
++++ b/tests/test_pb1_practice_reset.py
+@@ -1,38 +1,42 @@
++import os
+ from pathlib import Path
+ 
++import pytest
 +
-+# bot_state db files
-+bot_state/db/**
-+_botstate_worktree/**/bot_state/db/**
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import LedgerEventsRepo, PositionsRepo
+ from trader.pb1_runner import _handle_missing_positions_reset
+ from trader.time_utils import now_kst
+ 
+ 
+ def test_practice_reset_closes_positions_and_writes_event(tmp_path, monkeypatch):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
+-    monkeypatch.setenv("DATABASE_URL", db_url)
+-    engine = make_engine(db_url)
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
++    engine = make_engine()
+     run_migrations(engine)
+ 
+     positions_repo = PositionsRepo(engine)
+     ledger_repo = LedgerEventsRepo(engine)
+ 
+     positions_repo.apply_fill(
+         env="practice",
+         strategy="pb1_pullback_close",
+         sid=1,
+         mode=1,
+         code="000001",
+         market="KOSPI",
+         side="BUY",
+         qty=5,
+         price=1000.0,
+         fee=0.0,
+         tax=0.0,
+         filled_at=now_kst(),
+     )
+     positions_repo.apply_fill(
+         env="practice",
+         strategy="pb1_pullback_close",
+         sid=1,
+         mode=1,
+         code="000002",
+diff --git a/tests/test_pb1_runner_reconcile_degraded.py b/tests/test_pb1_runner_reconcile_degraded.py
+index b80d2c5e6c11350d158aa02769778e4f821cb126..7a3bb5bda9bc7534275ebee49ee71dc9969f0e6c 100644
+--- a/tests/test_pb1_runner_reconcile_degraded.py
++++ b/tests/test_pb1_runner_reconcile_degraded.py
+@@ -1,42 +1,46 @@
+ from types import SimpleNamespace
++import os
+ import sys
+ from pathlib import Path
+ 
+ import sqlalchemy as sa
++import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ import trader.pb1_runner as pb1_runner
+ from trader.db.migrate import run_migrations
+ from trader.kis_wrapper import KisTemporaryError
+ from trader.pb1_engine import RunResult
+ from trader.window_router import WindowDecision
+ 
+ 
+ def test_run_once_continues_after_reconcile_temp_error(tmp_path, monkeypatch):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
+     engine = sa.create_engine(db_url)
+     run_migrations(engine)
+ 
+     class DummyKis:
+         env = "practice"
+         CANO = "12345678"
+         ACNT_PRDT_CD = "01"
+ 
+         def __init__(self):
+             self.inquire_called = False
+ 
+         def inquire_daily_ccld(self, **_kwargs):
+             self.inquire_called = True
+             raise KisTemporaryError("HTTP 500")
+ 
+         def get_balance_cached(self, **_kwargs):
+             return {"output1": [], "output2": {"dnca_tot_amt": "10000000", "ord_psbl_cash": "10000000"}}
+ 
+         def get_price_quote(self, *_args, **_kwargs):
+             return {}
+ 
+     dummy_kis = DummyKis()
+ 
+     def fake_kis_factory():
+         return dummy_kis
+@@ -53,42 +57,41 @@ def test_run_once_continues_after_reconcile_temp_error(tmp_path, monkeypatch):
+             return RunResult(status="OK", notes="test", balance_api_calls=0, balance_cache_hits=0, balance_tick_cache_hits=0)
+ 
+         def run_close_cancel(self):
+             return self.run()
+ 
+     monkeypatch.setattr(pb1_runner, "KisAPI", fake_kis_factory)
+     monkeypatch.setattr(pb1_runner, "PB1Engine", DummyEngine)
+     monkeypatch.setattr(pb1_runner, "ensure_universe_built_once", lambda **_kwargs: None)
+     monkeypatch.setattr(pb1_runner, "_load_universe_context", lambda **_kwargs: None)
+     monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_args, **_kwargs: True)
+     monkeypatch.setattr(pb1_runner, "release_lock", lambda *_args, **_kwargs: None)
+     monkeypatch.setattr(pb1_runner, "detect_window", lambda *_args, **_kwargs: "day")
+     monkeypatch.setattr(pb1_runner, "resolve_strategy_mode", lambda **_kwargs: ("LIVE", True, "day", "test"))
+     monkeypatch.setattr(
+         pb1_runner,
+         "_resolve_market_context",
+         lambda **_kwargs: (WindowDecision(name="day", phase="trade"), "day", "entry", "test", "day", []),
+     )
+     monkeypatch.setattr(pb1_runner, "_decide_action", lambda *_args, **_kwargs: ("run", None))
+     monkeypatch.setattr(
+         pb1_runner,
+         "get_balance_state",
+         lambda **_kwargs: (pb1_runner.BALANCE_STATE_OK, dummy_kis.get_balance_cached(), "stub"),
+     )
+     monkeypatch.setattr(pb1_runner, "get_botstate_root", lambda: tmp_path)
+-    monkeypatch.setattr(pb1_runner, "ensure_sqlite_writable", lambda *_args, **_kwargs: None)
+ 
+     args = SimpleNamespace(window="auto", phase="entry", target_branch="bot-state")
+ 
+     touched, did_work, _metrics, _phase, status = pb1_runner.run_once(
+         args=args,
+         engine=engine,
+         loop_mode=False,
+         window=WindowDecision(name="day", phase="trade"),
+         bot_state_dir=tmp_path,
+     )
+ 
+     assert dummy_kis.inquire_called is True
+     assert ran["called"] is True
+     assert did_work is True
+     assert status == "OK"
+     assert touched is not None
+diff --git a/tests/test_pb1_runner_wait.py b/tests/test_pb1_runner_wait.py
+index b0cb7484914b7d5b9054837b5288d88eaf1ab6bc..064be0841cc967cb590eedfada8059282da7d13e 100644
+--- a/tests/test_pb1_runner_wait.py
++++ b/tests/test_pb1_runner_wait.py
+@@ -121,119 +121,122 @@ def test_wait_branch_does_not_crash(monkeypatch) -> None:
+         datetime(2024, 1, 2, 8, 50, tzinfo=ZoneInfo("Asia/Seoul")),
+     ]
+ 
+     def fake_now():
+         return times.pop(0) if times else datetime(2024, 1, 2, 8, 50, tzinfo=ZoneInfo("Asia/Seoul"))
+ 
+     monkeypatch.setattr(pb1_runner, "now_kst", fake_now)
+     monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+     monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+     monkeypatch.delenv("EXPECT_LIVE_TRADING", raising=False)
+     monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
+     monkeypatch.setattr(
+         pb1_runner,
+         "parse_args",
+         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
+     )
+     monkeypatch.setattr(
+         pb1_runner,
+         "KisAPI",
+         lambda *_, **__: SimpleNamespace(
+             env="practice",
+             get_balance_cached=lambda **__: {},
+             get_price_quote=lambda *_, **__: {},
+         ),
+     )
+-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
++    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
++    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
+     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
+ 
+     slept = []
+ 
+     def fake_sleep(seconds):
+         slept.append(seconds)
+ 
+     monkeypatch.setattr(pb1_runner.time_mod, "sleep", fake_sleep)
+     monkeypatch.setattr(pb1_runner, "is_trading_day", lambda _: True)
+ 
+     # Act / Assert: should exit cleanly without raising
+     pb1_runner.main()
+     assert slept, "wait path should invoke sleep"
+ 
+ 
+ def test_expect_live_guard_skipped_in_diag(monkeypatch) -> None:
+     now = datetime(2024, 1, 2, 16, 10, tzinfo=ZoneInfo("Asia/Seoul"))
+     monkeypatch.setattr(pb1_runner, "now_kst", lambda: now)
+     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+     monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+     monkeypatch.setenv("EXPECT_LIVE_TRADING", "1")
+     monkeypatch.setenv("KIS_ENV", "practice")
+     monkeypatch.setenv("API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
+     monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
+     monkeypatch.setattr(
+         pb1_runner,
+         "parse_args",
+         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
+     )
+     monkeypatch.setattr(
+         pb1_runner,
+         "KisAPI",
+         lambda *_, **__: SimpleNamespace(
+             env="practice",
+             get_balance_cached=lambda **__: {},
+             get_price_quote=lambda *_, **__: {},
+         ),
+     )
+-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
++    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
++    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
+     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
+ 
+     pb1_runner.main()  # should not raise even with EXPECT_LIVE_TRADING=1 in diag path
+ 
+ 
+ def test_schedule_event_does_not_wait(monkeypatch) -> None:
+     now = datetime(2024, 1, 2, 8, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+     monkeypatch.setattr(pb1_runner, "now_kst", lambda: now)
+     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+     monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+     monkeypatch.setenv("PB1_ALLOW_WAIT", "0")
+     monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: False)
+     monkeypatch.setattr(
+         pb1_runner,
+         "parse_args",
+         lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state"),
+     )
+     monkeypatch.setattr(
+         pb1_runner,
+         "KisAPI",
+         lambda *_, **__: SimpleNamespace(
+             env="practice",
+             get_balance_cached=lambda **__: {},
+             get_price_quote=lambda *_, **__: {},
+         ),
+     )
+-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
++    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
++    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
+     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
+ 
+     def sleep_fail(_):
+         raise AssertionError("schedule run should not sleep")
+ 
+     monkeypatch.setattr(pb1_runner.time_mod, "sleep", sleep_fail)
+ 
+     pb1_runner.main()
+ 
+ 
+ def test_decide_action_smoke_after_close():
+     now = datetime(2024, 1, 2, 16, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+     open_dt, close_dt = pb1_runner._market_session(now)
+ 
+     action, target_start = pb1_runner._decide_action(
+         now=now,
+         trading_day=True,
+         open_dt=open_dt,
+         close_dt=close_dt,
+         allow_wait=True,
+         max_wait_s=3600,
+         smoke_enabled=False,
+     )
+ 
+diff --git a/tests/test_reconcile_kis_degraded.py b/tests/test_reconcile_kis_degraded.py
+index 008d9262745063bbcfa113f8f825c7c5cf8076db..ca120c2c419840bdead9bbbaad3b55ee113c85b7 100644
+--- a/tests/test_reconcile_kis_degraded.py
++++ b/tests/test_reconcile_kis_degraded.py
+@@ -1,33 +1,37 @@
++import os
+ import sys
+ from pathlib import Path
+ 
+ import sqlalchemy as sa
++import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ from trader.db.schema import METADATA
+ from trader.kis_wrapper import KisTemporaryError
+ from trader.reconcile_kis import reconcile_today
+ 
+ 
+ def test_reconcile_today_returns_ok_on_temp_error(tmp_path):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
+     engine = sa.create_engine(db_url)
+     METADATA.create_all(engine)
+ 
+     class DummyKis:
+         def inquire_daily_ccld(self, **_kwargs):
+             raise KisTemporaryError("HTTP 500")
+ 
+     result = reconcile_today(
+         engine=engine,
+         kis=DummyKis(),
+         env="practice",
+         run_id=None,
+         strategy="pb1_pullback_close",
+     )
+ 
+     assert result["ok"] is True
+     assert result["orders"] == 0
+     assert result["fills"] == 0
+     assert result["degraded"] == "temporary"
+diff --git a/tests/test_universe_build_empty_ok.py b/tests/test_universe_build_empty_ok.py
+index 56089cbb07344ed33ce241cee20d8ec79faa99da..c2f176aa3fba2f5838f0460b15ac345fe8cc8e2f 100644
+--- a/tests/test_universe_build_empty_ok.py
++++ b/tests/test_universe_build_empty_ok.py
+@@ -1,25 +1,37 @@
+ import os
+ from importlib import reload
+ 
+ import pytest
+ 
+ from trader.universe import build
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def reset_env(tmp_path, monkeypatch):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
+-    monkeypatch.setenv("DATABASE_URL", db_url)
++    monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
+     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+     yield
+ 
+ 
+ def test_build_universe_succeeds_on_empty_payload(monkeypatch):
++    class FakeUniverseRepo:
++        def __init__(self, _engine):
++            return None
 +
- # Allow tracking runtime universe outputs in bot_state
- !bot_state/
- !bot_state/runtime/
- !bot_state/runtime/universe/
- !bot_state/runtime/universe/**
- !bot_state/runtime/universe_build_done_*.flag
- !bot_state/runtime/universe_sanitize_*.json
- !bot_state/runtime/*.flag
- !bot_state/runtime/*.json
- !bot_state/runtime/events/
- !bot_state/runtime/events/*.jsonl
- !bot_state/runtime/diagnostics/
- !bot_state/runtime/diagnostics/*.json
- !bot_state/runtime/diagnostics/universe_drop_*.json
-diff --git a/requirements.txt b/requirements.txt
-index fd68daef7b0216aa454c724fb3a3b92cc7e36139..24013a6237718012267b684d4a8a84df2df7ff3e 100644
---- a/requirements.txt
-+++ b/requirements.txt
-@@ -1,13 +1,13 @@
- fastapi>=0.110,<1.0
- uvicorn[standard]>=0.29,<1.0
- pandas>=2.2
- numpy>=1.26
- pykrx>=1.0.51
- pyarrow>=15
++        def store_universe_snapshot(self, **_kwargs):
++            return "fake-run"
++
++        def cleanup_old_runs(self, **_kwargs):
++            return None
++
++    monkeypatch.setattr(build, "make_engine", lambda: None)
++    monkeypatch.setattr(build, "run_migrations", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(build, "UniverseRepo", FakeUniverseRepo)
+     monkeypatch.setattr(
+         build,
+         "run_rebalance",
+         lambda as_of_date, return_by_market=True: {"selected": [], "selected_stocks": [], "selected_by_market": {}},
+     )
+     with pytest.raises(RuntimeError, match="universe_members_empty"):
+         build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
+diff --git a/tests/test_universe_current_pointer.py b/tests/test_universe_current_pointer.py
+index a6ae5271e9236bb617751a21539744a772fdf787..9294a6093856e9219fd2329009aea84f788ef89f 100644
+--- a/tests/test_universe_current_pointer.py
++++ b/tests/test_universe_current_pointer.py
+@@ -1,33 +1,38 @@
++import os
++
++import pytest
++
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
  
  
- finance-datareader>=0.9
- python-dotenv>=0.21.0
- sqlalchemy>=2.0
--psycopg[binary]>=3.1
-+psycopg[binary]>=3.2
- pytest
-diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
-index 274ce635071be94996148f2350ca623d5469b1ce..d3e5bad5890b64a6ff92b73d7e9f9617c2a7a4e5 100644
---- a/trader/botstate_persist.py
-+++ b/trader/botstate_persist.py
-@@ -14,51 +14,50 @@ from trader.botstate_sync import (
-     BotStatePersistError,
-     persist_run_files,
-     release_lock,
-     resolve_botstate_worktree_dir,
-     setup_worktree,
- )
+ def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
+-    db_url = f"sqlite:///{tmp_path}/test.db"
+-    monkeypatch.setenv("DATABASE_URL", db_url)
++    db_url = os.getenv("PBCORE_DB_URL")
++    if not db_url:
++        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
  
- logger = logging.getLogger(__name__)
- KST = ZoneInfo("Asia/Seoul")
+     engine = make_engine()
+     run_migrations(engine)
+     repo = UniverseRepo(engine)
  
+     repo.store_universe_snapshot(
+         env="practice",
+         strategy="best_k_meta",
+         as_of_date="2025-01-01",
+         provider="seed_static",
+         members=[{"code": "218410", "market": "KOSDAQ"}],
+         reason="legacy",
+     )
+     repo.store_universe_snapshot(
+         env="practice",
+         strategy="best_k_meta",
+         as_of_date="2025-01-02",
+         provider="seed_static",
+         members=[{"code": "005930", "market": "KOSPI"}],
+         reason="current",
+     )
  
- def _add_if_exists(paths: list[Path], candidate: Path) -> None:
-     if candidate.is_file():
-         paths.append(candidate)
+     members = repo.get_current_universe_members("practice", "best_k_meta")
+     codes = [m.get("code") for m in members]
  
+diff --git a/tests/test_universe_lkg_sqlite_fallback.py b/tests/test_universe_lkg_sqlite_fallback.py
+index 8a7208e5042065c05476378c991d2b7e0acbd2f8..327f23e94a601f5fa4b08792b974fd6f292c0b2f 100644
+--- a/tests/test_universe_lkg_sqlite_fallback.py
++++ b/tests/test_universe_lkg_sqlite_fallback.py
+@@ -71,59 +71,54 @@ def _install_sa_stub() -> None:
+     scalar_type = lambda *args, **kwargs: object()
+     sa.String = sa.Integer = sa.Float = sa.JSON = sa.Boolean = sa.DateTime = sa.Text = scalar_type
+     sa.ForeignKey = lambda *args, **kwargs: None
+     sa.func = types.SimpleNamespace(now=lambda: None)
+     sa.insert = lambda *args, **kwargs: _DummyStatement()
+     sa.update = lambda *args, **kwargs: _DummyStatement()
+     sa.select = lambda *args, **kwargs: _DummyStatement()
+     sa.and_ = lambda *args, **kwargs: None
+     sa.UniqueConstraint = lambda *args, **kwargs: None
  
- def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
-     for path in base_dir.glob(pattern):
-         if path.is_file():
-             paths.append(path)
- 
- 
- def _collect_paths(base_dir: Path) -> list[Path]:
-     paths: list[Path] = []
-     bot_root = get_botstate_root()
--    _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
-     _add_if_exists(paths, bot_root / "runtime/state.json")
-     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
-     _add_glob(paths, bot_root, "runtime/universe/*.json")
-     _add_glob(paths, bot_root, "runtime/universe/**/*.json")
-     _add_glob(paths, bot_root, "runtime/universe_build_done_*.flag")
-     _add_glob(paths, bot_root, "runtime/universe_sanitize_*.json")
-     _add_glob(paths, bot_root, "runtime/reports/**/*.json")
-     _add_glob(paths, bot_root, "runtime/status/*.json")
-     _add_glob(paths, bot_root, "runtime/status/*.flag")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
-     _add_if_exists(paths, botstate_path("runtime", "strategy_intents.jsonl"))
-     _add_if_exists(paths, botstate_path("runtime", "strategy_intents_state.json"))
-     _add_if_exists(paths, botstate_path("runtime", "diagnostics", "diag_latest.json"))
-     _add_glob(paths, bot_root, "runtime/diagnostics/diag_*.json")
-     _add_glob(paths, bot_root, "runtime/diagnostics/universe_drop_*.json")
-     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
-     return paths
+     sa_engine = types.ModuleType("sqlalchemy.engine")
+     sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
+     sa_engine.Engine = _DummyEngine
+     sys.modules["sqlalchemy.engine"] = sa_engine
+     sys.modules["sqlalchemy.engine.url"] = sa_engine.url
+     sys.modules["sqlalchemy"] = sa
  
  
- def _resolve_owner() -> str:
-     return os.getenv("GITHUB_ACTOR", "local")
+ _install_sa_stub()
+ 
+ from trader.db.engine import make_engine
+ from trader.db.repos import UniverseRepo
  
  
- def _resolve_run_id() -> str:
+ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
+-    db_url = f"sqlite:///{tmp_path}/pbcore.db"
+     lkg_root = tmp_path / "lkg"
+-    sqlite_cache = tmp_path / "cache.sqlite3"
+-    monkeypatch.setenv("DATABASE_URL", db_url)
+-    monkeypatch.setenv("USING_EXTERNAL_DB", "0")
++    monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
+     monkeypatch.setenv("UNIVERSE_LKG_ROOT", str(lkg_root))
+-    monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
+     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
+-    monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+ 
+     from trader.universe import lkg_store
+ 
+     importlib.reload(lkg_store)
+     from trader.universe import build as build_module
+ 
+     importlib.reload(build_module)
+ 
+     stored: dict = {}
+ 
+     class FakeUniverseRepo:
+         def __init__(self, engine):
+             self.engine = engine
+ 
+         def store_universe_snapshot(self, *, env, strategy, as_of_date, provider, members, reason=None):
+             stored[(env, strategy)] = {
+                 "universe": {
+                     "run_id": "fake-id",
+                     "env": env,
+                     "strategy": strategy,
+                     "as_of": as_of_date,
+                     "provider": provider,
+                     "reason": reason,
+diff --git a/tests/test_universe_runtime_outputs.py b/tests/test_universe_runtime_outputs.py
+index 12c84ab675b7cbc1646a8317ac9bff85620165b2..318823f72a4ba81e7a9f08e0fa884a9ef17f733f 100644
+--- a/tests/test_universe_runtime_outputs.py
++++ b/tests/test_universe_runtime_outputs.py
+@@ -1,34 +1,48 @@
+ from pathlib import Path
+ 
+ from trader.universe import build
+ 
+ 
+ def test_universe_build_writes_runtime_files(tmp_path, monkeypatch):
+     bot_state_dir = tmp_path / "bot_state"
+     bot_state_dir.mkdir(parents=True, exist_ok=True)
+     monkeypatch.setenv("BOTSTATE_ROOT", str(bot_state_dir))
+-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
++    monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
+     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+ 
++    class FakeUniverseRepo:
++        def __init__(self, _engine):
++            return None
++
++        def store_universe_snapshot(self, **_kwargs):
++            return "fake-run"
++
++        def cleanup_old_runs(self, **_kwargs):
++            return None
++
++    monkeypatch.setattr(build, "make_engine", lambda: None)
++    monkeypatch.setattr(build, "run_migrations", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(build, "UniverseRepo", FakeUniverseRepo)
++
+     seed_payload = {
+         "payload": {
+             "selected": ["000001"],
+             "selected_by_market": {"KOSPI": [{"code": "000001", "rank": 1}]},
+         },
+         "members": [{"code": "000001", "market": "KOSPI"}],
+         "source": "seed_static",
+         "params": {"as_of": "2025-01-01"},
+     }
+     monkeypatch.setattr(build, "_load_static_seed", lambda: seed_payload)
+ 
+     build.build_universe(as_of_date="2025-01-01", env="practice", strategy="best_k_meta", provider_override="seed_static")
+ 
+     runtime_universe = bot_state_dir / "runtime" / "universe" / "2025-01-01.json"
+     runtime_sanitize = bot_state_dir / "runtime" / "universe_sanitize_2025-01-01.json"
+     runtime_flag = bot_state_dir / "runtime" / "universe_build_done_2025-01-01.flag"
+ 
+     assert runtime_universe.exists()
+     assert runtime_sanitize.exists()
+     assert runtime_flag.exists()
 diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index 84ca0d6b58c159beb6a02add01bee9003c7b06aa..06b31035e8c34ada9fd5d46d863c98c4aac7d8a4 100644
+index 06b31035e8c34ada9fd5d46d863c98c4aac7d8a4..f3b7e5f27073586bcbd0b2e454d98ee7f6e5c1ef 100644
 --- a/trader/botstate_sync.py
 +++ b/trader/botstate_sync.py
-@@ -31,81 +31,87 @@ BOTSTATE_GITIGNORE_TEXT = """\
- # --- botstate (tracked artifacts) ---
- # Keep minimal runtime artifacts only.
- 
- # Ignore runtime by default
- bot_state/runtime/
+@@ -36,50 +36,58 @@ bot_state/runtime/
  bot_state/runtime/**
  
  # Allowlist runtime artifacts
@@ -154,11 +1170,19 @@ index 84ca0d6b58c159beb6a02add01bee9003c7b06aa..06b31035e8c34ada9fd5d46d863c98c4
  
  # Never commit archive/ or readonly backups
  bot_state/archive/
-+bot_state/db/
-+bot_state/db/**
+ bot_state/db/
+ bot_state/db/**
  bot_state/db/*.bak*
  bot_state/db/*.readonly.bak.*
  
++# Runtime DB artifacts (should never be created)
++**/*.sqlite3
++**/*.sqlite3-wal
++**/*.sqlite3-shm
++**/*.db
++**/*.db-wal
++**/*.db-shm
++
  # Python / OS noise
  .DS_Store
  __pycache__/
@@ -166,7 +1190,6 @@ index 84ca0d6b58c159beb6a02add01bee9003c7b06aa..06b31035e8c34ada9fd5d46d863c98c4
  """
  
  ALLOWLIST_PATTERNS = [
--    "bot_state/db/pbcore.sqlite3",
      "bot_state/runtime/events/*.jsonl",
      "bot_state/runtime/status/**",
      "bot_state/runtime/universe/*.json",
@@ -181,340 +1204,977 @@ index 84ca0d6b58c159beb6a02add01bee9003c7b06aa..06b31035e8c34ada9fd5d46d863c98c4
      "bot_state/archive/**",
      "bot_state/runtime/ohlcv_cache/**",
      "bot_state/db/*.bak*",
-+    "bot_state/db/*.sqlite3",
-+    "bot_state/db/*.sqlite3-wal",
-+    "bot_state/db/*.sqlite3-shm",
-+    "bot_state/db/*.db",
-+    "bot_state/db/*.db-wal",
-+    "bot_state/db/*.db-shm",
- ]
- 
- 
- @dataclass(frozen=True)
- class DirtyStatSnapshot:
--    db: tuple[float, int] | None
-     events: tuple[int, float | None, int]
-     universe: tuple[int, float | None, int]
-     last_seen_positions: tuple[float, int] | None
-     positions_snapshot: tuple[float, int] | None
- 
- 
- class BotStatePersistError(RuntimeError):
-     def __init__(self, message: str, *, require_persist: bool, dirty_by_stat: bool) -> None:
-         super().__init__(message)
-         self.require_persist = require_persist
-         self.dirty_by_stat = dirty_by_stat
- 
- 
- def ensure_botstate_gitignore(workdir: str) -> None:
-     # workdir is the botstate worktree root
-     path = os.path.join(workdir, "bot_state", ".gitignore")
-     os.makedirs(os.path.dirname(path), exist_ok=True)
- 
-     current = None
-     if os.path.exists(path):
-         with open(path, "r", encoding="utf-8") as f:
-             current = f.read()
- 
-     if current != BOTSTATE_GITIGNORE_TEXT:
-         with open(path, "w", encoding="utf-8") as f:
-@@ -462,70 +468,65 @@ def _latest_event_mtime(events_dir: Path) -> float | None:
-         except FileNotFoundError:
-             continue
-         latest = mtime if latest is None else max(latest, mtime)
-     return latest
- 
- 
- def _collect_dir_stats(base_dir: Path, pattern: str) -> tuple[int, float | None, int]:
-     count = 0
-     latest_mtime = None
-     total_size = 0
-     if not base_dir.exists():
-         return 0, None, 0
-     for entry in base_dir.glob(pattern):
+     "bot_state/db/*.sqlite3",
+     "bot_state/db/*.sqlite3-wal",
+     "bot_state/db/*.sqlite3-shm",
+     "bot_state/db/*.db",
+@@ -122,162 +130,109 @@ def ensure_writable_path(path: str | Path, *, is_dir: bool) -> None:
+     target = Path(path)
+     if is_dir:
+         target.mkdir(parents=True, exist_ok=True)
          try:
-             stat = entry.stat()
-         except FileNotFoundError:
-             continue
-         count += 1
-         total_size += stat.st_size
-         latest_mtime = stat.st_mtime if latest_mtime is None else max(latest_mtime, stat.st_mtime)
-     return count, latest_mtime, total_size
+             os.chmod(target, 0o700)
+         except OSError:
+             logger.warning("[DB][PERM][DIR_CHMOD_FAIL] path=%s", target, exc_info=True)
+     else:
+         target.parent.mkdir(parents=True, exist_ok=True)
+         if target.exists():
+             try:
+                 os.chmod(target, 0o600)
+             except OSError:
+                 logger.warning("[DB][PERM][FILE_CHMOD_FAIL] path=%s", target, exc_info=True)
+     try:
+         subprocess.run(
+             ["sudo", "chown", "-R", "runner:runner", str(target)],
+             check=False,
+             text=True,
+             capture_output=True,
+         )
+     except Exception:
+         logger.info("[DB][PERM][CHOWN_SKIP] path=%s", target, exc_info=True)
  
  
- def _collect_dirty_stats(worktree_dir: Path) -> DirtyStatSnapshot:
+-def ensure_sqlite_writable(db_path: str | Path) -> None:
+-    db_path = Path(db_path)
+-    ensure_writable_path(db_path.parent, is_dir=True)
+-    ensure_writable_path(db_path, is_dir=False)
+-
+-    import sqlite3
+-
+-    conn = sqlite3.connect(str(db_path), timeout=30)
+-    try:
+-        cur = conn.cursor()
+-        cur.execute("PRAGMA journal_mode=WAL;")
+-        cur.execute("CREATE TABLE IF NOT EXISTS __writetest (k TEXT PRIMARY KEY, v TEXT);")
+-        cur.execute(
+-            "INSERT OR REPLACE INTO __writetest(k,v) VALUES ('t', ?);",
+-            (str(time.time()),),
+-        )
+-        conn.commit()
+-    finally:
+-        conn.close()
+-
+-    try:
+-        db_stat = os.stat(db_path)
+-        dir_stat = os.stat(db_path.parent)
+-        logger.info(
+-            "[DB][PERM] path=%s mode=%o uid=%s gid=%s",
+-            db_path,
+-            db_stat.st_mode & 0o777,
+-            db_stat.st_uid,
+-            db_stat.st_gid,
+-        )
+-        logger.info(
+-            "[DB][DIR_PERM] dir=%s mode=%o uid=%s gid=%s",
+-            db_path.parent,
+-            dir_stat.st_mode & 0o777,
+-            dir_stat.st_uid,
+-            dir_stat.st_gid,
+-        )
+-    except OSError:
+-        logger.warning("[DB][PERM][STAT_FAIL] path=%s", db_path, exc_info=True)
+-
+-
+ def _is_live_trading_env() -> bool:
+     env = (os.getenv("KIS_ENV") or "").strip().lower()
+     mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+     live_flag = (os.getenv("LIVE_TRADING_ENABLED") or "").strip()
+     return env in {"live", "real", "prod", "production"} or mode == "LIVE" or live_flag == "1"
+ 
+ 
+ def _reset_flag_path(bot_state_dir: Path, as_of: str) -> Path:
+     return bot_state_dir / "runtime" / "reset_flags" / f"{as_of}.json"
+ 
+ 
+ def _ensure_gitkeep(path: Path) -> None:
+     path.mkdir(parents=True, exist_ok=True)
+     gitkeep = path / ".gitkeep"
+     if not gitkeep.exists():
+         gitkeep.write_text("", encoding="utf-8")
+ 
+ 
+ def hard_reset_bot_state(bot_state_dir: Path, *, reason: str = "manual") -> dict:
+     deleted: list[str] = []
+     skipped = False
+     now = datetime.now(tz=KST)
+     as_of = now.date().isoformat()
+     reset_flag_path = _reset_flag_path(bot_state_dir, as_of)
+     is_live = _is_live_trading_env()
+ 
+     if is_live and reset_flag_path.exists():
+         logger.warning("[RESET][HARD][SKIP] reason=already_reset_today flag=%s", reset_flag_path)
+         return {"skipped": True, "reason": "already_reset_today", "flag": str(reset_flag_path)}
+ 
+-    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
+-    for target in [db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")]:
+-        try:
+-            if target.exists():
+-                target.unlink()
+-                deleted.append(str(target))
+-                logger.info("[RESET][HARD] removed %s", target.name)
+-        except Exception:
+-            logger.warning("[RESET][HARD][SKIP] path=%s", target, exc_info=True)
+-
+     runtime_dir = bot_state_dir / "runtime"
+     if runtime_dir.exists():
+         try:
+             shutil.rmtree(runtime_dir, ignore_errors=True)
+             deleted.append(str(runtime_dir))
+             logger.info("[RESET][HARD] removed runtime/")
+         except Exception:
+             logger.warning("[RESET][HARD][SKIP] path=%s", runtime_dir, exc_info=True)
+ 
+     for ledger_dir in [bot_state_dir / "ledger", bot_state_dir / "trader_ledger"]:
+         if ledger_dir.exists():
+             try:
+                 shutil.rmtree(ledger_dir, ignore_errors=True)
+                 deleted.append(str(ledger_dir))
+                 logger.info("[RESET][HARD] removed %s/", ledger_dir.name)
+             except Exception:
+                 logger.warning("[RESET][HARD][SKIP] path=%s", ledger_dir, exc_info=True)
+ 
+     for extra in [bot_state_dir / "universe_lkg", bot_state_dir / "locks"]:
+         if extra.exists():
+             try:
+                 shutil.rmtree(extra, ignore_errors=True)
+                 deleted.append(str(extra))
+             except Exception:
+                 logger.warning("[RESET][HARD][SKIP] path=%s", extra, exc_info=True)
+ 
+     _ensure_gitkeep(bot_state_dir / "runtime")
+     _ensure_gitkeep(bot_state_dir / "trader_ledger")
+     _ensure_gitkeep(bot_state_dir / "ledger")
+-    (bot_state_dir / "db").mkdir(parents=True, exist_ok=True)
+-
+     reset_flag_path.parent.mkdir(parents=True, exist_ok=True)
+     reset_flag_path.write_text(
+         json.dumps(
+             {
+                 "ts": now.isoformat(),
+                 "reason": reason,
+                 "live": is_live,
+             },
+             ensure_ascii=False,
+             indent=2,
+         ),
+         encoding="utf-8",
+     )
+ 
+     logger.info("[BOTSTATE][HARD_RESET] deleted=%s skipped=%s", deleted, skipped)
+     return {"deleted": deleted, "skipped": skipped, "flag": str(reset_flag_path)}
+ 
+ 
+ def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
+     try:
+         buffer_sec = int(
+             os.getenv(
+                 "BOTSTATE_LOCK_BUFFER_SEC",
+                 os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)),
+             )
+@@ -730,51 +685,50 @@ def ensure_worktree(repo_dir: Path, worktree_dir: Path, branch: str, remote_ref:
+         proc.returncode,
+         (proc.stderr or "").strip(),
+     )
+     _git(repo_dir, ["git", "worktree", "remove", "--force", str(wt)], check=False)
+     shutil.rmtree(wt, ignore_errors=True)
+     _git(repo_dir, ["git", "worktree", "prune"], check=False)
+ 
+     _git(repo_dir, ["git", "worktree", "add", "-B", branch, str(wt), remote_ref], check=True)
+     logger.info("[BOTSTATE][WORKTREE][CREATE_OK] dir=%s retried=1", wt)
+ 
+ 
+ def setup_worktree(base_dir: Path, worktree_dir: Path, target_branch: str = "bot-state") -> BotStateContext:
+     base_dir = base_dir.resolve()
+     worktree_dir = worktree_dir.resolve()
+     _configure_safe_directories(base_dir, worktree_dir)
+     dirty_files = get_dirty_status_excluding(base_dir, paths_to_exclude=["bot_state", "runtime"])
+     if dirty_files:
+         raise RuntimeError(f"code worktree dirty; refusing botstate sync: {dirty_files}")
+ 
+     remote = "origin"
+     remote_ref = f"{remote}/{target_branch}"
+     _run(["git", "fetch", remote, "--prune"], cwd=base_dir)
+     ensure_worktree(base_dir, worktree_dir, target_branch, remote_ref)
+     _run(["git", "-C", str(worktree_dir), "reset", "--hard", remote_ref], cwd=base_dir)
      bot_state_dir = worktree_dir / "bot_state"
--    db_stat = _safe_stat(bot_state_dir / "db" / "pbcore.sqlite3")
-     events_stats = _collect_dir_stats(bot_state_dir / "runtime" / "events", "*.jsonl")
-     universe_stats = _collect_dir_stats(bot_state_dir / "runtime" / "universe", "*.json")
-     last_seen_positions = _safe_stat(bot_state_dir / "runtime" / "last_seen_positions.json")
-     positions_snapshot = _safe_stat(bot_state_dir / "runtime" / "positions_snapshot.json")
-     return DirtyStatSnapshot(
--        db=db_stat,
-         events=events_stats,
-         universe=universe_stats,
-         last_seen_positions=last_seen_positions,
-         positions_snapshot=positions_snapshot,
+-    ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
+     ensure_writable_path(bot_state_dir / "runtime", is_dir=True)
+     ensure_writable_path(bot_state_dir / "trader_ledger", is_dir=True)
+     os.environ["BOTSTATE_ROOT"] = str(bot_state_dir)
+     return BotStateContext(
+         worktree_dir=worktree_dir,
+         bot_state_dir=bot_state_dir,
+         runtime_dir=bot_state_dir / "runtime",
+         branch=target_branch,
+         ref=remote_ref,
      )
  
  
- def _force_stage_dirty_files(worktree_dir: Path) -> None:
-     to_add: list[str] = []
-     bot_state_dir = worktree_dir / "bot_state"
--    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
--    if db_path.exists():
--        to_add.append(db_path.relative_to(worktree_dir).as_posix())
-     for entry in (bot_state_dir / "runtime" / "events").glob("*.jsonl"):
-         to_add.append(entry.relative_to(worktree_dir).as_posix())
-     for entry in (bot_state_dir / "runtime" / "universe").glob("*.json"):
-         to_add.append(entry.relative_to(worktree_dir).as_posix())
-     for name in ("last_seen_positions.json", "positions_snapshot.json"):
-         path = bot_state_dir / "runtime" / name
-         if path.exists():
-             to_add.append(path.relative_to(worktree_dir).as_posix())
-     if to_add:
-         _git_worktree(worktree_dir, "add", "-f", "--", *sorted(set(to_add)), check=False)
+ def _lock_path(worktree_dir: Path) -> Path:
+     return worktree_dir / "bot_state" / "locks" / "trader.lock.json"
  
  
- def evaluate_persist_guard(*, require_persist: bool, dirty_by_stat: bool) -> str:
-     if not require_persist:
-         return "ok"
-     if dirty_by_stat:
-         raise BotStatePersistError(
-             "PERSIST_REQUIRED_BUT_EMPTY_STAGE",
-             require_persist=require_persist,
-             dirty_by_stat=dirty_by_stat,
-         )
-     return "warn"
+ def acquire_lock(worktree_dir: Path, owner: str, run_id: str, ttl_sec: int | None = None) -> bool:
+     worktree_dir = worktree_dir.resolve()
+     lock_path = _lock_path(worktree_dir)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+     branch = _git_worktree(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+     remote = "origin"
+     sync_mode = SYNC_MODE_FETCH_RESET
+     if ttl_sec is None:
+         ttl_sec, _ = compute_lock_ttl(0)
+diff --git a/trader/config.py b/trader/config.py
+index 3b0620d71c96ddfc360fb35d4cbcb52237deb029..6d2a9dfb6ff3dd9dd5159f53ebe69a30a35cf57b 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -1,36 +1,35 @@
+ # -*- coding: utf-8 -*-
+ """공용 설정 및 환경 파싱 모듈.
+ 
+ trader.py가 분리되어도 모든 전략/유틸이 동일한 설정을 참조할 수 있도록
+ CONFIG와 파생 상수를 한 곳에 모았다.
+ """
+ from __future__ import annotations
+ 
+ import logging
+ import os
+-import stat
+ from datetime import datetime, time as dtime
+ from pathlib import Path
+ from typing import Dict
+ from zoneinfo import ZoneInfo
+ 
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_cache_root
+ from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
+ 
+ # =========================
+ # [CONFIG] .env 없이도 동작
+ # - 아래 값을 기본으로 사용
+ # - (선택) 동일 키를 환경변수로 넘기면 override
+ # =========================
+ CONFIG = {
+     "SELL_FORCE_TIME": "14:40",
+     "SELL_ALL_BALANCES_AT_CUTOFF": "false",  # "true"면 커트오프에 전체 잔고 포함 강제매도 루틴 사용
+     "API_RATE_SLEEP_SEC": "0.5",
+     "FORCE_SELL_PASSES_CUTOFF": "2",
+     "FORCE_SELL_PASSES_CLOSE": "4",
+     "FORCE_SELL_BLOCKED_LOTS": "0",
+     "PARTIAL1": "0.5",
+     "PARTIAL2": "0.3",
+     "TRAIL_PCT": "0.02",
+     "FAST_STOP": "0.01",
+     "ATR_STOP": "1.5",
+@@ -278,63 +277,50 @@ def _cfg_with_alias(primary: str, alias: str) -> str:
+ def _default_bool(key: str, fallback: bool = False) -> bool:
+     raw_default = str(CONFIG.get(key, "")).strip().lower()
+     if raw_default in TRUE_VALUES:
+         return True
+     if raw_default in FALSE_VALUES:
+         return False
+     return fallback
  
  
- def _normalize_botstate_rel(path: Path) -> str | None:
-@@ -1044,62 +1045,59 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-     allowlist_changed = _allowlist_changed(files, ALLOWLIST_PATTERNS)
+ def _cfg_bool(key: str, fallback: bool | None = None) -> bool:
+     default_value = _default_bool(key, fallback if fallback is not None else False)
+     return env_bool(key, default=default_value)
  
-     for attempt in range(1, retries + 1):
-         try:
-             st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-             logger.info(
-                 "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
-                 sync_mode,
-                 st.remote_ref,
-                 st.behind,
-                 st.ahead,
-                 attempt,
-             )
-         except Exception as exc:
-             logger.warning(
-                 "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
-                 sync_mode,
-                 attempt,
-                 str(exc),
-             )
-             if attempt == retries:
-                 raise
-             time.sleep(retry_sleep_sec)
-             continue
  
--        db_path = worktree_dir / "bot_state" / "db" / "pbcore.sqlite3"
-         events_dir = worktree_dir / "bot_state" / "runtime" / "events"
-         pre_stats = _collect_dirty_stats(worktree_dir)
--        db_stat = _safe_stat(db_path)
-         events_latest = _latest_event_mtime(events_dir)
-         status_pre = _run_git_logged(
-             ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_pre"
-         ).stdout
-         logger.info(
--            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s dirty_stats=%s status_lines=%s",
-+            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s events_latest=%s dirty_stats=%s status_lines=%s",
-             allowlist_changed,
--            db_stat,
-             events_latest,
-             pre_stats,
-             [line for line in status_pre.splitlines() if line.strip()][:50],
-         )
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
  
-         for path in files:
-             try:
-                 if path.resolve().is_relative_to(worktree_dir.resolve()):
-                     target = path.resolve()
-                 else:
-                     if "bot_state" in path.parts:
-                         idx = path.parts.index("bot_state")
-                         rel = Path(*path.parts[idx:])
-                     else:
-                         rel = Path("bot_state") / Path(*path.parts[-4:])
-                     target = (worktree_dir / rel).resolve()
-                     target.parent.mkdir(parents=True, exist_ok=True)
-                     target.write_bytes(path.read_bytes())
-                 rel_target = target.relative_to(worktree_dir)
-                 _git_worktree(worktree_dir, "add", str(rel_target))
-             except Exception:
-                 continue
+ LOG_DIR = Path(__file__).parent / "logs"
+ LOG_DIR.mkdir(exist_ok=True)
+ STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
+ STATE_DIR_RAW = _cfg("STATE_DIR")
+ STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else botstate_path("runtime")
+ STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
+ ensure_not_repo_tracked_path(STATE_PATH)
+ STATE_DIR.mkdir(parents=True, exist_ok=True)
+-_db_path_env = os.getenv("PBCORE_DB_PATH")
+-if _db_path_env:
+-    _db_path = Path(_db_path_env).expanduser().resolve()
+-else:
+-    _db_path = botstate_path("db", "pbcore.sqlite3").expanduser().resolve()
+-PBCORE_DB_PATH = str(_db_path)
+-_db_path.parent.mkdir(parents=True, exist_ok=True)
+-try:
+-    os.chmod(_db_path.parent, _db_path.parent.stat().st_mode | stat.S_IWUSR)
+-    if _db_path.exists():
+-        os.chmod(_db_path, _db_path.stat().st_mode | stat.S_IWUSR)
+-except Exception:
+-    pass
+ STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
  
-         _stage_allowlist(worktree_dir, ALLOWLIST_PATTERNS)
-         post_stats = _collect_dirty_stats(worktree_dir)
-@@ -1111,58 +1109,54 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-             dirty_by_stat,
-             pre_stats,
-             post_stats,
-         )
-         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
-         status_lines = [line for line in status.splitlines() if line.strip()]
-         reverted_deleted, cleaned_untracked = _clean_non_allowlisted_changes(
-             worktree_dir,
-             status_lines,
-             CLEAN_PATTERNS,
-         )
-         if reverted_deleted or cleaned_untracked:
-             logger.info(
-                 "[BOTSTATE][PERSIST][CLEAN] reverted_deleted=%s cleaned_untracked=%s patterns=%s",
-                 reverted_deleted,
-                 cleaned_untracked,
-                 CLEAN_PATTERNS,
-             )
-         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_post").stdout
-         cached_names = _run_git_logged(
-             ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
-         ).stdout
-         if _run_git_logged(
-             ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
-         ).returncode == 0:
--            has_recent_db = False
--            if db_stat:
--                db_mtime = db_stat[0]
--                has_recent_db = (time.time() - db_mtime) < 600
-             has_recent_events = False
-             if events_latest is not None:
-                 has_recent_events = (time.time() - events_latest) < 600
--            require_persist = allowlist_changed or has_recent_db or has_recent_events or dirty_by_stat
-+            require_persist = allowlist_changed or has_recent_events or dirty_by_stat
-             logger.info(
-                 "[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip require_persist=%s",
-                 require_persist,
-             )
-             post = git_porcelain(worktree_dir)
-             if post.strip():
-                 logger.warning(
-                     "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
-                     post,
-                 )
-             if require_persist:
-                 logger.warning(
-                     "[BOTSTATE][PERSIST][EMPTY_STAGE] require_persist=1 dirty_by_stat=%s",
-                     dirty_by_stat,
-                 )
-                 outcome = evaluate_persist_guard(require_persist=require_persist, dirty_by_stat=dirty_by_stat)
-                 if outcome == "warn":
-                     logger.warning("[BOTSTATE][PERSIST][EMPTY_STAGE] dirty_by_stat=0 -> skip")
-                     return
-             return
-         status_lines = [line for line in status.splitlines() if line.strip()]
-         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
-         status2 = git_porcelain(worktree_dir)
-         status2_lines = [line for line in status2.splitlines() if line.strip()]
-         staged_files = [line for line in cached_names.splitlines() if line.strip()]
-diff --git a/trader/db/config.py b/trader/db/config.py
-index 737484a9183e96a084111cd2a879f36bccd9edc7..e2f998268ab6f78ef760d7e8354f36768a910fa2 100644
---- a/trader/db/config.py
-+++ b/trader/db/config.py
-@@ -10,46 +10,55 @@ DEFAULT_SQLITE_PATH = Path(
-     os.getenv("PBCORE_DB_PATH")
-     or os.getenv("UNIVERSE_SQLITE_PATH")
-     or PBCORE_DB_PATH
-     or Path(__file__).resolve().parents[1] / "state" / "pbcore.sqlite3"
+ # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)
+ MARKET_MAP: Dict[str, str] = {
+     # 예시: '145020': 'J', '347850': 'J', '257720': 'U', '178320': 'J', '348370': 'U'
+ }
+ 
+ # 데이터 없음 1차 감지 상태 저장(연속 DATA_EMPTY 확인용)
+ EXCLUDE_STATE: Dict[str, Dict[str, bool]] = {}
+ 
+ KST = ZoneInfo("Asia/Seoul")
+ 
+ SELL_FORCE_TIME_STR = _cfg("SELL_FORCE_TIME").strip()
+ SELL_ALL_BALANCES_AT_CUTOFF = _cfg_bool("SELL_ALL_BALANCES_AT_CUTOFF")
+ EMERGENCY_GLOBAL_SELL = _cfg_bool("EMERGENCY_GLOBAL_SELL")
+ RATE_SLEEP_SEC = float(_cfg("API_RATE_SLEEP_SEC"))
+ FORCE_SELL_PASSES_CUTOFF = int(_cfg("FORCE_SELL_PASSES_CUTOFF"))
+ FORCE_SELL_PASSES_CLOSE = int(_cfg("FORCE_SELL_PASSES_CLOSE"))
+ FORCE_SELL_BLOCKED_LOTS = _cfg_bool("FORCE_SELL_BLOCKED_LOTS")
+ PARTIAL1 = float(_cfg("PARTIAL1"))
+ PARTIAL2 = float(_cfg("PARTIAL2"))
+ TRAIL_PCT = float(_cfg("TRAIL_PCT"))
+ FAST_STOP = float(_cfg("FAST_STOP"))
+ ATR_STOP = float(_cfg("ATR_STOP"))
+ TIME_STOP_HHMM = _cfg("TIME_STOP_HHMM")
+diff --git a/trader/db/__init__.py b/trader/db/__init__.py
+index 84ffdaa6221f18816806f67440dedfd7e00eb941..7f5de38e527bd1ce1586315c28cc7561ce66abad 100644
+--- a/trader/db/__init__.py
++++ b/trader/db/__init__.py
+@@ -1,41 +1,38 @@
+ """
+ Database utilities for the PB-Core v2 backend.
+ """
+ 
+-from .config import get_database_url, get_db_echo, is_sqlite_url
+-from .engine import make_engine
++from .engine import get_db_url, make_engine
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+     UNIVERSE_CURRENT,
+     UNIVERSE_MEMBERS,
+     UNIVERSE_RUNS,
+     METADATA,
  )
  
  
- def using_external_db() -> bool:
-     return os.getenv("USING_EXTERNAL_DB", "0").lower() in {"1", "true", "yes", "on"}
+ def run_migrations(engine, migrations_dir: str = "migrations"):
+     from .migrate import run_migrations as _rm
+ 
+     return _rm(engine, migrations_dir=migrations_dir)
  
  
- def _ensure_sqlite_parent(url: str) -> None:
-     try:
-         if not is_sqlite_url(url):
-             return
-         db_path = make_url(url).database
-         if not db_path:
-             return
-         Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-     except Exception:
-         # Best-effort only; filesystem permissions may vary.
-         return
- 
- 
- def get_database_url() -> str:
--    url = os.getenv("DATABASE_URL")
-+    url = (os.getenv("DATABASE_URL") or "").strip()
-+    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
-+    if strategy_mode == "LIVE":
-+        if not url:
-+            raise RuntimeError("LIVE requires DATABASE_URL (Postgres). Refuse to run.")
-+        if is_sqlite_url(url):
-+            raise RuntimeError("LIVE forbids sqlite. Use Postgres DATABASE_URL.")
-+        return url
-+
-     if using_external_db():
-         if not url:
-             raise RuntimeError("DATABASE_URL must be set when USING_EXTERNAL_DB=1")
-         return url
- 
--    if url and is_sqlite_url(url):
--        _ensure_sqlite_parent(url)
-+    if url:
-+        if is_sqlite_url(url):
-+            _ensure_sqlite_parent(url)
-         return url
- 
-     default_url = f"sqlite:///{DEFAULT_SQLITE_PATH}"
-     _ensure_sqlite_parent(default_url)
-     return default_url
- 
- 
- def get_db_echo() -> bool:
-     return os.getenv("DB_ECHO", "false").lower() in ("1", "true", "yes", "on")
- 
- 
- def is_sqlite_url(url: str) -> bool:
-     return url.startswith("sqlite:")
+ __all__ = [
+-    "get_database_url",
+-    "get_db_echo",
+-    "is_sqlite_url",
++    "get_db_url",
+     "make_engine",
+     "run_migrations",
+     "FILLS",
+     "LEDGER_EVENTS",
+     "ORDERS",
+     "POSITIONS",
+     "RUNS",
+     "UNIVERSE_CURRENT",
+     "UNIVERSE_MEMBERS",
+     "UNIVERSE_RUNS",
+     "METADATA",
+ ]
+diff --git a/trader/db/config.py b/trader/db/config.py
+deleted file mode 100644
+index e2f998268ab6f78ef760d7e8354f36768a910fa2..0000000000000000000000000000000000000000
+--- a/trader/db/config.py
++++ /dev/null
+@@ -1,64 +0,0 @@
+-import os
+-from pathlib import Path
+-
+-from sqlalchemy.engine.url import make_url
+-
+-from trader.config import PBCORE_DB_PATH
+-
+-
+-DEFAULT_SQLITE_PATH = Path(
+-    os.getenv("PBCORE_DB_PATH")
+-    or os.getenv("UNIVERSE_SQLITE_PATH")
+-    or PBCORE_DB_PATH
+-    or Path(__file__).resolve().parents[1] / "state" / "pbcore.sqlite3"
+-)
+-
+-
+-def using_external_db() -> bool:
+-    return os.getenv("USING_EXTERNAL_DB", "0").lower() in {"1", "true", "yes", "on"}
+-
+-
+-def _ensure_sqlite_parent(url: str) -> None:
+-    try:
+-        if not is_sqlite_url(url):
+-            return
+-        db_path = make_url(url).database
+-        if not db_path:
+-            return
+-        Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+-    except Exception:
+-        # Best-effort only; filesystem permissions may vary.
+-        return
+-
+-
+-def get_database_url() -> str:
+-    url = (os.getenv("DATABASE_URL") or "").strip()
+-    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+-    if strategy_mode == "LIVE":
+-        if not url:
+-            raise RuntimeError("LIVE requires DATABASE_URL (Postgres). Refuse to run.")
+-        if is_sqlite_url(url):
+-            raise RuntimeError("LIVE forbids sqlite. Use Postgres DATABASE_URL.")
+-        return url
+-
+-    if using_external_db():
+-        if not url:
+-            raise RuntimeError("DATABASE_URL must be set when USING_EXTERNAL_DB=1")
+-        return url
+-
+-    if url:
+-        if is_sqlite_url(url):
+-            _ensure_sqlite_parent(url)
+-        return url
+-
+-    default_url = f"sqlite:///{DEFAULT_SQLITE_PATH}"
+-    _ensure_sqlite_parent(default_url)
+-    return default_url
+-
+-
+-def get_db_echo() -> bool:
+-    return os.getenv("DB_ECHO", "false").lower() in ("1", "true", "yes", "on")
+-
+-
+-def is_sqlite_url(url: str) -> bool:
+-    return url.startswith("sqlite:")
 diff --git a/trader/db/engine.py b/trader/db/engine.py
-index 95f91ccaaeb82e05e4eae78982d954857bf08c14..580c9215df26e217615dc85c3678d12fa774dc86 100644
+index 580c9215df26e217615dc85c3678d12fa774dc86..5e1185ec5aa64e01d09dfcd728e0aaa8cf17a79f 100644
 --- a/trader/db/engine.py
 +++ b/trader/db/engine.py
-@@ -1,21 +1,23 @@
- from sqlalchemy import Engine, create_engine, event
+@@ -1,23 +1,27 @@
+-from sqlalchemy import Engine, create_engine, event
++import os
  
- from . import config
+-from . import config
++from sqlalchemy import create_engine
++from sqlalchemy.engine import Engine
  
  
- def make_engine(database_url: str | None = None) -> Engine:
-     url = database_url or config.get_database_url()
-     kwargs = {}
-     if not config.is_sqlite_url(url):
-         kwargs["pool_pre_ping"] = True
-+        kwargs["pool_size"] = 5
-+        kwargs["max_overflow"] = 10
-     engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
-     if config.is_sqlite_url(url):
-         @event.listens_for(engine, "connect")
-         def _set_sqlite_pragma(dbapi_conn, _connection_record) -> None:
-             cursor = dbapi_conn.cursor()
-             cursor.execute("PRAGMA foreign_keys=ON;")
-             cursor.execute("PRAGMA journal_mode=WAL;")
-             cursor.execute("PRAGMA synchronous=NORMAL;")
-             cursor.execute("PRAGMA busy_timeout=5000;")
-             cursor.close()
-     return engine
+-def make_engine(database_url: str | None = None) -> Engine:
+-    url = database_url or config.get_database_url()
+-    kwargs = {}
+-    if not config.is_sqlite_url(url):
+-        kwargs["pool_pre_ping"] = True
+-        kwargs["pool_size"] = 5
+-        kwargs["max_overflow"] = 10
+-    engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
+-    if config.is_sqlite_url(url):
+-        @event.listens_for(engine, "connect")
+-        def _set_sqlite_pragma(dbapi_conn, _connection_record) -> None:
+-            cursor = dbapi_conn.cursor()
+-            cursor.execute("PRAGMA foreign_keys=ON;")
+-            cursor.execute("PRAGMA journal_mode=WAL;")
+-            cursor.execute("PRAGMA synchronous=NORMAL;")
+-            cursor.execute("PRAGMA busy_timeout=5000;")
+-            cursor.close()
+-    return engine
++def _db_echo() -> bool:
++    return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
++
++
++def get_db_url() -> str:
++    url = os.getenv("PBCORE_DB_URL", "").strip()
++    if not url:
++        raise RuntimeError("PBCORE_DB_URL is required. SQLite fallback is disabled by design.")
++    if url.startswith("sqlite:"):
++        raise RuntimeError("SQLite is forbidden. Use Postgres only.")
++    return url
++
++
++def make_engine() -> Engine:
++    url = get_db_url()
++    return create_engine(
++        url,
++        echo=_db_echo(),
++        pool_pre_ping=True,
++        pool_recycle=1800,
++    )
+diff --git a/trader/db/health.py b/trader/db/health.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fedb0ba41a884f72b3dc9716167cf73e43f31aca
+--- /dev/null
++++ b/trader/db/health.py
+@@ -0,0 +1,9 @@
++from sqlalchemy import text
++
++from trader.db.engine import make_engine
++
++
++def assert_db_ready() -> None:
++    engine = make_engine()
++    with engine.connect() as conn:
++        conn.execute(text("SELECT 1"))
+diff --git a/trader/db/lock.py b/trader/db/lock.py
+index d6b76fc177629927e6efca113f10c6f312bad3cc..4e77567f2864fd8135f03fa4a47e026e84e6db27 100644
+--- a/trader/db/lock.py
++++ b/trader/db/lock.py
+@@ -1,40 +1,35 @@
+ from __future__ import annotations
+ 
+ import logging
+ 
+ import sqlalchemy as sa
+ from sqlalchemy import Engine, text
+ 
+-from .config import is_sqlite_url
+-
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def try_acquire_lock(engine: Engine, key: str) -> bool:
+     """
+     Attempt to acquire a database-level advisory lock.
+-    Falls back to a no-op lock on non-Postgres engines to keep local testing simple.
+     """
+-    url = str(engine.url)
+-    if is_sqlite_url(url):
+-        return True
++    if engine.dialect.name != "postgresql":
++        raise RuntimeError("Postgres is required for advisory locks.")
+ 
+     try:
+         with engine.begin() as conn:
+             res = conn.execute(text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": key})
+             row = res.scalar()
+             return bool(row)
+     except Exception:
+         logger.exception("Failed to acquire advisory lock key=%s", key)
+         return False
+ 
+ 
+ def release_lock(engine: Engine, key: str) -> None:
+-    url = str(engine.url)
+-    if is_sqlite_url(url):
++    if engine.dialect.name != "postgresql":
+         return
+     try:
+         with engine.begin() as conn:
+             conn.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key})
+     except Exception:
+         logger.exception("Failed to release advisory lock key=%s", key)
+diff --git a/trader/db/migrate.py b/trader/db/migrate.py
+index db4a00d57f28e45296d0cb4f1b643508afbd5752..771622d84beb6a98493a135b3f58827d13342380 100644
+--- a/trader/db/migrate.py
++++ b/trader/db/migrate.py
+@@ -1,392 +1,143 @@
+ import glob
+ import hashlib
+ import re
+ import logging
+ import os
+-import sqlite3
+-import stat
+ from pathlib import Path
+-from typing import Iterable
+ 
+ import sqlalchemy as sa
+ from sqlalchemy import Engine, text
+-from sqlalchemy.exc import OperationalError
+ 
+-from . import config
+-from .schema import schema_for_engine
+ 
+ 
+ logger = logging.getLogger(__name__)
+ MIGRATION_VERSION = "v1"
+-REQUIRED_TABLES = ("runs",)
+ 
+ 
+ def _strip_sql_comments(sql: str) -> str:
+     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
+     out_lines = []
+     for line in sql.splitlines():
+         stripped = line.strip()
+         if not stripped:
+             continue
+         if stripped.startswith("--"):
+             continue
+         if "--" in line:
+             line = line.split("--", 1)[0]
+         out_lines.append(line)
+     return "\n".join(out_lines).strip()
+ 
+ 
+-def _is_sqlite_benign(err_msg: str) -> bool:
+-    lowered = err_msg.lower()
+-    return any(
+-        token in lowered
+-        for token in (
+-            "duplicate column name",
+-            "no such column",
+-            "already exists",
+-            "duplicate table",
+-            "duplicate index",
+-        )
+-    )
+-
+-
+-def _sqlite_has_table(db_path: Path, table_name: str) -> bool:
+-    if not db_path.exists():
+-        return False
+-    try:
+-        conn = sqlite3.connect(str(db_path))
+-        try:
+-            cur = conn.cursor()
+-            cur.execute(
+-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+-                (table_name,),
+-            )
+-            row = cur.fetchone()
+-            return row is not None
+-        finally:
+-            conn.close()
+-    except Exception:
+-        return False
+-
+-
+-def _db_file_size(db_path: Path) -> int:
+-    try:
+-        return db_path.stat().st_size
+-    except Exception:
+-        return 0
+-
+-
+-def _must_bootstrap_sqlite(db_path: Path, required_tables: Iterable[str]) -> bool:
+-    if _db_file_size(db_path) == 0:
+-        return True
+-    for table in required_tables:
+-        if not _sqlite_has_table(db_path, table):
+-            return True
+-    return False
+-
+-
+-def _chmod_rw(path: Path) -> None:
+-    try:
+-        if path.is_dir():
+-            targets = [path] + list(path.rglob("*"))
+-        else:
+-            targets = [path]
+-        for target in targets:
+-            try:
+-                os.chmod(
+-                    target,
+-                    target.stat().st_mode | stat.S_IWUSR | stat.S_IRUSR,
+-                )
+-            except Exception:
+-                continue
+-    except Exception:
+-        pass
+-
+-
+-def _prepare_sqlite_path(db_path: Path) -> None:
+-    ensure_sqlite_writable(db_path)
+-    _chmod_rw(db_path)
+-
+-
+-def ensure_sqlite_writable(db_path: Path) -> None:
+-    db_path.parent.mkdir(parents=True, exist_ok=True)
+-    try:
+-        os.chmod(db_path.parent, 0o700)
+-    except Exception:
+-        logger.warning("[DB][PERM][DIR_CHMOD_FAIL] path=%s", db_path.parent, exc_info=True)
+-
+-    if db_path.exists():
+-        try:
+-            os.chmod(db_path, 0o600)
+-        except Exception:
+-            logger.warning("[DB][PERM][FILE_CHMOD_FAIL] path=%s", db_path, exc_info=True)
+-    else:
+-        try:
+-            db_path.touch()
+-            os.chmod(db_path, 0o600)
+-        except Exception:
+-            logger.warning("[DB][PERM][TOUCH_FAIL] path=%s", db_path, exc_info=True)
+-
+-    for suffix in ("-wal", "-shm"):
+-        sidecar = Path(f"{db_path}{suffix}")
+-        if sidecar.exists():
+-            try:
+-                sidecar.unlink()
+-            except Exception:
+-                logger.warning("[DB][PERM][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
+-
+-
+ def _schema_stamp_path() -> Path:
+     cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
+     return cache_root / "schema_version.txt"
+ 
+ 
+ def _compute_migration_version(migrations_dir: str) -> str:
+     hasher = hashlib.sha256()
+     hasher.update(MIGRATION_VERSION.encode("utf-8"))
+     migration_files = sorted(Path(migrations_dir).glob("*.sql"))
+     for path in migration_files:
+         hasher.update(path.name.encode("utf-8"))
+         try:
+             hasher.update(path.read_bytes())
+         except FileNotFoundError:
+             continue
+     return hasher.hexdigest()
+ 
+ 
+ def _should_skip_migrations(engine: Engine, migrations_dir: str) -> bool:
+     mode = os.getenv("MIGRATE_MODE", "AUTO").upper()
+     if mode == "OFF":
+         logger.info("[DB][MIGRATE][SKIP] reason=disabled")
+         return True
+     if mode != "AUTO":
+         return False
+     stamp_path = _schema_stamp_path()
+     if not stamp_path.exists():
+         return False
+-    db_exists = True
+-    url = str(engine.url)
+-    if config.is_sqlite_url(url):
+-        db_path = Path(engine.url.database or "")
+-        db_exists = db_path.exists()
+-    if not db_exists:
+-        return False
+     stamp_version = stamp_path.read_text(encoding="utf-8").strip()
+     current_version = _compute_migration_version(migrations_dir)
+     if stamp_version == current_version:
+         logger.info("[DB][MIGRATE][SKIP] reason=up_to_date")
+         return True
+     return False
+ 
+ 
+ def _write_schema_stamp(migrations_dir: str) -> None:
+     stamp_path = _schema_stamp_path()
+     stamp_path.parent.mkdir(parents=True, exist_ok=True)
+     stamp_path.write_text(_compute_migration_version(migrations_dir), encoding="utf-8")
+ 
+ 
+ def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
+-    if conn.dialect.name == "sqlite":
+-        ddl = """
+-        CREATE TABLE IF NOT EXISTS schema_migrations (
+-            version TEXT PRIMARY KEY,
+-            applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+-        )
+-        """
+-    else:
+-        ddl = """
+-        CREATE TABLE IF NOT EXISTS schema_migrations (
+-            version TEXT PRIMARY KEY,
+-            applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+-        )
+-        """
++    ddl = """
++    CREATE TABLE IF NOT EXISTS schema_migrations (
++        version TEXT PRIMARY KEY,
++        applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
++    )
++    """
+     conn.exec_driver_sql(ddl)
+ 
+ 
+ def _list_applied_versions(conn: sa.Connection) -> set[str]:
+     result = conn.execute(text("SELECT version FROM schema_migrations"))
+     return {row[0] for row in result}
+ 
+ 
+-def _sqlite_column_names(conn: sa.Connection, table: str) -> set[str]:
+-    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+-    return {row[1] for row in rows if len(row) > 1}
+-
+-
+-def _apply_sqlite_statement(conn: sa.Connection, statement: str) -> None:
+-    cleaned = statement.strip()
+-    if not cleaned:
+-        return
+-    head = cleaned.lstrip().upper()
+-    if head.startswith("DO $$") or head.startswith("DO\n$$") or head.startswith("DO\t$$"):
+-        exec_sqls = re.findall(r"(?is)\bEXECUTE\s+'([^']+)'\s*;?", cleaned)
+-        for sql in exec_sqls:
+-            sql = sql.strip().rstrip(";")
+-            if not sql:
+-                continue
+-            try:
+-                conn.exec_driver_sql(sql)
+-            except Exception:
+-                pass
+-        return
+-    probe = cleaned
+-    probe = re.sub(r"(?ms)^\s*(--[^\n]*\n\s*)+", "", probe)
+-    probe = re.sub(r"(?s)^\s*/\*.*?\*/\s*", "", probe)
+-    if re.match(r"(?is)^\s*CREATE\s+EXTENSION\b", probe):
+-        return
+-    if re.search(r"(?im)^\s*CREATE\s+EXTENSION\b.*?$", cleaned):
+-        cleaned2 = re.sub(r"(?im)^\s*CREATE\s+EXTENSION\b.*?;\s*", "", cleaned)
+-        cleaned2 = re.sub(r"(?im)^\s*CREATE\s+EXTENSION\b.*?$", "", cleaned2).strip()
+-        if not cleaned2:
+-            return
+-        cleaned = cleaned2
+-        probe = cleaned
+-    repl = cleaned
+-    repl = re.sub(r"(?i)\btimestamptz\b", "TEXT", repl)
+-    repl = re.sub(r"(?i)\bdouble\s+precision\b", "REAL", repl)
+-    repl = re.sub(r"(?i)\bjsonb\b", "TEXT", repl)
+-    repl = re.sub(r"(?i)\bboolean\b", "INTEGER", repl)
+-    repl = re.sub(r"(?i)\bnow\(\)", "CURRENT_TIMESTAMP", repl)
+-    repl = re.sub(r"(?is)'\{\}'\s*::\s*TEXT", "'{}'", repl)
+-    repl = re.sub(r"(?is)'\{\}'\s*::\s*jsonb", "'{}'", repl)
+-    repl = re.sub(r"(?is)gen_random_uuid\(\)\s*::\s*text", "lower(hex(randomblob(16)))", repl)
+-    repl = re.sub(r"(?is)\bgen_random_uuid\(\)", "lower(hex(randomblob(16)))", repl)
+-    repl = re.sub(
+-        r"(?is)DEFAULT\s+lower\(hex\(randomblob\(16\)\)\)",
+-        "DEFAULT (lower(hex(randomblob(16))))",
+-        repl,
+-    )
+-    repl = re.sub(r"(?is)::\s*text\b", "", repl)
+-    repl = re.sub(r"(?is)::\s*jsonb\b", "", repl)
+-    match = re.match(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", repl, re.IGNORECASE)
+-    if match:
+-        table, column = match.group(1), match.group(2)
+-        existing = _sqlite_column_names(conn, table)
+-        if column in existing:
+-            logger.info("[DB][MIGRATE][SQLITE] skip existing column table=%s column=%s", table, column)
+-            return
+-    try:
+-        conn.exec_driver_sql(repl)
+-    except OperationalError as exc:
+-        msg = str(getattr(exc, "orig", exc))
+-        if _is_sqlite_benign(msg):
+-            logger.warning("[DB][MIGRATE][SQLITE][BENIGN_SKIP] %s | %s", msg, repl[:200])
+-            return
+-        raise
+-
+-
+ def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
+     cleaned = statement.strip()
+     if not cleaned:
+         return
+     try:
+         conn.exec_driver_sql(cleaned)
+     except Exception as exc:
+         if _should_ignore_pg_error(exc):
+             logger.info("[DB][MIGRATE][PG] ignore error=%s statement=%s", exc, cleaned)
+             return
+         raise
+ 
+ 
+ def _should_ignore_pg_error(exc: Exception) -> bool:
+     message = str(exc).lower()
+     if "column" in message and ("already exists" in message or "does not exist" in message):
+         return True
+     if "relation" in message and "already exists" in message:
+         return True
+     if "duplicate_table" in message or "duplicate_column" in message:
+         return True
+     return False
+ 
+ 
+ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
+-    url = str(engine.url)
+-    db_path = None
+-    if config.is_sqlite_url(url):
+-        db_path = Path(engine.url.database or "")
+-        if db_path:
+-            _prepare_sqlite_path(db_path)
+-        if db_path and _must_bootstrap_sqlite(db_path, REQUIRED_TABLES):
+-            logger.warning(
+-                "[DB][MIGRATE][BOOTSTRAP] reason=missing_required_tables path=%s size=%s",
+-                db_path,
+-                _db_file_size(db_path),
+-            )
+-            schema_for_engine(engine).metadata.create_all(engine)
+-            _write_schema_stamp(migrations_dir)
+-            if db_path:
+-                logger.info(
+-                    "[DB][CHECK] path=%s exists=%s size=%s",
+-                    db_path,
+-                    int(os.path.exists(db_path)),
+-                    os.path.getsize(db_path) if os.path.exists(db_path) else -1,
+-                )
+-            return
+     if _should_skip_migrations(engine, migrations_dir):
+         return
+     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
+     with engine.begin() as conn:
+         url = str(engine.url)
+-        if config.is_sqlite_url(url):
+-            logger.info("[DB][MIGRATE] sqlite url=%s", url)
+-            _ensure_schema_migrations_table(conn)
+-            applied = _list_applied_versions(conn)
+-            migration_files = sorted(
+-                [
+-                    Path(path)
+-                    for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+-                    if Path(path).is_file()
+-                ]
+-            )
+-            for path in migration_files:
+-                version = path.name
+-                if version in applied:
+-                    continue
+-                sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
+-                logger.info("[DB][MIGRATE] applying %s", version)
+-                try:
+-                    statements = [stmt for stmt in sql.split(";") if stmt.strip()]
+-                    for statement in statements:
+-                        _apply_sqlite_statement(conn, statement)
+-                    conn.execute(
+-                        text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+-                        {"version": version},
+-                    )
+-                except Exception as exc:
+-                    snippet = " ".join(sql.split())[:2000]
+-                    logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
+-                    raise
+-            _write_schema_stamp(migrations_dir)
+-            if db_path:
+-                logger.info(
+-                    "[DB][CHECK] path=%s exists=%s size=%s",
+-                    db_path,
+-                    int(os.path.exists(db_path)),
+-                    os.path.getsize(db_path) if os.path.exists(db_path) else -1,
+-                )
+-            return
+         logger.info("[DB][MIGRATE] external url=%s", url)
+         _ensure_schema_migrations_table(conn)
+         applied = _list_applied_versions(conn)
+ 
+         migration_files = sorted(
+             [
+                 Path(path)
+                 for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+                 if Path(path).is_file()
+             ]
+         )
+         for path in migration_files:
+             version = path.name
+             if version in applied:
+                 continue
+             sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
+             logger.info("[DB][MIGRATE] applying %s", version)
+             try:
+                 statements = [stmt for stmt in sql.split(";") if stmt.strip()]
+                 for statement in statements:
+                     _apply_pg_statement(conn, statement)
+                 conn.execute(
+                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                     {"version": version},
+                 )
 diff --git a/trader/db/repos.py b/trader/db/repos.py
-index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758bfdeb72f 100644
+index f81400bc5f99803698a4512a0ae71758bfdeb72f..14042a64aa8ffdd9de97c4a316a60d7ddd7154c9 100644
 --- a/trader/db/repos.py
 +++ b/trader/db/repos.py
-@@ -1,50 +1,51 @@
+@@ -1,138 +1,90 @@
  from __future__ import annotations
  
  from datetime import datetime, timedelta
  import logging
  import os
- from pathlib import Path
+-from pathlib import Path
  import time
  from typing import Any, Dict, Iterable, List, Optional
  from uuid import UUID, uuid4
@@ -522,7 +2182,7 @@ index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758
  import sqlalchemy as sa
  from sqlalchemy.exc import OperationalError, StatementError
  from sqlalchemy import Engine, and_, func, select
- from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
  from sqlalchemy.dialects.postgresql import insert as pg_insert
  
  from .schema import (
@@ -534,12 +2194,13 @@ index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758
      UNIVERSE_MEMBERS,
      UNIVERSE_CURRENT,
      UNIVERSE_RUNS,
-+    SchemaTables,
+     SchemaTables,
      schema_for_engine,
      uuid_value_for_url,
  )
- from .migrate import ensure_sqlite_writable, run_migrations
- from . import config
+-from .migrate import ensure_sqlite_writable, run_migrations
+-from . import config
++from .migrate import run_migrations
  from trader.time_utils import now_kst
  from trader.db.json_safe import json_sanitize
  
@@ -551,81 +2212,86 @@ index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758
      return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
  
  
- def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
-     message = str(exc).lower()
-     if "readonly" not in message:
-         return False
-     return config.is_sqlite_url(str(engine.url))
- 
- 
- def _recover_sqlite_readonly(engine: Engine) -> bool:
-     url = str(engine.url)
-@@ -56,50 +57,90 @@ def _recover_sqlite_readonly(engine: Engine) -> bool:
-     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-     backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
+-def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
+-    message = str(exc).lower()
+-    if "readonly" not in message:
+-        return False
+-    return config.is_sqlite_url(str(engine.url))
+-
+-
+-def _recover_sqlite_readonly(engine: Engine) -> bool:
+-    url = str(engine.url)
+-    if not config.is_sqlite_url(url):
+-        return False
+-    db_path = Path(engine.url.database or "")
+-    if not db_path:
+-        return False
+-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+-    backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
+-    try:
+-        if db_path.exists():
+-            db_path.rename(backup_path)
+-            logger.warning("[DB][READONLY][BACKUP] backup=%s", backup_path)
+-    except Exception:
+-        logger.warning("[DB][READONLY][BACKUP_FAIL] path=%s", db_path, exc_info=True)
+-
+-    for suffix in ("-wal", "-shm"):
+-        sidecar = Path(f"{db_path}{suffix}")
+-        if sidecar.exists():
+-            try:
+-                sidecar.unlink()
+-            except Exception:
+-                logger.warning("[DB][READONLY][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
+-    try:
+-        engine.dispose()
+-    except Exception:
+-        logger.warning("[DB][READONLY][DISPOSE_FAIL] url=%s", url, exc_info=True)
+-    ensure_sqlite_writable(db_path)
+-    run_migrations(engine)
+-    return True
+-
+-
+ def ensure_run(
+     conn: sa.Connection,
+     schema: SchemaTables,
+     *,
+     run_id: str,
+     env: str,
+     run_window: str | None,
+     strategy: str,
+     ts: datetime,
+     database_url: str,
+ ) -> None:
+     if not run_id or not strategy:
+         return
+     values = {
+         "run_id": uuid_value_for_url(database_url, run_id),
+         "env": env,
+         "strategy": strategy,
+         "run_window": run_window,
+         "phase": None,
+         "event_name": "ledger_event",
+         "dry_run": False,
+         "config_json": {},
+         "started_at": ts,
+     }
+     if conn.dialect.name == "postgresql":
+-        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(
+-            index_elements=["run_id"]
+-        )
+-    elif conn.dialect.name == "sqlite":
+-        insert_stmt = sqlite_insert(schema.runs).values(**values).on_conflict_do_nothing(
+-            index_elements=["run_id"]
+-        )
++        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(index_elements=["run_id"])
+     else:
+         insert_stmt = sa.insert(schema.runs).values(**values)
      try:
-         if db_path.exists():
-             db_path.rename(backup_path)
-             logger.warning("[DB][READONLY][BACKUP] backup=%s", backup_path)
+         conn.execute(insert_stmt)
      except Exception:
-         logger.warning("[DB][READONLY][BACKUP_FAIL] path=%s", db_path, exc_info=True)
- 
-     for suffix in ("-wal", "-shm"):
-         sidecar = Path(f"{db_path}{suffix}")
-         if sidecar.exists():
-             try:
-                 sidecar.unlink()
-             except Exception:
-                 logger.warning("[DB][READONLY][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
-     try:
-         engine.dispose()
-     except Exception:
-         logger.warning("[DB][READONLY][DISPOSE_FAIL] url=%s", url, exc_info=True)
-     ensure_sqlite_writable(db_path)
-     run_migrations(engine)
-     return True
+         return
  
  
-+def ensure_run(
-+    conn: sa.Connection,
-+    schema: SchemaTables,
-+    *,
-+    run_id: str,
-+    env: str,
-+    run_window: str | None,
-+    strategy: str,
-+    ts: datetime,
-+    database_url: str,
-+) -> None:
-+    if not run_id or not strategy:
-+        return
-+    values = {
-+        "run_id": uuid_value_for_url(database_url, run_id),
-+        "env": env,
-+        "strategy": strategy,
-+        "run_window": run_window,
-+        "phase": None,
-+        "event_name": "ledger_event",
-+        "dry_run": False,
-+        "config_json": {},
-+        "started_at": ts,
-+    }
-+    if conn.dialect.name == "postgresql":
-+        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(
-+            index_elements=["run_id"]
-+        )
-+    elif conn.dialect.name == "sqlite":
-+        insert_stmt = sqlite_insert(schema.runs).values(**values).on_conflict_do_nothing(
-+            index_elements=["run_id"]
-+        )
-+    else:
-+        insert_stmt = sa.insert(schema.runs).values(**values)
-+    try:
-+        conn.execute(insert_stmt)
-+    except Exception:
-+        return
-+
-+
  def execute_with_retry(conn, stmt, payload=None, retries: int = 5, base_sleep: float = 0.2):
      last_exc: OperationalError | None = None
      for attempt in range(retries):
@@ -643,15 +2309,203 @@ index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758
      if last_exc:
          raise last_exc
      raise OperationalError("database is locked", params=None, orig=None)
+@@ -177,54 +129,51 @@ class RunsRepo:
+         workflow_attempt: int | None,
+         config_json: dict | None,
+     ) -> str:
+         values = {
+             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+             "env": env,
+             "strategy": strategy,
+             "run_window": run_window,
+             "phase": phase,
+             "event_name": event_name,
+             "dry_run": dry_run,
+             "git_sha": git_sha,
+             "workflow": workflow,
+             "workflow_run_id": workflow_run_id,
+             "workflow_attempt": workflow_attempt,
+             "config_json": config_json or {},
+         }
+         stmt = sa.insert(self._schema.runs).values(**values)
+         run_id = values["run_id"]
+         for attempt in range(2):
+             with self.engine.begin() as conn:
+                 try:
+                     res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
+                     run_id = res.scalar() or run_id
+                     return str(run_id)
+-                except OperationalError as exc:
+-                    if attempt == 0 and _is_sqlite_readonly(exc, self.engine):
+-                        _recover_sqlite_readonly(self.engine)
+-                        continue
++                except OperationalError:
+                     raise
+                 except Exception:
+                     conn.execute(stmt)
+                     return str(run_id)
+         return str(run_id)
+ 
+     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.runs)
+                 .where(self._schema.runs.c.run_id == run_id)
+                 .values(status=status, finished_at=func.now(), notes=notes),
+             )
  
  
- def _collect_json_type_paths(value: Any, *, path: str = "request_json", limit: int = 50) -> list[str]:
-     results: list[str] = []
+ class UniverseRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
  
-     def _walk(node: Any, prefix: str) -> None:
-         if len(results) >= limit:
-             return
-@@ -656,94 +697,118 @@ class FillsRepo:
+     def _strategy_key(self, env: str, strategy: str) -> str:
+         return f"{env}:{strategy}"
+ 
+     def _fetch_members_for_run(self, run_id: str, *, env: str, strategy: str) -> list[dict]:
+         stmt = (
+@@ -302,51 +251,51 @@ class UniverseRepo:
+                         provider=provider,
+                         as_of=as_of_date,
+                         created_ts=now_kst().isoformat(),
+                     )
+                 )
+                 for rank, member in enumerate(members_list, start=1):
+                     meta = member.get("meta_json") or {}
+                     conn.execute(
+                         sa.insert(self._schema.universe_members).values(
+                             run_id=uuid_value_for_url(db_url, run_id),
+                             stock_code=str(member.get("code") or "").zfill(6),
+                             name=member.get("name") or meta.get("name"),
+                             market=member.get("market"),
+                             rank=member.get("rank") if member.get("rank") is not None else rank,
+                             market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
+                             reason=member.get("reason") or reason,
+                         )
+                     )
+                 if self.engine.dialect.name == "postgresql":
+                     insert_stmt = pg_insert(self._schema.universe_current).values(
+                         strategy=strategy_key,
+                         run_id=uuid_value_for_url(db_url, run_id),
+                         updated_ts=now_kst().isoformat(),
+                     )
+                 else:
+-                    insert_stmt = sqlite_insert(self._schema.universe_current).values(
++                    insert_stmt = sa.insert(self._schema.universe_current).values(
+                         strategy=strategy_key,
+                         run_id=uuid_value_for_url(db_url, run_id),
+                         updated_ts=now_kst().isoformat(),
+                     )
+                 conn.execute(
+                     insert_stmt.on_conflict_do_update(
+                         index_elements=[self._schema.universe_current.c.strategy],
+                         set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
+                     )
+                 )
+             return str(run_id)
+         except Exception:
+             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+             if ALLOW_UNIVERSE_DB_FAIL:
+                 return None
+             raise
+ 
+     def cleanup_old_runs(self, *, retain_days: int = 30) -> None:
+         cutoff = (now_kst() - timedelta(days=retain_days)).isoformat()
+         with self.engine.begin() as conn:
+             current_runs = select(self._schema.universe_current.c.run_id)
+             conn.execute(
+                 sa.delete(self._schema.universe_runs).where(
+                     and_(
+                         self._schema.universe_runs.c.created_ts < cutoff,
+@@ -559,51 +508,51 @@ class OrdersRepo:
+             "stage": stage,
+             "client_order_key": client_order_key,
+             "status": status,
+             "kis_odno": kis_odno,
+             "broker_order_id": broker_order_id,
+             "request_json": safe_request_json,
+             "response_json": safe_response_json,
+             "submitted_at": submitted_at,
+             "acked_at": acked_at,
+         }
+         conflict_cols = ["env", "broker_order_id"] if broker_order_id else ["env", "client_order_key"]
+         update_cols = {
+             "status": status,
+             "kis_odno": kis_odno,
+             "broker_order_id": broker_order_id,
+             "response_json": safe_response_json,
+             "request_json": safe_request_json,
+             "submitted_at": submitted_at,
+             "acked_at": acked_at,
+             "updated_at": func.now(),
+         }
+         insert_stmt: sa.Insert
+         if self.engine.dialect.name == "postgresql":
+             insert_stmt = pg_insert(self._schema.orders).values(**payload)
+         else:
+-            insert_stmt = sqlite_insert(self._schema.orders).values(**payload)
++            insert_stmt = sa.insert(self._schema.orders).values(**payload)
+         stmt = insert_stmt.on_conflict_do_update(
+             index_elements=conflict_cols,
+             set_=update_cols,
+         ).returning(self._schema.orders.c.order_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
+                 order_id = res.scalar()
+                 if order_id:
+                     return str(order_id)
+             except Exception:
+                 pass
+             existing = conn.execute(
+                 select(self._schema.orders.c.order_id).where(
+                     and_(
+                         self._schema.orders.c.env == env,
+                         self._schema.orders.c.client_order_key == client_order_key,
+                     )
+                 )
+             ).scalar()
+             return str(existing or payload["order_id"])
+ 
+ 
+ class FillsRepo:
+     def __init__(self, engine: Engine):
+@@ -664,51 +613,51 @@ class FillsRepo:
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "fee": fee,
+             "tax": tax,
+             "filled_at": filled_at,
+             "raw_json": safe_raw_json,
+         }
+         conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
+             "env",
+             "kis_odno",
+             "code",
+             "side",
+             "qty",
+             "price",
+             "filled_at",
+         ]
+         update_cols = {
+             "raw_json": safe_raw_json,
+             "broker_fill_id": broker_fill_id,
+         }
+         insert_stmt: sa.Insert
+         if self.engine.dialect.name == "postgresql":
+             insert_stmt = pg_insert(self._schema.fills).values(**payload)
+         else:
+-            insert_stmt = sqlite_insert(self._schema.fills).values(**payload)
++            insert_stmt = sa.insert(self._schema.fills).values(**payload)
+         stmt = insert_stmt.on_conflict_do_update(
+             index_elements=conflict_cols,
+             set_=update_cols,
+         ).returning(self._schema.fills.c.fill_id)
+         with self.engine.begin() as conn:
+             try:
+                 res = conn.execute(stmt)
                  fill_id = res.scalar()
                  if fill_id:
                      return str(fill_id)
@@ -670,387 +2524,723 @@ index dfd2769b0ccc1a7b47ece177ee2382e5f437b49a..f81400bc5f99803698a4512a0ae71758
  class LedgerEventsRepo:
      def __init__(self, engine: Engine):
          self.engine = engine
-         self._schema = schema_for_engine(engine)
+diff --git a/trader/db/schema.py b/trader/db/schema.py
+index 75957e46e0f49a6581bffbd6668e44797edd4479..5685b9b8c864f4efb81f945ca6ffe3c0619b25ab 100644
+--- a/trader/db/schema.py
++++ b/trader/db/schema.py
+@@ -1,37 +1,36 @@
+ from __future__ import annotations
  
-     def append_event(
-         self,
-         *,
-         env: str,
-         run_id: str | None,
-+        strategy: str | None = None,
-+        run_window: str | None = None,
-         event_type: str,
-         ts: datetime,
-         code: str | None = None,
-         market: str | None = None,
-         sid: int | None = None,
-         mode: int | None = None,
-         side: str | None = None,
-         qty: int | None = None,
-         price: float | None = None,
-         kis_odno: str | None = None,
-         client_order_key: str | None = None,
-         ok: bool = True,
-         reasons: list[str] | None = None,
-         stage: str | None = None,
-         payload_json: dict | None = None,
-     ) -> str:
-         db_url = str(self.engine.url)
-         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
-         payload = {
-             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-             "env": env,
-             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-             "event_type": event_type,
-             "ts": ts,
-             "code": code,
-             "market": market,
-             "sid": sid,
-             "mode": mode,
-             "side": side,
-             "qty": qty,
-             "price": price,
-             "kis_odno": kis_odno,
-             "client_order_key": client_order_key,
-             "ok": ok,
-             "reasons": reasons or [],
-             "stage": stage,
-             "payload_json": safe_payload_json,
-         }
-         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
-         with self.engine.begin() as conn:
-             try:
-+                if run_id is not None and strategy:
-+                    ensure_run(
-+                        conn,
-+                        self._schema,
-+                        run_id=run_id,
-+                        env=env,
-+                        run_window=run_window,
-+                        strategy=strategy,
-+                        ts=ts,
-+                        database_url=db_url,
-+                    )
-                 res = conn.execute(stmt)
-                 return str(res.scalar())
-             except Exception:
-+                if run_id is not None and strategy:
-+                    ensure_run(
-+                        conn,
-+                        self._schema,
-+                        run_id=run_id,
-+                        env=env,
-+                        run_window=run_window,
-+                        strategy=strategy,
-+                        ts=ts,
-+                        database_url=db_url,
-+                    )
-                 conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
-                 return str(payload["ledger_event_id"])
+ import os
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from typing import Any
+ from uuid import UUID, uuid4
+ 
+ import sqlalchemy as sa
+ from sqlalchemy import Engine
+ 
+-from . import config
  
  
- class PositionsRepo:
-     def __init__(self, engine: Engine):
-         self.engine = engine
-         self._schema = schema_for_engine(engine)
+ def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
+     # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
+     return sa.String()
  
-     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
-         stmt = select(self._schema.positions).where(
-             and_(
-                 self._schema.positions.c.env == env,
-                 self._schema.positions.c.strategy == strategy,
-                 self._schema.positions.c.sid == sid,
-                 self._schema.positions.c.mode == mode,
-                 self._schema.positions.c.code == code,
-             )
-         )
-         with self.engine.begin() as conn:
-             row = conn.execute(stmt).mappings().first()
-             return dict(row) if row else None
  
-     def list_positions(self, env: str, strategy: str) -> list[dict]:
-         stmt = select(self._schema.positions).where(
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index 47871de75d3f1b5d1aafb8eac5296e01d6f33461..6c3345c3e7831daf1ace7f387464175fad0e2fb8 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -844,50 +844,51 @@ class PB1Engine:
-     ) -> list[dict]:
-         kis_holdings = self._parse_kis_holdings(holdings_rows)
-         positions_by_code = {
-             str(row.get("code") or "").zfill(6): row
-             for row in positions_rows or []
-             if row.get("code")
-         }
-         ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
-         ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-         if ledger_positions:
-             api_codes = set(kis_holdings.keys())
-             for (code, sid, mode), state in ledger_positions.items():
-                 if sid != 1:
-                     continue
-                 total_qty = int(state.get("total_qty") or 0)
-                 if total_qty <= 0 or code in api_codes:
-                     continue
-                 logger.warning(
-                     "[RECONCILE][ORPHAN] code=%s reason=ledger_only ledger_qty=%s",
-                     code,
-                     total_qty,
-                 )
-                 self.ledger_repo.append_event(
-                     env=self.env,
-                     run_id=self.run_id,
-+                    strategy=self.STRATEGY_NAME,
-                     event_type="POSITION_ORPHANED",
-                     ts=now_kst(),
-                     code=code,
-                     market=state.get("market"),
-                     sid=sid,
-                     mode=mode,
-                     qty=total_qty,
-                     ok=True,
-                     reasons=["ledger_only"],
-                     payload_json={"ledger_total_qty": total_qty},
-                 )
-         ledger_by_code: dict[str, dict] = {}
-         for (code, sid, mode), state in ledger_positions.items():
-             if sid != 1:
-                 continue
-             existing = ledger_by_code.get(code)
-             if not existing or int(state.get("total_qty") or 0) > int(existing.get("total_qty") or 0):
-                 ledger_by_code[code] = {**state, "sid": sid, "mode": mode, "code": code}
+ def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
+     try:
+         if value is None:
+             return str(uuid4())
+         if isinstance(value, UUID):
+             return str(value)
+         return str(UUID(str(value)))
+     except Exception:
+         return str(uuid4())
  
-         positions: list[dict] = []
-         for code, holding in kis_holdings.items():
-             ledger_state = ledger_by_code.get(code, {})
-             pos_state = positions_by_code.get(code, {})
-             qty = holding.get("qty") or 0
-             avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
-@@ -1175,50 +1176,51 @@ class PB1Engine:
-             self._display_code(code),
-             int(bool(ok)),
-             reasons or ["ok"],
-         )
  
-     def _append_ledger_event(
-         self,
-         *,
-         event_type: str,
-         code: str | None,
-         market: str | None,
-         mode: int | None,
-         side: str | None,
-         qty: int | None,
-         price: float | None,
-         client_order_key: str | None,
-         ok: bool,
-         reasons: list[str] | None,
-         stage: str | None,
-         payload_json: dict | None = None,
-     ) -> None:
-         try:
-             self.ledger_repo.append_event(
-                 env=self.env,
-                 run_id=self.run_id,
-+                strategy=self.STRATEGY_NAME,
-                 event_type=event_type,
-                 ts=now_kst(),
-                 code=code,
-                 market=market,
-                 sid=1,
-                 mode=mode,
-                 side=side,
-                 qty=qty,
-                 price=price,
-                 client_order_key=client_order_key,
-                 ok=ok,
-                 reasons=self._with_name_reason(reasons, code),
-                 stage=stage,
-                 payload_json=payload_json or {},
-             )
-         except Exception as exc:
-             logger.warning(
-                 "[PB1][LEDGER][FAIL] event=%s code=%s err=%s",
-                 event_type,
-                 self._display_code(code),
-                 repr(exc),
-             )
-             if self.debug:
-                 logger.exception("[PB1][LEDGER][FAIL_TRACE]")
+ @dataclass(frozen=True)
+ class SchemaTables:
+     database_url: str
+     metadata: sa.MetaData
+     runs: sa.Table
+     universe_runs: sa.Table
+     universe_members: sa.Table
+@@ -262,38 +261,38 @@ def _build_schema(database_url: str) -> SchemaTables:
+         ledger_events=ledger_events,
+         reconcile_log=reconcile_log,
+         uses_native_uuid=uses_native_uuid,
+     )
  
+ 
+ _SCHEMA_CACHE: dict[str, SchemaTables] = {}
+ 
+ 
+ @lru_cache(maxsize=None)
+ def schema_for_url(database_url: str) -> SchemaTables:
+     normalized = str(database_url)
+     if normalized not in _SCHEMA_CACHE:
+         _SCHEMA_CACHE[normalized] = _build_schema(normalized)
+     return _SCHEMA_CACHE[normalized]
+ 
+ 
+ def schema_for_engine(engine: Engine) -> SchemaTables:
+     return schema_for_url(str(engine.url))
+ 
+ 
+ def metadata_for_url(database_url: str) -> sa.MetaData:
+     return schema_for_url(database_url).metadata
+ 
+ 
+-DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
++DEFAULT_DATABASE_URL = os.getenv("PBCORE_DB_URL", "postgresql+psycopg://")
+ DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
+ 
+ METADATA = DEFAULT_SCHEMA.metadata
+ RUNS = DEFAULT_SCHEMA.runs
+ UNIVERSE_RUNS = DEFAULT_SCHEMA.universe_runs
+ UNIVERSE_MEMBERS = DEFAULT_SCHEMA.universe_members
+ UNIVERSE_CURRENT = DEFAULT_SCHEMA.universe_current
+ ORDERS = DEFAULT_SCHEMA.orders
+ FILLS = DEFAULT_SCHEMA.fills
+ POSITIONS = DEFAULT_SCHEMA.positions
+ LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
+ RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 476c0e7abf2f73b29216865f4dad95ff5581849f..edffce5ca39fc26d0c8556d254060337b76de25f 100644
+index edffce5ca39fc26d0c8556d254060337b76de25f..9ed8a52e9df71ede0ca258d86d3201cc3fd655e4 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -486,112 +486,115 @@ def _handle_missing_positions_reset(
-     missing_codes = sorted(position_codes | ledger_codes)
-     if not missing_codes:
-         return False
-     if not reset_on_missing_positions and not force_safe_exit:
-         if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-             reset_result = hard_reset_bot_state(bot_state_dir, reason="stale_db")
-             os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
-             logger.warning(
-                 "[PB1][RESET][HARD_STALE_DB] env=%s missing_positions=%s result=%s",
+@@ -34,59 +34,59 @@ from trader.config import (
+     MORNING_WINDOW_END,
+     MORNING_WINDOW_START,
+     PB1_ALLOW_PREOPEN_ENTRY,
+     PB1_PREOPEN_END,
+     PB1_PREOPEN_MAX_NEW_POSITIONS,
+     PB1_PREOPEN_REQUIRE_BALANCE,
+     PB1_PREOPEN_START,
+     PB1_ENTRY_ENABLED,
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_END,
+     PB1_MORNING_WINDOW_END,
+     PB1_REQUIRE_BALANCE_FOR_ENTRY,
+     PB1_FORCE_ENTRY_ON_PUSH,
+     PB1_MAX_WAIT_FOR_WINDOW_MIN,
+     PB1_WAIT_FOR_WINDOW,
+     PAPER_MAX_CAPITAL_KRW,
+     PAPER_RESET_AUTO_PURGE,
+     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
+     resolve_strategy_mode,
+ )
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+ from trader.botstate_sync import (
+     BotStateContext,
+     acquire_lock as acquire_botstate_lock,
+     compute_lock_ttl,
+-    ensure_sqlite_writable,
+     hard_reset_bot_state,
+     persist_or_fail,
+     persist_run_files,
+     release_lock as release_botstate_lock,
+     resolve_botstate_worktree_dir,
+     setup_worktree,
+ )
+ from trader.db.engine import make_engine
++from trader.db.health import assert_db_ready
+ from trader.db.lock import release_lock, try_acquire_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import (
+     FillsRepo,
+     LedgerEventsRepo,
+     OrdersRepo,
+     PositionsRepo,
+     ReconcileLogRepo,
+     RunsRepo,
+     UniverseRepo,
+ )
+ from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
+ from trader.ledger.store import LedgerStore
+ from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_kis, reconcile_today
+ from trader.reconcile_db import close_stale_positions
+ from trader.reset_utils import (
+     detect_account_fp,
+     load_reset_guard,
+     purge_bot_state,
+     record_purge_event,
+     should_purge_on_empty_kis_holdings,
+     update_reset_guard_from_balance,
+ )
+ from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
+@@ -2072,62 +2072,62 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+                 balance_tick_cache_hits,
+             )
+         else:
+             logger.info(
+                 "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
+ 
+ 
+ def _exit_code_for_status(status: str) -> int:
+     if status in {"FAILED", "ERROR"}:
+         return 1
+     return 0
+ 
+ 
+ def main() -> int:
+     args = parse_args()
++    assert_db_ready()
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
+     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
+     if run_loop and not smoke_enabled:
+         try:
+             _run_loop(args=args)
+         except Exception:
+             logger.error("[PB1][FATAL_GUARD] loop crashed", exc_info=True)
+         return 0
+     if smoke_enabled:
+         bot_state_dir = get_botstate_root()
+-        ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
+         engine = make_engine()
+         run_migrations(engine)
+         _write_change_flag(False, ["init"])
+         run_once(args=args, engine=engine, loop_mode=False, window=None)
+         return 0
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
+     logger.info(
+         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+         ttl_sec,
+         max_seconds,
+         ttl_buffer,
+     )
+     botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+     if botstate_ctx is None:
+         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
+         return 0
+     _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
+     engine = make_engine()
+     run_migrations(engine)
+     _write_change_flag(False, ["init"])
+     signal.signal(
+         signal.SIGTERM,
+diff --git a/trader/tools/reset_bot_state.py b/trader/tools/reset_bot_state.py
+index 9f391cefbac2451383e7726d3c5e1fb2ee0cbdfb..74706d606b7bc70026d499d079ad4ef4a34f36a1 100644
+--- a/trader/tools/reset_bot_state.py
++++ b/trader/tools/reset_bot_state.py
+@@ -12,52 +12,48 @@ def rm(path: pathlib.Path) -> None:
+     elif p.is_dir():
+         shutil.rmtree(p, ignore_errors=True)
+ 
+ 
+ def chmod_rw(root: pathlib.Path) -> None:
+     root = pathlib.Path(root)
+     for p in [root] + list(root.rglob("*")):
+         try:
+             m = p.stat().st_mode
+             os.chmod(p, m | stat.S_IWUSR | stat.S_IRUSR)
+         except Exception:
+             pass
+ 
+ 
+ def main() -> None:
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--bot-state-dir", required=True)
+     ap.add_argument("--keep-universe-lkg", type=int, default=1)
+     ap.add_argument("--yes", action="store_true")
+     args = ap.parse_args()
+     if not args.yes:
+         raise SystemExit("Add --yes to proceed")
+ 
+     bs = pathlib.Path(args.bot_state_dir)
+ 
+-    rm(bs / "db" / "pbcore.sqlite3")
+     events_dir = bs / "runtime" / "events"
+     if events_dir.exists():
+         for path in events_dir.glob("*.jsonl"):
+             rm(path)
+     rm(events_dir)
+     rm(bs / "runtime")
+     rm(bs / "trader_ledger")
+     rm(bs / "locks")
+     rm(bs / "state.json")
+ 
+     if args.keep_universe_lkg:
+         (bs / "universe_lkg").mkdir(parents=True, exist_ok=True)
+ 
+-    (bs / "db").mkdir(parents=True, exist_ok=True)
+     (bs / "runtime").mkdir(parents=True, exist_ok=True)
+     (bs / "runtime" / "diagnostics").mkdir(parents=True, exist_ok=True)
+     (bs / "trader_ledger").mkdir(parents=True, exist_ok=True)
+     (bs / "locks").mkdir(parents=True, exist_ok=True)
+-    (bs / "db" / "pbcore.sqlite3").touch()
+-
+     chmod_rw(bs)
+     print(f"[RESET] bot_state reset done: {bs}")
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index b6995781c7cd0d317d8aa4d5c891340281a93bf2..36f582b94c3afc12f4f3bb1658af9c5dd7170805 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -2,114 +2,111 @@ from __future__ import annotations
+ 
+ import argparse
+ import csv
+ import json
+ import logging
+ import os
+ import re
+ from pathlib import Path
+ from typing import Iterable
+ 
+ 
+ from trader.config import (
+     PB1_MIN_CANDLES,
+ )
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.time_utils import now_kst
+ from trader.universe.capabilities import providers_for_env
+ from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
+ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
+ from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+ from trader.universe.providers.lkg_provider import LKGProvider
+-from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
+ from trader.universe.validation import validate_listed_and_tradeable
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+ from trader.runtime_store import RuntimeStore
+ 
+ from datetime import date
+ 
+ 
+ def _parse_as_of_date(val: str) -> date | None:
+     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+     from datetime import datetime as _datetime
+ 
+     if not val:
+         return None
+     s = str(val).strip()
+     try:
+         if "-" in s:
+             return _datetime.fromisoformat(s).date()
+         if len(s) == 8 and s.isdigit():
+             return _datetime.strptime(s, "%Y%m%d").date()
+         return _datetime.fromisoformat(s).date()
+     except Exception:
+         return None
+ 
+ 
+ def _prefer_provider_order(chain: list[str]) -> list[str]:
+     """Prefer live providers first, then static, then caches."""
+     preferred = [
+         "fdr_kospi100_kosdaq100",
+         "fdr_marketcap_top",
+         "seed_static",
+         "lkg",
+-        "sqlite_cache",
+     ]
+     ordered = [name for name in preferred if name in chain]
+     tail = [name for name in chain if name not in ordered]
+     return ordered + tail
+ 
+ logger = logging.getLogger(__name__)
+ 
+ FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
+ 
+ 
+ def _resolve_bot_state_dir() -> Path:
+     raw = os.getenv("BOT_STATE_DIR", "").strip()
+     if raw:
+         return Path(raw).expanduser().resolve()
+     return get_botstate_root()
+ 
+ 
+ def _resolve_seed_dir() -> Path:
+     default_dir = _resolve_bot_state_dir() / "universe_lkg"
+     seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", str(default_dir)))
+     seed_dir.mkdir(parents=True, exist_ok=True)
+     return seed_dir
+ 
+ 
+ SEED_DIR = _resolve_seed_dir()
+ SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
+ SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
+ TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
+ DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
+ ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
+-ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
+ TICKER_PATTERN = re.compile(r"^\d{6}$")
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Build and persist universe members")
+     parser.add_argument("--env", required=True, help="Environment (practice/real)")
+     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
+     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
+     parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
+     return parser.parse_args()
+ 
+ 
+ def _normalize_payload(payload: dict | None) -> dict:
+     payload = payload or {}
+     selected = payload.get("selected") or []
+     selected_stocks = payload.get("selected_stocks") or selected
+     selected_by_market = payload.get("selected_by_market") or {}
+     normalized = {
+         "selected": list(selected),
+         "selected_stocks": list(selected_stocks),
+         "selected_by_market": dict(selected_by_market),
+     }
+     if "weight_scope" in payload:
+         normalized["weight_scope"] = payload.get("weight_scope")
+     return normalized
+@@ -390,71 +387,50 @@ def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, refere
+     got_d = _parse_as_of_date(str(cached_as_of or ""))
+     if ref_d and got_d:
+         age = (ref_d - got_d).days
+         if age > int(max_age_days):
+             logger.info(
+                 "[UNIVERSE][LKG][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s",
                  env,
-                 missing_codes,
-                 reset_result,
+                 strategy,
+                 cached_as_of,
+                 reference_as_of,
+                 age,
+                 max_age_days,
              )
-             return True
-         closed_count = close_stale_positions(
-             engine=engine,
-             env=env,
-             strategy=strategy,
-             reason="STALE_DB_BUT_KIS_EMPTY",
-             ts=now_kst(),
-         )
-         for code in missing_codes:
-             ledger_repo.append_event(
-                 env=env,
-                 run_id=run_id,
-+                strategy=strategy,
-                 event_type="AUTO_CLOSED_STALE_KIS_EMPTY",
-                 ts=now_kst(),
-                 code=code,
-                 sid=1,
-                 mode=1,
-                 ok=True,
-                 reasons=["AUTO_CLOSED_STALE_KIS_EMPTY"],
-                 payload_json={
-                     "source": "stale_db_autoclose",
-                     "orders": orders_count,
-                     "fills": fills_count,
-                 },
-             )
-         ledger_repo.append_event(
-             env=env,
-             run_id=run_id,
-+            strategy=strategy,
-             event_type="STALE_DB_SOFT_RESET",
-             ts=now_kst(),
-             ok=True,
-             reasons=["holdings_empty", "soft_close", "orphan_marked"],
-             payload_json={
-                 "closed_positions": closed_count,
-                 "missing_codes": missing_codes,
-                 "orders": orders_count,
-                 "fills": fills_count,
-                 "reason": "STALE_DB_BUT_KIS_EMPTY",
-             },
-         )
-         emit_event(
-             as_of=now_kst().date().isoformat(),
-             event="stale_db_autoclosed",
-             env=env,
-             strategy=strategy,
-             kis_holdings_count=len(holdings_rows),
-             missing_codes=missing_codes,
-             ledger_position_count=len(ledger_codes),
-             db_position_count=len(position_codes),
-             closed_positions=closed_count,
-             orders=orders_count,
-             fills=fills_count,
-             reason="AUTO_CLOSED_STALE_KIS_EMPTY",
-         )
-         logger.warning(
-             "[PB1][RESET][STALE_DB] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s reason=%s",
-             env,
-             missing_codes,
-             closed_count,
-             "STALE_DB_BUT_KIS_EMPTY",
-         )
-         if kis is not None:
-             try:
-                 reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
-             except Exception:
-                 logger.exception("[PB1][RESET][STALE_DB] reconcile_today failed")
-         return False
-     closed_count = 0
-     if position_codes:
-         closed_count = positions_repo.close_positions(env=env, strategy=strategy, codes=sorted(position_codes))
-     for code in missing_codes:
-         ledger_repo.append_event(
-             env=env,
-             run_id=run_id,
-+            strategy=strategy,
-             event_type="ACCOUNT_RESET_POSITION_CLOSED",
-             ts=now_kst(),
-             code=code,
-             sid=1,
-             mode=1,
-             ok=True,
-             reasons=["account_reset_or_position_missing"],
-             payload_json={"source": "missing_position_reset"},
-         )
-     _write_account_reset_event(
-         bot_state_dir,
+             return None
+ 
+     payload_norm = _normalize_payload(payload.get("payload"))
+     members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
+     return {
+         "payload": payload_norm,
+         "members": members,
+         "source": "fallback:lkg",
+         "params": payload.get("params") or {"as_of": payload.get("as_of")},
+     }
+ 
+ 
+-def _fallback_from_sqlite(
+-    provider: SQLiteCacheProvider,
+-    env: str,
+-    strategy: str,
+-    *,
+-    reference_as_of: str,
+-    max_age_days: int,
+-) -> dict | None:
+-    payload = provider.load_latest_universe_cache(env, strategy, max_age_days=max_age_days, reference_as_of=reference_as_of)
+-    if not payload:
+-        return None
+-    payload_norm = _normalize_payload(payload.get("payload"))
+-    members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
+-    return {
+-        "payload": payload_norm,
+-        "members": members,
+-        "source": "fallback:sqlite_cache",
+-        "params": payload.get("params") or {"as_of": payload.get("as_of")},
+-    }
+-
+-
+ def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
+     try:
+         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
+         kosdaq_rows = provider.get_marketcap_top_with_meta("KOSDAQ", TARGETS["KOSDAQ"])
+     except Exception as exc:  # pragma: no cover - network/remote failure
+         logger.warning("[UNIVERSE][KIS][FAIL] %s", exc)
+         return None, str(exc)
+ 
+     if len(kospi_rows) < TARGETS["KOSPI"] or len(kosdaq_rows) < TARGETS["KOSDAQ"]:
+         reason = f"insufficient kospi={len(kospi_rows)} kosdaq={len(kosdaq_rows)}"
+         logger.warning("[UNIVERSE][KIS][INSUFFICIENT] %s target=%s", reason, TARGETS)
+         return None, reason
+ 
+     kospi_rows = kospi_rows[: TARGETS["KOSPI"]]
+     kosdaq_rows = kosdaq_rows[: TARGETS["KOSDAQ"]]
+     _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+     _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+ 
+     selected_by_market = {
+         "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+         "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+     }
+     payload = _normalize_payload(
          {
-             "ts": now_kst().isoformat(),
-             "env": env,
-             "strategy": strategy,
-             "reason": "account_reset_or_position_missing",
-             "kis_holdings_count": len(holdings_rows),
-             "missing_codes": missing_codes,
-             "ledger_position_count": len(ledger_codes),
-             "db_position_count": len(position_codes),
-             "closed_positions": closed_count,
-         },
-     )
-     logger.warning(
-         "[PB1][RESET][SAFE_EXIT] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s",
-diff --git a/trader/reconcile_kis.py b/trader/reconcile_kis.py
-index 7d7176dbcf791a4aa94ab012d7163ddfc6a9c805..f93eafcfdfdcb6f53e50f31c01e8e0f39596c6fd 100644
---- a/trader/reconcile_kis.py
-+++ b/trader/reconcile_kis.py
-@@ -136,50 +136,51 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
-         if filled_qty and filled_price is not None and side != "UNKNOWN":
-             fills_repo.upsert_fill(
-                 env=env,
-                 run_id=run_id,
-                 order_id=None,
-                 kis_odno=kis_odno,
-                 trade_id=str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None,
-                 code=code,
-                 market=market,
-                 side=side,
-                 qty=filled_qty,
-                 price=filled_price,
-                 fee=0.0,
-                 tax=0.0,
-                 filled_at=order_time,
-                 raw_json=row,
+             "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+@@ -567,108 +543,94 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
+     if provider_override:
+         if provider_override not in allowed_chain:
+             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
+         allowed_chain = [provider_override]
+     preferred_chain = _prefer_provider_order(allowed_chain)
+     if preferred_chain != list(allowed_chain):
+         logger.info(
+             "[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s preferred=%s",
+             env,
+             strategy,
+             allowed_chain,
+             preferred_chain,
+         )
+     else:
+         logger.info("[UNIVERSE][CHAIN] env=%s strategy=%s providers=%s", env, strategy, allowed_chain)
+ 
+     kis_provider: KISMarketcapTopProvider | None = None
+     if "kis_marketcap_top" in allowed_chain:
+         try:
+             kis_provider = KISMarketcapTopProvider(kis=KisAPI(), env=env)
+         except Exception as exc:
+             last_reason = f"kis_init_fail:{exc}"
+             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
+ 
+     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
+-    sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
+-
+     today = now_kst().date()
+     as_of_day = _parse_as_of_date(as_of_date) or today
+     for provider_name in preferred_chain:
+         result: dict | None = None
+         reason: str | None = None
+ 
+-        if as_of_day == today and provider_name in {"sqlite_cache", "lkg"}:
++        if as_of_day == today and provider_name in {"lkg"}:
+             logger.info(
+                 "[UNIVERSE][PROVIDER][SKIP] provider=%s reason=today_requires_fresh",
+                 provider_name,
              )
-             fill_count += 1
+             continue
+         if provider_name == "fdr_kospi100_kosdaq100":
+             result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
+         elif provider_name == "fdr_marketcap_top":
+             result, reason = _build_from_fdr(as_of_date, TARGETS)
+         elif provider_name == "kis_marketcap_top":
+             if not kis_provider:
+                 reason = last_reason or "kis_provider_unavailable"
+             else:
+                 result, reason = _build_from_kis(kis_provider, as_of_date)
+         elif provider_name == "lkg":
+             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
+             reason = "lkg_hit" if result else "lkg_miss"
+-        elif provider_name == "sqlite_cache":
+-            if sqlite_provider:
+-                result = _fallback_from_sqlite(
+-                    sqlite_provider,
+-                    env=env,
+-                    strategy=strategy,
+-                    reference_as_of=as_of_date,
+-                    max_age_days=FALLBACK_MAX_AGE_DAYS,
+-                )
+-            reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
+         elif provider_name == "seed_static":
+             result = _load_static_seed()
+             reason = "seed_static" if result else "seed_missing"
+         else:
+             logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
+             continue
  
-     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
-     if degraded_reason:
-         reasons.append(f"degraded:{degraded_reason}")
-     ledger_repo.append_event(
-         env=env,
-         run_id=run_id,
-+        strategy=strategy,
-         event_type="RECONCILE",
-         ts=now_kst(),
-         ok=True,
-         reasons=reasons,
-         payload_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
+         if result:
+             payload = result["payload"]
+             members = result["members"]
+             source = result.get("source", provider_name)
+             params.update(result.get("params") or {})
+             last_reason = reason or provider_name
+             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
+             if source in {"fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top"}:
+                 if ENABLE_LKG:
+                     try:
+                         lkg_provider.save(env, strategy, result)
+                     except Exception:
+                         logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
+-                if ENABLE_SQLITE_CACHE and sqlite_provider:
+-                    sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
+             break
+ 
+         last_reason = reason or provider_name
+         logger.warning("[UNIVERSE][PROVIDER][FAIL] env=%s provider=%s reason=%s", env, provider_name, last_reason)
+ 
+     validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
+     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
+     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
+     members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
+     logger.info(
+         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
+         stats["total_raw"],
+         stats["invalid_format"],
+         stats["insufficient_history"],
+         stats["final"],
      )
-     logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
-     reconcile_repo.append_log(
-         env=env,
-         strategy=strategy,
-         tick_ts=now_kst(),
-         action="reconcile_today",
-         details_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
-     )
-     return {"ok": True, "orders": order_count, "fills": fill_count, "degraded": degraded_reason}
+     invalid_codes = sanitize_detail.get("invalid_format_codes") or []
+     insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
+     if invalid_codes:
+         logger.info(
+             "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
+             len(invalid_codes),
+             invalid_codes[: min(5, len(invalid_codes))],
+         )
+     if insufficient_codes:
+diff --git a/trader/universe/capabilities.py b/trader/universe/capabilities.py
+index b113fb3610b9e9005d150aa359148b97c1ff703c..dc42dbd0ef2973bd3be80e5ee16464c7fb7243a6 100644
+--- a/trader/universe/capabilities.py
++++ b/trader/universe/capabilities.py
+@@ -1,11 +1,11 @@
+ from __future__ import annotations
+ 
+ ALLOWED_PROVIDER_CHAIN = {
+-    "practice": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
+-    "real": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top", "lkg", "sqlite_cache", "seed_static"],
++    "practice": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "lkg", "seed_static"],
++    "real": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top", "lkg", "seed_static"],
+ }
  
  
- def reconcile_kis(
-     *,
-     engine,
-     kis: KisAPI,
-     env: str,
-     run_id: str | None,
-     strategy: str,
-     tick_ts: datetime,
+ def providers_for_env(env: str) -> list[str]:
+     normalized = (env or "practice").lower()
+     return list(ALLOWED_PROVIDER_CHAIN.get(normalized, ALLOWED_PROVIDER_CHAIN["practice"]))
+diff --git a/trader/universe/providers/sqlite_cache_provider.py b/trader/universe/providers/sqlite_cache_provider.py
+deleted file mode 100644
+index a74246a982a70fdeb2e4e442ed2cf2837055aed6..0000000000000000000000000000000000000000
+--- a/trader/universe/providers/sqlite_cache_provider.py
++++ /dev/null
+@@ -1,127 +0,0 @@
+-from __future__ import annotations
+-
+-import json
+-import logging
+-import os
+-import sqlite3
+-from dataclasses import dataclass
+-from datetime import date, datetime
+-from pathlib import Path
+-from typing import Optional
+-
+-from trader.db import config as db_config
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-def _parse_as_of_date(val: str) -> date | None:
+-    """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+-    if not val:
+-        return None
+-    s = str(val).strip()
+-    try:
+-        if "-" in s:
+-            return datetime.fromisoformat(s).date()
+-        if len(s) == 8 and s.isdigit():
+-            return datetime.strptime(s, "%Y%m%d").date()
+-        return datetime.fromisoformat(s).date()
+-    except Exception:
+-        return None
+-
+-
+-def _default_db_path() -> Path:
+-    env_path = os.getenv("UNIVERSE_SQLITE_PATH")
+-    if env_path:
+-        return Path(env_path)
+-    return db_config.DEFAULT_SQLITE_PATH
+-
+-
+-def _ensure_table(conn: sqlite3.Connection) -> None:
+-    conn.execute(
+-        """
+-        CREATE TABLE IF NOT EXISTS universe_cache (
+-            env TEXT NOT NULL,
+-            strategy TEXT NOT NULL,
+-            as_of TEXT NOT NULL,
+-            payload_json TEXT NOT NULL,
+-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-            UNIQUE(env, strategy, as_of)
+-        )
+-        """
+-    )
+-    conn.commit()
+-
+-
+-@dataclass
+-class SQLiteCacheProvider:
+-    db_path: Path | None = None
+-
+-    def __post_init__(self) -> None:
+-        self.db_path = self.db_path or _default_db_path()
+-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+-
+-    def _connect(self) -> sqlite3.Connection:
+-        conn = sqlite3.connect(self.db_path)
+-        _ensure_table(conn)
+-        return conn
+-
+-    def save_universe_cache(self, env: str, strategy: str, as_of: str, payload: dict) -> None:
+-        try:
+-            with self._connect() as conn:
+-                conn.execute(
+-                    """
+-                    INSERT OR REPLACE INTO universe_cache(env, strategy, as_of, payload_json, created_at)
+-                    VALUES (?, ?, ?, ?, ?)
+-                    """,
+-                    (env, strategy, as_of, json.dumps(payload, ensure_ascii=False), datetime.utcnow().isoformat()),
+-                )
+-            logger.info("[UNIVERSE][SQLITE_CACHE][SAVE] env=%s strategy=%s as_of=%s path=%s", env, strategy, as_of, self.db_path)
+-        except Exception:
+-            logger.exception("[UNIVERSE][SQLITE_CACHE][SAVE_FAIL] env=%s strategy=%s as_of=%s path=%s", env, strategy, as_of, self.db_path)
+-
+-    def load_latest_universe_cache(
+-        self,
+-        env: str,
+-        strategy: str,
+-        max_age_days: int | None = None,
+-        reference_as_of: str | None = None,
+-    ) -> Optional[dict]:
+-        try:
+-            with self._connect() as conn:
+-                row = conn.execute(
+-                    """
+-                    SELECT payload_json, as_of, created_at
+-                    FROM universe_cache
+-                    WHERE env=? AND strategy=?
+-                    ORDER BY as_of DESC, created_at DESC
+-                    LIMIT 1
+-                    """,
+-                    (env, strategy),
+-                ).fetchone()
+-            if not row:
+-                logger.info("[UNIVERSE][SQLITE_CACHE][MISS] env=%s strategy=%s path=%s", env, strategy, self.db_path)
+-                return None
+-            payload = json.loads(row[0])
+-            if max_age_days is not None and reference_as_of:
+-                ref_d = _parse_as_of_date(str(reference_as_of))
+-                got_d = _parse_as_of_date(str(row[1]))
+-                if ref_d and got_d:
+-                    age = (ref_d - got_d).days
+-                    if age > int(max_age_days):
+-                        logger.info(
+-                            "[UNIVERSE][SQLITE_CACHE][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s path=%s",
+-                            env,
+-                            strategy,
+-                            row[1],
+-                            reference_as_of,
+-                            age,
+-                            max_age_days,
+-                            self.db_path,
+-                        )
+-                        return None
+-            logger.info("[UNIVERSE][SQLITE_CACHE][HIT] env=%s strategy=%s as_of=%s path=%s", env, strategy, row[1], self.db_path)
+-            return payload
+-        except Exception:
+-            logger.exception("[UNIVERSE][SQLITE_CACHE][LOAD_FAIL] env=%s strategy=%s path=%s", env, strategy, self.db_path)
+-            return None
+-

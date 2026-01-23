@@ -5,19 +5,15 @@ import logging
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
 
-from .config import is_sqlite_url
-
 logger = logging.getLogger(__name__)
 
 
 def try_acquire_lock(engine: Engine, key: str) -> bool:
     """
     Attempt to acquire a database-level advisory lock.
-    Falls back to a no-op lock on non-Postgres engines to keep local testing simple.
     """
-    url = str(engine.url)
-    if is_sqlite_url(url):
-        return True
+    if engine.dialect.name != "postgresql":
+        raise RuntimeError("Postgres is required for advisory locks.")
 
     try:
         with engine.begin() as conn:
@@ -30,8 +26,7 @@ def try_acquire_lock(engine: Engine, key: str) -> bool:
 
 
 def release_lock(engine: Engine, key: str) -> None:
-    url = str(engine.url)
-    if is_sqlite_url(url):
+    if engine.dialect.name != "postgresql":
         return
     try:
         with engine.begin() as conn:

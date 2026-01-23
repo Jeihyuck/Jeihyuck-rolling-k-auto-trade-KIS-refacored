@@ -1,8 +1,10 @@
+import os
 import sys
 from pathlib import Path
 
 import sqlalchemy as sa
 from datetime import datetime
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -12,7 +14,9 @@ from trader.db.schema import ORDERS, FILLS
 
 
 def test_orders_upsert_idempotent(tmp_path):
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
     engine = sa.create_engine(db_url)
     run_migrations(engine)
 
@@ -65,7 +69,9 @@ def test_orders_upsert_idempotent(tmp_path):
 
 
 def test_fills_upsert_idempotent(tmp_path):
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
     engine = sa.create_engine(db_url)
     run_migrations(engine)
 

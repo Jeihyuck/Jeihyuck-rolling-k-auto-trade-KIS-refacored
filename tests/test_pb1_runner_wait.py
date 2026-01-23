@@ -143,7 +143,8 @@ def test_wait_branch_does_not_crash(monkeypatch) -> None:
             get_price_quote=lambda *_, **__: {},
         ),
     )
-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
+    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 
@@ -183,7 +184,8 @@ def test_expect_live_guard_skipped_in_diag(monkeypatch) -> None:
             get_price_quote=lambda *_, **__: {},
         ),
     )
-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
+    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 
@@ -211,7 +213,8 @@ def test_schedule_event_does_not_wait(monkeypatch) -> None:
             get_price_quote=lambda *_, **__: {},
         ),
     )
-    dummy_engine = SimpleNamespace(url="sqlite:///tmp.db")
+    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
+    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
     monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
     monkeypatch.setattr(pb1_runner, "run_migrations", lambda *_, **__: None)
 

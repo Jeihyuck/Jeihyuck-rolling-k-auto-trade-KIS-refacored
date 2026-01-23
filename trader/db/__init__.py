@@ -2,8 +2,7 @@
 Database utilities for the PB-Core v2 backend.
 """
 
-from .config import get_database_url, get_db_echo, is_sqlite_url
-from .engine import make_engine
+from .engine import get_db_url, make_engine
 from .schema import (
     FILLS,
     LEDGER_EVENTS,
@@ -24,9 +23,7 @@ def run_migrations(engine, migrations_dir: str = "migrations"):
 
 
 __all__ = [
-    "get_database_url",
-    "get_db_echo",
-    "is_sqlite_url",
+    "get_db_url",
     "make_engine",
     "run_migrations",
     "FILLS",

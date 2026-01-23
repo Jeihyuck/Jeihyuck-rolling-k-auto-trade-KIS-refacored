@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from datetime import date, datetime
 from decimal import Decimal
@@ -7,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import sqlalchemy as sa
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -38,7 +40,9 @@ def test_json_sanitize_handles_complex_types() -> None:
 
 
 def test_create_intent_sanitizes_request_json(tmp_path) -> None:
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
     engine = sa.create_engine(db_url)
     run_migrations(engine)
 

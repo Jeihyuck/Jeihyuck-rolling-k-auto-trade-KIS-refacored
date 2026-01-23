@@ -24,7 +24,6 @@ from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq
 from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
-from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
 from trader.runtime_store import RuntimeStore
@@ -56,7 +55,6 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
         "fdr_marketcap_top",
         "seed_static",
         "lkg",
-        "sqlite_cache",
     ]
     ordered = [name for name in preferred if name in chain]
     tail = [name for name in chain if name not in ordered]
@@ -87,7 +85,6 @@ SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
 DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
 ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
-ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
 TICKER_PATTERN = re.compile(r"^\d{6}$")
 
 
@@ -412,27 +409,6 @@ def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, refere
     }
 
 
-def _fallback_from_sqlite(
-    provider: SQLiteCacheProvider,
-    env: str,
-    strategy: str,
-    *,
-    reference_as_of: str,
-    max_age_days: int,
-) -> dict | None:
-    payload = provider.load_latest_universe_cache(env, strategy, max_age_days=max_age_days, reference_as_of=reference_as_of)
-    if not payload:
-        return None
-    payload_norm = _normalize_payload(payload.get("payload"))
-    members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
-    return {
-        "payload": payload_norm,
-        "members": members,
-        "source": "fallback:sqlite_cache",
-        "params": payload.get("params") or {"as_of": payload.get("as_of")},
-    }
-
-
 def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
     try:
         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
@@ -589,15 +565,13 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 
     lkg_provider = LKGProvider(enabled=ENABLE_LKG)
-    sqlite_provider = SQLiteCacheProvider() if ENABLE_SQLITE_CACHE else None
-
     today = now_kst().date()
     as_of_day = _parse_as_of_date(as_of_date) or today
     for provider_name in preferred_chain:
         result: dict | None = None
         reason: str | None = None
 
-        if as_of_day == today and provider_name in {"sqlite_cache", "lkg"}:
+        if as_of_day == today and provider_name in {"lkg"}:
             logger.info(
                 "[UNIVERSE][PROVIDER][SKIP] provider=%s reason=today_requires_fresh",
                 provider_name,
@@ -615,16 +589,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         elif provider_name == "lkg":
             result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
             reason = "lkg_hit" if result else "lkg_miss"
-        elif provider_name == "sqlite_cache":
-            if sqlite_provider:
-                result = _fallback_from_sqlite(
-                    sqlite_provider,
-                    env=env,
-                    strategy=strategy,
-                    reference_as_of=as_of_date,
-                    max_age_days=FALLBACK_MAX_AGE_DAYS,
-                )
-            reason = "sqlite_cache_hit" if result else "sqlite_cache_miss"
         elif provider_name == "seed_static":
             result = _load_static_seed()
             reason = "seed_static" if result else "seed_missing"
@@ -645,8 +609,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                         lkg_provider.save(env, strategy, result)
                     except Exception:
                         logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
-                if ENABLE_SQLITE_CACHE and sqlite_provider:
-                    sqlite_provider.save_universe_cache(env, strategy, as_of_date, result)
             break
 
         last_reason = reason or provider_name

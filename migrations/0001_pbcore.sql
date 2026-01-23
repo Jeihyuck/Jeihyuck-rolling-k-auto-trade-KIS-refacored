@@ -1,5 +1,4 @@
 -- PB-Core v2 base schema
--- Enum placeholders as TEXT to keep compatibility with sqlite tests.
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,

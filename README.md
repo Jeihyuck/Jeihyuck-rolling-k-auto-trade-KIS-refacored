@@ -67,6 +67,6 @@ Key log markers for grep:
 
 ## Smoke commands
 ```
-DATABASE_URL=sqlite:///./dev.db python -m trader.db.migrate
-DATABASE_URL=sqlite:///./dev.db python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
+PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.db.migrate
+PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
 ```

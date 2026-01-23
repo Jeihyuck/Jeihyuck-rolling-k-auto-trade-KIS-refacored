@@ -1,11 +1,16 @@
+import os
+
+import pytest
+
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
 
 
 def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
-    db_url = f"sqlite:///{tmp_path}/test.db"
-    monkeypatch.setenv("DATABASE_URL", db_url)
+    db_url = os.getenv("PBCORE_DB_URL")
+    if not db_url:
+        pytest.skip("PBCORE_DB_URL not set for Postgres-backed test")
 
     engine = make_engine()
     run_migrations(engine)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import stat
 from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Dict
@@ -300,19 +299,6 @@ STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else botstate_path("runtime")
 STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
 ensure_not_repo_tracked_path(STATE_PATH)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-_db_path_env = os.getenv("PBCORE_DB_PATH")
-if _db_path_env:
-    _db_path = Path(_db_path_env).expanduser().resolve()
-else:
-    _db_path = botstate_path("db", "pbcore.sqlite3").expanduser().resolve()
-PBCORE_DB_PATH = str(_db_path)
-_db_path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    os.chmod(_db_path.parent, _db_path.parent.stat().st_mode | stat.S_IWUSR)
-    if _db_path.exists():
-        os.chmod(_db_path, _db_path.stat().st_mode | stat.S_IWUSR)
-except Exception:
-    pass
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # 종목별 시장코드 고정 맵 (실전에서는 마스터테이블 로드로 대체 권장)

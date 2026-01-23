@@ -9,7 +9,6 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy import Engine
 
-from . import config
 
 
 def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
@@ -284,7 +283,7 @@ def metadata_for_url(database_url: str) -> sa.MetaData:
     return schema_for_url(database_url).metadata
 
 
-DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+DEFAULT_DATABASE_URL = os.getenv("PBCORE_DB_URL", "postgresql+psycopg://")
 DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
 
 METADATA = DEFAULT_SCHEMA.metadata

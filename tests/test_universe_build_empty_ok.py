@@ -8,14 +8,26 @@ from trader.universe import build
 
 @pytest.fixture(autouse=True)
 def reset_env(tmp_path, monkeypatch):
-    db_url = f"sqlite:///{tmp_path}/test.db"
-    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
     yield
 
 
 def test_build_universe_succeeds_on_empty_payload(monkeypatch):
+    class FakeUniverseRepo:
+        def __init__(self, _engine):
+            return None
+
+        def store_universe_snapshot(self, **_kwargs):
+            return "fake-run"
+
+        def cleanup_old_runs(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(build, "make_engine", lambda: None)
+    monkeypatch.setattr(build, "run_migrations", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(build, "UniverseRepo", FakeUniverseRepo)
     monkeypatch.setattr(
         build,
         "run_rebalance",

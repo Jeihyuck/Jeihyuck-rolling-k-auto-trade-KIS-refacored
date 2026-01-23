@@ -56,7 +56,7 @@ jobs:
 
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
@@ -257,7 +257,7 @@ jobs:
 
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
@@ -461,7 +461,7 @@ jobs:
           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
-          PBCORE_DB_PATH: ${{ env.BOT_STATE_DIR }}/db/pbcore.sqlite3
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
           STATE_PATH: bot_state/runtime/state.json
           LOT_STATE_PATH: bot_state/runtime/lot_state.json
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
@@ -497,23 +497,6 @@ jobs:
           find bot_state -maxdepth 3 -type f -print || true
           echo "=== git status (workspace) ==="
           git status --porcelain || true
-
-      - name: Debug botstate DB existence (worktree)
-        if: always()
-        run: |
-          set -euo pipefail
-          echo "BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
-          echo "BOT_STATE_DIR=$BOT_STATE_DIR"
-          echo "PBCORE_DB_PATH=$PBCORE_DB_PATH"
-          echo "---- ls bot_state/db ----"
-          ls -la "$BOT_STATE_DIR/db" || true
-          echo "---- find pbcore.sqlite3 under worktree ----"
-          cd "$BOTSTATE_WORKTREE_DIR"
-          find . -name "pbcore.sqlite3" -maxdepth 5 -print || true
-          echo "---- stat (if exists) ----"
-          if [ -f "$PBCORE_DB_PATH" ]; then
-            stat "$PBCORE_DB_PATH" || true
-          fi
 
       - name: Persist bot_state (stage untracked + commit/push)
         if: always() && (env.PERSIST_MODE != 'OFF')
@@ -562,7 +545,7 @@ jobs:
 
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
-      PBCORE_DB_PATH: "bot_state/db/pbcore.sqlite3"
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       TRADER_CACHE_ROOT: "bot_state/runtime"
       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
@@ -666,7 +649,7 @@ jobs:
           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
-          PBCORE_DB_PATH: ${{ env.BOT_STATE_DIR }}/db/pbcore.sqlite3
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
           STATE_PATH: bot_state/runtime/state.json
           LOT_STATE_PATH: bot_state/runtime/lot_state.json
 

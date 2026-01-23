@@ -18,3 +18,11 @@ runtime/ohlcv_cache/**
 archive/
 db/*.readonly.bak.*
 db/*.bak*
+
+# Runtime DB artifacts (should never be created)
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm

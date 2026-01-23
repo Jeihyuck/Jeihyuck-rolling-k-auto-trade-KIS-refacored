@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import logging
 import os
-from pathlib import Path
 import time
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
@@ -11,7 +10,6 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy import Engine, and_, func, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
@@ -27,8 +25,7 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
-from .migrate import ensure_sqlite_writable, run_migrations
-from . import config
+from .migrate import run_migrations
 from trader.time_utils import now_kst
 from trader.db.json_safe import json_sanitize
 
@@ -38,45 +35,6 @@ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
-
-
-def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
-    message = str(exc).lower()
-    if "readonly" not in message:
-        return False
-    return config.is_sqlite_url(str(engine.url))
-
-
-def _recover_sqlite_readonly(engine: Engine) -> bool:
-    url = str(engine.url)
-    if not config.is_sqlite_url(url):
-        return False
-    db_path = Path(engine.url.database or "")
-    if not db_path:
-        return False
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.readonly.bak.{ts}")
-    try:
-        if db_path.exists():
-            db_path.rename(backup_path)
-            logger.warning("[DB][READONLY][BACKUP] backup=%s", backup_path)
-    except Exception:
-        logger.warning("[DB][READONLY][BACKUP_FAIL] path=%s", db_path, exc_info=True)
-
-    for suffix in ("-wal", "-shm"):
-        sidecar = Path(f"{db_path}{suffix}")
-        if sidecar.exists():
-            try:
-                sidecar.unlink()
-            except Exception:
-                logger.warning("[DB][READONLY][SIDECAR_REMOVE_FAIL] path=%s", sidecar, exc_info=True)
-    try:
-        engine.dispose()
-    except Exception:
-        logger.warning("[DB][READONLY][DISPOSE_FAIL] url=%s", url, exc_info=True)
-    ensure_sqlite_writable(db_path)
-    run_migrations(engine)
-    return True
 
 
 def ensure_run(
@@ -104,13 +62,7 @@ def ensure_run(
         "started_at": ts,
     }
     if conn.dialect.name == "postgresql":
-        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(
-            index_elements=["run_id"]
-        )
-    elif conn.dialect.name == "sqlite":
-        insert_stmt = sqlite_insert(schema.runs).values(**values).on_conflict_do_nothing(
-            index_elements=["run_id"]
-        )
+        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(index_elements=["run_id"])
     else:
         insert_stmt = sa.insert(schema.runs).values(**values)
     try:
@@ -199,10 +151,7 @@ class RunsRepo:
                     res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
                     run_id = res.scalar() or run_id
                     return str(run_id)
-                except OperationalError as exc:
-                    if attempt == 0 and _is_sqlite_readonly(exc, self.engine):
-                        _recover_sqlite_readonly(self.engine)
-                        continue
+                except OperationalError:
                     raise
                 except Exception:
                     conn.execute(stmt)
@@ -324,7 +273,7 @@ class UniverseRepo:
                         updated_ts=now_kst().isoformat(),
                     )
                 else:
-                    insert_stmt = sqlite_insert(self._schema.universe_current).values(
+                    insert_stmt = sa.insert(self._schema.universe_current).values(
                         strategy=strategy_key,
                         run_id=uuid_value_for_url(db_url, run_id),
                         updated_ts=now_kst().isoformat(),
@@ -581,7 +530,7 @@ class OrdersRepo:
         if self.engine.dialect.name == "postgresql":
             insert_stmt = pg_insert(self._schema.orders).values(**payload)
         else:
-            insert_stmt = sqlite_insert(self._schema.orders).values(**payload)
+            insert_stmt = sa.insert(self._schema.orders).values(**payload)
         stmt = insert_stmt.on_conflict_do_update(
             index_elements=conflict_cols,
             set_=update_cols,
@@ -686,7 +635,7 @@ class FillsRepo:
         if self.engine.dialect.name == "postgresql":
             insert_stmt = pg_insert(self._schema.fills).values(**payload)
         else:
-            insert_stmt = sqlite_insert(self._schema.fills).values(**payload)
+            insert_stmt = sa.insert(self._schema.fills).values(**payload)
         stmt = insert_stmt.on_conflict_do_update(
             index_elements=conflict_cols,
             set_=update_cols,

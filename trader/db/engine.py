@@ -1,23 +1,27 @@
-from sqlalchemy import Engine, create_engine, event
+import os
 
-from . import config
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 
-def make_engine(database_url: str | None = None) -> Engine:
-    url = database_url or config.get_database_url()
-    kwargs = {}
-    if not config.is_sqlite_url(url):
-        kwargs["pool_pre_ping"] = True
-        kwargs["pool_size"] = 5
-        kwargs["max_overflow"] = 10
-    engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
-    if config.is_sqlite_url(url):
-        @event.listens_for(engine, "connect")
-        def _set_sqlite_pragma(dbapi_conn, _connection_record) -> None:
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON;")
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA synchronous=NORMAL;")
-            cursor.execute("PRAGMA busy_timeout=5000;")
-            cursor.close()
-    return engine
+def _db_echo() -> bool:
+    return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def get_db_url() -> str:
+    url = os.getenv("PBCORE_DB_URL", "").strip()
+    if not url:
+        raise RuntimeError("PBCORE_DB_URL is required. SQLite fallback is disabled by design.")
+    if url.startswith("sqlite:"):
+        raise RuntimeError("SQLite is forbidden. Use Postgres only.")
+    return url
+
+
+def make_engine() -> Engine:
+    url = get_db_url()
+    return create_engine(
+        url,
+        echo=_db_echo(),
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
