@@ -5,6 +5,9 @@
     },
     "POST /uapi/domestic-stock/v1/trading/order-cash": {
       "failures": []
+    },
+    "GET /uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice": {
+      "failures": []
     }
   }
 }
