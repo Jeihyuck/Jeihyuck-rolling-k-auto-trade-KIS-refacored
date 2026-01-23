@@ -42,6 +42,8 @@ bot_state/runtime/**
 !bot_state/runtime/status/**
 !bot_state/runtime/universe/
 !bot_state/runtime/universe/**
+!bot_state/runtime/reports/
+!bot_state/runtime/reports/**
 !bot_state/runtime/balance_snapshot.json
 !bot_state/runtime/schema_version.txt
 
@@ -63,8 +65,9 @@ __pycache__/
 ALLOWLIST_PATTERNS = [
     "bot_state/db/pbcore.sqlite3",
     "bot_state/runtime/events/*.jsonl",
-    "bot_state/runtime/status/*.json",
+    "bot_state/runtime/status/**",
     "bot_state/runtime/universe/*.json",
+    "bot_state/runtime/reports/**",
     "bot_state/universe_lkg/**/latest.json",
     "bot_state/runtime/balance_snapshot.json",
     "bot_state/runtime/schema_version.txt",

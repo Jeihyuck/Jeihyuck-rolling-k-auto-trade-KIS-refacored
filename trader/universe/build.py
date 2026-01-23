@@ -37,6 +37,7 @@ from trader.factors.rs_rank import rank_rs
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
+from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
 from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
@@ -71,8 +72,9 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
         "sqlite_cache": 10,
         "lkg": 20,
         # live providers
-        "fdr_marketcap_top": 30,
-        "kis_marketcap_top": 30,
+        "fdr_kospi100_kosdaq100": 30,
+        "fdr_marketcap_top": 31,
+        "kis_marketcap_top": 31,
         # ultimate fallback
         "seed_static": 90,
     }
@@ -101,7 +103,7 @@ SEED_DIR = _resolve_seed_dir()
 SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
-DEFAULT_PROVIDER = "fdr_marketcap_top"
+DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
 ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
 ENABLE_SQLITE_CACHE = os.getenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1").lower() not in {"0", "false", "off"}
 TICKER_PATTERN = re.compile(r"^\d{6}$")
@@ -598,6 +600,44 @@ def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | No
     return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
 
 
+def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict | None, str]:
+    try:
+        rows_by_market = fetch_kospi100_kosdaq100(target=target)
+    except Exception as exc:  # pragma: no cover - network/remote failure
+        logger.warning("[UNIVERSE][FDR-KOSPI100][FAIL] as_of=%s err=%s", as_of_date, exc)
+        return None, "fdr_kospi100_fetch_fail"
+
+    if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
+        return None, "fdr_kospi100_rows_missing"
+
+    kospi_rows = rows_by_market["KOSPI"][:target]
+    kosdaq_rows = rows_by_market["KOSDAQ"][:target]
+    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
+    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
+
+    selected_by_market = {
+        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
+        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
+    }
+    payload = _normalize_payload(
+        {
+            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
+            "selected_by_market": selected_by_market,
+        }
+    )
+    params = {"as_of": as_of_date, "target": target}
+    members = _build_members_from_payload(selected_by_market)
+    return (
+        {
+            "payload": payload,
+            "members": members,
+            "source": "fdr_kospi100_kosdaq100",
+            "params": params,
+        },
+        "fdr_kospi100_kosdaq100",
+    )
+
+
 def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> str | None:
     engine = make_engine()
     run_migrations(engine)
@@ -652,7 +692,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         result: dict | None = None
         reason: str | None = None
 
-        if provider_name == "fdr_marketcap_top":
+        if provider_name == "fdr_kospi100_kosdaq100":
+            result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
+        elif provider_name == "fdr_marketcap_top":
             result, reason = _build_from_fdr(as_of_date, TARGETS)
         elif provider_name == "kis_marketcap_top":
             if not kis_provider:
@@ -686,7 +728,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             params.update(result.get("params") or {})
             last_reason = reason or provider_name
             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
-            if source in {"fdr_marketcap_top", "kis_marketcap_top"}:
+            if source in {"fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top"}:
                 if ENABLE_LKG:
                     try:
                         lkg_provider.save(env, strategy, result)

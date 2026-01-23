@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List
 import numpy as np
 import pandas as pd
 
-from trader.botstate_paths import close_entry_orders_path
+from trader.botstate_paths import botstate_path, close_entry_orders_path
 from trader.config import (
     CAP_CAP,
     LEDGER_BASE_DIR,
@@ -118,6 +118,7 @@ from trader.strategies.pb1_minervini_v2 import (
 )
 from trader.time_utils import now_kst
 from trader.core_utils import _round_to_tick
+from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
 from trader.utils.env import env_bool
 from trader.utils.json_sanitize import to_jsonable
@@ -1437,6 +1438,177 @@ class PB1Engine:
         return counts
 
     @staticmethod
+    def _map_minervini_reasons(reasons: Iterable[str] | None) -> list[str]:
+        mapping = {
+            "rs_below_min": "RS_BELOW",
+            "trend_template_fail": "TREND_FAIL",
+            "ma200_not_rising": "MA200_NOT_RISING",
+            "illiquid": "LIQ_FAIL",
+            "liquidity_fail": "LIQ_FAIL",
+            "gap_fail": "GAP_FAIL",
+            "spread_fail": "SPREAD_FAIL",
+            "range_fail": "RANGE_FAIL",
+            "vcp_fail": "VCP_SCORE_LOW",
+            "score_below_min": "SCORE_BELOW_MIN",
+            "score_below_cut": "SCORE_BELOW_CUT",
+            "price_scale_outlier": "PRICE_SCALE_OUTLIER",
+            "insufficient_candles": "INSUFFICIENT_CANDLES",
+            "data_empty": "DATA_MISSING",
+            "planned_qty_zero_or_min_order": "MIN_ORDER_FAIL",
+            "atr_pct_too_high": "ATR_TOO_HIGH",
+            "liquidity_too_low": "LIQ_TOO_LOW",
+        }
+        mapped = []
+        for reason in reasons or []:
+            mapped.append(mapping.get(reason, str(reason).upper()))
+        if not mapped:
+            mapped = ["UNSPECIFIED_FAIL"]
+        return mapped
+
+    @staticmethod
+    def _exit_reason_code(reason: str) -> str:
+        mapping = {
+            "STOP_HIT": ReasonCode.EXIT_STOP_LOSS,
+            "FAILED_BREAKOUT": ReasonCode.EXIT_STOP_LOSS,
+            "TP1": ReasonCode.EXIT_TP_PARTIAL,
+            "TP2": ReasonCode.EXIT_TP_PARTIAL,
+            "climax_partial": ReasonCode.EXIT_TP_PARTIAL,
+            "time_stop": ReasonCode.EXIT_TIME,
+            "ma50_break_heavy_volume": ReasonCode.EXIT_REGIME,
+        }
+        return mapping.get(reason, ReasonCode.EXIT_TRAIL)
+
+    def _log_minervini_stats(
+        self,
+        *,
+        pool_count: int,
+        candidates: list[CandidateFeature],
+        final_candidates: list[CandidateFeature],
+    ) -> None:
+        liq_pass = 0
+        rs_pass = 0
+        vcp_pass = 0
+        for cf in candidates:
+            if not cf.features.get("data_ok"):
+                continue
+            if all(
+                [
+                    cf.features.get("liq_ok"),
+                    cf.features.get("gap_ok"),
+                    cf.features.get("spread_ok"),
+                    cf.features.get("range_ok"),
+                ]
+            ):
+                liq_pass += 1
+            rs_pctile = cf.features.get("rs_pctile")
+            if rs_pctile is not None and float(rs_pctile) >= float(RS_MIN_PCTILE):
+                rs_pass += 1
+            vcp_score = cf.features.get("vcp_score")
+            if is_vcp_ready(vcp_score or 0.0, VCP_MIN_SCORE):
+                vcp_pass += 1
+        regime_pass = liq_pass if float(getattr(self, "_regime_risk_mult", 1.0)) > 0 else 0
+        logger.info(
+            "[MINERVINI][STATS] pool=%s liq_pass=%s regime_pass=%s rs_pass=%s vcp_pass=%s final=%s",
+            pool_count,
+            liq_pass,
+            regime_pass,
+            rs_pass,
+            vcp_pass,
+            len(final_candidates),
+        )
+
+    def _write_minervini_report(
+        self,
+        *,
+        as_of: str,
+        members: list[dict],
+        candidates: list[CandidateFeature],
+        final_candidates: list[CandidateFeature],
+        selected_thresholds: FilterThresholds,
+        applied_min_score: float,
+        applied_require_both: bool,
+        tiers_tried: list[str],
+        relax_passes_used: int,
+    ) -> str | None:
+        report_dir = botstate_path("runtime", "reports", "minervini", as_of)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / "minervini_report.json"
+
+        candidates_payload: list[dict] = []
+        rejected_payload: list[dict] = []
+        reason_counts: Counter[str] = Counter()
+
+        name_map = {
+            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
+            for m in members
+        }
+
+        for cf in candidates:
+            metrics = {
+                "rs_pctile": cf.features.get("rs_pctile"),
+                "rs_comp": cf.features.get("rs_comp"),
+                "vcp_score": cf.features.get("vcp_score"),
+                "vcp_ok": cf.features.get("vcp_ok"),
+                "pivot": cf.features.get("pivot"),
+                "close": cf.features.get("close"),
+                "ma50": cf.features.get("ma50"),
+                "ma150": cf.features.get("ma150"),
+                "ma200": cf.features.get("ma200"),
+                "atr_pct": cf.features.get("atr_pct"),
+                "value20": cf.features.get("value20"),
+            }
+            if cf.setup_ok:
+                candidates_payload.append(
+                    {
+                        "code": cf.code,
+                        "name": name_map.get(cf.code),
+                        "score": float(cf.features.get("score") or 0.0),
+                        "metrics": metrics,
+                    }
+                )
+            else:
+                mapped_reasons = self._map_minervini_reasons(cf.reasons)
+                for reason in mapped_reasons:
+                    reason_counts[reason] += 1
+                rejected_payload.append(
+                    {
+                        "code": cf.code,
+                        "name": name_map.get(cf.code),
+                        "reasons": mapped_reasons,
+                        "metrics": metrics,
+                    }
+                )
+
+        params = {
+            "thresholds": {
+                "vol_max": selected_thresholds.vol_contraction_max,
+                "volu_max": selected_thresholds.volu_contraction_max,
+                "pullback_min": selected_thresholds.pullback_min,
+                "pullback_max": selected_thresholds.pullback_max,
+                "require_both": selected_thresholds.require_both_contractions,
+            },
+            "min_score": applied_min_score,
+            "require_both": applied_require_both,
+            "tiers_tried": tiers_tried,
+            "relax_passes_used": relax_passes_used,
+            "config": self.minervini_config.__dict__,
+        }
+
+        payload = {
+            "as_of": as_of,
+            "pool": len(members),
+            "final": len(final_candidates),
+            "benchmark": RS_BENCHMARK,
+            "params": params,
+            "candidates": candidates_payload,
+            "rejected": rejected_payload,
+            "reason_counts": dict(reason_counts),
+        }
+        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[MINERVINI][REPORT] path=%s candidates=%s rejected=%s", report_path, len(candidates_payload), len(rejected_payload))
+        return str(report_path)
+
+    @staticmethod
     def _normalize_setup_score(raw_score: float) -> float:
         try:
             return float(min(100.0, max(0.0, raw_score)))
@@ -2012,6 +2184,18 @@ class PB1Engine:
 
     def _place_entry(self, cf: CandidateFeature) -> None:
         display_code = self._display_code(cf.code)
+        logger.info(
+            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f",
+            display_code,
+            self._code_name_map.get(cf.code),
+            ReasonCode.ENTRY_BREAKOUT,
+            float(cf.features.get("score") or 0.0),
+            float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+            float(cf.features.get("stop_price") or 0.0),
+            float(RISK_PER_TRADE_PCT),
+            cf.planned_qty,
+            float(cf.features.get("planned_cap") or 0.0),
+        )
         reasons = cf.reasons or []
         features_snapshot = {
             k: cf.features.get(k)
@@ -2115,6 +2299,13 @@ class PB1Engine:
             return
         if self.dry_run:
             logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
+            logger.info(
+                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                display_code,
+                order_id,
+                cf.planned_qty,
+                float(limit_price or entry_price or 0.0),
+            )
             return
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
@@ -2164,6 +2355,14 @@ class PB1Engine:
             rt_cd,
             msg_cd,
             msg1,
+        )
+        logger.info(
+            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
+            display_code,
+            kis_odno or order_id,
+            cf.planned_qty,
+            float(limit_price or entry_price or 0.0),
+            "ACCEPTED" if ok else "REJECTED",
         )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -2231,6 +2430,13 @@ class PB1Engine:
                 code=cf.code,
                 fields=fields,
             )
+            logger.info(
+                "[TRADE][FILL][BUY] code=%s oid=%s fill_qty=%s fill_px=%.2f",
+                display_code,
+                kis_odno or order_id,
+                cf.planned_qty,
+                float(record_price or 0.0),
+            )
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
 
@@ -2239,6 +2445,14 @@ class PB1Engine:
         if not code or qty <= 0:
             return
         display_code = self._display_code(code)
+        logger.info(
+            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s price=%.2f qty=%s",
+            display_code,
+            self._code_name_map.get(code),
+            ReasonCode.ENTRY_PYRAMID,
+            float(price or 0.0),
+            qty,
+        )
         mode = int(pos.get("mode") or 1)
         pyramid_level = int(pos.get("pyramid_level") or 0)
         client_key = self._client_order_key(code, mode, "BUY", f"add{pyramid_level + 1}", "PB1")
@@ -2272,6 +2486,13 @@ class PB1Engine:
             return
         if self.dry_run:
             logger.info("[PB1][ADD-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+            logger.info(
+                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                display_code,
+                order_id,
+                qty,
+                float(limit_price or price or 0.0),
+            )
             return
         if not self.kis:
             logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
@@ -2295,6 +2516,14 @@ class PB1Engine:
             logger.exception("[PB1][ADD][FAIL] code=%s", display_code)
         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        logger.info(
+            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
+            display_code,
+            kis_odno or order_id,
+            qty,
+            float(limit_price or price or 0.0),
+            "ACCEPTED" if ok else "REJECTED",
+        )
         if ok:
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
             filled_at = now_kst()
@@ -2346,6 +2575,13 @@ class PB1Engine:
                     "last_stop_update_ts": filled_at.isoformat(),
                 },
             )
+            logger.info(
+                "[TRADE][FILL][BUY] code=%s oid=%s fill_qty=%s fill_px=%.2f",
+                display_code,
+                kis_odno or order_id,
+                qty,
+                float(fill_price or 0.0),
+            )
         else:
             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
 
@@ -2357,6 +2593,16 @@ class PB1Engine:
 
     def _place_entry_close(self, cf: CandidateFeature) -> None:
         display_code = self._display_code(cf.code)
+        logger.info(
+            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s",
+            display_code,
+            self._code_name_map.get(cf.code),
+            ReasonCode.ENTRY_BREAKOUT,
+            float(cf.features.get("score") or 0.0),
+            float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+            float(cf.features.get("stop_price") or 0.0),
+            cf.planned_qty,
+        )
         cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
         ref_daily_close = cf.features.get("close")
         snap = self.kis.get_quote_snapshot(cf.code) if self.kis else {}
@@ -2436,6 +2682,13 @@ class PB1Engine:
                 cf.client_order_key,
                 order_id,
             )
+            logger.info(
+                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                display_code,
+                order_id,
+                cf.planned_qty,
+                float(cap or 0.0),
+            )
             return
         if not self.kis:
             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
@@ -2482,6 +2735,14 @@ class PB1Engine:
             rt_cd,
             msg_cd,
             msg1,
+        )
+        logger.info(
+            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
+            display_code,
+            kis_odno or order_id,
+            cf.planned_qty,
+            float(cap or 0.0),
+            "ACCEPTED" if ok else "REJECTED",
         )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
@@ -2662,6 +2923,24 @@ class PB1Engine:
             else:
                 decision_reasons = ["ok_hold"]
 
+        if should_sell and decision_reasons:
+            reason_primary = decision_reasons[0]
+            reason_code = self._exit_reason_code(reason_primary)
+            decision_tag = "SELL"
+            if reason_primary in {"TP1", "TP2", "climax_partial"} or stage.startswith("PARTIAL"):
+                decision_tag = "SELL_PARTIAL"
+            logger.info(
+                "[TRADE][DECISION][%s] code=%s reason=%s stop=%s last=%s pnl_pct=%.2f qty=%s stage=%s",
+                decision_tag,
+                display_code,
+                reason_code,
+                stop_price,
+                mark,
+                ret_pct,
+                qty,
+                stage,
+            )
+
         emit_event(
             as_of=self._today,
             event="PB1_SELL_DECISION",
@@ -2804,6 +3083,13 @@ class PB1Engine:
         )
         if self.dry_run:
             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+            logger.info(
+                "[TRADE][ORDER][SELL] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                display_code,
+                order_id,
+                qty,
+                float(mark or 0.0),
+            )
             return
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
@@ -2851,6 +3137,14 @@ class PB1Engine:
             msg_cd,
             msg1,
         )
+        logger.info(
+            "[TRADE][ORDER][SELL] code=%s oid=%s qty=%s price=%.2f result=%s",
+            display_code,
+            kis_odno or order_id,
+            qty,
+            float(mark or 0.0),
+            "ACCEPTED" if ok else "REJECTED",
+        )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
             filled_at = now_kst()
@@ -2883,6 +3177,13 @@ class PB1Engine:
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
+            )
+            logger.info(
+                "[TRADE][FILL][SELL] code=%s oid=%s fill_qty=%s fill_px=%.2f",
+                display_code,
+                kis_odno or order_id,
+                qty,
+                float(mark or 0.0),
             )
         else:
             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
@@ -3452,6 +3753,7 @@ class PB1Engine:
         after_buyable_check_count = 0
         after_dedup_count = 0
         orderable_candidates: list[CandidateFeature] = []
+        minervini_report_path: str | None = None
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             candidates = self._compute_candidates(members)
             (
@@ -3474,6 +3776,36 @@ class PB1Engine:
                 reverse=True,
             )
             after_risk_check_count = len(ok_after_risk)
+            self._log_minervini_stats(
+                pool_count=len(members),
+                candidates=candidates,
+                final_candidates=ok_after_risk,
+            )
+            reject_summary = Counter()
+            for cf in candidates:
+                if cf.setup_ok:
+                    continue
+                for reason in self._map_minervini_reasons(cf.reasons):
+                    reject_summary[reason] += 1
+            summary_text = " ".join([f"{key}={count}" for key, count in reject_summary.most_common(10)]) or "(none)"
+            logger.info("[MINERVINI][REJECT_SUMMARY] %s", summary_text)
+            candidate_codes = [cf.code for cf in ok_after_risk]
+            logger.info(
+                "[MINERVINI][CANDIDATES] n=%s codes=%s",
+                len(candidate_codes),
+                ", ".join(candidate_codes) if candidate_codes else "(no candidates)",
+            )
+            minervini_report_path = self._write_minervini_report(
+                as_of=self._today,
+                members=members,
+                candidates=candidates,
+                final_candidates=ok_after_risk,
+                selected_thresholds=selected_thresholds,
+                applied_min_score=applied_min_score,
+                applied_require_both=applied_require_both,
+                tiers_tried=tiers_tried,
+                relax_passes_used=relax_passes_used,
+            )
             self.top_candidates = [
                 {
                     "code": cf.code,
@@ -3806,6 +4138,13 @@ class PB1Engine:
                     top_reasons or "none",
                 )
                 if self.phase in {"prep", "entry"}:
+                    logger.info(
+                        "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
+                        ReasonCode.SKIP_NO_CANDIDATES,
+                        len(members),
+                        ok_count,
+                        minervini_report_path or "none",
+                    )
                     self._log_reason_summary(final_notes)
                     _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
                     _emit_entry_decision(
@@ -3850,6 +4189,14 @@ class PB1Engine:
                         no_orders_reasons or ["none"],
                     )
                     if self.phase in {"prep", "entry"}:
+                        if ok_count == 0:
+                            logger.info(
+                                "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
+                                ReasonCode.SKIP_NO_CANDIDATES,
+                                len(members),
+                                ok_count,
+                                minervini_report_path or "none",
+                            )
                         self._log_reason_summary(final_notes)
                         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
                         blocked_by = _normalize_entry_block_counts(drop_reason_counter)

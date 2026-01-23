@@ -216,6 +216,74 @@ class RuntimeStore:
         meta["members"] = len(members)
         return members, meta
 
+    def ensure_universe(
+        self,
+        *,
+        as_of: str,
+        env: str,
+        strategy: str,
+        provider_override: str | None = None,
+    ) -> dict:
+        ok, meta = self.universe_check(as_of)
+        if not ok:
+            return meta
+        today_members = int(meta.get("members") or 0)
+        if today_members > 0:
+            return meta
+        if not meta.get("have_today"):
+            return meta
+
+        flag_rel = Path("runtime") / "status" / f"universe_rebuild_{as_of}.flag"
+        flag = self.base_dir / flag_rel
+        if flag.exists():
+            logger.info("[UNIVERSE][REBUILD_SKIP] as_of=%s flag=%s", as_of, flag)
+            return meta
+
+        logger.info("[UNIVERSE][EMPTY_FATAL] today_universe_members=0 -> rebuild_once")
+        self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
+        try:
+            from trader.universe import build as universe_build
+        except Exception:
+            logger.exception("[UNIVERSE][REBUILD_FAIL] import_error=1")
+            return meta
+
+        prev_bot_state = os.environ.get("BOT_STATE_DIR")
+        os.environ["BOT_STATE_DIR"] = str(self.base_dir)
+        os.environ.setdefault("BOTSTATE_ROOT", str(self.base_dir))
+        try:
+            universe_build.build_universe(
+                as_of_date=as_of,
+                env=env,
+                strategy=strategy,
+                provider_override=provider_override,
+            )
+        finally:
+            if prev_bot_state is None:
+                os.environ.pop("BOT_STATE_DIR", None)
+            else:
+                os.environ["BOT_STATE_DIR"] = prev_bot_state
+
+        members, post_meta = self.load_today_universe(as_of)
+        source = None
+        try:
+            today_path = Path(post_meta.get("today_path") or "")
+            if today_path.exists():
+                data = json.loads(today_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    source = data.get("source")
+        except Exception:
+            logger.exception("[UNIVERSE][REBUILD][LOAD_FAIL] as_of=%s", as_of)
+        if members:
+            logger.info(
+                "[UNIVERSE][REBUILD_DONE] members=%s provider=%s",
+                len(members),
+                source or "unknown",
+            )
+        else:
+            logger.warning("[UNIVERSE][REBUILD_FAILED] members=0 -> skip trading")
+        post_meta["members"] = len(members)
+        return post_meta
+
     def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
         today_raw = self._today_path(as_of)
         today, today_rel = self._resolve_universe_path(today_raw)

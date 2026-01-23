@@ -381,6 +381,7 @@ def _load_universe_context(
     env: str,
     strategy: str,
 ) -> UniverseContext:
+    runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
     ok, meta = runtime_store.universe_check(as_of)
     selected_path = meta.get("selected_path")
     if not ok or not selected_path or not os.path.exists(selected_path):
