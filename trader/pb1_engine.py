@@ -866,6 +866,7 @@ class PB1Engine:
                 self.ledger_repo.append_event(
                     env=self.env,
                     run_id=self.run_id,
+                    strategy=self.STRATEGY_NAME,
                     event_type="POSITION_ORPHANED",
                     ts=now_kst(),
                     code=code,
@@ -1197,6 +1198,7 @@ class PB1Engine:
             self.ledger_repo.append_event(
                 env=self.env,
                 run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
                 event_type=event_type,
                 ts=now_kst(),
                 code=code,

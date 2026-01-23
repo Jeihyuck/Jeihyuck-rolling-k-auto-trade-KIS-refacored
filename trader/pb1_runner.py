@@ -508,6 +508,7 @@ def _handle_missing_positions_reset(
             ledger_repo.append_event(
                 env=env,
                 run_id=run_id,
+                strategy=strategy,
                 event_type="AUTO_CLOSED_STALE_KIS_EMPTY",
                 ts=now_kst(),
                 code=code,
@@ -524,6 +525,7 @@ def _handle_missing_positions_reset(
         ledger_repo.append_event(
             env=env,
             run_id=run_id,
+            strategy=strategy,
             event_type="STALE_DB_SOFT_RESET",
             ts=now_kst(),
             ok=True,
@@ -570,6 +572,7 @@ def _handle_missing_positions_reset(
         ledger_repo.append_event(
             env=env,
             run_id=run_id,
+            strategy=strategy,
             event_type="ACCOUNT_RESET_POSITION_CLOSED",
             ts=now_kst(),
             code=code,

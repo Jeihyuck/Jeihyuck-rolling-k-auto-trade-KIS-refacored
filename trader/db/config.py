@@ -32,14 +32,23 @@ def _ensure_sqlite_parent(url: str) -> None:
 
 
 def get_database_url() -> str:
-    url = os.getenv("DATABASE_URL")
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+    if strategy_mode == "LIVE":
+        if not url:
+            raise RuntimeError("LIVE requires DATABASE_URL (Postgres). Refuse to run.")
+        if is_sqlite_url(url):
+            raise RuntimeError("LIVE forbids sqlite. Use Postgres DATABASE_URL.")
+        return url
+
     if using_external_db():
         if not url:
             raise RuntimeError("DATABASE_URL must be set when USING_EXTERNAL_DB=1")
         return url
 
-    if url and is_sqlite_url(url):
-        _ensure_sqlite_parent(url)
+    if url:
+        if is_sqlite_url(url):
+            _ensure_sqlite_parent(url)
         return url
 
     default_url = f"sqlite:///{DEFAULT_SQLITE_PATH}"

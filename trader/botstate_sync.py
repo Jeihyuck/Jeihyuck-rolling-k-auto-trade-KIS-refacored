@@ -53,6 +53,8 @@ bot_state/runtime/ohlcv_cache/**
 
 # Never commit archive/ or readonly backups
 bot_state/archive/
+bot_state/db/
+bot_state/db/**
 bot_state/db/*.bak*
 bot_state/db/*.readonly.bak.*
 
@@ -63,7 +65,6 @@ __pycache__/
 """
 
 ALLOWLIST_PATTERNS = [
-    "bot_state/db/pbcore.sqlite3",
     "bot_state/runtime/events/*.jsonl",
     "bot_state/runtime/status/**",
     "bot_state/runtime/universe/*.json",
@@ -78,12 +79,17 @@ CLEAN_PATTERNS = [
     "bot_state/archive/**",
     "bot_state/runtime/ohlcv_cache/**",
     "bot_state/db/*.bak*",
+    "bot_state/db/*.sqlite3",
+    "bot_state/db/*.sqlite3-wal",
+    "bot_state/db/*.sqlite3-shm",
+    "bot_state/db/*.db",
+    "bot_state/db/*.db-wal",
+    "bot_state/db/*.db-shm",
 ]
 
 
 @dataclass(frozen=True)
 class DirtyStatSnapshot:
-    db: tuple[float, int] | None
     events: tuple[int, float | None, int]
     universe: tuple[int, float | None, int]
     last_seen_positions: tuple[float, int] | None
@@ -484,13 +490,11 @@ def _collect_dir_stats(base_dir: Path, pattern: str) -> tuple[int, float | None,
 
 def _collect_dirty_stats(worktree_dir: Path) -> DirtyStatSnapshot:
     bot_state_dir = worktree_dir / "bot_state"
-    db_stat = _safe_stat(bot_state_dir / "db" / "pbcore.sqlite3")
     events_stats = _collect_dir_stats(bot_state_dir / "runtime" / "events", "*.jsonl")
     universe_stats = _collect_dir_stats(bot_state_dir / "runtime" / "universe", "*.json")
     last_seen_positions = _safe_stat(bot_state_dir / "runtime" / "last_seen_positions.json")
     positions_snapshot = _safe_stat(bot_state_dir / "runtime" / "positions_snapshot.json")
     return DirtyStatSnapshot(
-        db=db_stat,
         events=events_stats,
         universe=universe_stats,
         last_seen_positions=last_seen_positions,
@@ -501,9 +505,6 @@ def _collect_dirty_stats(worktree_dir: Path) -> DirtyStatSnapshot:
 def _force_stage_dirty_files(worktree_dir: Path) -> None:
     to_add: list[str] = []
     bot_state_dir = worktree_dir / "bot_state"
-    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
-    if db_path.exists():
-        to_add.append(db_path.relative_to(worktree_dir).as_posix())
     for entry in (bot_state_dir / "runtime" / "events").glob("*.jsonl"):
         to_add.append(entry.relative_to(worktree_dir).as_posix())
     for entry in (bot_state_dir / "runtime" / "universe").glob("*.json"):
@@ -1066,18 +1067,15 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             time.sleep(retry_sleep_sec)
             continue
 
-        db_path = worktree_dir / "bot_state" / "db" / "pbcore.sqlite3"
         events_dir = worktree_dir / "bot_state" / "runtime" / "events"
         pre_stats = _collect_dirty_stats(worktree_dir)
-        db_stat = _safe_stat(db_path)
         events_latest = _latest_event_mtime(events_dir)
         status_pre = _run_git_logged(
             ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_pre"
         ).stdout
         logger.info(
-            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s dirty_stats=%s status_lines=%s",
+            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s events_latest=%s dirty_stats=%s status_lines=%s",
             allowlist_changed,
-            db_stat,
             events_latest,
             pre_stats,
             [line for line in status_pre.splitlines() if line.strip()][:50],
@@ -1133,14 +1131,10 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
         if _run_git_logged(
             ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
         ).returncode == 0:
-            has_recent_db = False
-            if db_stat:
-                db_mtime = db_stat[0]
-                has_recent_db = (time.time() - db_mtime) < 600
             has_recent_events = False
             if events_latest is not None:
                 has_recent_events = (time.time() - events_latest) < 600
-            require_persist = allowlist_changed or has_recent_db or has_recent_events or dirty_by_stat
+            require_persist = allowlist_changed or has_recent_events or dirty_by_stat
             logger.info(
                 "[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip require_persist=%s",
                 require_persist,

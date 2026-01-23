@@ -23,6 +23,7 @@ from .schema import (
     UNIVERSE_MEMBERS,
     UNIVERSE_CURRENT,
     UNIVERSE_RUNS,
+    SchemaTables,
     schema_for_engine,
     uuid_value_for_url,
 )
@@ -76,6 +77,46 @@ def _recover_sqlite_readonly(engine: Engine) -> bool:
     ensure_sqlite_writable(db_path)
     run_migrations(engine)
     return True
+
+
+def ensure_run(
+    conn: sa.Connection,
+    schema: SchemaTables,
+    *,
+    run_id: str,
+    env: str,
+    run_window: str | None,
+    strategy: str,
+    ts: datetime,
+    database_url: str,
+) -> None:
+    if not run_id or not strategy:
+        return
+    values = {
+        "run_id": uuid_value_for_url(database_url, run_id),
+        "env": env,
+        "strategy": strategy,
+        "run_window": run_window,
+        "phase": None,
+        "event_name": "ledger_event",
+        "dry_run": False,
+        "config_json": {},
+        "started_at": ts,
+    }
+    if conn.dialect.name == "postgresql":
+        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(
+            index_elements=["run_id"]
+        )
+    elif conn.dialect.name == "sqlite":
+        insert_stmt = sqlite_insert(schema.runs).values(**values).on_conflict_do_nothing(
+            index_elements=["run_id"]
+        )
+    else:
+        insert_stmt = sa.insert(schema.runs).values(**values)
+    try:
+        conn.execute(insert_stmt)
+    except Exception:
+        return
 
 
 def execute_with_retry(conn, stmt, payload=None, retries: int = 5, base_sleep: float = 0.2):
@@ -678,6 +719,8 @@ class LedgerEventsRepo:
         *,
         env: str,
         run_id: str | None,
+        strategy: str | None = None,
+        run_window: str | None = None,
         event_type: str,
         ts: datetime,
         code: str | None = None,
@@ -719,9 +762,31 @@ class LedgerEventsRepo:
         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
         with self.engine.begin() as conn:
             try:
+                if run_id is not None and strategy:
+                    ensure_run(
+                        conn,
+                        self._schema,
+                        run_id=run_id,
+                        env=env,
+                        run_window=run_window,
+                        strategy=strategy,
+                        ts=ts,
+                        database_url=db_url,
+                    )
                 res = conn.execute(stmt)
                 return str(res.scalar())
             except Exception:
+                if run_id is not None and strategy:
+                    ensure_run(
+                        conn,
+                        self._schema,
+                        run_id=run_id,
+                        env=env,
+                        run_window=run_window,
+                        strategy=strategy,
+                        ts=ts,
+                        database_url=db_url,
+                    )
                 conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
                 return str(payload["ledger_event_id"])
 

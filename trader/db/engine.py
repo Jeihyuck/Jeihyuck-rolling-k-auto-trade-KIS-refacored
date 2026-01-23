@@ -8,6 +8,8 @@ def make_engine(database_url: str | None = None) -> Engine:
     kwargs = {}
     if not config.is_sqlite_url(url):
         kwargs["pool_pre_ping"] = True
+        kwargs["pool_size"] = 5
+        kwargs["max_overflow"] = 10
     engine = create_engine(url, echo=config.get_db_echo(), **kwargs)
     if config.is_sqlite_url(url):
         @event.listens_for(engine, "connect")

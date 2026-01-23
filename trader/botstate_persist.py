@@ -36,7 +36,6 @@ def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
 def _collect_paths(base_dir: Path) -> list[Path]:
     paths: list[Path] = []
     bot_root = get_botstate_root()
-    _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
     _add_if_exists(paths, bot_root / "runtime/state.json")
     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
     _add_glob(paths, bot_root, "runtime/universe/*.json")

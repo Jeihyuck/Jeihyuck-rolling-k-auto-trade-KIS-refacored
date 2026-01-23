@@ -18,6 +18,18 @@ trader/state/ohlcv_cache/
 runtime/
 bot_state/
 
+# Local/Runtime DB artifacts (NEVER COMMIT)
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# bot_state db files
+bot_state/db/**
+_botstate_worktree/**/bot_state/db/**
+
 # Allow tracking runtime universe outputs in bot_state
 !bot_state/
 !bot_state/runtime/

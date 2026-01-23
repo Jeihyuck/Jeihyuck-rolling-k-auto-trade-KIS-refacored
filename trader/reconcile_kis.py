@@ -158,6 +158,7 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
     ledger_repo.append_event(
         env=env,
         run_id=run_id,
+        strategy=strategy,
         event_type="RECONCILE",
         ts=now_kst(),
         ok=True,
