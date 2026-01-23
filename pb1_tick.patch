@@ -1,1655 +1,148 @@
-diff --git a/migrations/0008_orders_fills_idempotency.sql b/migrations/0008_orders_fills_idempotency.sql
-new file mode 100644
-index 0000000000000000000000000000000000000000..05e8c6e70fe390568589ccb2083b13394bfb8547
---- /dev/null
-+++ b/migrations/0008_orders_fills_idempotency.sql
-@@ -0,0 +1,17 @@
-+-- Orders/Fills idempotency + reconcile log + positions reconcile tracking
-+
-+ALTER TABLE orders ADD COLUMN broker_order_id TEXT;
-+ALTER TABLE fills ADD COLUMN broker_fill_id TEXT;
-+ALTER TABLE positions ADD COLUMN last_reconciled_at TEXT;
-+
-+CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_env_broker_order_id ON orders (env, broker_order_id);
-+CREATE UNIQUE INDEX IF NOT EXISTS uq_fills_env_broker_fill_id ON fills (env, broker_fill_id);
-+
-+CREATE TABLE IF NOT EXISTS reconcile_log (
-+    env TEXT NOT NULL,
-+    strategy TEXT NOT NULL,
-+    tick_ts TEXT NOT NULL,
-+    action TEXT NOT NULL,
-+    details_json TEXT,
-+    created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-+);
-diff --git a/tests/test_idempotency.py b/tests/test_idempotency.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..aa49fa3aba7577db7ff0d0d3337c8e0790ada7e8
---- /dev/null
-+++ b/tests/test_idempotency.py
-@@ -0,0 +1,107 @@
-+import sys
-+from pathlib import Path
-+
-+import sqlalchemy as sa
-+from datetime import datetime
-+
-+sys.path.append(str(Path(__file__).resolve().parents[1]))
-+
-+from trader.db.migrate import run_migrations
-+from trader.db.repos import OrdersRepo, FillsRepo
-+from trader.db.schema import ORDERS, FILLS
-+
-+
-+def test_orders_upsert_idempotent(tmp_path):
-+    db_url = f"sqlite:///{tmp_path}/test.db"
-+    engine = sa.create_engine(db_url)
-+    run_migrations(engine)
-+
-+    repo = OrdersRepo(engine)
-+    repo.upsert_reconciled_order(
-+        env="practice",
-+        run_id=None,
-+        strategy="pb1_pullback_close",
-+        sid=1,
-+        mode=1,
-+        code="005930",
-+        market="KOSPI",
-+        side="BUY",
-+        ord_type="RECONCILED",
-+        qty=1,
-+        limit_price=100.0,
-+        stage="RECONCILE",
-+        client_order_key="practice:pb1:000",
-+        kis_odno="KIS123",
-+        status="ACKED",
-+        request_json={},
-+        response_json={},
-+        submitted_at=None,
-+        acked_at=None,
-+    )
-+    repo.upsert_reconciled_order(
-+        env="practice",
-+        run_id=None,
-+        strategy="pb1_pullback_close",
-+        sid=1,
-+        mode=1,
-+        code="005930",
-+        market="KOSPI",
-+        side="BUY",
-+        ord_type="RECONCILED",
-+        qty=1,
-+        limit_price=100.0,
-+        stage="RECONCILE",
-+        client_order_key="practice:pb1:000",
-+        kis_odno="KIS123",
-+        status="ACKED",
-+        request_json={},
-+        response_json={},
-+        submitted_at=None,
-+        acked_at=None,
-+    )
-+    with engine.begin() as conn:
-+        count = conn.execute(sa.select(sa.func.count()).select_from(ORDERS)).scalar()
-+    assert count == 1
-+
-+
-+def test_fills_upsert_idempotent(tmp_path):
-+    db_url = f"sqlite:///{tmp_path}/test.db"
-+    engine = sa.create_engine(db_url)
-+    run_migrations(engine)
-+
-+    repo = FillsRepo(engine)
-+    repo.upsert_fill(
-+        env="practice",
-+        run_id=None,
-+        order_id=None,
-+        kis_odno="KIS123",
-+        trade_id="TRD-1",
-+        code="005930",
-+        market="KOSPI",
-+        side="BUY",
-+        qty=1,
-+        price=100.0,
-+        fee=0.0,
-+        tax=0.0,
-+        filled_at=datetime.utcnow(),
-+        raw_json={},
-+    )
-+    repo.upsert_fill(
-+        env="practice",
-+        run_id=None,
-+        order_id=None,
-+        kis_odno="KIS123",
-+        trade_id="TRD-1",
-+        code="005930",
-+        market="KOSPI",
-+        side="BUY",
-+        qty=1,
-+        price=100.0,
-+        fee=0.0,
-+        tax=0.0,
-+        filled_at=datetime.utcnow(),
-+        raw_json={},
-+    )
-+    with engine.begin() as conn:
-+        count = conn.execute(sa.select(sa.func.count()).select_from(FILLS)).scalar()
-+    assert count == 1
-diff --git a/tests/test_persist_guard.py b/tests/test_persist_guard.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..13d08abf3e21a28fc0924f2925e67df122f68285
---- /dev/null
-+++ b/tests/test_persist_guard.py
-@@ -0,0 +1,18 @@
-+import sys
-+from pathlib import Path
-+
-+import pytest
-+
-+sys.path.append(str(Path(__file__).resolve().parents[1]))
-+
-+from trader.botstate_sync import BotStatePersistError, evaluate_persist_guard
-+
-+
-+def test_persist_guard_hard_fail_on_dirty_stat():
-+    with pytest.raises(BotStatePersistError):
-+        evaluate_persist_guard(require_persist=True, dirty_by_stat=True)
-+
-+
-+def test_persist_guard_warn_on_empty_stat():
-+    result = evaluate_persist_guard(require_persist=True, dirty_by_stat=False)
-+    assert result == "warn"
-diff --git a/tests/test_reconcile_purge_guard.py b/tests/test_reconcile_purge_guard.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..be6e2752b178e21dc4034cc20734040c9a5c4502
---- /dev/null
-+++ b/tests/test_reconcile_purge_guard.py
-@@ -0,0 +1,49 @@
-+import sys
-+from datetime import datetime, timedelta
-+from pathlib import Path
-+
-+sys.path.append(str(Path(__file__).resolve().parents[1]))
-+
-+from trader.reconcile_db import evaluate_stale_db_guard
-+
-+
-+def test_kis_holdings_empty_requires_consecutive_ticks(tmp_path):
-+    now = datetime.utcnow()
-+    allow, reason, guard = evaluate_stale_db_guard(
-+        bot_state_dir=tmp_path,
-+        tick_ts=now,
-+        kis_holdings_empty=True,
-+        orders_count=0,
-+        fills_count=0,
-+        had_kis_error=False,
-+    )
-+    assert allow is False
-+    assert reason == "empty_streak_insufficient"
-+    assert guard["empty_streak"] == 1
-+
-+    allow, reason, guard = evaluate_stale_db_guard(
-+        bot_state_dir=tmp_path,
-+        tick_ts=now + timedelta(seconds=30),
-+        kis_holdings_empty=True,
-+        orders_count=0,
-+        fills_count=0,
-+        had_kis_error=False,
-+    )
-+    assert allow is True
-+    assert reason == "empty_streak_confirmed"
-+    assert guard["empty_streak"] >= 2
-+
-+
-+def test_kis_error_blocks_purge(tmp_path):
-+    now = datetime.utcnow()
-+    allow, reason, guard = evaluate_stale_db_guard(
-+        bot_state_dir=tmp_path,
-+        tick_ts=now,
-+        kis_holdings_empty=True,
-+        orders_count=0,
-+        fills_count=0,
-+        had_kis_error=True,
-+    )
-+    assert allow is False
-+    assert reason == "kis_error"
-+    assert guard["last_kis_error_ts"]
-diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
-index b9756175ddc1f309532bbe58f12064d29092a721..c25c5bf57b5ac3ef480481385422cddd06e0a731 100644
---- a/trader/botstate_persist.py
-+++ b/trader/botstate_persist.py
-@@ -1,38 +1,39 @@
- from __future__ import annotations
- 
- import argparse
- import logging
- import os
- import sys
- from datetime import datetime
- from pathlib import Path
- from zoneinfo import ZoneInfo
- 
- from trader.botstate_paths import botstate_path, get_botstate_root
- from trader.botstate_sync import (
-     acquire_lock,
-+    BotStatePersistError,
-     persist_run_files,
-     release_lock,
-     resolve_botstate_worktree_dir,
-     setup_worktree,
- )
- 
- logger = logging.getLogger(__name__)
- KST = ZoneInfo("Asia/Seoul")
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 65c1b632e8a48bf94f0d9d9bfb9691ce38380faa..13246a7ed7e6ab338da6d2944bf98cf870023e62 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -337,50 +337,51 @@ class CandidateFeature:
+     setup_ok: bool
+     reasons: List[str]
+     mode: int
+     mode_reasons: List[str]
+     client_order_key: str | None = None
+     planned_qty: int = 0
+     planned_value: float = 0.0
+     score: float | None = None
  
  
- def _add_if_exists(paths: list[Path], candidate: Path) -> None:
-     if candidate.is_file():
-         paths.append(candidate)
- 
- 
- def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
-     for path in base_dir.glob(pattern):
-         if path.is_file():
-             paths.append(path)
- 
- 
- def _collect_paths(base_dir: Path) -> list[Path]:
-     paths: list[Path] = []
-     bot_root = get_botstate_root()
-     _add_if_exists(paths, bot_root / "db/pbcore.sqlite3")
-@@ -68,38 +69,46 @@ def main() -> int:
-         "--soft-fail",
-         action="store_true",
-         help="Log errors and exit 0 instead of failing the job",
-     )
-     args = parser.parse_args()
- 
-     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
- 
-     try:
-         base_dir = Path.cwd().resolve()
-         worktree_dir = resolve_botstate_worktree_dir(base_dir)
-         setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
- 
-         owner = _resolve_owner()
-         run_id = _resolve_run_id()
- 
-         if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
-             logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
-             return 1
- 
-         try:
-             files = _collect_paths(base_dir)
-             if not files:
-                 logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
-                 return 0
--            persist_run_files(worktree_dir, files, args.message)
-+            try:
-+                persist_run_files(worktree_dir, files, args.message)
-+            except BotStatePersistError as exc:
-+                if exc.require_persist and not exc.dirty_by_stat:
-+                    logger.warning(
-+                        "[BOTSTATE][PERSIST][EMPTY_STAGE][WARN] require_persist=1 dirty_by_stat=0 -> skip"
-+                    )
-+                    return 0
-+                raise
-             return 0
-         finally:
-             release_lock(worktree_dir, owner=owner, run_id=run_id)
-     except Exception as exc:
-         if args.soft_fail:
-             logger.warning("[BOTSTATE][PERSIST][SOFT-FAIL] %s", exc, exc_info=True)
-             return 0
-         raise
- 
- 
- if __name__ == "__main__":
-     sys.exit(main())
-diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index e45b34b2b802e37ed78d13b53c0dbf529d8ef0fb..be7c72d87d7f3d140ffa582a87d0ebb8647a71ce 100644
---- a/trader/botstate_sync.py
-+++ b/trader/botstate_sync.py
-@@ -56,50 +56,66 @@ bot_state/db/*.readonly.bak.*
- 
- # Python / OS noise
- .DS_Store
- __pycache__/
- *.pyc
- """
- 
- ALLOWLIST_PATTERNS = [
-     "bot_state/db/pbcore.sqlite3",
-     "bot_state/runtime/events/*.jsonl",
-     "bot_state/runtime/status/*.json",
-     "bot_state/runtime/universe/*.json",
-     "bot_state/universe_lkg/**/latest.json",
-     "bot_state/runtime/balance_snapshot.json",
-     "bot_state/runtime/schema_version.txt",
-     "bot_state/runtime/runtime_meta.json",
- ]
- 
- CLEAN_PATTERNS = [
-     "bot_state/archive/**",
-     "bot_state/runtime/ohlcv_cache/**",
-     "bot_state/db/*.bak*",
- ]
- 
- 
-+@dataclass(frozen=True)
-+class DirtyStatSnapshot:
-+    db: tuple[float, int] | None
-+    events: tuple[int, float | None, int]
-+    universe: tuple[int, float | None, int]
-+    last_seen_positions: tuple[float, int] | None
-+    positions_snapshot: tuple[float, int] | None
-+
-+
-+class BotStatePersistError(RuntimeError):
-+    def __init__(self, message: str, *, require_persist: bool, dirty_by_stat: bool) -> None:
-+        super().__init__(message)
-+        self.require_persist = require_persist
-+        self.dirty_by_stat = dirty_by_stat
-+
-+
- def ensure_botstate_gitignore(workdir: str) -> None:
-     # workdir is the botstate worktree root
-     path = os.path.join(workdir, "bot_state", ".gitignore")
-     os.makedirs(os.path.dirname(path), exist_ok=True)
- 
-     current = None
-     if os.path.exists(path):
-         with open(path, "r", encoding="utf-8") as f:
-             current = f.read()
- 
-     if current != BOTSTATE_GITIGNORE_TEXT:
-         with open(path, "w", encoding="utf-8") as f:
-             f.write(BOTSTATE_GITIGNORE_TEXT)
- 
- 
- def ensure_writable_path(path: str | Path, *, is_dir: bool) -> None:
-     target = Path(path)
-     if is_dir:
-         target.mkdir(parents=True, exist_ok=True)
-         try:
-             os.chmod(target, 0o700)
-         except OSError:
-             logger.warning("[DB][PERM][DIR_CHMOD_FAIL] path=%s", target, exc_info=True)
-     else:
-         target.parent.mkdir(parents=True, exist_ok=True)
-@@ -416,50 +432,113 @@ def _cached_diff_names(worktree_dir: Path) -> list[str]:
-     output = _git_worktree(worktree_dir, "diff", "--cached", "--name-only", check=False).stdout.strip()
-     return [line for line in output.splitlines() if line.strip()]
- 
- 
- def _safe_stat(path: Path) -> tuple[float, int] | None:
-     try:
-         stat = path.stat()
-         return stat.st_mtime, stat.st_size
-     except FileNotFoundError:
-         return None
- 
- 
- def _latest_event_mtime(events_dir: Path) -> float | None:
-     if not events_dir.exists():
-         return None
-     latest = None
-     for entry in events_dir.glob("*.jsonl"):
-         try:
-             mtime = entry.stat().st_mtime
-         except FileNotFoundError:
-             continue
-         latest = mtime if latest is None else max(latest, mtime)
-     return latest
- 
- 
-+def _collect_dir_stats(base_dir: Path, pattern: str) -> tuple[int, float | None, int]:
-+    count = 0
-+    latest_mtime = None
-+    total_size = 0
-+    if not base_dir.exists():
-+        return 0, None, 0
-+    for entry in base_dir.glob(pattern):
-+        try:
-+            stat = entry.stat()
-+        except FileNotFoundError:
-+            continue
-+        count += 1
-+        total_size += stat.st_size
-+        latest_mtime = stat.st_mtime if latest_mtime is None else max(latest_mtime, stat.st_mtime)
-+    return count, latest_mtime, total_size
-+
-+
-+def _collect_dirty_stats(worktree_dir: Path) -> DirtyStatSnapshot:
-+    bot_state_dir = worktree_dir / "bot_state"
-+    db_stat = _safe_stat(bot_state_dir / "db" / "pbcore.sqlite3")
-+    events_stats = _collect_dir_stats(bot_state_dir / "runtime" / "events", "*.jsonl")
-+    universe_stats = _collect_dir_stats(bot_state_dir / "runtime" / "universe", "*.json")
-+    last_seen_positions = _safe_stat(bot_state_dir / "runtime" / "last_seen_positions.json")
-+    positions_snapshot = _safe_stat(bot_state_dir / "runtime" / "positions_snapshot.json")
-+    return DirtyStatSnapshot(
-+        db=db_stat,
-+        events=events_stats,
-+        universe=universe_stats,
-+        last_seen_positions=last_seen_positions,
-+        positions_snapshot=positions_snapshot,
-+    )
-+
-+
-+def _force_stage_dirty_files(worktree_dir: Path) -> None:
-+    to_add: list[str] = []
-+    bot_state_dir = worktree_dir / "bot_state"
-+    db_path = bot_state_dir / "db" / "pbcore.sqlite3"
-+    if db_path.exists():
-+        to_add.append(db_path.relative_to(worktree_dir).as_posix())
-+    for entry in (bot_state_dir / "runtime" / "events").glob("*.jsonl"):
-+        to_add.append(entry.relative_to(worktree_dir).as_posix())
-+    for entry in (bot_state_dir / "runtime" / "universe").glob("*.json"):
-+        to_add.append(entry.relative_to(worktree_dir).as_posix())
-+    for name in ("last_seen_positions.json", "positions_snapshot.json"):
-+        path = bot_state_dir / "runtime" / name
-+        if path.exists():
-+            to_add.append(path.relative_to(worktree_dir).as_posix())
-+    if to_add:
-+        _git_worktree(worktree_dir, "add", "-f", "--", *sorted(set(to_add)), check=False)
-+
-+
-+def evaluate_persist_guard(*, require_persist: bool, dirty_by_stat: bool) -> str:
-+    if not require_persist:
-+        return "ok"
-+    if dirty_by_stat:
-+        raise BotStatePersistError(
-+            "PERSIST_REQUIRED_BUT_EMPTY_STAGE",
-+            require_persist=require_persist,
-+            dirty_by_stat=dirty_by_stat,
-+        )
-+    return "warn"
-+
-+
- def _normalize_botstate_rel(path: Path) -> str | None:
-     parts = path.parts
-     if "bot_state" in parts:
-         idx = parts.index("bot_state")
-         return Path(*parts[idx:]).as_posix()
-     if parts and parts[0] == "bot_state":
-         return Path(*parts).as_posix()
-     return None
- 
- 
- def _allowlist_changed(new_files: Iterable[Path], patterns: list[str]) -> bool:
-     for path in new_files:
-         rel = _normalize_botstate_rel(path)
-         if not rel:
-             continue
-         if any(fnmatch.fnmatch(rel, pattern) for pattern in patterns):
-             return True
-     return False
- 
- 
- def commit_if_staged(worktree_dir: Path, message: str) -> bool:
-     diff_proc = _git_worktree(worktree_dir, "diff", "--cached", "--quiet", check=False)
-     if diff_proc.returncode == 0:
-         return False
-     _git_worktree(worktree_dir, "commit", "-m", message)
-@@ -956,123 +1035,142 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
-     for attempt in range(1, retries + 1):
-         try:
-             st = git_fetch_reset(remote=remote, branch=branch, cwd=str(worktree_dir))
-             logger.info(
-                 "[BOTSTATE][SYNC] SYNC_MODE=%s step=post_sync remote_ref=%s behind=%d ahead=%d attempt=%d",
-                 sync_mode,
-                 st.remote_ref,
-                 st.behind,
-                 st.ahead,
-                 attempt,
-             )
-         except Exception as exc:
-             logger.warning(
-                 "[BOTSTATE][SYNC][ERR] SYNC_MODE=%s step=sync_failed attempt=%d err=%s",
-                 sync_mode,
-                 attempt,
-                 str(exc),
-             )
-             if attempt == retries:
-                 raise
-             time.sleep(retry_sleep_sec)
-             continue
- 
-         db_path = worktree_dir / "bot_state" / "db" / "pbcore.sqlite3"
-         events_dir = worktree_dir / "bot_state" / "runtime" / "events"
-+        pre_stats = _collect_dirty_stats(worktree_dir)
-         db_stat = _safe_stat(db_path)
-         events_latest = _latest_event_mtime(events_dir)
-         status_pre = _run_git_logged(
-             ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_pre"
-         ).stdout
-         logger.info(
--            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s status_lines=%s",
-+            "[BOTSTATE][PERSIST][PRE] allowlist_changed=%s db_stat=%s events_latest=%s dirty_stats=%s status_lines=%s",
-             allowlist_changed,
-             db_stat,
-             events_latest,
-+            pre_stats,
-             [line for line in status_pre.splitlines() if line.strip()][:50],
-         )
- 
-         for path in files:
-             try:
-                 if path.resolve().is_relative_to(worktree_dir.resolve()):
-                     target = path.resolve()
-                 else:
-                     if "bot_state" in path.parts:
-                         idx = path.parts.index("bot_state")
-                         rel = Path(*path.parts[idx:])
-                     else:
-                         rel = Path("bot_state") / Path(*path.parts[-4:])
-                     target = (worktree_dir / rel).resolve()
-                     target.parent.mkdir(parents=True, exist_ok=True)
-                     target.write_bytes(path.read_bytes())
-                 rel_target = target.relative_to(worktree_dir)
-                 _git_worktree(worktree_dir, "add", str(rel_target))
-             except Exception:
-                 continue
- 
-         _stage_allowlist(worktree_dir, ALLOWLIST_PATTERNS)
-+        post_stats = _collect_dirty_stats(worktree_dir)
-+        dirty_by_stat = pre_stats != post_stats
-+        if dirty_by_stat:
-+            _force_stage_dirty_files(worktree_dir)
-+        logger.info(
-+            "[BOTSTATE][PERSIST][STAT] dirty_by_stat=%s pre=%s post=%s",
-+            dirty_by_stat,
-+            pre_stats,
-+            post_stats,
-+        )
-         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain").stdout
-         status_lines = [line for line in status.splitlines() if line.strip()]
-         reverted_deleted, cleaned_untracked = _clean_non_allowlisted_changes(
-             worktree_dir,
-             status_lines,
-             CLEAN_PATTERNS,
-         )
-         if reverted_deleted or cleaned_untracked:
-             logger.info(
-                 "[BOTSTATE][PERSIST][CLEAN] reverted_deleted=%s cleaned_untracked=%s patterns=%s",
-                 reverted_deleted,
-                 cleaned_untracked,
-                 CLEAN_PATTERNS,
-             )
-         status = _run_git_logged(["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_post").stdout
-         cached_names = _run_git_logged(
-             ["diff", "--cached", "--name-only"], worktree_dir, check=True, label="cached_names"
-         ).stdout
-         if _run_git_logged(
-             ["diff", "--cached", "--quiet"], worktree_dir, check=False, label="cached_quiet"
-         ).returncode == 0:
-             has_recent_db = False
-             if db_stat:
-                 db_mtime = db_stat[0]
-                 has_recent_db = (time.time() - db_mtime) < 600
-             has_recent_events = False
-             if events_latest is not None:
-                 has_recent_events = (time.time() - events_latest) < 600
--            require_persist = allowlist_changed or has_recent_db or has_recent_events
-+            require_persist = allowlist_changed or has_recent_db or has_recent_events or dirty_by_stat
-             logger.info(
-                 "[BOTSTATE][PERSIST] no staged changes after allowlist staging -> skip require_persist=%s",
-                 require_persist,
-             )
-             post = git_porcelain(worktree_dir)
-             if post.strip():
-                 logger.warning(
-                     "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
-                     post,
-                 )
-             if require_persist:
--                raise RuntimeError("PERSIST_REQUIRED_BUT_EMPTY_STAGE")
-+                logger.warning(
-+                    "[BOTSTATE][PERSIST][EMPTY_STAGE] require_persist=1 dirty_by_stat=%s",
-+                    dirty_by_stat,
-+                )
-+                outcome = evaluate_persist_guard(require_persist=require_persist, dirty_by_stat=dirty_by_stat)
-+                if outcome == "warn":
-+                    logger.warning("[BOTSTATE][PERSIST][EMPTY_STAGE] dirty_by_stat=0 -> skip")
-+                    return
-             return
-         status_lines = [line for line in status.splitlines() if line.strip()]
-         logger.info("[BOTSTATE][PERSIST][STATUS] lines=%s", status_lines[:50])
-         status2 = git_porcelain(worktree_dir)
-         status2_lines = [line for line in status2.splitlines() if line.strip()]
-         staged_files = [line for line in cached_names.splitlines() if line.strip()]
-         logger.info("[BOTSTATE][PERSIST][CACHED] files=%s", staged_files)
-         if not status2_lines:
-             logger.info("[PERSIST] no changes -> skip")
-             post = git_porcelain(worktree_dir)
-             if post.strip():
-                 logger.warning(
-                     "[BOTSTATE][PERSIST][SOFT-FAIL] remaining changes after allowlist:\n%s",
-                     post,
-                 )
-             return
- 
-         committed = commit_if_staged(worktree_dir, message)
-         logger.info(
-             "[BOTSTATE][GIT] SYNC_MODE=%s step=commit committed=%s msg=%s attempt=%d",
-             sync_mode,
-             committed,
-             message,
-             attempt,
-         )
-diff --git a/trader/db/repos.py b/trader/db/repos.py
-index 982a258a73219481b32b6ebc0649af0547947563..22dc79ff3479518d8b4b0e1fc6253e3f3071890d 100644
---- a/trader/db/repos.py
-+++ b/trader/db/repos.py
-@@ -1,37 +1,39 @@
- from __future__ import annotations
- 
- from datetime import datetime, timedelta
- import logging
- import os
- from pathlib import Path
- from typing import Any, Dict, Iterable, List, Optional
- from uuid import UUID, uuid4
- 
- import sqlalchemy as sa
- from sqlalchemy.exc import OperationalError
- from sqlalchemy import Engine, and_, func, select
-+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-+from sqlalchemy.dialects.postgresql import insert as pg_insert
- 
- from .schema import (
-     FILLS,
-     LEDGER_EVENTS,
-     ORDERS,
-     POSITIONS,
-     RUNS,
-     UNIVERSE,
-     UNIVERSE_MEMBERS,
-     schema_for_engine,
-     uuid_value_for_url,
- )
- from .migrate import ensure_sqlite_writable, run_migrations
- from . import config
- from trader.time_utils import now_kst
- 
- logger = logging.getLogger(__name__)
- ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
- 
- 
- def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
-     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
- 
- 
- def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
-@@ -332,64 +334,66 @@ class OrdersRepo:
-         }
-         with self.engine.begin() as conn:
-             existing = conn.execute(
-                 select(self._schema.orders.c.order_id).where(
-                     and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
-                 )
-             ).scalar()
-             if existing:
-                 return str(existing), False
-             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
-             try:
-                 res = conn.execute(stmt)
-                 return str(res.scalar()), True
-             except Exception:
-                 conn.execute(sa.insert(self._schema.orders).values(**payload))
-                 return str(payload["order_id"]), True
- 
-     def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                 .values(
-                     status="SUBMITTED",
-                     kis_odno=kis_odno,
-+                    broker_order_id=kis_odno or client_order_key,
-                     response_json=response_json,
-                     submitted_at=func.now(),
-                     updated_at=func.now(),
-                 )
-             )
- 
-     def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
-                 .values(
-                     status="ACKED",
-                     response_json=response_json,
-+                    broker_order_id=kis_odno,
-                     acked_at=func.now(),
-                     updated_at=func.now(),
-                 )
-             )
- 
-     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                 .values(status="ERROR", response_json=error_payload or {}, updated_at=func.now()),
-             )
- 
-     def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
-         with self.engine.begin() as conn:
-             conn.execute(
-                 sa.update(self._schema.orders)
-                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                 .values(status="CANCELLED", response_json=response_json or {}, updated_at=func.now()),
-             )
- 
-     def get_open_orders(self, env: str) -> list[dict]:
-         stmt = select(self._schema.orders).where(
-             and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
-         )
-@@ -429,208 +433,214 @@ class OrdersRepo:
- 
-     def upsert_reconciled_order(
-         self,
-         *,
-         env: str,
-         run_id: str | None,
-         strategy: str,
-         sid: int,
-         mode: int,
-         code: str,
-         market: str | None,
-         side: str,
-         ord_type: str,
-         qty: int,
-         limit_price: float | None,
-         stage: str | None,
-         client_order_key: str,
-         kis_odno: str | None,
-         status: str,
-         request_json: dict | None,
-         response_json: dict | None,
-         submitted_at: datetime | None,
-         acked_at: datetime | None,
-     ) -> str:
-         db_url = str(self.engine.url)
-+        broker_order_id = kis_odno or client_order_key
-         payload = {
-             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-             "env": env,
-             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-             "strategy": strategy,
-             "sid": sid,
-             "mode": mode,
-             "code": code,
-             "market": market,
-             "side": side,
-             "ord_type": ord_type,
-             "qty": qty,
-             "limit_price": limit_price,
-             "stage": stage,
-             "client_order_key": client_order_key,
-             "status": status,
-             "kis_odno": kis_odno,
-+            "broker_order_id": broker_order_id,
-             "request_json": request_json or {},
-             "response_json": response_json or {},
-             "submitted_at": submitted_at,
-             "acked_at": acked_at,
-         }
-+        conflict_cols = ["env", "broker_order_id"] if broker_order_id else ["env", "client_order_key"]
-+        update_cols = {
-+            "status": status,
-+            "kis_odno": kis_odno,
-+            "broker_order_id": broker_order_id,
-+            "response_json": response_json or {},
-+            "request_json": request_json or {},
-+            "submitted_at": submitted_at,
-+            "acked_at": acked_at,
-+            "updated_at": func.now(),
-+        }
-+        insert_stmt: sa.Insert
-+        if self.engine.dialect.name == "postgresql":
-+            insert_stmt = pg_insert(self._schema.orders).values(**payload)
-+        else:
-+            insert_stmt = sqlite_insert(self._schema.orders).values(**payload)
-+        stmt = insert_stmt.on_conflict_do_update(
-+            index_elements=conflict_cols,
-+            set_=update_cols,
-+        ).returning(self._schema.orders.c.order_id)
-         with self.engine.begin() as conn:
--            existing = None
--            if kis_odno:
--                existing = conn.execute(
--                    select(self._schema.orders.c.order_id).where(
--                        and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno)
--                    )
--                ).scalar()
--            if not existing:
--                existing = conn.execute(
--                    select(self._schema.orders.c.order_id).where(
--                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
--                    )
--                ).scalar()
--            if existing:
--                conn.execute(
--                    sa.update(self._schema.orders)
--                    .where(self._schema.orders.c.order_id == existing)
--                    .values(
--                        status=status,
--                        kis_odno=kis_odno,
--                        response_json=response_json or {},
--                        request_json=request_json or {},
--                        submitted_at=submitted_at,
--                        acked_at=acked_at,
--                        updated_at=func.now(),
--                    )
--                )
--                return str(existing)
--            stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
-             try:
-                 res = conn.execute(stmt)
--                return str(res.scalar())
-+                order_id = res.scalar()
-+                if order_id:
-+                    return str(order_id)
-             except Exception:
--                conn.execute(sa.insert(self._schema.orders).values(**payload))
--                return str(payload["order_id"])
-+                pass
-+            existing = conn.execute(
-+                select(self._schema.orders.c.order_id).where(
-+                    and_(
-+                        self._schema.orders.c.env == env,
-+                        self._schema.orders.c.client_order_key == client_order_key,
-+                    )
-+                )
-+            ).scalar()
-+            return str(existing or payload["order_id"])
- 
- 
- class FillsRepo:
-     def __init__(self, engine: Engine):
-         self.engine = engine
-         self._schema = schema_for_engine(engine)
- 
-     def list_today_fills(
-         self,
-         env: str,
-         *,
-         side: str | None = None,
-         code: str | None = None,
-     ) -> list[dict]:
-         now = now_kst()
-         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-         end = start + timedelta(days=1)
-         conditions = [self._schema.fills.c.env == env, self._schema.fills.c.filled_at >= start, self._schema.fills.c.filled_at < end]
-         if side:
-             conditions.append(self._schema.fills.c.side == side)
-         if code:
-             conditions.append(self._schema.fills.c.code == code)
-         stmt = select(self._schema.fills).where(and_(*conditions))
-         with self.engine.begin() as conn:
-             rows = conn.execute(stmt).mappings().all()
-         return [dict(r) for r in rows]
- 
-     def upsert_fill(
-         self,
-         *,
-         env: str,
-         run_id: str | None,
-         order_id: str | None,
-         kis_odno: str | None,
-         trade_id: str | None,
-         code: str,
-         market: str | None,
-         side: str,
-         qty: int,
-         price: float,
-         fee: float,
-         tax: float,
-         filled_at: datetime,
-         raw_json: dict | None,
-     ) -> str:
-         db_url = str(self.engine.url)
-+        broker_fill_id = trade_id or None
-+        payload = {
-+            "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-+            "env": env,
-+            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-+            "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
-+            "kis_odno": kis_odno,
-+            "trade_id": trade_id,
-+            "broker_fill_id": broker_fill_id,
-+            "code": code,
-+            "market": market,
-+            "side": side,
-+            "qty": qty,
-+            "price": price,
-+            "fee": fee,
-+            "tax": tax,
-+            "filled_at": filled_at,
-+            "raw_json": raw_json or {},
-+        }
-+        conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
-+            "env",
-+            "kis_odno",
-+            "code",
-+            "side",
-+            "qty",
-+            "price",
-+            "filled_at",
-+        ]
-+        update_cols = {
-+            "raw_json": raw_json or {},
-+            "broker_fill_id": broker_fill_id,
-+        }
-+        insert_stmt: sa.Insert
-+        if self.engine.dialect.name == "postgresql":
-+            insert_stmt = pg_insert(self._schema.fills).values(**payload)
-+        else:
-+            insert_stmt = sqlite_insert(self._schema.fills).values(**payload)
-+        stmt = insert_stmt.on_conflict_do_update(
-+            index_elements=conflict_cols,
-+            set_=update_cols,
-+        ).returning(self._schema.fills.c.fill_id)
-         with self.engine.begin() as conn:
--            fill_id = None
-+            try:
-+                res = conn.execute(stmt)
-+                fill_id = res.scalar()
-+                if fill_id:
-+                    return str(fill_id)
-+            except Exception:
-+                pass
-+            existing = None
-             if trade_id:
--                fill_id = conn.execute(
-+                existing = conn.execute(
-                     select(self._schema.fills.c.fill_id).where(
-                         and_(self._schema.fills.c.env == env, self._schema.fills.c.trade_id == trade_id)
-                     )
-                 ).scalar()
--            if not fill_id and kis_odno:
--                fill_id = conn.execute(
--                    select(self._schema.fills.c.fill_id).where(
--                        and_(
--                            self._schema.fills.c.env == env,
--                            self._schema.fills.c.kis_odno == kis_odno,
--                            self._schema.fills.c.code == code,
--                            self._schema.fills.c.side == side,
--                            self._schema.fills.c.qty == qty,
--                            self._schema.fills.c.price == price,
--                            self._schema.fills.c.filled_at == filled_at,
--                        )
--                    )
--                ).scalar()
--            if fill_id:
--                conn.execute(
--                    sa.update(self._schema.fills)
--                    .where(self._schema.fills.c.fill_id == fill_id)
--                    .values(raw_json=raw_json or {}),
--                )
--                return str(fill_id)
--
--            payload = {
--                "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
--                "env": env,
--                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
--                "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
--                "kis_odno": kis_odno,
--                "trade_id": trade_id,
--                "code": code,
--                "market": market,
--                "side": side,
--                "qty": qty,
--                "price": price,
--                "fee": fee,
--                "tax": tax,
--                "filled_at": filled_at,
--                "raw_json": raw_json or {},
--            }
--            stmt = sa.insert(self._schema.fills).values(**payload).returning(self._schema.fills.c.fill_id)
--            try:
--                res = conn.execute(stmt)
--                return str(res.scalar())
--            except Exception:
--                conn.execute(sa.insert(self._schema.fills).values(**payload))
--                return str(payload["fill_id"])
-+            return str(existing or payload["fill_id"])
- 
- 
- class LedgerEventsRepo:
-     def __init__(self, engine: Engine):
-         self.engine = engine
-         self._schema = schema_for_engine(engine)
- 
-     def append_event(
-         self,
-         *,
-         env: str,
-         run_id: str | None,
-         event_type: str,
-         ts: datetime,
-         code: str | None = None,
-         market: str | None = None,
-         sid: int | None = None,
-         mode: int | None = None,
-         side: str | None = None,
-         qty: int | None = None,
-         price: float | None = None,
-         kis_odno: str | None = None,
-         client_order_key: str | None = None,
-         ok: bool = True,
-         reasons: list[str] | None = None,
-@@ -886,29 +896,113 @@ class PositionsRepo:
-                         and_(
-                             self._schema.positions.c.env == env,
-                             self._schema.positions.c.strategy == strategy,
-                             self._schema.positions.c.sid == sid,
-                             self._schema.positions.c.mode == mode,
-                             self._schema.positions.c.code == code,
-                         )
-                     )
-                 ).scalar()
-                 if existing:
-                     continue
-                 conn.execute(
-                     sa.insert(self._schema.positions).values(
-                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                         env=env,
-                         strategy=strategy,
-                         sid=sid,
-                         mode=mode,
-                         code=code,
-                         market=market,
-                         qty=qty,
-                         avg_buy_price=avg_price or None,
-                         total_cost=total_cost or 0.0,
-                         realized_pnl=0.0,
-                         last_trade_at=None,
-+                        status="OPEN",
-+                        last_reconciled_at=func.now(),
-                     )
-                 )
-                 count += 1
-         return count
-+
-+    def restore_missing_from_holdings(
-+        self,
-+        *,
-+        env: str,
-+        strategy: str,
-+        sid: int,
-+        mode: int,
-+        holdings: Iterable[dict],
-+    ) -> int:
-+        restored = 0
-+        with self.engine.begin() as conn:
-+            for row in holdings or []:
-+                try:
-+                    code = str(row.get("pdno") or row.get("code") or "").zfill(6)
-+                    qty = int(float(row.get("hldg_qty") or row.get("qty") or 0))
-+                    if qty <= 0 or not code:
-+                        continue
-+                    avg_price = float(row.get("pchs_avg_pric") or row.get("pchs_avg_price") or row.get("avg_price") or 0.0)
-+                    total_cost = float(row.get("pchs_amt") or row.get("total_cost") or avg_price * qty)
-+                    market = row.get("prdt_type_cd") or row.get("market") or row.get("mket_gb")
-+                except Exception:
-+                    continue
-+                existing = conn.execute(
-+                    select(self._schema.positions.c.position_id).where(
-+                        and_(
-+                            self._schema.positions.c.env == env,
-+                            self._schema.positions.c.strategy == strategy,
-+                            self._schema.positions.c.sid == sid,
-+                            self._schema.positions.c.mode == mode,
-+                            self._schema.positions.c.code == code,
-+                        )
-+                    )
-+                ).scalar()
-+                if existing:
-+                    continue
-+                conn.execute(
-+                    sa.insert(self._schema.positions).values(
-+                        position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-+                        env=env,
-+                        strategy=strategy,
-+                        sid=sid,
-+                        mode=mode,
-+                        code=code,
-+                        market=market,
-+                        qty=qty,
-+                        avg_buy_price=avg_price or None,
-+                        total_cost=total_cost or 0.0,
-+                        realized_pnl=0.0,
-+                        last_trade_at=None,
-+                        status="OPEN",
-+                        last_reconciled_at=func.now(),
-+                    )
-+                )
-+                restored += 1
-+        return restored
-+
-+
-+class ReconcileLogRepo:
-+    def __init__(self, engine: Engine):
-+        self.engine = engine
-+        self._schema = schema_for_engine(engine)
-+
-+    def append_log(
-+        self,
-+        *,
-+        env: str,
-+        strategy: str,
-+        tick_ts: datetime,
-+        action: str,
-+        details_json: dict | None,
-+    ) -> None:
-+        payload = {
-+            "env": env,
-+            "strategy": strategy,
-+            "tick_ts": tick_ts,
-+            "action": action,
-+            "details_json": details_json or {},
-+        }
-+        stmt = sa.insert(self._schema.reconcile_log).values(**payload)
-+        with self.engine.begin() as conn:
-+            conn.execute(stmt)
-diff --git a/trader/db/schema.py b/trader/db/schema.py
-index e82bdc236c4078ee276d9730efc7f14613a01724..9808054299eee7adcdbea63f3ddafc1b188cac8f 100644
---- a/trader/db/schema.py
-+++ b/trader/db/schema.py
-@@ -17,50 +17,51 @@ def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
-     return sa.String()
- 
- 
- def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
-     try:
-         if value is None:
-             return str(uuid4())
-         if isinstance(value, UUID):
-             return str(value)
-         return str(UUID(str(value)))
-     except Exception:
-         return str(uuid4())
+ @dataclass
+ class RunResult:
+     status: str
+     notes: str | None = None
+     balance_api_calls: int = 0
+     balance_cache_hits: int = 0
+     balance_tick_cache_hits: int = 0
  
  
  @dataclass(frozen=True)
- class SchemaTables:
-     database_url: str
-     metadata: sa.MetaData
-     runs: sa.Table
-     universe: sa.Table
-     universe_members: sa.Table
-     orders: sa.Table
-     fills: sa.Table
-     positions: sa.Table
-     ledger_events: sa.Table
-+    reconcile_log: sa.Table
-     uses_native_uuid: bool
+ class UniverseContext:
+     as_of_date: str | None
+     members: list[dict]
+     selected_path: str | None = None
+     meta: dict | None = None
++    is_empty: bool = False
  
  
- def _build_schema(database_url: str) -> SchemaTables:
-     metadata = sa.MetaData()
-     uuid_type = _uuid_type_for_url(database_url)
-     uses_native_uuid = False
+ @dataclass(frozen=True)
+ class FilterThresholds:
+     vol_contraction_max: float
+     volu_contraction_max: float
+     pullback_min: float
+     pullback_max: float
+     require_both_contractions: bool
  
-     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
-         return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
- 
-     runs = sa.Table(
-         "runs",
-         metadata,
-         uuid_col("run_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("run_window", sa.String),
-         sa.Column("phase", sa.String),
-         sa.Column("event_name", sa.String),
-         sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
-         sa.Column("git_sha", sa.String),
-         sa.Column("workflow", sa.String),
-         sa.Column("workflow_run_id", sa.String),
-         sa.Column("workflow_attempt", sa.Integer),
-@@ -93,79 +94,83 @@ def _build_schema(database_url: str) -> SchemaTables:
-         sa.Column("market", sa.String),
-         sa.Column("weight", sa.Float),
-         sa.Column("rank", sa.Integer),
-         sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
-     )
- 
-     orders = sa.Table(
-         "orders",
-         metadata,
-         uuid_col("order_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("sid", sa.Integer, nullable=False),
-         sa.Column("mode", sa.Integer, nullable=False),
-         sa.Column("code", sa.String, nullable=False),
-         sa.Column("market", sa.String),
-         sa.Column("side", sa.String, nullable=False),
-         sa.Column("ord_type", sa.String, nullable=False),
-         sa.Column("qty", sa.Integer, nullable=False),
-         sa.Column("limit_price", sa.Float),
-         sa.Column("stage", sa.String),
-         sa.Column("client_order_key", sa.String, nullable=False),
-         sa.Column("status", sa.String, nullable=False, default="INTENT"),
-         sa.Column("kis_odno", sa.String),
-+        sa.Column("broker_order_id", sa.String),
-         sa.Column("request_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("response_json", sa.JSON),
-         sa.Column("submitted_at", sa.DateTime(timezone=True)),
-         sa.Column("acked_at", sa.DateTime(timezone=True)),
-         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-         sa.UniqueConstraint("env", "client_order_key", name="uq_orders_env_client_order_key"),
-+        sa.UniqueConstraint("env", "broker_order_id", name="uq_orders_env_broker_order_id"),
-     )
- 
-     fills = sa.Table(
-         "fills",
-         metadata,
-         uuid_col("fill_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
-         sa.Column("order_id", uuid_type, sa.ForeignKey("orders.order_id")),
-         sa.Column("kis_odno", sa.String),
-         sa.Column("trade_id", sa.String),
-+        sa.Column("broker_fill_id", sa.String),
-         sa.Column("code", sa.String, nullable=False),
-         sa.Column("market", sa.String),
-         sa.Column("side", sa.String, nullable=False),
-         sa.Column("qty", sa.Integer, nullable=False),
-         sa.Column("price", sa.Float, nullable=False),
-         sa.Column("fee", sa.Float, nullable=False, default=0.0),
-         sa.Column("tax", sa.Float, nullable=False, default=0.0),
-         sa.Column("filled_at", sa.DateTime(timezone=True), nullable=False),
-         sa.Column("raw_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-         sa.UniqueConstraint("env", "trade_id", name="uq_fills_env_trade_id"),
-+        sa.UniqueConstraint("env", "broker_fill_id", name="uq_fills_env_broker_fill_id"),
-         sa.UniqueConstraint(
-             "env",
-             "kis_odno",
-             "code",
-             "side",
-             "qty",
-             "price",
-             "filled_at",
-             name="uq_fills_fallback",
-         ),
-     )
- 
-     positions = sa.Table(
-         "positions",
-         metadata,
-         uuid_col("position_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("strategy", sa.String, nullable=False),
-         sa.Column("sid", sa.Integer, nullable=False),
-         sa.Column("mode", sa.Integer, nullable=False),
-         sa.Column("code", sa.String, nullable=False),
-         sa.Column("market", sa.String),
-         sa.Column("qty", sa.Integer, nullable=False, default=0),
-         sa.Column("avg_buy_price", sa.Float),
-         sa.Column("total_cost", sa.Float, nullable=False, default=0.0),
-@@ -174,97 +179,111 @@ def _build_schema(database_url: str) -> SchemaTables:
-         sa.Column("initial_stop", sa.Float, nullable=True),
-         sa.Column("stop_price", sa.Float, nullable=True),
-         sa.Column("max_price", sa.Float, nullable=True),
-         sa.Column("pyramid_level", sa.Integer, nullable=False, server_default="0"),
-         sa.Column("pivot", sa.Float, nullable=True),
-         sa.Column("last_add_price", sa.Float, nullable=True),
-         sa.Column("last_stop_update_ts", sa.Text, nullable=True),
-         sa.Column("partial_exit_level", sa.Integer, nullable=False, server_default="0"),
-         sa.Column("base_id", sa.Text, nullable=True),
-         sa.Column("setup_id", sa.Text, nullable=True),
-         sa.Column("tight_low", sa.Float, nullable=True),
-         sa.Column("base_high", sa.Float, nullable=True),
-         sa.Column("entry_price", sa.Float, nullable=True),
-         sa.Column("r_value", sa.Float, nullable=True),
-         sa.Column("tp1_done", sa.Integer, nullable=False, server_default="0"),
-         sa.Column("tp2_done", sa.Integer, nullable=False, server_default="0"),
-         sa.Column("trail_mode", sa.Text, nullable=True),
-         sa.Column("last_trail_stop", sa.Float, nullable=True),
-         sa.Column("cooldown_until", sa.Text, nullable=True),
-         sa.Column("regime_at_entry", sa.Text, nullable=True),
-         sa.Column("risk_mult_at_entry", sa.Float, nullable=True),
-         sa.Column("last_trade_at", sa.DateTime(timezone=True)),
-         sa.Column("status", sa.String, nullable=True),
-         sa.Column("closed_reason", sa.String, nullable=True),
-         sa.Column("closed_ts", sa.DateTime(timezone=True)),
-+        sa.Column("last_reconciled_at", sa.DateTime(timezone=True)),
-         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-         sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
-     )
- 
-     ledger_events = sa.Table(
-         "ledger_events",
-         metadata,
-         uuid_col("ledger_event_id", primary_key=True),
-         sa.Column("env", sa.String, nullable=False),
-         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
-         sa.Column("event_type", sa.String, nullable=False),
-         sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
-         sa.Column("code", sa.String),
-         sa.Column("market", sa.String),
-         sa.Column("sid", sa.Integer),
-         sa.Column("mode", sa.Integer),
-         sa.Column("side", sa.String),
-         sa.Column("qty", sa.Integer),
-         sa.Column("price", sa.Float),
-         sa.Column("kis_odno", sa.String),
-         sa.Column("client_order_key", sa.String),
-         sa.Column("ok", sa.Boolean, nullable=False, default=True),
-         sa.Column("reasons", sa.JSON, nullable=False, default=list),
-         sa.Column("stage", sa.String),
-         sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
-         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-     )
- 
-+    reconcile_log = sa.Table(
-+        "reconcile_log",
-+        metadata,
-+        sa.Column("env", sa.String, nullable=False),
-+        sa.Column("strategy", sa.String, nullable=False),
-+        sa.Column("tick_ts", sa.DateTime(timezone=True), nullable=False),
-+        sa.Column("action", sa.String, nullable=False),
-+        sa.Column("details_json", sa.JSON, nullable=False, default=dict),
-+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-+    )
-+
-     return SchemaTables(
-         database_url=database_url,
-         metadata=metadata,
-         runs=runs,
-         universe=universe,
-         universe_members=universe_members,
-         orders=orders,
-         fills=fills,
-         positions=positions,
-         ledger_events=ledger_events,
-+        reconcile_log=reconcile_log,
-         uses_native_uuid=uses_native_uuid,
-     )
- 
- 
- _SCHEMA_CACHE: dict[str, SchemaTables] = {}
- 
- 
- @lru_cache(maxsize=None)
- def schema_for_url(database_url: str) -> SchemaTables:
-     normalized = str(database_url)
-     if normalized not in _SCHEMA_CACHE:
-         _SCHEMA_CACHE[normalized] = _build_schema(normalized)
-     return _SCHEMA_CACHE[normalized]
- 
- 
- def schema_for_engine(engine: Engine) -> SchemaTables:
-     return schema_for_url(str(engine.url))
- 
- 
- def metadata_for_url(database_url: str) -> sa.MetaData:
-     return schema_for_url(database_url).metadata
- 
- 
- DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
- DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
- 
- METADATA = DEFAULT_SCHEMA.metadata
- RUNS = DEFAULT_SCHEMA.runs
- UNIVERSE = DEFAULT_SCHEMA.universe
- UNIVERSE_MEMBERS = DEFAULT_SCHEMA.universe_members
- ORDERS = DEFAULT_SCHEMA.orders
- FILLS = DEFAULT_SCHEMA.fills
- POSITIONS = DEFAULT_SCHEMA.positions
- LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
-+RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index d478fe9cbc37ce55a688d94c2d9d487e1a1bb00e..d79546de0f6a7329bd0104cdff3c924620bbccbb 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -378,57 +378,96 @@ class KisAPI:
-         self.CANO = safe_strip(CANO)
-         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
-         self.env = safe_strip(KIS_ENV or "practice").lower()
-         if self.env not in ("practice", "real"):
-             self.env = "practice"
- 
-         # [CHG] 세션 생성 → 멤버로 보관
-         self.session = _build_session()
- 
-         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
-         self._safe_attempts = 3
-         self._safe_backoff_seq = [0.5, 1.5]
-         self._safe_max_seconds = 18.0
- 
-         self._limiter = _RateLimiter(min_interval_sec=0.20)
-         self._recent_sells: Dict[str, float] = {}
-         self._recent_sells_lock = threading.Lock()
-         self._recent_sells_cooldown = 60.0
- 
-         self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
-         self._balance_cache: Optional[dict] = None
-         self._balance_cache_at: Optional[datetime] = None
-         self._orderable_cash_cache: Optional[int] = None
-         self._orderable_cash_cache_at: Optional[datetime] = None
-         self._orderable_cash_cache_ttl_sec = 5.0
-+        self.safe_mode = False
-+        self._load_safe_mode_state()
- 
-         self.token = self.get_valid_token()
-         logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
- 
-         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
-         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
- 
-+    def _safe_mode_path(self) -> Path:
-+        path = botstate_path("runtime", "status", "kis_safe_mode.json")
-+        path.parent.mkdir(parents=True, exist_ok=True)
-+        return path
-+
-+    def _load_safe_mode_state(self) -> None:
-+        ttl_sec = int(os.getenv("KIS_SAFE_MODE_TTL_SEC", "300") or "300")
-+        path = self._safe_mode_path()
-+        if not path.exists():
-+            return
-+        try:
-+            payload = json.loads(path.read_text(encoding="utf-8"))
-+            ts_raw = payload.get("ts")
-+            if not ts_raw:
-+                return
-+            ts = datetime.fromisoformat(ts_raw)
-+            if ts.tzinfo is None:
-+                ts = ts.replace(tzinfo=pytz.timezone("Asia/Seoul"))
-+            age = (now_kst() - ts).total_seconds()
-+            if age <= ttl_sec:
-+                self.safe_mode = True
-+        except Exception:
-+            logger.warning("[SAFE_MODE][LOAD_FAIL]", exc_info=True)
-+
-+    def _set_safe_mode(self, *, reason: str, err: Exception | None = None) -> None:
-+        self.safe_mode = True
-+        try:
-+            payload = {
-+                "ts": now_kst().isoformat(),
-+                "reason": reason,
-+                "err": str(err) if err else None,
-+            }
-+            path = self._safe_mode_path()
-+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-+        except Exception:
-+            logger.warning("[SAFE_MODE][WRITE_FAIL]", exc_info=True)
-+
-     # ===== [NEW] 안전요청 & 세션리셋 =====
-     def _reset_session(self):
-         try:
-             old = self.session
-             self.session = _build_session()
-             try:
-                 old.close()
-             except Exception:
-                 pass
-             logger.warning("[NET] session reset")
-         except Exception as e:
-             logger.warning("[NET] session reset failed: %s", e)
- 
-     def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
-         """
-         공통 안전요청 래퍼:
-         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
-         - 기본 시도 self._safe_attempts
-         """
-         attempts = max(self._safe_attempts, 1)
-         start_ts = time.monotonic()
-         auth_refreshed = False
-         reset_done = False
-         breaker_open, breaker_until = _breaker_check(method, url)
-         if breaker_open:
-@@ -1702,53 +1741,66 @@ class KisAPI:
-             logger.warning("[CASH][STATUS][FAIL] cache_stale=%s source=%s", cache_stale, source, exc_info=True)
- 
-     def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
-         """주문가능조회 호출."""
-         tr_list = _pick_tr(self.env, "PSBL_ORDER")
-         if not tr_list:
-             raise RuntimeError("PSBL_ORDER TR 미구성")
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-         tr = tr_list[0]
-         headers = self._headers(tr)
-         try:
-             ord_unpr = int(float(price_hint)) if price_hint is not None else 1
-         except Exception:
-             ord_unpr = 1
-         params = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "PDNO": safe_strip(code_hint) or "005930",
-             "ORD_UNPR": str(max(ord_unpr, 1)),
-             "ORD_DVSN": "00",
-             "ORD_DVSN_CD": "00",
-             "CMA_EVLU_AMT_ICLD_YN": "N",
-             "OVRS_ICLD_YN": "N",
+     def with_overrides(self, **kwargs: float | bool) -> "FilterThresholds":
+         data = {
+             "vol_contraction_max": self.vol_contraction_max,
+             "volu_contraction_max": self.volu_contraction_max,
+             "pullback_min": self.pullback_min,
+             "pullback_max": self.pullback_max,
+             "require_both_contractions": self.require_both_contractions,
          }
-         self._limiter.wait("psbl-order")
--        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
--        data = resp.json()
--        return data
-+        last_exc: Exception | None = None
-+        for attempt in range(1, 4):
-+            try:
-+                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
-+                return resp.json()
-+            except KisTemporaryError as exc:
-+                last_exc = exc
-+                logger.warning("[PSBL_ORDER][RETRY] attempt=%s err=%s", attempt, exc)
-+                if attempt >= 3:
-+                    self._set_safe_mode(reason="psbl_order_temp_error", err=exc)
-+                    logger.error("[PSBL_ORDER][SAFE_MODE] entry_blocked=1 err=%s", exc)
-+                    raise
-+                time.sleep(0.5 * attempt)
-+        if last_exc:
-+            raise last_exc
-+        raise KisTemporaryError("psbl_order_failed")
+         data.update(kwargs)
+         return FilterThresholds(**data)
  
-     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
-         """잔고 1페이지 호출(예외는 상위에서 처리)."""
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-         tr_list = _pick_tr(self.env, "BALANCE")
-         if not tr_list:
-             raise RuntimeError("BALANCE TR 미구성")
-         tr = tr_list[0]
-         if os.getenv("KIS_FORCE_500_BALANCE", "0") == "1":
-             logger.warning("[BALANCE][FORCE_500] env=KIS_FORCE_500_BALANCE=1 -> simulate temp error")
-             _breaker_record_temp_failure("GET", url)
-             raise KisTemporaryError("forced_500_balance")
-         headers = self._headers(tr)
-         params = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "AFHR_FLPR_YN": "N",
-             "UNPR_YN": "N",
-             "UNPR_DVSN": "01",
-             "FUND_STTL_ICLD_YN": "N",
-             "FNCG_AMT_AUTO_RDPT_YN": "N",
-             "PRCS_DVSN": "01",
-             "OFL_YN": "N",
-             "INQR_DVSN": "02",
-             "CTX_AREA_FK100": fk,
+ 
+ def resolve_pb1_phase(
+     now: datetime,
+     trading_day: bool,
 diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index ae5ab1546d66a308e4eabd73be9c1af16060f0dd..e0238300765003fe77656c93bda5e55f8b11093c 100644
+index e0238300765003fe77656c93bda5e55f8b11093c..e6af29da4863e18ece248f36d84f06aefb872893 100644
 --- a/trader/pb1_runner.py
 +++ b/trader/pb1_runner.py
-@@ -44,55 +44,63 @@ from trader.config import (
-     PB1_REQUIRE_BALANCE_FOR_ENTRY,
-     PB1_FORCE_ENTRY_ON_PUSH,
-     PB1_MAX_WAIT_FOR_WINDOW_MIN,
-     PB1_WAIT_FOR_WINDOW,
-     PAPER_MAX_CAPITAL_KRW,
-     PAPER_RESET_AUTO_PURGE,
-     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
-     resolve_strategy_mode,
- )
- from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
- from trader.botstate_sync import (
-     BotStateContext,
-     acquire_lock as acquire_botstate_lock,
-     compute_lock_ttl,
-     ensure_sqlite_writable,
-     hard_reset_bot_state,
-     persist_or_fail,
-     persist_run_files,
-     release_lock as release_botstate_lock,
-     resolve_botstate_worktree_dir,
-     setup_worktree,
- )
- from trader.db.engine import make_engine
- from trader.db.lock import release_lock, try_acquire_lock
- from trader.db.migrate import run_migrations
--from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, RunsRepo, UniverseRepo
-+from trader.db.repos import (
-+    FillsRepo,
-+    LedgerEventsRepo,
-+    OrdersRepo,
-+    PositionsRepo,
-+    ReconcileLogRepo,
-+    RunsRepo,
-+    UniverseRepo,
-+)
- from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
- from trader.ledger.store import LedgerStore
- from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
--from trader.reconcile_kis import reconcile_today
-+from trader.reconcile_kis import reconcile_kis, reconcile_today
- from trader.reconcile_db import close_stale_positions
- from trader.reset_utils import (
-     detect_account_fp,
-     load_reset_guard,
-     purge_bot_state,
-     record_purge_event,
-     should_purge_on_empty_kis_holdings,
-     update_reset_guard_from_balance,
- )
- from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
- from trader.time_utils import now_kst
- from trader.eventlog import emit_event
- from trader.utils.env import env_bool, parse_env_flag, resolve_mode
- from trader.utils.json_sanitize import to_jsonable
- from trader.window_router import WindowDecision, decide_window
+@@ -359,69 +359,88 @@ def ensure_universe_built_once(
+     bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
+     env_vars = os.environ.copy()
+     env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
+     env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
+     subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
+     _, post_meta = runtime_store.load_today_universe(as_of)
+     if post_meta.get("have_today"):
+         log.info(
+             "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+             post_meta.get("today_path"),
+         )
+     else:
+         log.warning(
+             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+             post_meta.get("today_path"),
+         )
  
- logger = logging.getLogger(__name__)
- log = logger
  
- _WINDOW_MISMATCH_LOGGED = False
- _CURRENT_BOTSTATE: dict | None = None
+ def _load_universe_context(
+     *,
+     runtime_store: RuntimeStore,
+     as_of: str,
+     env: str,
+     strategy: str,
+ ) -> UniverseContext:
+-    members, meta = runtime_store.load_universe_for_trading(as_of)
+-    if not isinstance(members, list) or not members:
+-        ensure_universe_built_once(
+-            runtime_store=runtime_store,
+-            env=env,
+-            strategy=strategy,
+-            as_of=as_of,
+-            force=True,
+-            allow_missing=False,
++    ok, meta = runtime_store.universe_check(as_of)
++    selected_path = meta.get("selected_path")
++    if not ok or not selected_path or not os.path.exists(selected_path):
++        raise RuntimeError(f"Universe missing: cannot trade as_of={as_of} path={selected_path}")
++    try:
++        with open(selected_path, "r", encoding="utf-8") as handle:
++            data = json.load(handle)
++    except Exception as exc:
++        raise RuntimeError(f"Universe load failed: cannot trade as_of={as_of} path={selected_path}") from exc
++    if isinstance(data, dict):
++        universe = data
++        members = data.get("members")
++    else:
++        universe = {"members": data}
++        members = data
++    if not isinstance(members, list):
++        raise RuntimeError(f"Universe malformed: cannot trade as_of={as_of} path={selected_path}")
++    if len(members) == 0:
++        logger.warning(
++            "[PB1][UNIVERSE][EMPTY_OK] as_of=%s path=%s reason=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
++            as_of,
++            selected_path,
++            universe.get("reason"),
++        )
++        return UniverseContext(
++            as_of_date=universe.get("as_of"),
++            members=[],
++            selected_path=selected_path,
++            meta=meta,
++            is_empty=True,
+         )
+-        members, meta = runtime_store.load_universe_for_trading(as_of)
+-    if not isinstance(members, list) or not members:
+-        raise RuntimeError(f"Universe missing/empty: cannot trade as_of={as_of} path={meta.get('selected_path')}")
+-    universe_as_of = meta.get("as_of") or (members[0].get("as_of_date") if members else None)
++    universe_as_of = universe.get("as_of") or (members[0].get("as_of_date") if members else None)
+     return UniverseContext(
+         as_of_date=universe_as_of,
+         members=members,
+-        selected_path=meta.get("selected_path"),
++        selected_path=selected_path,
+         meta=meta,
++        is_empty=False,
+     )
  
- BALANCE_STATE_OK = "OK"
- BALANCE_STATE_STALE_OK = "STALE_OK"
- BALANCE_STATE_UNKNOWN = "UNKNOWN"
-@@ -402,69 +410,77 @@ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+ 
+ def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
+     events_dir = base_dir / "runtime" / "events"
+     events_dir.mkdir(parents=True, exist_ok=True)
+     path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
      ensure_not_repo_tracked_path(path)
      payload = to_jsonable(payload)
      line = json.dumps(payload, ensure_ascii=False)
@@ -1668,659 +161,209 @@ index ae5ab1546d66a308e4eabd73be9c1af16060f0dd..e0238300765003fe77656c93bda5e55f
      engine,
      kis: KisAPI | None,
      orders_count: int,
-     fills_count: int,
-     positions_repo: PositionsRepo,
-     ledger_repo: LedgerEventsRepo,
-     bot_state_dir: Path,
-     reset_on_missing_positions: bool,
-     force_safe_exit: bool,
-     hard_reset_requested: bool,
-+    allow_stale_purge: bool | None,
-+    stale_guard_reason: str | None,
- ) -> bool:
-     if not balance_snapshot:
-         return False
-     holdings_rows = balance_snapshot.get("output1") or []
-     kis_codes = {str(row.get("pdno") or row.get("code") or "").zfill(6) for row in holdings_rows}
-     kis_codes = {code for code in kis_codes if code}
-     if kis_codes:
-         return False
-     positions = positions_repo.list_positions(env, strategy)
-     position_codes = {str(p.get("code") or "").zfill(6) for p in positions if int(p.get("qty") or 0) > 0}
-     if not position_codes:
-         return False
-     if orders_count > 0 or fills_count > 0:
-         logger.info(
-             "[PB1][RESET][SKIP] holdings_empty=1 recent_orders=%s recent_fills=%s -> no stale reset",
-             orders_count,
-             fills_count,
-         )
-         return False
-+    if allow_stale_purge is False:
-+        logger.info(
-+            "[PB1][RESET][SKIP] holdings_empty=1 stale_guard=%s -> no stale reset",
-+            stale_guard_reason or "guard_block",
-+        )
-+        return False
-     ledger_store = LedgerStore(LEDGER_BASE_DIR, env=env, run_id=run_id)
-     ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-     ledger_codes = {code for (code, sid, mode) in ledger_positions.keys() if code}
-     missing_codes = sorted(position_codes | ledger_codes)
-     if not missing_codes:
-         return False
-     if not reset_on_missing_positions and not force_safe_exit:
-         if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-             reset_result = hard_reset_bot_state(bot_state_dir, reason="stale_db")
-             os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
-             logger.warning(
-                 "[PB1][RESET][HARD_STALE_DB] env=%s missing_positions=%s result=%s",
-                 env,
-                 missing_codes,
-                 reset_result,
-             )
-             return True
-         closed_count = close_stale_positions(
-             engine=engine,
-             env=env,
-             strategy=strategy,
-             reason="STALE_DB_BUT_KIS_EMPTY",
-             ts=now_kst(),
-         )
-         for code in missing_codes:
-@@ -924,50 +940,56 @@ def _release_botstate_lock_best_effort(reason: str) -> None:
-     try:
-         release_botstate_lock(
-             _CURRENT_BOTSTATE["worktree_dir"],
-             _CURRENT_BOTSTATE["owner"],
-             _CURRENT_BOTSTATE["run_id"],
-         )
-         logger.warning("[BOTSTATE][LOCK][RELEASE] reason=%s ok=1", reason)
-     except Exception as exc:
-         logger.warning("[BOTSTATE][LOCK][RELEASE_FAIL] reason=%s err=%s", reason, exc)
- 
- 
- def run_once(
-     *,
-     args: argparse.Namespace,
-     engine,
-     loop_mode: bool = False,
-     window: WindowDecision | None = None,
-     bot_state_dir: Path | None = None,
-     max_seconds: int = 0,
- ) -> tuple[list[Path], bool, dict[str, int], str, str]:
-     now = _get_now_kst()
-     if now.tzinfo is None:
-         now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
-     tick_start_ts = time_mod.monotonic()
-     deadline_ts = tick_start_ts + max_seconds if max_seconds > 0 else None
-+    persist_budget_sec = _parse_int_env("PB1_PERSIST_BUDGET_SEC", 30)
-+    if max_seconds > 0:
-+        persist_budget_sec = max(5, min(persist_budget_sec, max_seconds))
-+    else:
-+        persist_budget_sec = max(5, persist_budget_sec)
-+    trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
-     run_start_ts = time_mod.time()
-     as_of = now.date().isoformat()
-     resolved_bot_state_dir = bot_state_dir or get_botstate_root()
-     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
-     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
-     if close_cancel_only:
-         logger.info("[PB1][MODE] close_cancel_only=Y")
-     event_name = os.getenv("GITHUB_EVENT_NAME", "") or ""
-     event_name_lower = event_name.lower()
-     mode, trading_day, market_window, mode_source = resolve_strategy_mode(
-         now_kst=now,
-         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
-     )
-     auto_window = detect_window(now, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
-     if auto_window != market_window:
-         logger.info(
-             "[PB1][WINDOW][AUTO] now_kst=%s env_window=%s auto_window=%s -> using auto",
-             now.isoformat(),
-             market_window,
-             auto_window,
-         )
-         market_window = auto_window
-     effective_mode = mode
-     if smoke_enabled:
-@@ -1427,50 +1449,77 @@ def run_once(
-         if entry_cutoff_raw:
-             try:
-                 cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
-                 cutoff_dt = datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
-                 logger.info(
-                     "[PB1][TIME] now_kst=%s cutoff=%s close=%s phase=%s",
-                     now.isoformat(),
-                     cutoff_dt.isoformat(),
-                     close_dt.isoformat(),
-                     resolved_phase,
-                 )
-                 if now.time() > cutoff_time:
-                     entry_allowed_this_tick = False
-                     entry_block_reason = entry_block_reason or "entry_cutoff"
-             except ValueError:
-                 logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s", entry_cutoff_raw)
- 
-         if market_window == "preopen":
-             if not PB1_ALLOW_PREOPEN_ENTRY:
-                 entry_allowed_this_tick = False
-                 entry_block_reason = entry_block_reason or "preopen_block"
-             elif PB1_PREOPEN_REQUIRE_BALANCE and balance_state != BALANCE_STATE_OK:
-                 entry_allowed_this_tick = False
-                 entry_block_reason = entry_block_reason or "balance_unknown"
- 
-+        if deadline_ts:
-+            remaining_budget = deadline_ts - time_mod.monotonic()
-+            if remaining_budget <= persist_budget_sec:
-+                entry_allowed_this_tick = False
-+                entry_block_reason = entry_block_reason or "timeout_budget"
-+                logger.warning(
-+                    "[PB1][TIMEOUT][ENTRY_BLOCKED] remaining=%.1fs persist_budget=%s trade_budget=%s",
-+                    remaining_budget,
-+                    persist_budget_sec,
-+                    trade_budget_sec,
-+                )
-+
-+        if kis and getattr(kis, "safe_mode", False):
-+            entry_allowed_this_tick = False
-+            entry_block_reason = entry_block_reason or "safe_mode"
-+            logger.warning("[PB1][SAFE_MODE] entry_allowed=0")
-+            try:
-+                ReconcileLogRepo(engine).append_log(
-+                    env=kis_env or "practice",
-+                    strategy="pb1_pullback_close",
-+                    tick_ts=now,
-+                    action="safe_mode_entry_block",
-+                    details_json={"reason": "safe_mode"},
-+                )
-+            except Exception:
-+                logger.warning("[PB1][SAFE_MODE][RECONCILE_LOG][FAIL]", exc_info=True)
-+
-         if not entry_allowed_this_tick:
-             logger.info(
-                 "[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0",
-                 entry_block_reason or "unknown",
-             )
- 
-         reset_reason = None
-         account_fp_now = None
-         dnca_total = None
-         if kis and balance_snapshot_raw:
-             account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
-             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
-             runtime_fp = runtime_meta.get("account_fp")
-             if BOT_STATE_HARD_RESET:
-                 reset_reason = None
-             elif BOT_STATE_RESET:
-                 reset_reason = "env_reset"
-             elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
-                 reset_reason = "account_fp_mismatch"
-             elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
-                 kis_holdings = balance_snapshot_raw.get("output1") or []
-                 ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
-                 ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-                 ledger_positions_count = sum(
-                     1 for state in ledger_positions.values() if int(state.get("total_qty") or 0) > 0
-@@ -1557,107 +1606,114 @@ def run_once(
-             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
-             if runtime_meta.get("account_fp") != account_fp_now:
-                 _write_runtime_meta(resolved_bot_state_dir, {"account_fp": account_fp_now})
- 
-         run_record_id = runs_repo.start_run(
-             env=kis_env or "practice",
-             strategy="pb1_pullback_close",
-             run_window=window_label,
-             phase=phase_override_arg,
-             event_name=event_name_lower,
-             dry_run=dry_run,
-             git_sha=os.getenv("GITHUB_SHA"),
-             workflow=os.getenv("GITHUB_WORKFLOW"),
-             workflow_run_id=workflow_run_id,
-             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
-             config_json={
-                 "dry_run_reasons": dry_run_reasons,
-                 "run_window": window_label,
-                 "phase": phase_override_arg,
-                 "phase_reason": phase_reason,
-             },
-         )
-         db_write_reasons.append("run_start")
-         reset_on_missing_positions = env_bool("PB1_RESET_ON_MISSING_POSITIONS", False)
-         force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
-+        reconcile_result: dict | None = None
-+        if kis:
-+            try:
-+                reconcile_result = reconcile_kis(
-+                    engine=engine,
-+                    kis=kis,
-+                    env=kis_env or "practice",
-+                    run_id=run_record_id,
-+                    strategy="pb1_pullback_close",
-+                    tick_ts=now,
-+                    balance_snapshot=balance_snapshot_raw,
-+                    bot_state_dir=str(resolved_bot_state_dir),
-+                )
-+                db_write_reasons.append("reconcile")
-+                if not reconcile_result.get("ok", True):
-+                    logger.warning(
-+                        "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
-+                        reconcile_result.get("reason"),
-+                        reconcile_result.get("err"),
-+                    )
-+            except KisTemporaryError as exc:
-+                logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
-+            except Exception as exc:
-+                if not dry_run and mode_resolved == "LIVE":
-+                    logger.error("[PB1][RECONCILE][FAIL] %s", exc)
-+                logger.warning("[PB1][RECONCILE][WARN] %s", exc)
-+
-         todays_orders = orders_repo.list_today_orders(kis_env or "practice")
-         todays_fills = fills_repo.list_today_fills(kis_env or "practice")
-         if balance_state == BALANCE_STATE_OK:
-             if _handle_missing_positions_reset(
-                 balance_snapshot=balance_snapshot_raw,
-                 env=kis_env or "practice",
-                 strategy="pb1_pullback_close",
-                 run_id=run_record_id,
-                 engine=engine,
-                 kis=kis,
-                 orders_count=len(todays_orders),
-                 fills_count=len(todays_fills),
-                 positions_repo=positions_repo,
-                 ledger_repo=ledger_repo,
-                 bot_state_dir=resolved_bot_state_dir,
-                 reset_on_missing_positions=reset_on_missing_positions,
-                 force_safe_exit=force_safe_exit,
-                 hard_reset_requested=BOT_STATE_HARD_RESET,
-+                allow_stale_purge=(reconcile_result or {}).get("allow_purge"),
-+                stale_guard_reason=(reconcile_result or {}).get("guard_reason"),
-             ):
-                 if env_bool("PRACTICE_RESET_DAY", False):
-                     logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
-                 runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
-                 db_write_reasons.append("reset_abort")
-                 _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="reset_abort", now=now)
-                 touched_files = _collect_botstate_files(run_start_ts)
-                 return touched_files, True, {}, phase_for_log, "RESET_ABORT"
-         else:
-             logger.warning("[PB1][BALANCE][DEGRADED] state=%s -> skip reset/reconcile", balance_state)
-         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
-             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
-             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
-             db_write_reasons.append("balance_degraded")
-             _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="balance_degraded", now=now)
-             touched_files = _collect_botstate_files(run_start_ts)
-             return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
--        if kis and balance_state == BALANCE_STATE_OK:
--            try:
--                reconcile_result = reconcile_today(
--                    engine=engine,
--                    kis=kis,
--                    env=kis_env or "practice",
--                    run_id=run_record_id,
--                    strategy="pb1_pullback_close",
--                )
--                db_write_reasons.append("reconcile")
--                if not reconcile_result.get("ok", True):
--                    logger.warning(
--                        "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
--                        reconcile_result.get("reason"),
--                        reconcile_result.get("err"),
--                    )
--            except KisTemporaryError as exc:
--                logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
--            except Exception as exc:
--                if not dry_run and mode_resolved == "LIVE":
--                    logger.error("[PB1][RECONCILE][FAIL] %s", exc)
--                logger.warning("[PB1][RECONCILE][WARN] %s", exc)
- 
-         engine_runner = PB1Engine(
-             universe_repo=universe_repo,
-             orders_repo=orders_repo,
-             fills_repo=fills_repo,
-             positions_repo=positions_repo,
-             ledger_repo=ledger_repo,
-             kis=kis,
-             window=window,
-             window_label=window_label,
-             phase=phase_override_arg,
-             dry_run=dry_run,
-             env=kis_env or "practice",
-             run_id=run_record_id,
-             now_kst_value=now,
-             balance_snapshot=balance_snapshot_raw,
-             balance_source=balance_source,
-             entry_allowed_this_tick=entry_allowed_this_tick,
-             entry_block_reason=entry_block_reason,
-             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
-             universe_context=universe_ctx,
-         )
-         if close_cancel_only:
-             result = engine_runner.run_close_cancel()
-         else:
-diff --git a/trader/reconcile_db.py b/trader/reconcile_db.py
-index e0ffaf5507551606a0180c557678ef4dcc1b1b44..c7fbd22cb533d98a967b262fcc5464c57b056730 100644
---- a/trader/reconcile_db.py
-+++ b/trader/reconcile_db.py
-@@ -1,33 +1,103 @@
- from __future__ import annotations
- 
- import logging
- from datetime import datetime
-+import json
-+from pathlib import Path
- 
- import sqlalchemy as sa
- 
- logger = logging.getLogger(__name__)
-+RECONCILE_GUARD_FILE = Path("runtime") / "reconcile_guard.json"
-+EMPTY_STREAK_MIN = 2
-+EMPTY_STREAK_MAX = 3
-+
-+
-+def _guard_path(bot_state_dir: Path) -> Path:
-+    return bot_state_dir / RECONCILE_GUARD_FILE
-+
-+
-+def load_reconcile_guard(bot_state_dir: Path) -> dict:
-+    path = _guard_path(bot_state_dir)
-+    if not path.exists():
-+        return {}
-+    try:
-+        return json.loads(path.read_text(encoding="utf-8"))
-+    except Exception:
-+        logger.warning("[RECONCILE][GUARD][LOAD_FAIL] path=%s", path, exc_info=True)
-+        return {}
-+
-+
-+def save_reconcile_guard(bot_state_dir: Path, payload: dict) -> Path:
-+    path = _guard_path(bot_state_dir)
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-+    return path
-+
-+
-+def evaluate_stale_db_guard(
-+    *,
-+    bot_state_dir: Path,
-+    tick_ts: datetime,
-+    kis_holdings_empty: bool,
-+    orders_count: int,
-+    fills_count: int,
-+    had_kis_error: bool,
-+    min_empty_ticks: int = EMPTY_STREAK_MIN,
-+) -> tuple[bool, str, dict]:
-+    guard = load_reconcile_guard(bot_state_dir)
-+    empty_streak = int(guard.get("empty_streak") or 0)
-+
-+    if kis_holdings_empty and not had_kis_error:
-+        empty_streak = min(empty_streak + 1, EMPTY_STREAK_MAX)
-+    elif not kis_holdings_empty:
-+        empty_streak = 0
-+
-+    guard.update(
-+        {
-+            "last_tick_ts": tick_ts.isoformat(),
-+            "empty_streak": empty_streak,
-+            "last_holdings_empty": kis_holdings_empty,
-+        }
-+    )
-+    if had_kis_error:
-+        guard["last_kis_error_ts"] = tick_ts.isoformat()
-+    if orders_count > 0 or fills_count > 0:
-+        guard["last_order_or_fill_ts"] = tick_ts.isoformat()
-+
-+    save_reconcile_guard(bot_state_dir, guard)
-+
-+    if had_kis_error:
-+        return False, "kis_error", guard
-+    if not kis_holdings_empty:
-+        return False, "kis_has_holdings", guard
-+    if orders_count > 0 or fills_count > 0:
-+        return False, "recent_orders_or_fills", guard
-+    if empty_streak < min_empty_ticks:
-+        return False, "empty_streak_insufficient", guard
-+    return True, "empty_streak_confirmed", guard
- 
- 
- def close_stale_positions(*, engine, env: str, strategy: str, reason: str, ts: datetime) -> int:
-     inspector = sa.inspect(engine)
-     columns = {col["name"] for col in inspector.get_columns("positions")}
-     has_status = "status" in columns
-     has_reason = "closed_reason" in columns
-     has_closed_ts = "closed_ts" in columns
-     status_value = "SOFT_CLOSED"
-     if reason in {"stale_db_holdings_empty", "STALE_DB_BUT_KIS_EMPTY"}:
-         status_value = "ORPHAN"
-     with engine.begin() as conn:
-         if has_status:
-             set_parts = [
-                 "status = :status",
-                 "qty = 0",
-                 "avg_buy_price = NULL",
-                 "total_cost = 0.0",
-                 "updated_at = CURRENT_TIMESTAMP",
-             ]
-             params = {"status": status_value, "env": env, "strategy": strategy}
-             if has_reason:
-                 set_parts.append("closed_reason = :reason")
-                 params["reason"] = reason
-             if has_closed_ts:
-diff --git a/trader/reconcile_kis.py b/trader/reconcile_kis.py
-index a4fb5384bc67a99f70be6f7f8b038d3cd6823652..c580995413f8c6482c5b3173f2e8f66a2ff0dfd2 100644
---- a/trader/reconcile_kis.py
-+++ b/trader/reconcile_kis.py
-@@ -1,33 +1,35 @@
- from __future__ import annotations
- 
- import logging
- from datetime import datetime
- from typing import Any
-+from pathlib import Path
- 
- from trader.config import MARKET_MAP
--from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo
-+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
-+from trader.reconcile_db import evaluate_stale_db_guard
- from trader.kis_wrapper import KisAPI, KisTemporaryError
- from trader.time_utils import now_kst
- 
- logger = logging.getLogger(__name__)
- 
- 
- def _first_value(row: dict, keys: list[str]) -> Any:
-     for key in keys:
-         value = row.get(key)
-         if value is not None and value != "":
-             return value
-     return None
- 
- 
- def _to_int(value: Any) -> int | None:
-     if value is None or value == "":
-         return None
-     try:
-         return int(str(value).strip())
-     except Exception:
-         return None
- 
- 
- def _to_float(value: Any) -> float | None:
-     if value is None or value == "":
-@@ -67,50 +69,51 @@ def _parse_side(row: dict) -> str:
-     return "UNKNOWN"
- 
- 
- def _normalize_code(value: Any) -> str:
-     return str(value or "").strip().zfill(6)
- 
- 
- def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strategy: str) -> dict[str, object]:
-     today = now_kst().strftime("%Y%m%d")
-     degraded_reason: str | None = None
-     try:
-         resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
-     except KisTemporaryError as exc:
-         logger.warning("[RECONCILE][DEGRADED] temporary error: %s", exc)
-         degraded_reason = "temporary"
-         resp = {"output1": [], "output2": []}
-     if not isinstance(resp, dict):
-         degraded_reason = degraded_reason or "invalid_response"
-         resp = {"output1": [], "output2": []}
-     rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
-     if isinstance(rows, dict):
-         rows = [rows]
+@@ -1379,50 +1398,57 @@ def run_once(
      orders_repo = OrdersRepo(engine)
      fills_repo = FillsRepo(engine)
+     positions_repo = PositionsRepo(engine)
      ledger_repo = LedgerEventsRepo(engine)
-+    reconcile_repo = ReconcileLogRepo(engine)
  
-     order_count = 0
-     fill_count = 0
-     for row in rows or []:
-         code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
-         if not code:
-             continue
-         side = _parse_side(row)
-         qty = _to_int(_first_value(row, ["ord_qty", "qty", "tot_ccld_qty", "ord_qty_sum"])) or 0
-         price = _to_float(_first_value(row, ["ord_unpr", "ord_price", "avg_prvs", "ccld_prc"])) or 0.0
-         kis_odno = str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() or None
-         status = str(_first_value(row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
-         market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
-         order_time = _parse_date_time(row)
-         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
+     run_record_id = None
+     engine_runner: PB1Engine | None = None
+     did_work = False
+     touched_files: list[Path] = []
+     result = None
+     db_write_reasons: list[str] = []
+     universe_ctx: UniverseContext | None = None
+     try:
+         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+             try:
+                 universe_ctx = _load_universe_context(
+                     runtime_store=runtime_store,
+                     as_of=as_of,
+                     env=kis_env or "practice",
+                     strategy=universe_strategy,
+                 )
+             except RuntimeError as exc:
+                 logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
+                 raise
++            if getattr(universe_ctx, "is_empty", False):
++                logger.info(
++                    "[PB1][SKIP] empty universe -> no candidates today; phase=%s window=%s",
++                    phase_for_log,
++                    window_label,
++                )
++                return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
+         kis: KisAPI | None = None
+         try:
+             kis = KisAPI()
+             if kis.env != kis_env:
+                 dry_run_reasons.append("kis_env_mismatch")
+                 dry_run = True
+                 _apply_env_flags(dry_run)
+         except Exception:
+             logger.exception("[PB1] KIS init failed -> skip tick")
+             return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
  
-         orders_repo.upsert_reconciled_order(
-             env=env,
-             run_id=run_id,
-             strategy=strategy,
-             sid=1,
-             mode=1,
-             code=code,
-             market=market,
-             side=side,
-@@ -140,26 +143,123 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
-                 code=code,
-                 market=market,
-                 side=side,
-                 qty=filled_qty,
-                 price=filled_price,
-                 fee=0.0,
-                 tax=0.0,
-                 filled_at=order_time,
-                 raw_json=row,
+         balance_snapshot_raw: dict | None = None
+         balance_source: str | None = None
+         balance_state = BALANCE_STATE_UNKNOWN
+         if kis:
+             _log_balance_cache(force=False)
+             balance_state, balance_snapshot_raw, balance_source = get_balance_state(
+                 kis=kis,
+                 runtime_store=runtime_store,
+                 now=now,
              )
-             fill_count += 1
+         logger.info(
+             "[PB1][BALANCE][STATE] state=%s source=%s",
+             balance_state,
+             balance_source,
+@@ -1993,107 +2019,115 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
+         else:
+             logger.info(
+                 "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
  
-     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
-     if degraded_reason:
-         reasons.append(f"degraded:{degraded_reason}")
-     ledger_repo.append_event(
-         env=env,
-         run_id=run_id,
-         event_type="RECONCILE",
-         ts=now_kst(),
-         ok=True,
-         reasons=reasons,
-         payload_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
+ 
+-def main() -> None:
++def _exit_code_for_status(status: str) -> int:
++    if status in {"FAILED", "ERROR"}:
++        return 1
++    return 0
++
++
++def main() -> int:
+     args = parse_args()
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
+     run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+     if run_loop_minutes > 0:
+         run_loop = True
+     if run_loop and not smoke_enabled:
+         _run_loop(args=args)
+-        return
++        return 0
+     if smoke_enabled:
+         bot_state_dir = get_botstate_root()
+         ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
+         engine = make_engine()
+         run_migrations(engine)
+         _write_change_flag(False, ["init"])
+         run_once(args=args, engine=engine, loop_mode=False, window=None)
+-        return
++        return 0
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     ttl_sec, ttl_buffer = compute_lock_ttl(run_loop_minutes * 60)
+     logger.info(
+         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+         ttl_sec,
+         run_loop_minutes * 60,
+         ttl_buffer,
      )
-     logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
-+    reconcile_repo.append_log(
-+        env=env,
-+        strategy=strategy,
-+        tick_ts=now_kst(),
-+        action="reconcile_today",
-+        details_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
-+    )
-     return {"ok": True, "orders": order_count, "fills": fill_count, "degraded": degraded_reason}
-+
-+
-+def reconcile_kis(
-+    *,
-+    engine,
-+    kis: KisAPI,
-+    env: str,
-+    run_id: str | None,
-+    strategy: str,
-+    tick_ts: datetime,
-+    balance_snapshot: dict | None = None,
-+    bot_state_dir: str | None = None,
-+) -> dict[str, object]:
-+    holdings_error = None
-+    holdings_rows: list[dict] = []
-+    try:
-+        snapshot = balance_snapshot or kis.get_balance_cached(force=True)
-+        holdings_rows = snapshot.get("output1") or []
-+    except KisTemporaryError as exc:
-+        holdings_error = str(exc)
-+        holdings_rows = []
-+    except Exception as exc:
-+        holdings_error = str(exc)
-+        holdings_rows = []
-+
-+    reconcile_result = reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
-+    orders_count = int(reconcile_result.get("orders") or 0)
-+    fills_count = int(reconcile_result.get("fills") or 0)
-+
-+    positions_repo = PositionsRepo(engine)
-+    restored = positions_repo.restore_missing_from_holdings(
-+        env=env,
-+        strategy=strategy,
-+        sid=1,
-+        mode=1,
-+        holdings=holdings_rows,
-+    )
-+    if restored:
-+        logger.warning("[RECONCILE][POSITIONS][RESTORE] env=%s restored=%s", env, restored)
-+
-+    guard_result = None
-+    guard_reason = None
-+    allow_purge = None
-+    if bot_state_dir:
-+        allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
-+            bot_state_dir=Path(bot_state_dir),
-+            tick_ts=tick_ts,
-+            kis_holdings_empty=len(holdings_rows) == 0,
-+            orders_count=orders_count,
-+            fills_count=fills_count,
-+            had_kis_error=holdings_error is not None,
-+        )
-+        if allow_purge:
-+            logger.warning(
-+                "[RECONCILE][STALE_DB_GUARD] allow_purge=1 empty_streak=%s",
-+                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
-+            )
-+        else:
-+            logger.info(
-+                "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=%s empty_streak=%s",
-+                guard_reason,
-+                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
-+            )
-+
-+    reconcile_repo = ReconcileLogRepo(engine)
-+    reconcile_repo.append_log(
-+        env=env,
-+        strategy=strategy,
-+        tick_ts=tick_ts,
-+        action="reconcile_kis",
-+        details_json={
-+            "orders": orders_count,
-+            "fills": fills_count,
-+            "holdings": len(holdings_rows),
-+            "restored_positions": restored,
-+            "holdings_error": holdings_error,
-+            "guard_reason": guard_reason,
-+            "allow_purge": allow_purge,
-+        },
-+    )
-+    reconcile_result.update(
-+        {
-+            "holdings": len(holdings_rows),
-+            "restored_positions": restored,
-+            "holdings_error": holdings_error,
-+            "guard_reason": guard_reason,
-+            "allow_purge": allow_purge,
-+        }
-+    )
-+    return reconcile_result
+     botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
+     if botstate_ctx is None:
+         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
+-        return
++        return 0
+     _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
+     engine = make_engine()
+     run_migrations(engine)
+     _write_change_flag(False, ["init"])
+     signal.signal(
+         signal.SIGTERM,
+         lambda *_args: _release_botstate_lock_best_effort("SIGTERM"),
+     )
+     signal.signal(
+         signal.SIGINT,
+         lambda *_args: _release_botstate_lock_best_effort("SIGINT"),
+     )
+     metrics: dict[str, int] = {}
+     phase_for_log = "none"
++    result_status = "UNKNOWN"
+     start_ts = time_mod.time()
+     try:
+-        touched, _did_work, metrics, phase_for_log, _result_status = run_once(
++        touched, _did_work, metrics, phase_for_log, result_status = run_once(
+             args=args,
+             engine=engine,
+             loop_mode=False,
+             window=None,
+             bot_state_dir=botstate_ctx.bot_state_dir,
+             max_seconds=run_loop_minutes * 60,
+         )
+         if touched:
+             _write_change_flag(True, ["touched_files"])
+             persist_run_files(
+                 botstate_ctx.worktree_dir,
+                 touched,
+                 message=f"pb1 run {now_kst().isoformat()}",
+             )
+         else:
+             _write_change_flag(False, ["no_changes"])
+     finally:
+         release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
+         elapsed = time_mod.time() - start_ts
+         logger.info(
+             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+             elapsed,
+             run_loop_minutes * 60,
+             "none",
+             phase_for_log,
+             metrics.get("balance_api_calls", 0),
+             metrics.get("balance_cache_hits", 0),
+             metrics.get("balance_tick_cache_hits", 0),
+         )
++    return _exit_code_for_status(result_status)
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    raise SystemExit(main())
+diff --git a/trader/run.py b/trader/run.py
+index afc10cb067c0221f90a4ad6551054e68bd5dd609..16fbc4dccb13adb924575d2833a37b108d4a3f0a 100644
+--- a/trader/run.py
++++ b/trader/run.py
+@@ -1,20 +1,19 @@
+ from __future__ import annotations
+ 
+ import logging
+ import sys
+ 
+ import trader
+ from trader import pb1_runner
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> int:
+     logger.info("[IMPORT_ORIGIN] trader=%s", trader.__file__)
+     logger.info("[SYSPATH_HEAD]=%s", sys.path[:10])
+-    pb1_runner.main()
+-    return 0
++    return pb1_runner.main()
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())

@@ -359,6 +359,7 @@ class UniverseContext:
     members: list[dict]
     selected_path: str | None = None
     meta: dict | None = None
+    is_empty: bool = False
 
 
 @dataclass(frozen=True)

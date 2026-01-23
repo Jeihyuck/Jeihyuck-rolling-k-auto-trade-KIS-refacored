@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 def main() -> int:
     logger.info("[IMPORT_ORIGIN] trader=%s", trader.__file__)
     logger.info("[SYSPATH_HEAD]=%s", sys.path[:10])
-    pb1_runner.main()
-    return 0
+    return pb1_runner.main()
 
 
 if __name__ == "__main__":

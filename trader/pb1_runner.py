@@ -381,25 +381,44 @@ def _load_universe_context(
     env: str,
     strategy: str,
 ) -> UniverseContext:
-    members, meta = runtime_store.load_universe_for_trading(as_of)
-    if not isinstance(members, list) or not members:
-        ensure_universe_built_once(
-            runtime_store=runtime_store,
-            env=env,
-            strategy=strategy,
-            as_of=as_of,
-            force=True,
-            allow_missing=False,
+    ok, meta = runtime_store.universe_check(as_of)
+    selected_path = meta.get("selected_path")
+    if not ok or not selected_path or not os.path.exists(selected_path):
+        raise RuntimeError(f"Universe missing: cannot trade as_of={as_of} path={selected_path}")
+    try:
+        with open(selected_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"Universe load failed: cannot trade as_of={as_of} path={selected_path}") from exc
+    if isinstance(data, dict):
+        universe = data
+        members = data.get("members")
+    else:
+        universe = {"members": data}
+        members = data
+    if not isinstance(members, list):
+        raise RuntimeError(f"Universe malformed: cannot trade as_of={as_of} path={selected_path}")
+    if len(members) == 0:
+        logger.warning(
+            "[PB1][UNIVERSE][EMPTY_OK] as_of=%s path=%s reason=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
+            as_of,
+            selected_path,
+            universe.get("reason"),
         )
-        members, meta = runtime_store.load_universe_for_trading(as_of)
-    if not isinstance(members, list) or not members:
-        raise RuntimeError(f"Universe missing/empty: cannot trade as_of={as_of} path={meta.get('selected_path')}")
-    universe_as_of = meta.get("as_of") or (members[0].get("as_of_date") if members else None)
+        return UniverseContext(
+            as_of_date=universe.get("as_of"),
+            members=[],
+            selected_path=selected_path,
+            meta=meta,
+            is_empty=True,
+        )
+    universe_as_of = universe.get("as_of") or (members[0].get("as_of_date") if members else None)
     return UniverseContext(
         as_of_date=universe_as_of,
         members=members,
-        selected_path=meta.get("selected_path"),
+        selected_path=selected_path,
         meta=meta,
+        is_empty=False,
     )
 
 
@@ -1401,6 +1420,13 @@ def run_once(
             except RuntimeError as exc:
                 logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
                 raise
+            if getattr(universe_ctx, "is_empty", False):
+                logger.info(
+                    "[PB1][SKIP] empty universe -> no candidates today; phase=%s window=%s",
+                    phase_for_log,
+                    window_label,
+                )
+                return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
         kis: KisAPI | None = None
         try:
             kis = KisAPI()
@@ -2015,7 +2041,13 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             )
 
 
-def main() -> None:
+def _exit_code_for_status(status: str) -> int:
+    if status in {"FAILED", "ERROR"}:
+        return 1
+    return 0
+
+
+def main() -> int:
     args = parse_args()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
@@ -2024,7 +2056,7 @@ def main() -> None:
         run_loop = True
     if run_loop and not smoke_enabled:
         _run_loop(args=args)
-        return
+        return 0
     if smoke_enabled:
         bot_state_dir = get_botstate_root()
         ensure_sqlite_writable(bot_state_dir / "db" / "pbcore.sqlite3")
@@ -2032,7 +2064,7 @@ def main() -> None:
         run_migrations(engine)
         _write_change_flag(False, ["init"])
         run_once(args=args, engine=engine, loop_mode=False, window=None)
-        return
+        return 0
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
@@ -2046,7 +2078,7 @@ def main() -> None:
     botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
     if botstate_ctx is None:
         logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
-        return
+        return 0
     _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
     engine = make_engine()
     run_migrations(engine)
@@ -2061,9 +2093,10 @@ def main() -> None:
     )
     metrics: dict[str, int] = {}
     phase_for_log = "none"
+    result_status = "UNKNOWN"
     start_ts = time_mod.time()
     try:
-        touched, _did_work, metrics, phase_for_log, _result_status = run_once(
+        touched, _did_work, metrics, phase_for_log, result_status = run_once(
             args=args,
             engine=engine,
             loop_mode=False,
@@ -2093,7 +2126,8 @@ def main() -> None:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
+    return _exit_code_for_status(result_status)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
