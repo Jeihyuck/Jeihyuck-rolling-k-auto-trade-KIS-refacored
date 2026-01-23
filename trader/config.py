@@ -144,6 +144,7 @@ CONFIG = {
     "PB1_ENTRY_ENABLED": "true",
     "PB1_ENTRY_MODE": "BOTH",
     "PB1_REQUIRE_BOTH": "1",
+    "ENTRY_COND_MODE": "OR",
     "PB1_LOG_ENTRY_GATE": "1",
     "PB1_LOG_DROP_REASONS_TOPN": "10",
     "PB1_ENTRY_WINDOW_START": "09:00",
@@ -644,6 +645,10 @@ if PB1_ENTRY_MODE not in {"PULLBACK", "BREAKOUT", "BOTH"}:
     PB1_ENTRY_MODE = "BOTH"
 PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH", fallback=True))
 PB1_REQUIRE_BOTH_CONTRACTIONS = _cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=PB1_REQUIRE_BOTH)
+ENTRY_COND_MODE = (_cfg("ENTRY_COND_MODE") or "OR").strip().upper()
+if ENTRY_COND_MODE not in {"OR", "AND", "SETUP_ONLY", "TRIGGER_ONLY"}:
+    logger.warning("[CONFIG] ENTRY_COND_MODE invalid=%s -> fallback=OR", ENTRY_COND_MODE)
+    ENTRY_COND_MODE = "OR"
 PB1_VOL_CONTRACTION_MAX = PB1_VOL_MAX
 PB1_VOLU_CONTRACTION_MAX = PB1_VOLU_MAX
 PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
@@ -732,9 +737,10 @@ PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
 PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
 
 logger.info(
-    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
+    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_cond_mode=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
     PB1_ENTRY_MODE,
     int(PB1_REQUIRE_BOTH),
+    ENTRY_COND_MODE,
     PB1_ENTRY_BUDGET_PCT_PER_TICK,
     PB1_MAX_POS_PCT,
     PB1_VOL_MAX,

@@ -52,6 +52,7 @@ from trader.config import (
     PB1_ENTRY_MODE,
     PB1_REQUIRE_BOTH,
     PB1_REQUIRE_BOTH_CONTRACTIONS,
+    ENTRY_COND_MODE,
     PB1_LOG_ENTRY_GATE,
     PB1_LOG_DROP_REASONS_TOPN,
     MIN_ORDER_KRW,
@@ -493,6 +494,7 @@ class PB1Engine:
         self._today = self._now_kst.date().isoformat()
         self.entry_mode = PB1_ENTRY_MODE
         self.entry_require_both = bool(PB1_REQUIRE_BOTH)
+        self.entry_cond_mode = ENTRY_COND_MODE
         self.log_entry_gate = bool(PB1_LOG_ENTRY_GATE)
         self.drop_reasons_topn = int(PB1_LOG_DROP_REASONS_TOPN)
         self.debug = env_bool("DEBUG", False)
@@ -1102,53 +1104,67 @@ class PB1Engine:
             enriched.append(f"name:{name}")
         return enriched
 
-    def _entry_gate(self, *, pullback_ok: bool, breakout_ok: bool) -> tuple[bool, list[str]]:
-        mode = (self.entry_mode or "BOTH").strip().upper()
-        require_both = bool(self.entry_require_both)
+    def _entry_gate(self, *, setup_filters_ok: bool, breakout_trigger_ok: bool) -> tuple[bool, list[str], str]:
+        mode = (self.entry_cond_mode or "OR").strip().upper()
         reasons: list[str] = []
 
-        if mode == "PULLBACK":
-            entry_ok = bool(pullback_ok)
+        if mode == "SETUP_ONLY":
+            entry_ok = bool(setup_filters_ok)
             if not entry_ok:
-                reasons.append("pullback_fail")
-            return entry_ok, reasons
+                reasons.append("setup_filters_fail")
+            return entry_ok, reasons, mode
 
-        if mode == "BREAKOUT":
-            entry_ok = bool(breakout_ok)
+        if mode == "TRIGGER_ONLY":
+            entry_ok = bool(breakout_trigger_ok)
             if not entry_ok:
-                reasons.append("pivot_breakout_fail")
-            return entry_ok, reasons
+                reasons.append("breakout_trigger_fail")
+            return entry_ok, reasons, mode
 
-        if require_both:
-            entry_ok = bool(pullback_ok and breakout_ok)
-            if not pullback_ok:
-                reasons.append("pullback_fail")
-            if not breakout_ok:
-                reasons.append("pivot_breakout_fail")
+        if mode == "AND":
+            entry_ok = bool(setup_filters_ok and breakout_trigger_ok)
+            if not setup_filters_ok:
+                reasons.append("setup_filters_fail")
+            if not breakout_trigger_ok:
+                reasons.append("breakout_trigger_fail")
             if not entry_ok:
-                reasons.append("require_both_fail")
-            return entry_ok, reasons
+                reasons.append("require_and_fail")
+            return entry_ok, reasons, mode
 
-        entry_ok = bool(pullback_ok or breakout_ok)
+        entry_ok = bool(setup_filters_ok or breakout_trigger_ok)
         if not entry_ok:
-            if not pullback_ok:
-                reasons.append("pullback_fail")
-            if not breakout_ok:
-                reasons.append("pivot_breakout_fail")
-            reasons.append("require_either_fail")
-        return entry_ok, reasons
+            if not setup_filters_ok:
+                reasons.append("setup_filters_fail")
+            if not breakout_trigger_ok:
+                reasons.append("breakout_trigger_fail")
+            reasons.append("require_or_fail")
+        return entry_ok, reasons, mode
 
-    def _log_entry_gate(self, *, code: str, pullback_ok: bool, breakout_ok: bool, entry_ok: bool) -> None:
+    def _log_entry_gate(
+        self,
+        *,
+        code: str,
+        setup_filters_ok: bool,
+        breakout_trigger_ok: bool,
+        entry_ok: bool,
+        entry_mode: str,
+        setup_metrics: dict,
+        trigger_metrics: dict,
+    ) -> None:
         if not self.log_entry_gate:
             return
+        prefix = "[PB1][ENTRY][SETUP-OK]" if entry_ok else "[PB1][ENTRY][SETUP-BAD]"
         logger.info(
-            "[PB1][ENTRY_GATE] code=%s pullback_ok=%s breakout_ok=%s entry_mode=%s require_both=%s entry_ok=%s",
+            "%s code=%s setup_filters_ok=%s breakout_trigger_ok=%s entry_cond_mode=%s should_buy=%s setup_def=%s trigger_def=%s setup_metrics=%s trigger_metrics=%s",
+            prefix,
             self._display_code(code),
-            int(bool(pullback_ok)),
-            int(bool(breakout_ok)),
-            self.entry_mode,
-            int(bool(self.entry_require_both)),
+            int(bool(setup_filters_ok)),
+            int(bool(breakout_trigger_ok)),
+            entry_mode,
             int(bool(entry_ok)),
+            "trend_template+rs+vcp+liquidity+score_or_pullback_override",
+            "pivot_breakout+volume",
+            setup_metrics,
+            trigger_metrics,
         )
 
     def _log_buyable_gate(self, *, code: str, ok: bool, reasons: list[str]) -> None:
@@ -3980,16 +3996,38 @@ class PB1Engine:
                     last_volume=last_volume,
                     cfg=self.minervini_config,
                 )
-                pullback_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
-                entry_ok, entry_reasons = self._entry_gate(
-                    pullback_ok=pullback_ok,
-                    breakout_ok=trigger_ok,
+                setup_filters_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
+                entry_ok, entry_reasons, entry_mode = self._entry_gate(
+                    setup_filters_ok=setup_filters_ok,
+                    breakout_trigger_ok=trigger_ok,
                 )
                 self._log_entry_gate(
                     code=cf.code,
-                    pullback_ok=pullback_ok,
-                    breakout_ok=trigger_ok,
+                    setup_filters_ok=setup_filters_ok,
+                    breakout_trigger_ok=trigger_ok,
                     entry_ok=entry_ok,
+                    entry_mode=entry_mode,
+                    setup_metrics={
+                        "close": cf.features.get("close"),
+                        "ma50": cf.features.get("ma50"),
+                        "ma150": cf.features.get("ma150"),
+                        "ma200": cf.features.get("ma200"),
+                        "ma200_slope": cf.features.get("ma200_slope"),
+                        "rs_percentile": cf.features.get("rs_percentile"),
+                        "dollar_vol_50": cf.features.get("dollar_vol_50"),
+                        "vcp_ok": cf.features.get("vcp_ok"),
+                        "score": cf.features.get("score"),
+                    },
+                    trigger_metrics={
+                        "last_price": last_price,
+                        "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
+                        "trigger": trigger_info.get("trigger"),
+                        "max_chase": trigger_info.get("max_chase"),
+                        "last_volume": last_volume,
+                        "vol20": trigger_info.get("vol20", cf.features.get("vol20")),
+                        "vol_ok": trigger_info.get("vol_ok"),
+                        "reason": trigger_info.get("reason"),
+                    },
                 )
                 if not entry_ok:
                     if not trigger_ok:
