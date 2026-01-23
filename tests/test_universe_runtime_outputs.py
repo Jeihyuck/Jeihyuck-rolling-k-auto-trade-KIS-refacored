@@ -9,6 +9,7 @@ def test_universe_build_writes_runtime_files(tmp_path, monkeypatch):
     monkeypatch.setenv("BOTSTATE_ROOT", str(bot_state_dir))
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
+    monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
 
     seed_payload = {
         "payload": {

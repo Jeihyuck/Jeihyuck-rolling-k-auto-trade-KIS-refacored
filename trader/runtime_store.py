@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from trader.botstate_paths import botstate_path, get_botstate_root
+from trader.config import UNIVERSE_POOL_SIZE
 from trader.universe.lkg_store import lkg_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+MIN_UNIVERSE_MEMBERS = int(os.getenv("MIN_UNIVERSE_MEMBERS", str(UNIVERSE_POOL_SIZE)))
 
 def _resolve_universe_env() -> str:
     return (os.getenv("KIS_ENV") or "practice").lower()
@@ -235,12 +237,11 @@ class RuntimeStore:
 
         flag_rel = Path("runtime") / "status" / f"universe_rebuild_{as_of}.flag"
         flag = self.base_dir / flag_rel
-        if flag.exists():
+        if flag.exists() and today_members > 0:
             logger.info("[UNIVERSE][REBUILD_SKIP] as_of=%s flag=%s", as_of, flag)
             return meta
 
         logger.info("[UNIVERSE][EMPTY_FATAL] today_universe_members=0 -> rebuild_once")
-        self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
         try:
             from trader.universe import build as universe_build
         except Exception:
@@ -257,6 +258,8 @@ class RuntimeStore:
                 strategy=strategy,
                 provider_override=provider_override,
             )
+        except Exception:
+            logger.exception("[UNIVERSE][REBUILD_FAIL] build_error=1")
         finally:
             if prev_bot_state is None:
                 os.environ.pop("BOT_STATE_DIR", None)
@@ -264,9 +267,9 @@ class RuntimeStore:
                 os.environ["BOT_STATE_DIR"] = prev_bot_state
 
         members, post_meta = self.load_today_universe(as_of)
+        today_path = Path(post_meta.get("today_path") or "")
         source = None
         try:
-            today_path = Path(post_meta.get("today_path") or "")
             if today_path.exists():
                 data = json.loads(today_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
@@ -279,8 +282,19 @@ class RuntimeStore:
                 len(members),
                 source or "unknown",
             )
+            if len(members) >= MIN_UNIVERSE_MEMBERS:
+                self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
         else:
             logger.warning("[UNIVERSE][REBUILD_FAILED] members=0 -> skip trading")
+            if today_path.exists():
+                try:
+                    today_path.unlink()
+                    logger.info("[UNIVERSE][EMPTY_FATAL] removed_empty_today path=%s", today_path)
+                except Exception:
+                    logger.exception("[UNIVERSE][EMPTY_FATAL] failed_remove_today path=%s", today_path)
+            post_ok, post_meta = self.universe_check(as_of)
+            if post_ok:
+                return post_meta
         post_meta["members"] = len(members)
         return post_meta
 

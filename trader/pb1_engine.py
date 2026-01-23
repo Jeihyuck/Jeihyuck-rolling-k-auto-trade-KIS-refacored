@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List
 import numpy as np
 import pandas as pd
 
-from trader.botstate_paths import botstate_path, close_entry_orders_path
+from trader.botstate_paths import close_entry_orders_path
 from trader.config import (
     CAP_CAP,
     LEDGER_BASE_DIR,
@@ -103,6 +103,7 @@ from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_fi
 from trader.factors.regime import get_regime, risk_multiplier
 from trader.factors.rs_rank import rank_rs
 from trader.positioning.minervini_risk import calc_initial_stop, calc_position_size, update_exits
+from trader.minervini.report import run_minervini_report
 from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
 from trader.strategies.pb1_minervini_v2 import (
     MinerviniConfig,
@@ -1478,135 +1479,6 @@ class PB1Engine:
         }
         return mapping.get(reason, ReasonCode.EXIT_TRAIL)
 
-    def _log_minervini_stats(
-        self,
-        *,
-        pool_count: int,
-        candidates: list[CandidateFeature],
-        final_candidates: list[CandidateFeature],
-    ) -> None:
-        liq_pass = 0
-        rs_pass = 0
-        vcp_pass = 0
-        for cf in candidates:
-            if not cf.features.get("data_ok"):
-                continue
-            if all(
-                [
-                    cf.features.get("liq_ok"),
-                    cf.features.get("gap_ok"),
-                    cf.features.get("spread_ok"),
-                    cf.features.get("range_ok"),
-                ]
-            ):
-                liq_pass += 1
-            rs_pctile = cf.features.get("rs_pctile")
-            if rs_pctile is not None and float(rs_pctile) >= float(RS_MIN_PCTILE):
-                rs_pass += 1
-            vcp_score = cf.features.get("vcp_score")
-            if is_vcp_ready(vcp_score or 0.0, VCP_MIN_SCORE):
-                vcp_pass += 1
-        regime_pass = liq_pass if float(getattr(self, "_regime_risk_mult", 1.0)) > 0 else 0
-        logger.info(
-            "[MINERVINI][STATS] pool=%s liq_pass=%s regime_pass=%s rs_pass=%s vcp_pass=%s final=%s",
-            pool_count,
-            liq_pass,
-            regime_pass,
-            rs_pass,
-            vcp_pass,
-            len(final_candidates),
-        )
-
-    def _write_minervini_report(
-        self,
-        *,
-        as_of: str,
-        members: list[dict],
-        candidates: list[CandidateFeature],
-        final_candidates: list[CandidateFeature],
-        selected_thresholds: FilterThresholds,
-        applied_min_score: float,
-        applied_require_both: bool,
-        tiers_tried: list[str],
-        relax_passes_used: int,
-    ) -> str | None:
-        report_dir = botstate_path("runtime", "reports", "minervini", as_of)
-        report_dir.mkdir(parents=True, exist_ok=True)
-        report_path = report_dir / "minervini_report.json"
-
-        candidates_payload: list[dict] = []
-        rejected_payload: list[dict] = []
-        reason_counts: Counter[str] = Counter()
-
-        name_map = {
-            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
-            for m in members
-        }
-
-        for cf in candidates:
-            metrics = {
-                "rs_pctile": cf.features.get("rs_pctile"),
-                "rs_comp": cf.features.get("rs_comp"),
-                "vcp_score": cf.features.get("vcp_score"),
-                "vcp_ok": cf.features.get("vcp_ok"),
-                "pivot": cf.features.get("pivot"),
-                "close": cf.features.get("close"),
-                "ma50": cf.features.get("ma50"),
-                "ma150": cf.features.get("ma150"),
-                "ma200": cf.features.get("ma200"),
-                "atr_pct": cf.features.get("atr_pct"),
-                "value20": cf.features.get("value20"),
-            }
-            if cf.setup_ok:
-                candidates_payload.append(
-                    {
-                        "code": cf.code,
-                        "name": name_map.get(cf.code),
-                        "score": float(cf.features.get("score") or 0.0),
-                        "metrics": metrics,
-                    }
-                )
-            else:
-                mapped_reasons = self._map_minervini_reasons(cf.reasons)
-                for reason in mapped_reasons:
-                    reason_counts[reason] += 1
-                rejected_payload.append(
-                    {
-                        "code": cf.code,
-                        "name": name_map.get(cf.code),
-                        "reasons": mapped_reasons,
-                        "metrics": metrics,
-                    }
-                )
-
-        params = {
-            "thresholds": {
-                "vol_max": selected_thresholds.vol_contraction_max,
-                "volu_max": selected_thresholds.volu_contraction_max,
-                "pullback_min": selected_thresholds.pullback_min,
-                "pullback_max": selected_thresholds.pullback_max,
-                "require_both": selected_thresholds.require_both_contractions,
-            },
-            "min_score": applied_min_score,
-            "require_both": applied_require_both,
-            "tiers_tried": tiers_tried,
-            "relax_passes_used": relax_passes_used,
-            "config": self.minervini_config.__dict__,
-        }
-
-        payload = {
-            "as_of": as_of,
-            "pool": len(members),
-            "final": len(final_candidates),
-            "benchmark": RS_BENCHMARK,
-            "params": params,
-            "candidates": candidates_payload,
-            "rejected": rejected_payload,
-            "reason_counts": dict(reason_counts),
-        }
-        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("[MINERVINI][REPORT] path=%s candidates=%s rejected=%s", report_path, len(candidates_payload), len(rejected_payload))
-        return str(report_path)
 
     @staticmethod
     def _normalize_setup_score(raw_score: float) -> float:
@@ -3776,35 +3648,17 @@ class PB1Engine:
                 reverse=True,
             )
             after_risk_check_count = len(ok_after_risk)
-            self._log_minervini_stats(
-                pool_count=len(members),
-                candidates=candidates,
-                final_candidates=ok_after_risk,
-            )
-            reject_summary = Counter()
-            for cf in candidates:
-                if cf.setup_ok:
-                    continue
-                for reason in self._map_minervini_reasons(cf.reasons):
-                    reject_summary[reason] += 1
-            summary_text = " ".join([f"{key}={count}" for key, count in reject_summary.most_common(10)]) or "(none)"
-            logger.info("[MINERVINI][REJECT_SUMMARY] %s", summary_text)
             candidate_codes = [cf.code for cf in ok_after_risk]
             logger.info(
                 "[MINERVINI][CANDIDATES] n=%s codes=%s",
                 len(candidate_codes),
                 ", ".join(candidate_codes) if candidate_codes else "(no candidates)",
             )
-            minervini_report_path = self._write_minervini_report(
+            minervini_report_path = run_minervini_report(
+                members,
+                self.minervini_config,
                 as_of=self._today,
-                members=members,
                 candidates=candidates,
-                final_candidates=ok_after_risk,
-                selected_thresholds=selected_thresholds,
-                applied_min_score=applied_min_score,
-                applied_require_both=applied_require_both,
-                tiers_tried=tiers_tried,
-                relax_passes_used=relax_passes_used,
             )
             self.top_candidates = [
                 {
@@ -3814,6 +3668,11 @@ class PB1Engine:
                 }
                 for cf in ok_after_risk
             ]
+            if not ok_after_risk:
+                logger.info(
+                    "[TRADE][SKIP] reason=NO_CANDIDATES report_path=%s",
+                    minervini_report_path or "none",
+                )
             dropped_after_risk = {c.code for c in candidates if c.code in setup_ok_codes and not c.setup_ok}
             for cf in candidates:
                 if cf.code in dropped_after_risk:

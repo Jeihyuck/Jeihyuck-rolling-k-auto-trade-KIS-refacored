@@ -20,5 +20,5 @@ def test_build_universe_succeeds_on_empty_payload(monkeypatch):
         "run_rebalance",
         lambda as_of_date, return_by_market=True: {"selected": [], "selected_stocks": [], "selected_by_market": {}},
     )
-    result = build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
-    assert result is None or isinstance(result, str)
+    with pytest.raises(RuntimeError, match="universe_members_empty"):
+        build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")

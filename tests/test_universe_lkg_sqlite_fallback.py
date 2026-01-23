@@ -102,6 +102,7 @@ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
     monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
     monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
+    monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
 
     from trader.universe import lkg_store
 
