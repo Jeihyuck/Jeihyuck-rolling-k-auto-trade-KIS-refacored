@@ -131,6 +131,22 @@ def _deepcopy_json(value: Any) -> Any:
         return value
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name, "").strip()
+        return int(raw) if raw else default
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name, "").strip()
+        return float(raw) if raw else default
+    except Exception:
+        return default
+
+
 def _resolve_breaker_path() -> Path:
     global _KIS_BREAKER_PATH
     if _KIS_BREAKER_PATH is None:
@@ -385,9 +401,10 @@ class KisAPI:
         self.session = _build_session()
 
         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
-        self._safe_attempts = 3
-        self._safe_backoff_seq = [0.5, 1.5]
-        self._safe_max_seconds = 18.0
+        self._safe_attempts = max(1, _env_int("KIS_HTTP_MAX_RETRIES", 5))
+        self._safe_backoff_base = _env_float("KIS_HTTP_BACKOFF_BASE_SEC", 1.2)
+        self._safe_backoff_cap = _env_float("KIS_HTTP_BACKOFF_CAP_SEC", 8.0)
+        self._safe_max_seconds = _env_float("KIS_HTTP_MAX_SECONDS", 18.0)
 
         self._limiter = _RateLimiter(min_interval_sec=0.20)
         self._recent_sells: Dict[str, float] = {}
@@ -478,6 +495,7 @@ class KisAPI:
                 breaker_until or 0,
             )
             raise KisTemporaryError(f"FAST_FAIL breaker open for {url}")
+        last_err: Exception | None = None
         for i in range(1, attempts + 1):
             try:
                 resp = self.session.request(
@@ -514,18 +532,21 @@ class KisAPI:
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
+                last_err = e
                 if reset_on_error and not reset_done:
                     self._reset_session()
                     reset_done = True
             except requests.exceptions.RequestException as e:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
+                last_err = e
                 if reset_on_error and not reset_done:
                     self._reset_session()
                     reset_done = True
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
+                last_err = e
                 if reset_on_error and not reset_done:
                     self._reset_session()
                     reset_done = True
@@ -535,10 +556,20 @@ class KisAPI:
                 raise
             if time.monotonic() - start_ts >= self._safe_max_seconds:
                 break
-            delay = self._safe_backoff_seq[min(i - 1, len(self._safe_backoff_seq) - 1)]
-            jitter = random.uniform(0.0, min(0.2, delay * 0.2))
-            time.sleep(delay + jitter)
-        raise KisTemporaryError(f"request failed after retries: {url}")
+            if i >= attempts:
+                break
+            delay = min(self._safe_backoff_cap, self._safe_backoff_base * (2 ** (i - 1)))
+            jitter = random.uniform(0.0, delay * 0.25)
+            sleep_s = delay + jitter
+            logger.warning(
+                "[KIS][HTTP][RETRY] attempt=%s/%s sleep=%.2f err=%s",
+                i,
+                attempts,
+                sleep_s,
+                last_err,
+            )
+            time.sleep(sleep_s)
+        raise KisTemporaryError(f"request failed after retries: {url} err={last_err}")
 
     @classmethod
     def _resolve_cache_path(cls) -> Path:

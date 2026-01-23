@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import signal
+import traceback
 import time as time_mod
 import copy
 from datetime import datetime, time as dtime, timedelta
@@ -810,6 +811,36 @@ def _parse_int_env(name: str, default: int) -> int:
         return default
 
 
+def _parse_optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("[PB1][ENV] invalid %s=%s fallback=none", name, raw)
+        return None
+
+
+def _resolve_loop_limits() -> tuple[int, int, int, bool]:
+    run_loop_minutes_env = _parse_optional_int_env("PB1_RUN_LOOP_MINUTES")
+    if run_loop_minutes_env is None:
+        run_loop_minutes_env = _parse_optional_int_env("RUN_LOOP_MINUTES")
+    run_loop_configured = run_loop_minutes_env is not None
+    run_loop_minutes = run_loop_minutes_env if run_loop_minutes_env is not None else 15
+
+    max_minutes_env = _parse_optional_int_env("PB1_MAX_MINUTES")
+    max_minutes = max_minutes_env if max_minutes_env is not None else run_loop_minutes
+
+    max_seconds_env = _parse_optional_int_env("PB1_MAX_SECONDS")
+    max_seconds = max_seconds_env if max_seconds_env is not None else max(0, max_minutes * 60)
+
+    return run_loop_minutes, max_minutes, max_seconds, run_loop_configured
+
+
 def _collect_botstate_files(since_ts: float) -> list[Path]:
     base_dir = get_botstate_root()
     if not base_dir.exists():
@@ -1544,7 +1575,7 @@ def run_once(
                 reset_reason = "env_reset"
             elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
                 reset_reason = "account_fp_mismatch"
-            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS:
+            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS and balance_state == BALANCE_STATE_OK:
                 kis_holdings = balance_snapshot_raw.get("output1") or []
                 ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
                 ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
@@ -1591,6 +1622,11 @@ def run_once(
                             last_balance_had_positions,
                             dnca_total,
                         )
+            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS and balance_state != BALANCE_STATE_OK:
+                logger.warning(
+                    "[STATE][PURGE][SKIP] reason=balance_not_ok state=%s",
+                    balance_state,
+                )
 
         if reset_reason:
             if reset_reason == "paper_reset_detected":
@@ -1786,13 +1822,10 @@ def run_once(
 def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-    loop_max_minutes = _parse_int_env("PB1_LOOP_MAX_MINUTES", 0)
-    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
+    run_loop_minutes, loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
     now = _get_now_kst()
     _, close_dt = _market_session(now)
-    max_seconds = run_loop_minutes * 60 if run_loop_minutes > 0 else 0
-    if run_loop_minutes > 0:
-        loop_max_minutes = run_loop_minutes
+    if max_seconds > 0:
         persist_interval = max(120, min(persist_interval, 240))
     logger.info(
         "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
@@ -1971,36 +2004,44 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             remaining_budget_s = 0
             if loop_deadline_ts:
                 remaining_budget_s = max(0, int(loop_deadline_ts - time_mod.monotonic()))
-            touched, _did_work, metrics, last_phase, result_status = run_once(
-                args=args,
-                engine=engine,
-                loop_mode=True,
-                window=window,
-                bot_state_dir=botstate_ctx.bot_state_dir,
-                max_seconds=remaining_budget_s,
-            )
-            balance_api_calls += metrics.get("balance_api_calls", 0)
-            balance_cache_hits += metrics.get("balance_cache_hits", 0)
-            balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
-            if result_status == "NO_TRADE":
-                logger.info("[PB1][LOOP] no trade -> exit")
-                exit_reason = "no_candidates"
-                break
-            if touched:
-                _write_change_flag(True, ["touched_files"])
-            for path in touched:
-                pending_touched[path] = path
-            if pending_touched:
-                now_ts = time_mod.monotonic()
-                urgent = _is_urgent_persist(list(pending_touched.values()))
-                if urgent or (now_ts - last_persist_ts >= persist_interval):
-                    persist_run_files(
-                        botstate_ctx.worktree_dir,
-                        list(pending_touched.values()),
-                        message=f"pb1 loop {now.isoformat()}",
-                    )
-                    pending_touched.clear()
-                    last_persist_ts = now_ts
+            try:
+                touched, _did_work, metrics, last_phase, result_status = run_once(
+                    args=args,
+                    engine=engine,
+                    loop_mode=True,
+                    window=window,
+                    bot_state_dir=botstate_ctx.bot_state_dir,
+                    max_seconds=remaining_budget_s,
+                )
+                balance_api_calls += metrics.get("balance_api_calls", 0)
+                balance_cache_hits += metrics.get("balance_cache_hits", 0)
+                balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
+                if result_status == "NO_TRADE":
+                    logger.info("[PB1][LOOP] no trade -> exit")
+                    exit_reason = "no_candidates"
+                    break
+                if touched:
+                    _write_change_flag(True, ["touched_files"])
+                for path in touched:
+                    pending_touched[path] = path
+                if pending_touched:
+                    now_ts = time_mod.monotonic()
+                    urgent = _is_urgent_persist(list(pending_touched.values()))
+                    if urgent or (now_ts - last_persist_ts >= persist_interval):
+                        persist_run_files(
+                            botstate_ctx.worktree_dir,
+                            list(pending_touched.values()),
+                            message=f"pb1 loop {now.isoformat()}",
+                        )
+                        pending_touched.clear()
+                        last_persist_ts = now_ts
+            except Exception as exc:
+                logger.error(
+                    "[PB1][TICK][FATAL_GUARD] exception=%s\n%s",
+                    exc,
+                    traceback.format_exc(),
+                )
+                time_mod.sleep(3)
             time_mod.sleep(loop_interval)
     finally:
         elapsed_trade = time_mod.monotonic() - loop_started_ts
@@ -2051,12 +2092,13 @@ def _exit_code_for_status(status: str) -> int:
 def main() -> int:
     args = parse_args()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
-    run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1"
-    run_loop_minutes = _parse_int_env("RUN_LOOP_MINUTES", 0)
-    if run_loop_minutes > 0:
-        run_loop = True
+    run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
+    run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
     if run_loop and not smoke_enabled:
-        _run_loop(args=args)
+        try:
+            _run_loop(args=args)
+        except Exception:
+            logger.error("[PB1][FATAL_GUARD] loop crashed", exc_info=True)
         return 0
     if smoke_enabled:
         bot_state_dir = get_botstate_root()
@@ -2069,11 +2111,11 @@ def main() -> int:
 
     owner = os.getenv("GITHUB_ACTOR", "local")
     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec, ttl_buffer = compute_lock_ttl(run_loop_minutes * 60)
+    ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
     logger.info(
         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
         ttl_sec,
-        run_loop_minutes * 60,
+        max_seconds,
         ttl_buffer,
     )
     botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
@@ -2103,7 +2145,7 @@ def main() -> int:
             loop_mode=False,
             window=None,
             bot_state_dir=botstate_ctx.bot_state_dir,
-            max_seconds=run_loop_minutes * 60,
+            max_seconds=max_seconds,
         )
         if touched:
             _write_change_flag(True, ["touched_files"])
@@ -2114,19 +2156,24 @@ def main() -> int:
             )
         else:
             _write_change_flag(False, ["no_changes"])
+    except Exception:
+        logger.error("[PB1][FATAL_GUARD] unexpected error", exc_info=True)
+        result_status = "ERROR"
     finally:
         release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
         elapsed = time_mod.time() - start_ts
         logger.info(
             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
             elapsed,
-            run_loop_minutes * 60,
+            max_seconds,
             "none",
             phase_for_log,
             metrics.get("balance_api_calls", 0),
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
+    if result_status == "ERROR":
+        return 0
     return _exit_code_for_status(result_status)
 
 

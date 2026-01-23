@@ -245,7 +245,7 @@ jobs:
   trade_tick:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
-    timeout-minutes: 8
+    timeout-minutes: 25
 
     env:
       TZ: Asia/Seoul
@@ -285,11 +285,18 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      RUN_LOOP_MINUTES: "4"
+      PB1_RUN_LOOP_MINUTES: "15"
+      PB1_MAX_MINUTES: "15"
+      PB1_MAX_SECONDS: "900"
 
-      BOTSTATE_LOCK_TTL_SEC: "240"
+      BOTSTATE_LOCK_TTL_SEC: "1500"
+      BOTSTATE_LOCK_BUFFER_SEC: "240"
       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "70"
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "3"
+
+      KIS_HTTP_MAX_RETRIES: "5"
+      KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
+      KIS_HTTP_BACKOFF_CAP_SEC: "8"
 
       ACTIVE_STRATEGIES: "1"
       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
@@ -542,7 +549,7 @@ jobs:
   close_cancel:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
-    timeout-minutes: 8
+    timeout-minutes: 15
 
     env:
       TZ: Asia/Seoul
@@ -580,9 +587,14 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      BOTSTATE_LOCK_TTL_SEC: "240"
+      BOTSTATE_LOCK_TTL_SEC: "1500"
+      BOTSTATE_LOCK_BUFFER_SEC: "240"
       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
+
+      KIS_HTTP_MAX_RETRIES: "5"
+      KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
+      KIS_HTTP_BACKOFF_CAP_SEC: "8"
 
       ACTIVE_STRATEGIES: "1"
       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}

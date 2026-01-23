@@ -270,15 +270,23 @@ def hard_reset_bot_state(bot_state_dir: Path, *, reason: str = "manual") -> dict
 
 def compute_lock_ttl(max_seconds: int) -> tuple[int, int]:
     try:
-        buffer_sec = int(os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)))
+        buffer_sec = int(
+            os.getenv(
+                "BOTSTATE_LOCK_BUFFER_SEC",
+                os.getenv("BOTSTATE_LOCK_TTL_BUFFER_SEC", str(DEFAULT_LOCK_BUFFER_SEC)),
+            )
+        )
     except Exception:
         buffer_sec = DEFAULT_LOCK_BUFFER_SEC
     try:
         base_sec = int(os.getenv("BOTSTATE_LOCK_TTL_SEC", str(DEFAULT_LOCK_TTL_SEC)))
     except Exception:
         base_sec = DEFAULT_LOCK_TTL_SEC
-    ttl_base = max_seconds if max_seconds > 0 else base_sec
-    ttl_sec = ttl_base + buffer_sec
+    if max_seconds > 0:
+        ttl_min = max_seconds + buffer_sec + 300
+        ttl_sec = max(base_sec, ttl_min)
+    else:
+        ttl_sec = base_sec + buffer_sec
     return ttl_sec, buffer_sec
 
 

@@ -193,12 +193,18 @@ def reconcile_kis(
         holdings_rows = snapshot.get("output1") or []
     except KisTemporaryError as exc:
         holdings_error = str(exc)
+        logger.error("[KIS][HTTP][FAIL_SOFT] step=holdings err=%s", exc, exc_info=True)
         holdings_rows = []
     except Exception as exc:
         holdings_error = str(exc)
+        logger.error("[KIS][HTTP][FAIL_SOFT] step=holdings err=%s", exc, exc_info=True)
         holdings_rows = []
 
-    reconcile_result = reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
+    try:
+        reconcile_result = reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
+    except Exception as exc:
+        logger.error("[KIS][HTTP][FAIL_SOFT] step=reconcile_today err=%s", exc, exc_info=True)
+        reconcile_result = {"ok": False, "reason": "reconcile_today_failed", "err": str(exc)}
     orders_count = int(reconcile_result.get("orders") or 0)
     fills_count = int(reconcile_result.get("fills") or 0)
 
@@ -225,6 +231,13 @@ def reconcile_kis(
             fills_count=fills_count,
             had_kis_error=holdings_error is not None,
         )
+        if holdings_error:
+            allow_purge = False
+            guard_reason = guard_reason or "holdings_error"
+            logger.warning(
+                "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=holdings_error err=%s",
+                holdings_error,
+            )
         if allow_purge:
             logger.warning(
                 "[RECONCILE][STALE_DB_GUARD] allow_purge=1 empty_streak=%s",
