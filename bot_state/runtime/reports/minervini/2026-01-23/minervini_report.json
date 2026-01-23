@@ -1,0 +1,2030 @@
+{
+  "input_members": 198,
+  "candidates": [
+    {
+      "code": "140410",
+      "name": "메지온",
+      "score": 94.76439790575915
+    }
+  ],
+  "rejected": [
+    {
+      "code": "005930",
+      "name": "삼성전자",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000660",
+      "name": "SK하이닉스",
+      "reasons": [
+        "MIN_ORDER_FAIL"
+      ]
+    },
+    {
+      "code": "005380",
+      "name": "현대차",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "373220",
+      "name": "LG에너지솔루션",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005935",
+      "name": "삼성전자우",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "207940",
+      "name": "삼성바이오로직스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "329180",
+      "name": "HD현대중공업",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "012450",
+      "name": "한화에어로스페이스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000270",
+      "name": "기아",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "034020",
+      "name": "두산에너빌리티",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "402340",
+      "name": "SK스퀘어",
+      "reasons": [
+        "MIN_ORDER_FAIL"
+      ]
+    },
+    {
+      "code": "028260",
+      "name": "삼성물산",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "105560",
+      "name": "KB금융",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "068270",
+      "name": "셀트리온",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "042660",
+      "name": "한화오션",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "035420",
+      "name": "NAVER",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "012330",
+      "name": "현대모비스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "055550",
+      "name": "신한지주",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "015760",
+      "name": "한국전력",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "032830",
+      "name": "삼성생명",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "010130",
+      "name": "고려아연",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "267260",
+      "name": "HD현대일렉트릭",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "009540",
+      "name": "HD한국조선해양",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "006400",
+      "name": "삼성SDI",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005490",
+      "name": "POSCO홀딩스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "086790",
+      "name": "하나금융지주",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "035720",
+      "name": "카카오",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "010140",
+      "name": "삼성중공업",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "051910",
+      "name": "LG화학",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "064350",
+      "name": "현대로템",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000810",
+      "name": "삼성화재",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "298040",
+      "name": "효성중공업",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "316140",
+      "name": "우리금융지주",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "034730",
+      "name": "SK",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "009150",
+      "name": "삼성전기",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "267250",
+      "name": "HD현대",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "011200",
+      "name": "HMM",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "086280",
+      "name": "현대글로비스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "138040",
+      "name": "메리츠금융지주",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "003670",
+      "name": "포스코퓨처엠",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "096770",
+      "name": "SK이노베이션",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "006800",
+      "name": "미래에셋증권",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "066570",
+      "name": "LG전자",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "272210",
+      "name": "한화시스템",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "033780",
+      "name": "KT&G",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "024110",
+      "name": "기업은행",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "042700",
+      "name": "한미반도체",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "352820",
+      "name": "하이브",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "047810",
+      "name": "한국항공우주",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "010120",
+      "name": "LS ELECTRIC",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000150",
+      "name": "두산",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "003550",
+      "name": "LG",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "030200",
+      "name": "KT",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "018260",
+      "name": "삼성에스디에스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "017670",
+      "name": "SK텔레콤",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "307950",
+      "name": "현대오토에버",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "000720",
+      "name": "현대건설",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "079550",
+      "name": "LIG넥스원",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "259960",
+      "name": "크래프톤",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "047050",
+      "name": "포스코인터내셔널",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "010950",
+      "name": "S-Oil",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "323410",
+      "name": "카카오뱅크",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "071050",
+      "name": "한국금융지주",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "278470",
+      "name": "에이피알",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005387",
+      "name": "현대차2우B",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "003230",
+      "name": "삼양식품",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "326030",
+      "name": "SK바이오팜",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005830",
+      "name": "DB손해보험",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "039490",
+      "name": "키움증권",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000880",
+      "name": "한화",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "003490",
+      "name": "대한항공",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "180640",
+      "name": "한진칼",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "377300",
+      "name": "카카오페이",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000100",
+      "name": "유한양행",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005940",
+      "name": "NH투자증권",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "007660",
+      "name": "이수페타시스",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "443060",
+      "name": "HD현대마린솔루션",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "161390",
+      "name": "한국타이어앤테크놀로지",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "016360",
+      "name": "삼성증권",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "090430",
+      "name": "아모레퍼시픽",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "454910",
+      "name": "두산로보틱스",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "064400",
+      "name": "LG씨엔에스",
+      "reasons": [
+        "INSUFFICIENT_CANDLES"
+      ]
+    },
+    {
+      "code": "006260",
+      "name": "LS",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "032640",
+      "name": "LG유플러스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "011070",
+      "name": "LG이노텍",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005385",
+      "name": "현대차우",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "029780",
+      "name": "삼성카드",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "034220",
+      "name": "LG디스플레이",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "022100",
+      "name": "포스코DX",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "128940",
+      "name": "한미약품",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "241560",
+      "name": "두산밥캣",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "078930",
+      "name": "GS",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "001040",
+      "name": "CJ",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "021240",
+      "name": "코웨이",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "088980",
+      "name": "맥쿼리인프라",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "052690",
+      "name": "한전기술",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "001440",
+      "name": "대한전선",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "009830",
+      "name": "한화솔루션",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "028050",
+      "name": "삼성E&A",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "036570",
+      "name": "엔씨소프트",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "196170",
+      "name": "알테오젠",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "247540",
+      "name": "에코프로비엠",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "086520",
+      "name": "에코프로",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "298380",
+      "name": "에이비엘바이오",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "277810",
+      "name": "레인보우로보틱스",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "000250",
+      "name": "삼천당제약",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "028300",
+      "name": "HLB",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "950160",
+      "name": "코오롱티슈진",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "087010",
+      "name": "펩트론",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "141080",
+      "name": "리가켐바이오",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "058470",
+      "name": "리노공업",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "214450",
+      "name": "파마리서치",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "319400",
+      "name": "현대무벡스",
+      "reasons": [
+        "PRICE_SCALE_OUTLIER"
+      ]
+    },
+    {
+      "code": "214370",
+      "name": "케어젠",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "214150",
+      "name": "클래시스",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "240810",
+      "name": "원익IPS",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "347850",
+      "name": "디앤디파마텍",
+      "reasons": [
+        "REGIME_FAIL",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "039030",
+      "name": "이오테크닉스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "108490",
+      "name": "로보티즈",
+      "reasons": [
+        "REGIME_FAIL",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "310210",
+      "name": "보로노이",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "145020",
+      "name": "휴젤",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "030530",
+      "name": "원익홀딩스",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "257720",
+      "name": "실리콘투",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "090710",
+      "name": "휴림로봇",
+      "reasons": [
+        "PRICE_SCALE_OUTLIER"
+      ]
+    },
+    {
+      "code": "403870",
+      "name": "HPSP",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "263750",
+      "name": "펄어비스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "068760",
+      "name": "셀트리온제약",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "237690",
+      "name": "에스티팜",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "357780",
+      "name": "솔브레인",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "226950",
+      "name": "올릭스",
+      "reasons": [
+        "REGIME_FAIL",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "041510",
+      "name": "에스엠",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "035900",
+      "name": "JYP Ent.",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "475830",
+      "name": "오름테라퓨틱",
+      "reasons": [
+        "INSUFFICIENT_CANDLES"
+      ]
+    },
+    {
+      "code": "058610",
+      "name": "에스피지",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "095340",
+      "name": "ISC",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "445680",
+      "name": "큐리옥스바이오시스템즈",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "160190",
+      "name": "하이젠알앤엠",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "005290",
+      "name": "동진쎄미켐",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "437730",
+      "name": "삼현",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "098460",
+      "name": "고영",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "458870",
+      "name": "씨어스테크놀로지",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "064760",
+      "name": "티씨케이",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "083650",
+      "name": "비에이치아이",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "222800",
+      "name": "심텍",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "178320",
+      "name": "서진시스템",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "084370",
+      "name": "유진테크",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "067310",
+      "name": "하나마이크론",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "466100",
+      "name": "클로봇",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "140860",
+      "name": "파크시스템스",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "065350",
+      "name": "신성델타테크",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "099320",
+      "name": "쎄트렉아이",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "039200",
+      "name": "오스코텍",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "036930",
+      "name": "주성엔지니어링",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "323280",
+      "name": "태성",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "060370",
+      "name": "LS마린솔루션",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "035760",
+      "name": "CJ ENM",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "348340",
+      "name": "뉴로메카",
+      "reasons": [
+        "PRICE_SCALE_OUTLIER"
+      ]
+    },
+    {
+      "code": "195940",
+      "name": "HK이노엔",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "348370",
+      "name": "엔켐",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "101490",
+      "name": "에스앤에스텍",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "253450",
+      "name": "스튜디오드래곤",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "089030",
+      "name": "테크윙",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "293490",
+      "name": "카카오게임즈",
+      "reasons": [
+        "LIQ_FAIL",
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "290650",
+      "name": "엘앤씨바이오",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "032820",
+      "name": "우리기술",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "007390",
+      "name": "네이처셀",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "122870",
+      "name": "와이지엔터테인먼트",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "031980",
+      "name": "피에스케이홀딩스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "003380",
+      "name": "하림지주",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "281740",
+      "name": "레이크머티리얼즈",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "GAP_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "085660",
+      "name": "차바이오텍",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "096530",
+      "name": "씨젠",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "456160",
+      "name": "지투지바이오",
+      "reasons": [
+        "INSUFFICIENT_CANDLES"
+      ]
+    },
+    {
+      "code": "056080",
+      "name": "유진로봇",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "174900",
+      "name": "앱클론",
+      "reasons": [
+        "ATR_TOO_HIGH"
+      ]
+    },
+    {
+      "code": "204270",
+      "name": "제이앤티씨",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "232140",
+      "name": "와이씨",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "388720",
+      "name": "유일로보틱스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "397030",
+      "name": "에이프릴바이오",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "319660",
+      "name": "피에스케이",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "328130",
+      "name": "루닛",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "082270",
+      "name": "젬백스",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "166090",
+      "name": "하나머티리얼즈",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "078600",
+      "name": "대주전자재료",
+      "reasons": [
+        "REGIME_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "GAP_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "440110",
+      "name": "파두",
+      "reasons": [
+        "LIQ_FAIL",
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "115180",
+      "name": "큐리언트",
+      "reasons": [
+        "REGIME_FAIL",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "161580",
+      "name": "필옵틱스",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "131970",
+      "name": "두산테스나",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "080220",
+      "name": "제주반도체",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "376900",
+      "name": "로킷헬스케어",
+      "reasons": [
+        "INSUFFICIENT_CANDLES"
+      ]
+    },
+    {
+      "code": "295310",
+      "name": "에이치브이엠",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "137400",
+      "name": "피엔티",
+      "reasons": [
+        "REGIME_FAIL",
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "183300",
+      "name": "코미코",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "347700",
+      "name": "스피어",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "389470",
+      "name": "인벤티지랩",
+      "reasons": [
+        "REGIME_FAIL",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "006730",
+      "name": "서부T&D",
+      "reasons": [
+        "RS_BELOW",
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    },
+    {
+      "code": "124500",
+      "name": "아이티센글로벌",
+      "reasons": [
+        "VCP_LOW",
+        "SPREAD_FAIL",
+        "SCORE_BELOW_MIN"
+      ]
+    }
+  ],
+  "reason_counts": {
+    "VCP_LOW": 180,
+    "SPREAD_FAIL": 179,
+    "SCORE_BELOW_MIN": 180,
+    "MIN_ORDER_FAIL": 2,
+    "REGIME_FAIL": 88,
+    "RS_BELOW": 152,
+    "ATR_TOO_HIGH": 8,
+    "INSUFFICIENT_CANDLES": 4,
+    "PRICE_SCALE_OUTLIER": 3,
+    "LIQ_FAIL": 2,
+    "GAP_FAIL": 2
+  },
+  "cfg_snapshot": {
+    "rs_min_percentile": 0.8,
+    "min_dollar_vol_50d": 3000000000.0,
+    "base_lookback_max": 80,
+    "base_exclude_recent": 10,
+    "vcp_min_contractions": 2,
+    "vcp_max_contractions": 4,
+    "contraction_decline_min": 0.15,
+    "vol_dryup_ratio": 0.7,
+    "tight_close_max_pct": 0.015,
+    "pivot_buffer_pct": 0.0015,
+    "breakout_vol_mult_20": 1.5,
+    "max_extension_from_pivot": 0.05,
+    "initial_stop_pct": 0.075,
+    "breakeven_R": 1.0,
+    "trail_use_ma50": true,
+    "heavy_volume_mult": 1.5,
+    "risk_pct_of_equity": 0.005,
+    "max_pyramid_levels": 3,
+    "add_on_R": 1.5,
+    "add_on_max_extension": 0.03,
+    "add_on_size_frac": 0.5
+  }
+}
