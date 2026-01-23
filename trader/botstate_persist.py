@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
 
+def _is_git_repo(path: str) -> bool:
+    repo_path = Path(path)
+    return (repo_path / ".git").is_file() or (repo_path / ".git").is_dir()
+
+
 def _add_if_exists(paths: list[Path], candidate: Path) -> None:
     if candidate.is_file():
         paths.append(candidate)
@@ -77,6 +82,14 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     try:
+        worktree_env = os.environ.get("BOTSTATE_WORKTREE_DIR", "").strip()
+        if not worktree_env:
+            logger.info("[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty")
+            return 0
+        if not _is_git_repo(worktree_env):
+            logger.info("[PERSIST] skip: worktree is not a git repo (PB1 exited early)")
+            return 0
+
         base_dir = Path.cwd().resolve()
         worktree_dir = resolve_botstate_worktree_dir(base_dir)
         setup_worktree(base_dir, worktree_dir, target_branch="bot-state")

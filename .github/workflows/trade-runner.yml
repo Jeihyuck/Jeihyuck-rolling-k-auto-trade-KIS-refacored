@@ -498,10 +498,24 @@ jobs:
           echo "=== git status (workspace) ==="
           git status --porcelain || true
 
-      - name: Persist bot_state (stage untracked + commit/push)
+      - name: Persist bot_state (guarded)
         if: always() && (env.PERSIST_MODE != 'OFF')
+        env:
+          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
           set -euo pipefail
+          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
+          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
+            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
+            exit 0
+          fi
+
+          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
+            echo "[PERSIST] ok: worktree is a git repo -> run persist"
+          else
+            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
+            exit 0
+          fi
 
           cd "$BOTSTATE_WORKTREE_DIR"
           echo "[PERSIST] workdir=$(pwd)"
@@ -653,10 +667,24 @@ jobs:
           STATE_PATH: bot_state/runtime/state.json
           LOT_STATE_PATH: bot_state/runtime/lot_state.json
 
-      - name: Persist bot_state (stage untracked + commit/push)
+      - name: Persist bot_state (guarded)
         if: always() && (env.PERSIST_MODE != 'OFF')
+        env:
+          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
           set -euo pipefail
+          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
+          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
+            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
+            exit 0
+          fi
+
+          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
+            echo "[PERSIST] ok: worktree is a git repo -> run persist"
+          else
+            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
+            exit 0
+          fi
 
           cd "$BOTSTATE_WORKTREE_DIR"
           echo "[PERSIST] workdir=$(pwd)"

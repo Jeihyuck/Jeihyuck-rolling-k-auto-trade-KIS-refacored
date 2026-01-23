@@ -11,7 +11,10 @@ def _db_echo() -> bool:
 def get_db_url() -> str:
     url = os.getenv("PBCORE_DB_URL", "").strip()
     if not url:
-        raise RuntimeError("PBCORE_DB_URL is required. SQLite fallback is disabled by design.")
+        raise RuntimeError(
+            "PBCORE_DB_URL is required. Set GitHub Actions secret 'PBCORE_DB_URL' "
+            "and inject it as env in the workflow."
+        )
     if url.startswith("sqlite:"):
         raise RuntimeError("SQLite is forbidden. Use Postgres only.")
     return url
