@@ -1,0 +1,9 @@
+{
+  "invalid_format": [],
+  "insufficient_history": [
+    "476830",
+    "491000"
+  ],
+  "source": "fdr_kospi100_kosdaq100",
+  "as_of": "2026-01-24"
+}
