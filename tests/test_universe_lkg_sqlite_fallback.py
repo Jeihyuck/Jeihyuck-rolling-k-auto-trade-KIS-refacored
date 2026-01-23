@@ -103,6 +103,7 @@ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
     monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
+    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
 
     from trader.universe import lkg_store
 
@@ -117,26 +118,22 @@ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
         def __init__(self, engine):
             self.engine = engine
 
-        def store_universe(self, env, strategy, as_of_date, source, params_json, payload_json, members):
+        def store_universe_snapshot(self, *, env, strategy, as_of_date, provider, members, reason=None):
             stored[(env, strategy)] = {
                 "universe": {
-                    "universe_id": "fake-id",
+                    "run_id": "fake-id",
                     "env": env,
                     "strategy": strategy,
-                    "as_of_date": as_of_date,
-                    "source": source,
-                    "params_json": params_json,
-                    "payload_json": payload_json,
+                    "as_of": as_of_date,
+                    "provider": provider,
+                    "reason": reason,
                 },
                 "members": list(members),
             }
             return "fake-id"
 
-        def get_latest_universe(self, env, strategy, max_age_days=10):
-            row = stored.get((env, strategy))
-            if not row:
-                return None
-            return row["universe"], row["members"]
+        def cleanup_old_runs(self, *, retain_days=30):
+            return None
 
     build_module.UniverseRepo = FakeUniverseRepo
     build_module.make_engine = lambda *args, **kwargs: None
@@ -169,7 +166,5 @@ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
     assert latest is not None
     universe_row = latest["universe"]
     members = latest["members"]
-    assert universe_row.get("source") == "fallback:lkg"
+    assert universe_row.get("provider") == "fallback:lkg"
     assert len(members) == 2
-import sys
-import types

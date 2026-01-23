@@ -1,510 +1,1754 @@
-diff --git a/trader/config.py b/trader/config.py
-index 2933483fc27552b37d5c4b2df167460b632c39c8..3b0620d71c96ddfc360fb35d4cbcb52237deb029 100644
---- a/trader/config.py
-+++ b/trader/config.py
-@@ -122,50 +122,51 @@ CONFIG = {
-     "ENABLE_BREAKOUT": "false",
-     "LEDGER_LOOKBACK_DAYS": "120",
-     "BOTSTATE_LOCK_TTL_SEC": "240",
-     "LEDGER_BASE_DIR": "trader_ledger",
-     "BOT_STATE_RESET": "0",
-     "BOT_STATE_HARD_RESET": "0",
-     "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
-     "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
-     "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
-     "PAPER_RESET_AUTO_PURGE": "0",
-     "PAPER_RESET_EVENT_ONLY_IN_PRACTICE": "1",
-     "PB1_CAPITAL_MODE": "CASH",
-     "PB1_ENTRY_CAPITAL_KRW": "0",
-     "PB1_CASH_RESERVE_PCT": "0.10",
-     "PB1_ALLOW_PREOPEN_ENTRY": "0",
-     "PB1_PREOPEN_START": "08:45",
-     "PB1_PREOPEN_END": "09:00",
-     "PB1_PREOPEN_REQUIRE_BALANCE": "1",
-     "PB1_PREOPEN_MAX_NEW_POSITIONS": "0",
-     "PB1_PREOPEN_ORDER_TYPE": "LIMIT",
-     "PB1_PREOPEN_LIMIT_BUFFER_PCT": "0.3",
-     "PB1_REQUIRE_BALANCE_FOR_ENTRY": "1",
-     "PB1_ENTRY_ENABLED": "true",
-     "PB1_ENTRY_MODE": "BOTH",
-     "PB1_REQUIRE_BOTH": "1",
-+    "ENTRY_COND_MODE": "OR",
-     "PB1_LOG_ENTRY_GATE": "1",
-     "PB1_LOG_DROP_REASONS_TOPN": "10",
-     "PB1_ENTRY_WINDOW_START": "09:00",
-     "PB1_ENTRY_OPEN_END": "09:05",
-     "PB1_ENTRY_WINDOW_END": "15:15",
-     "PB1_EXIT_WINDOW_START": "15:15",
-     "PB1_EXIT_WINDOW_END": "15:30",
-     "PB1_MORNING_WINDOW_END": "10:30",
-     "MORNING_WINDOW_START": "09:00",
-     "MORNING_WINDOW_END": "10:30",
-     "MORNING_EXIT_START": "09:00",
-     "MORNING_EXIT_END": "09:20",
-     "AFTERNOON_WINDOW_START": "10:30",
-     "AFTERNOON_WINDOW_END": "15:15",
-     "CLOSE_AUCTION_START": "15:15",
-     "CLOSE_AUCTION_END": "15:30",
-     "PB1_REQUIRE_VOLUME": "1",
-     "PB1_FORCE_ENTRY_ON_PUSH": "1",
-     "PB1_WAIT_FOR_WINDOW": "1",
-     "PB1_MAX_WAIT_FOR_WINDOW_MIN": "240",
-     "PB1_ALLOW_ADD_TO_EXISTING": "0",
-     "MIN_ORDER_KRW": "0",
-     "MARKET_OPEN_HHMM": "09:00",
-     "MARKET_CLOSE_HHMM": "15:30",
-     "PB1_PULLBACK_BAND_KOSPI": "3,8",
-@@ -622,50 +623,54 @@ CLOSE_AUCTION_END = _cfg("CLOSE_AUCTION_END") or "15:30"
- PB1_REQUIRE_VOLUME = _cfg_bool("PB1_REQUIRE_VOLUME", fallback=False)
- PB1_FORCE_ENTRY_ON_PUSH = _cfg_bool("PB1_FORCE_ENTRY_ON_PUSH", fallback=True)
- PB1_WAIT_FOR_WINDOW = _cfg_bool("PB1_WAIT_FOR_WINDOW", fallback=True)
- PB1_MAX_WAIT_FOR_WINDOW_MIN = int(_cfg("PB1_MAX_WAIT_FOR_WINDOW_MIN") or "240")
- MARKET_OPEN_HHMM = _cfg("MARKET_OPEN_HHMM") or "09:00"
- MARKET_CLOSE_HHMM = _cfg("MARKET_CLOSE_HHMM") or "15:30"
- PB1_ENTRY_WINDOW_START = _cfg("PB1_ENTRY_WINDOW_START") or "09:00"
- PB1_ENTRY_OPEN_END = _cfg("PB1_ENTRY_OPEN_END") or "09:05"
- PB1_ENTRY_WINDOW_END = _cfg("PB1_ENTRY_WINDOW_END") or "15:15"
- PB1_EXIT_WINDOW_START = _cfg("PB1_EXIT_WINDOW_START") or "15:15"
- PB1_EXIT_WINDOW_END = _cfg("PB1_EXIT_WINDOW_END") or "15:30"
- PB1_MORNING_WINDOW_END = _cfg("PB1_MORNING_WINDOW_END") or "10:30"
- PB1_PULLBACK_BAND_KOSPI = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSPI") or "3,8").split(","))
- PB1_PULLBACK_BAND_KOSDAQ = tuple(float(x.strip()) for x in (_cfg("PB1_PULLBACK_BAND_KOSDAQ") or "4,10").split(","))
- PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.00")
- PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "0.98")
- PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
- PB1_PULLBACK_MIN = float(_cfg("PB1_PULLBACK_MIN") or "0.03")
- PB1_PULLBACK_MAX = float(_cfg("PB1_PULLBACK_MAX") or "0.18")
- PB1_ENTRY_MODE = (_cfg("PB1_ENTRY_MODE") or "BOTH").strip().upper()
- if PB1_ENTRY_MODE not in {"PULLBACK", "BREAKOUT", "BOTH"}:
-     logger.warning("[CONFIG] PB1_ENTRY_MODE invalid=%s -> fallback=BOTH", PB1_ENTRY_MODE)
-     PB1_ENTRY_MODE = "BOTH"
- PB1_REQUIRE_BOTH = env_bool("PB1_REQUIRE_BOTH", default=_cfg_bool("PB1_REQUIRE_BOTH", fallback=True))
- PB1_REQUIRE_BOTH_CONTRACTIONS = _cfg_bool("PB1_REQUIRE_BOTH_CONTRACTIONS", fallback=PB1_REQUIRE_BOTH)
-+ENTRY_COND_MODE = (_cfg("ENTRY_COND_MODE") or "OR").strip().upper()
-+if ENTRY_COND_MODE not in {"OR", "AND", "SETUP_ONLY", "TRIGGER_ONLY"}:
-+    logger.warning("[CONFIG] ENTRY_COND_MODE invalid=%s -> fallback=OR", ENTRY_COND_MODE)
-+    ENTRY_COND_MODE = "OR"
- PB1_VOL_CONTRACTION_MAX = PB1_VOL_MAX
- PB1_VOLU_CONTRACTION_MAX = PB1_VOLU_MAX
- PB1_SWING_TREND_MIN = float(_cfg("PB1_SWING_TREND_MIN") or "1.05")
- PB1_SWING_VOL_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOL_CONTRACTION_MAX") or "0.80")
- PB1_SWING_VOLU_CONTRACTION_MAX = float(_cfg("PB1_SWING_VOLU_CONTRACTION_MAX") or "0.75")
- PB1_R_FLOOR_PCT = float(_cfg("PB1_R_FLOOR_PCT") or "2.0")
- PB1_DAY_TP_R = float(_cfg("PB1_DAY_TP_R") or "0.8")
- PB1_DAY_SL_R = float(_cfg("PB1_DAY_SL_R") or "0.6")
- KOSPI_HARD_STOP_PCT = float(_cfg("KOSPI_HARD_STOP_PCT") or "7.0")
- KOSDAQ_HARD_STOP_PCT = float(_cfg("KOSDAQ_HARD_STOP_PCT") or "8.0")
- PB1_SWING_TRAIL_MA = int(_cfg("PB1_SWING_TRAIL_MA") or "20")
- PB1_TIME_STOP_DAYS = int(_cfg("PB1_TIME_STOP_DAYS") or "10")
- PB1_MIN_CANDLES = int(_cfg("PB1_MIN_CANDLES") or "60")
- MINERVINI_RS_MIN = float(_cfg("MINERVINI_RS_MIN") or "0.80")
- MINERVINI_MAX_PYRAMID = int(_cfg("MINERVINI_MAX_PYRAMID") or "3")
- MINERVINI_ADD_ON_R = float(_cfg("MINERVINI_ADD_ON_R") or "1.5")
- MINERVINI_BREAKOUT_VOL_MULT = float(_cfg("MINERVINI_BREAKOUT_VOL_MULT") or "1.5")
- MINERVINI_MAX_EXTENSION_PIVOT = float(_cfg("MINERVINI_MAX_EXTENSION_PIVOT") or "0.05")
- MINERVINI_INITIAL_STOP_PCT = float(_cfg("MINERVINI_INITIAL_STOP_PCT") or "0.075")
- MINERVINI_TIME_STOP_DAYS = int(_cfg("MINERVINI_TIME_STOP_DAYS") or "20")
- MINERVINI_HEAVY_VOL_MULT = float(_cfg("MINERVINI_HEAVY_VOL_MULT") or "1.5")
- UNIVERSE_POOL_SIZE = int(_cfg("UNIVERSE_POOL_SIZE") or "200")
+diff --git a/migrations/0009_universe_snapshot.sql b/migrations/0009_universe_snapshot.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..57fdfc2a2131b91f461c146cf7363d9d80edff3f
+--- /dev/null
++++ b/migrations/0009_universe_snapshot.sql
+@@ -0,0 +1,36 @@
++-- Universe snapshot tables with current pointer
++
++ALTER TABLE universe_members RENAME TO universe_members_legacy;
++ALTER TABLE universe RENAME TO universe_legacy;
++
++CREATE TABLE IF NOT EXISTS universe_runs (
++  run_id TEXT PRIMARY KEY,
++  strategy TEXT NOT NULL,
++  provider TEXT NOT NULL,
++  as_of DATE NOT NULL,
++  created_ts TEXT NOT NULL
++);
++
++CREATE UNIQUE INDEX IF NOT EXISTS ux_universe_runs_key
++ON universe_runs(strategy, provider, as_of);
++
++CREATE TABLE IF NOT EXISTS universe_members (
++  run_id TEXT NOT NULL,
++  stock_code TEXT NOT NULL,
++  name TEXT,
++  market TEXT,
++  rank INTEGER,
++  market_cap REAL,
++  reason TEXT,
++  PRIMARY KEY (run_id, stock_code),
++  FOREIGN KEY (run_id) REFERENCES universe_runs(run_id) ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS ix_universe_members_code ON universe_members(stock_code);
++
++CREATE TABLE IF NOT EXISTS universe_current (
++  strategy TEXT PRIMARY KEY,
++  run_id TEXT NOT NULL,
++  updated_ts TEXT NOT NULL,
++  FOREIGN KEY (run_id) REFERENCES universe_runs(run_id) ON DELETE RESTRICT
++);
+diff --git a/migrations/0010_purge_218410.sql b/migrations/0010_purge_218410.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..291f106927f31ded4fb374732169dabfb2ea6e21
+--- /dev/null
++++ b/migrations/0010_purge_218410.sql
+@@ -0,0 +1 @@
++DELETE FROM universe_members WHERE stock_code='218410';
+diff --git a/tests/test_db_uuid_types.py b/tests/test_db_uuid_types.py
+index 52a1ca15e747e4c02ae84cd5890fccb7d202a3a5..1e26ed90c1803f00a374fb8d88c57daf5f6c7f00 100644
+--- a/tests/test_db_uuid_types.py
++++ b/tests/test_db_uuid_types.py
+@@ -1,17 +1,17 @@
+ import sqlalchemy as sa
+ 
+ from trader.db.schema import schema_for_url
  
  
- def _normalize_index_code(raw: str | None, fallback: str) -> str:
-@@ -710,53 +715,54 @@ TRAIL_MODE = (_cfg("TRAIL_MODE") or "MA20").strip().upper()
- TRAIL_STEP_AFTER_R = float(_cfg("TRAIL_STEP_AFTER_R") or "1.5")
- FAILED_BREAKOUT_EXIT_DAYS = int(_cfg("FAILED_BREAKOUT_EXIT_DAYS") or "2")
- REENTRY_COOLDOWN_DAYS = int(_cfg("REENTRY_COOLDOWN_DAYS") or "10")
+ def test_universe_id_uses_string_for_postgres():
+     url = "postgresql+psycopg://user:pass@localhost:5432/db"
+     schema = schema_for_url(url)
+-    col_type = schema.universe.c.universe_id.type
++    col_type = schema.universe_runs.c.run_id.type
+     assert isinstance(col_type, sa.String)
  
  
- PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
- PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
- PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
- PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")
- PB1_MIN_SCORE = float(_cfg("PB1_MIN_SCORE") or str(PB1_MIN_SCORE_BASE))
- PB1_FAILMODE_SOFT = env_bool("PB1_FAILMODE_SOFT", default=True)
- PB1_MIN_CANDIDATES = int(_cfg("PB1_MIN_CANDIDATES") or "3")
- PB1_RELAX_MAX_PASSES = int(_cfg("PB1_RELAX_MAX_PASSES") or "3")
- PB1_SPREAD_HARD_MAX_PCT = float(_cfg("PB1_SPREAD_HARD_MAX_PCT") or "0")
- PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
- PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
- PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
- PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
- PB1_MAX_ATR_PCT = float(_cfg_with_alias("PB1_MAX_ATR_PCT", "PB1_ATR_PCT_MAX") or "6.0")
- PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
- PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
- PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
- PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
+ def test_universe_id_uses_string_for_sqlite():
+     url = "sqlite:///./dev.db"
+     schema = schema_for_url(url)
+-    col_type = schema.universe.c.universe_id.type
++    col_type = schema.universe_runs.c.run_id.type
+     assert isinstance(col_type, sa.String)
+diff --git a/tests/test_pretrade_validation_skip.py b/tests/test_pretrade_validation_skip.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0700d9d7da4064eff3655281dd28e700e7445553
+--- /dev/null
++++ b/tests/test_pretrade_validation_skip.py
+@@ -0,0 +1,48 @@
++from trader.pb1_engine import PB1Engine
++from trader.window_router import WindowDecision
++
++
++class DummyLedgerRepo:
++    def __init__(self) -> None:
++        self.events: list[dict] = []
++
++    def append_event(self, **payload) -> None:
++        self.events.append(payload)
++
++
++class FakeKis:
++    def get_quote_safe(self, code: str, diag_mode: bool = False):
++        return {"rt_cd": "1"}
++
++
++def test_pretrade_validation_skips_untradeable():
++    ledger_repo = DummyLedgerRepo()
++    engine = PB1Engine(
++        universe_repo=object(),
++        orders_repo=object(),
++        fills_repo=object(),
++        positions_repo=object(),
++        ledger_repo=ledger_repo,
++        kis=FakeKis(),
++        window=WindowDecision(name="day", phase="trade"),
++        window_label="day",
++        phase="trade",
++        dry_run=True,
++        env="practice",
++        run_id="run-1",
++    )
++
++    ok = engine._pretrade_check(
++        code="218410",
++        market="KOSDAQ",
++        mode=1,
++        side="BUY",
++        qty=10,
++        price=1000.0,
++        client_order_key="test",
++        stage="PB1-CLOSE",
++    )
++
++    assert ok is False
++    assert ledger_repo.events
++    assert ledger_repo.events[0]["event_type"] == "ORDER_SKIP"
+diff --git a/tests/test_universe_build_empty_ok.py b/tests/test_universe_build_empty_ok.py
+index 65fe444541702e03ac5f8ec6d0f01897e4c99928..56089cbb07344ed33ce241cee20d8ec79faa99da 100644
+--- a/tests/test_universe_build_empty_ok.py
++++ b/tests/test_universe_build_empty_ok.py
+@@ -1,24 +1,25 @@
+ import os
+ from importlib import reload
  
- logger.info(
--    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
-+    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_cond_mode=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
-     PB1_ENTRY_MODE,
-     int(PB1_REQUIRE_BOTH),
-+    ENTRY_COND_MODE,
-     PB1_ENTRY_BUDGET_PCT_PER_TICK,
-     PB1_MAX_POS_PCT,
-     PB1_VOL_MAX,
-     PB1_VOLU_MAX,
-     PB1_VOLU_MAX_INTRADAY,
-     PB1_PULLBACK_MIN,
-     PB1_PULLBACK_MAX,
-     int(PB1_REQUIRE_BOTH_CONTRACTIONS),
-     PB1_MIN_SCORE_BASE,
-     PB1_MIN_SCORE_FLOOR,
-     PB1_MIN_SCORE_STEP,
-     int(PB1_FAILMODE_SOFT),
-     PB1_RELAX_MAX_PASSES,
-     PB1_MIN_CANDIDATES,
+ import pytest
+ 
+ from trader.universe import build
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def reset_env(tmp_path, monkeypatch):
+     db_url = f"sqlite:///{tmp_path}/test.db"
+     monkeypatch.setenv("DATABASE_URL", db_url)
+     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
++    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+     yield
+ 
+ 
+ def test_build_universe_succeeds_on_empty_payload(monkeypatch):
+     monkeypatch.setattr(
+         build,
+         "run_rebalance",
+         lambda as_of_date, return_by_market=True: {"selected": [], "selected_stocks": [], "selected_by_market": {}},
+     )
+     with pytest.raises(RuntimeError, match="universe_members_empty"):
+         build.build_universe(as_of_date="2026-01-05", env="practice", strategy="best_k_meta")
+diff --git a/tests/test_universe_current_pointer.py b/tests/test_universe_current_pointer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6ae5271e9236bb617751a21539744a772fdf787
+--- /dev/null
++++ b/tests/test_universe_current_pointer.py
+@@ -0,0 +1,35 @@
++from trader.db.engine import make_engine
++from trader.db.migrate import run_migrations
++from trader.db.repos import UniverseRepo
++
++
++def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
++    db_url = f"sqlite:///{tmp_path}/test.db"
++    monkeypatch.setenv("DATABASE_URL", db_url)
++
++    engine = make_engine()
++    run_migrations(engine)
++    repo = UniverseRepo(engine)
++
++    repo.store_universe_snapshot(
++        env="practice",
++        strategy="best_k_meta",
++        as_of_date="2025-01-01",
++        provider="seed_static",
++        members=[{"code": "218410", "market": "KOSDAQ"}],
++        reason="legacy",
++    )
++    repo.store_universe_snapshot(
++        env="practice",
++        strategy="best_k_meta",
++        as_of_date="2025-01-02",
++        provider="seed_static",
++        members=[{"code": "005930", "market": "KOSPI"}],
++        reason="current",
++    )
++
++    members = repo.get_current_universe_members("practice", "best_k_meta")
++    codes = [m.get("code") for m in members]
++
++    assert "005930" in codes
++    assert "218410" not in codes
+diff --git a/tests/test_universe_lkg_sqlite_fallback.py b/tests/test_universe_lkg_sqlite_fallback.py
+index 24dbd1b20cc180645c7991ed0d37409559e80e4c..8a7208e5042065c05476378c991d2b7e0acbd2f8 100644
+--- a/tests/test_universe_lkg_sqlite_fallback.py
++++ b/tests/test_universe_lkg_sqlite_fallback.py
+@@ -81,95 +81,90 @@ def _install_sa_stub() -> None:
+     sa_engine = types.ModuleType("sqlalchemy.engine")
+     sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
+     sa_engine.Engine = _DummyEngine
+     sys.modules["sqlalchemy.engine"] = sa_engine
+     sys.modules["sqlalchemy.engine.url"] = sa_engine.url
+     sys.modules["sqlalchemy"] = sa
+ 
+ 
+ _install_sa_stub()
+ 
+ from trader.db.engine import make_engine
+ from trader.db.repos import UniverseRepo
+ 
+ 
+ def test_lkg_used_when_krx_jsondecode(monkeypatch, tmp_path):
+     db_url = f"sqlite:///{tmp_path}/pbcore.db"
+     lkg_root = tmp_path / "lkg"
+     sqlite_cache = tmp_path / "cache.sqlite3"
+     monkeypatch.setenv("DATABASE_URL", db_url)
+     monkeypatch.setenv("USING_EXTERNAL_DB", "0")
+     monkeypatch.setenv("UNIVERSE_LKG_ROOT", str(lkg_root))
+     monkeypatch.setenv("UNIVERSE_SQLITE_PATH", str(sqlite_cache))
+     monkeypatch.setenv("UNIVERSE_ENABLE_LKG", "1")
+     monkeypatch.setenv("UNIVERSE_ENABLE_SQLITE_CACHE", "1")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
++    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+ 
+     from trader.universe import lkg_store
+ 
+     importlib.reload(lkg_store)
+     from trader.universe import build as build_module
+ 
+     importlib.reload(build_module)
+ 
+     stored: dict = {}
+ 
+     class FakeUniverseRepo:
+         def __init__(self, engine):
+             self.engine = engine
+ 
+-        def store_universe(self, env, strategy, as_of_date, source, params_json, payload_json, members):
++        def store_universe_snapshot(self, *, env, strategy, as_of_date, provider, members, reason=None):
+             stored[(env, strategy)] = {
+                 "universe": {
+-                    "universe_id": "fake-id",
++                    "run_id": "fake-id",
+                     "env": env,
+                     "strategy": strategy,
+-                    "as_of_date": as_of_date,
+-                    "source": source,
+-                    "params_json": params_json,
+-                    "payload_json": payload_json,
++                    "as_of": as_of_date,
++                    "provider": provider,
++                    "reason": reason,
+                 },
+                 "members": list(members),
+             }
+             return "fake-id"
+ 
+-        def get_latest_universe(self, env, strategy, max_age_days=10):
+-            row = stored.get((env, strategy))
+-            if not row:
+-                return None
+-            return row["universe"], row["members"]
++        def cleanup_old_runs(self, *, retain_days=30):
++            return None
+ 
+     build_module.UniverseRepo = FakeUniverseRepo
+     build_module.make_engine = lambda *args, **kwargs: None
+     build_module.run_migrations = lambda *args, **kwargs: None
+ 
+     lkg_payload = {
+         "payload": {
+             "selected": ["000001", "000002"],
+             "selected_by_market": {
+                 "KOSPI": [{"code": "000001", "rank": 1, "name": "foo"}],
+                 "KOSDAQ": [{"code": "000002", "rank": 1, "name": "bar"}],
+             },
+         },
+         "members": [
+             {"code": "000001", "market": "KOSPI", "rank": 1, "meta_json": {}},
+             {"code": "000002", "market": "KOSDAQ", "rank": 1, "meta_json": {}},
+         ],
+         "params": {"as_of": "2024-01-02"},
+     }
+     lkg_store.save_lkg("practice", "best_k_meta", lkg_payload)
+ 
+     def fail_fetch(*_, **__):
+         raise json.JSONDecodeError("bad", "{}", 0)
+ 
+     monkeypatch.setattr(build_module, "fetch_with_rollback", fail_fetch)
+ 
+     build_module.build_universe(as_of_date=date(2024, 1, 3).isoformat(), env="practice", strategy="best_k_meta")
+ 
+     latest = stored.get(("practice", "best_k_meta"))
+     assert latest is not None
+     universe_row = latest["universe"]
+     members = latest["members"]
+-    assert universe_row.get("source") == "fallback:lkg"
++    assert universe_row.get("provider") == "fallback:lkg"
+     assert len(members) == 2
+-import sys
+-import types
+diff --git a/tests/test_universe_runtime_outputs.py b/tests/test_universe_runtime_outputs.py
+index 168e92463102ab9f9804b26ee2e075d04dff5260..12c84ab675b7cbc1646a8317ac9bff85620165b2 100644
+--- a/tests/test_universe_runtime_outputs.py
++++ b/tests/test_universe_runtime_outputs.py
+@@ -1,33 +1,34 @@
+ from pathlib import Path
+ 
+ from trader.universe import build
+ 
+ 
+ def test_universe_build_writes_runtime_files(tmp_path, monkeypatch):
+     bot_state_dir = tmp_path / "bot_state"
+     bot_state_dir.mkdir(parents=True, exist_ok=True)
+     monkeypatch.setenv("BOTSTATE_ROOT", str(bot_state_dir))
+     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
+     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
+     monkeypatch.setenv("UNIVERSE_VALIDATE_OHLCV", "0")
++    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
+ 
+     seed_payload = {
+         "payload": {
+             "selected": ["000001"],
+             "selected_by_market": {"KOSPI": [{"code": "000001", "rank": 1}]},
+         },
+         "members": [{"code": "000001", "market": "KOSPI"}],
+         "source": "seed_static",
+         "params": {"as_of": "2025-01-01"},
+     }
+     monkeypatch.setattr(build, "_load_static_seed", lambda: seed_payload)
+ 
+     build.build_universe(as_of_date="2025-01-01", env="practice", strategy="best_k_meta", provider_override="seed_static")
+ 
+     runtime_universe = bot_state_dir / "runtime" / "universe" / "2025-01-01.json"
+     runtime_sanitize = bot_state_dir / "runtime" / "universe_sanitize_2025-01-01.json"
+     runtime_flag = bot_state_dir / "runtime" / "universe_build_done_2025-01-01.flag"
+ 
+     assert runtime_universe.exists()
+     assert runtime_sanitize.exists()
+     assert runtime_flag.exists()
+diff --git a/trader/db/__init__.py b/trader/db/__init__.py
+index 10f3d7da6cf12cfd877836e46ab86d806d90897d..84ffdaa6221f18816806f67440dedfd7e00eb941 100644
+--- a/trader/db/__init__.py
++++ b/trader/db/__init__.py
+@@ -1,39 +1,41 @@
+ """
+ Database utilities for the PB-Core v2 backend.
+ """
+ 
+ from .config import get_database_url, get_db_echo, is_sqlite_url
+ from .engine import make_engine
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+-    UNIVERSE,
++    UNIVERSE_CURRENT,
+     UNIVERSE_MEMBERS,
++    UNIVERSE_RUNS,
+     METADATA,
  )
- logger.info(
-     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
-     UNIVERSE_POOL_SIZE,
+ 
+ 
+ def run_migrations(engine, migrations_dir: str = "migrations"):
+     from .migrate import run_migrations as _rm
+ 
+     return _rm(engine, migrations_dir=migrations_dir)
+ 
+ 
+ __all__ = [
+     "get_database_url",
+     "get_db_echo",
+     "is_sqlite_url",
+     "make_engine",
+     "run_migrations",
+     "FILLS",
+     "LEDGER_EVENTS",
+     "ORDERS",
+     "POSITIONS",
+     "RUNS",
+-    "UNIVERSE",
++    "UNIVERSE_CURRENT",
+     "UNIVERSE_MEMBERS",
++    "UNIVERSE_RUNS",
+     "METADATA",
+ ]
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 85d17c3c395431bcf2272895d90f96e74a690e0e..adc33e575600a6f8f1a04eeef119ae952425ef95 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -1,48 +1,49 @@
+ from __future__ import annotations
+ 
+ from datetime import datetime, timedelta
+ import logging
+ import os
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional
+ from uuid import UUID, uuid4
+ 
+ import sqlalchemy as sa
+ from sqlalchemy.exc import OperationalError
+ from sqlalchemy import Engine, and_, func, select
+ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ 
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+-    UNIVERSE,
+     UNIVERSE_MEMBERS,
++    UNIVERSE_CURRENT,
++    UNIVERSE_RUNS,
+     schema_for_engine,
+     uuid_value_for_url,
+ )
+ from .migrate import ensure_sqlite_writable, run_migrations
+ from . import config
+ from trader.time_utils import now_kst
+ from trader.utils.json_sanitize import json_safe
+ 
+ logger = logging.getLogger(__name__)
+ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
+ 
+ 
+ def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
+     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+ 
+ 
+ def _is_sqlite_readonly(exc: Exception, engine: Engine) -> bool:
+     message = str(exc).lower()
+     if "readonly" not in message:
+         return False
+     return config.is_sqlite_url(str(engine.url))
+ 
+ 
+ def _recover_sqlite_readonly(engine: Engine) -> bool:
+     url = str(engine.url)
+@@ -119,198 +120,182 @@ class RunsRepo:
+                     return str(run_id)
+                 except OperationalError as exc:
+                     if attempt == 0 and _is_sqlite_readonly(exc, self.engine):
+                         _recover_sqlite_readonly(self.engine)
+                         continue
+                     raise
+                 except Exception:
+                     conn.execute(stmt)
+                     return str(run_id)
+         return str(run_id)
+ 
+     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
+         with self.engine.begin() as conn:
+             conn.execute(
+                 sa.update(self._schema.runs)
+                 .where(self._schema.runs.c.run_id == run_id)
+                 .values(status=status, finished_at=func.now(), notes=notes),
+             )
+ 
+ 
+ class UniverseRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+-    def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
++    def _strategy_key(self, env: str, strategy: str) -> str:
++        return f"{env}:{strategy}"
++
++    def _fetch_members_for_run(self, run_id: str, *, env: str, strategy: str) -> list[dict]:
+         stmt = (
+             select(
+-                self._schema.universe_members.c.code,
++                self._schema.universe_members.c.stock_code,
++                self._schema.universe_members.c.name,
+                 self._schema.universe_members.c.market,
+-                self._schema.universe_members.c.weight,
+                 self._schema.universe_members.c.rank,
+-                self._schema.universe_members.c.meta_json,
+-                self._schema.universe.c.as_of_date,
+-                self._schema.universe.c.strategy,
+-                self._schema.universe.c.env,
++                self._schema.universe_members.c.market_cap,
++                self._schema.universe_members.c.reason,
++                self._schema.universe_runs.c.as_of,
++                self._schema.universe_runs.c.provider,
+             )
+             .select_from(
+                 self._schema.universe_members.join(
+-                    self._schema.universe, self._schema.universe_members.c.universe_id == self._schema.universe.c.universe_id
++                    self._schema.universe_runs,
++                    self._schema.universe_members.c.run_id == self._schema.universe_runs.c.run_id,
+                 )
+             )
+-            .where(self._schema.universe_members.c.universe_id == universe_id)
+-            .order_by(self._schema.universe_members.c.rank.nullsfirst(), self._schema.universe_members.c.universe_member_id)
++            .where(self._schema.universe_members.c.run_id == run_id)
++            .order_by(self._schema.universe_members.c.rank.nullsfirst())
+         )
+         with self.engine.begin() as conn:
+             rows = conn.execute(stmt).mappings().all()
+-            return [dict(row) for row in rows]
+-
+-    def get_universe_members(self, env: str, strategy: str, as_of_date: str) -> list[dict]:
+-        stmt = (
+-            select(self._schema.universe.c.universe_id)
+-            .where(
+-                and_(
+-                    self._schema.universe.c.env == env,
+-                    self._schema.universe.c.strategy == strategy,
+-                    self._schema.universe.c.as_of_date == as_of_date,
+-                )
+-            )
+-            .order_by(self._schema.universe.c.created_at.desc())
+-            .limit(1)
+-        )
++            results: list[dict] = []
++            for row in rows:
++                payload = dict(row)
++                payload["code"] = payload.pop("stock_code")
++                payload["as_of_date"] = payload.pop("as_of")
++                payload["env"] = env
++                payload["strategy"] = strategy
++                results.append(payload)
++            return results
++
++    def get_current_universe_members(self, env: str, strategy: str) -> list[dict]:
++        strategy_key = self._strategy_key(env, strategy)
++        stmt = select(self._schema.universe_current.c.run_id).where(self._schema.universe_current.c.strategy == strategy_key)
+         with self.engine.begin() as conn:
+-            universe_id = conn.execute(stmt).scalar()
+-        if not universe_id:
++            run_id = conn.execute(stmt).scalar()
++        if not run_id:
+             return []
+-        return self._fetch_members_for_universe(str(universe_id))
++        return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
+ 
+-    def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
+-        stmt = (
+-            select(self._schema.universe.c.universe_id)
+-            .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
+-            .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
+-            .limit(1)
+-        )
+-        with self.engine.begin() as conn:
+-            universe_id = conn.execute(stmt).scalar()
+-        if not universe_id:
+-            return []
+-        return self._fetch_members_for_universe(str(universe_id))
+-
+-    def get_latest_universe(
+-        self, env: str, strategy: str, *, max_age_days: int = 10
+-    ) -> tuple[dict, list[dict]] | None:
+-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+-        stmt = (
+-            select(self._schema.universe)
+-            .where(
+-                and_(
+-                    self._schema.universe.c.env == env,
+-                    self._schema.universe.c.strategy == strategy,
+-                    self._schema.universe.c.created_at >= cutoff,
+-                )
+-            )
+-            .order_by(self._schema.universe.c.created_at.desc())
+-            .limit(1)
+-        )
+-        with self.engine.begin() as conn:
+-            row = conn.execute(stmt).mappings().first()
+-        if not row:
+-            return None
+-        universe_id = str(row.get("universe_id"))
+-        return dict(row), self._fetch_members_for_universe(universe_id)
+-
+-    def store_universe(
++    def store_universe_snapshot(
+         self,
++        *,
+         env: str,
+         strategy: str,
+         as_of_date: str,
+-        source: str,
+-        params_json: dict,
+-        payload_json: dict,
++        provider: str,
+         members: Iterable[dict],
++        reason: str | None = None,
+     ) -> str | None:
+         members_list = list(members)
+         db_url = str(self.engine.url)
+-        values = {
+-            "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+-            "env": env,
+-            "strategy": strategy,
+-            "as_of_date": as_of_date,
+-            "source": source,
+-            "params_json": params_json or {},
+-            "payload_json": payload_json or {},
+-        }
++        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
++        strategy_key = self._strategy_key(env, strategy)
+         try:
+             with self.engine.begin() as conn:
+                 existing = conn.execute(
+-                    select(self._schema.universe.c.universe_id).where(
++                    select(self._schema.universe_runs.c.run_id).where(
+                         and_(
+-                            self._schema.universe.c.env == env,
+-                            self._schema.universe.c.strategy == strategy,
+-                            self._schema.universe.c.as_of_date == as_of_date,
++                            self._schema.universe_runs.c.strategy == strategy_key,
++                            self._schema.universe_runs.c.provider == provider,
++                            self._schema.universe_runs.c.as_of == as_of_date,
+                         )
+                     )
+                 ).scalar()
+-                universe_id = existing or values["universe_id"]
+                 if existing:
+-                    conn.execute(
+-                        sa.update(self._schema.universe)
+-                        .where(self._schema.universe.c.universe_id == existing)
+-                        .values(source=source, params_json=params_json or {}, payload_json=payload_json or {}, created_at=func.now()),
++                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
++                conn.execute(
++                    sa.insert(self._schema.universe_runs).values(
++                        run_id=run_id,
++                        strategy=strategy_key,
++                        provider=provider,
++                        as_of=as_of_date,
++                        created_ts=now_kst().isoformat(),
+                     )
++                )
++                for rank, member in enumerate(members_list, start=1):
++                    meta = member.get("meta_json") or {}
+                     conn.execute(
+-                        sa.delete(self._schema.universe_members).where(self._schema.universe_members.c.universe_id == existing)
++                        sa.insert(self._schema.universe_members).values(
++                            run_id=uuid_value_for_url(db_url, run_id),
++                            stock_code=str(member.get("code") or "").zfill(6),
++                            name=member.get("name") or meta.get("name"),
++                            market=member.get("market"),
++                            rank=member.get("rank") if member.get("rank") is not None else rank,
++                            market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
++                            reason=member.get("reason") or reason,
++                        )
++                    )
++                if self.engine.dialect.name == "postgresql":
++                    insert_stmt = pg_insert(self._schema.universe_current).values(
++                        strategy=strategy_key,
++                        run_id=uuid_value_for_url(db_url, run_id),
++                        updated_ts=now_kst().isoformat(),
+                     )
+                 else:
+-                    res = conn.execute(
+-                        sa.insert(self._schema.universe)
+-                        .values(**values)
+-                        .returning(self._schema.universe.c.universe_id)
++                    insert_stmt = sqlite_insert(self._schema.universe_current).values(
++                        strategy=strategy_key,
++                        run_id=uuid_value_for_url(db_url, run_id),
++                        updated_ts=now_kst().isoformat(),
+                     )
+-                    universe_id = res.scalar() or universe_id
+-                fk_universe_id = uuid_value_for_url(db_url, universe_id)
+-                for rank, m in enumerate(members_list, start=1):
+-                    conn.execute(
+-                        sa.insert(self._schema.universe_members).values(
+-                            universe_member_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+-                            universe_id=fk_universe_id,
+-                            code=str(m.get("code") or "").zfill(6),
+-                            market=m.get("market"),
+-                            weight=m.get("weight"),
+-                            rank=m.get("rank") if m.get("rank") is not None else rank,
+-                            meta_json=m.get("meta_json") or {},
+-                        )
++                conn.execute(
++                    insert_stmt.on_conflict_do_update(
++                        index_elements=[self._schema.universe_current.c.strategy],
++                        set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
+                     )
+-            return str(universe_id)
++                )
++            return str(run_id)
+         except Exception:
+             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+             if ALLOW_UNIVERSE_DB_FAIL:
+                 return None
+             raise
+ 
++    def cleanup_old_runs(self, *, retain_days: int = 30) -> None:
++        cutoff = (now_kst() - timedelta(days=retain_days)).isoformat()
++        with self.engine.begin() as conn:
++            current_runs = select(self._schema.universe_current.c.run_id)
++            conn.execute(
++                sa.delete(self._schema.universe_runs).where(
++                    and_(
++                        self._schema.universe_runs.c.created_ts < cutoff,
++                        self._schema.universe_runs.c.run_id.not_in(current_runs),
++                    )
++                )
++            )
++
+ 
+ class OrdersRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def create_intent_idempotent(
+         self,
+         env: str,
+         run_id: str,
+         strategy: str,
+         sid: int,
+         mode: int,
+         code: str,
+         market: str | None,
+         side: str,
+         ord_type: str,
+         qty: int,
+         limit_price: float | None,
+         stage: str,
+         client_order_key: str,
+         request_json: dict | None,
+         *,
+         status: str = "CREATED",
+     ) -> tuple[str, bool]:
+diff --git a/trader/db/schema.py b/trader/db/schema.py
+index 9808054299eee7adcdbea63f3ddafc1b188cac8f..75957e46e0f49a6581bffbd6668e44797edd4479 100644
+--- a/trader/db/schema.py
++++ b/trader/db/schema.py
+@@ -11,112 +11,120 @@ from sqlalchemy import Engine
+ 
+ from . import config
+ 
+ 
+ def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
+     # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
+     return sa.String()
+ 
+ 
+ def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
+     try:
+         if value is None:
+             return str(uuid4())
+         if isinstance(value, UUID):
+             return str(value)
+         return str(UUID(str(value)))
+     except Exception:
+         return str(uuid4())
+ 
+ 
+ @dataclass(frozen=True)
+ class SchemaTables:
+     database_url: str
+     metadata: sa.MetaData
+     runs: sa.Table
+-    universe: sa.Table
++    universe_runs: sa.Table
+     universe_members: sa.Table
++    universe_current: sa.Table
+     orders: sa.Table
+     fills: sa.Table
+     positions: sa.Table
+     ledger_events: sa.Table
+     reconcile_log: sa.Table
+     uses_native_uuid: bool
+ 
+ 
+ def _build_schema(database_url: str) -> SchemaTables:
+     metadata = sa.MetaData()
+     uuid_type = _uuid_type_for_url(database_url)
+     uses_native_uuid = False
+ 
+     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
+         return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
+ 
+     runs = sa.Table(
+         "runs",
+         metadata,
+         uuid_col("run_id", primary_key=True),
+         sa.Column("env", sa.String, nullable=False),
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("run_window", sa.String),
+         sa.Column("phase", sa.String),
+         sa.Column("event_name", sa.String),
+         sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
+         sa.Column("git_sha", sa.String),
+         sa.Column("workflow", sa.String),
+         sa.Column("workflow_run_id", sa.String),
+         sa.Column("workflow_attempt", sa.Integer),
+         sa.Column("config_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("status", sa.String, nullable=False, default="STARTED"),
+         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+         sa.Column("finished_at", sa.DateTime(timezone=True)),
+         sa.Column("notes", sa.Text),
+     )
+ 
+-    universe = sa.Table(
+-        "universe",
++    universe_runs = sa.Table(
++        "universe_runs",
+         metadata,
+-        uuid_col("universe_id", primary_key=True),
+-        sa.Column("env", sa.String, nullable=False),
+         sa.Column("strategy", sa.String, nullable=False),
+-        sa.Column("as_of_date", sa.String, nullable=False),
+-        sa.Column("source", sa.String, nullable=False),
+-        sa.Column("params_json", sa.JSON, nullable=False, default=dict),
+-        sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
+-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
++        sa.Column("provider", sa.String, nullable=False),
++        sa.Column("as_of", sa.Date, nullable=False),
++        sa.Column("created_ts", sa.Text, nullable=False),
++        uuid_col("run_id", primary_key=True),
++        sa.UniqueConstraint("strategy", "provider", "as_of", name="ux_universe_runs_key"),
+     )
+ 
+     universe_members = sa.Table(
+         "universe_members",
+         metadata,
+-        uuid_col("universe_member_id", primary_key=True),
+-        sa.Column("universe_id", uuid_type, sa.ForeignKey("universe.universe_id"), nullable=False),
+-        sa.Column("code", sa.String, nullable=False),
++        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
++        sa.Column("stock_code", sa.String, nullable=False),
++        sa.Column("name", sa.String),
+         sa.Column("market", sa.String),
+-        sa.Column("weight", sa.Float),
+         sa.Column("rank", sa.Integer),
+-        sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
++        sa.Column("market_cap", sa.Float),
++        sa.Column("reason", sa.String),
++        sa.PrimaryKeyConstraint("run_id", "stock_code"),
++    )
++
++    universe_current = sa.Table(
++        "universe_current",
++        metadata,
++        sa.Column("strategy", sa.String, primary_key=True),
++        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
++        sa.Column("updated_ts", sa.Text, nullable=False),
+     )
+ 
+     orders = sa.Table(
+         "orders",
+         metadata,
+         uuid_col("order_id", primary_key=True),
+         sa.Column("env", sa.String, nullable=False),
+         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("sid", sa.Integer, nullable=False),
+         sa.Column("mode", sa.Integer, nullable=False),
+         sa.Column("code", sa.String, nullable=False),
+         sa.Column("market", sa.String),
+         sa.Column("side", sa.String, nullable=False),
+         sa.Column("ord_type", sa.String, nullable=False),
+         sa.Column("qty", sa.Integer, nullable=False),
+         sa.Column("limit_price", sa.Float),
+         sa.Column("stage", sa.String),
+         sa.Column("client_order_key", sa.String, nullable=False),
+         sa.Column("status", sa.String, nullable=False, default="INTENT"),
+         sa.Column("kis_odno", sa.String),
+         sa.Column("broker_order_id", sa.String),
+         sa.Column("request_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("response_json", sa.JSON),
+         sa.Column("submitted_at", sa.DateTime(timezone=True)),
+@@ -223,67 +231,69 @@ def _build_schema(database_url: str) -> SchemaTables:
+         sa.Column("price", sa.Float),
+         sa.Column("kis_odno", sa.String),
+         sa.Column("client_order_key", sa.String),
+         sa.Column("ok", sa.Boolean, nullable=False, default=True),
+         sa.Column("reasons", sa.JSON, nullable=False, default=list),
+         sa.Column("stage", sa.String),
+         sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+     )
+ 
+     reconcile_log = sa.Table(
+         "reconcile_log",
+         metadata,
+         sa.Column("env", sa.String, nullable=False),
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("tick_ts", sa.DateTime(timezone=True), nullable=False),
+         sa.Column("action", sa.String, nullable=False),
+         sa.Column("details_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+     )
+ 
+     return SchemaTables(
+         database_url=database_url,
+         metadata=metadata,
+         runs=runs,
+-        universe=universe,
++        universe_runs=universe_runs,
+         universe_members=universe_members,
++        universe_current=universe_current,
+         orders=orders,
+         fills=fills,
+         positions=positions,
+         ledger_events=ledger_events,
+         reconcile_log=reconcile_log,
+         uses_native_uuid=uses_native_uuid,
+     )
+ 
+ 
+ _SCHEMA_CACHE: dict[str, SchemaTables] = {}
+ 
+ 
+ @lru_cache(maxsize=None)
+ def schema_for_url(database_url: str) -> SchemaTables:
+     normalized = str(database_url)
+     if normalized not in _SCHEMA_CACHE:
+         _SCHEMA_CACHE[normalized] = _build_schema(normalized)
+     return _SCHEMA_CACHE[normalized]
+ 
+ 
+ def schema_for_engine(engine: Engine) -> SchemaTables:
+     return schema_for_url(str(engine.url))
+ 
+ 
+ def metadata_for_url(database_url: str) -> sa.MetaData:
+     return schema_for_url(database_url).metadata
+ 
+ 
+ DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+ DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
+ 
+ METADATA = DEFAULT_SCHEMA.metadata
+ RUNS = DEFAULT_SCHEMA.runs
+-UNIVERSE = DEFAULT_SCHEMA.universe
++UNIVERSE_RUNS = DEFAULT_SCHEMA.universe_runs
+ UNIVERSE_MEMBERS = DEFAULT_SCHEMA.universe_members
++UNIVERSE_CURRENT = DEFAULT_SCHEMA.universe_current
+ ORDERS = DEFAULT_SCHEMA.orders
+ FILLS = DEFAULT_SCHEMA.fills
+ POSITIONS = DEFAULT_SCHEMA.positions
+ LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
+ RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
+diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
+index 485aa593b3382d71f2487c98513437e60356eac0..50d6dac9d60ea06803845260435d94eb979783f6 100644
+--- a/trader/pb1_engine.py
++++ b/trader/pb1_engine.py
+@@ -82,50 +82,51 @@ from trader.config import (
+     REGIME_MID_RISK,
+     REGIME_MIN_RISK,
+     REGIME_MODE,
+     RISK_PER_TRADE_PCT,
      RS_BENCHMARK,
+     RS_COMPOSITE_W1,
+     RS_COMPOSITE_W2,
      RS_LOOKBACK_DAYS,
      RS_LOOKBACK2_DAYS,
      RS_MIN_PCTILE,
-     REGIME_INDEX,
-     REGIME_MODE,
+     TAKE_PROFIT_R1,
+     TAKE_PROFIT_R2,
+     TP1_SELL_PCT,
+     TP2_SELL_PCT,
+     TRAIL_MODE,
+     TRAIL_STEP_AFTER_R,
+     UNIVERSE_POOL_SIZE,
      VCP_LOOKBACK,
-diff --git a/trader/pb1_engine.py b/trader/pb1_engine.py
-index c8dca128ed9bed7bc9507692d576143dac5d00bb..485aa593b3382d71f2487c98513437e60356eac0 100644
---- a/trader/pb1_engine.py
-+++ b/trader/pb1_engine.py
-@@ -30,50 +30,51 @@ from trader.config import (
-     PB1_RELAX_MAX_PASSES,
-     PB1_SPREAD_HARD_MAX_PCT,
-     PB1_GAP_HARD_MAX_PCT,
-     PB1_CAPITAL_MODE,
-     PB1_ENTRY_CAPITAL_KRW,
-     PB1_CASH_RESERVE_PCT,
-     PB1_ENTRY_BUDGET_PCT_PER_TICK,
-     PB1_MAX_POS_PCT,
-     PAPER_MAX_CAPITAL_KRW,
-     PB1_ENTRY_WINDOW_START,
-     PB1_ENTRY_OPEN_END,
-     PB1_ENTRY_WINDOW_END,
-     PB1_EXIT_WINDOW_START,
-     PB1_EXIT_WINDOW_END,
-     PB1_ALLOW_ADD_TO_EXISTING,
-     PB1_PREOPEN_ORDER_TYPE,
-     PB1_PREOPEN_LIMIT_BUFFER_PCT,
-     PB1_VOL_MAX,
-     PB1_VOLU_MAX,
-     PB1_VOLU_MAX_INTRADAY,
-     PB1_PULLBACK_MIN,
-     PB1_PULLBACK_MAX,
-     PB1_ENTRY_MODE,
-     PB1_REQUIRE_BOTH,
-     PB1_REQUIRE_BOTH_CONTRACTIONS,
-+    ENTRY_COND_MODE,
-     PB1_LOG_ENTRY_GATE,
-     PB1_LOG_DROP_REASONS_TOPN,
-     MIN_ORDER_KRW,
-     MINERVINI_ADD_ON_R,
-     MINERVINI_BREAKOUT_VOL_MULT,
-     MINERVINI_HEAVY_VOL_MULT,
-     MINERVINI_INITIAL_STOP_PCT,
-     MINERVINI_MAX_EXTENSION_PIVOT,
-     MINERVINI_MAX_PYRAMID,
-     MINERVINI_RS_MIN,
-     MINERVINI_TIME_STOP_DAYS,
-     ATR_WINDOW,
-     ATR_MULT,
-     BREAKOUT_VOL_MULT,
-     ENTRY_MODE,
-     FAILED_BREAKOUT_EXIT_DAYS,
-     INITIAL_STOP_MODE,
-     MAX_GAP_UP_PCT,
-     MAX_INTRADAY_RANGE_PCT,
-     MAX_SPREAD_PROXY_BPS,
-     MIN_AVG_VALUE_KRW,
-     REENTRY_COOLDOWN_DAYS,
-     REGIME_INDEX,
-     REGIME_MA_FAST,
-     REGIME_MA_SLOW,
-@@ -471,50 +472,51 @@ class PB1Engine:
-         self.balance_cache_hits = 0
-         self.balance_tick_cache_hits = 0
-         self.require_volume = env_bool("PB1_REQUIRE_VOLUME", PB1_REQUIRE_VOLUME)
-         self.min_candles = int(PB1_MIN_CANDLES)
-         self.minervini_config = MinerviniConfig(
-             rs_min_percentile=RS_MIN_PCTILE / 100.0,
-             min_dollar_vol_50d=PB1_MIN_VALUE20,
-             breakout_vol_mult_20=BREAKOUT_VOL_MULT,
-             max_extension_from_pivot=MINERVINI_MAX_EXTENSION_PIVOT,
-             initial_stop_pct=MINERVINI_INITIAL_STOP_PCT,
-             risk_pct_of_equity=RISK_PER_TRADE_PCT / 100.0,
-             max_pyramid_levels=MINERVINI_MAX_PYRAMID,
-             add_on_R=MINERVINI_ADD_ON_R,
-             heavy_volume_mult=MINERVINI_HEAVY_VOL_MULT,
+     VCP_MIN_SCORE,
+     resolve_market_window,
+ )
+ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.kis_wrapper import KisAPI
+ from trader.ledger.store import LedgerStore
++from trader.universe.validation import validate_tradeable
+ from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
+ from trader.factors.regime import get_regime, risk_multiplier
+ from trader.factors.rs_rank import rank_rs
+ from trader.positioning.minervini_risk import calc_initial_stop, calc_position_size, update_exits
+ from trader.minervini.report import run_minervini_report
+ from trader.setups.vcp_pro import PriceTightRules, VolContractRules, find_pivot, is_vcp_ready, score_vcp
+ from trader.strategies.pb1_minervini_v2 import (
+     MinerviniConfig,
+     compute_features,
+     compute_pivot,
+     detect_vcp,
+     entry_trigger,
+     evaluate_filters,
+     initial_stop,
+     risk_position_size,
+     score_setup,
+     update_trailing_stop,
+ )
+ from trader.time_utils import now_kst
+ from trader.core_utils import _round_to_tick
+ from trader.reasons import ReasonCode
+ from trader.eventlog import emit_event
+ from trader.utils.env import env_bool
+ from trader.utils.json_sanitize import to_jsonable
+ from trader.window_router import WindowDecision
+@@ -2174,50 +2175,87 @@ class PB1Engine:
+                 return buyables, meta, drop_reasons
+             drop_reasons.update(planned_drop)
+             effective_target -= 1
+ 
+         meta = {"reason": "cannot_make_valid_qty"}
+         logger.info(
+             "[PB1][BUDGET_PLAN] effective_target=0 cap=0 affordable=%s drop_reasons=%s",
+             len(affordable),
+             drop_reasons.most_common(3),
          )
-         providers = []
-         if kis:
-             providers.append(KISOHLCVProvider(kis))
-         providers.append(KRXOHLCVProvider())
-         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
-         self._setup_reason_counter: Counter[str] = Counter()
-         self._now_kst = now_kst_value or now_kst()
-         self._today = self._now_kst.date().isoformat()
-         self.entry_mode = PB1_ENTRY_MODE
-         self.entry_require_both = bool(PB1_REQUIRE_BOTH)
-+        self.entry_cond_mode = ENTRY_COND_MODE
-         self.log_entry_gate = bool(PB1_LOG_ENTRY_GATE)
-         self.drop_reasons_topn = int(PB1_LOG_DROP_REASONS_TOPN)
-         self.debug = env_bool("DEBUG", False)
-         self._universe_as_of = None
-         self._universe_path: str | None = None
-         self._universe_context = universe_context
-         self._warned_keys: set[str] = set()
-         self._balance_price_map: Dict[str, float] = {}
-         self._balance_cost: float | None = None
-         self._balance_snapshot: dict | None = balance_snapshot
-         self._balance_snapshot_source: str | None = balance_source
-         if balance_snapshot is not None:
-             if balance_source == "api":
-                 self.balance_api_calls += 1
-             elif balance_source is not None:
-                 self.balance_cache_hits += 1
-         self._holdings_summary: Dict[str, Any] = {}
-         self._code_name_map: Dict[str, str] = {}
-         self.current_code: str | None = None
-         self.top_candidates: list[dict[str, Any]] = []
-         self.entry_enabled = bool(entry_allowed_this_tick)
-         self.entry_block_reason = entry_block_reason
-         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
-         self.window_internal = self._resolve_window_internal()
-         self.filter_thresholds = self._resolve_filter_thresholds()
-@@ -1080,97 +1082,111 @@ class PB1Engine:
-         logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
-         self._balance_snapshot = snap
-         return self._balance_snapshot
+         return [], meta, drop_reasons
  
-     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
-         return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{side.upper()}"
+     def _fetch_marks(self, codes: Iterable[str], fallback: Dict[str, float]) -> Dict[str, float]:
+         marks: Dict[str, float] = {}
+         for code in codes:
+             px, source = self._resolve_price_with_fallback(code, ohlcv_close=fallback.get(code))
+             if px is not None:
+                 marks[code] = px
+         return marks
  
-     def _name_for_code(self, code: str | None) -> str | None:
-         if not code:
-             return None
-         return self._code_name_map.get(str(code).zfill(6))
+     def _should_block_order(self, client_order_key: str) -> bool:
+         if not client_order_key:
+             return True
+         return self.orders_repo.has_client_order_key(self.env, client_order_key)
  
-     def _display_code(self, code: str | None) -> str:
-         if not code:
-             return ""
-         name = self._name_for_code(code)
-         return f"{name}({code})" if name else str(code)
- 
-     def _with_name_reason(self, reasons: list[str] | None, code: str | None) -> list[str]:
-         enriched = list(reasons or [])
-         name = self._name_for_code(code)
-         if name:
-             enriched.append(f"name:{name}")
-         return enriched
- 
--    def _entry_gate(self, *, pullback_ok: bool, breakout_ok: bool) -> tuple[bool, list[str]]:
--        mode = (self.entry_mode or "BOTH").strip().upper()
--        require_both = bool(self.entry_require_both)
-+    def _entry_gate(self, *, setup_filters_ok: bool, breakout_trigger_ok: bool) -> tuple[bool, list[str], str]:
-+        mode = (self.entry_cond_mode or "OR").strip().upper()
-         reasons: list[str] = []
- 
--        if mode == "PULLBACK":
--            entry_ok = bool(pullback_ok)
-+        if mode == "SETUP_ONLY":
-+            entry_ok = bool(setup_filters_ok)
-             if not entry_ok:
--                reasons.append("pullback_fail")
--            return entry_ok, reasons
-+                reasons.append("setup_filters_fail")
-+            return entry_ok, reasons, mode
- 
--        if mode == "BREAKOUT":
--            entry_ok = bool(breakout_ok)
-+        if mode == "TRIGGER_ONLY":
-+            entry_ok = bool(breakout_trigger_ok)
-             if not entry_ok:
--                reasons.append("pivot_breakout_fail")
--            return entry_ok, reasons
--
--        if require_both:
--            entry_ok = bool(pullback_ok and breakout_ok)
--            if not pullback_ok:
--                reasons.append("pullback_fail")
--            if not breakout_ok:
--                reasons.append("pivot_breakout_fail")
-+                reasons.append("breakout_trigger_fail")
-+            return entry_ok, reasons, mode
-+
-+        if mode == "AND":
-+            entry_ok = bool(setup_filters_ok and breakout_trigger_ok)
-+            if not setup_filters_ok:
-+                reasons.append("setup_filters_fail")
-+            if not breakout_trigger_ok:
-+                reasons.append("breakout_trigger_fail")
-             if not entry_ok:
--                reasons.append("require_both_fail")
--            return entry_ok, reasons
-+                reasons.append("require_and_fail")
-+            return entry_ok, reasons, mode
- 
--        entry_ok = bool(pullback_ok or breakout_ok)
-+        entry_ok = bool(setup_filters_ok or breakout_trigger_ok)
-         if not entry_ok:
--            if not pullback_ok:
--                reasons.append("pullback_fail")
--            if not breakout_ok:
--                reasons.append("pivot_breakout_fail")
--            reasons.append("require_either_fail")
--        return entry_ok, reasons
--
--    def _log_entry_gate(self, *, code: str, pullback_ok: bool, breakout_ok: bool, entry_ok: bool) -> None:
-+            if not setup_filters_ok:
-+                reasons.append("setup_filters_fail")
-+            if not breakout_trigger_ok:
-+                reasons.append("breakout_trigger_fail")
-+            reasons.append("require_or_fail")
-+        return entry_ok, reasons, mode
-+
-+    def _log_entry_gate(
++    def _pretrade_check(
 +        self,
 +        *,
 +        code: str,
-+        setup_filters_ok: bool,
-+        breakout_trigger_ok: bool,
-+        entry_ok: bool,
-+        entry_mode: str,
-+        setup_metrics: dict,
-+        trigger_metrics: dict,
-+    ) -> None:
-         if not self.log_entry_gate:
++        market: str | None,
++        mode: int | None,
++        side: str,
++        qty: int | None,
++        price: float | None,
++        client_order_key: str | None,
++        stage: str,
++    ) -> bool:
++        if not self.kis:
++            return False
++        ok, reason = validate_tradeable(self.kis, code)
++        if ok:
++            return True
++        display_code = self._display_code(code)
++        logger.warning("[PB1][PRETRADE][SKIP] code=%s reason=%s stage=%s", display_code, reason, stage)
++        try:
++            self._append_ledger_event(
++                event_type="ORDER_SKIP",
++                code=code,
++                market=market,
++                mode=mode,
++                side=side,
++                qty=qty,
++                price=price,
++                client_order_key=client_order_key,
++                ok=False,
++                reasons=[f"pretrade:{reason}"],
++                stage=stage,
++            )
++        except Exception:
++            logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
++        return False
++
+     def _place_entry(self, cf: CandidateFeature) -> None:
+         display_code = self._display_code(cf.code)
+         logger.info(
+             "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f",
+             display_code,
+             self._code_name_map.get(cf.code),
+             ReasonCode.ENTRY_BREAKOUT,
+             float(cf.features.get("score") or 0.0),
+             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+             float(cf.features.get("stop_price") or 0.0),
+             float(RISK_PER_TRADE_PCT),
+             cf.planned_qty,
+             float(cf.features.get("planned_cap") or 0.0),
+         )
+         reasons = cf.reasons or []
+         features_snapshot = {
+             k: cf.features.get(k)
+             for k in [
+                 "close",
+                 "ma50",
+                 "ma150",
+                 "ma200",
+                 "ma200_slope",
+                 "hi_52w",
+                 "lo_52w",
+@@ -2302,50 +2340,61 @@ class PB1Engine:
+                 price=record_price,
+                 client_order_key=cf.client_order_key,
+                 ok=True,
+                 reasons=["entry"] + (cf.reasons or []),
+                 stage="PB1-CLOSE",
+                 payload_json={"features": cf.features},
+             )
+         except Exception:
+             logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
+             if not self.dry_run:
+                 raise
              return
-+        prefix = "[PB1][ENTRY][SETUP-OK]" if entry_ok else "[PB1][ENTRY][SETUP-BAD]"
+         if self.dry_run:
+             logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
+             logger.info(
+                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                 display_code,
+                 order_id,
+                 cf.planned_qty,
+                 float(limit_price or entry_price or 0.0),
+             )
+             return
+         if not self.kis:
+             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+             return
++        if not self._pretrade_check(
++            code=cf.code,
++            market=cf.market,
++            mode=cf.mode,
++            side="BUY",
++            qty=cf.planned_qty,
++            price=record_price,
++            client_order_key=cf.client_order_key,
++            stage="PB1-CLOSE",
++        ):
++            return
+         emit_event(
+             as_of=self._today,
+             event="ORDER_SUBMIT",
+             side="BUY",
+             code=cf.code,
+             qty=cf.planned_qty,
+             price=float(limit_price or 0.0),
+             order_type=order_type,
+             client_order_key=cf.client_order_key,
+         )
+         resp = None
+         kis_odno = None
+         try:
+             if order_type == "LIMIT":
+                 resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, float(limit_price))
+             else:
+                 resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
+             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+         except Exception:
+             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
+         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+@@ -2489,50 +2538,61 @@ class PB1Engine:
+                 client_order_key=client_key,
+                 request_json={"reasons": ["pyramid_add"], "price": price, "level": pyramid_level + 1},
+                 status="CREATED",
+             )
+         except Exception:
+             logger.exception("[PB1][ADD][DB_FAIL] code=%s", display_code)
+             if not self.dry_run:
+                 raise
+             return
+         if not created:
+             logger.info("[PB1][ADD][SKIP] code=%s reason=duplicate_order", display_code)
+             return
+         if self.dry_run:
+             logger.info("[PB1][ADD-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+             logger.info(
+                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                 display_code,
+                 order_id,
+                 qty,
+                 float(limit_price or price or 0.0),
+             )
+             return
+         if not self.kis:
+             logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
+             return
++        if not self._pretrade_check(
++            code=code,
++            market=pos.get("market"),
++            mode=mode,
++            side="BUY",
++            qty=qty,
++            price=fill_price,
++            client_order_key=client_key,
++            stage="PB1-ADD",
++        ):
++            return
+         emit_event(
+             as_of=self._today,
+             event="ORDER_SUBMIT",
+             side="BUY",
+             code=code,
+             qty=qty,
+             price=float(limit_price),
+             order_type="LIMIT",
+             client_order_key=client_key,
+         )
+         resp = None
+         kis_odno = None
+         try:
+             resp = self.kis.buy_stock_limit(code, qty, float(limit_price))
+             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+         except Exception:
+             logger.exception("[PB1][ADD][FAIL] code=%s", display_code)
+         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
          logger.info(
--            "[PB1][ENTRY_GATE] code=%s pullback_ok=%s breakout_ok=%s entry_mode=%s require_both=%s entry_ok=%s",
-+            "%s code=%s setup_filters_ok=%s breakout_trigger_ok=%s entry_cond_mode=%s should_buy=%s setup_def=%s trigger_def=%s setup_metrics=%s trigger_metrics=%s",
-+            prefix,
-             self._display_code(code),
--            int(bool(pullback_ok)),
--            int(bool(breakout_ok)),
--            self.entry_mode,
--            int(bool(self.entry_require_both)),
-+            int(bool(setup_filters_ok)),
-+            int(bool(breakout_trigger_ok)),
-+            entry_mode,
-             int(bool(entry_ok)),
-+            "trend_template+rs+vcp+liquidity+score_or_pullback_override",
-+            "pivot_breakout+volume",
-+            setup_metrics,
-+            trigger_metrics,
+             "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
+             display_code,
+             kis_odno or order_id,
+             qty,
+             float(limit_price or price or 0.0),
+@@ -2685,50 +2745,61 @@ class PB1Engine:
+                 raise
+             return
+         if not created:
+             logger.info("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=duplicate_order", display_code)
+             return
+         if self.dry_run:
+             logger.info(
+                 "[PB1][CLOSE_ENTRY-DRY] code=%s qty=%s cap=%s key=%s order_id=%s",
+                 display_code,
+                 cf.planned_qty,
+                 cap,
+                 cf.client_order_key,
+                 order_id,
+             )
+             logger.info(
+                 "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                 display_code,
+                 order_id,
+                 cf.planned_qty,
+                 float(cap or 0.0),
+             )
+             return
+         if not self.kis:
+             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
+             return
++        if not self._pretrade_check(
++            code=cf.code,
++            market=cf.market,
++            mode=cf.mode,
++            side="BUY",
++            qty=cf.planned_qty,
++            price=float(cap or 0.0),
++            client_order_key=cf.client_order_key,
++            stage="PB1-CLOSE",
++        ):
++            return
+         emit_event(
+             as_of=self._today,
+             event="ORDER_SUBMIT",
+             side="BUY",
+             code=cf.code,
+             qty=cf.planned_qty,
+             price=float(cap),
+             order_type="LIMIT",
+             client_order_key=cf.client_order_key,
+         )
+         resp = None
+         kis_odno = None
+         try:
+             resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
+             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+         except Exception:
+             logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
+         self.orders_repo.mark_submitted(self.env, cf.client_order_key or "", kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+         emit_event(
+             as_of=self._today,
+             event="ORDER_RESULT",
+@@ -3086,50 +3157,61 @@ class PB1Engine:
+         logger.info(
+             "[PB1][EXIT][WHY] code=%s qty=%s mark=%s avg=%s ret_pct=%.2f exit_reason_codes=%s exit_reason_text=%s holding_days=%s stage=%s",
+             display_code,
+             qty,
+             mark,
+             avg,
+             ret_pct,
+             reasons,
+             ", ".join(reasons),
+             pos.get("holding_days") or 0,
+             stage,
+         )
+         if self.dry_run:
+             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+             logger.info(
+                 "[TRADE][ORDER][SELL] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                 display_code,
+                 order_id,
+                 qty,
+                 float(mark or 0.0),
+             )
+             return
+         if not self.kis:
+             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
+             return
++        if not self._pretrade_check(
++            code=code,
++            market=market,
++            mode=mode,
++            side="SELL",
++            qty=qty,
++            price=float(mark or 0.0),
++            client_order_key=client_key,
++            stage=stage,
++        ):
++            return
+         emit_event(
+             as_of=self._today,
+             event="ORDER_SUBMIT",
+             side="SELL",
+             code=code,
+             qty=qty,
+             price=float(mark),
+             order_type="MARKET",
+             client_order_key=client_key,
+         )
+         resp = None
+         kis_odno = None
+         try:
+             resp = self.kis.sell_stock_market(code, qty)
+             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+         except Exception:
+             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
+         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+         emit_event(
+             as_of=self._today,
+             event="ORDER_RESULT",
+@@ -3306,59 +3388,54 @@ class PB1Engine:
+             logger.info(
+                 "[PB1][CLOSE_CANCEL][WHY] code=%s qty=%s reason_codes=%s reason_text=%s stage=%s",
+                 self._display_code(code),
+                 qty,
+                 ["close_cancel"],
+                 "close_cancel",
+                 row.get("stage") or "PB1-CLOSE",
+             )
+             self.orders_repo.mark_cancelled(self.env, client_key, response_json={"reason": "close_cancel"})
+         return RunResult(
+             status="OK",
+             notes="close_cancel_only",
+             balance_api_calls=self.balance_api_calls,
+             balance_cache_hits=self.balance_cache_hits,
+             balance_tick_cache_hits=self.balance_tick_cache_hits,
          )
  
-     def _log_buyable_gate(self, *, code: str, ok: bool, reasons: list[str]) -> None:
+     def _load_universe(self) -> list[dict]:
+         if self._universe_context is not None:
+             members = list(self._universe_context.members or [])
+             self._universe_as_of = self._universe_context.as_of_date or (
+                 members[0].get("as_of_date") if members else None
+             )
+             self._universe_path = self._universe_context.selected_path
+         else:
+-            today = self._now_kst.date().isoformat()
+-            members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
+-            self._universe_as_of = today if members else None
+-            if not members:
+-                members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
+-                if members:
+-                    self._universe_as_of = members[0].get("as_of_date")
++            members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
++            self._universe_as_of = members[0].get("as_of_date") if members else None
+         self._code_name_map = {
+-            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
++            str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
+             for m in members or []
+             if m.get("code")
+         }
+         return members
+ 
+     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
+         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
+         marks = self._fetch_marks([p["code"] for p in positions], fallback)
+         totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+         for pos in positions:
+             qty = pos.get("qty") or 0
+             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
+             market_value = float(mark) * qty
+             cost = float(pos.get("total_cost") or 0.0)
+             totals["market_value"] += market_value
+             totals["cost"] += cost
+             totals["realized"] += float(pos.get("realized_pnl") or 0.0)
+             totals["unrealized"] += market_value - cost
+ 
+         summary_mv = None
+         for key in EVAL_KEYS:
+             summary_mv = self._to_float(self._holdings_summary.get(key))
+             if summary_mv is not None:
+                 break
+         summary_cash = None
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 4bb9c0281ea4b740180264ab7b4c7f3fad07554d..9815c7a81017f98d3c47b8d558e247673c9155a2 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -725,57 +725,57 @@ def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt
+ 
+ def _log_balance_cache(force: bool) -> None:
+     logger.info("[BALANCE][CACHE] hit=%s", not force)
+ 
+ 
+ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
+     token_ok = balance_ok = universe_ok = pretrade_ok = False
+     kis: KisAPI | None = None
+     members: list[dict] = []
+     try:
+         kis = KisAPI()
+         token_ok = True
+     except Exception as exc:
+         logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
+ 
+     if kis:
+         try:
+             _log_balance_cache(force=True)
+             snap = kis.get_balance_cached(force=True)
+             balance_ok = bool(snap)
+         except Exception:
+             logger.exception("[SMOKE][FAIL] balance")
+ 
+     repo = UniverseRepo(engine)
+     try:
+-        members = repo.get_latest_universe_members(kis_env, "best_k_meta")
++        members = repo.get_current_universe_members(kis_env, "best_k_meta")
+         if not members:
+             if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
+                 from trader.universe import build as universe_build
+ 
+                 universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
+-                members = repo.get_latest_universe_members(kis_env, "best_k_meta")
++                members = repo.get_current_universe_members(kis_env, "best_k_meta")
+             else:
+                 logger.info("[UNIVERSE][SKIP] forbidden during trade path")
+         universe_ok = bool(members)
+     except Exception:
+         logger.exception("[SMOKE][FAIL] universe")
+ 
+     if kis:
+         try:
+             code = members[0]["code"] if members else "005930"
+             quote = kis.get_price_quote(code, diag_mode=True, attempts=1)
+             pretrade_ok = bool(quote)
+         except Exception:
+             logger.exception("[SMOKE][FAIL] pretrade")
+ 
+     status = token_ok and balance_ok and universe_ok and pretrade_ok
+     if status:
          logger.info(
-             "[PB1][BUYABLE_GATE] code=%s ok=%s reasons=%s",
-             self._display_code(code),
-             int(bool(ok)),
-             reasons or ["ok"],
+             "[SMOKE][PASS] token=%s balance=%s universe=%s pretrade=%s",
+             token_ok,
+             balance_ok,
+             universe_ok,
+             pretrade_ok,
+         )
+     else:
+         logger.warning(
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index e9be1a35076ac6cf50a9bc625eba0f77d9a3eef0..b6995781c7cd0d317d8aa4d5c891340281a93bf2 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -3,50 +3,51 @@ from __future__ import annotations
+ import argparse
+ import csv
+ import json
+ import logging
+ import os
+ import re
+ from pathlib import Path
+ from typing import Iterable
+ 
+ 
+ from trader.config import (
+     PB1_MIN_CANDLES,
+ )
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.time_utils import now_kst
+ from trader.universe.capabilities import providers_for_env
+ from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
+ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
+ from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+ from trader.universe.providers.lkg_provider import LKGProvider
+ from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
++from trader.universe.validation import validate_listed_and_tradeable
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+ from trader.runtime_store import RuntimeStore
+ 
+ from datetime import date
+ 
+ 
+ def _parse_as_of_date(val: str) -> date | None:
+     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+     from datetime import datetime as _datetime
+ 
+     if not val:
+         return None
+     s = str(val).strip()
+     try:
+         if "-" in s:
+             return _datetime.fromisoformat(s).date()
+         if len(s) == 8 and s.isdigit():
+             return _datetime.strptime(s, "%Y%m%d").date()
+         return _datetime.fromisoformat(s).date()
+     except Exception:
+         return None
+ 
+ 
+ def _prefer_provider_order(chain: list[str]) -> list[str]:
+     """Prefer live providers first, then static, then caches."""
+@@ -121,50 +122,70 @@ def _build_members_from_payload(selected_by_market: dict | None) -> list[dict]:
+             code = str(row.get("code") or row.get("pdno") or "").zfill(6)
+             if not code:
+                 continue
+             members.append(
+                 {
+                     "code": code,
+                     "market": market,
+                     "weight": row.get("weight") or row.get("target_weight") or row.get("weight_pct"),
+                     "rank": row.get("rank") or idx + 1,
+                     "meta_json": row,
+                 }
+             )
+     return members
+ 
+ 
+ def _dedup(seq: Iterable[str]) -> list[str]:
+     seen: set[str] = set()
+     uniq: list[str] = []
+     for val in seq:
+         if val not in seen:
+             seen.add(val)
+             uniq.append(val)
+     return uniq
+ 
+ 
++def _filter_tradeable_members(
++    members: list[dict],
++    *,
++    kis: KisAPI | None,
++) -> tuple[list[dict], list[dict]]:
++    if not kis:
++        logger.warning("[UNIVERSE][TRADEABLE][SKIP] kis_unavailable=1")
++        return members, []
++    kept: list[dict] = []
++    dropped: list[dict] = []
++    for member in members:
++        code = str(member.get("code") or "").zfill(6)
++        ok, reason = validate_listed_and_tradeable(kis, code)
++        if ok:
++            kept.append(member)
++            continue
++        dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
++    return kept, dropped
++
++
+ 
+ 
+ def _load_seed_rows(path: Path) -> list[dict]:
+     if not path.exists():
+         return []
+     rows: list[dict] = []
+     try:
+         with path.open(encoding="utf-8") as f:
+             # CSV with header: code,name
+             reader = csv.DictReader(f)
+             has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
+             if has_code_header:
+                 for row in reader:
+                     code = str(row.get("code") or "").strip()
+                     if not code:
+                         continue
+                     rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+             else:
+                 f.seek(0)
+                 for line in f:
+                     code = line.strip()
+                     if code:
+                         rows.append({"code": code.zfill(6), "name": None})
+     except Exception:
+         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
+@@ -635,63 +656,83 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
+     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
+     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
+     members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
+     logger.info(
+         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
+         stats["total_raw"],
+         stats["invalid_format"],
+         stats["insufficient_history"],
+         stats["final"],
+     )
+     invalid_codes = sanitize_detail.get("invalid_format_codes") or []
+     insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
+     if invalid_codes:
+         logger.info(
+             "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
+             len(invalid_codes),
+             invalid_codes[: min(5, len(invalid_codes))],
+         )
+     if insufficient_codes:
+         logger.info(
+             "[UNIVERSE][DROP] reason=insufficient_history count=%s sample=%s",
+             len(insufficient_codes),
+             insufficient_codes[: min(5, len(insufficient_codes))],
          )
  
-     def _append_ledger_event(
-         self,
-         *,
-         event_type: str,
-         code: str | None,
-         market: str | None,
-         mode: int | None,
-         side: str | None,
-         qty: int | None,
-         price: float | None,
-         client_order_key: str | None,
-         ok: bool,
-         reasons: list[str] | None,
-         stage: str | None,
-         payload_json: dict | None = None,
-@@ -3958,60 +3974,82 @@ class PB1Engine:
-                         entry_allowed=entry_allowed,
-                         entry_reason=entry_reason,
-                     )
-                     continue
-                 if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
-                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_intraday_only", cf.code)
-                     self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_intraday_only"])
-                     self._log_order_skip(cf, ["entry_mode_intraday_only"], "PB1-CLOSE")
-                     self._emit_buy_decision(
-                         cf,
-                         order_value=order_value,
-                         reasons=["entry_mode_intraday_only"],
-                         entry_allowed=entry_allowed,
-                         entry_reason=entry_reason,
-                     )
-                     continue
-                 self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
-                 last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
-                 last_volume = float(cf.features.get("last_volume") or 0.0)
-                 trigger_ok, trigger_info = entry_trigger(
-                     cf.features,
-                     last_price=last_price,
-                     last_volume=last_volume,
-                     cfg=self.minervini_config,
-                 )
--                pullback_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
--                entry_ok, entry_reasons = self._entry_gate(
--                    pullback_ok=pullback_ok,
--                    breakout_ok=trigger_ok,
-+                setup_filters_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
-+                entry_ok, entry_reasons, entry_mode = self._entry_gate(
-+                    setup_filters_ok=setup_filters_ok,
-+                    breakout_trigger_ok=trigger_ok,
-                 )
-                 self._log_entry_gate(
-                     code=cf.code,
--                    pullback_ok=pullback_ok,
--                    breakout_ok=trigger_ok,
-+                    setup_filters_ok=setup_filters_ok,
-+                    breakout_trigger_ok=trigger_ok,
-                     entry_ok=entry_ok,
-+                    entry_mode=entry_mode,
-+                    setup_metrics={
-+                        "close": cf.features.get("close"),
-+                        "ma50": cf.features.get("ma50"),
-+                        "ma150": cf.features.get("ma150"),
-+                        "ma200": cf.features.get("ma200"),
-+                        "ma200_slope": cf.features.get("ma200_slope"),
-+                        "rs_percentile": cf.features.get("rs_percentile"),
-+                        "dollar_vol_50": cf.features.get("dollar_vol_50"),
-+                        "vcp_ok": cf.features.get("vcp_ok"),
-+                        "score": cf.features.get("score"),
-+                    },
-+                    trigger_metrics={
-+                        "last_price": last_price,
-+                        "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
-+                        "trigger": trigger_info.get("trigger"),
-+                        "max_chase": trigger_info.get("max_chase"),
-+                        "last_volume": last_volume,
-+                        "vol20": trigger_info.get("vol20", cf.features.get("vol20")),
-+                        "vol_ok": trigger_info.get("vol_ok"),
-+                        "reason": trigger_info.get("reason"),
-+                    },
-                 )
-                 if not entry_ok:
-                     if not trigger_ok:
-                         cf.features["entry_trigger"] = trigger_info
-                     for reason in entry_reasons:
-                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
-                     self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
-                     self._emit_buy_decision(
-                         cf,
-                         order_value=order_value,
-                         reasons=entry_reasons or ["entry_gate_fail"],
-                         entry_allowed=entry_allowed,
-                         entry_reason=entry_reason,
-                     )
-                     continue
-                 df, _ = self._fetch_daily(cf.code, count=260)
-                 if df.empty:
-                     self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
-                     self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
-                     self._emit_buy_decision(
-                         cf,
-                         order_value=order_value,
-                         reasons=["stop_calc_fail"],
-                         entry_allowed=entry_allowed,
-                         entry_reason=entry_reason,
++    validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
++    kis_validator: KisAPI | None = None
++    if validate_kis:
++        try:
++            kis_validator = kis_provider.kis if kis_provider else KisAPI(env=env)
++        except Exception as exc:
++            logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
++            kis_validator = None
++    if validate_kis:
++        members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
++        if dropped_tradeable:
++            stats["not_tradeable"] = len(dropped_tradeable)
++            sanitize_detail["dropped"].extend(dropped_tradeable)
++            sanitize_detail["kept"] = [m.get("code") for m in members]
++            logger.info(
++                "[UNIVERSE][DROP] reason=not_tradeable count=%s sample=%s",
++                len(dropped_tradeable),
++                dropped_tradeable[: min(5, len(dropped_tradeable))],
++            )
++
+     if not members:
+         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
+         raise RuntimeError("universe_members_empty")
+ 
+-    repo.store_universe(
++    repo.store_universe_snapshot(
+         env=env,
+         strategy=strategy,
+         as_of_date=as_of_date,
+-        source=source,
+-        params_json=params,
+-        payload_json=payload or {},
++        provider=source,
+         members=members,
++        reason=last_reason,
+     )
++    repo.cleanup_old_runs(retain_days=int(os.getenv("UNIVERSE_RETENTION_DAYS", "30")))
+     logger.info(
+         "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",
+         env,
+         strategy,
+         as_of_date,
+         len(members),
+         source,
+         last_reason or "n/a",
+     )
+     _write_runtime_universe(
+         runtime_store=runtime_store,
+         as_of_date=as_of_date,
+         env=env,
+         strategy=strategy,
+         payload=payload,
+         members=members,
+         source=source,
+         params=params,
+     )
+     _write_universe_sanitize_report(
+         as_of_date=as_of_date,
+         keep_codes=sanitize_detail.get("kept") or [],
+         dropped=sanitize_detail.get("dropped") or [],
+     )
+     _write_universe_drop_diagnostics(
+diff --git a/trader/universe/validation.py b/trader/universe/validation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b0711e332a636514113208ec6d2aa6bbf3a5645
+--- /dev/null
++++ b/trader/universe/validation.py
+@@ -0,0 +1,65 @@
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++from trader.kis_wrapper import KisAPI
++
++logger = logging.getLogger(__name__)
++
++_TRADE_BLOCK_KEYS = (
++    "trht_yn",
++    "trht",
++    "trading_halt",
++    "trade_halt",
++    "trade_stop_yn",
++    "halted",
++)
++
++
++def _is_truthy(value: Any) -> bool:
++    if isinstance(value, bool):
++        return value
++    if value is None:
++        return False
++    return str(value).strip().lower() in {"y", "yes", "true", "1"}
++
++
++def _extract_price(quote: dict) -> float:
++    raw = quote.get("raw") if isinstance(quote, dict) else None
++    price = (
++        quote.get("prpr")
++        or quote.get("stck_prpr")
++        or quote.get("last")
++        or (raw.get("stck_prpr") if isinstance(raw, dict) else None)
++    )
++    try:
++        return float(price)
++    except Exception:
++        return 0.0
++
++
++def validate_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
++    if not code:
++        return False, "missing_code"
++    code = str(code).zfill(6)
++    try:
++        quote = kis.get_quote_safe(code, diag_mode=True)
++    except Exception as exc:  # pragma: no cover - external failure
++        return False, f"quote_fail:{exc}"
++    if not isinstance(quote, dict):
++        return False, "quote_missing"
++    rt_cd = quote.get("rt_cd")
++    if rt_cd is not None and str(rt_cd) != "0":
++        return False, f"rt_cd_{rt_cd}"
++    raw = quote.get("raw") if isinstance(quote, dict) else None
++    for key in _TRADE_BLOCK_KEYS:
++        if _is_truthy(quote.get(key)) or (isinstance(raw, dict) and _is_truthy(raw.get(key))):
++            return False, f"halted:{key}"
++    if _extract_price(quote) <= 0:
++        return False, "price_unavailable"
++    return True, "ok"
++
++
++def validate_listed_and_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
++    return validate_tradeable(kis, code)

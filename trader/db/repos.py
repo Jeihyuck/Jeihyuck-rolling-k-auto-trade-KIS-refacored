@@ -19,8 +19,9 @@ from .schema import (
     ORDERS,
     POSITIONS,
     RUNS,
-    UNIVERSE,
     UNIVERSE_MEMBERS,
+    UNIVERSE_CURRENT,
+    UNIVERSE_RUNS,
     schema_for_engine,
     uuid_value_for_url,
 )
@@ -141,153 +142,137 @@ class UniverseRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
-    def _fetch_members_for_universe(self, universe_id: str) -> list[dict]:
+    def _strategy_key(self, env: str, strategy: str) -> str:
+        return f"{env}:{strategy}"
+
+    def _fetch_members_for_run(self, run_id: str, *, env: str, strategy: str) -> list[dict]:
         stmt = (
             select(
-                self._schema.universe_members.c.code,
+                self._schema.universe_members.c.stock_code,
+                self._schema.universe_members.c.name,
                 self._schema.universe_members.c.market,
-                self._schema.universe_members.c.weight,
                 self._schema.universe_members.c.rank,
-                self._schema.universe_members.c.meta_json,
-                self._schema.universe.c.as_of_date,
-                self._schema.universe.c.strategy,
-                self._schema.universe.c.env,
+                self._schema.universe_members.c.market_cap,
+                self._schema.universe_members.c.reason,
+                self._schema.universe_runs.c.as_of,
+                self._schema.universe_runs.c.provider,
             )
             .select_from(
                 self._schema.universe_members.join(
-                    self._schema.universe, self._schema.universe_members.c.universe_id == self._schema.universe.c.universe_id
+                    self._schema.universe_runs,
+                    self._schema.universe_members.c.run_id == self._schema.universe_runs.c.run_id,
                 )
             )
-            .where(self._schema.universe_members.c.universe_id == universe_id)
-            .order_by(self._schema.universe_members.c.rank.nullsfirst(), self._schema.universe_members.c.universe_member_id)
+            .where(self._schema.universe_members.c.run_id == run_id)
+            .order_by(self._schema.universe_members.c.rank.nullsfirst())
         )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
-            return [dict(row) for row in rows]
+            results: list[dict] = []
+            for row in rows:
+                payload = dict(row)
+                payload["code"] = payload.pop("stock_code")
+                payload["as_of_date"] = payload.pop("as_of")
+                payload["env"] = env
+                payload["strategy"] = strategy
+                results.append(payload)
+            return results
 
-    def get_universe_members(self, env: str, strategy: str, as_of_date: str) -> list[dict]:
-        stmt = (
-            select(self._schema.universe.c.universe_id)
-            .where(
-                and_(
-                    self._schema.universe.c.env == env,
-                    self._schema.universe.c.strategy == strategy,
-                    self._schema.universe.c.as_of_date == as_of_date,
-                )
-            )
-            .order_by(self._schema.universe.c.created_at.desc())
-            .limit(1)
-        )
+    def get_current_universe_members(self, env: str, strategy: str) -> list[dict]:
+        strategy_key = self._strategy_key(env, strategy)
+        stmt = select(self._schema.universe_current.c.run_id).where(self._schema.universe_current.c.strategy == strategy_key)
         with self.engine.begin() as conn:
-            universe_id = conn.execute(stmt).scalar()
-        if not universe_id:
+            run_id = conn.execute(stmt).scalar()
+        if not run_id:
             return []
-        return self._fetch_members_for_universe(str(universe_id))
+        return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
 
-    def get_latest_universe_members(self, env: str, strategy: str) -> list[dict]:
-        stmt = (
-            select(self._schema.universe.c.universe_id)
-            .where(and_(self._schema.universe.c.env == env, self._schema.universe.c.strategy == strategy))
-            .order_by(self._schema.universe.c.as_of_date.desc(), self._schema.universe.c.created_at.desc())
-            .limit(1)
-        )
-        with self.engine.begin() as conn:
-            universe_id = conn.execute(stmt).scalar()
-        if not universe_id:
-            return []
-        return self._fetch_members_for_universe(str(universe_id))
-
-    def get_latest_universe(
-        self, env: str, strategy: str, *, max_age_days: int = 10
-    ) -> tuple[dict, list[dict]] | None:
-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-        stmt = (
-            select(self._schema.universe)
-            .where(
-                and_(
-                    self._schema.universe.c.env == env,
-                    self._schema.universe.c.strategy == strategy,
-                    self._schema.universe.c.created_at >= cutoff,
-                )
-            )
-            .order_by(self._schema.universe.c.created_at.desc())
-            .limit(1)
-        )
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-        if not row:
-            return None
-        universe_id = str(row.get("universe_id"))
-        return dict(row), self._fetch_members_for_universe(universe_id)
-
-    def store_universe(
+    def store_universe_snapshot(
         self,
+        *,
         env: str,
         strategy: str,
         as_of_date: str,
-        source: str,
-        params_json: dict,
-        payload_json: dict,
+        provider: str,
         members: Iterable[dict],
+        reason: str | None = None,
     ) -> str | None:
         members_list = list(members)
         db_url = str(self.engine.url)
-        values = {
-            "universe_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-            "env": env,
-            "strategy": strategy,
-            "as_of_date": as_of_date,
-            "source": source,
-            "params_json": params_json or {},
-            "payload_json": payload_json or {},
-        }
+        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+        strategy_key = self._strategy_key(env, strategy)
         try:
             with self.engine.begin() as conn:
                 existing = conn.execute(
-                    select(self._schema.universe.c.universe_id).where(
+                    select(self._schema.universe_runs.c.run_id).where(
                         and_(
-                            self._schema.universe.c.env == env,
-                            self._schema.universe.c.strategy == strategy,
-                            self._schema.universe.c.as_of_date == as_of_date,
+                            self._schema.universe_runs.c.strategy == strategy_key,
+                            self._schema.universe_runs.c.provider == provider,
+                            self._schema.universe_runs.c.as_of == as_of_date,
                         )
                     )
                 ).scalar()
-                universe_id = existing or values["universe_id"]
                 if existing:
-                    conn.execute(
-                        sa.update(self._schema.universe)
-                        .where(self._schema.universe.c.universe_id == existing)
-                        .values(source=source, params_json=params_json or {}, payload_json=payload_json or {}, created_at=func.now()),
+                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                conn.execute(
+                    sa.insert(self._schema.universe_runs).values(
+                        run_id=run_id,
+                        strategy=strategy_key,
+                        provider=provider,
+                        as_of=as_of_date,
+                        created_ts=now_kst().isoformat(),
                     )
-                    conn.execute(
-                        sa.delete(self._schema.universe_members).where(self._schema.universe_members.c.universe_id == existing)
-                    )
-                else:
-                    res = conn.execute(
-                        sa.insert(self._schema.universe)
-                        .values(**values)
-                        .returning(self._schema.universe.c.universe_id)
-                    )
-                    universe_id = res.scalar() or universe_id
-                fk_universe_id = uuid_value_for_url(db_url, universe_id)
-                for rank, m in enumerate(members_list, start=1):
+                )
+                for rank, member in enumerate(members_list, start=1):
+                    meta = member.get("meta_json") or {}
                     conn.execute(
                         sa.insert(self._schema.universe_members).values(
-                            universe_member_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-                            universe_id=fk_universe_id,
-                            code=str(m.get("code") or "").zfill(6),
-                            market=m.get("market"),
-                            weight=m.get("weight"),
-                            rank=m.get("rank") if m.get("rank") is not None else rank,
-                            meta_json=m.get("meta_json") or {},
+                            run_id=uuid_value_for_url(db_url, run_id),
+                            stock_code=str(member.get("code") or "").zfill(6),
+                            name=member.get("name") or meta.get("name"),
+                            market=member.get("market"),
+                            rank=member.get("rank") if member.get("rank") is not None else rank,
+                            market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
+                            reason=member.get("reason") or reason,
                         )
                     )
-            return str(universe_id)
+                if self.engine.dialect.name == "postgresql":
+                    insert_stmt = pg_insert(self._schema.universe_current).values(
+                        strategy=strategy_key,
+                        run_id=uuid_value_for_url(db_url, run_id),
+                        updated_ts=now_kst().isoformat(),
+                    )
+                else:
+                    insert_stmt = sqlite_insert(self._schema.universe_current).values(
+                        strategy=strategy_key,
+                        run_id=uuid_value_for_url(db_url, run_id),
+                        updated_ts=now_kst().isoformat(),
+                    )
+                conn.execute(
+                    insert_stmt.on_conflict_do_update(
+                        index_elements=[self._schema.universe_current.c.strategy],
+                        set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
+                    )
+                )
+            return str(run_id)
         except Exception:
             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
             if ALLOW_UNIVERSE_DB_FAIL:
                 return None
             raise
+
+    def cleanup_old_runs(self, *, retain_days: int = 30) -> None:
+        cutoff = (now_kst() - timedelta(days=retain_days)).isoformat()
+        with self.engine.begin() as conn:
+            current_runs = select(self._schema.universe_current.c.run_id)
+            conn.execute(
+                sa.delete(self._schema.universe_runs).where(
+                    and_(
+                        self._schema.universe_runs.c.created_ts < cutoff,
+                        self._schema.universe_runs.c.run_id.not_in(current_runs),
+                    )
+                )
+            )
 
 
 class OrdersRepo:

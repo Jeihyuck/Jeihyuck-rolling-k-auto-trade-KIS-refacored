@@ -33,8 +33,9 @@ class SchemaTables:
     database_url: str
     metadata: sa.MetaData
     runs: sa.Table
-    universe: sa.Table
+    universe_runs: sa.Table
     universe_members: sa.Table
+    universe_current: sa.Table
     orders: sa.Table
     fills: sa.Table
     positions: sa.Table
@@ -72,29 +73,36 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("notes", sa.Text),
     )
 
-    universe = sa.Table(
-        "universe",
+    universe_runs = sa.Table(
+        "universe_runs",
         metadata,
-        uuid_col("universe_id", primary_key=True),
-        sa.Column("env", sa.String, nullable=False),
         sa.Column("strategy", sa.String, nullable=False),
-        sa.Column("as_of_date", sa.String, nullable=False),
-        sa.Column("source", sa.String, nullable=False),
-        sa.Column("params_json", sa.JSON, nullable=False, default=dict),
-        sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("provider", sa.String, nullable=False),
+        sa.Column("as_of", sa.Date, nullable=False),
+        sa.Column("created_ts", sa.Text, nullable=False),
+        uuid_col("run_id", primary_key=True),
+        sa.UniqueConstraint("strategy", "provider", "as_of", name="ux_universe_runs_key"),
     )
 
     universe_members = sa.Table(
         "universe_members",
         metadata,
-        uuid_col("universe_member_id", primary_key=True),
-        sa.Column("universe_id", uuid_type, sa.ForeignKey("universe.universe_id"), nullable=False),
-        sa.Column("code", sa.String, nullable=False),
+        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
+        sa.Column("stock_code", sa.String, nullable=False),
+        sa.Column("name", sa.String),
         sa.Column("market", sa.String),
-        sa.Column("weight", sa.Float),
         sa.Column("rank", sa.Integer),
-        sa.Column("meta_json", sa.JSON, nullable=False, default=dict),
+        sa.Column("market_cap", sa.Float),
+        sa.Column("reason", sa.String),
+        sa.PrimaryKeyConstraint("run_id", "stock_code"),
+    )
+
+    universe_current = sa.Table(
+        "universe_current",
+        metadata,
+        sa.Column("strategy", sa.String, primary_key=True),
+        sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
+        sa.Column("updated_ts", sa.Text, nullable=False),
     )
 
     orders = sa.Table(
@@ -245,8 +253,9 @@ def _build_schema(database_url: str) -> SchemaTables:
         database_url=database_url,
         metadata=metadata,
         runs=runs,
-        universe=universe,
+        universe_runs=universe_runs,
         universe_members=universe_members,
+        universe_current=universe_current,
         orders=orders,
         fills=fills,
         positions=positions,
@@ -280,8 +289,9 @@ DEFAULT_SCHEMA = schema_for_url(DEFAULT_DATABASE_URL)
 
 METADATA = DEFAULT_SCHEMA.metadata
 RUNS = DEFAULT_SCHEMA.runs
-UNIVERSE = DEFAULT_SCHEMA.universe
+UNIVERSE_RUNS = DEFAULT_SCHEMA.universe_runs
 UNIVERSE_MEMBERS = DEFAULT_SCHEMA.universe_members
+UNIVERSE_CURRENT = DEFAULT_SCHEMA.universe_current
 ORDERS = DEFAULT_SCHEMA.orders
 FILLS = DEFAULT_SCHEMA.fills
 POSITIONS = DEFAULT_SCHEMA.positions

@@ -11,6 +11,7 @@ def reset_env(tmp_path, monkeypatch):
     db_url = f"sqlite:///{tmp_path}/test.db"
     monkeypatch.setenv("DATABASE_URL", db_url)
     monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
+    monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
     yield
 
 

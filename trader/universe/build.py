@@ -25,6 +25,7 @@ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.providers.sqlite_cache_provider import SQLiteCacheProvider
+from trader.universe.validation import validate_listed_and_tradeable
 from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
 from trader.runtime_store import RuntimeStore
 
@@ -141,6 +142,26 @@ def _dedup(seq: Iterable[str]) -> list[str]:
             seen.add(val)
             uniq.append(val)
     return uniq
+
+
+def _filter_tradeable_members(
+    members: list[dict],
+    *,
+    kis: KisAPI | None,
+) -> tuple[list[dict], list[dict]]:
+    if not kis:
+        logger.warning("[UNIVERSE][TRADEABLE][SKIP] kis_unavailable=1")
+        return members, []
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for member in members:
+        code = str(member.get("code") or "").zfill(6)
+        ok, reason = validate_listed_and_tradeable(kis, code)
+        if ok:
+            kept.append(member)
+            continue
+        dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
+    return kept, dropped
 
 
 
@@ -657,19 +678,39 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             insufficient_codes[: min(5, len(insufficient_codes))],
         )
 
+    validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
+    kis_validator: KisAPI | None = None
+    if validate_kis:
+        try:
+            kis_validator = kis_provider.kis if kis_provider else KisAPI(env=env)
+        except Exception as exc:
+            logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
+            kis_validator = None
+    if validate_kis:
+        members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
+        if dropped_tradeable:
+            stats["not_tradeable"] = len(dropped_tradeable)
+            sanitize_detail["dropped"].extend(dropped_tradeable)
+            sanitize_detail["kept"] = [m.get("code") for m in members]
+            logger.info(
+                "[UNIVERSE][DROP] reason=not_tradeable count=%s sample=%s",
+                len(dropped_tradeable),
+                dropped_tradeable[: min(5, len(dropped_tradeable))],
+            )
+
     if not members:
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         raise RuntimeError("universe_members_empty")
 
-    repo.store_universe(
+    repo.store_universe_snapshot(
         env=env,
         strategy=strategy,
         as_of_date=as_of_date,
-        source=source,
-        params_json=params,
-        payload_json=payload or {},
+        provider=source,
         members=members,
+        reason=last_reason,
     )
+    repo.cleanup_old_runs(retain_days=int(os.getenv("UNIVERSE_RETENTION_DAYS", "30")))
     logger.info(
         "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",
         env,

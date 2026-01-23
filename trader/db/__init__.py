@@ -10,8 +10,9 @@ from .schema import (
     ORDERS,
     POSITIONS,
     RUNS,
-    UNIVERSE,
+    UNIVERSE_CURRENT,
     UNIVERSE_MEMBERS,
+    UNIVERSE_RUNS,
     METADATA,
 )
 
@@ -33,7 +34,8 @@ __all__ = [
     "ORDERS",
     "POSITIONS",
     "RUNS",
-    "UNIVERSE",
+    "UNIVERSE_CURRENT",
     "UNIVERSE_MEMBERS",
+    "UNIVERSE_RUNS",
     "METADATA",
 ]

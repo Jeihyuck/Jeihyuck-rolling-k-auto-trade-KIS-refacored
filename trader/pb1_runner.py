@@ -747,13 +747,13 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
 
     repo = UniverseRepo(engine)
     try:
-        members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+        members = repo.get_current_universe_members(kis_env, "best_k_meta")
         if not members:
             if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
                 from trader.universe import build as universe_build
 
                 universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
-                members = repo.get_latest_universe_members(kis_env, "best_k_meta")
+                members = repo.get_current_universe_members(kis_env, "best_k_meta")
             else:
                 logger.info("[UNIVERSE][SKIP] forbidden during trade path")
         universe_ok = bool(members)

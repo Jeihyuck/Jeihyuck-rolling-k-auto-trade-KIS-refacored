@@ -104,6 +104,7 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.ledger.store import LedgerStore
+from trader.universe.validation import validate_tradeable
 from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
 from trader.factors.regime import get_regime, risk_multiplier
 from trader.factors.rs_rank import rank_rs
@@ -2196,6 +2197,43 @@ class PB1Engine:
             return True
         return self.orders_repo.has_client_order_key(self.env, client_order_key)
 
+    def _pretrade_check(
+        self,
+        *,
+        code: str,
+        market: str | None,
+        mode: int | None,
+        side: str,
+        qty: int | None,
+        price: float | None,
+        client_order_key: str | None,
+        stage: str,
+    ) -> bool:
+        if not self.kis:
+            return False
+        ok, reason = validate_tradeable(self.kis, code)
+        if ok:
+            return True
+        display_code = self._display_code(code)
+        logger.warning("[PB1][PRETRADE][SKIP] code=%s reason=%s stage=%s", display_code, reason, stage)
+        try:
+            self._append_ledger_event(
+                event_type="ORDER_SKIP",
+                code=code,
+                market=market,
+                mode=mode,
+                side=side,
+                qty=qty,
+                price=price,
+                client_order_key=client_order_key,
+                ok=False,
+                reasons=[f"pretrade:{reason}"],
+                stage=stage,
+            )
+        except Exception:
+            logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
+        return False
+
     def _place_entry(self, cf: CandidateFeature) -> None:
         display_code = self._display_code(cf.code)
         logger.info(
@@ -2323,6 +2361,17 @@ class PB1Engine:
             return
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+            return
+        if not self._pretrade_check(
+            code=cf.code,
+            market=cf.market,
+            mode=cf.mode,
+            side="BUY",
+            qty=cf.planned_qty,
+            price=record_price,
+            client_order_key=cf.client_order_key,
+            stage="PB1-CLOSE",
+        ):
             return
         emit_event(
             as_of=self._today,
@@ -2510,6 +2559,17 @@ class PB1Engine:
             return
         if not self.kis:
             logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
+            return
+        if not self._pretrade_check(
+            code=code,
+            market=pos.get("market"),
+            mode=mode,
+            side="BUY",
+            qty=qty,
+            price=fill_price,
+            client_order_key=client_key,
+            stage="PB1-ADD",
+        ):
             return
         emit_event(
             as_of=self._today,
@@ -2706,6 +2766,17 @@ class PB1Engine:
             return
         if not self.kis:
             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
+            return
+        if not self._pretrade_check(
+            code=cf.code,
+            market=cf.market,
+            mode=cf.mode,
+            side="BUY",
+            qty=cf.planned_qty,
+            price=float(cap or 0.0),
+            client_order_key=cf.client_order_key,
+            stage="PB1-CLOSE",
+        ):
             return
         emit_event(
             as_of=self._today,
@@ -3108,6 +3179,17 @@ class PB1Engine:
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
             return
+        if not self._pretrade_check(
+            code=code,
+            market=market,
+            mode=mode,
+            side="SELL",
+            qty=qty,
+            price=float(mark or 0.0),
+            client_order_key=client_key,
+            stage=stage,
+        ):
+            return
         emit_event(
             as_of=self._today,
             event="ORDER_SUBMIT",
@@ -3328,15 +3410,10 @@ class PB1Engine:
             )
             self._universe_path = self._universe_context.selected_path
         else:
-            today = self._now_kst.date().isoformat()
-            members = self.universe_repo.get_universe_members(self.env, self.UNIVERSE_STRATEGY, today)
-            self._universe_as_of = today if members else None
-            if not members:
-                members = self.universe_repo.get_latest_universe_members(self.env, self.UNIVERSE_STRATEGY)
-                if members:
-                    self._universe_as_of = members[0].get("as_of_date")
+            members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
+            self._universe_as_of = members[0].get("as_of_date") if members else None
         self._code_name_map = {
-            str(m.get("code") or "").zfill(6): (m.get("meta_json") or {}).get("name")
+            str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
             for m in members or []
             if m.get("code")
         }
