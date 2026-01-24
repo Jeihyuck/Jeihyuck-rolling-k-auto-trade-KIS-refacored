@@ -261,16 +261,25 @@ jobs:
           print("[VERIFY] lkg members=", len(data.get("members", [])))
           PY
 
-      - name: Assert no repo/bot_state usage
+      - name: Assert SSOT (no repo/bot_state exists)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-            echo "ERROR: repo/bot_state path detected. SSOT violated."
+          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
+          # SSOT intent: ensure repo does not contain an actual bot_state directory.
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "ERROR: repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
-          echo "OK: no repo/bot_state usage."
+          # additionally fail if tracked by git (defensive)
+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+            echo "ERROR: repo contains tracked bot_state. SSOT violated."
+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+            exit 1
+          fi
+          echo "OK: SSOT holds (no repo/bot_state)."
 
   trade_tick:
     runs-on: ubuntu-latest
@@ -556,8 +565,8 @@ jobs:
           else
             echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
             echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=false"
-          fi  
-          
+          fi
+
       - name: Verify hard reset markers (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
         run: |
@@ -606,16 +615,24 @@ jobs:
           git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
           git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
 
-      - name: Assert no repo/bot_state usage
+      - name: Assert SSOT (no repo/bot_state exists)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-            echo "ERROR: repo/bot_state path detected. SSOT violated."
+          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
+          # SSOT intent: ensure repo does not contain an actual bot_state directory.
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "ERROR: repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
-          echo "OK: no repo/bot_state usage."
+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+            echo "ERROR: repo contains tracked bot_state. SSOT violated."
+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+            exit 1
+          fi
+          echo "OK: SSOT holds (no repo/bot_state)."
 
   close_cancel:
     runs-on: ubuntu-latest
@@ -798,16 +815,21 @@ jobs:
             exit 1
           fi
 
-      - name: Assert no repo/bot_state usage
+      - name: Assert SSOT (no repo/bot_state exists)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-            echo "ERROR: repo/bot_state path detected. SSOT violated."
+          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
+          # SSOT intent: ensure repo does not contain an actual bot_state directory.
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "ERROR: repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
-          echo "OK: no repo/bot_state usage."
-
-
-          
+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+            echo "ERROR: repo contains tracked bot_state. SSOT violated."
+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+            exit 1
+          fi
+          echo "OK: SSOT holds (no repo/bot_state)."
