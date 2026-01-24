@@ -1,0 +1,30 @@
+{
+  "ok": false,
+  "steps": {
+    "universe": {
+      "members": 198,
+      "today_path": "/home/runner/work/Jeihyuck-rolling-k-auto-trade-KIS-refacored/Jeihyuck-rolling-k-auto-trade-KIS-refacored/_botstate_worktree/21309382890_trade_tick/bot_state/runtime/universe/2026-01-24.json",
+      "selected_path": null
+    },
+    "probe": {
+      "codes": [
+        "005930",
+        "000660",
+        "005380"
+      ],
+      "rows": {
+        "005930": 5,
+        "000660": 5,
+        "005380": 5
+      },
+      "ok": true
+    },
+    "db_store": {
+      "enabled": true,
+      "wrote_event": null,
+      "ok": false
+    }
+  },
+  "error": "RuntimeError('nontrading_smoke db_store failed')",
+  "elapsed_sec": 1.929
+}
