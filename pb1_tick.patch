@@ -1,8 +1,188 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index bedeba9d53700eddeafb6eca5356360197470f06..29c5127ac5e3ad1f60668935687ec4f1356093b8 100644
+index dc1f3106f7ad4f0e394ab4e94b398b929200a250..2e5316ce8818be5e3440810435f45de3760c1ad4 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -446,83 +446,95 @@ jobs:
+@@ -1,43 +1,47 @@
+ name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: true
+ 
+ on:
+   push:
+     branches: [ "nullim", "main" ]
+     paths-ignore:
+       - "bot_state/**"
+       - "**/bot_state/**"
+ 
+   workflow_dispatch:
+     inputs:
++      VERIFY_NONTRADING_SMOKE:
++        description: "Run non-trading smoke once by clearing today's flag (KST)."
++        required: false
++        default: "0"
+       EMERGENCY_UNIVERSE_BUILD:
+         description: "Set to 1 to allow one-time emergency universe build when DB is missing."
+         required: false
+         default: "0"
+       BOT_STATE_HARD_RESET:
+         description: "Delete pbcore.sqlite3 + runtime + ledger and restart clean (one-shot)"
+         required: false
+         default: "0"
+       NONTRADING_UNIVERSE_SMOKE:
+         description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
+         required: false
+         default: "0"
+       NONTRADING_SMOKE_DB_STORE:
+         description: "Set to 1 to persist the non-trading universe snapshot to DB."
+         required: false
+         default: "1"
+       NONTRADING_SMOKE_FORCE_REBUILD:
+         description: "Set to 1 to force rebuild during non-trading smoke."
+         required: false
+         default: "0"
+ 
+   schedule:
+     # KST 08:50~08:55  => UTC 23:50~23:55 (Sun~Thu UTC)
+     - cron: "50-59/5 23 * * 0-4"
+     # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
+@@ -309,70 +313,104 @@ jobs:
+       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "70"
+       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "3"
+ 
+       KIS_HTTP_MAX_RETRIES: "5"
+       KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
+       KIS_HTTP_BACKOFF_CAP_SEC: "8"
+ 
+       ACTIVE_STRATEGIES: "1"
+       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
+ 
+     steps:
+       - name: Checkout code (always run nullim code)
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "nullim"
+           path: repo
+ 
+       - name: Checkout bot-state branch
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "bot-state"
+           path: botstate
+ 
+-      - name: Compute BOT_STATE_DIR (runtime)
++      - name: Set botstate paths (SSOT)
++        id: botstate_paths
+         shell: bash
+         run: |
+           set -euo pipefail
+-          # botstate worktree dir가 이미 스텝에서 출력/결정되는 구조라면,
+-          # 그 값을 파일/환경에서 읽어오거나, 여기서 확정한다.
+-          # (가장 안전: workflow에서 쓰는 고정 경로 규칙을 여기서 생성)
++          REPO_DIR="${GITHUB_WORKSPACE}/repo"
++          BOTSTATE_REPO_DIR="${GITHUB_WORKSPACE}/botstate"
+           BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}"
+-          echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
+-          echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
+-          mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
+-          echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
+-          echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
++          BOT_STATE_DIR="${BOTSTATE_WORKTREE_DIR}/bot_state"
++
++          {
++            echo "REPO_DIR=${REPO_DIR}"
++            echo "BOTSTATE_REPO_DIR=${BOTSTATE_REPO_DIR}"
++            echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}"
++            echo "BOT_STATE_DIR=${BOT_STATE_DIR}"
++          } >> "$GITHUB_ENV"
++
++          {
++            echo "repo_dir=${REPO_DIR}"
++            echo "botstate_repo_dir=${BOTSTATE_REPO_DIR}"
++            echo "botstate_worktree_dir=${BOTSTATE_WORKTREE_DIR}"
++            echo "bot_state_dir=${BOT_STATE_DIR}"
++          } >> "$GITHUB_OUTPUT"
++
++          echo "[BOTSTATE_PATHS] REPO_DIR=$REPO_DIR"
++          echo "[BOTSTATE_PATHS] BOTSTATE_REPO_DIR=$BOTSTATE_REPO_DIR"
++          echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
++          echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
++
++      - name: Prepare bot_state dir (always)
++        shell: bash
++        run: |
++          set -euo pipefail
++          mkdir -p "$BOT_STATE_DIR"
++          touch "$BOT_STATE_DIR/.gitkeep"
++          # 기본 ignore (원하면 확장)
++          if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
++            printf "runtime/\n*.sqlite3\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
++          fi
++          ls -la "$BOT_STATE_DIR" || true
++
++      - name: Restore bot_state cache
++        uses: actions/cache@v4
++        with:
++          path: ${{ steps.botstate_paths.outputs.bot_state_dir }}
++          key: botstate-${{ github.ref_name }}-${{ github.run_id }}
++          restore-keys: |
++            botstate-${{ github.ref_name }}-
+ 
+       - name: Restore bot_state into workspace
+         run: |
+           set -euo pipefail
+-          mkdir -p "$BOT_STATE_DIR"
+-          if [ -d ../botstate/bot_state ]; then
+-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
++          if [ -d "$BOTSTATE_REPO_DIR/bot_state" ]; then
++            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' "$BOTSTATE_REPO_DIR/bot_state/" "$BOT_STATE_DIR/"
+           fi
+           echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
+           ls -al "$BOT_STATE_DIR/.gitignore" || true
+           ls -al "$BOT_STATE_DIR/.gitkeep" || true
+           git status --porcelain || true
+ 
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Cache pip
+         uses: actions/cache@v4
+         with:
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+           restore-keys: |
+             ${{ runner.os }}-pip-
+ 
+       - name: Install deps
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+@@ -431,160 +469,152 @@ jobs:
+               pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+ 
+           print(
+               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
+               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
+           )
+ 
+           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
+               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
+               f.write(f"MARKET_WINDOW={window}\n")
+               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+           PY
+ 
+       - name: Compile check (gated)
          if: env.COMPILE_CHECK_ENABLED == '1'
          run: |
            set -euo pipefail
@@ -13,33 +193,68 @@ index bedeba9d53700eddeafb6eca5356360197470f06..29c5127ac5e3ad1f60668935687ec4f1
            git config --global user.email "actions@github.com"
            git config --global user.name "github-actions[bot]"
  
-       - name: Run PB1 (auto window) - should exit within 4 minutes
+-      - name: Run PB1 (auto window) - should exit within 4 minutes
++      - name: Force nontrading smoke once (KST) when requested
++        if: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE == '1' }}
++        shell: bash
          run: |
            set -euo pipefail
-           echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
-           python -m trader.run --window auto --phase auto
+-          echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+-          python -m trader.run --window auto --phase auto
++
++          # KST 날짜 계산
++          KST_DATE="$(python - <<'PY'
++          from datetime import datetime, timezone, timedelta
++          kst = timezone(timedelta(hours=9))
++          print(datetime.now(kst).date().isoformat())
++          PY
++          )"
++          FLAG="$BOT_STATE_DIR/runtime/diagnostics/nontrading_smoke_once_${KST_DATE}.flag"
++
++          echo "[VERIFY_NONTRADING_SMOKE] KST_DATE=$KST_DATE"
++          echo "[VERIFY_NONTRADING_SMOKE] Removing flag if exists: $FLAG"
++
++          rm -f "$FLAG" || true
++          # diagnostics 폴더가 없을 수도 있으니 생성
++          mkdir -p "$BOT_STATE_DIR/runtime/diagnostics"
++          ls -la "$BOT_STATE_DIR/runtime/diagnostics" || true
++
++      - name: Run PB1 (auto window) - should exit within 4 minutes
++        shell: bash
          env:
-           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
-           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
+-          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
+-          TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
+-          UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
++          BOTSTATE_WORKTREE_DIR: ${{ steps.botstate_paths.outputs.botstate_worktree_dir }}
++          BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
++          DATABASE_URL: ${{ secrets.DATABASE_URL }}
++          TRADER_CACHE_ROOT: ${{ steps.botstate_paths.outputs.bot_state_dir }}/runtime
++          UNIVERSE_LKG_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}/universe_lkg
            PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
            STATE_PATH: bot_state/runtime/state.json
            LOT_STATE_PATH: bot_state/runtime/lot_state.json
            STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
            LIVE_TRADING_ENABLED: "1"
- 
-+      - name: Detect botstate git repo
-+        id: botstate_git
-+        shell: bash
 +        run: |
 +          set -euo pipefail
-+          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
-+            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
-+          else
-+            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
-+          fi
-+          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
-+
++          cd "$REPO_DIR"
++          echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
++          python -m trader.run --window auto --phase auto
+ 
+       - name: Detect botstate git repo
+         id: botstate_git
+         shell: bash
+         run: |
+           set -euo pipefail
+-          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
++          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && git -C "$BOTSTATE_WORKTREE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+             echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
+             echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR is_git_repo=true"
+           else
+             echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
+             echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=false"
+           fi  
+           
        - name: Verify hard reset markers (workflow_dispatch)
          if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
          run: |
@@ -54,8 +269,7 @@ index bedeba9d53700eddeafb6eca5356360197470f06..29c5127ac5e3ad1f60668935687ec4f1
            fi
  
        - name: Inspect bot_state git status (post tick)
--        if: always()
-+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
+         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
          run: |
            set -euo pipefail
            cd "$BOTSTATE_WORKTREE_DIR"
@@ -68,280 +282,94 @@ index bedeba9d53700eddeafb6eca5356360197470f06..29c5127ac5e3ad1f60668935687ec4f1
          run: |
            set -euo pipefail
            echo "=== bot_state tree ==="
-           find bot_state -maxdepth 3 -type f -print || true
+-          find bot_state -maxdepth 3 -type f -print || true
++          find "$BOT_STATE_DIR" -maxdepth 3 -type f -print || true
            echo "=== git status (workspace) ==="
            git status --porcelain || true
  
-       - name: Persist bot_state (guarded)
--        if: always() && (env.PERSIST_MODE != 'OFF')
-+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
-         env:
-           BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
-         run: |
-           set -euo pipefail
-           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
-           if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
-             echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
-             exit 0
-           fi
- 
-           if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
-             echo "[PERSIST] ok: worktree is a git repo -> run persist"
-           else
-             echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
-             exit 0
-           fi
- 
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
- 
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
- 
-           # 1) allowlist stage only
-           shopt -s globstar
-@@ -653,52 +665,64 @@ jobs:
-             ${{ runner.os }}-pip-
- 
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Configure git identity for botstate commits
-         run: |
-           git config --global user.email "actions@github.com"
-           git config --global user.name "github-actions[bot]"
- 
-       - name: Run PB1 close-cancel (auto window)
-         run: |
-           set -euo pipefail
-           python -m trader.pb1_runner --window auto --phase auto
-         env:
-           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
-           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
-           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-           STATE_PATH: bot_state/runtime/state.json
-           LOT_STATE_PATH: bot_state/runtime/lot_state.json
- 
-+      - name: Detect botstate git repo
-+        id: botstate_git
+-      - name: Persist bot_state (guarded)
+-        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
+-        env:
+-          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
++      - name: Persist bot_state to bot-state branch
++        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
 +        shell: bash
-+        run: |
-+          set -euo pipefail
-+          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
-+            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
-+          else
-+            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
-+          fi
-+          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
-+
-       - name: Persist bot_state (guarded)
--        if: always() && (env.PERSIST_MODE != 'OFF')
-+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
-         env:
-           BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
          run: |
            set -euo pipefail
-           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
-           if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
-             echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
+-          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
+-          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
+-            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
+-            exit 0
+-          fi
++          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
+ 
+-          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
+-            echo "[PERSIST] ok: worktree is a git repo -> run persist"
+-          else
+-            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
++          # 변경 없으면 종료
++          if [ -z "$(git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain)" ]; then
++            echo "[PERSIST] no changes -> skip"
              exit 0
            fi
  
-           if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
-             echo "[PERSIST] ok: worktree is a git repo -> run persist"
-           else
-             echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
-             exit 0
-           fi
+-          cd "$BOTSTATE_WORKTREE_DIR"
+-          echo "[PERSIST] workdir=$(pwd)"
+-          git status --porcelain | head -n 50 || true
+-
+-          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+-
+-          # 1) allowlist stage only
+-          shopt -s globstar
+-          git add -A \
+-            bot_state/runtime/state.json \
+-            bot_state/runtime/lot_state.json \
+-            bot_state/runtime/universe/*.json \
+-            bot_state/universe_lkg/**/latest.json \
+-            bot_state/runtime/diagnostics/*.flag \
+-            || true
+-
+-          # 2) staged 변경이 없으면 스킵
+-          if git diff --cached --quiet; then
+-            echo "[PERSIST] no staged changes -> skip"
+-          else
+-            git config user.email "actions@github.com"
+-            git config user.name "github-actions[bot]"
+-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
+-            git push origin HEAD:bot-state
+-          fi
+-
+-          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
+-          if [[ -n "$(git status --porcelain)" ]]; then
+-            echo "::error::botstate worktree dirty after persist"
+-            git status --porcelain | head -n 200
+-            exit 1
+-          fi
++          git -C "$BOTSTATE_WORKTREE_DIR" add -A
++          git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
++          git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
  
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
+   close_cancel:
+     runs-on: ubuntu-latest
+     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
+     timeout-minutes: 15
  
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
  
-           # 1) untracked 포함 bot_state 전체 stage
-           git add -A bot_state
-diff --git a/tests/test_db_url.py b/tests/test_db_url.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..83ccee2f992e01ff6c935d269d89cb1a7c13973e
---- /dev/null
-+++ b/tests/test_db_url.py
-@@ -0,0 +1,43 @@
-+import pytest
-+
-+from trader.db.engine import get_db_url
-+
-+
-+@pytest.fixture(autouse=True)
-+def clear_env(monkeypatch):
-+    # 테스트 전 DB URL 관련 env 전부 제거
-+    for k in [
-+        "PBCORE_DB_URL",
-+        "DATABASE_URL",
-+        "TRADER_DB_URL",
-+        "DB_URL",
-+        "SQLALCHEMY_DATABASE_URL",
-+    ]:
-+        monkeypatch.delenv(k, raising=False)
-+
-+
-+def test_accept_postgresql_psycopg_scheme(monkeypatch):
-+    monkeypatch.setenv(
-+        "PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/postgres"
-+    )
-+    assert get_db_url().startswith("postgresql+psycopg://")
-+
-+
-+def test_reject_sqlite(monkeypatch):
-+    monkeypatch.setenv("PBCORE_DB_URL", "sqlite:///bot_state/db/pbcore.sqlite3")
-+    with pytest.raises(RuntimeError) as e:
-+        get_db_url()
-+    assert "SQLite is forbidden" in str(e.value)
-+
-+
-+def test_reject_non_postgres_scheme(monkeypatch):
-+    monkeypatch.setenv("PBCORE_DB_URL", "mysql://user:pass@localhost:3306/db")
-+    with pytest.raises(RuntimeError) as e:
-+        get_db_url()
-+    assert "Postgres only" in str(e.value)
-+
-+
-+def test_missing_db_url(monkeypatch):
-+    with pytest.raises(RuntimeError) as e:
-+        get_db_url()
-+    assert "DB URL missing" in str(e.value)
-diff --git a/trader/db/engine.py b/trader/db/engine.py
-index c0e3323507f62adf2db75daec505acd27959f895..b6f47a6ec15230060418163c34eab0359eb5e073 100644
---- a/trader/db/engine.py
-+++ b/trader/db/engine.py
-@@ -1,41 +1,75 @@
-+from __future__ import annotations
-+
- import os
-+from typing import Tuple
-+
-+import sqlalchemy as sa
-+
-+# Postgres-only 정책: 허용할 URL prefix들
-+ALLOWED_PG_PREFIXES = (
-+    "postgres://",
-+    "postgresql://",
-+    "postgresql+psycopg://",
-+    "postgresql+psycopg2://",
-+    "postgresql+asyncpg://",
-+)
+       FORCE_STRATEGY_MODE: ""
+       FORCE_PB1_PHASE: ""
  
--from sqlalchemy import create_engine
--from sqlalchemy.engine import Engine
-+# DB URL을 읽을 env 우선순위
-+DB_URL_KEYS = (
-+    "PBCORE_DB_URL",            # ✅ primary
-+    "DATABASE_URL",             # common
-+    "TRADER_DB_URL",
-+    "DB_URL",
-+    "SQLALCHEMY_DATABASE_URL",
-+)
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
  
--def _db_echo() -> bool:
--    return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
- 
-+def _redact_url(url: str) -> str:
-+    # user:pass@host 형태에서 pass 노출 방지
-+    if "@" in url:
-+        left = url.split("@", 1)[0]
-+        return f"{left}@***"
-+    return (url[:24] + "***") if len(url) > 24 else (url + "***")
- 
--def _pick_db_url() -> str:
--    # ✅ 하나로 통일: PBCORE_DB_URL을 1순위로 강제
--    for key in ("PBCORE_DB_URL", "DATABASE_URL", "TRADER_DB_URL", "DB_URL", "SQLALCHEMY_DATABASE_URL"):
-+
-+def _pick_db_url() -> Tuple[str, str]:
-+    for key in DB_URL_KEYS:
-         v = (os.getenv(key) or "").strip()
-         if v:
--            return v
--    return ""
-+            return v, key
-+    return "", ""
- 
- 
- def get_db_url() -> str:
--    url = _pick_db_url()
-+    url, src = _pick_db_url()
-+
-     if not url:
-         raise RuntimeError(
--            "Postgres DB URL missing. Set one of: PBCORE_DB_URL (preferred), DATABASE_URL, TRADER_DB_URL, DB_URL."
-+            "Postgres DB URL missing. "
-+            "Set PBCORE_DB_URL (preferred) or DATABASE_URL."
-         )
- 
-     u = url.lower()
--    if u.startswith("postgresql://") or u.startswith("postgres://"):
-+
-+    # SQLite 명시 금지
-+    if u.startswith("sqlite:"):
-+        raise RuntimeError(
-+            f"SQLite is forbidden. Use Postgres only. "
-+            f"Got {src}=sqlite:***"
-+        )
-+
-+    # Postgres 스킴 허용
-+    if u.startswith(ALLOWED_PG_PREFIXES):
-         return url
- 
--    # sqlite거나 다른 스킴이면 금지
--    raise RuntimeError(f"SQLite is forbidden. Use Postgres only. Got url={url.split('@')[0]}***")
-+    # 나머지 스킴은 모두 불허 (mysql 등)
-+    raise RuntimeError(
-+        "DB URL scheme not allowed (Postgres only). "
-+        f"Got {src}={_redact_url(url)}"
-+    )
- 
- 
--def make_engine() -> Engine:
-+def make_engine() -> sa.Engine:
-     url = get_db_url()
--    return create_engine(
--        url,
--        echo=_db_echo(),
--        pool_pre_ping=True,
--        pool_recycle=1800,
--    )
-+    # SQLAlchemy 엔진 생성 (psycopg v3 지원)
-+    return sa.create_engine(url, pool_pre_ping=True)
-diff --git a/trader/db/health.py b/trader/db/health.py
-index fedb0ba41a884f72b3dc9716167cf73e43f31aca..7c3b94627218099ce93484554857fb7c2c7fd235 100644
---- a/trader/db/health.py
-+++ b/trader/db/health.py
-@@ -1,9 +1,21 @@
--from sqlalchemy import text
-+from __future__ import annotations
- 
--from trader.db.engine import make_engine
-+import logging
-+
-+from .engine import get_db_url, make_engine, _redact_url
-+
-+logger = logging.getLogger(__name__)
- 
- 
- def assert_db_ready() -> None:
-+    # url 로깅은 마스킹
-+    try:
-+        url = get_db_url()
-+        logger.info("[DB][HEALTH] url=%s", _redact_url(url))
-+    except Exception as e:
-+        logger.error("[DB][HEALTH] get_db_url failed: %s", e)
-+        raise
-+
-     engine = make_engine()
-     with engine.connect() as conn:
--        conn.execute(text("SELECT 1"))
-+        conn.exec_driver_sql("SELECT 1")
+       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
+       COMPILE_CHECK_ENABLED: "0"
+       MIGRATE_MODE: "AUTO"
