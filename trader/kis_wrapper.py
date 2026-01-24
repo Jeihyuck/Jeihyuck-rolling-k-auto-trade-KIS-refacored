@@ -80,6 +80,10 @@ class DataShortError(Exception):
     pass
 
 
+class OrderBlockedError(RuntimeError):
+    """주문 하드 가드에 의해 차단된 경우."""
+
+
 def _build_session():
     s = requests.Session()
     retry = Retry(
@@ -298,14 +302,17 @@ def _order_block_reason(now: datetime | None = None) -> Optional[str]:
     return None
 
 
-def _assert_orders_allowed() -> None:
-    if os.getenv("PB1_DIAG_REHEARSAL") == "1":
-        raise RuntimeError("orders forbidden in rehearsal")
-    mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
-    live_flag = (os.getenv("LIVE_TRADING_ENABLED") or "").strip()
-    if mode != "LIVE" or live_flag != "1":
-        raise RuntimeError(
-            f"orders forbidden (STRATEGY_MODE={mode or 'unset'} LIVE_TRADING_ENABLED={live_flag or 'unset'})"
+def _assert_orders_allowed(action: str) -> None:
+    block = (os.getenv("PB1_BLOCK_ORDERS") or "").strip().lower() in {"1", "true", "yes", "y"}
+    diag_rehearsal = (os.getenv("PB1_DIAG_REHEARSAL") or "").strip().lower() in {"1", "true", "yes", "y"}
+    mode = (os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or "").strip().upper()
+    live = (os.getenv("LIVE_TRADING_ENABLED") or "").strip().lower() in {"1", "true", "yes", "y"}
+
+    if block or diag_rehearsal or mode == "DIAG" or not live:
+        raise OrderBlockedError(
+            "Orders are blocked. "
+            f"action={action} PB1_BLOCK_ORDERS={os.getenv('PB1_BLOCK_ORDERS')} "
+            f"mode={mode} LIVE_TRADING_ENABLED={os.getenv('LIVE_TRADING_ENABLED')}"
         )
 
 
@@ -2168,7 +2175,7 @@ class KisAPI:
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        _assert_orders_allowed()
+        _assert_orders_allowed("order_cash")
 
         # TR 후보 순차 시도
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
@@ -2362,7 +2369,7 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        _assert_orders_allowed()
+        _assert_orders_allowed("buy_stock_limit")
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
@@ -2417,7 +2424,7 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        _assert_orders_allowed()
+        _assert_orders_allowed("sell_stock_limit")
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
