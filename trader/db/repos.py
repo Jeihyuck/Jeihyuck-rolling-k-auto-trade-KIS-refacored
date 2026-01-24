@@ -118,6 +118,22 @@ def _collect_json_type_paths(value: Any, *, path: str = "request_json", limit: i
     return results
 
 
+def _is_in_failed_transaction_error(exc: Exception) -> bool:
+    message = f"{exc.__class__.__name__}:{exc}"
+    if "InFailedSqlTransaction" in message:
+        return True
+    orig = getattr(exc, "orig", None)
+    if orig and "InFailedSqlTransaction" in f"{orig.__class__.__name__}:{orig}":
+        return True
+    try:
+        from psycopg.errors import InFailedSqlTransaction as PsycopgInFailedSqlTransaction
+    except Exception:
+        PsycopgInFailedSqlTransaction = None
+    if PsycopgInFailedSqlTransaction and isinstance(orig or exc, PsycopgInFailedSqlTransaction):
+        return True
+    return False
+
+
 class RunsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -694,9 +710,10 @@ class LedgerEventsRepo:
         reasons: list[str] | None = None,
         stage: str | None = None,
         payload_json: dict | None = None,
-    ) -> str:
+    ) -> str | None:
         db_url = str(self.engine.url)
         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
+        safe_reasons = json_sanitize(reasons or [])
         payload = {
             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -713,13 +730,14 @@ class LedgerEventsRepo:
             "kis_odno": kis_odno,
             "client_order_key": client_order_key,
             "ok": ok,
-            "reasons": reasons or [],
+            "reasons": safe_reasons,
             "stage": stage,
             "payload_json": safe_payload_json,
         }
         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
         with self.engine.begin() as conn:
             try:
+                logger.info("[DB][LEDGER_EVENT][APPEND] attempt=1 env=%s event_type=%s", env, event_type)
                 if run_id is not None and strategy:
                     ensure_run(
                         conn,
@@ -733,20 +751,49 @@ class LedgerEventsRepo:
                     )
                 res = conn.execute(stmt)
                 return str(res.scalar())
-            except Exception:
-                if run_id is not None and strategy:
-                    ensure_run(
-                        conn,
-                        self._schema,
-                        run_id=run_id,
-                        env=env,
-                        run_window=run_window,
-                        strategy=strategy,
-                        ts=ts,
-                        database_url=db_url,
-                    )
-                conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
-                return str(payload["ledger_event_id"])
+            except Exception as exc:
+                if _is_in_failed_transaction_error(exc):
+                    logger.info("[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction env=%s event_type=%s", env, event_type)
+                    try:
+                        conn.rollback()
+                        logger.info("[DB][LEDGER_EVENT][ROLLBACK] env=%s event_type=%s", env, event_type)
+                    except Exception:
+                        logger.exception("[DB][LEDGER_EVENT][ROLLBACK_FAIL] env=%s event_type=%s", env, event_type)
+                    try:
+                        with self.engine.begin() as retry_conn:
+                            logger.info("[DB][LEDGER_EVENT][APPEND] attempt=2 env=%s event_type=%s", env, event_type)
+                            if run_id is not None and strategy:
+                                ensure_run(
+                                    retry_conn,
+                                    self._schema,
+                                    run_id=run_id,
+                                    env=env,
+                                    run_window=run_window,
+                                    strategy=strategy,
+                                    ts=ts,
+                                    database_url=db_url,
+                                )
+                            res = retry_conn.execute(stmt)
+                            return str(res.scalar())
+                    except Exception as retry_exc:
+                        logger.exception(
+                            "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
+                            env,
+                            event_type,
+                            retry_exc,
+                            stmt,
+                            payload,
+                        )
+                        return None
+                logger.exception(
+                    "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
+                    env,
+                    event_type,
+                    exc,
+                    stmt,
+                    payload,
+                )
+                return None
 
 
 class PositionsRepo:

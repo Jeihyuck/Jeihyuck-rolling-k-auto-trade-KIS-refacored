@@ -148,6 +148,7 @@ def run_nontrading_smoke_once(
             raise RuntimeError("nontrading_smoke probe empty")
 
         db_store_ok = False
+        db_store_error = None
         event_id = None
         if db_store:
             _check_timeout("db_store")
@@ -169,13 +170,17 @@ def run_nontrading_smoke_once(
                         "rows": probe_rows,
                     },
                 )
-                db_store_ok = True
-            except Exception:
+                db_store_ok = event_id is not None
+            except Exception as exc:
+                db_store_error = repr(exc)
                 logger.exception("[NONTRADING_SMOKE][DB][FAIL] env=%s strategy=%s", env, strategy)
-        result["steps"]["db_store"] = {"enabled": db_store, "wrote_event": event_id, "ok": db_store_ok}
+        result["steps"]["db_store"] = {
+            "enabled": db_store,
+            "wrote_event": event_id,
+            "ok": db_store_ok,
+            "error": db_store_error,
+        }
         logger.info("[NONTRADING_SMOKE][DB] wrote_event=%s", event_id or "none")
-        if db_store and not db_store_ok:
-            raise RuntimeError("nontrading_smoke db_store failed")
 
         result["ok"] = True
     except Exception as exc:

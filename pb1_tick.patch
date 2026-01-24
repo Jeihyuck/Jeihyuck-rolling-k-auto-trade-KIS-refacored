@@ -1,256 +1,367 @@
-diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
-index f3b7e5f27073586bcbd0b2e454d98ee7f6e5c1ef..0d3c1415d07a6938d895bd2fe15b93d6bfeb69b8 100644
---- a/trader/botstate_sync.py
-+++ b/trader/botstate_sync.py
-@@ -22,83 +22,86 @@ KST = ZoneInfo("Asia/Seoul")
- BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
- SYNC_MODE_FETCH_RESET = "FETCH_RESET"
- BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
- DEFAULT_LOCK_TTL_SEC = 240
- DEFAULT_LOCK_RETRY_SEC = 70
- DEFAULT_LOCK_RETRY_SLEEP_SEC = 3
- DEFAULT_LOCK_BUFFER_SEC = 180
- DEFAULT_LOCK_GRACE_SEC = 60
- BOTSTATE_GITIGNORE_TEXT = """\
- # --- botstate (tracked artifacts) ---
- # Keep minimal runtime artifacts only.
- 
- # Ignore runtime by default
- bot_state/runtime/
- bot_state/runtime/**
- 
- # Allowlist runtime artifacts
- !bot_state/runtime/events/
- !bot_state/runtime/events/**
- !bot_state/runtime/status/
- !bot_state/runtime/status/**
- !bot_state/runtime/universe/
- !bot_state/runtime/universe/**
- !bot_state/runtime/reports/
- !bot_state/runtime/reports/**
-+!bot_state/runtime/diagnostics/
-+!bot_state/runtime/diagnostics/**
- !bot_state/runtime/balance_snapshot.json
- !bot_state/runtime/schema_version.txt
- 
- # Large caches MUST NOT be committed
- bot_state/runtime/ohlcv_cache/
- bot_state/runtime/ohlcv_cache/**
- 
- # Never commit archive/ or readonly backups
- bot_state/archive/
- bot_state/db/
- bot_state/db/**
- bot_state/db/*.bak*
- bot_state/db/*.readonly.bak.*
- 
- # Runtime DB artifacts (should never be created)
- **/*.sqlite3
- **/*.sqlite3-wal
- **/*.sqlite3-shm
- **/*.db
- **/*.db-wal
- **/*.db-shm
- 
- # Python / OS noise
- .DS_Store
- __pycache__/
- *.pyc
- """
- 
- ALLOWLIST_PATTERNS = [
-     "bot_state/runtime/events/*.jsonl",
-     "bot_state/runtime/status/**",
-     "bot_state/runtime/universe/*.json",
-     "bot_state/runtime/reports/**",
-+    "bot_state/runtime/diagnostics/nontrading_smoke_*",
-     "bot_state/universe_lkg/**/latest.json",
-     "bot_state/runtime/balance_snapshot.json",
-     "bot_state/runtime/schema_version.txt",
-     "bot_state/runtime/runtime_meta.json",
- ]
- 
- CLEAN_PATTERNS = [
-     "bot_state/archive/**",
-     "bot_state/runtime/ohlcv_cache/**",
-     "bot_state/db/*.bak*",
-     "bot_state/db/*.sqlite3",
-     "bot_state/db/*.sqlite3-wal",
-     "bot_state/db/*.sqlite3-shm",
-     "bot_state/db/*.db",
-     "bot_state/db/*.db-wal",
-     "bot_state/db/*.db-shm",
- ]
- 
- 
- @dataclass(frozen=True)
- class DirtyStatSnapshot:
-     events: tuple[int, float | None, int]
-     universe: tuple[int, float | None, int]
-     last_seen_positions: tuple[float, int] | None
-     positions_snapshot: tuple[float, int] | None
-@@ -326,61 +329,64 @@ def _run_git_logged(args: list[str], cwd: Path, *, check: bool = True, label: st
- def git_porcelain(worktree_dir: Path) -> str:
-     return _git_worktree(worktree_dir, "status", "--porcelain").stdout
- 
- 
- def stage_all(worktree_dir: Path) -> None:
-     _git_worktree(worktree_dir, "add", "-A")
- 
- 
- def stage_runtime_universe(worktree_dir: Path) -> None:
-     for spec in ALLOWLIST_PATTERNS:
-         _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
- 
- 
- def _safe_rm(path: Path) -> None:
+diff --git a/trader/db/migrate.py b/trader/db/migrate.py
+index fd52ba7b7cf08b004e355bdd3effd09acf87e7bb..8aa0ebdaf1ae7d587504e3addf8747ad231f06c8 100644
+--- a/trader/db/migrate.py
++++ b/trader/db/migrate.py
+@@ -214,63 +214,83 @@ def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
+         return
      try:
-         if path.is_dir():
-             shutil.rmtree(path, ignore_errors=True)
-         elif path.exists():
-             path.unlink()
-     except Exception:
-         logger.info("[BOTSTATE][PERSIST][CLEANUP_SKIP] path=%s", path, exc_info=True)
+         conn.exec_driver_sql(cleaned)
+     except Exception as exc:
+         if _should_ignore_pg_error(exc):
+             logger.info("[DB][MIGRATE][PG] ignore error=%s statement=%s", exc, cleaned)
+             return
+         raise
  
  
- def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
-     _git_worktree(worktree_dir, "reset", check=False)
--    bot_state_dir = worktree_dir / "bot_state"
-     to_add: list[str] = []
--    for root, _, files in os.walk(bot_state_dir):
--        for name in files:
--            rel = Path(root, name).relative_to(worktree_dir).as_posix()
--            for pattern in allow_patterns:
--                if fnmatch.fnmatch(rel, pattern):
--                    to_add.append(rel)
--                    break
-+    status = _run_git_logged(
-+        ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_allowlist"
-+    ).stdout
-+    for line in status.splitlines():
-+        if not line.strip():
-+            continue
-+        _, rel = _parse_porcelain_path(line)
-+        if not rel:
-+            continue
-+        if any(fnmatch.fnmatch(rel, pattern) for pattern in allow_patterns):
-+            to_add.append(rel)
-     if to_add:
--        _git_worktree(worktree_dir, "add", "--", *to_add, check=False)
-+        _git_worktree(worktree_dir, "add", "--", *sorted(set(to_add)), check=False)
- 
-     _safe_rm(worktree_dir / "bot_state" / "archive")
-     db_dir = worktree_dir / "bot_state" / "db"
-     if db_dir.is_dir():
-         for entry in db_dir.iterdir():
-             if ".readonly.bak." in entry.name:
-                 _safe_rm(entry)
+ def _should_ignore_pg_error(exc: Exception) -> bool:
+     message = str(exc).lower()
+     if "column" in message and ("already exists" in message or "does not exist" in message):
+         return True
+     if "relation" in message and "already exists" in message:
+         return True
+     if "duplicate_table" in message or "duplicate_column" in message:
+         return True
+     return False
  
  
- def _parse_porcelain_path(line: str) -> tuple[str, str]:
-     status = line[:2]
-     path = line[3:].strip()
-     if "->" in path:
-         path = path.split("->")[-1].strip()
-     return status, path
+ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
+     if _should_skip_migrations(engine, migrations_dir):
+         return
+     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
++    migration_files = sorted(
++        [
++            Path(path)
++            for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
++            if Path(path).is_file()
++        ]
++    )
+     with engine.begin() as conn:
+         url = str(engine.url)
+         logger.info("[DB][MIGRATE] external url=%s", url)
+         _ensure_schema_migrations_table(conn)
+         applied = _list_applied_versions(conn)
+ 
+-        migration_files = sorted(
+-            [
+-                Path(path)
+-                for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+-                if Path(path).is_file()
+-            ]
+-        )
+         for path in migration_files:
+             version = path.name
+             if version in applied:
+                 continue
+             sql = path.read_text(encoding="utf-8")
+-            logger.info("[DB][MIGRATE] applying %s", version)
++            logger.info("[DB][MIGRATE][APPLY] version=%s", version)
+             try:
+                 statements = split_postgres_sql(sql)
+                 for statement in statements:
+-                    _apply_pg_statement(conn, statement)
++                    try:
++                        _apply_pg_statement(conn, statement)
++                    except Exception as exc:
++                        logger.exception(
++                            "[DB][MIGRATE][FAIL] version=%s statement=%s err=%s",
++                            version,
++                            statement,
++                            exc,
++                        )
++                        try:
++                            conn.rollback()
++                            logger.info("[DB][MIGRATE][ROLLBACK] version=%s", version)
++                        except Exception:
++                            logger.exception("[DB][MIGRATE][ROLLBACK_FAIL] version=%s", version)
++                        raise
+                 conn.execute(
+                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                     {"version": version},
+                 )
+             except Exception as exc:
+                 snippet = " ".join(sql.split())[:2000]
+-                logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
++                logger.exception(
++                    "[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s",
++                    version,
++                    exc,
++                    snippet,
++                )
+                 raise
+     _write_schema_stamp(migrations_dir)
++    logger.info("[DB][MIGRATE][MIGRATE OK] count=%s", len(migration_files))
  
  
- def _clean_non_allowlisted_changes(
-     worktree_dir: Path,
-     status_lines: list[str],
-     patterns: list[str],
- ) -> tuple[int, int]:
-     reverted_deleted = 0
-     cleaned_untracked = 0
-     for line in status_lines:
+ if __name__ == "__main__":
+     from .engine import make_engine
+ 
+     run_migrations(make_engine())
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 0cab9dd67f4ca1ebbbd36b2f2b820b667cbdbeaa..6de06241745d1f6502335474201ac985150a6bfa 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -96,50 +96,66 @@ def execute_with_retry(conn, stmt, payload=None, retries: int = 5, base_sleep: f
+     if last_exc:
+         raise last_exc
+     raise OperationalError("database is locked", params=None, orig=None)
+ 
+ 
+ def _collect_json_type_paths(value: Any, *, path: str = "request_json", limit: int = 50) -> list[str]:
+     results: list[str] = []
+ 
+     def _walk(node: Any, prefix: str) -> None:
+         if len(results) >= limit:
+             return
+         if isinstance(node, dict):
+             for key, val in node.items():
+                 _walk(val, f"{prefix}.{key}")
+             return
+         if isinstance(node, (list, tuple, set)):
+             for idx, val in enumerate(node):
+                 _walk(val, f"{prefix}[{idx}]")
+             return
+         results.append(f"{prefix}:{type(node).__name__}")
+ 
+     _walk(value, path)
+     return results
+ 
+ 
++def _is_in_failed_transaction_error(exc: Exception) -> bool:
++    message = f"{exc.__class__.__name__}:{exc}"
++    if "InFailedSqlTransaction" in message:
++        return True
++    orig = getattr(exc, "orig", None)
++    if orig and "InFailedSqlTransaction" in f"{orig.__class__.__name__}:{orig}":
++        return True
++    try:
++        from psycopg.errors import InFailedSqlTransaction as PsycopgInFailedSqlTransaction
++    except Exception:
++        PsycopgInFailedSqlTransaction = None
++    if PsycopgInFailedSqlTransaction and isinstance(orig or exc, PsycopgInFailedSqlTransaction):
++        return True
++    return False
++
++
+ class RunsRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def start_run(
+         self,
+         env: str,
+         strategy: str,
+         run_window: str | None,
+         phase: str,
+         event_name: str,
+         dry_run: bool,
+         git_sha: str | None,
+         workflow: str | None,
+         workflow_run_id: str | None,
+         workflow_attempt: int | None,
+         config_json: dict | None,
+     ) -> str:
+         values = {
+             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+             "env": env,
+             "strategy": strategy,
+             "run_window": run_window,
+             "phase": phase,
+@@ -672,103 +688,134 @@ class LedgerEventsRepo:
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def append_event(
+         self,
+         *,
+         env: str,
+         run_id: str | None,
+         strategy: str | None = None,
+         run_window: str | None = None,
+         event_type: str,
+         ts: datetime,
+         code: str | None = None,
+         market: str | None = None,
+         sid: int | None = None,
+         mode: int | None = None,
+         side: str | None = None,
+         qty: int | None = None,
+         price: float | None = None,
+         kis_odno: str | None = None,
+         client_order_key: str | None = None,
+         ok: bool = True,
+         reasons: list[str] | None = None,
+         stage: str | None = None,
+         payload_json: dict | None = None,
+-    ) -> str:
++    ) -> str | None:
+         db_url = str(self.engine.url)
+         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
++        safe_reasons = json_sanitize(reasons or [])
+         payload = {
+             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "event_type": event_type,
+             "ts": ts,
+             "code": code,
+             "market": market,
+             "sid": sid,
+             "mode": mode,
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "kis_odno": kis_odno,
+             "client_order_key": client_order_key,
+             "ok": ok,
+-            "reasons": reasons or [],
++            "reasons": safe_reasons,
+             "stage": stage,
+             "payload_json": safe_payload_json,
+         }
+         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+         with self.engine.begin() as conn:
+             try:
++                logger.info("[DB][LEDGER_EVENT][APPEND] attempt=1 env=%s event_type=%s", env, event_type)
+                 if run_id is not None and strategy:
+                     ensure_run(
+                         conn,
+                         self._schema,
+                         run_id=run_id,
+                         env=env,
+                         run_window=run_window,
+                         strategy=strategy,
+                         ts=ts,
+                         database_url=db_url,
+                     )
+                 res = conn.execute(stmt)
+                 return str(res.scalar())
+-            except Exception:
+-                if run_id is not None and strategy:
+-                    ensure_run(
+-                        conn,
+-                        self._schema,
+-                        run_id=run_id,
+-                        env=env,
+-                        run_window=run_window,
+-                        strategy=strategy,
+-                        ts=ts,
+-                        database_url=db_url,
+-                    )
+-                conn.execute(sa.insert(self._schema.ledger_events).values(**payload))
+-                return str(payload["ledger_event_id"])
++            except Exception as exc:
++                if _is_in_failed_transaction_error(exc):
++                    logger.info("[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction env=%s event_type=%s", env, event_type)
++                    try:
++                        conn.rollback()
++                        logger.info("[DB][LEDGER_EVENT][ROLLBACK] env=%s event_type=%s", env, event_type)
++                    except Exception:
++                        logger.exception("[DB][LEDGER_EVENT][ROLLBACK_FAIL] env=%s event_type=%s", env, event_type)
++                    try:
++                        with self.engine.begin() as retry_conn:
++                            logger.info("[DB][LEDGER_EVENT][APPEND] attempt=2 env=%s event_type=%s", env, event_type)
++                            if run_id is not None and strategy:
++                                ensure_run(
++                                    retry_conn,
++                                    self._schema,
++                                    run_id=run_id,
++                                    env=env,
++                                    run_window=run_window,
++                                    strategy=strategy,
++                                    ts=ts,
++                                    database_url=db_url,
++                                )
++                            res = retry_conn.execute(stmt)
++                            return str(res.scalar())
++                    except Exception as retry_exc:
++                        logger.exception(
++                            "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
++                            env,
++                            event_type,
++                            retry_exc,
++                            stmt,
++                            payload,
++                        )
++                        return None
++                logger.exception(
++                    "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
++                    env,
++                    event_type,
++                    exc,
++                    stmt,
++                    payload,
++                )
++                return None
+ 
+ 
+ class PositionsRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
+ 
+     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
+         stmt = select(self._schema.positions).where(
+             and_(
+                 self._schema.positions.c.env == env,
+                 self._schema.positions.c.strategy == strategy,
+                 self._schema.positions.c.sid == sid,
+                 self._schema.positions.c.mode == mode,
+                 self._schema.positions.c.code == code,
+             )
+         )
+         with self.engine.begin() as conn:
+             row = conn.execute(stmt).mappings().first()
+             return dict(row) if row else None
+ 
+     def list_positions(self, env: str, strategy: str) -> list[dict]:
+         stmt = select(self._schema.positions).where(
+             and_(self._schema.positions.c.env == env, self._schema.positions.c.strategy == strategy)
+         )
 diff --git a/trader/diagnostics/nontrading_smoke.py b/trader/diagnostics/nontrading_smoke.py
-index 7628bb789f3ff043ff4c226c2082cd670851addc..5be86906ddebe3cfdc0302d60c6cb61355ef54c8 100644
+index 5be86906ddebe3cfdc0302d60c6cb61355ef54c8..a58a8ecbd5a87c78699f66c2e5db895af9631e2e 100644
 --- a/trader/diagnostics/nontrading_smoke.py
 +++ b/trader/diagnostics/nontrading_smoke.py
-@@ -1,54 +1,79 @@
- from __future__ import annotations
+@@ -126,70 +126,75 @@ def run_nontrading_smoke_once(
+             logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
+             kis = None
+         providers = [KISOHLCVProvider(kis)] if kis else []
+         providers.append(KRXOHLCVProvider())
+         chain = ChainOHLCVProvider(providers, env=env)
  
- import json
- import logging
- import os
- import time
- from datetime import datetime
- from pathlib import Path
+         codes = _select_probe_codes(members, limit=3)
+         if not codes:
+             raise RuntimeError("nontrading_smoke missing probe codes")
+         probe_rows: dict[str, int] = {}
+         probe_ok = True
+         for code in codes:
+             _check_timeout("probe_fetch")
+             probe = chain.get_ohlcv(code, days=5)
+             df = probe.df
+             rows = len(df) if df is not None else 0
+             probe_rows[code] = rows
+             if rows <= 0:
+                 probe_ok = False
+         result["steps"]["probe"] = {"codes": codes, "rows": probe_rows, "ok": probe_ok}
+         logger.info("[NONTRADING_SMOKE][PROBE] codes=%s ok=%s", codes, int(probe_ok))
+         if not probe_ok:
+             raise RuntimeError("nontrading_smoke probe empty")
  
- from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
- from trader.db.repos import LedgerEventsRepo
- from trader.kis_wrapper import KisAPI
- from trader.runtime_store import RuntimeStore
- 
- logger = logging.getLogger(__name__)
- 
- 
--def nontrading_smoke_flag_path(runtime_store: RuntimeStore) -> Path:
--    return Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_once.flag"
-+def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> str:
-+    if as_of:
-+        return as_of
-+    if now is None:
-+        now = datetime.now()
-+    return now.date().isoformat()
-+
-+
-+def nontrading_smoke_flag_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
-+    suffix = _nontrading_smoke_suffix(as_of)
-+    return (
-+        Path(runtime_store.base_dir)
-+        / "runtime"
-+        / "diagnostics"
-+        / f"nontrading_smoke_once_{suffix}.flag"
-+    )
-+
-+
-+def nontrading_smoke_result_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
-+    suffix = _nontrading_smoke_suffix(as_of)
-+    return (
-+        Path(runtime_store.base_dir)
-+        / "runtime"
-+        / "diagnostics"
-+        / f"nontrading_smoke_result_{suffix}.json"
-+    )
- 
- 
- def write_nontrading_smoke_flag(
-     runtime_store: RuntimeStore,
-     *,
-     now: datetime,
-     run_id: str,
-     sha: str,
-+    as_of: str | None = None,
- ) -> Path:
--    flag = nontrading_smoke_flag_path(runtime_store)
-+    flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of or now.date().isoformat())
-     flag.parent.mkdir(parents=True, exist_ok=True)
-     flag.write_text(f"{now.isoformat()} run_id={run_id} sha={sha}\n", encoding="utf-8")
-     return flag
- 
- 
- def _select_probe_codes(members: list[dict], limit: int = 3) -> list[str]:
-     codes: list[str] = []
-     for member in members:
-         if isinstance(member, dict):
-             code = member.get("code") or member.get("symbol") or member.get("ticker")
-         else:
-             code = None
-         if not code:
-             continue
-         normalized = str(code).strip().lstrip("A").zfill(6)
-         if normalized and normalized not in codes:
-             codes.append(normalized)
-         if len(codes) >= limit:
-             break
-     return codes
- 
- 
- def run_nontrading_smoke_once(
-     *,
-     runtime_store: RuntimeStore,
-@@ -139,32 +164,32 @@ def run_nontrading_smoke_once(
+         db_store_ok = False
++        db_store_error = None
+         event_id = None
+         if db_store:
+             _check_timeout("db_store")
+             try:
+                 repo = LedgerEventsRepo(engine)
+                 event_id = repo.append_event(
+                     env=env,
+                     run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                     strategy=strategy,
+                     run_window=None,
+                     event_type="NONTRADING_SMOKE",
+                     ts=now,
+                     ok=True,
                      reasons=["nontrading_smoke"],
                      stage="smoke",
                      payload_json={
@@ -259,13 +370,22 @@ index 7628bb789f3ff043ff4c226c2082cd670851addc..5be86906ddebe3cfdc0302d60c6cb613
                          "rows": probe_rows,
                      },
                  )
-                 db_store_ok = True
-             except Exception:
+-                db_store_ok = True
+-            except Exception:
++                db_store_ok = event_id is not None
++            except Exception as exc:
++                db_store_error = repr(exc)
                  logger.exception("[NONTRADING_SMOKE][DB][FAIL] env=%s strategy=%s", env, strategy)
-         result["steps"]["db_store"] = {"enabled": db_store, "wrote_event": event_id, "ok": db_store_ok}
+-        result["steps"]["db_store"] = {"enabled": db_store, "wrote_event": event_id, "ok": db_store_ok}
++        result["steps"]["db_store"] = {
++            "enabled": db_store,
++            "wrote_event": event_id,
++            "ok": db_store_ok,
++            "error": db_store_error,
++        }
          logger.info("[NONTRADING_SMOKE][DB] wrote_event=%s", event_id or "none")
-         if db_store and not db_store_ok:
-             raise RuntimeError("nontrading_smoke db_store failed")
+-        if db_store and not db_store_ok:
+-            raise RuntimeError("nontrading_smoke db_store failed")
  
          result["ok"] = True
      except Exception as exc:
@@ -276,90 +396,10 @@ index 7628bb789f3ff043ff4c226c2082cd670851addc..5be86906ddebe3cfdc0302d60c6cb613
          elapsed = time.monotonic() - start_ts
          result["elapsed_sec"] = round(elapsed, 3)
          try:
--            result_path = Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_result.json"
-+            result_path = nontrading_smoke_result_path(runtime_store, as_of=as_of)
+             result_path = nontrading_smoke_result_path(runtime_store, as_of=as_of)
              result_path.parent.mkdir(parents=True, exist_ok=True)
              result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
          except Exception:
              logger.exception("[NONTRADING_SMOKE][RESULT][WRITE_FAIL]")
          logger.info("[NONTRADING_SMOKE][DONE] ok=%s elapsed=%.2fs", int(result.get("ok")), elapsed)
      return result
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 8aa27f3731724a86f068dbe2ad2058ce56d2b6e5..d2474c2e4738dd41e6da3c041ac663e23eccb95b 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -1283,70 +1283,72 @@ def run_once(
-                 )
-                 window = resolved_window
-                 phase_for_log = resolved_phase
-                 logger.info(
-                     "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
-                     mode_source,
-                     now.isoformat(),
-                     trading_day,
-                     market_window,
-                     mode,
-                 )
-                 logger.info(
-                     "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s phase_window=%s",
-                     now.isoformat(),
-                     window_label,
-                     resolved_phase,
-                     phase_reason,
-                     entry_flag.value,
-                     phase_window,
-                 )
-                 action = "run" if trading_day else "smoke"
-                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
-     if not trading_day:
-         exit_status = "NONTRADING_DAY_EXIT"
-         if mode == "DIAG":
--            smoke_flag = nontrading_smoke_flag_path(runtime_store)
-+            as_of = now.date().isoformat()
-+            smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
-             if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
-                 logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
-             else:
-                 run_nontrading_smoke_once(
-                     runtime_store=runtime_store,
-                     engine=engine,
-                     now=now,
-                     env=(os.getenv("KIS_ENV") or "practice").lower(),
-                     strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
--                    as_of=now.date().isoformat(),
-+                    as_of=as_of,
-                     timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
-                     db_store=NONTRADING_SMOKE_DB_STORE,
-                     force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-                 )
-                 write_nontrading_smoke_flag(
-                     runtime_store,
-                     now=now,
-                     run_id=os.getenv("GITHUB_RUN_ID", "local"),
-                     sha=os.getenv("GITHUB_SHA", "unknown"),
-+                    as_of=as_of,
-                 )
-                 exit_status = "NONTRADING_SMOKE_DONE"
-         if loop_mode:
-             logger.info("[PB1][LOOP] non-trading-day -> skip")
-         else:
-             logger.info("[PB1][SKIP] non-trading-day -> skip")
-         logger.info(
-             "[PB1][EXIT] reason=%s",
-             "nontrading_smoke_done" if exit_status == "NONTRADING_SMOKE_DONE" else "nontrading_day_exit",
-         )
-         return [], False, {}, phase_for_log, exit_status
- 
-     if action == "smoke":
-         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
-         return [], False, {}, phase_for_log, "SMOKE"
- 
-     if not window and not close_cancel_only:
-         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-         return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
- 
-     non_trading_day = not trading_day
-     force_diag = diag_env_flag
- 
-     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
-     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)

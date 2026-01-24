@@ -236,38 +236,58 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     if _should_skip_migrations(engine, migrations_dir):
         return
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
+    migration_files = sorted(
+        [
+            Path(path)
+            for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
+            if Path(path).is_file()
+        ]
+    )
     with engine.begin() as conn:
         url = str(engine.url)
         logger.info("[DB][MIGRATE] external url=%s", url)
         _ensure_schema_migrations_table(conn)
         applied = _list_applied_versions(conn)
 
-        migration_files = sorted(
-            [
-                Path(path)
-                for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
-                if Path(path).is_file()
-            ]
-        )
         for path in migration_files:
             version = path.name
             if version in applied:
                 continue
             sql = path.read_text(encoding="utf-8")
-            logger.info("[DB][MIGRATE] applying %s", version)
+            logger.info("[DB][MIGRATE][APPLY] version=%s", version)
             try:
                 statements = split_postgres_sql(sql)
                 for statement in statements:
-                    _apply_pg_statement(conn, statement)
+                    try:
+                        _apply_pg_statement(conn, statement)
+                    except Exception as exc:
+                        logger.exception(
+                            "[DB][MIGRATE][FAIL] version=%s statement=%s err=%s",
+                            version,
+                            statement,
+                            exc,
+                        )
+                        try:
+                            conn.rollback()
+                            logger.info("[DB][MIGRATE][ROLLBACK] version=%s", version)
+                        except Exception:
+                            logger.exception("[DB][MIGRATE][ROLLBACK_FAIL] version=%s", version)
+                        raise
                 conn.execute(
                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
                     {"version": version},
                 )
             except Exception as exc:
                 snippet = " ".join(sql.split())[:2000]
-                logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
+                logger.exception(
+                    "[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s",
+                    version,
+                    exc,
+                    snippet,
+                )
                 raise
     _write_schema_stamp(migrations_dir)
+    logger.info("[DB][MIGRATE][MIGRATE OK] count=%s", len(migration_files))
 
 
 if __name__ == "__main__":
