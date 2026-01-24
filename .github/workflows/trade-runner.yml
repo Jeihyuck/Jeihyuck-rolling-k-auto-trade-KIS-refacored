@@ -69,7 +69,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
+
       FORCE_NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
       NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
       NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
@@ -99,6 +99,13 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
+
+      - name: Set runtime dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TRADER_RUNTIME_DIR=${RUNNER_TEMP}/trader_runtime" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/trader_runtime"
 
       - name: Assert Postgres-only (startup)
         shell: bash
@@ -159,6 +166,7 @@ jobs:
             db_ok = bool(members)
 
             print(f"[UNIVERSE][EMERGENCY_CHECK] as_of={as_of} db={'Y' if db_ok else 'N'} members={len(members)}")
+
             should_build = "0" if db_ok else "1"
             with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
                 f.write(f"SHOULD_BUILD_UNIVERSE={should_build}\n")
@@ -191,14 +199,17 @@ jobs:
 
           engine = make_engine()
           repo = UniverseRepo(engine)
+
           members = repo.get_universe_members(env, strategy, as_of)
           db_ok = bool(members)
           lkg_ok = lkg_path(env, strategy).exists()
 
-          print(
-              "[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s"
-              % ("Y" if lkg_ok else "N", "Y" if db_ok else "N", as_of, len(members))
-          )
+          print("[UNIVERSE][SAVE] lkg=%s db=%s as_of=%s members=%s" % (
+              "Y" if lkg_ok else "N",
+              "Y" if db_ok else "N",
+              as_of,
+              len(members),
+          ))
           PY
 
       - name: Scan for SQLite artifacts
@@ -223,7 +234,6 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
@@ -273,6 +283,13 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
+
+      - name: Set runtime dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TRADER_RUNTIME_DIR=${RUNNER_TEMP}/trader_runtime" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/trader_runtime"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -333,7 +350,6 @@ jobs:
               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
           )
-
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
@@ -363,6 +379,7 @@ jobs:
             echo "LIVE_TRADING_ENABLED=0"
             echo "DIAG_KIS_CALLS_ENABLED=${DIAG_REHEARSAL_KIS_CALLS}"
           } >> "$GITHUB_ENV"
+
           if [ "${DIAG_REHEARSAL_KIS_CALLS}" = "0" ]; then
             {
               echo "PB1_REQUIRE_BALANCE_FOR_ENTRY=0"
@@ -413,6 +430,7 @@ jobs:
           from trader.botstate_paths import runtime_root
 
           env = (os.getenv("KIS_ENV") or "practice").lower()
+
           engine = make_engine()
           orders_repo = OrdersRepo(engine)
           orders = orders_repo.list_today_orders(env)
@@ -454,7 +472,6 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
@@ -497,6 +514,13 @@ jobs:
           ref: "nullim"
           path: repo
 
+      - name: Set runtime dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TRADER_RUNTIME_DIR=${RUNNER_TEMP}/trader_runtime" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/trader_runtime"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -523,20 +547,18 @@ jobs:
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
           scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
           echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
-
           if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
             echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql:// (and optional +driver)."
             exit 1
           fi
-
           echo "[GUARD] OK: postgres-only"
 
       - name: Run PB1 close-cancel (auto window)
+        env:
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
         run: |
           set -euo pipefail
           python -m trader.pb1_runner --window auto --phase auto
-        env:
-          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
 
       - name: Scan for SQLite artifacts
         if: always()
