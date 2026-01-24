@@ -468,6 +468,18 @@ jobs:
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
 
+      - name: Detect botstate git repo
+        id: botstate_git
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
+            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
+
       - name: Verify hard reset markers (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
         run: |
@@ -482,7 +494,7 @@ jobs:
           fi
 
       - name: Inspect bot_state git status (post tick)
-        if: always()
+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
         run: |
           set -euo pipefail
           cd "$BOTSTATE_WORKTREE_DIR"
@@ -500,7 +512,7 @@ jobs:
           git status --porcelain || true
 
       - name: Persist bot_state (guarded)
-        if: always() && (env.PERSIST_MODE != 'OFF')
+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
         env:
           BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
@@ -675,8 +687,20 @@ jobs:
           STATE_PATH: bot_state/runtime/state.json
           LOT_STATE_PATH: bot_state/runtime/lot_state.json
 
+      - name: Detect botstate git repo
+        id: botstate_git
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
+            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
+
       - name: Persist bot_state (guarded)
-        if: always() && (env.PERSIST_MODE != 'OFF')
+        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
         env:
           BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
         run: |
