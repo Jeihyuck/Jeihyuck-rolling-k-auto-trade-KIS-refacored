@@ -1305,7 +1305,8 @@ def run_once(
     if not trading_day:
         exit_status = "NONTRADING_DAY_EXIT"
         if mode == "DIAG":
-            smoke_flag = nontrading_smoke_flag_path(runtime_store)
+            as_of = now.date().isoformat()
+            smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
             if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
                 logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
             else:
@@ -1315,7 +1316,7 @@ def run_once(
                     now=now,
                     env=(os.getenv("KIS_ENV") or "practice").lower(),
                     strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
-                    as_of=now.date().isoformat(),
+                    as_of=as_of,
                     timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
                     db_store=NONTRADING_SMOKE_DB_STORE,
                     force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
@@ -1325,6 +1326,7 @@ def run_once(
                     now=now,
                     run_id=os.getenv("GITHUB_RUN_ID", "local"),
                     sha=os.getenv("GITHUB_SHA", "unknown"),
+                    as_of=as_of,
                 )
                 exit_status = "NONTRADING_SMOKE_DONE"
         if loop_mode:

@@ -44,6 +44,8 @@ bot_state/runtime/**
 !bot_state/runtime/universe/**
 !bot_state/runtime/reports/
 !bot_state/runtime/reports/**
+!bot_state/runtime/diagnostics/
+!bot_state/runtime/diagnostics/**
 !bot_state/runtime/balance_snapshot.json
 !bot_state/runtime/schema_version.txt
 
@@ -77,6 +79,7 @@ ALLOWLIST_PATTERNS = [
     "bot_state/runtime/status/**",
     "bot_state/runtime/universe/*.json",
     "bot_state/runtime/reports/**",
+    "bot_state/runtime/diagnostics/nontrading_smoke_*",
     "bot_state/universe_lkg/**/latest.json",
     "bot_state/runtime/balance_snapshot.json",
     "bot_state/runtime/schema_version.txt",
@@ -348,17 +351,20 @@ def _safe_rm(path: Path) -> None:
 
 def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
     _git_worktree(worktree_dir, "reset", check=False)
-    bot_state_dir = worktree_dir / "bot_state"
     to_add: list[str] = []
-    for root, _, files in os.walk(bot_state_dir):
-        for name in files:
-            rel = Path(root, name).relative_to(worktree_dir).as_posix()
-            for pattern in allow_patterns:
-                if fnmatch.fnmatch(rel, pattern):
-                    to_add.append(rel)
-                    break
+    status = _run_git_logged(
+        ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_allowlist"
+    ).stdout
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        _, rel = _parse_porcelain_path(line)
+        if not rel:
+            continue
+        if any(fnmatch.fnmatch(rel, pattern) for pattern in allow_patterns):
+            to_add.append(rel)
     if to_add:
-        _git_worktree(worktree_dir, "add", "--", *to_add, check=False)
+        _git_worktree(worktree_dir, "add", "--", *sorted(set(to_add)), check=False)
 
     _safe_rm(worktree_dir / "bot_state" / "archive")
     db_dir = worktree_dir / "bot_state" / "db"

@@ -1,415 +1,294 @@
-diff --git a/trader/config.py b/trader/config.py
-index 316e7c15b69e7bdc6e7c6e56a7bff3fc4f984c08..ba60ab41c6b45fbe4e73c435bd72a8005ac875de 100644
---- a/trader/config.py
-+++ b/trader/config.py
-@@ -81,50 +81,51 @@ CONFIG = {
-     # NEW: 1분봉 VWAP 모멘텀 파라미터
-     "MOM_FAST": "5",        # 1분봉 fast MA 길이
-     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
-     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
-     # Subject flow gate 기본값
-     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
-     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
-     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
-     "SUBJECT_FLOW_RETRY": "1",
-     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
-     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
-     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
-     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
-     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
-     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
-     "EMERGENCY_GLOBAL_SELL": "false",
-     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
-     # Diagnostics
-     "DIAGNOSTIC_MODE": "false",
-     "DIAGNOSTIC_ONLY": "false",
-     "DIAGNOSTIC_FORCE_RUN": "false",
-     "DIAGNOSTIC_DUMP_PATH": "",
-     "DIAGNOSTIC_TARGET_MARKETS": "",
-     "DIAGNOSTIC_MAX_SYMBOLS": "200",
-     "FORCE_NONTRADING_UNIVERSE_SMOKE": "0",
-+    "NONTRADING_SMOKE_FORCE": "0",
-     "NONTRADING_SMOKE_DB_STORE": "1",
-     "NONTRADING_SMOKE_FORCE_REBUILD": "0",
-     "NONTRADING_SMOKE_TIMEOUT_SEC": "180",
-     # === Strategy intent/exec defaults ===
-     "ENABLED_STRATEGIES": "",
-     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
-     "STRATEGY_DRY_RUN": "true",
-     "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
-     "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
-     "STRATEGY_MAX_OPEN_INTENTS": "20",
-     "STRATEGY_MAX_POSITION_PCT": "0.10",
-     "STRATEGY_ALLOW_SELL_ONLY": "false",
-     "STRATEGY_WEIGHTS": "",
-     "DISABLE_KOSDAQ_LOOP": "false",
-     "DISABLE_KOSPI_ENGINE": "false",
-     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
-     "ALLOW_ADOPT_UNMANAGED": "false",
-     "STATE_PATH": "runtime/state.json",
-     # PB1 close-pullback defaults
-     "ENABLE_BREAKOUT": "false",
-     "LEDGER_LOOKBACK_DAYS": "120",
-     "BOTSTATE_LOCK_TTL_SEC": "240",
-     "LEDGER_BASE_DIR": "trader_ledger",
-     "BOT_STATE_RESET": "0",
-     "BOT_STATE_HARD_RESET": "0",
-@@ -441,57 +442,58 @@ DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
- DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
- DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
- _diag_dump_env = os.getenv("DIAGNOSTIC_DUMP_DIR") or os.getenv("DIAGNOSTIC_DUMP_PATH")
- DIAGNOSTIC_DUMP_DIR = Path(_diag_dump_env) if _diag_dump_env else get_cache_root() / "diagnostics"
- ensure_not_repo_tracked_path(DIAGNOSTIC_DUMP_DIR)
- DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
- DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
- DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
- DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index f3b7e5f27073586bcbd0b2e454d98ee7f6e5c1ef..0d3c1415d07a6938d895bd2fe15b93d6bfeb69b8 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -22,83 +22,86 @@ KST = ZoneInfo("Asia/Seoul")
+ BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
+ SYNC_MODE_FETCH_RESET = "FETCH_RESET"
+ BOTSTATE_SYNC_MODE_ENV = "BOTSTATE_SYNC_MODE"  # optional
+ DEFAULT_LOCK_TTL_SEC = 240
+ DEFAULT_LOCK_RETRY_SEC = 70
+ DEFAULT_LOCK_RETRY_SLEEP_SEC = 3
+ DEFAULT_LOCK_BUFFER_SEC = 180
+ DEFAULT_LOCK_GRACE_SEC = 60
+ BOTSTATE_GITIGNORE_TEXT = """\
+ # --- botstate (tracked artifacts) ---
+ # Keep minimal runtime artifacts only.
  
- if DIAGNOSTIC_MODE:
-     STRATEGY_MODE = "INTENT_ONLY"
-     STRATEGY_DRY_RUN = True
-     STRATEGY_ALLOW_SELL_ONLY = True
+ # Ignore runtime by default
+ bot_state/runtime/
+ bot_state/runtime/**
  
- logger.info(
-     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
-     DIAGNOSTIC_MODE,
-     DIAGNOSTIC_ONLY,
-     DIAGNOSTIC_FORCE_RUN,
-     str(DIAGNOSTIC_DUMP_DIR),
-     DIAG_ENABLED,
- )
+ # Allowlist runtime artifacts
+ !bot_state/runtime/events/
+ !bot_state/runtime/events/**
+ !bot_state/runtime/status/
+ !bot_state/runtime/status/**
+ !bot_state/runtime/universe/
+ !bot_state/runtime/universe/**
+ !bot_state/runtime/reports/
+ !bot_state/runtime/reports/**
++!bot_state/runtime/diagnostics/
++!bot_state/runtime/diagnostics/**
+ !bot_state/runtime/balance_snapshot.json
+ !bot_state/runtime/schema_version.txt
  
- FORCE_NONTRADING_UNIVERSE_SMOKE = _cfg_bool("FORCE_NONTRADING_UNIVERSE_SMOKE")
-+NONTRADING_SMOKE_FORCE = _cfg_bool("NONTRADING_SMOKE_FORCE") or FORCE_NONTRADING_UNIVERSE_SMOKE
- NONTRADING_SMOKE_DB_STORE = _cfg_bool("NONTRADING_SMOKE_DB_STORE")
- NONTRADING_SMOKE_FORCE_REBUILD = _cfg_bool("NONTRADING_SMOKE_FORCE_REBUILD")
- NONTRADING_SMOKE_TIMEOUT_SEC = int(_cfg("NONTRADING_SMOKE_TIMEOUT_SEC") or "180")
+ # Large caches MUST NOT be committed
+ bot_state/runtime/ohlcv_cache/
+ bot_state/runtime/ohlcv_cache/**
  
- logger.info(
-     "[CONFIG][NONTRADING_SMOKE] force=%s db_store=%s force_rebuild=%s timeout_sec=%s",
--    FORCE_NONTRADING_UNIVERSE_SMOKE,
-+    NONTRADING_SMOKE_FORCE,
-     NONTRADING_SMOKE_DB_STORE,
-     NONTRADING_SMOKE_FORCE_REBUILD,
-     NONTRADING_SMOKE_TIMEOUT_SEC,
- )
+ # Never commit archive/ or readonly backups
+ bot_state/archive/
+ bot_state/db/
+ bot_state/db/**
+ bot_state/db/*.bak*
+ bot_state/db/*.readonly.bak.*
  
- # 전략별 레짐 축소 우선순위
- def _parse_strategy_priority(raw: str) -> list[int]:
-     priorities: list[int] = []
-     for item in raw.split(","):
-         item = item.strip()
-         if not item:
-             continue
-         try:
-             value = int(item)
-         except ValueError:
-             continue
-         if 1 <= value <= 5 and value not in priorities:
-             priorities.append(value)
-     return priorities or [5, 4, 3, 2, 1]
+ # Runtime DB artifacts (should never be created)
+ **/*.sqlite3
+ **/*.sqlite3-wal
+ **/*.sqlite3-shm
+ **/*.db
+ **/*.db-wal
+ **/*.db-shm
+ 
+ # Python / OS noise
+ .DS_Store
+ __pycache__/
+ *.pyc
+ """
+ 
+ ALLOWLIST_PATTERNS = [
+     "bot_state/runtime/events/*.jsonl",
+     "bot_state/runtime/status/**",
+     "bot_state/runtime/universe/*.json",
+     "bot_state/runtime/reports/**",
++    "bot_state/runtime/diagnostics/nontrading_smoke_*",
+     "bot_state/universe_lkg/**/latest.json",
+     "bot_state/runtime/balance_snapshot.json",
+     "bot_state/runtime/schema_version.txt",
+     "bot_state/runtime/runtime_meta.json",
+ ]
+ 
+ CLEAN_PATTERNS = [
+     "bot_state/archive/**",
+     "bot_state/runtime/ohlcv_cache/**",
+     "bot_state/db/*.bak*",
+     "bot_state/db/*.sqlite3",
+     "bot_state/db/*.sqlite3-wal",
+     "bot_state/db/*.sqlite3-shm",
+     "bot_state/db/*.db",
+     "bot_state/db/*.db-wal",
+     "bot_state/db/*.db-shm",
+ ]
  
  
- STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
-     _cfg("STRATEGY_REDUCTION_PRIORITY")
- )
+ @dataclass(frozen=True)
+ class DirtyStatSnapshot:
+     events: tuple[int, float | None, int]
+     universe: tuple[int, float | None, int]
+     last_seen_positions: tuple[float, int] | None
+     positions_snapshot: tuple[float, int] | None
+@@ -326,61 +329,64 @@ def _run_git_logged(args: list[str], cwd: Path, *, check: bool = True, label: st
+ def git_porcelain(worktree_dir: Path) -> str:
+     return _git_worktree(worktree_dir, "status", "--porcelain").stdout
  
-diff --git a/trader/diagnostics/nontrading_smoke.py b/trader/diagnostics/nontrading_smoke.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..7628bb789f3ff043ff4c226c2082cd670851addc
---- /dev/null
-+++ b/trader/diagnostics/nontrading_smoke.py
-@@ -0,0 +1,170 @@
-+from __future__ import annotations
-+
-+import json
-+import logging
-+import os
-+import time
-+from datetime import datetime
-+from pathlib import Path
-+
-+from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-+from trader.db.repos import LedgerEventsRepo
-+from trader.kis_wrapper import KisAPI
-+from trader.runtime_store import RuntimeStore
-+
-+logger = logging.getLogger(__name__)
-+
-+
-+def nontrading_smoke_flag_path(runtime_store: RuntimeStore) -> Path:
-+    return Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_once.flag"
-+
-+
-+def write_nontrading_smoke_flag(
-+    runtime_store: RuntimeStore,
-+    *,
-+    now: datetime,
-+    run_id: str,
-+    sha: str,
-+) -> Path:
-+    flag = nontrading_smoke_flag_path(runtime_store)
-+    flag.parent.mkdir(parents=True, exist_ok=True)
-+    flag.write_text(f"{now.isoformat()} run_id={run_id} sha={sha}\n", encoding="utf-8")
-+    return flag
-+
-+
-+def _select_probe_codes(members: list[dict], limit: int = 3) -> list[str]:
-+    codes: list[str] = []
-+    for member in members:
-+        if isinstance(member, dict):
-+            code = member.get("code") or member.get("symbol") or member.get("ticker")
-+        else:
-+            code = None
-+        if not code:
+ 
+ def stage_all(worktree_dir: Path) -> None:
+     _git_worktree(worktree_dir, "add", "-A")
+ 
+ 
+ def stage_runtime_universe(worktree_dir: Path) -> None:
+     for spec in ALLOWLIST_PATTERNS:
+         _git_worktree(worktree_dir, "add", "-A", "--", spec, check=False)
+ 
+ 
+ def _safe_rm(path: Path) -> None:
+     try:
+         if path.is_dir():
+             shutil.rmtree(path, ignore_errors=True)
+         elif path.exists():
+             path.unlink()
+     except Exception:
+         logger.info("[BOTSTATE][PERSIST][CLEANUP_SKIP] path=%s", path, exc_info=True)
+ 
+ 
+ def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
+     _git_worktree(worktree_dir, "reset", check=False)
+-    bot_state_dir = worktree_dir / "bot_state"
+     to_add: list[str] = []
+-    for root, _, files in os.walk(bot_state_dir):
+-        for name in files:
+-            rel = Path(root, name).relative_to(worktree_dir).as_posix()
+-            for pattern in allow_patterns:
+-                if fnmatch.fnmatch(rel, pattern):
+-                    to_add.append(rel)
+-                    break
++    status = _run_git_logged(
++        ["status", "--porcelain"], worktree_dir, check=True, label="status_porcelain_allowlist"
++    ).stdout
++    for line in status.splitlines():
++        if not line.strip():
 +            continue
-+        normalized = str(code).strip().lstrip("A").zfill(6)
-+        if normalized and normalized not in codes:
-+            codes.append(normalized)
-+        if len(codes) >= limit:
-+            break
-+    return codes
-+
-+
-+def run_nontrading_smoke_once(
-+    *,
-+    runtime_store: RuntimeStore,
-+    engine,
-+    now: datetime,
-+    env: str,
-+    strategy: str,
-+    as_of: str,
-+    timeout_sec: int,
-+    db_store: bool,
-+    force_rebuild: bool,
-+) -> dict:
-+    start_ts = time.monotonic()
-+    result: dict = {"ok": False, "steps": {}}
-+    logger.info(
-+        "[NONTRADING_SMOKE][START] as_of=%s timeout_sec=%s db_store=%s force_rebuild=%s",
-+        as_of,
-+        timeout_sec,
-+        int(db_store),
-+        int(force_rebuild),
-+    )
-+
-+    def _check_timeout(stage: str) -> None:
-+        elapsed = time.monotonic() - start_ts
-+        if elapsed > timeout_sec:
-+            raise TimeoutError(f"nontrading_smoke timeout stage={stage} elapsed={elapsed:.1f}s")
-+
-+    try:
-+        _check_timeout("universe_load")
-+        members, meta = runtime_store.load_today_universe(as_of)
-+        if not members and force_rebuild:
-+            runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
-+            members, meta = runtime_store.load_today_universe(as_of)
-+        if not members:
-+            members, meta = runtime_store.load_universe_for_trading(as_of)
-+        member_count = len(members)
-+        result["steps"]["universe"] = {
-+            "members": member_count,
-+            "today_path": meta.get("today_path"),
-+            "selected_path": meta.get("selected_path"),
-+        }
-+        logger.info("[NONTRADING_SMOKE][UNIVERSE] members=%s", member_count)
-+        if member_count <= 0:
-+            raise RuntimeError("nontrading_smoke empty universe")
-+
-+        _check_timeout("probe_prepare")
-+        try:
-+            kis = KisAPI(env=env)
-+        except Exception as exc:
-+            logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
-+            kis = None
-+        providers = [KISOHLCVProvider(kis)] if kis else []
-+        providers.append(KRXOHLCVProvider())
-+        chain = ChainOHLCVProvider(providers, env=env)
-+
-+        codes = _select_probe_codes(members, limit=3)
-+        if not codes:
-+            raise RuntimeError("nontrading_smoke missing probe codes")
-+        probe_rows: dict[str, int] = {}
-+        probe_ok = True
-+        for code in codes:
-+            _check_timeout("probe_fetch")
-+            probe = chain.get_ohlcv(code, days=5)
-+            df = probe.df
-+            rows = len(df) if df is not None else 0
-+            probe_rows[code] = rows
-+            if rows <= 0:
-+                probe_ok = False
-+        result["steps"]["probe"] = {"codes": codes, "rows": probe_rows, "ok": probe_ok}
-+        logger.info("[NONTRADING_SMOKE][PROBE] codes=%s ok=%s", codes, int(probe_ok))
-+        if not probe_ok:
-+            raise RuntimeError("nontrading_smoke probe empty")
-+
-+        db_store_ok = False
-+        event_id = None
-+        if db_store:
-+            _check_timeout("db_store")
-+            try:
-+                repo = LedgerEventsRepo(engine)
-+                event_id = repo.append_event(
-+                    env=env,
-+                    run_id=os.getenv("GITHUB_RUN_ID", "local"),
-+                    strategy=strategy,
-+                    run_window=None,
-+                    event_type="NONTRADING_SMOKE",
-+                    ts=now,
-+                    ok=True,
-+                    reasons=["nontrading_smoke"],
-+                    stage="smoke",
-+                    payload_json={
-+                        "as_of": as_of,
-+                        "codes": codes,
-+                        "rows": probe_rows,
-+                    },
-+                )
-+                db_store_ok = True
-+            except Exception:
-+                logger.exception("[NONTRADING_SMOKE][DB][FAIL] env=%s strategy=%s", env, strategy)
-+        result["steps"]["db_store"] = {"enabled": db_store, "wrote_event": event_id, "ok": db_store_ok}
-+        logger.info("[NONTRADING_SMOKE][DB] wrote_event=%s", event_id or "none")
-+        if db_store and not db_store_ok:
-+            raise RuntimeError("nontrading_smoke db_store failed")
-+
-+        result["ok"] = True
-+    except Exception as exc:
-+        logger.exception("[NONTRADING_SMOKE][FAIL] err=%s", exc)
-+        result["ok"] = False
-+        result["error"] = repr(exc)
-+    finally:
-+        elapsed = time.monotonic() - start_ts
-+        result["elapsed_sec"] = round(elapsed, 3)
-+        try:
-+            result_path = Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_result.json"
-+            result_path.parent.mkdir(parents=True, exist_ok=True)
-+            result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-+        except Exception:
-+            logger.exception("[NONTRADING_SMOKE][RESULT][WRITE_FAIL]")
-+        logger.info("[NONTRADING_SMOKE][DONE] ok=%s elapsed=%.2fs", int(result.get("ok")), elapsed)
-+    return result
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 6097176bfacf3e0f4d4e5ad9d23ddae81fb4ee71..8aa27f3731724a86f068dbe2ad2058ce56d2b6e5 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -3,105 +3,110 @@ from __future__ import annotations
- import argparse
++        _, rel = _parse_porcelain_path(line)
++        if not rel:
++            continue
++        if any(fnmatch.fnmatch(rel, pattern) for pattern in allow_patterns):
++            to_add.append(rel)
+     if to_add:
+-        _git_worktree(worktree_dir, "add", "--", *to_add, check=False)
++        _git_worktree(worktree_dir, "add", "--", *sorted(set(to_add)), check=False)
+ 
+     _safe_rm(worktree_dir / "bot_state" / "archive")
+     db_dir = worktree_dir / "bot_state" / "db"
+     if db_dir.is_dir():
+         for entry in db_dir.iterdir():
+             if ".readonly.bak." in entry.name:
+                 _safe_rm(entry)
+ 
+ 
+ def _parse_porcelain_path(line: str) -> tuple[str, str]:
+     status = line[:2]
+     path = line[3:].strip()
+     if "->" in path:
+         path = path.split("->")[-1].strip()
+     return status, path
+ 
+ 
+ def _clean_non_allowlisted_changes(
+     worktree_dir: Path,
+     status_lines: list[str],
+     patterns: list[str],
+ ) -> tuple[int, int]:
+     reverted_deleted = 0
+     cleaned_untracked = 0
+     for line in status_lines:
+diff --git a/trader/diagnostics/nontrading_smoke.py b/trader/diagnostics/nontrading_smoke.py
+index 7628bb789f3ff043ff4c226c2082cd670851addc..5be86906ddebe3cfdc0302d60c6cb61355ef54c8 100644
+--- a/trader/diagnostics/nontrading_smoke.py
++++ b/trader/diagnostics/nontrading_smoke.py
+@@ -1,54 +1,79 @@
+ from __future__ import annotations
+ 
  import json
  import logging
  import os
- import subprocess
- import signal
- import traceback
- import time as time_mod
- import copy
- from datetime import datetime, time as dtime, timedelta
+ import time
+ from datetime import datetime
  from pathlib import Path
- from zoneinfo import ZoneInfo
  
- from trader.config import (
-     AFTERNOON_WINDOW_END,
-     AFTERNOON_WINDOW_START,
-     BOT_STATE_RESET,
-     BOT_STATE_HARD_RESET,
-     BOT_STATE_RESET_CASH_MAX_KRW,
-     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
-     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
-     CLOSE_AUCTION_END,
-     CLOSE_AUCTION_START,
-     DIAGNOSTIC_MODE,
-     DIAGNOSTIC_ONLY,
--    FORCE_NONTRADING_UNIVERSE_SMOKE,
-     LEDGER_BASE_DIR,
-     LEDGER_LOOKBACK_DAYS,
-     MARKET_CLOSE_HHMM,
-     MARKET_OPEN_HHMM,
-     MORNING_EXIT_END,
-     MORNING_EXIT_START,
-     MORNING_WINDOW_END,
-     MORNING_WINDOW_START,
-     NONTRADING_SMOKE_DB_STORE,
-+    NONTRADING_SMOKE_FORCE,
-     NONTRADING_SMOKE_FORCE_REBUILD,
-     NONTRADING_SMOKE_TIMEOUT_SEC,
-     PB1_ALLOW_PREOPEN_ENTRY,
-     PB1_PREOPEN_END,
-     PB1_PREOPEN_MAX_NEW_POSITIONS,
-     PB1_PREOPEN_REQUIRE_BALANCE,
-     PB1_PREOPEN_START,
-     PB1_ENTRY_ENABLED,
-     PB1_ENTRY_WINDOW_END,
-     PB1_EXIT_WINDOW_END,
-     PB1_MORNING_WINDOW_END,
-     PB1_REQUIRE_BALANCE_FOR_ENTRY,
-     PB1_FORCE_ENTRY_ON_PUSH,
-     PB1_MAX_WAIT_FOR_WINDOW_MIN,
-     PB1_WAIT_FOR_WINDOW,
-     PAPER_MAX_CAPITAL_KRW,
-     PAPER_RESET_AUTO_PURGE,
-     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
-     resolve_strategy_mode,
- )
- from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
- from trader.botstate_sync import (
-     BotStateContext,
-     acquire_lock as acquire_botstate_lock,
-     compute_lock_ttl,
-     hard_reset_bot_state,
-     persist_or_fail,
-     persist_run_files,
-     release_lock as release_botstate_lock,
-     resolve_botstate_worktree_dir,
-     setup_worktree,
- )
- from trader.db.engine import make_engine
- from trader.db.health import assert_db_ready
- from trader.db.lock import release_lock, try_acquire_lock
- from trader.db.migrate import run_migrations
- from trader.db.repos import (
-     FillsRepo,
-     LedgerEventsRepo,
-     OrdersRepo,
-     PositionsRepo,
-     ReconcileLogRepo,
-     RunsRepo,
-     UniverseRepo,
- )
-+from trader.diagnostics.nontrading_smoke import (
-+    nontrading_smoke_flag_path,
-+    run_nontrading_smoke_once,
-+    write_nontrading_smoke_flag,
-+)
- from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
- from trader.ledger.store import LedgerStore
- from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
- from trader.reconcile_kis import reconcile_kis, reconcile_today
- from trader.reconcile_db import close_stale_positions
- from trader.reset_utils import (
-     detect_account_fp,
-     load_reset_guard,
-     purge_bot_state,
-     record_purge_event,
-     should_purge_on_empty_kis_holdings,
-     update_reset_guard_from_balance,
- )
- from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
- from trader.time_utils import now_kst
- from trader.eventlog import emit_event
- from trader.utils.env import env_bool, parse_env_flag, resolve_mode
- from trader.utils.json_sanitize import to_jsonable
- from trader.window_router import WindowDecision, decide_window
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.db.repos import LedgerEventsRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.runtime_store import RuntimeStore
  
  logger = logging.getLogger(__name__)
- log = logger
  
- _WINDOW_MISMATCH_LOGGED = False
- _CURRENT_BOTSTATE: dict | None = None
-@@ -1275,79 +1280,84 @@ def run_once(
-                     market_window=market_window,
-                     window_override=args.window,
-                     phase_seed=phase_seed,
+ 
+-def nontrading_smoke_flag_path(runtime_store: RuntimeStore) -> Path:
+-    return Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_once.flag"
++def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> str:
++    if as_of:
++        return as_of
++    if now is None:
++        now = datetime.now()
++    return now.date().isoformat()
++
++
++def nontrading_smoke_flag_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
++    suffix = _nontrading_smoke_suffix(as_of)
++    return (
++        Path(runtime_store.base_dir)
++        / "runtime"
++        / "diagnostics"
++        / f"nontrading_smoke_once_{suffix}.flag"
++    )
++
++
++def nontrading_smoke_result_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
++    suffix = _nontrading_smoke_suffix(as_of)
++    return (
++        Path(runtime_store.base_dir)
++        / "runtime"
++        / "diagnostics"
++        / f"nontrading_smoke_result_{suffix}.json"
++    )
+ 
+ 
+ def write_nontrading_smoke_flag(
+     runtime_store: RuntimeStore,
+     *,
+     now: datetime,
+     run_id: str,
+     sha: str,
++    as_of: str | None = None,
+ ) -> Path:
+-    flag = nontrading_smoke_flag_path(runtime_store)
++    flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of or now.date().isoformat())
+     flag.parent.mkdir(parents=True, exist_ok=True)
+     flag.write_text(f"{now.isoformat()} run_id={run_id} sha={sha}\n", encoding="utf-8")
+     return flag
+ 
+ 
+ def _select_probe_codes(members: list[dict], limit: int = 3) -> list[str]:
+     codes: list[str] = []
+     for member in members:
+         if isinstance(member, dict):
+             code = member.get("code") or member.get("symbol") or member.get("ticker")
+         else:
+             code = None
+         if not code:
+             continue
+         normalized = str(code).strip().lstrip("A").zfill(6)
+         if normalized and normalized not in codes:
+             codes.append(normalized)
+         if len(codes) >= limit:
+             break
+     return codes
+ 
+ 
+ def run_nontrading_smoke_once(
+     *,
+     runtime_store: RuntimeStore,
+@@ -139,32 +164,32 @@ def run_nontrading_smoke_once(
+                     reasons=["nontrading_smoke"],
+                     stage="smoke",
+                     payload_json={
+                         "as_of": as_of,
+                         "codes": codes,
+                         "rows": probe_rows,
+                     },
+                 )
+                 db_store_ok = True
+             except Exception:
+                 logger.exception("[NONTRADING_SMOKE][DB][FAIL] env=%s strategy=%s", env, strategy)
+         result["steps"]["db_store"] = {"enabled": db_store, "wrote_event": event_id, "ok": db_store_ok}
+         logger.info("[NONTRADING_SMOKE][DB] wrote_event=%s", event_id or "none")
+         if db_store and not db_store_ok:
+             raise RuntimeError("nontrading_smoke db_store failed")
+ 
+         result["ok"] = True
+     except Exception as exc:
+         logger.exception("[NONTRADING_SMOKE][FAIL] err=%s", exc)
+         result["ok"] = False
+         result["error"] = repr(exc)
+     finally:
+         elapsed = time.monotonic() - start_ts
+         result["elapsed_sec"] = round(elapsed, 3)
+         try:
+-            result_path = Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_result.json"
++            result_path = nontrading_smoke_result_path(runtime_store, as_of=as_of)
+             result_path.parent.mkdir(parents=True, exist_ok=True)
+             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+         except Exception:
+             logger.exception("[NONTRADING_SMOKE][RESULT][WRITE_FAIL]")
+         logger.info("[NONTRADING_SMOKE][DONE] ok=%s elapsed=%.2fs", int(result.get("ok")), elapsed)
+     return result
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 8aa27f3731724a86f068dbe2ad2058ce56d2b6e5..d2474c2e4738dd41e6da3c041ac663e23eccb95b 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -1283,70 +1283,72 @@ def run_once(
                  )
                  window = resolved_window
                  phase_for_log = resolved_phase
@@ -432,60 +311,44 @@ index 6097176bfacf3e0f4d4e5ad9d23ddae81fb4ee71..8aa27f3731724a86f068dbe2ad2058ce
                  )
                  action = "run" if trading_day else "smoke"
                  logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
--    else:
--        if not trading_day:
--            if FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
--                run_nontrading_universe_smoke(
-+    if not trading_day:
-+        exit_status = "NONTRADING_DAY_EXIT"
-+        if mode == "DIAG":
-+            smoke_flag = nontrading_smoke_flag_path(runtime_store)
-+            if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
-+                logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
-+            else:
-+                run_nontrading_smoke_once(
+     if not trading_day:
+         exit_status = "NONTRADING_DAY_EXIT"
+         if mode == "DIAG":
+-            smoke_flag = nontrading_smoke_flag_path(runtime_store)
++            as_of = now.date().isoformat()
++            smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
+             if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
+                 logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
+             else:
+                 run_nontrading_smoke_once(
                      runtime_store=runtime_store,
                      engine=engine,
                      now=now,
                      env=(os.getenv("KIS_ENV") or "practice").lower(),
                      strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
--                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
--                    db_store=NONTRADING_SMOKE_DB_STORE,
-+                    as_of=now.date().isoformat(),
+-                    as_of=now.date().isoformat(),
++                    as_of=as_of,
                      timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
-+                    db_store=NONTRADING_SMOKE_DB_STORE,
-+                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-+                )
-+                write_nontrading_smoke_flag(
-+                    runtime_store,
-+                    now=now,
-+                    run_id=os.getenv("GITHUB_RUN_ID", "local"),
-+                    sha=os.getenv("GITHUB_SHA", "unknown"),
+                     db_store=NONTRADING_SMOKE_DB_STORE,
+                     force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
                  )
--                return [], False, {}, phase_for_log, "SMOKE"
-+                exit_status = "NONTRADING_SMOKE_DONE"
-+        if loop_mode:
+                 write_nontrading_smoke_flag(
+                     runtime_store,
+                     now=now,
+                     run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                     sha=os.getenv("GITHUB_SHA", "unknown"),
++                    as_of=as_of,
+                 )
+                 exit_status = "NONTRADING_SMOKE_DONE"
+         if loop_mode:
              logger.info("[PB1][LOOP] non-trading-day -> skip")
--            return [], False, {}, phase_for_log, "SKIPPED"
--
--    if not trading_day and FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
--        run_nontrading_universe_smoke(
--            runtime_store=runtime_store,
--            engine=engine,
--            now=now,
--            env=(os.getenv("KIS_ENV") or "practice").lower(),
--            strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
--            force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
--            db_store=NONTRADING_SMOKE_DB_STORE,
--            timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
-+        else:
-+            logger.info("[PB1][SKIP] non-trading-day -> skip")
-+        logger.info(
-+            "[PB1][EXIT] reason=%s",
-+            "nontrading_smoke_done" if exit_status == "NONTRADING_SMOKE_DONE" else "nontrading_day_exit",
+         else:
+             logger.info("[PB1][SKIP] non-trading-day -> skip")
+         logger.info(
+             "[PB1][EXIT] reason=%s",
+             "nontrading_smoke_done" if exit_status == "NONTRADING_SMOKE_DONE" else "nontrading_day_exit",
          )
--        return [], False, {}, phase_for_log, "SMOKE"
-+        return [], False, {}, phase_for_log, exit_status
+         return [], False, {}, phase_for_log, exit_status
  
      if action == "smoke":
          _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
@@ -500,69 +363,3 @@ index 6097176bfacf3e0f4d4e5ad9d23ddae81fb4ee71..8aa27f3731724a86f068dbe2ad2058ce
  
      dry_run_flag = parse_env_flag("DRY_RUN", default=False)
      disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
-     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
-     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-     mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-     dry_run_reasons: list[str] = []
-     diag_enabled = force_diag
-     if diag_enabled:
-         dry_run_reasons.append("diagnostic_mode")
-     if mode_resolved == "INTENT_ONLY":
-         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
-     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
-         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
-@@ -2159,50 +2169,54 @@ def _run_loop(*, args: argparse.Namespace) -> None:
-                     sleep_for,
-                     next_start.isoformat() if next_start else "unknown",
-                 )
-                 time_mod.sleep(sleep_for)
-                 continue
- 
-             if loop_deadline_ts and time_mod.monotonic() > loop_deadline_ts:
-                 logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
-                 exit_reason = "deadline_exceeded_pre_trade"
-                 break
-             remaining_budget_s = 0
-             if loop_deadline_ts:
-                 remaining_budget_s = max(0, int(loop_deadline_ts - time_mod.monotonic()))
-             try:
-                 touched, _did_work, metrics, last_phase, result_status = run_once(
-                     args=args,
-                     engine=engine,
-                     loop_mode=True,
-                     window=window,
-                     bot_state_dir=botstate_ctx.bot_state_dir,
-                     max_seconds=remaining_budget_s,
-                 )
-                 balance_api_calls += metrics.get("balance_api_calls", 0)
-                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
-                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
-+                if result_status in {"NONTRADING_SMOKE_DONE", "NONTRADING_DAY_EXIT"}:
-+                    logger.info("[PB1][LOOP] non-trading-day exit status=%s", result_status)
-+                    exit_reason = result_status.lower()
-+                    break
-                 if result_status == "NO_TRADE":
-                     logger.info("[PB1][LOOP] no trade -> exit")
-                     exit_reason = "no_candidates"
-                     break
-                 if touched:
-                     _write_change_flag(True, ["touched_files"])
-                 for path in touched:
-                     pending_touched[path] = path
-                 if pending_touched:
-                     now_ts = time_mod.monotonic()
-                     urgent = _is_urgent_persist(list(pending_touched.values()))
-                     if urgent or (now_ts - last_persist_ts >= persist_interval):
-                         persist_run_files(
-                             botstate_ctx.worktree_dir,
-                             list(pending_touched.values()),
-                             message=f"pb1 loop {now.isoformat()}",
-                         )
-                         pending_touched.clear()
-                         last_persist_ts = now_ts
-             except Exception as exc:
-                 logger.error(
-                     "[PB1][TICK][FATAL_GUARD] exception=%s\n%s",
-                     exc,
-                     traceback.format_exc(),
-                 )

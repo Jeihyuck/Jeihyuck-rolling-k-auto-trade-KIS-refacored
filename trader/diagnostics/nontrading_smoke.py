@@ -15,8 +15,32 @@ from trader.runtime_store import RuntimeStore
 logger = logging.getLogger(__name__)
 
 
-def nontrading_smoke_flag_path(runtime_store: RuntimeStore) -> Path:
-    return Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_once.flag"
+def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> str:
+    if as_of:
+        return as_of
+    if now is None:
+        now = datetime.now()
+    return now.date().isoformat()
+
+
+def nontrading_smoke_flag_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
+    suffix = _nontrading_smoke_suffix(as_of)
+    return (
+        Path(runtime_store.base_dir)
+        / "runtime"
+        / "diagnostics"
+        / f"nontrading_smoke_once_{suffix}.flag"
+    )
+
+
+def nontrading_smoke_result_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
+    suffix = _nontrading_smoke_suffix(as_of)
+    return (
+        Path(runtime_store.base_dir)
+        / "runtime"
+        / "diagnostics"
+        / f"nontrading_smoke_result_{suffix}.json"
+    )
 
 
 def write_nontrading_smoke_flag(
@@ -25,8 +49,9 @@ def write_nontrading_smoke_flag(
     now: datetime,
     run_id: str,
     sha: str,
+    as_of: str | None = None,
 ) -> Path:
-    flag = nontrading_smoke_flag_path(runtime_store)
+    flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of or now.date().isoformat())
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(f"{now.isoformat()} run_id={run_id} sha={sha}\n", encoding="utf-8")
     return flag
@@ -161,7 +186,7 @@ def run_nontrading_smoke_once(
         elapsed = time.monotonic() - start_ts
         result["elapsed_sec"] = round(elapsed, 3)
         try:
-            result_path = Path(runtime_store.base_dir) / "runtime" / "diagnostics" / "nontrading_smoke_result.json"
+            result_path = nontrading_smoke_result_path(runtime_store, as_of=as_of)
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         except Exception:
