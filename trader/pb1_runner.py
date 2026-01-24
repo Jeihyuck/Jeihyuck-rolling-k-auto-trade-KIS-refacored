@@ -25,7 +25,6 @@ from trader.config import (
     CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
     DIAGNOSTIC_ONLY,
-    FORCE_NONTRADING_UNIVERSE_SMOKE,
     LEDGER_BASE_DIR,
     LEDGER_LOOKBACK_DAYS,
     MARKET_CLOSE_HHMM,
@@ -35,6 +34,7 @@ from trader.config import (
     MORNING_WINDOW_END,
     MORNING_WINDOW_START,
     NONTRADING_SMOKE_DB_STORE,
+    NONTRADING_SMOKE_FORCE,
     NONTRADING_SMOKE_FORCE_REBUILD,
     NONTRADING_SMOKE_TIMEOUT_SEC,
     PB1_ALLOW_PREOPEN_ENTRY,
@@ -79,6 +79,11 @@ from trader.db.repos import (
     ReconcileLogRepo,
     RunsRepo,
     UniverseRepo,
+)
+from trader.diagnostics.nontrading_smoke import (
+    nontrading_smoke_flag_path,
+    run_nontrading_smoke_once,
+    write_nontrading_smoke_flag,
 )
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.ledger.store import LedgerStore
@@ -1297,35 +1302,40 @@ def run_once(
                 )
                 action = "run" if trading_day else "smoke"
                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
-    else:
-        if not trading_day:
-            if FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
-                run_nontrading_universe_smoke(
+    if not trading_day:
+        exit_status = "NONTRADING_DAY_EXIT"
+        if mode == "DIAG":
+            smoke_flag = nontrading_smoke_flag_path(runtime_store)
+            if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
+                logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
+            else:
+                run_nontrading_smoke_once(
                     runtime_store=runtime_store,
                     engine=engine,
                     now=now,
                     env=(os.getenv("KIS_ENV") or "practice").lower(),
                     strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
-                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-                    db_store=NONTRADING_SMOKE_DB_STORE,
+                    as_of=now.date().isoformat(),
                     timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+                    db_store=NONTRADING_SMOKE_DB_STORE,
+                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
                 )
-                return [], False, {}, phase_for_log, "SMOKE"
+                write_nontrading_smoke_flag(
+                    runtime_store,
+                    now=now,
+                    run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                    sha=os.getenv("GITHUB_SHA", "unknown"),
+                )
+                exit_status = "NONTRADING_SMOKE_DONE"
+        if loop_mode:
             logger.info("[PB1][LOOP] non-trading-day -> skip")
-            return [], False, {}, phase_for_log, "SKIPPED"
-
-    if not trading_day and FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
-        run_nontrading_universe_smoke(
-            runtime_store=runtime_store,
-            engine=engine,
-            now=now,
-            env=(os.getenv("KIS_ENV") or "practice").lower(),
-            strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
-            force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-            db_store=NONTRADING_SMOKE_DB_STORE,
-            timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+        else:
+            logger.info("[PB1][SKIP] non-trading-day -> skip")
+        logger.info(
+            "[PB1][EXIT] reason=%s",
+            "nontrading_smoke_done" if exit_status == "NONTRADING_SMOKE_DONE" else "nontrading_day_exit",
         )
-        return [], False, {}, phase_for_log, "SMOKE"
+        return [], False, {}, phase_for_log, exit_status
 
     if action == "smoke":
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
@@ -2181,6 +2191,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
+                if result_status in {"NONTRADING_SMOKE_DONE", "NONTRADING_DAY_EXIT"}:
+                    logger.info("[PB1][LOOP] non-trading-day exit status=%s", result_status)
+                    exit_reason = result_status.lower()
+                    break
                 if result_status == "NO_TRADE":
                     logger.info("[PB1][LOOP] no trade -> exit")
                     exit_reason = "no_candidates"
