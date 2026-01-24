@@ -27,6 +27,7 @@ def _unique_archive_path(archive_dir: Path, name: str) -> Path:
 
 def purge_bot_state(bot_state_dir: Path, archive_dir: Path, reason: str) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
+    purge_sqlite_artifacts(bot_state_dir, reason=f"{reason}:pre_purge")
     targets: list[Path] = []
     runtime_dir = bot_state_dir / "runtime"
     purge_universe = os.getenv("PURGE_UNIVERSE") == "1"
@@ -35,7 +36,7 @@ def purge_bot_state(bot_state_dir: Path, archive_dir: Path, reason: str) -> None
             if child.name == "universe" and not purge_universe:
                 continue
             targets.append(child)
-    for rel in ("trader_ledger", "db"):
+    for rel in ("trader_ledger",):
         targets.append(bot_state_dir / rel)
     for pattern in ("positions*", "*state*"):
         targets.extend(sorted(bot_state_dir.glob(pattern)))
@@ -64,6 +65,30 @@ def purge_bot_state(bot_state_dir: Path, archive_dir: Path, reason: str) -> None
                 src,
                 dest,
             )
+
+
+def purge_sqlite_artifacts(bot_state_dir: Path, reason: str) -> list[Path]:
+    removed: list[Path] = []
+    if not bot_state_dir.exists():
+        return removed
+    for db_dir in sorted({p for p in bot_state_dir.rglob("db") if p.is_dir()}):
+        try:
+            shutil.rmtree(db_dir)
+            removed.append(db_dir)
+        except Exception:
+            logger.exception("[STATE][PURGE_SQLITE] reason=%s path=%s removed=0", reason, db_dir)
+    for pattern in ("*.sqlite3*", "*.db"):
+        for entry in sorted(bot_state_dir.rglob(pattern)):
+            if not entry.is_file():
+                continue
+            try:
+                entry.unlink()
+                removed.append(entry)
+            except Exception:
+                logger.exception("[STATE][PURGE_SQLITE] reason=%s path=%s removed=0", reason, entry)
+    if removed:
+        logger.warning("[STATE][PURGE_SQLITE] reason=%s removed=%s", reason, len(removed))
+    return removed
 
 
 def _reset_guard_path(bot_state_dir: Path) -> Path:

@@ -58,6 +58,8 @@ bot_state/archive/
 # Runtime DB artifacts (should never be created)
 db/
 db/**
+bot_state/**/db/
+bot_state/archive/**/db/
 *.sqlite3
 *.sqlite3.*
 *.db

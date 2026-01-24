@@ -1,26 +1,12 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e76b0ccb19 100644
+index ca310c480f67d4cb2114dae12f313af129d12b86..dedd9780eafa554b2e3e3e65c5af444262ee7a13 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -99,50 +99,55 @@ jobs:
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
-           ref: "nullim"
-           path: repo
- 
-       - name: Assert Postgres-only + SSOT (startup)
-         shell: bash
-         run: |
-           set -euo pipefail
+@@ -114,50 +114,58 @@ jobs:
            : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-           if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-             echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
+           # allow: postgres://, postgresql://, postgresql+psycopg://, postgresql+psycopg2:// etc.
+           if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+             echo "::error::PBCORE_DB_URL must be postgres-only."
              exit 1
            fi
            if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
@@ -28,11 +14,11 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
              ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
              exit 1
            fi
-+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-+            echo "::error::repo contains tracked bot_state. SSOT violated."
-+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-+            exit 1
-+          fi
+           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+             echo "::error::repo contains tracked bot_state. SSOT violated."
+             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+             exit 1
+           fi
  
        - name: Checkout bot-state branch
          uses: actions/checkout@v4
@@ -40,8 +26,16 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
            fetch-depth: 0
            ref: "bot-state"
            path: botstate
-           token: ${{ secrets.GITHUB_TOKEN }}
+           token: ${{ github.token }}
  
++      - name: Purge SQLite artifacts (botstate)
++        shell: bash
++        run: |
++          set -euo pipefail
++          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
++          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
++          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
++
        - name: Compute BOT_STATE_DIR (runtime)
          shell: bash
          run: |
@@ -58,119 +52,33 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
          run: |
            set -euo pipefail
            {
-@@ -292,52 +297,52 @@ jobs:
-             git -C "$BOTSTATE_WORKTREE_DIR" config user.name "github-actions"
-             git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: universe build $(date -u +%F)"
-             git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
-           fi
+             echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
+             echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
+             echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
+             echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
+           } >> "$GITHUB_ENV"
  
-       - name: Verify persisted universe (botstate)
-         if: env.SHOULD_BUILD_UNIVERSE == '1'
+       - name: Restore bot_state into workspace
          run: |
            set -euo pipefail
-           python - << 'PY'
-           import json
-           import os
- 
-           env = (os.getenv("KIS_ENV") or "practice").lower()
-           path = f"botstate/bot_state/universe_lkg/{env}/best_k_meta/latest.json"
-           with open(path, "r", encoding="utf-8") as handle:
-               data = json.load(handle)
-           print("[VERIFY] lkg members=", len(data.get("members", [])))
-           PY
- 
-       - name: Assert SSOT (no repo/bot_state exists)
-         if: always()
-         shell: bash
-         run: |
-           set -euo pipefail
--          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
--          # SSOT intent: ensure repo does not contain an actual bot_state directory.
-+          # NOTE: grep-based check is banned (false positives).
-+          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
-           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-             echo "ERROR: repo/bot_state exists. SSOT violated."
-             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-             exit 1
-           fi
-           # additionally fail if tracked by git (defensive)
-           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-             echo "ERROR: repo contains tracked bot_state. SSOT violated."
-             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-             exit 1
-           fi
-           echo "OK: SSOT holds (no repo/bot_state)."
- 
-   trade_tick:
-     runs-on: ubuntu-latest
-     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
-     timeout-minutes: 25
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
- 
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-@@ -363,74 +368,75 @@ jobs:
-       KIS_ENV: ${{ secrets.KIS_ENV }}
-       CANO: ${{ secrets.CANO }}
-       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
-       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
- 
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       PB1_RUN_LOOP_MINUTES: "15"
-       PB1_MAX_MINUTES: "15"
-       PB1_MAX_SECONDS: "900"
- 
-       BOTSTATE_LOCK_TTL_SEC: "1500"
-       BOTSTATE_LOCK_BUFFER_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "70"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "3"
- 
-       KIS_HTTP_MAX_RETRIES: "5"
-       KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
-       KIS_HTTP_BACKOFF_CAP_SEC: "8"
- 
-       ACTIVE_STRATEGIES: "1"
-       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
--      LIVE_TRADING_ENABLED: "1"
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
+@@ -397,50 +405,58 @@ jobs:
            ref: "nullim"
            path: repo
  
--      - name: Assert Postgres-only + SSOT (startup)
-+      - name: Assert SSOT (startup)
+       - name: Assert SSOT (startup)
          shell: bash
          run: |
            set -euo pipefail
--          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
--          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
--            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
--            exit 1
--          fi
-+          # NOTE: grep-based check is banned (false positives).
-+          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
            if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
              echo "::error::repo/bot_state exists. SSOT violated."
              ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
              exit 1
            fi
-+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-+            echo "::error::repo contains tracked bot_state. SSOT violated."
-+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-+            exit 1
-+          fi
+           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+             echo "::error::repo contains tracked bot_state. SSOT violated."
+             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+             exit 1
+           fi
  
        - name: Checkout bot-state branch
          uses: actions/checkout@v4
@@ -179,6 +87,14 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
            ref: "bot-state"
            path: botstate
  
++      - name: Purge SQLite artifacts (botstate)
++        shell: bash
++        run: |
++          set -euo pipefail
++          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
++          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
++          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
++
        - name: Set botstate paths (SSOT)
          id: botstate_paths
          shell: bash
@@ -196,329 +112,85 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
              echo "BOT_STATE_DIR=${BOT_STATE_DIR}"
            } >> "$GITHUB_ENV"
  
-@@ -542,117 +548,170 @@ jobs:
-           is_weekday = is_trading_weekday(now)
-           window = calc_market_window_kst(now)
-           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
- 
-           mode = "LIVE" if in_market else "DIAG"
-           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
-               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
- 
-           if force_phase in {"entry", "exit", "verify"}:
-               pb1_phase = force_phase
-           else:
-               pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
- 
-           print(
-               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
-               f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}"
-           )
- 
-           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
-               f.write(f"TRADING_DAY={'true' if is_weekday else 'false'}\n")
-               f.write(f"MARKET_WINDOW={window}\n")
-               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
-           PY
- 
-+      - name: Set LIVE_TRADING_ENABLED default
-+        shell: bash
-+        run: |
-+          set -euo pipefail
-+          if [ -z "${LIVE_TRADING_ENABLED:-}" ]; then
-+            echo "LIVE_TRADING_ENABLED=1" >> "$GITHUB_ENV"
-+          fi
-+
-       - name: Configure DIAG full rehearsal
-         if: env.DIAG_FULL_REHEARSAL == '1'
-         shell: bash
-         run: |
-           set -euo pipefail
            {
-             echo "PB1_DIAG_REHEARSAL=1"
-             echo "DIAG_ALLOW_NONTRADING_RUN=1"
-             echo "FORCE_STRATEGY_MODE=DIAG"
-             echo "FORCE_MARKET_WINDOW=morning"
-             echo "FORCE_PB1_PHASE=entry"
-             echo "LIVE_TRADING_ENABLED=0"
-             echo "DIAG_KIS_CALLS_ENABLED=${DIAG_REHEARSAL_KIS_CALLS}"
-           } >> "$GITHUB_ENV"
-           if [ "${DIAG_REHEARSAL_KIS_CALLS}" = "0" ]; then
-             {
-               echo "PB1_REQUIRE_BALANCE_FOR_ENTRY=0"
-               echo "PB1_PREOPEN_REQUIRE_BALANCE=0"
-             } >> "$GITHUB_ENV"
-           fi
+             echo "repo_dir=${REPO_DIR}"
+             echo "botstate_repo_dir=${BOTSTATE_REPO_DIR}"
+             echo "botstate_worktree_dir=${BOTSTATE_WORKTREE_DIR}"
+             echo "bot_state_dir=${BOT_STATE_DIR}"
+           } >> "$GITHUB_OUTPUT"
  
-+      - name: Gate: disable live trading in DIAG
-+        shell: bash
-+        run: |
-+          set -euo pipefail
-+          mode="${EFFECTIVE_STRATEGY_MODE:-}"
-+          if [ "$mode" = "DIAG" ] || [ "${FORCE_STRATEGY_MODE:-}" = "DIAG" ]; then
-+            echo "[GATE] DIAG detected -> force LIVE_TRADING_ENABLED=0"
-+            echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
-+          fi
-+
-       - name: Compile check (gated)
-         if: env.COMPILE_CHECK_ENABLED == '1'
+           echo "[BOTSTATE_PATHS] REPO_DIR=$REPO_DIR"
+@@ -473,51 +489,51 @@ jobs:
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+       - name: Precheck env (fail fast)
          run: |
            set -euo pipefail
-           python -m compileall trader
- 
-       - name: Configure git identity for botstate commits
-         run: |
-           git config --global user.email "actions@github.com"
-           git config --global user.name "github-actions[bot]"
- 
-       - name: Force nontrading smoke once (KST) when requested
-         if: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE == '1' }}
-         shell: bash
-         run: |
-           set -euo pipefail
- 
-           # KST 날짜 계산
-           KST_DATE="$(python - <<'PY'
-           from datetime import datetime, timezone, timedelta
-           kst = timezone(timedelta(hours=9))
-           print(datetime.now(kst).date().isoformat())
-           PY
-           )"
-           FLAG="$BOT_STATE_DIR/runtime/diagnostics/nontrading_smoke_once_${KST_DATE}.flag"
- 
-           echo "[VERIFY_NONTRADING_SMOKE] KST_DATE=$KST_DATE"
-           echo "[VERIFY_NONTRADING_SMOKE] Removing flag if exists: $FLAG"
- 
-           rm -f "$FLAG" || true
-           # diagnostics 폴더가 없을 수도 있으니 생성
-           mkdir -p "$BOT_STATE_DIR/runtime/diagnostics"
-           ls -la "$BOT_STATE_DIR/runtime/diagnostics" || true
- 
-+      - name: Guard: postgres-only + SSOT + DIAG safety
-+        shell: bash
-+        run: |
-+          set -euo pipefail
-+
-+          # 1) Postgres-only 강제 (스킴만 출력해서 원인 파악 가능)
-+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-+          scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
-+          echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
-+
-+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-+            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql://"
-+            exit 1
-+          fi
-+
-+          # 2) SSOT 강제: repo/bot_state 존재 금지 (실제 디렉토리만 체크)
-+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-+            echo "::error::repo/bot_state exists. SSOT violated."
-+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-+            exit 1
-+          fi
-+
-+          # 3) repo에 bot_state가 tracked로 들어왔는지 체크
-+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-+            echo "::error::repo contains tracked bot_state. SSOT violated."
-+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-+            exit 1
-+          fi
-+
-+          echo "[GUARD] OK: postgres-only + SSOT"
-+
-       - name: Run PB1 (auto window) - should exit within 4 minutes
-         shell: bash
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+             if [ -z "${!k:-}" ]; then
+               echo "::error::Missing required secret/env: $k"
+               exit 1
+             fi
+           done
+           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
          env:
-           BOTSTATE_WORKTREE_DIR: ${{ steps.botstate_paths.outputs.botstate_worktree_dir }}
-           BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
-           NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
-           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-           TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
-           UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
-           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-           STATE_PATH: ${{ env.STATE_PATH }}
-           LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
-+          LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
-+          DIAG_FULL_REHEARSAL: ${{ env.DIAG_FULL_REHEARSAL }}
-+          DIAG_REHEARSAL_KIS_CALLS: ${{ env.DIAG_REHEARSAL_KIS_CALLS }}
-+          PB1_BLOCK_ORDERS: ${{ env.EFFECTIVE_STRATEGY_MODE == 'DIAG' && '1' || '0' }}
-         run: |
-           set -euo pipefail
-           cd "$REPO_DIR"
-           if [ "${DIAG_FULL_REHEARSAL}" = "1" ]; then
-             echo "[RUN] DIAG rehearsal enabled (window=morning phase=entry)"
-             python -m trader.run --window morning --phase entry
-           else
-             echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
-             python -m trader.run --window auto --phase auto
-           fi
+           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
  
-       - name: Verify DIAG rehearsal outputs
-         if: env.DIAG_FULL_REHEARSAL == '1'
+       - name: Prepare bot_state dir (always)
          shell: bash
          run: |
            set -euo pipefail
-           python - << 'PY'
-           import json
-           import os
-           from datetime import date
- 
-           from trader.db.engine import make_engine
-           from trader.db.repos import OrdersRepo, UniverseRepo
- 
-           env = (os.getenv("KIS_ENV") or "practice").lower()
-@@ -694,96 +753,100 @@ jobs:
-         run: |
-           set -euo pipefail
-           reset_flag="$BOT_STATE_DIR/runtime/reset_flags/$(TZ=Asia/Seoul date +%F).json"
-           if [ -f "$reset_flag" ]; then
-             echo "[RESET][HARD][FLAG] $reset_flag"
-             cat "$reset_flag"
-           else
-             echo "::error::reset flag missing: $reset_flag"
-             exit 1
+           mkdir -p "$BOT_STATE_DIR"
+           touch "$BOT_STATE_DIR/.gitkeep"
+           if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
+-            printf "runtime/\ndb/\n*.sqlite3\n*.sqlite3.*\n*.db\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
++            printf "runtime/\ndb/\n**/db/\n*.sqlite3\n*.sqlite3.*\n*.db\narchive/**/db/\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
            fi
+           ls -la "$BOT_STATE_DIR" || true
  
-       - name: Inspect bot_state git status (post tick)
-         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
+       - name: Restore bot_state cache
+         uses: actions/cache@v4
+         with:
+           path: ${{ steps.botstate_paths.outputs.bot_state_dir }}
+           key: botstate-${{ github.ref_name }}-${{ github.run_id }}
+           restore-keys: |
+             botstate-${{ github.ref_name }}-
+ 
+       - name: Restore bot_state into workspace
          run: |
            set -euo pipefail
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[BOTSTATE][GIT] workdir=$(pwd)"
-           git status --porcelain | head -n 200 || true
-           git diff --cached --name-only | head -n 200 || true
- 
-       - name: Debug bot_state contents (after run)
-         if: always()
-         run: |
-           set -euo pipefail
-           echo "=== bot_state tree ==="
--          find "$BOT_STATE_DIR" -maxdepth 3 -type f -print || true
-+          if [ -n "${BOT_STATE_DIR:-}" ] && [ -d "${BOT_STATE_DIR}" ]; then
-+            find "$BOT_STATE_DIR" -maxdepth 3 -type f -print || true
-+          else
-+            echo "BOT_STATE_DIR is not set or dir missing -> skip tree dump"
-+          fi
-           echo "=== git status (workspace) ==="
+           if [ -d "$BOTSTATE_REPO_DIR/bot_state" ]; then
+             rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' "$BOTSTATE_REPO_DIR/bot_state/" "$BOT_STATE_DIR/"
+           fi
+           echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
+           ls -al "$BOT_STATE_DIR/.gitignore" || true
+           ls -al "$BOT_STATE_DIR/.gitkeep" || true
            git status --porcelain || true
  
-       - name: Persist bot_state to bot-state branch
-         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
-         shell: bash
+       - name: Hard reset bot_state (one-shot)
          run: |
            set -euo pipefail
-           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
- 
-           # 변경 없으면 종료
-           if [ -z "$(git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain)" ]; then
-             echo "[PERSIST] no changes -> skip"
-             exit 0
-           fi
- 
-           git -C "$BOTSTATE_WORKTREE_DIR" add -A
-           if git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
-             echo "::error::Forbidden sqlite/db paths in botstate changes."
-             git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | head -n 200
-             exit 1
-           fi
-           git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
-           git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
- 
-       - name: Scan for SQLite artifacts
-         if: always()
-         shell: bash
-         run: |
-           set -euo pipefail
-           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
-           if [ -n "$hits" ]; then
-             echo "::error::SQLite artifacts detected (forbidden):"
-             echo "$hits"
-             exit 1
-           fi
-           echo "OK: no sqlite artifacts."
- 
-       - name: Assert SSOT (no repo/bot_state exists)
-         if: always()
-         shell: bash
-         run: |
-           set -euo pipefail
--          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
--          # SSOT intent: ensure repo does not contain an actual bot_state directory.
-+          # NOTE: grep-based check is banned (false positives).
-+          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
-           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-             echo "ERROR: repo/bot_state exists. SSOT violated."
-             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-             exit 1
-           fi
-           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-             echo "ERROR: repo contains tracked bot_state. SSOT violated."
-             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-             exit 1
-           fi
-           echo "OK: SSOT holds (no repo/bot_state)."
- 
-   close_cancel:
-     runs-on: ubuntu-latest
-     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
-     timeout-minutes: 15
- 
-     env:
-       TZ: Asia/Seoul
-       PYTHONUNBUFFERED: "1"
-       PYTHONPATH: ${{ github.workspace }}/repo
-       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
- 
-       FORCE_STRATEGY_MODE: ""
-       FORCE_PB1_PHASE: ""
-@@ -809,64 +872,66 @@ jobs:
- 
-       APP_KEY: ${{ secrets.KIS_APP_KEY }}
-       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
- 
-       BOTSTATE_LOCK_TTL_SEC: "1500"
-       BOTSTATE_LOCK_BUFFER_SEC: "240"
-       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-       BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
- 
-       KIS_HTTP_MAX_RETRIES: "5"
-       KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
-       KIS_HTTP_BACKOFF_CAP_SEC: "8"
- 
-       ACTIVE_STRATEGIES: "1"
-       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
- 
-     steps:
-       - name: Checkout code (always run nullim code)
-         uses: actions/checkout@v4
-         with:
-           fetch-depth: 0
+@@ -875,50 +891,58 @@ jobs:
            ref: "nullim"
            path: repo
  
--      - name: Assert Postgres-only + SSOT (startup)
-+      - name: Assert SSOT (startup)
+       - name: Assert SSOT (startup)
          shell: bash
          run: |
            set -euo pipefail
--          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
--          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
--            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
--            exit 1
--          fi
-+          # NOTE: grep-based check is banned (false positives).
-+          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
            if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
              echo "::error::repo/bot_state exists. SSOT violated."
              ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
              exit 1
            fi
-+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-+            echo "::error::repo contains tracked bot_state. SSOT violated."
-+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-+            exit 1
-+          fi
+           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+             echo "::error::repo contains tracked bot_state. SSOT violated."
+             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+             exit 1
+           fi
  
        - name: Checkout bot-state branch
          uses: actions/checkout@v4
@@ -527,6 +199,14 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
            ref: "bot-state"
            path: botstate
  
++      - name: Purge SQLite artifacts (botstate)
++        shell: bash
++        run: |
++          set -euo pipefail
++          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
++          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
++          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
++
        - name: Compute BOT_STATE_DIR (runtime)
          shell: bash
          run: |
@@ -544,414 +224,440 @@ index b63f7cad3e71a8b71060d02dd35e5ec8a95deb57..e9bba21b39157f9d18df3c84da7f88e7
            set -euo pipefail
            {
              echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
-@@ -886,50 +951,81 @@ jobs:
+             echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
+             echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
+             echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
+           } >> "$GITHUB_ENV"
  
-       - name: Setup Python
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.11"
- 
-       - name: Cache pip
-         uses: actions/cache@v4
-         with:
-           path: ~/.cache/pip
-           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-           restore-keys: |
-             ${{ runner.os }}-pip-
- 
-       - name: Install deps
+       - name: Restore bot_state into workspace
          run: |
            set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+diff --git a/trader/botstate_sync.py b/trader/botstate_sync.py
+index 47e6d4e002329e3c9149f11bd93e1f276c95e28b..59d4be33257a1445ae85a93eefddeb0e696a4d3c 100644
+--- a/trader/botstate_sync.py
++++ b/trader/botstate_sync.py
+@@ -36,50 +36,52 @@ bot_state/runtime/
+ bot_state/runtime/**
  
-       - name: Configure git identity for botstate commits
-         run: |
-           git config --global user.email "actions@github.com"
-           git config --global user.name "github-actions[bot]"
+ # Allowlist runtime artifacts
+ !bot_state/runtime/
+ !bot_state/runtime/state.json
+ !bot_state/runtime/lot_state.json
+ !bot_state/runtime/universe/
+ !bot_state/runtime/universe/**
+ !bot_state/runtime/diagnostics/
+ !bot_state/runtime/diagnostics/*.flag
  
-+      - name: Guard: postgres-only + SSOT + DIAG safety
-+        shell: bash
-+        run: |
-+          set -euo pipefail
-+
-+          # 1) Postgres-only 강제 (스킴만 출력해서 원인 파악 가능)
-+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-+          scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
-+          echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
-+
-+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-+            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql://"
-+            exit 1
-+          fi
-+
-+          # 2) SSOT 강제: repo/bot_state 존재 금지 (실제 디렉토리만 체크)
-+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-+            echo "::error::repo/bot_state exists. SSOT violated."
-+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-+            exit 1
-+          fi
-+
-+          # 3) repo에 bot_state가 tracked로 들어왔는지 체크
-+          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-+            echo "::error::repo contains tracked bot_state. SSOT violated."
-+            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-+            exit 1
-+          fi
-+
-+          echo "[GUARD] OK: postgres-only + SSOT"
-+
-       - name: Run PB1 close-cancel (auto window)
-         run: |
-           set -euo pipefail
-           python -m trader.pb1_runner --window auto --phase auto
-         env:
-           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-           TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
-           UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
-           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-           STATE_PATH: ${{ env.STATE_PATH }}
-           LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
+ # Large caches MUST NOT be committed
+ bot_state/runtime/ohlcv_cache/
+ bot_state/runtime/ohlcv_cache/**
  
-       - name: Detect botstate git repo
-         id: botstate_git
-         shell: bash
-         run: |
-           set -euo pipefail
-           if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
-             echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
-           else
-             echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
-           fi
-           echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
+ # Keep only latest universe snapshots
+ bot_state/universe_lkg/**
+ !bot_state/universe_lkg/**/latest.json
  
-       - name: Persist bot_state (guarded)
-@@ -978,38 +1074,38 @@ jobs:
-           # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
-           if [[ -n "$(git status --porcelain)" ]]; then
-             echo "::error::botstate worktree dirty after persist"
-             git status --porcelain | head -n 200
-             exit 1
-           fi
+ # Never commit archive/ or readonly backups
+ bot_state/archive/
  
-       - name: Scan for SQLite artifacts
-         if: always()
-         shell: bash
-         run: |
-           set -euo pipefail
-           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
-           if [ -n "$hits" ]; then
-             echo "::error::SQLite artifacts detected (forbidden):"
-             echo "$hits"
-             exit 1
-           fi
-           echo "OK: no sqlite artifacts."
+ # Runtime DB artifacts (should never be created)
+ db/
+ db/**
++bot_state/**/db/
++bot_state/archive/**/db/
+ *.sqlite3
+ *.sqlite3.*
+ *.db
  
-       - name: Assert SSOT (no repo/bot_state exists)
-         if: always()
-         shell: bash
-         run: |
-           set -euo pipefail
--          # NOTE: grep-based check was a false-positive (matched workflow/patch text).
--          # SSOT intent: ensure repo does not contain an actual bot_state directory.
-+          # NOTE: grep-based check is banned (false positives).
-+          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
-           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-             echo "ERROR: repo/bot_state exists. SSOT violated."
-             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-             exit 1
-           fi
-           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-             echo "ERROR: repo contains tracked bot_state. SSOT violated."
-             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-             exit 1
-           fi
-           echo "OK: SSOT holds (no repo/bot_state)."
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index df352ba995a2157a4190f91f07b5dd26f0847353..da9fbe86704af6c08e8f954744c0c120cd697b71 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -58,50 +58,54 @@ class KisAuthError(Exception):
-     """401/403 인증 오류."""
+ # Python / OS noise
+ .DS_Store
+ __pycache__/
+ *.pyc
+ """
+ 
+ ALLOWLIST_PATTERNS = [
+     "bot_state/runtime/universe/*.json",
+     "bot_state/universe_lkg/**/latest.json",
+     "bot_state/runtime/state.json",
+     "bot_state/runtime/lot_state.json",
+     "bot_state/runtime/diagnostics/*.flag",
+ ]
+ 
+ CLEAN_PATTERNS = [
+     "bot_state/archive/**",
+     "bot_state/runtime/ohlcv_cache/**",
+ ]
  
  
- class KisPermanentError(Exception):
-     """기타 4xx 등 영구 오류."""
+ @dataclass(frozen=True)
+diff --git a/trader/db/engine.py b/trader/db/engine.py
+index 2feab2d772e13db4f69fa6693633fe0c19927bd4..daa7dae90f39d558db4a46eef9f95fe0e588be64 100644
+--- a/trader/db/engine.py
++++ b/trader/db/engine.py
+@@ -1,72 +1,81 @@
+ from __future__ import annotations
+ 
+ import os
+ from typing import Tuple
+ 
+ import sqlalchemy as sa
++from sqlalchemy.engine import make_url
+ 
+-# Postgres-only 정책: 허용할 URL prefix들
+-ALLOWED_PG_PREFIXES = (
+-    "postgres://",
+-    "postgresql://",
+-)
++ALLOWED_PG_SCHEMES = {"postgres", "postgresql"}
+ 
+ # DB URL을 읽을 env 우선순위
+ DB_URL_KEYS = (
+     "PBCORE_DB_URL",            # ✅ primary
+     "DATABASE_URL",             # common
+     "TRADER_DB_URL",
+     "DB_URL",
+     "SQLALCHEMY_DATABASE_URL",
+ )
  
  
- class KisBalanceUnavailable(KisTemporaryError):
-     """잔고 조회 실패."""
+ def _redact_url(url: str) -> str:
+     # user:pass@host 형태에서 pass 노출 방지
+     if "@" in url:
+         left = url.split("@", 1)[0]
+         return f"{left}@***"
+     return (url[:24] + "***") if len(url) > 24 else (url + "***")
  
  
- class NetTemporaryError(KisTemporaryError):
-     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+ def _pick_db_url() -> Tuple[str, str]:
+     for key in DB_URL_KEYS:
+         v = (os.getenv(key) or "").strip()
+         if v:
+             return v, key
+     return "", ""
  
  
- class DataEmptyError(Exception):
-     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
-     pass
- 
- 
- class DataShortError(Exception):
-     """정상응답이나 캔들이 need_n 미만."""
-     pass
- 
- 
-+class OrderBlockedError(RuntimeError):
-+    """주문 하드 가드에 의해 차단된 경우."""
++def _describe_db_url(url: str) -> Tuple[str, str]:
++    try:
++        parsed = make_url(url)
++    except Exception:
++        return "", ""
++    drivername = parsed.drivername or ""
++    base = drivername.split("+", 1)[0] if drivername else ""
++    return drivername, base
 +
 +
- def _build_session():
-     s = requests.Session()
-     retry = Retry(
-         total=0, connect=0, read=0, status=0,
-         backoff_factor=0,
-         status_forcelist=[],
-         allowed_methods=["GET", "POST"],
-         raise_on_status=False,
-     )
-     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-     s.mount("https://", adapter)
-     s.mount("http://", adapter)
-     s.headers.update({"User-Agent": "RKMax/1.0", "Connection": "keep-alive"})
-     return s
+ def get_db_url() -> str:
+     url, src = _pick_db_url()
  
- 
- SESSION = _build_session()
- 
- 
- def _get_json(url, params=None, timeout=(3.0, 7.0)):
-     try:
-         r = SESSION.get(url, params=params, timeout=timeout)
-         r.raise_for_status()
-         return r.json()
-     except requests.exceptions.SSLError as e:
-@@ -276,58 +280,61 @@ def _is_raw_balance_snapshot(snapshot: Any) -> bool:
-     if isinstance(output2, list) and output2:
-         first = output2[0]
-         return isinstance(first, dict) and bool(first)
-     if isinstance(output2, dict) and output2:
-         return True
-     return False
- 
- 
- def _order_block_reason(now: datetime | None = None) -> Optional[str]:
-     now = now or now_kst()
-     state_date = _ORDER_BLOCK_STATE.get("date")
-     state_reason = _ORDER_BLOCK_STATE.get("reason")
-     if state_date and state_date != now.date():
-         _ORDER_BLOCK_STATE.update({"date": None, "reason": None})
-         state_date, state_reason = None, None
-     if state_date == now.date() and state_reason:
-         return str(state_reason)
-     if not is_trading_day(now):
-         _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": "NON_TRADING_DAY"})
-         return "NON_TRADING_DAY"
-     if not is_trading_window(now):
-         return "OUTSIDE_TRADING_WINDOW"
-     return None
- 
- 
--def _assert_orders_allowed() -> None:
--    if os.getenv("PB1_DIAG_REHEARSAL") == "1":
--        raise RuntimeError("orders forbidden in rehearsal")
--    mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
--    live_flag = (os.getenv("LIVE_TRADING_ENABLED") or "").strip()
--    if mode != "LIVE" or live_flag != "1":
--        raise RuntimeError(
--            f"orders forbidden (STRATEGY_MODE={mode or 'unset'} LIVE_TRADING_ENABLED={live_flag or 'unset'})"
-+def _assert_orders_allowed(action: str) -> None:
-+    block = (os.getenv("PB1_BLOCK_ORDERS") or "").strip().lower() in {"1", "true", "yes", "y"}
-+    diag_rehearsal = (os.getenv("PB1_DIAG_REHEARSAL") or "").strip().lower() in {"1", "true", "yes", "y"}
-+    mode = (os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or "").strip().upper()
-+    live = (os.getenv("LIVE_TRADING_ENABLED") or "").strip().lower() in {"1", "true", "yes", "y"}
-+
-+    if block or diag_rehearsal or mode == "DIAG" or not live:
-+        raise OrderBlockedError(
-+            "Orders are blocked. "
-+            f"action={action} PB1_BLOCK_ORDERS={os.getenv('PB1_BLOCK_ORDERS')} "
-+            f"mode={mode} LIVE_TRADING_ENABLED={os.getenv('LIVE_TRADING_ENABLED')}"
+     if not url:
+         raise RuntimeError(
+             "Postgres DB URL missing. "
+             "Set PBCORE_DB_URL (preferred) or DATABASE_URL."
          )
  
+-    u = url.lower()
++    try:
++        parsed = make_url(url)
++    except Exception as exc:
++        raise RuntimeError(
++            "Invalid DB URL. "
++            f"Got {src}={_redact_url(url)}"
++        ) from exc
++
++    drivername = parsed.drivername
++    base = drivername.split("+", 1)[0] if drivername else ""
  
- def _mark_order_blocked(reason: str, now: datetime | None = None) -> None:
-     now = now or now_kst()
-     _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
+-    # SQLite 명시 금지
+-    if u.startswith("sqlite:"):
++    if base not in ALLOWED_PG_SCHEMES:
+         raise RuntimeError(
+-            f"SQLite is forbidden. Use Postgres only. "
+-            f"Got {src}=sqlite:***"
++            "DB URL scheme not allowed (Postgres only). "
++            f"Got {src}={_redact_url(url)} "
++            f"(drivername={drivername}, base={base})"
+         )
+ 
+-    # Postgres 스킴 허용
+-    if u.startswith(ALLOWED_PG_PREFIXES):
+-        return url
+-
+-    # 나머지 스킴은 모두 불허 (mysql 등)
+-    raise RuntimeError(
+-        "DB URL scheme not allowed (Postgres only). "
+-        f"Got {src}={_redact_url(url)}"
+-    )
++    normalized = parsed.set(drivername=base).render_as_string(hide_password=False)
++    return normalized
  
  
- def _is_order_disallowed(resp: Any) -> Optional[str]:
-     if not isinstance(resp, dict):
-         return None
-     msg1 = str(resp.get("msg1") or "")
-     msg_cd = str(resp.get("msg_cd") or "")
-     msg = f"{msg1} {msg_cd}".strip()
-     primary_phrases = ("영업일이 아닙니다", "주문 가능 시간이 아닙니다", "주문가능시간이 아닙니다")
-     if any(p in msg1 for p in primary_phrases):
-         return msg or "ORDER_NOT_ALLOWED"
+ def make_engine() -> sa.Engine:
+     url = get_db_url()
+     # SQLAlchemy 엔진 생성 (psycopg v3 지원)
+     return sa.create_engine(url, pool_pre_ping=True)
+diff --git a/trader/db/health.py b/trader/db/health.py
+index 7c3b94627218099ce93484554857fb7c2c7fd235..cbce201dedc03485c0b87d45f120c9041d0ca717 100644
+--- a/trader/db/health.py
++++ b/trader/db/health.py
+@@ -1,21 +1,31 @@
+ from __future__ import annotations
  
-     low = msg.lower()
-     keywords = ("휴장", "가능시간", "closed")
-     if any(k in low for k in keywords):
-         return msg or "ORDER_NOT_ALLOWED"
-     status = resp.get("_status")
-     if isinstance(status, int) and status in (401, 403):
-         return f"HTTP_{status}"
-@@ -2146,51 +2153,51 @@ class KisAPI:
-                     last_err = exc
-                     logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
-                     return _empty_daily_ccld("PERM_FAIL")
-                 except requests.exceptions.RequestException as exc:
-                     last_err = exc
-                     logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
-                     return _empty_daily_ccld("REQ_FAIL")
-                 except Exception as exc:
-                     last_err = exc
-                     logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
-                     return _empty_daily_ccld("TEMP_FAIL")
-             if attempt < len(backoff_seq):
-                 backoff = backoff_seq[attempt - 1]
-                 jitter = random.uniform(0.0, min(0.2, backoff * 0.2))
-                 time.sleep(backoff + jitter)
-         if last_err:
-             logger.warning("[RECONCILE][DEGRADED] daily_ccld_failed err=%s", last_err)
-         self._reset_session()
-         return _empty_daily_ccld("TEMP_FAIL")
+ import logging
  
-     # -------------------------------
-     # 주문 공통, 시장가/지정가, 매수/매도
-     # -------------------------------
-     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
--        _assert_orders_allowed()
-+        _assert_orders_allowed("order_cash")
+-from .engine import get_db_url, make_engine, _redact_url
++from .engine import get_db_url, make_engine, _redact_url, _describe_db_url, _pick_db_url
  
-         # TR 후보 순차 시도
-         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
+ logger = logging.getLogger(__name__)
  
-         now = now_kst()
-         block_reason = _order_block_reason(now)
-         if block_reason:
-             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, body.get("PDNO"), body.get("ORD_QTY"))
-             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
  
-         # Fallback: 시장가 → IOC시장가 → 최유리
-         ord_dvsn_chain = ["01", "13", "03"]
-         last_err = None
+ def assert_db_ready() -> None:
+     # url 로깅은 마스킹
+     try:
+         url = get_db_url()
+         logger.info("[DB][HEALTH] url=%s", _redact_url(url))
+     except Exception as e:
+-        logger.error("[DB][HEALTH] get_db_url failed: %s", e)
++        raw, src = _pick_db_url()
++        drivername, base = _describe_db_url(raw) if raw else ("", "")
++        extra = ""
++        if drivername or base:
++            extra = f" drivername={drivername} base={base}"
++        logger.error(
++            "[DB][HEALTH] get_db_url failed: %s (src=%s%s)",
++            e,
++            src or "unknown",
++            extra,
++        )
+         raise
  
-         for tr_id in tr_list:
-             for ord_dvsn in ord_dvsn_chain:
-                 body["ORD_DVSN"] = ord_dvsn
-                 body["ORD_UNPR"] = "0"
-                 if is_sell and not body.get("SLL_TYPE"):
-                     body["SLL_TYPE"] = "01"
-                 body.setdefault("EXCG_ID_DVSN_CD", "KRX")
+     engine = make_engine()
+     with engine.connect() as conn:
+         conn.exec_driver_sql("SELECT 1")
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 2ac339b2786e3a79462a9b3096344ea4601080a0..43d1aa2bda20d7d775c9774c4e27dde6b60dc002 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -72,50 +72,51 @@ from trader.db.health import assert_db_ready
+ from trader.db.lock import release_lock, try_acquire_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import (
+     FillsRepo,
+     LedgerEventsRepo,
+     OrdersRepo,
+     PositionsRepo,
+     ReconcileLogRepo,
+     RunsRepo,
+     UniverseRepo,
+ )
+ from trader.diagnostics.nontrading_smoke import (
+     nontrading_smoke_flag_path,
+     run_nontrading_smoke_once,
+     write_nontrading_smoke_flag,
+ )
+ from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
+ from trader.ledger.store import LedgerStore
+ from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_kis, reconcile_today
+ from trader.reconcile_db import close_stale_positions
+ from trader.reset_utils import (
+     detect_account_fp,
+     load_reset_guard,
+     purge_bot_state,
++    purge_sqlite_artifacts,
+     record_purge_event,
+     should_purge_on_empty_kis_holdings,
+     update_reset_guard_from_balance,
+ )
+ from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
+ from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+ from trader.eventlog import emit_event
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.utils.json_sanitize import to_jsonable
+ from trader.window_router import WindowDecision, decide_window
  
-                 # HashKey
-                 try:
-                     hk = self._create_hashkey(body)
-@@ -2340,51 +2347,51 @@ class KisAPI:
-                     f"last={last} age={now_ts-last:.1f}s"
-                 )
-                 return {"status": "SKIPPED", "skip_reason": "DUP_BLOCK"}
+ logger = logging.getLogger(__name__)
+ log = logger
  
-         body = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "PDNO": safe_strip(pdno),
-             "SLL_TYPE": "01",  # 일반매도
-             "ORD_QTY": str(int(qty)),
-             "ORD_DVSN": "01",
-             "ORD_UNPR": "0",
-             "EXCG_ID_DVSN_CD": "KRX",
-         }
-         resp = self._order_cash(body, is_sell=True)
-         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
-             with self._recent_sells_lock:
-                 self._recent_sells[pdno] = time.time()
-                 cutoff = time.time() - (self._recent_sells_cooldown * 5)
-                 keys_to_del = [k for k, v in self._recent_sells.items() if v < cutoff]
-                 for k in keys_to_del:
-                     del self._recent_sells[k]
-         return resp
+ _WINDOW_MISMATCH_LOGGED = False
+ _CURRENT_BOTSTATE: dict | None = None
  
-     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
--        _assert_orders_allowed()
-+        _assert_orders_allowed("buy_stock_limit")
-         now = now_kst()
-         block_reason = _order_block_reason(now)
-         if block_reason:
-             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
-             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
+ BALANCE_STATE_OK = "OK"
+ BALANCE_STATE_STALE_OK = "STALE_OK"
+ BALANCE_STATE_UNKNOWN = "UNKNOWN"
  
-         body = {
-             "CANO": self.CANO,
-             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
-             "PDNO": safe_strip(pdno),
-             "ORD_QTY": str(int(qty)),
-             "ORD_DVSN": "00",  # 지정가
-             "ORD_UNPR": str(int(price)),
-             "EXCG_ID_DVSN_CD": "KRX",
-         }
-         hk = self._create_hashkey(body)
-         tr_list = _pick_tr(self.env, "ORDER_BUY")
-         if not tr_list:
-             raise Exception("ORDER_BUY TR 미구성")
-         tr_id = tr_list[0]
-         headers = self._headers(tr_id, hk)
-         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-         # [CHG] 안전요청 사용
-         resp = self._safe_request(
-             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
-@@ -2395,51 +2402,51 @@ class KisAPI:
-             try:
-                 out = data.get("output") or {}
-                 odno = out.get("ODNO") or out.get("ord_no") or ""
-                 pdno = safe_strip(body.get("PDNO", ""))
-                 qty_int = int(float(body.get("ORD_QTY", "0")))
-                 price_for_fill = float(body.get("ORD_UNPR", 0))
-                 append_fill(
-                     side="BUY",
-                     code=pdno,
-                     name="",
-                     qty=qty_int,
-                     price=price_for_fill,
-                     odno=odno,
-                     note=f"limit,tr={tr_id}",
-                 )
-             except Exception as e:
-                 logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
-             return data
-         logger.error(f"[BUY_LIMIT_FAIL] {data}")
-         blocked = _is_order_disallowed(data)
-         if blocked:
-             _mark_order_blocked(blocked, now)
-         return None
  
-     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
--        _assert_orders_allowed()
-+        _assert_orders_allowed("sell_stock_limit")
-         now = now_kst()
-         block_reason = _order_block_reason(now)
-         if block_reason:
-             logger.warning("[ORDER_BLOCK] %s code=%s qty=%s", block_reason, pdno, qty)
-             return {"rt_cd": "1", "msg_cd": "ORDER_BLOCK", "msg1": block_reason, "output": {}}
- 
-         # --- 강화된 사전점검: 보유수량 우선 ---
-         pos = self.get_positions() or []
-         hldg = 0
-         ord_psbl = 0
-         for r in pos:
-             if safe_strip(r.get("pdno")) == safe_strip(pdno):
-                 hldg = int(float(r.get("hldg_qty", "0")))
-                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
-                 break
- 
-         base_qty = hldg if hldg > 0 else ord_psbl
-         if base_qty <= 0:
-             logger.error(
-                 f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}"
+ def _deepcopy_json(value):
+     try:
+         return copy.deepcopy(value)
+@@ -2325,50 +2326,52 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+                 balance_tick_cache_hits,
              )
-             return None
+         else:
+             logger.info(
+                 "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+                 exit_reason,
+                 elapsed_trade,
+                 elapsed_total,
+                 max_seconds,
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
  
-         if qty > base_qty:
+ 
+ def _exit_code_for_status(status: str) -> int:
+     if status in {"FAILED", "ERROR"}:
+         return 1
+     return 0
+ 
+ 
+ def main() -> int:
+     args = parse_args()
++    bot_state_dir = get_botstate_root()
++    purge_sqlite_artifacts(bot_state_dir, reason="startup")
+     assert_db_ready()
+     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
+     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
+     run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
+     if run_loop and not smoke_enabled:
+         try:
+             _run_loop(args=args)
+         except Exception:
+             logger.error("[PB1][FATAL_GUARD] loop crashed", exc_info=True)
+         return 0
+     if smoke_enabled:
+         bot_state_dir = get_botstate_root()
+         engine = make_engine()
+         run_migrations(engine)
+         _write_change_flag(False, ["init"])
+         run_once(args=args, engine=engine, loop_mode=False, window=None)
+         return 0
+ 
+     owner = os.getenv("GITHUB_ACTOR", "local")
+     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
+     ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
+     logger.info(
+         "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
+         ttl_sec,
+         max_seconds,
+diff --git a/trader/reset_utils.py b/trader/reset_utils.py
+index a4b5db3d8c686ea762c4f910fedacff614b4edc5..890700654b27ec1f5a7b4c01322166f98061a862 100644
+--- a/trader/reset_utils.py
++++ b/trader/reset_utils.py
+@@ -5,89 +5,114 @@ import logging
+ import os
+ import shutil
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ 
+ logger = logging.getLogger(__name__)
+ 
+ RESET_GUARD_FILE = Path("runtime") / "reset_guard.json"
+ RESET_GUARD_COOLDOWN_MIN = 60
+ 
+ 
+ def detect_account_fp(kis_env: str, cano: str, acnt_prdt_cd: str, api_base_url: str) -> str:
+     return f"{kis_env}|{api_base_url}|{cano}|{acnt_prdt_cd}"
+ 
+ 
+ def _unique_archive_path(archive_dir: Path, name: str) -> Path:
+     candidate = archive_dir / name
+     if not candidate.exists():
+         return candidate
+     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+     return archive_dir / f"{name}_{stamp}"
+ 
+ 
+ def purge_bot_state(bot_state_dir: Path, archive_dir: Path, reason: str) -> None:
+     archive_dir.mkdir(parents=True, exist_ok=True)
++    purge_sqlite_artifacts(bot_state_dir, reason=f"{reason}:pre_purge")
+     targets: list[Path] = []
+     runtime_dir = bot_state_dir / "runtime"
+     purge_universe = os.getenv("PURGE_UNIVERSE") == "1"
+     if runtime_dir.exists():
+         for child in sorted(runtime_dir.iterdir()):
+             if child.name == "universe" and not purge_universe:
+                 continue
+             targets.append(child)
+-    for rel in ("trader_ledger", "db"):
++    for rel in ("trader_ledger",):
+         targets.append(bot_state_dir / rel)
+     for pattern in ("positions*", "*state*"):
+         targets.extend(sorted(bot_state_dir.glob(pattern)))
+ 
+     seen: set[Path] = set()
+     for src in targets:
+         if src in seen:
+             continue
+         seen.add(src)
+         if not src.exists():
+             continue
+         dest = _unique_archive_path(archive_dir, src.name)
+         dest.parent.mkdir(parents=True, exist_ok=True)
+         try:
+             shutil.move(str(src), str(dest))
              logger.warning(
+                 "[STATE][PURGE] reason=%s src=%s archive=%s moved=1",
+                 reason,
+                 src,
+                 dest,
+             )
+         except Exception:
+             logger.exception(
+                 "[STATE][PURGE] reason=%s src=%s archive=%s moved=0",
+                 reason,
+                 src,
+                 dest,
+             )
+ 
+ 
++def purge_sqlite_artifacts(bot_state_dir: Path, reason: str) -> list[Path]:
++    removed: list[Path] = []
++    if not bot_state_dir.exists():
++        return removed
++    for db_dir in sorted({p for p in bot_state_dir.rglob("db") if p.is_dir()}):
++        try:
++            shutil.rmtree(db_dir)
++            removed.append(db_dir)
++        except Exception:
++            logger.exception("[STATE][PURGE_SQLITE] reason=%s path=%s removed=0", reason, db_dir)
++    for pattern in ("*.sqlite3*", "*.db"):
++        for entry in sorted(bot_state_dir.rglob(pattern)):
++            if not entry.is_file():
++                continue
++            try:
++                entry.unlink()
++                removed.append(entry)
++            except Exception:
++                logger.exception("[STATE][PURGE_SQLITE] reason=%s path=%s removed=0", reason, entry)
++    if removed:
++        logger.warning("[STATE][PURGE_SQLITE] reason=%s removed=%s", reason, len(removed))
++    return removed
++
++
+ def _reset_guard_path(bot_state_dir: Path) -> Path:
+     return bot_state_dir / RESET_GUARD_FILE
+ 
+ 
+ def load_reset_guard(bot_state_dir: Path) -> dict:
+     path = _reset_guard_path(bot_state_dir)
+     if not path.exists():
+         return {}
+     try:
+         return json.loads(path.read_text(encoding="utf-8"))
+     except Exception:
+         logger.exception("[STATE][RESET_GUARD][LOAD_FAIL] path=%s", path)
+         return {}
+ 
+ 
+ def save_reset_guard(bot_state_dir: Path, payload: dict) -> Path:
+     path = _reset_guard_path(bot_state_dir)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+     return path
+ 
+ 
+ def update_reset_guard_from_balance(
+     bot_state_dir: Path,
+     *,

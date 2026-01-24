@@ -94,6 +94,7 @@ from trader.reset_utils import (
     detect_account_fp,
     load_reset_guard,
     purge_bot_state,
+    purge_sqlite_artifacts,
     record_purge_event,
     should_purge_on_empty_kis_holdings,
     update_reset_guard_from_balance,
@@ -2347,6 +2348,8 @@ def _exit_code_for_status(status: str) -> int:
 
 def main() -> int:
     args = parse_args()
+    bot_state_dir = get_botstate_root()
+    purge_sqlite_artifacts(bot_state_dir, reason="startup")
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()

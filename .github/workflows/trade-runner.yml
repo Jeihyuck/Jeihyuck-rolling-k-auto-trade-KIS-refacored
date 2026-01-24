@@ -136,6 +136,14 @@ jobs:
           path: botstate
           token: ${{ github.token }}
 
+      - name: Purge SQLite artifacts (botstate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
+          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
+          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
+
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash
         run: |
@@ -419,6 +427,14 @@ jobs:
           ref: "bot-state"
           path: botstate
 
+      - name: Purge SQLite artifacts (botstate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
+          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
+          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
+
       - name: Set botstate paths (SSOT)
         id: botstate_paths
         shell: bash
@@ -495,7 +511,7 @@ jobs:
           mkdir -p "$BOT_STATE_DIR"
           touch "$BOT_STATE_DIR/.gitkeep"
           if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
-            printf "runtime/\ndb/\n*.sqlite3\n*.sqlite3.*\n*.db\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
+            printf "runtime/\ndb/\n**/db/\n*.sqlite3\n*.sqlite3.*\n*.db\narchive/**/db/\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
           fi
           ls -la "$BOT_STATE_DIR" || true
 
@@ -896,6 +912,14 @@ jobs:
           fetch-depth: 0
           ref: "bot-state"
           path: botstate
+
+      - name: Purge SQLite artifacts (botstate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
+          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
+          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
 
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash

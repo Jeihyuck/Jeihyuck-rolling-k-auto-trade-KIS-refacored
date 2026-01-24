@@ -4,12 +4,9 @@ import os
 from typing import Tuple
 
 import sqlalchemy as sa
+from sqlalchemy.engine import make_url
 
-# Postgres-only 정책: 허용할 URL prefix들
-ALLOWED_PG_PREFIXES = (
-    "postgres://",
-    "postgresql://",
-)
+ALLOWED_PG_SCHEMES = {"postgres", "postgresql"}
 
 # DB URL을 읽을 env 우선순위
 DB_URL_KEYS = (
@@ -37,6 +34,16 @@ def _pick_db_url() -> Tuple[str, str]:
     return "", ""
 
 
+def _describe_db_url(url: str) -> Tuple[str, str]:
+    try:
+        parsed = make_url(url)
+    except Exception:
+        return "", ""
+    drivername = parsed.drivername or ""
+    base = drivername.split("+", 1)[0] if drivername else ""
+    return drivername, base
+
+
 def get_db_url() -> str:
     url, src = _pick_db_url()
 
@@ -46,24 +53,26 @@ def get_db_url() -> str:
             "Set PBCORE_DB_URL (preferred) or DATABASE_URL."
         )
 
-    u = url.lower()
-
-    # SQLite 명시 금지
-    if u.startswith("sqlite:"):
+    try:
+        parsed = make_url(url)
+    except Exception as exc:
         raise RuntimeError(
-            f"SQLite is forbidden. Use Postgres only. "
-            f"Got {src}=sqlite:***"
+            "Invalid DB URL. "
+            f"Got {src}={_redact_url(url)}"
+        ) from exc
+
+    drivername = parsed.drivername
+    base = drivername.split("+", 1)[0] if drivername else ""
+
+    if base not in ALLOWED_PG_SCHEMES:
+        raise RuntimeError(
+            "DB URL scheme not allowed (Postgres only). "
+            f"Got {src}={_redact_url(url)} "
+            f"(drivername={drivername}, base={base})"
         )
 
-    # Postgres 스킴 허용
-    if u.startswith(ALLOWED_PG_PREFIXES):
-        return url
-
-    # 나머지 스킴은 모두 불허 (mysql 등)
-    raise RuntimeError(
-        "DB URL scheme not allowed (Postgres only). "
-        f"Got {src}={_redact_url(url)}"
-    )
+    normalized = parsed.set(drivername=base).render_as_string(hide_password=False)
+    return normalized
 
 
 def make_engine() -> sa.Engine:
