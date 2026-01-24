@@ -9,9 +9,6 @@ import sqlalchemy as sa
 ALLOWED_PG_PREFIXES = (
     "postgres://",
     "postgresql://",
-    "postgresql+psycopg://",
-    "postgresql+psycopg2://",
-    "postgresql+asyncpg://",
 )
 
 # DB URL을 읽을 env 우선순위

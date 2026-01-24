@@ -54,20 +54,13 @@ bot_state/universe_lkg/**
 
 # Never commit archive/ or readonly backups
 bot_state/archive/
-bot_state/db/
-bot_state/db/**
-bot_state/db/*.bak*
-bot_state/db/*.readonly.bak.*
-bot_state/db/*.sqlite3-*
-bot_state/db/*.db-*
 
 # Runtime DB artifacts (should never be created)
-**/*.sqlite3
-**/*.sqlite3-wal
-**/*.sqlite3-shm
-**/*.db
-**/*.db-wal
-**/*.db-shm
+db/
+db/**
+*.sqlite3
+*.sqlite3.*
+*.db
 
 # Python / OS noise
 .DS_Store
@@ -86,15 +79,6 @@ ALLOWLIST_PATTERNS = [
 CLEAN_PATTERNS = [
     "bot_state/archive/**",
     "bot_state/runtime/ohlcv_cache/**",
-    "bot_state/db/*.bak*",
-    "bot_state/db/*.sqlite3",
-    "bot_state/db/*.sqlite3-wal",
-    "bot_state/db/*.sqlite3-shm",
-    "bot_state/db/*.sqlite3-*",
-    "bot_state/db/*.db",
-    "bot_state/db/*.db-wal",
-    "bot_state/db/*.db-shm",
-    "bot_state/db/*.db-*",
 ]
 
 
@@ -366,11 +350,6 @@ def _stage_allowlist(worktree_dir: Path, allow_patterns: List[str]) -> None:
         _git_worktree(worktree_dir, "add", "--", *sorted(set(to_add)), check=False)
 
     _safe_rm(worktree_dir / "bot_state" / "archive")
-    db_dir = worktree_dir / "bot_state" / "db"
-    if db_dir.is_dir():
-        for entry in db_dir.iterdir():
-            if ".readonly.bak." in entry.name:
-                _safe_rm(entry)
 
 
 def _parse_porcelain_path(line: str) -> tuple[str, str]:
@@ -1159,11 +1138,6 @@ def persist_run_files(worktree_dir: Path, new_files: Iterable[Path], message: st
             post = git_porcelain(worktree_dir)
             if post.strip():
                 _safe_rm(worktree_dir / "bot_state" / "archive")
-                db_dir = worktree_dir / "bot_state" / "db"
-                if db_dir.is_dir():
-                    for entry in db_dir.iterdir():
-                        if ".readonly.bak." in entry.name:
-                            _safe_rm(entry)
                 post = git_porcelain(worktree_dir)
             if post.strip():
                 logger.warning(

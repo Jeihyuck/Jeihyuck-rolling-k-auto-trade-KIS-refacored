@@ -25,13 +25,21 @@ on:
         required: false
         default: "0"
       BOT_STATE_HARD_RESET:
-        description: "Delete pbcore.sqlite3 + runtime + ledger and restart clean (one-shot)"
+        description: "Delete runtime + ledger and restart clean (one-shot)"
         required: false
         default: "0"
       NONTRADING_UNIVERSE_SMOKE:
         description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
         required: false
         default: "0"
+      DIAG_FULL_REHEARSAL:
+        description: "비매매일에도 실전 파이프라인처럼 1회 실행(주문전송 금지)"
+        required: false
+        default: "0"
+      DIAG_REHEARSAL_KIS_CALLS:
+        description: "KIS 잔고/시세 조회를 실제로 호출할지(주문은 절대 안함)"
+        required: false
+        default: "1"
       NONTRADING_SMOKE_DB_STORE:
         description: "Set to 1 to persist the non-trading universe snapshot to DB."
         required: false
@@ -98,6 +106,21 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
+
+      - name: Assert Postgres-only + SSOT (startup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "::error::repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
+            exit 1
+          fi
 
       - name: Checkout bot-state branch
         uses: actions/checkout@v4
@@ -229,6 +252,19 @@ jobs:
           )
           PY
 
+      - name: Scan for SQLite artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
       - name: Configure git identity for botstate commits
         run: |
           git config --global user.email "actions@github.com"
@@ -247,6 +283,11 @@ jobs:
           if git -C "$BOTSTATE_WORKTREE_DIR" diff --cached --quiet; then
             echo "[PERSIST] nothing to commit"
           else
+            if git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
+              echo "::error::Forbidden sqlite/db paths in botstate changes."
+              git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | head -n 200
+              exit 1
+            fi
             git -C "$BOTSTATE_WORKTREE_DIR" config user.email "actions@github.com"
             git -C "$BOTSTATE_WORKTREE_DIR" config user.name "github-actions"
             git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: universe build $(date -u +%F)"
@@ -300,6 +341,8 @@ jobs:
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
+      DIAG_FULL_REHEARSAL: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_FULL_REHEARSAL || '0' }}
+      DIAG_REHEARSAL_KIS_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_REHEARSAL_KIS_CALLS || '1' }}
 
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       PAPER_MAX_CAPITAL_KRW: "10000000"
@@ -342,6 +385,7 @@ jobs:
 
       ACTIVE_STRATEGIES: "1"
       DAILY_CAPITAL: ${{ secrets.KIS_ENV == 'practice' && '10000000' || '250000000' }}
+      LIVE_TRADING_ENABLED: "1"
 
     steps:
       - name: Checkout code (always run nullim code)
@@ -350,6 +394,21 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
+
+      - name: Assert Postgres-only + SSOT (startup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "::error::repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
+            exit 1
+          fi
 
       - name: Checkout bot-state branch
         uses: actions/checkout@v4
@@ -436,7 +495,7 @@ jobs:
           touch "$BOT_STATE_DIR/.gitkeep"
           # 기본 ignore (원하면 확장)
           if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
-            printf "runtime/\n*.sqlite3\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
+            printf "runtime/\ndb/\n*.sqlite3\n*.sqlite3.*\n*.db\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
           fi
           ls -la "$BOT_STATE_DIR" || true
 
@@ -465,12 +524,6 @@ jobs:
           if [ "${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}" = "1" ]; then
             echo "[RESET] hard reset bot_state"
             python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
-          fi
-          if [[ "${PBCORE_DB_URL:-}" =~ ^postgres ]]; then
-            echo "[RESET] postgres mode -> skip sqlite placeholder"
-          else
-            mkdir -p "$BOT_STATE_DIR/db"
-            touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
           fi
           chmod -R u+rwX "$BOT_STATE_DIR" || true
 
@@ -510,6 +563,27 @@ jobs:
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
+
+      - name: Configure DIAG full rehearsal
+        if: env.DIAG_FULL_REHEARSAL == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "PB1_DIAG_REHEARSAL=1"
+            echo "DIAG_ALLOW_NONTRADING_RUN=1"
+            echo "FORCE_STRATEGY_MODE=DIAG"
+            echo "FORCE_MARKET_WINDOW=morning"
+            echo "FORCE_PB1_PHASE=entry"
+            echo "LIVE_TRADING_ENABLED=0"
+            echo "DIAG_KIS_CALLS_ENABLED=${DIAG_REHEARSAL_KIS_CALLS}"
+          } >> "$GITHUB_ENV"
+          if [ "${DIAG_REHEARSAL_KIS_CALLS}" = "0" ]; then
+            {
+              echo "PB1_REQUIRE_BALANCE_FOR_ENTRY=0"
+              echo "PB1_PREOPEN_REQUIRE_BALANCE=0"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: Compile check (gated)
         if: env.COMPILE_CHECK_ENABLED == '1'
@@ -557,13 +631,50 @@ jobs:
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
           STATE_PATH: ${{ env.STATE_PATH }}
           LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
-          STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
-          LIVE_TRADING_ENABLED: "1"
         run: |
           set -euo pipefail
           cd "$REPO_DIR"
-          echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
-          python -m trader.run --window auto --phase auto
+          if [ "${DIAG_FULL_REHEARSAL}" = "1" ]; then
+            echo "[RUN] DIAG rehearsal enabled (window=morning phase=entry)"
+            python -m trader.run --window morning --phase entry
+          else
+            echo "[RUN] STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+            python -m trader.run --window auto --phase auto
+          fi
+
+      - name: Verify DIAG rehearsal outputs
+        if: env.DIAG_FULL_REHEARSAL == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+          import os
+          from datetime import date
+
+          from trader.db.engine import make_engine
+          from trader.db.repos import OrdersRepo, UniverseRepo
+
+          env = (os.getenv("KIS_ENV") or "practice").lower()
+          engine = make_engine()
+          orders_repo = OrdersRepo(engine)
+          orders = orders_repo.list_today_orders(env)
+          if orders:
+            raise SystemExit(f"Orders detected during rehearsal: {len(orders)}")
+
+          status_path = os.path.join(os.environ["BOT_STATE_DIR"], "runtime", "status", "last_db_write.json")
+          if not os.path.exists(status_path):
+            raise SystemExit(f"Missing last_db_write marker: {status_path}")
+          with open(status_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+          print(f"[DIAG][DB_WRITE] ok payload={payload}")
+
+          repo = UniverseRepo(engine)
+          members = repo.get_current_universe_members(env, "best_k_meta")
+          if len(members) < 50:
+            raise SystemExit(f"Universe sanity failed: members={len(members)} (<50)")
+          print(f"[DIAG][UNIVERSE] members={len(members)}")
+          PY
 
       - name: Detect botstate git repo
         id: botstate_git
@@ -623,8 +734,26 @@ jobs:
           fi
 
           git -C "$BOTSTATE_WORKTREE_DIR" add -A
+          if git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
+            echo "::error::Forbidden sqlite/db paths in botstate changes."
+            git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | head -n 200
+            exit 1
+          fi
           git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
           git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
 
       - name: Assert SSOT (no repo/bot_state exists)
         if: always()
@@ -701,6 +830,21 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
+
+      - name: Assert Postgres-only + SSOT (startup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
+            echo "::error::repo/bot_state exists. SSOT violated."
+            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
+            exit 1
+          fi
 
       - name: Checkout bot-state branch
         uses: actions/checkout@v4
@@ -820,6 +964,11 @@ jobs:
           if git diff --cached --quiet; then
             echo "[PERSIST] no staged changes -> skip"
           else
+            if git status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
+              echo "::error::Forbidden sqlite/db paths in botstate changes."
+              git status --porcelain | head -n 200
+              exit 1
+            fi
             git config user.email "actions@github.com"
             git config user.name "github-actions[bot]"
             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
@@ -832,6 +981,19 @@ jobs:
             git status --porcelain | head -n 200
             exit 1
           fi
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
 
       - name: Assert SSOT (no repo/bot_state exists)
         if: always()

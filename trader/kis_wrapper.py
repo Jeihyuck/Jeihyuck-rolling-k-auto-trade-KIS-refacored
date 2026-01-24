@@ -298,6 +298,17 @@ def _order_block_reason(now: datetime | None = None) -> Optional[str]:
     return None
 
 
+def _assert_orders_allowed() -> None:
+    if os.getenv("PB1_DIAG_REHEARSAL") == "1":
+        raise RuntimeError("orders forbidden in rehearsal")
+    mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+    live_flag = (os.getenv("LIVE_TRADING_ENABLED") or "").strip()
+    if mode != "LIVE" or live_flag != "1":
+        raise RuntimeError(
+            f"orders forbidden (STRATEGY_MODE={mode or 'unset'} LIVE_TRADING_ENABLED={live_flag or 'unset'})"
+        )
+
+
 def _mark_order_blocked(reason: str, now: datetime | None = None) -> None:
     now = now or now_kst()
     _ORDER_BLOCK_STATE.update({"date": now.date(), "reason": reason})
@@ -484,6 +495,19 @@ class KisAPI:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
+        if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
+            logger.warning("[NET][DIAG] KIS calls disabled; skipping request method=%s url=%s", method, url)
+
+            class _DiagDummyResponse:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def json() -> dict:
+                    return {}
+
+            return _DiagDummyResponse()
+
         attempts = max(self._safe_attempts, 1)
         start_ts = time.monotonic()
         auth_refreshed = False
@@ -2144,6 +2168,7 @@ class KisAPI:
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        _assert_orders_allowed()
 
         # TR 후보 순차 시도
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
@@ -2337,6 +2362,7 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        _assert_orders_allowed()
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
@@ -2391,6 +2417,7 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        _assert_orders_allowed()
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:

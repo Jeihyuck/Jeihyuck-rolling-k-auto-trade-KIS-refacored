@@ -842,6 +842,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def decide_market_window(now: datetime) -> str:
+    forced_override = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    if forced_override in {"preopen", "morning", "day", "close", "after"}:
+        return forced_override
+
     trading_day_env = os.getenv("TRADING_DAY")
     if trading_day_env is not None:
         trading_day = _env_bool("TRADING_DAY", default=True)
@@ -1187,6 +1191,7 @@ def run_once(
         now_kst=now,
         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
     )
+    trading_day_detected = trading_day
     if os.getenv("TRADING_DAY") is not None:
         trading_day = _env_bool("TRADING_DAY", default=trading_day)
     auto_window = decide_market_window(now)
@@ -1200,6 +1205,13 @@ def run_once(
         market_window = auto_window
     effective_mode = mode
     if smoke_enabled:
+        trading_day = True
+    diag_rehearsal_active = _env_bool("PB1_DIAG_REHEARSAL", False) and _env_bool("DIAG_ALLOW_NONTRADING_RUN", False)
+    if diag_rehearsal_active and not trading_day:
+        logger.warning(
+            "[PB1][DIAG] non-trading-day override enabled (trading_day=%s -> forced True)",
+            trading_day_detected,
+        )
         trading_day = True
     logger.info(
         "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
@@ -1373,6 +1385,8 @@ def run_once(
         dry_run_reasons.append("diagnostic_mode")
     if mode_resolved == "INTENT_ONLY":
         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+    if mode_resolved != "LIVE":
+        dry_run_reasons.append("STRATEGY_MODE!=LIVE")
     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
