@@ -24,6 +24,18 @@ on:
         description: "Delete pbcore.sqlite3 + runtime + ledger and restart clean (one-shot)"
         required: false
         default: "0"
+      NONTRADING_UNIVERSE_SMOKE:
+        description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
+        required: false
+        default: "0"
+      NONTRADING_SMOKE_DB_STORE:
+        description: "Set to 1 to persist the non-trading universe snapshot to DB."
+        required: false
+        default: "1"
+      NONTRADING_SMOKE_FORCE_REBUILD:
+        description: "Set to 1 to force rebuild during non-trading smoke."
+        required: false
+        default: "0"
 
   schedule:
     # KST 08:50~08:55  => UTC 23:50~23:55 (Sun~Thu UTC)
@@ -53,6 +65,9 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+      FORCE_NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
+      NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
+      NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
 
       STATE_PATH: "bot_state/runtime/state.json"
       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"

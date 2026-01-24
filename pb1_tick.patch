@@ -1,270 +1,607 @@
-diff --git a/tests/test_migrations_splitter.py b/tests/test_migrations_splitter.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..f8f9525eef3f244217211af77b74ea6b19cba0ad
---- /dev/null
-+++ b/tests/test_migrations_splitter.py
-@@ -0,0 +1,47 @@
-+import sys
-+from pathlib import Path
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index 3ffd2fc0f1d79ff5684875afae251b6fcc26ee96..bf0d618733a21145abba6f69934f6f26da784b9c 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -2,79 +2,94 @@ name: "Trade Runner (AUTO: LIVE in market, DIAG otherwise) [5m tick]"
+ 
+ permissions:
+   contents: write
+ 
+ concurrency:
+   group: trade-bot-state
+   cancel-in-progress: true
+ 
+ on:
+   push:
+     branches: [ "nullim", "main" ]
+     paths-ignore:
+       - "bot_state/**"
+       - "**/bot_state/**"
+ 
+   workflow_dispatch:
+     inputs:
+       EMERGENCY_UNIVERSE_BUILD:
+         description: "Set to 1 to allow one-time emergency universe build when DB is missing."
+         required: false
+         default: "0"
+       BOT_STATE_HARD_RESET:
+         description: "Delete pbcore.sqlite3 + runtime + ledger and restart clean (one-shot)"
+         required: false
+         default: "0"
++      NONTRADING_UNIVERSE_SMOKE:
++        description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
++        required: false
++        default: "0"
++      NONTRADING_SMOKE_DB_STORE:
++        description: "Set to 1 to persist the non-trading universe snapshot to DB."
++        required: false
++        default: "1"
++      NONTRADING_SMOKE_FORCE_REBUILD:
++        description: "Set to 1 to force rebuild during non-trading smoke."
++        required: false
++        default: "0"
+ 
+   schedule:
+     # KST 08:50~08:55  => UTC 23:50~23:55 (Sun~Thu UTC)
+     - cron: "50-59/5 23 * * 0-4"
+     # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
+     - cron: "45 23 * * 0-4"
+     # KST 09:00~14:55  => UTC 00:00~05:55 (Mon~Fri UTC)
+     - cron: "*/5 0-5 * * 1-5"
+     # KST 15:00~15:30  => UTC 06:00~06:30 (Mon~Fri UTC)
+     - cron: "0-30/5 6 * * 1-5"
+     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
+     - cron: "29 6 * * 1-5"
+ 
+ defaults:
+   run:
+     shell: bash
+     working-directory: repo
+ 
+ jobs:
+   universe_build:
+     runs-on: ubuntu-latest
+     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
+     timeout-minutes: 15
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
++      FORCE_NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
++      NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
++      NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
+ 
+       STATE_PATH: "bot_state/runtime/state.json"
+       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+       TRADER_CACHE_ROOT: "bot_state/runtime"
+       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+     steps:
+       - name: Checkout code (always run nullim code)
+diff --git a/trader/config.py b/trader/config.py
+index 6d2a9dfb6ff3dd9dd5159f53ebe69a30a35cf57b..316e7c15b69e7bdc6e7c6e56a7bff3fc4f984c08 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -80,50 +80,54 @@ CONFIG = {
+     "FORCE_WEEKLY_REBALANCE": "0",
+     # NEW: 1분봉 VWAP 모멘텀 파라미터
+     "MOM_FAST": "5",        # 1분봉 fast MA 길이
+     "MOM_SLOW": "20",       # 1분봉 slow MA 길이
+     "MOM_TH_PCT": "0.5",    # fast/slow 괴리 임계값(%) – 0.5% 이상이면 강세로 본다
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
++    "FORCE_NONTRADING_UNIVERSE_SMOKE": "0",
++    "NONTRADING_SMOKE_DB_STORE": "1",
++    "NONTRADING_SMOKE_FORCE_REBUILD": "0",
++    "NONTRADING_SMOKE_TIMEOUT_SEC": "180",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "runtime/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "BOTSTATE_LOCK_TTL_SEC": "240",
+     "LEDGER_BASE_DIR": "trader_ledger",
+     "BOT_STATE_RESET": "0",
+     "BOT_STATE_HARD_RESET": "0",
+     "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
+     "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
+     "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
+@@ -436,50 +440,63 @@ STRATEGY_ALLOW_SELL_ONLY = _cfg_bool("STRATEGY_ALLOW_SELL_ONLY")
+ DIAGNOSTIC_MODE = _cfg_bool("DIAGNOSTIC_MODE")
+ DIAGNOSTIC_ONLY = _cfg_bool("DIAGNOSTIC_ONLY")
+ DIAGNOSTIC_FORCE_RUN = _cfg_bool("DIAGNOSTIC_FORCE_RUN")
+ _diag_dump_env = os.getenv("DIAGNOSTIC_DUMP_DIR") or os.getenv("DIAGNOSTIC_DUMP_PATH")
+ DIAGNOSTIC_DUMP_DIR = Path(_diag_dump_env) if _diag_dump_env else get_cache_root() / "diagnostics"
+ ensure_not_repo_tracked_path(DIAGNOSTIC_DUMP_DIR)
+ DIAGNOSTIC_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+ DIAGNOSTIC_MAX_SYMBOLS = int(_cfg("DIAGNOSTIC_MAX_SYMBOLS") or CONFIG["DIAGNOSTIC_MAX_SYMBOLS"])
+ DIAGNOSTIC_TARGET_MARKETS = (_cfg("DIAGNOSTIC_TARGET_MARKETS") or "").strip()
+ DIAG_ENABLED = DIAGNOSTIC_MODE or DIAGNOSTIC_ONLY
+ 
+ if DIAGNOSTIC_MODE:
+     STRATEGY_MODE = "INTENT_ONLY"
+     STRATEGY_DRY_RUN = True
+     STRATEGY_ALLOW_SELL_ONLY = True
+ 
+ logger.info(
+     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
+     DIAG_ENABLED,
+ )
+ 
++FORCE_NONTRADING_UNIVERSE_SMOKE = _cfg_bool("FORCE_NONTRADING_UNIVERSE_SMOKE")
++NONTRADING_SMOKE_DB_STORE = _cfg_bool("NONTRADING_SMOKE_DB_STORE")
++NONTRADING_SMOKE_FORCE_REBUILD = _cfg_bool("NONTRADING_SMOKE_FORCE_REBUILD")
++NONTRADING_SMOKE_TIMEOUT_SEC = int(_cfg("NONTRADING_SMOKE_TIMEOUT_SEC") or "180")
 +
-+sys.path.append(str(Path(__file__).resolve().parents[1]))
++logger.info(
++    "[CONFIG][NONTRADING_SMOKE] force=%s db_store=%s force_rebuild=%s timeout_sec=%s",
++    FORCE_NONTRADING_UNIVERSE_SMOKE,
++    NONTRADING_SMOKE_DB_STORE,
++    NONTRADING_SMOKE_FORCE_REBUILD,
++    NONTRADING_SMOKE_TIMEOUT_SEC,
++)
 +
-+from trader.db.migrate import split_postgres_sql
-+
-+
-+def test_splitter_handles_dollar_quote_block():
-+    sql = """
-+    DO $$
-+    BEGIN
-+      PERFORM 1;
-+    END
-+    $$;
-+    SELECT 1;
-+    """
-+    statements = split_postgres_sql(sql)
-+    assert len(statements) == 2
-+    assert "DO $$" in statements[0]
-+    assert "PERFORM 1;" in statements[0]
-+    assert statements[1].lstrip().startswith("SELECT 1")
-+
-+
-+def test_splitter_handles_tagged_dollar_quote():
-+    sql = """
-+    CREATE OR REPLACE FUNCTION test() RETURNS void AS $func$
-+    BEGIN
-+      RAISE NOTICE 'hi;';
-+    END;
-+    $func$;
-+    SELECT 2;
-+    """
-+    statements = split_postgres_sql(sql)
-+    assert len(statements) == 2
-+    assert "$func$" in statements[0]
-+    assert "RAISE NOTICE 'hi;';" in statements[0]
-+    assert statements[1].lstrip().startswith("SELECT 2")
-+
-+
-+def test_splitter_ignores_semicolons_in_comments():
-+    sql = "SELECT 1; -- comment;\nSELECT 2; /* block; comment */ SELECT 3;"
-+    statements = split_postgres_sql(sql)
-+    assert len(statements) == 3
-+    assert statements[0].lstrip().startswith("SELECT 1")
-+    assert "SELECT 2" in statements[1]
-+    assert "SELECT 3" in statements[2]
-diff --git a/trader/db/migrate.py b/trader/db/migrate.py
-index 771622d84beb6a98493a135b3f58827d13342380..fd52ba7b7cf08b004e355bdd3effd09acf87e7bb 100644
---- a/trader/db/migrate.py
-+++ b/trader/db/migrate.py
-@@ -1,41 +1,163 @@
- import glob
- import hashlib
- import re
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             value = int(item)
+         except ValueError:
+             continue
+         if 1 <= value <= 5 and value not in priorities:
+             priorities.append(value)
+     return priorities or [5, 4, 3, 2, 1]
+ 
+ 
+ STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+     _cfg("STRATEGY_REDUCTION_PRIORITY")
+ )
+ 
+ 
+ def _parse_active_strategies(raw: str) -> set[int]:
+     strategies: set[int] = set()
+     for item in (raw or "").split(","):
+         item = item.strip()
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 9ed8a52e9df71ede0ca258d86d3201cc3fd655e4..6097176bfacf3e0f4d4e5ad9d23ddae81fb4ee71 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -3,58 +3,62 @@ from __future__ import annotations
+ import argparse
+ import json
  import logging
  import os
+ import subprocess
+ import signal
+ import traceback
+ import time as time_mod
+ import copy
+ from datetime import datetime, time as dtime, timedelta
  from pathlib import Path
+ from zoneinfo import ZoneInfo
  
- import sqlalchemy as sa
- from sqlalchemy import Engine, text
+ from trader.config import (
+     AFTERNOON_WINDOW_END,
+     AFTERNOON_WINDOW_START,
+     BOT_STATE_RESET,
+     BOT_STATE_HARD_RESET,
+     BOT_STATE_RESET_CASH_MAX_KRW,
+     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
+     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
+     CLOSE_AUCTION_END,
+     CLOSE_AUCTION_START,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
++    FORCE_NONTRADING_UNIVERSE_SMOKE,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
+     MARKET_CLOSE_HHMM,
+     MARKET_OPEN_HHMM,
+     MORNING_EXIT_END,
+     MORNING_EXIT_START,
+     MORNING_WINDOW_END,
+     MORNING_WINDOW_START,
++    NONTRADING_SMOKE_DB_STORE,
++    NONTRADING_SMOKE_FORCE_REBUILD,
++    NONTRADING_SMOKE_TIMEOUT_SEC,
+     PB1_ALLOW_PREOPEN_ENTRY,
+     PB1_PREOPEN_END,
+     PB1_PREOPEN_MAX_NEW_POSITIONS,
+     PB1_PREOPEN_REQUIRE_BALANCE,
+     PB1_PREOPEN_START,
+     PB1_ENTRY_ENABLED,
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_END,
+     PB1_MORNING_WINDOW_END,
+     PB1_REQUIRE_BALANCE_FOR_ENTRY,
+     PB1_FORCE_ENTRY_ON_PUSH,
+     PB1_MAX_WAIT_FOR_WINDOW_MIN,
+     PB1_WAIT_FOR_WINDOW,
+     PAPER_MAX_CAPITAL_KRW,
+     PAPER_RESET_AUTO_PURGE,
+     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
+     resolve_strategy_mode,
+ )
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
+ from trader.botstate_sync import (
+     BotStateContext,
+     acquire_lock as acquire_botstate_lock,
+     compute_lock_ttl,
+     hard_reset_bot_state,
+     persist_or_fail,
+@@ -275,50 +279,54 @@ def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
+         "dnca_tot_amt", "prvs_rcdl_excc_amt", "nxdy_excc_amt", "cma_evlu_amt"
+     ]
  
+     picked_total = _pick(out2, candidates_total)
+     picked_orderable = _pick(out2, candidates_orderable)
+     picked_deposit = _pick(out2, candidates_deposit)
  
+     logger.info("[DIAG][BALANCE][RAW_KEYS] output2_keys=%s",
+                 sorted(list(out2.keys())) if isinstance(out2, dict) else None)
+     logger.info("[DIAG][BALANCE][PICK] total=%s orderable=%s deposit=%s",
+                 picked_total, picked_orderable, picked_deposit)
  
- logger = logging.getLogger(__name__)
- MIGRATION_VERSION = "v1"
- 
- 
-+def split_postgres_sql(sql: str) -> list[str]:
-+    statements: list[str] = []
-+    buffer: list[str] = []
-+    in_single_quote = False
-+    in_double_quote = False
-+    in_line_comment = False
-+    in_block_comment = False
-+    dollar_tag: str | None = None
-+    i = 0
-+    length = len(sql)
-+
-+    def flush_statement() -> None:
-+        statement = "".join(buffer).strip()
-+        if statement:
-+            statements.append(statement)
-+        buffer.clear()
-+
-+    while i < length:
-+        char = sql[i]
-+        next_char = sql[i + 1] if i + 1 < length else ""
-+
-+        if in_line_comment:
-+            buffer.append(char)
-+            if char == "\n":
-+                in_line_comment = False
-+            i += 1
-+            continue
-+
-+        if in_block_comment:
-+            buffer.append(char)
-+            if char == "*" and next_char == "/":
-+                buffer.append(next_char)
-+                in_block_comment = False
-+                i += 2
-+            else:
-+                i += 1
-+            continue
-+
-+        if dollar_tag is not None:
-+            if sql.startswith(dollar_tag, i):
-+                buffer.append(dollar_tag)
-+                i += len(dollar_tag)
-+                dollar_tag = None
-+            else:
-+                buffer.append(char)
-+                i += 1
-+            continue
-+
-+        if in_single_quote:
-+            buffer.append(char)
-+            if char == "'" and next_char == "'":
-+                buffer.append(next_char)
-+                i += 2
-+                continue
-+            if char == "'":
-+                in_single_quote = False
-+            i += 1
-+            continue
-+
-+        if in_double_quote:
-+            buffer.append(char)
-+            if char == '"' and next_char == '"':
-+                buffer.append(next_char)
-+                i += 2
-+                continue
-+            if char == '"':
-+                in_double_quote = False
-+            i += 1
-+            continue
-+
-+        if char == "-" and next_char == "-":
-+            buffer.append(char)
-+            buffer.append(next_char)
-+            in_line_comment = True
-+            i += 2
-+            continue
-+
-+        if char == "/" and next_char == "*":
-+            buffer.append(char)
-+            buffer.append(next_char)
-+            in_block_comment = True
-+            i += 2
-+            continue
-+
-+        if char == "'":
-+            buffer.append(char)
-+            in_single_quote = True
-+            i += 1
-+            continue
-+
-+        if char == '"':
-+            buffer.append(char)
-+            in_double_quote = True
-+            i += 1
-+            continue
-+
-+        if char == "$":
-+            end = sql.find("$", i + 1)
-+            if end != -1:
-+                tag = sql[i + 1 : end]
-+                if tag == "" or all(ch.isalnum() or ch == "_" for ch in tag):
-+                    delimiter = f"${tag}$"
-+                    buffer.append(delimiter)
-+                    dollar_tag = delimiter
-+                    i = end + 1
-+                    continue
-+            buffer.append(char)
-+            i += 1
-+            continue
-+
-+        if char == ";":
-+            flush_statement()
-+            i += 1
-+            continue
-+
-+        buffer.append(char)
-+        i += 1
-+
-+    flush_statement()
-+    return statements
-+
-+
- def _strip_sql_comments(sql: str) -> str:
-     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
-     out_lines = []
-     for line in sql.splitlines():
-         stripped = line.strip()
-         if not stripped:
-             continue
-         if stripped.startswith("--"):
-             continue
-         if "--" in line:
-             line = line.split("--", 1)[0]
-         out_lines.append(line)
-     return "\n".join(out_lines).strip()
+     raw_path = os.path.join(diag_dir, "diag_balance_raw.json")
+     try:
+         with open(raw_path, "w", encoding="utf-8") as f:
+             json.dump(raw, f, ensure_ascii=False)
+         logger.info("[DIAG][BALANCE] saved raw=%s", raw_path)
+     except Exception as e:
+         logger.warning("[DIAG][BALANCE] failed to save raw json: %s", e)
  
  
- def _schema_stamp_path() -> Path:
-     cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
-     return cache_root / "schema_version.txt"
+ def universe_build_flag(as_of: str) -> Path:
+     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
  
  
- def _compute_migration_version(migrations_dir: str) -> str:
-     hasher = hashlib.sha256()
-     hasher.update(MIGRATION_VERSION.encode("utf-8"))
-     migration_files = sorted(Path(migrations_dir).glob("*.sql"))
-     for path in migration_files:
-@@ -109,46 +231,46 @@ def _should_ignore_pg_error(exc: Exception) -> bool:
-         return True
-     return False
++def nontrading_universe_smoke_flag(as_of: str) -> Path:
++    return botstate_path("runtime", "diagnostics", f"nontrading_universe_smoke_done_{as_of}.flag")
++
++
+ def ensure_universe_built_once(
+     runtime_store: RuntimeStore | None = None,
+     *,
+     env: str | None = None,
+     strategy: str | None = None,
+     as_of: str | None = None,
+     force: bool = False,
+     allow_missing: bool = False,
+ ) -> None:
+     if runtime_store is None:
+         raise ValueError("runtime_store is required for ensure_universe_built_once")
  
+     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
+     if env is not None:
+         env = env.strip()
+     strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
+     as_of = as_of or _get_now_kst().date().isoformat()
  
- def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
-     if _should_skip_migrations(engine, migrations_dir):
-         return
-     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
-     with engine.begin() as conn:
-         url = str(engine.url)
-         logger.info("[DB][MIGRATE] external url=%s", url)
-         _ensure_schema_migrations_table(conn)
-         applied = _list_applied_versions(conn)
+     assert env, "env is required"
+     assert strategy, "strategy is required"
+     assert as_of, "as_of is required"
  
-         migration_files = sorted(
-             [
-                 Path(path)
-                 for path in glob.glob(os.path.join(migrations_dir, "*.sql"))
-                 if Path(path).is_file()
-             ]
+     log.info(
+         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
+         type(runtime_store).__name__,
+@@ -353,50 +361,178 @@ def ensure_universe_built_once(
+         env,
+         "--strategy",
+         strategy,
+         "--date",
+         as_of,
+     ]
+     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+     bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
+     env_vars = os.environ.copy()
+     env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
+     env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
+     subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
+     _, post_meta = runtime_store.load_today_universe(as_of)
+     if post_meta.get("have_today"):
+         log.info(
+             "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+             post_meta.get("today_path"),
          )
-         for path in migration_files:
-             version = path.name
-             if version in applied:
-                 continue
--            sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
-+            sql = path.read_text(encoding="utf-8")
-             logger.info("[DB][MIGRATE] applying %s", version)
-             try:
--                statements = [stmt for stmt in sql.split(";") if stmt.strip()]
-+                statements = split_postgres_sql(sql)
-                 for statement in statements:
-                     _apply_pg_statement(conn, statement)
-                 conn.execute(
-                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
-                     {"version": version},
+     else:
+         log.warning(
+             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+             post_meta.get("today_path"),
+         )
+ 
+ 
++def run_nontrading_universe_smoke(
++    *,
++    runtime_store: RuntimeStore,
++    engine,
++    now: datetime,
++    env: str,
++    strategy: str,
++    force_rebuild: bool,
++    db_store: bool,
++    timeout_sec: int,
++) -> bool:
++    as_of = now.date().isoformat()
++    done_flag = nontrading_universe_smoke_flag(as_of)
++    if done_flag.exists() and not force_rebuild:
++        logger.info(
++            "[SMOKE][NONTRADING][SKIP] as_of=%s reason=already_done flag=%s",
++            as_of,
++            done_flag,
++        )
++        return False
++
++    if force_rebuild and done_flag.exists():
++        try:
++            done_flag.unlink()
++        except Exception:
++            logger.warning("[SMOKE][NONTRADING][FLAG][REMOVE_FAIL] as_of=%s flag=%s", as_of, done_flag)
++
++    cmd = [
++        "python",
++        "-m",
++        "trader.universe.build",
++        "--env",
++        env,
++        "--strategy",
++        strategy,
++        "--date",
++        as_of,
++    ]
++    logger.info(
++        "[SMOKE][NONTRADING][BUILD] as_of=%s env=%s strategy=%s timeout_sec=%s force_rebuild=%s cmd=%s",
++        as_of,
++        env,
++        strategy,
++        timeout_sec,
++        int(force_rebuild),
++        cmd,
++    )
++    env_vars = os.environ.copy()
++    env_vars["BOT_STATE_DIR"] = str(runtime_store.base_dir)
++    env_vars.setdefault("BOTSTATE_ROOT", str(runtime_store.base_dir))
++    try:
++        subprocess.run(
++            cmd,
++            check=False,
++            cwd=str(Path(runtime_store.base_dir).parent),
++            env=env_vars,
++            timeout=timeout_sec,
++        )
++    except subprocess.TimeoutExpired:
++        logger.warning(
++            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=build_timeout timeout_sec=%s",
++            as_of,
++            timeout_sec,
++        )
++        return False
++
++    members, meta = runtime_store.load_today_universe(as_of)
++    have_today = bool(meta.get("have_today"))
++    today_path = meta.get("today_path")
++    logger.info(
++        "[SMOKE][NONTRADING][RUNTIME] as_of=%s have_today=%s members=%s path=%s",
++        as_of,
++        int(have_today),
++        len(members),
++        today_path,
++    )
++    if not have_today:
++        logger.warning(
++            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=runtime_missing path=%s",
++            as_of,
++            today_path,
++        )
++        return False
++
++    payload: dict = {}
++    if today_path:
++        try:
++            payload = json.loads(Path(today_path).read_text(encoding="utf-8"))
++        except Exception:
++            logger.exception("[SMOKE][NONTRADING][LOAD_FAIL] as_of=%s path=%s", as_of, today_path)
++
++    payload_members = payload.get("members") if isinstance(payload, dict) else None
++    if isinstance(payload_members, list):
++        members = payload_members
++
++    provider = payload.get("source") if isinstance(payload, dict) else None
++    if not provider:
++        provider = "runtime"
++
++    db_store_ok = False
++    if db_store:
++        try:
++            repo = UniverseRepo(engine)
++            repo.store_universe_snapshot(
++                env=env,
++                strategy=strategy,
++                as_of_date=as_of,
++                provider=provider,
++                members=members,
++                reason="nontrading_smoke",
++            )
++            db_store_ok = True
++        except Exception:
++            logger.exception("[SMOKE][NONTRADING][DB_STORE][FAIL] as_of=%s env=%s strategy=%s", as_of, env, strategy)
++
++    runtime_store.touch_flag(
++        Path("runtime") / "diagnostics" / f"nontrading_universe_smoke_done_{as_of}.flag",
++        content=f"done as_of={as_of} members={len(members)} db_store={int(db_store_ok)}\n",
++    )
++    logger.info(
++        "[SMOKE][NONTRADING][OK] universe_built=1 db_store=%s members=%s as_of=%s",
++        int(db_store_ok),
++        len(members),
++        as_of,
++    )
++    return True
++
++
+ def _load_universe_context(
+     *,
+     runtime_store: RuntimeStore,
+     as_of: str,
+     env: str,
+     strategy: str,
+ ) -> UniverseContext:
+     runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
+     ok, meta = runtime_store.universe_check(as_of)
+     selected_path = meta.get("selected_path")
+     if not ok or not selected_path or not os.path.exists(selected_path):
+         raise RuntimeError(f"Universe missing: cannot trade as_of={as_of} path={selected_path}")
+     try:
+         with open(selected_path, "r", encoding="utf-8") as handle:
+             data = json.load(handle)
+     except Exception as exc:
+         raise RuntimeError(f"Universe load failed: cannot trade as_of={as_of} path={selected_path}") from exc
+     if isinstance(data, dict):
+         universe = data
+         members = data.get("members")
+     else:
+         universe = {"members": data}
+         members = data
+     if not isinstance(members, list):
+         raise RuntimeError(f"Universe malformed: cannot trade as_of={as_of} path={selected_path}")
+@@ -1139,53 +1275,79 @@ def run_once(
+                     market_window=market_window,
+                     window_override=args.window,
+                     phase_seed=phase_seed,
                  )
-             except Exception as exc:
-                 snippet = " ".join(sql.split())[:2000]
-                 logger.error("[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s", version, exc, snippet)
-                 raise
-     _write_schema_stamp(migrations_dir)
+                 window = resolved_window
+                 phase_for_log = resolved_phase
+                 logger.info(
+                     "[MODE_DECISION] source=%s now_kst=%s trading_day=%s window=%s mode=%s",
+                     mode_source,
+                     now.isoformat(),
+                     trading_day,
+                     market_window,
+                     mode,
+                 )
+                 logger.info(
+                     "[PB1][PHASE] now=%s window=%s phase=%s reason=%s entry_enabled=%s phase_window=%s",
+                     now.isoformat(),
+                     window_label,
+                     resolved_phase,
+                     phase_reason,
+                     entry_flag.value,
+                     phase_window,
+                 )
+                 action = "run" if trading_day else "smoke"
+                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
+-    elif not trading_day:
+-        logger.info("[PB1][LOOP] non-trading-day -> skip")
+-        return [], False, {}, phase_for_log, "SKIPPED"
++    else:
++        if not trading_day:
++            if FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
++                run_nontrading_universe_smoke(
++                    runtime_store=runtime_store,
++                    engine=engine,
++                    now=now,
++                    env=(os.getenv("KIS_ENV") or "practice").lower(),
++                    strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
++                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
++                    db_store=NONTRADING_SMOKE_DB_STORE,
++                    timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
++                )
++                return [], False, {}, phase_for_log, "SMOKE"
++            logger.info("[PB1][LOOP] non-trading-day -> skip")
++            return [], False, {}, phase_for_log, "SKIPPED"
++
++    if not trading_day and FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
++        run_nontrading_universe_smoke(
++            runtime_store=runtime_store,
++            engine=engine,
++            now=now,
++            env=(os.getenv("KIS_ENV") or "practice").lower(),
++            strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
++            force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
++            db_store=NONTRADING_SMOKE_DB_STORE,
++            timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
++        )
++        return [], False, {}, phase_for_log, "SMOKE"
  
+     if action == "smoke":
+         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
+         return [], False, {}, phase_for_log, "SMOKE"
  
- if __name__ == "__main__":
-     from .engine import make_engine
+     if not window and not close_cancel_only:
+         logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+         return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
  
-     run_migrations(make_engine())
+     non_trading_day = not trading_day
+     force_diag = diag_env_flag
+ 
+     dry_run_flag = parse_env_flag("DRY_RUN", default=False)
+     disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
+     live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
+     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+     mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+     dry_run_reasons: list[str] = []
+     diag_enabled = force_diag
+     if diag_enabled:
+         dry_run_reasons.append("diagnostic_mode")
+     if mode_resolved == "INTENT_ONLY":
+         dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+     if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
+         dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+

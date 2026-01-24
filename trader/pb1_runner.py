@@ -25,6 +25,7 @@ from trader.config import (
     CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
     DIAGNOSTIC_ONLY,
+    FORCE_NONTRADING_UNIVERSE_SMOKE,
     LEDGER_BASE_DIR,
     LEDGER_LOOKBACK_DAYS,
     MARKET_CLOSE_HHMM,
@@ -33,6 +34,9 @@ from trader.config import (
     MORNING_EXIT_START,
     MORNING_WINDOW_END,
     MORNING_WINDOW_START,
+    NONTRADING_SMOKE_DB_STORE,
+    NONTRADING_SMOKE_FORCE_REBUILD,
+    NONTRADING_SMOKE_TIMEOUT_SEC,
     PB1_ALLOW_PREOPEN_ENTRY,
     PB1_PREOPEN_END,
     PB1_PREOPEN_MAX_NEW_POSITIONS,
@@ -297,6 +301,10 @@ def universe_build_flag(as_of: str) -> Path:
     return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
 
 
+def nontrading_universe_smoke_flag(as_of: str) -> Path:
+    return botstate_path("runtime", "diagnostics", f"nontrading_universe_smoke_done_{as_of}.flag")
+
+
 def ensure_universe_built_once(
     runtime_store: RuntimeStore | None = None,
     *,
@@ -373,6 +381,134 @@ def ensure_universe_built_once(
             "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
             post_meta.get("today_path"),
         )
+
+
+def run_nontrading_universe_smoke(
+    *,
+    runtime_store: RuntimeStore,
+    engine,
+    now: datetime,
+    env: str,
+    strategy: str,
+    force_rebuild: bool,
+    db_store: bool,
+    timeout_sec: int,
+) -> bool:
+    as_of = now.date().isoformat()
+    done_flag = nontrading_universe_smoke_flag(as_of)
+    if done_flag.exists() and not force_rebuild:
+        logger.info(
+            "[SMOKE][NONTRADING][SKIP] as_of=%s reason=already_done flag=%s",
+            as_of,
+            done_flag,
+        )
+        return False
+
+    if force_rebuild and done_flag.exists():
+        try:
+            done_flag.unlink()
+        except Exception:
+            logger.warning("[SMOKE][NONTRADING][FLAG][REMOVE_FAIL] as_of=%s flag=%s", as_of, done_flag)
+
+    cmd = [
+        "python",
+        "-m",
+        "trader.universe.build",
+        "--env",
+        env,
+        "--strategy",
+        strategy,
+        "--date",
+        as_of,
+    ]
+    logger.info(
+        "[SMOKE][NONTRADING][BUILD] as_of=%s env=%s strategy=%s timeout_sec=%s force_rebuild=%s cmd=%s",
+        as_of,
+        env,
+        strategy,
+        timeout_sec,
+        int(force_rebuild),
+        cmd,
+    )
+    env_vars = os.environ.copy()
+    env_vars["BOT_STATE_DIR"] = str(runtime_store.base_dir)
+    env_vars.setdefault("BOTSTATE_ROOT", str(runtime_store.base_dir))
+    try:
+        subprocess.run(
+            cmd,
+            check=False,
+            cwd=str(Path(runtime_store.base_dir).parent),
+            env=env_vars,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=build_timeout timeout_sec=%s",
+            as_of,
+            timeout_sec,
+        )
+        return False
+
+    members, meta = runtime_store.load_today_universe(as_of)
+    have_today = bool(meta.get("have_today"))
+    today_path = meta.get("today_path")
+    logger.info(
+        "[SMOKE][NONTRADING][RUNTIME] as_of=%s have_today=%s members=%s path=%s",
+        as_of,
+        int(have_today),
+        len(members),
+        today_path,
+    )
+    if not have_today:
+        logger.warning(
+            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=runtime_missing path=%s",
+            as_of,
+            today_path,
+        )
+        return False
+
+    payload: dict = {}
+    if today_path:
+        try:
+            payload = json.loads(Path(today_path).read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("[SMOKE][NONTRADING][LOAD_FAIL] as_of=%s path=%s", as_of, today_path)
+
+    payload_members = payload.get("members") if isinstance(payload, dict) else None
+    if isinstance(payload_members, list):
+        members = payload_members
+
+    provider = payload.get("source") if isinstance(payload, dict) else None
+    if not provider:
+        provider = "runtime"
+
+    db_store_ok = False
+    if db_store:
+        try:
+            repo = UniverseRepo(engine)
+            repo.store_universe_snapshot(
+                env=env,
+                strategy=strategy,
+                as_of_date=as_of,
+                provider=provider,
+                members=members,
+                reason="nontrading_smoke",
+            )
+            db_store_ok = True
+        except Exception:
+            logger.exception("[SMOKE][NONTRADING][DB_STORE][FAIL] as_of=%s env=%s strategy=%s", as_of, env, strategy)
+
+    runtime_store.touch_flag(
+        Path("runtime") / "diagnostics" / f"nontrading_universe_smoke_done_{as_of}.flag",
+        content=f"done as_of={as_of} members={len(members)} db_store={int(db_store_ok)}\n",
+    )
+    logger.info(
+        "[SMOKE][NONTRADING][OK] universe_built=1 db_store=%s members=%s as_of=%s",
+        int(db_store_ok),
+        len(members),
+        as_of,
+    )
+    return True
 
 
 def _load_universe_context(
@@ -1161,9 +1297,35 @@ def run_once(
                 )
                 action = "run" if trading_day else "smoke"
                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
-    elif not trading_day:
-        logger.info("[PB1][LOOP] non-trading-day -> skip")
-        return [], False, {}, phase_for_log, "SKIPPED"
+    else:
+        if not trading_day:
+            if FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
+                run_nontrading_universe_smoke(
+                    runtime_store=runtime_store,
+                    engine=engine,
+                    now=now,
+                    env=(os.getenv("KIS_ENV") or "practice").lower(),
+                    strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
+                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
+                    db_store=NONTRADING_SMOKE_DB_STORE,
+                    timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+                )
+                return [], False, {}, phase_for_log, "SMOKE"
+            logger.info("[PB1][LOOP] non-trading-day -> skip")
+            return [], False, {}, phase_for_log, "SKIPPED"
+
+    if not trading_day and FORCE_NONTRADING_UNIVERSE_SMOKE and mode == "DIAG":
+        run_nontrading_universe_smoke(
+            runtime_store=runtime_store,
+            engine=engine,
+            now=now,
+            env=(os.getenv("KIS_ENV") or "practice").lower(),
+            strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
+            force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
+            db_store=NONTRADING_SMOKE_DB_STORE,
+            timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+        )
+        return [], False, {}, phase_for_log, "SMOKE"
 
     if action == "smoke":
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
