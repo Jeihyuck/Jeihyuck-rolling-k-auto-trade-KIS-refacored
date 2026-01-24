@@ -1415,6 +1415,8 @@ def run_once(
             _write_last_db_write(runtime_store, run_id=run_id, reason="exit_shortcircuit", now=now)
             logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
             return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
+        except Exception:
+            logger.exception("[PB1][EXIT_SHORTCIRCUIT] failed")
 
     if should_degrade(remaining_s):
         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
@@ -1448,6 +1450,8 @@ def run_once(
                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
             _write_last_db_write(runtime_store, run_id=run_id, reason="budget_degraded", now=now)
             return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
+        except Exception:
+            logger.exception("[PB1][DEGRADED] failed")
 
     if not loop_mode:
         allow_missing = market_window == "preopen"
