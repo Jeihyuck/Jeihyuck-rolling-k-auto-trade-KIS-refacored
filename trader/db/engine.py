@@ -7,6 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import make_url
 
 ALLOWED_PG_SCHEMES = {"postgres", "postgresql"}
+PG_PSYCO_PG_DRIVER = "postgresql+psycopg"
 
 # DB URL을 읽을 env 우선순위
 DB_URL_KEYS = (
@@ -71,11 +72,21 @@ def get_db_url() -> str:
             f"(drivername={drivername}, base={base})"
         )
 
-    normalized = parsed.set(drivername=base).render_as_string(hide_password=False)
+    normalized = parsed.set(drivername=PG_PSYCO_PG_DRIVER).render_as_string(
+        hide_password=False
+    )
     return normalized
 
 
 def make_engine() -> sa.Engine:
     url = get_db_url()
-    # SQLAlchemy 엔진 생성 (psycopg v3 지원)
-    return sa.create_engine(url, pool_pre_ping=True)
+    drivername = ""
+    try:
+        drivername = make_url(url).drivername or ""
+        # SQLAlchemy 엔진 생성 (psycopg v3 지원)
+        return sa.create_engine(url, pool_pre_ping=True)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Postgres driver missing. Install psycopg[binary] (recommended) or "
+            f"psycopg2-binary. Current URL driver={drivername}."
+        ) from exc

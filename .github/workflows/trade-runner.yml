@@ -192,6 +192,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Resolve universe build gate
@@ -488,6 +489,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Precheck env (fail fast)
@@ -969,6 +971,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Configure git identity for botstate commits
