@@ -14,6 +14,128 @@ logger = logging.getLogger(__name__)
 MIGRATION_VERSION = "v1"
 
 
+def split_postgres_sql(sql: str) -> list[str]:
+    statements: list[str] = []
+    buffer: list[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    in_block_comment = False
+    dollar_tag: str | None = None
+    i = 0
+    length = len(sql)
+
+    def flush_statement() -> None:
+        statement = "".join(buffer).strip()
+        if statement:
+            statements.append(statement)
+        buffer.clear()
+
+    while i < length:
+        char = sql[i]
+        next_char = sql[i + 1] if i + 1 < length else ""
+
+        if in_line_comment:
+            buffer.append(char)
+            if char == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            buffer.append(char)
+            if char == "*" and next_char == "/":
+                buffer.append(next_char)
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if dollar_tag is not None:
+            if sql.startswith(dollar_tag, i):
+                buffer.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+            else:
+                buffer.append(char)
+                i += 1
+            continue
+
+        if in_single_quote:
+            buffer.append(char)
+            if char == "'" and next_char == "'":
+                buffer.append(next_char)
+                i += 2
+                continue
+            if char == "'":
+                in_single_quote = False
+            i += 1
+            continue
+
+        if in_double_quote:
+            buffer.append(char)
+            if char == '"' and next_char == '"':
+                buffer.append(next_char)
+                i += 2
+                continue
+            if char == '"':
+                in_double_quote = False
+            i += 1
+            continue
+
+        if char == "-" and next_char == "-":
+            buffer.append(char)
+            buffer.append(next_char)
+            in_line_comment = True
+            i += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            buffer.append(char)
+            buffer.append(next_char)
+            in_block_comment = True
+            i += 2
+            continue
+
+        if char == "'":
+            buffer.append(char)
+            in_single_quote = True
+            i += 1
+            continue
+
+        if char == '"':
+            buffer.append(char)
+            in_double_quote = True
+            i += 1
+            continue
+
+        if char == "$":
+            end = sql.find("$", i + 1)
+            if end != -1:
+                tag = sql[i + 1 : end]
+                if tag == "" or all(ch.isalnum() or ch == "_" for ch in tag):
+                    delimiter = f"${tag}$"
+                    buffer.append(delimiter)
+                    dollar_tag = delimiter
+                    i = end + 1
+                    continue
+            buffer.append(char)
+            i += 1
+            continue
+
+        if char == ";":
+            flush_statement()
+            i += 1
+            continue
+
+        buffer.append(char)
+        i += 1
+
+    flush_statement()
+    return statements
+
+
 def _strip_sql_comments(sql: str) -> str:
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
     out_lines = []
@@ -131,10 +253,10 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             version = path.name
             if version in applied:
                 continue
-            sql = _strip_sql_comments(path.read_text(encoding="utf-8"))
+            sql = path.read_text(encoding="utf-8")
             logger.info("[DB][MIGRATE] applying %s", version)
             try:
-                statements = [stmt for stmt in sql.split(";") if stmt.strip()]
+                statements = split_postgres_sql(sql)
                 for statement in statements:
                     _apply_pg_statement(conn, statement)
                 conn.execute(
