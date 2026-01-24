@@ -112,8 +112,9 @@ jobs:
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-            echo "::error::PBCORE_DB_URL must be postgres-only. got=${PBCORE_DB_URL}"
+          # allow: postgres://, postgresql://, postgresql+psycopg://, postgresql+psycopg2:// etc.
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
             exit 1
           fi
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
@@ -133,7 +134,7 @@ jobs:
           fetch-depth: 0
           ref: "bot-state"
           path: botstate
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
 
       - name: Compute BOT_STATE_DIR (runtime)
         shell: bash
@@ -319,14 +320,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: grep-based check is banned (false positives).
-          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "ERROR: repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
-          # additionally fail if tracked by git (defensive)
           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
             echo "ERROR: repo contains tracked bot_state. SSOT violated."
             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
@@ -403,8 +401,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: grep-based check is banned (false positives).
-          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "::error::repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
@@ -452,7 +448,6 @@ jobs:
           echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
           echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
 
-          # --- SSOT absolute paths (critical) ---
           {
             echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
             echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
@@ -499,7 +494,6 @@ jobs:
           set -euo pipefail
           mkdir -p "$BOT_STATE_DIR"
           touch "$BOT_STATE_DIR/.gitkeep"
-          # 기본 ignore (원하면 확장)
           if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
             printf "runtime/\ndb/\n*.sqlite3\n*.sqlite3.*\n*.db\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
           fi
@@ -538,7 +532,6 @@ jobs:
           set -euo pipefail
           python - << 'PY'
           import os
-
           from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
 
           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
@@ -599,7 +592,7 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-      - name: Gate: disable live trading in DIAG
+      - name: "Gate: disable live trading in DIAG"
         shell: bash
         run: |
           set -euo pipefail
@@ -625,8 +618,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # KST 날짜 계산
           KST_DATE="$(python - <<'PY'
           from datetime import datetime, timezone, timedelta
           kst = timezone(timedelta(hours=9))
@@ -639,33 +630,28 @@ jobs:
           echo "[VERIFY_NONTRADING_SMOKE] Removing flag if exists: $FLAG"
 
           rm -f "$FLAG" || true
-          # diagnostics 폴더가 없을 수도 있으니 생성
           mkdir -p "$BOT_STATE_DIR/runtime/diagnostics"
           ls -la "$BOT_STATE_DIR/runtime/diagnostics" || true
 
-      - name: Guard: postgres-only + SSOT + DIAG safety
+      - name: "Guard: postgres-only + SSOT + DIAG safety"
         shell: bash
         run: |
           set -euo pipefail
-
-          # 1) Postgres-only 강제 (스킴만 출력해서 원인 파악 가능)
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
           scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
           echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
 
-          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql://"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql:// (and optional +driver)."
             exit 1
           fi
 
-          # 2) SSOT 강제: repo/bot_state 존재 금지 (실제 디렉토리만 체크)
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "::error::repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
 
-          # 3) repo에 bot_state가 tracked로 들어왔는지 체크
           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
             echo "::error::repo contains tracked bot_state. SSOT violated."
             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
@@ -709,8 +695,6 @@ jobs:
           python - << 'PY'
           import json
           import os
-          from datetime import date
-
           from trader.db.engine import make_engine
           from trader.db.repos import OrdersRepo, UniverseRepo
 
@@ -790,7 +774,6 @@ jobs:
           set -euo pipefail
           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
 
-          # 변경 없으면 종료
           if [ -z "$(git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain)" ]; then
             echo "[PERSIST] no changes -> skip"
             exit 0
@@ -823,8 +806,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: grep-based check is banned (false positives).
-          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "ERROR: repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
@@ -898,8 +879,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: grep-based check is banned (false positives).
-          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "::error::repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
@@ -973,29 +952,25 @@ jobs:
           git config --global user.email "actions@github.com"
           git config --global user.name "github-actions[bot]"
 
-      - name: Guard: postgres-only + SSOT + DIAG safety
+      - name: "Guard: postgres-only + SSOT + DIAG safety"
         shell: bash
         run: |
           set -euo pipefail
-
-          # 1) Postgres-only 강제 (스킴만 출력해서 원인 파악 가능)
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
           scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
           echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
 
-          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?:// ]]; then
-            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql://"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql:// (and optional +driver)."
             exit 1
           fi
 
-          # 2) SSOT 강제: repo/bot_state 존재 금지 (실제 디렉토리만 체크)
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "::error::repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
             exit 1
           fi
 
-          # 3) repo에 bot_state가 tracked로 들어왔는지 체크
           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
             echo "::error::repo contains tracked bot_state. SSOT violated."
             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
@@ -1026,7 +1001,7 @@ jobs:
           else
             echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
+          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(tail -n 1 "$GITHUB_OUTPUT" | cut -d= -f2)"
 
       - name: Persist bot_state (guarded)
         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
@@ -1053,10 +1028,8 @@ jobs:
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
 
-          # 1) untracked 포함 bot_state 전체 stage
           git add -A bot_state
 
-          # 2) staged 변경이 없으면 스킵
           if git diff --cached --quiet; then
             echo "[PERSIST] no staged changes -> skip"
           else
@@ -1071,7 +1044,6 @@ jobs:
             git push origin HEAD:bot-state
           fi
 
-          # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
           if [[ -n "$(git status --porcelain)" ]]; then
             echo "::error::botstate worktree dirty after persist"
             git status --porcelain | head -n 200
@@ -1096,8 +1068,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: grep-based check is banned (false positives).
-          # SSOT intent: ensure repo does not contain actual bot_state directory or tracked files.
           if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
             echo "ERROR: repo/bot_state exists. SSOT violated."
             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
