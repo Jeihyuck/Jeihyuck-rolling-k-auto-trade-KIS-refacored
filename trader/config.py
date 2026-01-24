@@ -793,25 +793,13 @@ def _normalize_strategy_mode(raw: str | None) -> str | None:
 
 
 def resolve_market_window(now: datetime, trading_day: bool) -> str:
+    from trader.time_utils import calc_market_window_kst
+
     if now.tzinfo is None:
         now = now.replace(tzinfo=KST)
     if not trading_day:
         return "after"
-    preopen_start = _parse_hhmm(PB1_PREOPEN_START)
-    preopen_end = _parse_hhmm(PB1_PREOPEN_END)
-    morning_end = _parse_hhmm(PB1_MORNING_WINDOW_END)
-    entry_end = _parse_hhmm(PB1_ENTRY_WINDOW_END)
-    exit_end = _parse_hhmm(PB1_EXIT_WINDOW_END)
-    now_time = now.time()
-    if preopen_start <= now_time < preopen_end:
-        return "preopen"
-    if preopen_end <= now_time < morning_end:
-        return "morning"
-    if morning_end <= now_time < entry_end:
-        return "day"
-    if entry_end <= now_time <= exit_end:
-        return "close"
-    return "after"
+    return calc_market_window_kst(now)
 
 
 def resolve_strategy_mode(

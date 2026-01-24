@@ -3,6 +3,8 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
+from trader.db.utils import is_postgres_url
+
 
 def _db_echo() -> bool:
     return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
@@ -15,7 +17,7 @@ def get_db_url() -> str:
             "PBCORE_DB_URL is required. Set GitHub Actions secret 'PBCORE_DB_URL' "
             "and inject it as env in the workflow."
         )
-    if url.startswith("sqlite:"):
+    if not is_postgres_url(url):
         raise RuntimeError("SQLite is forbidden. Use Postgres only.")
     return url
 

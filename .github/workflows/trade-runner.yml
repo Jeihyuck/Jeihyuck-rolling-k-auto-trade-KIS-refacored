@@ -383,8 +383,12 @@ jobs:
             echo "[RESET] hard reset bot_state"
             python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
           fi
-          mkdir -p "$BOT_STATE_DIR/db"
-          touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
+          if [[ "${PBCORE_DB_URL:-}" =~ ^postgres ]]; then
+            echo "[RESET] postgres mode -> skip sqlite placeholder"
+          else
+            mkdir -p "$BOT_STATE_DIR/db"
+            touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
+          fi
           chmod -R u+rwX "$BOT_STATE_DIR" || true
 
       - name: Precheck env (fail fast)
@@ -405,39 +409,21 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          from datetime import datetime, time
-          from zoneinfo import ZoneInfo
           import os
 
-          KST = ZoneInfo("Asia/Seoul")
-          now = datetime.now(KST)
-          preopen_start = time.fromisoformat(os.getenv("PB1_PREOPEN_START", "08:45"))
-          preopen_end = time.fromisoformat(os.getenv("PB1_PREOPEN_END", "09:00"))
+          from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
 
           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
 
-          is_weekday = now.weekday() < 5
-          in_market = is_weekday and (time(8,50) <= now.time() <= time(15,30))
+          now = now_kst()
+          is_weekday = is_trading_weekday(now)
+          window = calc_market_window_kst(now)
+          in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
 
           mode = "LIVE" if in_market else "DIAG"
           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
-
-          if not is_weekday:
-              window = "after"
-          else:
-              now_t = now.time()
-              if preopen_start <= now_t < preopen_end:
-                  window = "preopen"
-              elif preopen_end <= now_t < time(10, 0):
-                  window = "morning"
-              elif time(10, 0) <= now_t < time(15, 15):
-                  window = "day"
-              elif time(15, 15) <= now_t <= time(15, 30):
-                  window = "close"
-              else:
-                  window = "after"
 
           if force_phase in {"entry", "exit", "verify"}:
               pb1_phase = force_phase
@@ -538,8 +524,15 @@ jobs:
 
           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
 
-          # 1) untracked 포함 bot_state 전체 stage
-          git add -A bot_state
+          # 1) allowlist stage only
+          shopt -s globstar
+          git add -A \
+            bot_state/runtime/state.json \
+            bot_state/runtime/lot_state.json \
+            bot_state/runtime/universe/*.json \
+            bot_state/universe_lkg/**/latest.json \
+            bot_state/runtime/diagnostics/*.flag \
+            || true
 
           # 2) staged 변경이 없으면 스킵
           if git diff --cached --quiet; then

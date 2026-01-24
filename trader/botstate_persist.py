@@ -44,20 +44,8 @@ def _collect_paths(base_dir: Path) -> list[Path]:
     _add_if_exists(paths, bot_root / "runtime/state.json")
     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
     _add_glob(paths, bot_root, "runtime/universe/*.json")
-    _add_glob(paths, bot_root, "runtime/universe/**/*.json")
-    _add_glob(paths, bot_root, "runtime/universe_build_done_*.flag")
-    _add_glob(paths, bot_root, "runtime/universe_sanitize_*.json")
-    _add_glob(paths, bot_root, "runtime/reports/**/*.json")
-    _add_glob(paths, bot_root, "runtime/status/*.json")
-    _add_glob(paths, bot_root, "runtime/status/*.flag")
-    _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
-    _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
-    _add_if_exists(paths, botstate_path("runtime", "strategy_intents.jsonl"))
-    _add_if_exists(paths, botstate_path("runtime", "strategy_intents_state.json"))
-    _add_if_exists(paths, botstate_path("runtime", "diagnostics", "diag_latest.json"))
-    _add_glob(paths, bot_root, "runtime/diagnostics/diag_*.json")
-    _add_glob(paths, bot_root, "runtime/diagnostics/universe_drop_*.json")
-    _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
+    _add_glob(paths, bot_root, "runtime/diagnostics/*.flag")
+    _add_glob(paths, bot_root, "universe_lkg/**/latest.json")
     return paths
 
 

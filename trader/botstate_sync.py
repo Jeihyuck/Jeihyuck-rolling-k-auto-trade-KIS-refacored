@@ -36,22 +36,21 @@ bot_state/runtime/
 bot_state/runtime/**
 
 # Allowlist runtime artifacts
-!bot_state/runtime/events/
-!bot_state/runtime/events/**
-!bot_state/runtime/status/
-!bot_state/runtime/status/**
+!bot_state/runtime/
+!bot_state/runtime/state.json
+!bot_state/runtime/lot_state.json
 !bot_state/runtime/universe/
 !bot_state/runtime/universe/**
-!bot_state/runtime/reports/
-!bot_state/runtime/reports/**
 !bot_state/runtime/diagnostics/
-!bot_state/runtime/diagnostics/**
-!bot_state/runtime/balance_snapshot.json
-!bot_state/runtime/schema_version.txt
+!bot_state/runtime/diagnostics/*.flag
 
 # Large caches MUST NOT be committed
 bot_state/runtime/ohlcv_cache/
 bot_state/runtime/ohlcv_cache/**
+
+# Keep only latest universe snapshots
+bot_state/universe_lkg/**
+!bot_state/universe_lkg/**/latest.json
 
 # Never commit archive/ or readonly backups
 bot_state/archive/
@@ -59,6 +58,8 @@ bot_state/db/
 bot_state/db/**
 bot_state/db/*.bak*
 bot_state/db/*.readonly.bak.*
+bot_state/db/*.sqlite3-*
+bot_state/db/*.db-*
 
 # Runtime DB artifacts (should never be created)
 **/*.sqlite3
@@ -75,15 +76,11 @@ __pycache__/
 """
 
 ALLOWLIST_PATTERNS = [
-    "bot_state/runtime/events/*.jsonl",
-    "bot_state/runtime/status/**",
     "bot_state/runtime/universe/*.json",
-    "bot_state/runtime/reports/**",
-    "bot_state/runtime/diagnostics/nontrading_smoke_*",
     "bot_state/universe_lkg/**/latest.json",
-    "bot_state/runtime/balance_snapshot.json",
-    "bot_state/runtime/schema_version.txt",
-    "bot_state/runtime/runtime_meta.json",
+    "bot_state/runtime/state.json",
+    "bot_state/runtime/lot_state.json",
+    "bot_state/runtime/diagnostics/*.flag",
 ]
 
 CLEAN_PATTERNS = [
@@ -93,9 +90,11 @@ CLEAN_PATTERNS = [
     "bot_state/db/*.sqlite3",
     "bot_state/db/*.sqlite3-wal",
     "bot_state/db/*.sqlite3-shm",
+    "bot_state/db/*.sqlite3-*",
     "bot_state/db/*.db",
     "bot_state/db/*.db-wal",
     "bot_state/db/*.db-shm",
+    "bot_state/db/*.db-*",
 ]
 
 

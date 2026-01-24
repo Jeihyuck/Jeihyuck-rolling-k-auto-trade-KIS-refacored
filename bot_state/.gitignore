@@ -1,22 +1,30 @@
 runtime/
 runtime/**
 
-!runtime/events/
-!runtime/events/**
-!runtime/status/
-!runtime/status/**
+!runtime/
 !runtime/universe/
 !runtime/universe/**
-!runtime/balance_snapshot.json
-!runtime/schema_version.txt
+!runtime/diagnostics/
+!runtime/diagnostics/*.flag
+!runtime/state.json
+!runtime/lot_state.json
 
 # Large caches must not be committed
 runtime/ohlcv_cache/
 runtime/ohlcv_cache/**
 
+# Keep only latest universe snapshots
+universe_lkg/**
+!universe_lkg/**/latest.json
+
 # --- never commit these ---
-archive/
-db/*.readonly.bak.*
+archive/**
+runtime/ohlcv_cache/**
+db/*.sqlite3
+db/*.sqlite3-*
+db/*.db
+db/*.db-*
+db/*.readonly.bak*
 db/*.bak*
 
 # Runtime DB artifacts (should never be created)

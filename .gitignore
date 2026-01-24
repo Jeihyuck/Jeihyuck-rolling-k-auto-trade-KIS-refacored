@@ -29,18 +29,19 @@ bot_state/
 # bot_state db files
 bot_state/db/**
 _botstate_worktree/**/bot_state/db/**
+bot_state/archive/**
+_botstate_worktree/**/bot_state/archive/**
+bot_state/runtime/ohlcv_cache/**
+_botstate_worktree/**/bot_state/runtime/ohlcv_cache/**
 
 # Allow tracking runtime universe outputs in bot_state
 !bot_state/
 !bot_state/runtime/
+!bot_state/runtime/state.json
+!bot_state/runtime/lot_state.json
 !bot_state/runtime/universe/
 !bot_state/runtime/universe/**
-!bot_state/runtime/universe_build_done_*.flag
-!bot_state/runtime/universe_sanitize_*.json
-!bot_state/runtime/*.flag
-!bot_state/runtime/*.json
-!bot_state/runtime/events/
-!bot_state/runtime/events/*.jsonl
 !bot_state/runtime/diagnostics/
-!bot_state/runtime/diagnostics/*.json
-!bot_state/runtime/diagnostics/universe_drop_*.json
+!bot_state/runtime/diagnostics/*.flag
+bot_state/universe_lkg/**
+!bot_state/universe_lkg/**/latest.json

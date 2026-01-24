@@ -99,7 +99,7 @@ from trader.reset_utils import (
     update_reset_guard_from_balance,
 )
 from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
-from trader.time_utils import now_kst
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
 from trader.eventlog import emit_event
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.utils.json_sanitize import to_jsonable
@@ -834,23 +834,33 @@ def _get_now_kst() -> datetime:
     return now_kst()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def decide_market_window(now: datetime) -> str:
+    trading_day_env = os.getenv("TRADING_DAY")
+    if trading_day_env is not None:
+        trading_day = _env_bool("TRADING_DAY", default=True)
+        if not trading_day:
+            return "after"
+
+    if not is_trading_weekday(now):
+        return "after"
+
+    computed = calc_market_window_kst(now)
+    forced = (os.getenv("MARKET_WINDOW") or "").strip().lower()
+    if forced in {"preopen", "morning", "day", "close", "after"}:
+        return forced
+
+    return computed
+
+
 def detect_window(now_kst_value: datetime, preopen_start: str = "08:45", preopen_end: str = "09:00") -> str:
-    t = now_kst_value.time()
-    ps = dtime.fromisoformat(preopen_start)
-    pe = dtime.fromisoformat(preopen_end)
-    morning_start = dtime.fromisoformat("09:00")
-    morning_end = dtime.fromisoformat(PB1_MORNING_WINDOW_END)
-    day_end = dtime.fromisoformat(PB1_ENTRY_WINDOW_END)
-    close_end = dtime.fromisoformat(PB1_EXIT_WINDOW_END)
-    if ps <= t < pe:
-        return "preopen"
-    if morning_start <= t < morning_end:
-        return "morning"
-    if morning_end <= t < day_end:
-        return "day"
-    if day_end <= t <= close_end:
-        return "close"
-    return "off"
+    return decide_market_window(now_kst_value)
 
 
 def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt: datetime, allow_wait: bool, max_wait_s: int, smoke_enabled: bool) -> tuple[str, datetime | None]:
@@ -1177,10 +1187,12 @@ def run_once(
         now_kst=now,
         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
     )
-    auto_window = detect_window(now, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
+    if os.getenv("TRADING_DAY") is not None:
+        trading_day = _env_bool("TRADING_DAY", default=trading_day)
+    auto_window = decide_market_window(now)
     if auto_window != market_window:
         logger.info(
-            "[PB1][WINDOW][AUTO] now_kst=%s env_window=%s auto_window=%s -> using auto",
+            "[PB1][WINDOW][AUTO] now_kst=%s env_window=%s computed_window=%s -> using computed",
             now.isoformat(),
             market_window,
             auto_window,
