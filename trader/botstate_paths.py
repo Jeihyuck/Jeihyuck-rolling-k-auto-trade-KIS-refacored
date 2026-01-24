@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 
-BOT_STATE_DIR_ENV = "BOT_STATE_DIR"
-BOTSTATE_ROOT_ENV = "BOTSTATE_ROOT"
-BOTSTATE_WORKTREE_DIR_ENV = "BOTSTATE_WORKTREE_DIR"
+TRADER_RUNTIME_DIR_ENV = "TRADER_RUNTIME_DIR"
 TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
-DEFAULT_BOTSTATE_ROOT = "bot_state"
-
-logger = logging.getLogger(__name__)
 
 
 def _repo_root() -> Path:
@@ -25,17 +19,16 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return False
 
 
+def runtime_root() -> Path:
+    explicit = os.getenv(TRADER_RUNTIME_DIR_ENV)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    base = os.getenv("RUNNER_TEMP") or "/tmp"
+    return (Path(base) / "trader_runtime").expanduser().resolve()
+
+
 def get_botstate_root() -> Path:
-    bot_state_dir = os.getenv(BOT_STATE_DIR_ENV)
-    if bot_state_dir:
-        return Path(bot_state_dir).expanduser().resolve()
-    env_root = os.getenv(BOTSTATE_ROOT_ENV)
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    worktree_dir = os.getenv(BOTSTATE_WORKTREE_DIR_ENV)
-    if worktree_dir:
-        return (Path(worktree_dir).expanduser() / "bot_state").resolve()
-    return Path(DEFAULT_BOTSTATE_ROOT).resolve()
+    return runtime_root()
 
 
 def ensure_not_repo_tracked_path(path: Path) -> None:
@@ -61,8 +54,7 @@ def get_cache_root() -> Path:
     if env_root:
         root = Path(env_root).expanduser().resolve()
     else:
-        botstate_runtime = get_botstate_root() / "runtime"
-        root = botstate_runtime.resolve() if botstate_runtime.exists() else Path("runtime").resolve()
+        root = get_botstate_root() / "runtime"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -78,8 +70,3 @@ def close_entry_orders_path(order_date: str) -> Path:
     path = botstate_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
-
-
-_BOTSTATE_ROOT = get_botstate_root()
-_CACHE_ROOT = get_cache_root()
-logger.info("[BOTSTATE][PATHS] root=%s cache_root=%s", _BOTSTATE_ROOT, _CACHE_ROOT)

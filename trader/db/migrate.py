@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
 
+from trader.botstate_paths import runtime_root
 
 
 logger = logging.getLogger(__name__)
@@ -152,7 +153,7 @@ def _strip_sql_comments(sql: str) -> str:
 
 
 def _schema_stamp_path() -> Path:
-    cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
+    cache_root = Path(os.getenv("TRADER_CACHE_ROOT") or runtime_root() / "runtime")
     return cache_root / "schema_version.txt"
 
 
@@ -235,6 +236,8 @@ def _should_ignore_pg_error(exc: Exception) -> bool:
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     if _should_skip_migrations(engine, migrations_dir):
         return
+    if str(engine.url).startswith("sqlite"):
+        raise RuntimeError("sqlite is forbidden. Use Postgres (PBCORE_DB_URL).")
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
     migration_files = sorted(
         [

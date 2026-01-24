@@ -87,6 +87,6 @@ def make_engine() -> sa.Engine:
         return sa.create_engine(url, pool_pre_ping=True)
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Postgres driver missing. Install psycopg[binary] (recommended) or "
-            f"psycopg2-binary. Current URL driver={drivername}."
+            "Postgres driver missing. Install psycopg[binary]. "
+            f"Current URL driver={drivername}."
         ) from exc

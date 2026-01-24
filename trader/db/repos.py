@@ -712,6 +712,9 @@ class LedgerEventsRepo:
         payload_json: dict | None = None,
     ) -> str | None:
         db_url = str(self.engine.url)
+        db_store_required = os.getenv("DB_STORE_REQUIRED", "0") not in {"0", "false", "FALSE"}
+        max_attempts = int(os.getenv("DB_WRITE_MAX_ATTEMPTS", "2"))
+        base_backoff = float(os.getenv("DB_WRITE_BACKOFF_SEC", "0.2"))
         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
         safe_reasons = json_sanitize(reasons or [])
         payload = {
@@ -735,65 +738,55 @@ class LedgerEventsRepo:
             "payload_json": safe_payload_json,
         }
         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
-        with self.engine.begin() as conn:
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
             try:
-                logger.info("[DB][LEDGER_EVENT][APPEND] attempt=1 env=%s event_type=%s", env, event_type)
-                if run_id is not None and strategy:
-                    ensure_run(
-                        conn,
-                        self._schema,
-                        run_id=run_id,
-                        env=env,
-                        run_window=run_window,
-                        strategy=strategy,
-                        ts=ts,
-                        database_url=db_url,
-                    )
-                res = conn.execute(stmt)
-                return str(res.scalar())
-            except Exception as exc:
-                if _is_in_failed_transaction_error(exc):
-                    logger.info("[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction env=%s event_type=%s", env, event_type)
-                    try:
-                        conn.rollback()
-                        logger.info("[DB][LEDGER_EVENT][ROLLBACK] env=%s event_type=%s", env, event_type)
-                    except Exception:
-                        logger.exception("[DB][LEDGER_EVENT][ROLLBACK_FAIL] env=%s event_type=%s", env, event_type)
-                    try:
-                        with self.engine.begin() as retry_conn:
-                            logger.info("[DB][LEDGER_EVENT][APPEND] attempt=2 env=%s event_type=%s", env, event_type)
-                            if run_id is not None and strategy:
-                                ensure_run(
-                                    retry_conn,
-                                    self._schema,
-                                    run_id=run_id,
-                                    env=env,
-                                    run_window=run_window,
-                                    strategy=strategy,
-                                    ts=ts,
-                                    database_url=db_url,
-                                )
-                            res = retry_conn.execute(stmt)
-                            return str(res.scalar())
-                    except Exception as retry_exc:
-                        logger.exception(
-                            "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
-                            env,
-                            event_type,
-                            retry_exc,
-                            stmt,
-                            payload,
+                with self.engine.begin() as conn:
+                    logger.info("[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s event_type=%s", attempt, env, event_type)
+                    if run_id is not None and strategy:
+                        ensure_run(
+                            conn,
+                            self._schema,
+                            run_id=run_id,
+                            env=env,
+                            run_window=run_window,
+                            strategy=strategy,
+                            ts=ts,
+                            database_url=db_url,
                         )
-                        return None
-                logger.exception(
-                    "[DB][LEDGER_EVENT][FAIL] env=%s event_type=%s err=%s sql=%s payload=%s",
-                    env,
-                    event_type,
-                    exc,
-                    stmt,
-                    payload,
-                )
-                return None
+                    res = conn.execute(stmt)
+                    return str(res.scalar())
+            except Exception as exc:
+                last_exc = exc
+                if _is_in_failed_transaction_error(exc):
+                    logger.info(
+                        "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s event_type=%s",
+                        attempt,
+                        env,
+                        event_type,
+                    )
+                else:
+                    logger.exception(
+                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s event_type=%s err=%s sql=%s payload=%s",
+                        attempt,
+                        env,
+                        event_type,
+                        exc,
+                        stmt,
+                        payload,
+                    )
+                if attempt < max_attempts:
+                    time.sleep(base_backoff * (2 ** (attempt - 1)))
+        if db_store_required and last_exc is not None:
+            raise last_exc
+        logger.warning(
+            "[DB][LEDGER_EVENT][SKIP] env=%s event_type=%s required=%s attempts=%s",
+            env,
+            event_type,
+            int(db_store_required),
+            max_attempts,
+        )
+        return None
 
 
 class PositionsRepo:

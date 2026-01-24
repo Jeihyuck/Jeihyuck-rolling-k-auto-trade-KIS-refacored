@@ -4,15 +4,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: trade-bot-state
+  group: trade-runner
   cancel-in-progress: true
 
 on:
   push:
     branches: [ "nullim", "main" ]
-    paths-ignore:
-      - "bot_state/**"
-      - "**/bot_state/**"
 
   workflow_dispatch:
     inputs:
@@ -22,10 +19,6 @@ on:
         default: "0"
       EMERGENCY_UNIVERSE_BUILD:
         description: "Set to 1 to allow one-time emergency universe build when DB is missing."
-        required: false
-        default: "0"
-      BOT_STATE_HARD_RESET:
-        description: "Delete runtime + ledger and restart clean (one-shot)"
         required: false
         default: "0"
       NONTRADING_UNIVERSE_SMOKE:
@@ -76,7 +69,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-      BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
       FORCE_NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
       NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
       NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
@@ -107,73 +100,15 @@ jobs:
           ref: "nullim"
           path: repo
 
-      - name: Assert Postgres-only + SSOT (startup)
+      - name: Assert Postgres-only (startup)
         shell: bash
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-          # allow: postgres://, postgresql://, postgresql+psycopg://, postgresql+psycopg2:// etc.
           if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
             echo "::error::PBCORE_DB_URL must be postgres-only."
             exit 1
           fi
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "::error::repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "::error::repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-
-      - name: Checkout bot-state branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: "bot-state"
-          path: botstate
-          token: ${{ github.token }}
-
-      - name: Purge SQLite artifacts (botstate)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
-          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
-          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
-
-      - name: Compute BOT_STATE_DIR (runtime)
-        shell: bash
-        run: |
-          set -euo pipefail
-          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
-          echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
-          echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
-          mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
-          echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
-          echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
-
-      - name: Set SSOT absolute paths (universe_build)
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
-            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
-            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
-            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
-          } >> "$GITHUB_ENV"
-
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          mkdir -p "$BOT_STATE_DIR"
-          if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
-          fi
-          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -192,7 +127,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Resolve universe build gate
@@ -280,67 +214,6 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Configure git identity for botstate commits
-        run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "github-actions[bot]"
-
-      - name: Persist bot_state (commit in botstate repo)
-        if: env.SHOULD_BUILD_UNIVERSE == '1'
-        run: |
-          set -euo pipefail
-          echo "[PERSIST] worktree=$BOTSTATE_WORKTREE_DIR"
-          test -d "$BOTSTATE_WORKTREE_DIR/.git" -o -f "$BOTSTATE_WORKTREE_DIR/.git" || (echo "ERROR: no git metadata in worktree" && ls -la "$BOTSTATE_WORKTREE_DIR" && exit 1)
-
-          git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain
-          git -C "$BOTSTATE_WORKTREE_DIR" add -A bot_state
-
-          if git -C "$BOTSTATE_WORKTREE_DIR" diff --cached --quiet; then
-            echo "[PERSIST] nothing to commit"
-          else
-            if git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
-              echo "::error::Forbidden sqlite/db paths in botstate changes."
-              git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | head -n 200
-              exit 1
-            fi
-            git -C "$BOTSTATE_WORKTREE_DIR" config user.email "actions@github.com"
-            git -C "$BOTSTATE_WORKTREE_DIR" config user.name "github-actions"
-            git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: universe build $(date -u +%F)"
-            git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
-          fi
-
-      - name: Verify persisted universe (botstate)
-        if: env.SHOULD_BUILD_UNIVERSE == '1'
-        run: |
-          set -euo pipefail
-          python - << 'PY'
-          import json
-          import os
-
-          env = (os.getenv("KIS_ENV") or "practice").lower()
-          path = f"botstate/bot_state/universe_lkg/{env}/best_k_meta/latest.json"
-          with open(path, "r", encoding="utf-8") as handle:
-              data = json.load(handle)
-          print("[VERIFY] lkg members=", len(data.get("members", [])))
-          PY
-
-      - name: Assert SSOT (no repo/bot_state exists)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "ERROR: repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "ERROR: repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-          echo "OK: SSOT holds (no repo/bot_state)."
-
   trade_tick:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
@@ -350,6 +223,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
+      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
@@ -362,7 +236,6 @@ jobs:
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
       COMPILE_CHECK_ENABLED: "0"
       MIGRATE_MODE: "AUTO"
-      PERSIST_MODE: "ON_CHANGE"
       PB1_ALLOW_PREOPEN_ENTRY: "1"
       PB1_PREOPEN_START: "08:45"
       PB1_PREOPEN_END: "09:00"
@@ -386,11 +259,6 @@ jobs:
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
 
-      BOTSTATE_LOCK_TTL_SEC: "1500"
-      BOTSTATE_LOCK_BUFFER_SEC: "240"
-      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "70"
-      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "3"
-
       KIS_HTTP_MAX_RETRIES: "5"
       KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
       KIS_HTTP_BACKOFF_CAP_SEC: "8"
@@ -405,72 +273,6 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
-
-      - name: Assert SSOT (startup)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "::error::repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "::error::repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-
-      - name: Checkout bot-state branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: "bot-state"
-          path: botstate
-
-      - name: Purge SQLite artifacts (botstate)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
-          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
-          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
-
-      - name: Set botstate paths (SSOT)
-        id: botstate_paths
-        shell: bash
-        run: |
-          set -euo pipefail
-          REPO_DIR="${GITHUB_WORKSPACE}/repo"
-          BOTSTATE_REPO_DIR="${GITHUB_WORKSPACE}/botstate"
-          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/_botstate_worktree/${GITHUB_RUN_ID}_${GITHUB_JOB}"
-          BOT_STATE_DIR="${BOTSTATE_WORKTREE_DIR}/bot_state"
-
-          {
-            echo "REPO_DIR=${REPO_DIR}"
-            echo "BOTSTATE_REPO_DIR=${BOTSTATE_REPO_DIR}"
-            echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}"
-            echo "BOT_STATE_DIR=${BOT_STATE_DIR}"
-          } >> "$GITHUB_ENV"
-
-          {
-            echo "repo_dir=${REPO_DIR}"
-            echo "botstate_repo_dir=${BOTSTATE_REPO_DIR}"
-            echo "botstate_worktree_dir=${BOTSTATE_WORKTREE_DIR}"
-            echo "bot_state_dir=${BOT_STATE_DIR}"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "[BOTSTATE_PATHS] REPO_DIR=$REPO_DIR"
-          echo "[BOTSTATE_PATHS] BOTSTATE_REPO_DIR=$BOTSTATE_REPO_DIR"
-          echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
-          echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
-
-          {
-            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
-            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
-            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
-            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
-          } >> "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -489,7 +291,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Precheck env (fail fast)
@@ -503,47 +304,6 @@ jobs:
             fi
           done
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
-        env:
-          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-
-      - name: Prepare bot_state dir (always)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$BOT_STATE_DIR"
-          touch "$BOT_STATE_DIR/.gitkeep"
-          if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
-            printf "runtime/\ndb/\n**/db/\n*.sqlite3\n*.sqlite3.*\n*.db\narchive/**/db/\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
-          fi
-          ls -la "$BOT_STATE_DIR" || true
-
-      - name: Restore bot_state cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.botstate_paths.outputs.bot_state_dir }}
-          key: botstate-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            botstate-${{ github.ref_name }}-
-
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          if [ -d "$BOTSTATE_REPO_DIR/bot_state" ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' "$BOTSTATE_REPO_DIR/bot_state/" "$BOT_STATE_DIR/"
-          fi
-          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
-          ls -al "$BOT_STATE_DIR/.gitignore" || true
-          ls -al "$BOT_STATE_DIR/.gitkeep" || true
-          git status --porcelain || true
-
-      - name: Hard reset bot_state (one-shot)
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}" = "1" ]; then
-            echo "[RESET] hard reset bot_state"
-            python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
-          fi
-          chmod -R u+rwX "$BOT_STATE_DIR" || true
 
       - name: Resolve market-aware runtime mode
         run: |
@@ -620,83 +380,18 @@ jobs:
             echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
           fi
 
-      - name: Compile check (gated)
-        if: env.COMPILE_CHECK_ENABLED == '1'
-        run: |
-          set -euo pipefail
-          python -m compileall trader
-
-      - name: Configure git identity for botstate commits
-        run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "github-actions[bot]"
-
-      - name: Force nontrading smoke once (KST) when requested
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE == '1' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          KST_DATE="$(python - <<'PY'
-          from datetime import datetime, timezone, timedelta
-          kst = timezone(timedelta(hours=9))
-          print(datetime.now(kst).date().isoformat())
-          PY
-          )"
-          FLAG="$BOT_STATE_DIR/runtime/diagnostics/nontrading_smoke_once_${KST_DATE}.flag"
-
-          echo "[VERIFY_NONTRADING_SMOKE] KST_DATE=$KST_DATE"
-          echo "[VERIFY_NONTRADING_SMOKE] Removing flag if exists: $FLAG"
-
-          rm -f "$FLAG" || true
-          mkdir -p "$BOT_STATE_DIR/runtime/diagnostics"
-          ls -la "$BOT_STATE_DIR/runtime/diagnostics" || true
-
-      - name: "Guard: postgres-only + SSOT + DIAG safety"
-        shell: bash
-        run: |
-          set -euo pipefail
-          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-          scheme="$(echo "$PBCORE_DB_URL" | sed -E 's#^([^:]+):.*#\1#')"
-          echo "[GUARD] PBCORE_DB_URL scheme=$scheme"
-
-          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
-            echo "::error::PBCORE_DB_URL must start with postgres:// or postgresql:// (and optional +driver)."
-            exit 1
-          fi
-
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "::error::repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "::error::repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-
-          echo "[GUARD] OK: postgres-only + SSOT"
-
       - name: Run PB1 (auto window) - should exit within 4 minutes
         shell: bash
         env:
-          BOTSTATE_WORKTREE_DIR: ${{ steps.botstate_paths.outputs.botstate_worktree_dir }}
-          BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
           NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
-          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          STATE_PATH: ${{ env.STATE_PATH }}
-          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
           LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
           DIAG_FULL_REHEARSAL: ${{ env.DIAG_FULL_REHEARSAL }}
           DIAG_REHEARSAL_KIS_CALLS: ${{ env.DIAG_REHEARSAL_KIS_CALLS }}
           PB1_BLOCK_ORDERS: ${{ env.EFFECTIVE_STRATEGY_MODE == 'DIAG' && '1' || '0' }}
         run: |
           set -euo pipefail
-          cd "$REPO_DIR"
           if [ "${DIAG_FULL_REHEARSAL}" = "1" ]; then
             echo "[RUN] DIAG rehearsal enabled (window=morning phase=entry)"
             python -m trader.run --window morning --phase entry
@@ -715,6 +410,7 @@ jobs:
           import os
           from trader.db.engine import make_engine
           from trader.db.repos import OrdersRepo, UniverseRepo
+          from trader.botstate_paths import runtime_root
 
           env = (os.getenv("KIS_ENV") or "practice").lower()
           engine = make_engine()
@@ -723,11 +419,10 @@ jobs:
           if orders:
             raise SystemExit(f"Orders detected during rehearsal: {len(orders)}")
 
-          status_path = os.path.join(os.environ["BOT_STATE_DIR"], "runtime", "status", "last_db_write.json")
-          if not os.path.exists(status_path):
+          status_path = runtime_root() / "runtime" / "status" / "last_db_write.json"
+          if not status_path.exists():
             raise SystemExit(f"Missing last_db_write marker: {status_path}")
-          with open(status_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+          payload = json.loads(status_path.read_text(encoding="utf-8"))
           print(f"[DIAG][DB_WRITE] ok payload={payload}")
 
           repo = UniverseRepo(engine)
@@ -736,75 +431,6 @@ jobs:
             raise SystemExit(f"Universe sanity failed: members={len(members)} (<50)")
           print(f"[DIAG][UNIVERSE] members={len(members)}")
           PY
-
-      - name: Detect botstate git repo
-        id: botstate_git
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && git -C "$BOTSTATE_WORKTREE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
-            echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR is_git_repo=true"
-          else
-            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
-            echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=false"
-          fi
-
-      - name: Verify hard reset markers (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
-        run: |
-          set -euo pipefail
-          reset_flag="$BOT_STATE_DIR/runtime/reset_flags/$(TZ=Asia/Seoul date +%F).json"
-          if [ -f "$reset_flag" ]; then
-            echo "[RESET][HARD][FLAG] $reset_flag"
-            cat "$reset_flag"
-          else
-            echo "::error::reset flag missing: $reset_flag"
-            exit 1
-          fi
-
-      - name: Inspect bot_state git status (post tick)
-        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
-        run: |
-          set -euo pipefail
-          cd "$BOTSTATE_WORKTREE_DIR"
-          echo "[BOTSTATE][GIT] workdir=$(pwd)"
-          git status --porcelain | head -n 200 || true
-          git diff --cached --name-only | head -n 200 || true
-
-      - name: Debug bot_state contents (after run)
-        if: always()
-        run: |
-          set -euo pipefail
-          echo "=== bot_state tree ==="
-          if [ -n "${BOT_STATE_DIR:-}" ] && [ -d "${BOT_STATE_DIR}" ]; then
-            find "$BOT_STATE_DIR" -maxdepth 3 -type f -print || true
-          else
-            echo "BOT_STATE_DIR is not set or dir missing -> skip tree dump"
-          fi
-          echo "=== git status (workspace) ==="
-          git status --porcelain || true
-
-      - name: Persist bot_state to bot-state branch
-        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
-
-          if [ -z "$(git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain)" ]; then
-            echo "[PERSIST] no changes -> skip"
-            exit 0
-          fi
-
-          git -C "$BOTSTATE_WORKTREE_DIR" add -A
-          if git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
-            echo "::error::Forbidden sqlite/db paths in botstate changes."
-            git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain | head -n 200
-            exit 1
-          fi
-          git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
-          git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -819,23 +445,6 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Assert SSOT (no repo/bot_state exists)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "ERROR: repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "ERROR: repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-          echo "OK: SSOT holds (no repo/bot_state)."
-
   close_cancel:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
@@ -845,7 +454,7 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-      BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+      TRADER_RUNTIME_DIR: ${{ runner.temp }}/trader_runtime
 
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
@@ -873,11 +482,6 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      BOTSTATE_LOCK_TTL_SEC: "1500"
-      BOTSTATE_LOCK_BUFFER_SEC: "240"
-      BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
-      BOTSTATE_LOCK_RETRY_SLEEP_SEC: "5"
-
       KIS_HTTP_MAX_RETRIES: "5"
       KIS_HTTP_BACKOFF_BASE_SEC: "1.2"
       KIS_HTTP_BACKOFF_CAP_SEC: "8"
@@ -892,67 +496,6 @@ jobs:
           fetch-depth: 0
           ref: "nullim"
           path: repo
-
-      - name: Assert SSOT (startup)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "::error::repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "::error::repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-
-      - name: Checkout bot-state branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: "bot-state"
-          path: botstate
-
-      - name: Purge SQLite artifacts (botstate)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/botstate/bot_state/db" || true
-          find "$GITHUB_WORKSPACE/botstate" -name "*.sqlite3*" -delete || true
-          find "$GITHUB_WORKSPACE/botstate" -path "*/archive/*/db" -prune -exec rm -rf {} + || true
-
-      - name: Compute BOT_STATE_DIR (runtime)
-        shell: bash
-        run: |
-          set -euo pipefail
-          BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
-          echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
-          echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
-          mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
-          echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
-          echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
-
-      - name: Set SSOT absolute paths (close_cancel)
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
-            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
-            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
-            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
-          } >> "$GITHUB_ENV"
-
-      - name: Restore bot_state into workspace
-        run: |
-          set -euo pipefail
-          mkdir -p "$BOT_STATE_DIR"
-          if [ -d ../botstate/bot_state ]; then
-            rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
-          fi
-          echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -971,15 +514,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "psycopg[binary]>=3.1,<4"
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Configure git identity for botstate commits
-        run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "github-actions[bot]"
-
-      - name: "Guard: postgres-only + SSOT + DIAG safety"
+      - name: "Guard: postgres-only"
         shell: bash
         run: |
           set -euo pipefail
@@ -992,90 +529,14 @@ jobs:
             exit 1
           fi
 
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "::error::repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "::error::repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-
-          echo "[GUARD] OK: postgres-only + SSOT"
+          echo "[GUARD] OK: postgres-only"
 
       - name: Run PB1 close-cancel (auto window)
         run: |
           set -euo pipefail
           python -m trader.pb1_runner --window auto --phase auto
         env:
-          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
-          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          STATE_PATH: ${{ env.STATE_PATH }}
-          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
-
-      - name: Detect botstate git repo
-        id: botstate_git
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
-            echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(tail -n 1 "$GITHUB_OUTPUT" | cut -d= -f2)"
-
-      - name: Persist bot_state (guarded)
-        if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
-        env:
-          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
-        run: |
-          set -euo pipefail
-          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
-          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
-            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
-            exit 0
-          fi
-
-          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
-            echo "[PERSIST] ok: worktree is a git repo -> run persist"
-          else
-            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
-            exit 0
-          fi
-
-          cd "$BOTSTATE_WORKTREE_DIR"
-          echo "[PERSIST] workdir=$(pwd)"
-          git status --porcelain | head -n 50 || true
-
-          python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
-
-          git add -A bot_state
-
-          if git diff --cached --quiet; then
-            echo "[PERSIST] no staged changes -> skip"
-          else
-            if git status --porcelain | grep -E '\.sqlite3|\.db|bot_state/db' >/dev/null 2>&1; then
-              echo "::error::Forbidden sqlite/db paths in botstate changes."
-              git status --porcelain | head -n 200
-              exit 1
-            fi
-            git config user.email "actions@github.com"
-            git config user.name "github-actions[bot]"
-            git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-            git push origin HEAD:bot-state
-          fi
-
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "::error::botstate worktree dirty after persist"
-            git status --porcelain | head -n 200
-            exit 1
-          fi
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -1089,20 +550,3 @@ jobs:
             exit 1
           fi
           echo "OK: no sqlite artifacts."
-
-      - name: Assert SSOT (no repo/bot_state exists)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -e "$GITHUB_WORKSPACE/repo/bot_state" ]; then
-            echo "ERROR: repo/bot_state exists. SSOT violated."
-            ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
-            exit 1
-          fi
-          if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
-            echo "ERROR: repo contains tracked bot_state. SSOT violated."
-            git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
-            exit 1
-          fi
-          echo "OK: SSOT holds (no repo/bot_state)."

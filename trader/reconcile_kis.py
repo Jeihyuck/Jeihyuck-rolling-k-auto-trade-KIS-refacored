@@ -6,6 +6,7 @@ from typing import Any
 from pathlib import Path
 
 from trader.config import MARKET_MAP
+from trader.botstate_paths import runtime_root
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.kis_wrapper import KisAPI, KisTemporaryError
@@ -223,33 +224,33 @@ def reconcile_kis(
     guard_result = None
     guard_reason = None
     allow_purge = None
-    if bot_state_dir:
-        allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
-            bot_state_dir=Path(bot_state_dir),
-            tick_ts=tick_ts,
-            kis_holdings_empty=len(holdings_rows) == 0,
-            orders_count=orders_count,
-            fills_count=fills_count,
-            had_kis_error=holdings_error is not None,
+    runtime_dir = Path(bot_state_dir) if bot_state_dir else runtime_root()
+    allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
+        bot_state_dir=runtime_dir,
+        tick_ts=tick_ts,
+        kis_holdings_empty=len(holdings_rows) == 0,
+        orders_count=orders_count,
+        fills_count=fills_count,
+        had_kis_error=holdings_error is not None,
+    )
+    if holdings_error:
+        allow_purge = False
+        guard_reason = guard_reason or "holdings_error"
+        logger.warning(
+            "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=holdings_error err=%s",
+            holdings_error,
         )
-        if holdings_error:
-            allow_purge = False
-            guard_reason = guard_reason or "holdings_error"
-            logger.warning(
-                "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=holdings_error err=%s",
-                holdings_error,
-            )
-        if allow_purge:
-            logger.warning(
-                "[RECONCILE][STALE_DB_GUARD] allow_purge=1 empty_streak=%s",
-                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
-            )
-        else:
-            logger.info(
-                "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=%s empty_streak=%s",
-                guard_reason,
-                guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
-            )
+    if allow_purge:
+        logger.warning(
+            "[RECONCILE][STALE_DB_GUARD] allow_purge=1 empty_streak=%s",
+            guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
+        )
+    else:
+        logger.info(
+            "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=%s empty_streak=%s",
+            guard_reason,
+            guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
+        )
 
     reconcile_repo = ReconcileLogRepo(engine)
     reconcile_repo.append_log(

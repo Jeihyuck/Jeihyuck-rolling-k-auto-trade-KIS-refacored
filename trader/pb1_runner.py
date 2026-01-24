@@ -17,7 +17,6 @@ from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
     BOT_STATE_RESET,
-    BOT_STATE_HARD_RESET,
     BOT_STATE_RESET_CASH_MAX_KRW,
     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
@@ -55,21 +54,10 @@ from trader.config import (
     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
 )
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_botstate_root
-from trader.botstate_sync import (
-    BotStateContext,
-    acquire_lock as acquire_botstate_lock,
-    compute_lock_ttl,
-    hard_reset_bot_state,
-    persist_or_fail,
-    persist_run_files,
-    release_lock as release_botstate_lock,
-    resolve_botstate_worktree_dir,
-    setup_worktree,
-)
+from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, runtime_root
 from trader.db.engine import make_engine
 from trader.db.health import assert_db_ready
-from trader.db.lock import release_lock, try_acquire_lock
+from trader.db.locks import acquire_advisory_lock, release_advisory_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
     FillsRepo,
@@ -94,7 +82,6 @@ from trader.reset_utils import (
     detect_account_fp,
     load_reset_guard,
     purge_bot_state,
-    purge_sqlite_artifacts,
     record_purge_event,
     should_purge_on_empty_kis_holdings,
     update_reset_guard_from_balance,
@@ -110,8 +97,6 @@ logger = logging.getLogger(__name__)
 log = logger
 
 _WINDOW_MISMATCH_LOGGED = False
-_CURRENT_BOTSTATE: dict | None = None
-
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
 BALANCE_STATE_UNKNOWN = "UNKNOWN"
@@ -211,33 +196,18 @@ def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
     import json
     import time
 
-    runtime_dir = None
-    try:
-        runtime_dir = getattr(runtime_store, "runtime_dir", None)
-        if runtime_dir is None:
-            runtime_dir = runtime_store.get_runtime_dir()
-    except Exception:
-        runtime_dir = None
+    runtime_dir = Path(runtime_store.base_dir) / "runtime"
 
-    if not runtime_dir:
-        bot_state_dir = os.getenv("BOT_STATE_DIR") or os.getenv("STATE_DIR") or ""
-        if bot_state_dir:
-            runtime_dir = os.path.join(bot_state_dir, "runtime")
+    diag_dir = runtime_dir / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
 
-    if not runtime_dir:
-        logger.warning("[DIAG][BALANCE] runtime_dir not resolved -> skip")
-        return
-
-    diag_dir = os.path.join(runtime_dir, "diagnostics")
-    os.makedirs(diag_dir, exist_ok=True)
-
-    flag_path = os.path.join(diag_dir, "diag_balance_once.flag")
-    if os.path.exists(flag_path):
+    flag_path = diag_dir / "diag_balance_once.flag"
+    if flag_path.exists():
         logger.info("[DIAG][BALANCE] already probed -> skip flag=%s", flag_path)
         return
 
     try:
-        with open(flag_path, "w", encoding="utf-8") as f:
+        with flag_path.open("w", encoding="utf-8") as f:
             f.write(str(int(time.time())))
     except Exception as e:
         logger.warning("[DIAG][BALANCE] failed to write flag: %s", e)
@@ -371,11 +341,10 @@ def ensure_universe_built_once(
         as_of,
     ]
     log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
-    bot_state_dir = Path(runtime_store.bot_state_dir).resolve()
+    runtime_dir = Path(runtime_store.base_dir).resolve()
     env_vars = os.environ.copy()
-    env_vars["BOT_STATE_DIR"] = str(bot_state_dir)
-    env_vars.setdefault("BOTSTATE_ROOT", str(bot_state_dir))
-    subprocess.run(cmd, check=False, cwd=str(bot_state_dir.parent), env=env_vars)
+    env_vars["TRADER_RUNTIME_DIR"] = str(runtime_dir)
+    subprocess.run(cmd, check=False, cwd=str(runtime_dir.parent), env=env_vars)
     _, post_meta = runtime_store.load_today_universe(as_of)
     if post_meta.get("have_today"):
         log.info(
@@ -437,8 +406,7 @@ def run_nontrading_universe_smoke(
         cmd,
     )
     env_vars = os.environ.copy()
-    env_vars["BOT_STATE_DIR"] = str(runtime_store.base_dir)
-    env_vars.setdefault("BOTSTATE_ROOT", str(runtime_store.base_dir))
+    env_vars["TRADER_RUNTIME_DIR"] = str(runtime_store.base_dir)
     try:
         subprocess.run(
             cmd,
@@ -594,7 +562,6 @@ def _handle_missing_positions_reset(
     bot_state_dir: Path,
     reset_on_missing_positions: bool,
     force_safe_exit: bool,
-    hard_reset_requested: bool,
     allow_stale_purge: bool | None,
     stale_guard_reason: str | None,
 ) -> bool:
@@ -629,16 +596,6 @@ def _handle_missing_positions_reset(
     if not missing_codes:
         return False
     if not reset_on_missing_positions and not force_safe_exit:
-        if hard_reset_requested and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-            reset_result = hard_reset_bot_state(bot_state_dir, reason="stale_db")
-            os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
-            logger.warning(
-                "[PB1][RESET][HARD_STALE_DB] env=%s missing_positions=%s result=%s",
-                env,
-                missing_codes,
-                reset_result,
-            )
-            return True
         closed_count = close_stale_positions(
             engine=engine,
             env=env,
@@ -1000,37 +957,8 @@ def _resolve_loop_limits() -> tuple[int, int, int, bool]:
     return run_loop_minutes, max_minutes, max_seconds, run_loop_configured
 
 
-def _collect_botstate_files(since_ts: float) -> list[Path]:
-    base_dir = get_botstate_root()
-    if not base_dir.exists():
-        touched: list[Path] = []
-    else:
-        touched = []
-    for path in base_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            if path.stat().st_mtime >= since_ts:
-                touched.append(path)
-        except FileNotFoundError:
-            continue
-    for env_key in ("STATE_PATH", "LOT_STATE_PATH"):
-        env_path = os.getenv(env_key)
-        if not env_path:
-            continue
-        path = Path(env_path)
-        if not path.exists():
-            continue
-        try:
-            if path.stat().st_mtime >= since_ts or path not in touched:
-                touched.append(path)
-        except FileNotFoundError:
-            continue
-    return touched
-
-
 def _change_flag_path() -> Path:
-    cache_root = Path(os.getenv("TRADER_CACHE_ROOT", "bot_state/runtime"))
+    cache_root = Path(os.getenv("TRADER_CACHE_ROOT") or runtime_root() / "runtime")
     return cache_root / "changed.flag"
 
 
@@ -1098,64 +1026,8 @@ def _is_balance_empty(balance_snapshot: dict | None) -> bool:
     return True
 
 
-def _is_urgent_persist(touched: list[Path]) -> bool:
-    keywords = {"orders", "fills", "exits_intent"}
-    for path in touched:
-        parts = {part.lower() for part in path.parts}
-        if parts & keywords:
-            return True
-    return False
-
-
 def should_degrade(remaining_s: float) -> bool:
     return remaining_s < 60
-
-
-def _setup_botstate_session(owner: str, run_id: str, ttl_sec: int) -> BotStateContext | None:
-    worktree_dir = resolve_botstate_worktree_dir(Path.cwd())
-    try:
-        ctx = setup_worktree(Path.cwd(), worktree_dir)
-    except Exception:
-        logger.exception("[BOTSTATE][SETUP] failed worktree=%s", worktree_dir)
-        return None
-    if not acquire_botstate_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=ttl_sec):
-        return None
-    if BOT_STATE_HARD_RESET and os.getenv("BOT_STATE_HARD_RESET_DONE") != "1":
-        reset_result = hard_reset_bot_state(ctx.bot_state_dir, reason="session_start")
-        os.environ["BOT_STATE_HARD_RESET_DONE"] = "1"
-        logger.info("[BOTSTATE][HARD_RESET][DONE] result=%s", reset_result)
-    return ctx
-
-
-def _register_botstate_ctx(ctx: BotStateContext, owner: str, run_id: str) -> None:
-    global _CURRENT_BOTSTATE
-    _CURRENT_BOTSTATE = {
-        "worktree_dir": ctx.worktree_dir,
-        "owner": owner,
-        "run_id": run_id,
-    }
-
-
-def _persist_botstate_or_fail(touched: list[Path], *, message: str) -> None:
-    if not _CURRENT_BOTSTATE:
-        logger.warning("[BOTSTATE][PERSIST][SKIP] reason=no_ctx")
-        return
-    persist_or_fail(_CURRENT_BOTSTATE["worktree_dir"], touched, message=message)
-
-
-def _release_botstate_lock_best_effort(reason: str) -> None:
-    global _CURRENT_BOTSTATE
-    if not _CURRENT_BOTSTATE:
-        return
-    try:
-        release_botstate_lock(
-            _CURRENT_BOTSTATE["worktree_dir"],
-            _CURRENT_BOTSTATE["owner"],
-            _CURRENT_BOTSTATE["run_id"],
-        )
-        logger.warning("[BOTSTATE][LOCK][RELEASE] reason=%s ok=1", reason)
-    except Exception as exc:
-        logger.warning("[BOTSTATE][LOCK][RELEASE_FAIL] reason=%s err=%s", reason, exc)
 
 
 def run_once(
@@ -1180,7 +1052,7 @@ def run_once(
     trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
     run_start_ts = time_mod.time()
     as_of = now.date().isoformat()
-    resolved_bot_state_dir = bot_state_dir or get_botstate_root()
+    resolved_bot_state_dir = bot_state_dir or runtime_root()
     runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
@@ -1512,10 +1384,6 @@ def run_once(
     exit_short_circuit = phase_for_log == "exit" or window_label == "close"
     if exit_short_circuit:
         logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
-        lock_key = f"PB1:{kis_env_raw or 'practice'}"
-        if not try_acquire_lock(engine, lock_key):
-            logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, os.getenv("GITHUB_ACTOR", "local"), os.getenv("GITHUB_RUN_ID", "local"))
-            return [], False, {}, phase_for_log, "LOCKED"
         kis = None
         try:
             kis = KisAPI()
@@ -1545,20 +1413,11 @@ def run_once(
             except Exception:
                 logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
             _write_last_db_write(runtime_store, run_id=run_id, reason="exit_shortcircuit", now=now)
-            touched_files = _collect_botstate_files(run_start_ts)
-            if touched_files:
-                _persist_botstate_or_fail(touched_files, message=f"pb1 exit {now.isoformat()}")
             logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
-            return touched_files, True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
-        finally:
-            release_lock(engine, lock_key)
+            return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
 
     if should_degrade(remaining_s):
         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
-        lock_key = f"PB1:{kis_env_raw or 'practice'}"
-        if not try_acquire_lock(engine, lock_key):
-            logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, os.getenv("GITHUB_ACTOR", "local"), os.getenv("GITHUB_RUN_ID", "local"))
-            return [], False, {}, phase_for_log, "LOCKED"
         kis = None
         try:
             kis = KisAPI()
@@ -1588,12 +1447,7 @@ def run_once(
             except Exception:
                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
             _write_last_db_write(runtime_store, run_id=run_id, reason="budget_degraded", now=now)
-            touched_files = _collect_botstate_files(run_start_ts)
-            if touched_files:
-                _persist_botstate_or_fail(touched_files, message=f"pb1 degrade {now.isoformat()}")
-            return touched_files, True, {}, phase_for_log, "DEGRADED_BUDGET"
-        finally:
-            release_lock(engine, lock_key)
+            return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
 
     if not loop_mode:
         allow_missing = market_window == "preopen"
@@ -1620,14 +1474,6 @@ def run_once(
         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
         if diag_enabled:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
-
-    owner = os.getenv("GITHUB_ACTOR", "local")
-    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    lock_key = f"PB1:{kis_env_raw or 'practice'}"
-    lock_acquired = try_acquire_lock(engine, lock_key)
-    if not lock_acquired:
-        logger.warning("[PB1][LOCKED] key=%s owner=%s run_id=%s", lock_key, owner, workflow_run_id)
-        return [], False, {}, phase_for_log, "LOCKED"
 
     runs_repo = RunsRepo(engine)
     universe_repo = UniverseRepo(engine)
@@ -1773,9 +1619,7 @@ def run_once(
             account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
             runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
             runtime_fp = runtime_meta.get("account_fp")
-            if BOT_STATE_HARD_RESET:
-                reset_reason = None
-            elif BOT_STATE_RESET:
+            if BOT_STATE_RESET:
                 reset_reason = "env_reset"
             elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
                 reset_reason = "account_fp_mismatch"
@@ -1939,7 +1783,6 @@ def run_once(
                 bot_state_dir=resolved_bot_state_dir,
                 reset_on_missing_positions=reset_on_missing_positions,
                 force_safe_exit=force_safe_exit,
-                hard_reset_requested=BOT_STATE_HARD_RESET,
                 allow_stale_purge=(reconcile_result or {}).get("allow_purge"),
                 stale_guard_reason=(reconcile_result or {}).get("guard_reason"),
             ):
@@ -1948,8 +1791,7 @@ def run_once(
                 runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
                 db_write_reasons.append("reset_abort")
                 _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="reset_abort", now=now)
-                touched_files = _collect_botstate_files(run_start_ts)
-                return touched_files, True, {}, phase_for_log, "RESET_ABORT"
+                return [], True, {}, phase_for_log, "RESET_ABORT"
         else:
             logger.warning("[PB1][BALANCE][DEGRADED] state=%s -> skip reset/reconcile", balance_state)
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
@@ -1957,8 +1799,7 @@ def run_once(
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             db_write_reasons.append("balance_degraded")
             _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="balance_degraded", now=now)
-            touched_files = _collect_botstate_files(run_start_ts)
-            return touched_files, False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+            return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
@@ -1994,7 +1835,7 @@ def run_once(
             reason=",".join(db_write_reasons),
             now=now,
         )
-        touched_files = _collect_botstate_files(run_start_ts)
+        touched_files = []
     except Exception as exc:
         logger.exception("[PB1][FAIL] unexpected error")
         phase_context = phase_for_log or phase_override_arg or "unknown"
@@ -2013,7 +1854,7 @@ def run_once(
             _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="failed", now=now)
         raise
     finally:
-        release_lock(engine, lock_key)
+        pass
     metrics = {
         "balance_api_calls": result.balance_api_calls if result else 0,
         "balance_cache_hits": result.balance_cache_hits if result else 0,
@@ -2066,16 +1907,12 @@ def _run_nontrading_smoke_if_needed(
 
 def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-    persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
     run_loop_minutes, loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
     now = _get_now_kst()
     _, close_dt = _market_session(now)
-    if max_seconds > 0:
-        persist_interval = max(120, min(persist_interval, 240))
     logger.info(
-        "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
+        "[PB1][LOOP] enabled interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
         loop_interval,
-        persist_interval,
         close_dt.isoformat(),
         loop_max_minutes,
         run_loop_minutes,
@@ -2087,82 +1924,73 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     )
 
     total_start_ts = time_mod.monotonic()
-    owner = os.getenv("GITHUB_ACTOR", "local")
-    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
-    logger.info(
-        "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
-        ttl_sec,
-        max_seconds,
-        ttl_buffer,
-    )
-    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-    if botstate_ctx is None:
-        logger.warning("[PB1][LOOP] botstate lock unavailable -> exit")
-        return
-    _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
     engine = make_engine()
-    run_migrations(engine)
-    _write_change_flag(False, ["init"])
-    runtime_store = RuntimeStore(base_dir=botstate_ctx.bot_state_dir)
-
-    pending_touched: dict[Path, Path] = {}
-    last_persist_ts = 0.0
-    trade_start_ts = time_mod.monotonic()
-    loop_started_ts = trade_start_ts
-    loop_deadline_ts = trade_start_ts + max_seconds if max_seconds > 0 else None
-    loop_deadline = None
-    now_kst_value = _get_now_kst()
-    if max_seconds > 0:
-        loop_deadline = now_kst_value + timedelta(seconds=max_seconds)
-    logger.info(
-        "[PB1][CLOCK] total_start=%.3f trade_start=%.3f",
-        total_start_ts,
-        trade_start_ts,
-    )
-    logger.info(
-        "[PB1][LOOP] deadline_ready now_kst=%s deadline=%s max_seconds=%s baseline=trade",
-        now_kst_value.isoformat(),
-        loop_deadline.isoformat() if loop_deadline else "none",
-        max_seconds,
-    )
-    loop_window = detect_window(now_kst_value, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
-    ensure_universe_built_once(
-        runtime_store=runtime_store,
-        as_of=now_kst_value.date().isoformat(),
-        allow_missing=loop_window == "preopen",
-    )
-    strategy_mode = (
-        getattr(args, "strategy_mode", None)
-        or os.getenv("EFFECTIVE_STRATEGY_MODE")
-        or os.getenv("STRATEGY_MODE")
-        or ""
-    )
-    strategy_mode = str(strategy_mode).upper()
-    kis_factory = lambda: KisAPI()
-    if strategy_mode == "DIAG":
-        logger.info("[DIAG][BALANCE] probe_once start")
-        _diag_balance_probe_once_safe(
-            logger=logger,
-            runtime_store=runtime_store,
-            kis_factory=kis_factory,
-        )
+    lock_conn = engine.connect()
+    if not acquire_advisory_lock(lock_conn):
+        logger.warning("[PB1][LOOP] run lock unavailable -> exit")
+        lock_conn.close()
+        return
     exit_reason = "unknown"
-    stop_requested = {"value": False}
     balance_api_calls = 0
     balance_cache_hits = 0
     balance_tick_cache_hits = 0
     last_phase = "none"
-
-    def _request_stop(reason: str) -> None:
-        if stop_requested["value"]:
-            return
-        stop_requested["value"] = True
-        logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
-
-    signal.signal(signal.SIGTERM, lambda *_args: (_request_stop("SIGTERM"), _release_botstate_lock_best_effort("SIGTERM")))
-    signal.signal(signal.SIGINT, lambda *_args: (_request_stop("SIGINT"), _release_botstate_lock_best_effort("SIGINT")))
+    loop_started_ts = total_start_ts
+    loop_deadline = None
+    loop_deadline_ts = None
     try:
+        run_migrations(engine)
+        _write_change_flag(False, ["init"])
+        runtime_store = RuntimeStore(base_dir=runtime_root())
+        trade_start_ts = time_mod.monotonic()
+        loop_started_ts = trade_start_ts
+        loop_deadline_ts = trade_start_ts + max_seconds if max_seconds > 0 else None
+        loop_deadline = None
+        now_kst_value = _get_now_kst()
+        if max_seconds > 0:
+            loop_deadline = now_kst_value + timedelta(seconds=max_seconds)
+        logger.info(
+            "[PB1][CLOCK] total_start=%.3f trade_start=%.3f",
+            total_start_ts,
+            trade_start_ts,
+        )
+        logger.info(
+            "[PB1][LOOP] deadline_ready now_kst=%s deadline=%s max_seconds=%s baseline=trade",
+            now_kst_value.isoformat(),
+            loop_deadline.isoformat() if loop_deadline else "none",
+            max_seconds,
+        )
+        loop_window = detect_window(now_kst_value, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
+        ensure_universe_built_once(
+            runtime_store=runtime_store,
+            as_of=now_kst_value.date().isoformat(),
+            allow_missing=loop_window == "preopen",
+        )
+        strategy_mode = (
+            getattr(args, "strategy_mode", None)
+            or os.getenv("EFFECTIVE_STRATEGY_MODE")
+            or os.getenv("STRATEGY_MODE")
+            or ""
+        )
+        strategy_mode = str(strategy_mode).upper()
+        kis_factory = lambda: KisAPI()
+        if strategy_mode == "DIAG":
+            logger.info("[DIAG][BALANCE] probe_once start")
+            _diag_balance_probe_once_safe(
+                logger=logger,
+                runtime_store=runtime_store,
+                kis_factory=kis_factory,
+            )
+        stop_requested = {"value": False}
+
+        def _request_stop(reason: str) -> None:
+            if stop_requested["value"]:
+                return
+            stop_requested["value"] = True
+            logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
+
+        signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
+        signal.signal(signal.SIGINT, lambda *_args: _request_stop("SIGINT"))
         while True:
             if stop_requested["value"]:
                 exit_reason = "sigterm"
@@ -2258,12 +2086,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             if loop_deadline_ts:
                 remaining_budget_s = max(0, int(loop_deadline_ts - time_mod.monotonic()))
             try:
-                touched, _did_work, metrics, last_phase, result_status = run_once(
+                _touched, _did_work, metrics, last_phase, result_status = run_once(
                     args=args,
                     engine=engine,
                     loop_mode=True,
                     window=window,
-                    bot_state_dir=botstate_ctx.bot_state_dir,
                     max_seconds=remaining_budget_s,
                 )
                 balance_api_calls += metrics.get("balance_api_calls", 0)
@@ -2277,21 +2104,6 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     logger.info("[PB1][LOOP] no trade -> exit")
                     exit_reason = "no_candidates"
                     break
-                if touched:
-                    _write_change_flag(True, ["touched_files"])
-                for path in touched:
-                    pending_touched[path] = path
-                if pending_touched:
-                    now_ts = time_mod.monotonic()
-                    urgent = _is_urgent_persist(list(pending_touched.values()))
-                    if urgent or (now_ts - last_persist_ts >= persist_interval):
-                        persist_run_files(
-                            botstate_ctx.worktree_dir,
-                            list(pending_touched.values()),
-                            message=f"pb1 loop {now.isoformat()}",
-                        )
-                        pending_touched.clear()
-                        last_persist_ts = now_ts
             except Exception as exc:
                 logger.error(
                     "[PB1][TICK][FATAL_GUARD] exception=%s\n%s",
@@ -2300,18 +2112,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 )
                 time_mod.sleep(3)
             time_mod.sleep(loop_interval)
-    finally:
         elapsed_trade = time_mod.monotonic() - loop_started_ts
         elapsed_total = time_mod.monotonic() - total_start_ts
         if exit_reason == "unknown":
             exit_reason = "shutdown"
-        if pending_touched:
-            persist_run_files(
-                botstate_ctx.worktree_dir,
-                list(pending_touched.values()),
-                message=f"pb1 loop {now_kst().isoformat()}",
-            )
-        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
         if max_seconds > 0 and elapsed_trade > max_seconds:
             logger.warning(
                 "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
@@ -2338,6 +2142,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_cache_hits,
                 balance_tick_cache_hits,
             )
+    finally:
+        try:
+            release_advisory_lock(lock_conn)
+        except Exception:
+            logger.exception("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed")
+        lock_conn.close()
 
 
 def _exit_code_for_status(status: str) -> int:
@@ -2348,8 +2158,6 @@ def _exit_code_for_status(status: str) -> int:
 
 def main() -> int:
     args = parse_args()
-    bot_state_dir = get_botstate_root()
-    purge_sqlite_artifacts(bot_state_dir, reason="startup")
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
@@ -2360,66 +2168,38 @@ def main() -> int:
         except Exception:
             logger.error("[PB1][FATAL_GUARD] loop crashed", exc_info=True)
         return 0
-    if smoke_enabled:
-        bot_state_dir = get_botstate_root()
-        engine = make_engine()
-        run_migrations(engine)
-        _write_change_flag(False, ["init"])
-        run_once(args=args, engine=engine, loop_mode=False, window=None)
-        return 0
-
-    owner = os.getenv("GITHUB_ACTOR", "local")
-    workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-    ttl_sec, ttl_buffer = compute_lock_ttl(max_seconds)
-    logger.info(
-        "[BOTSTATE][LOCK] ttl_sec=%s max_seconds=%s buffer=%s",
-        ttl_sec,
-        max_seconds,
-        ttl_buffer,
-    )
-    botstate_ctx = _setup_botstate_session(owner=owner, run_id=workflow_run_id, ttl_sec=ttl_sec)
-    if botstate_ctx is None:
-        logger.warning("[PB1][RUN] botstate lock unavailable -> exit")
-        return 0
-    _register_botstate_ctx(botstate_ctx, owner, workflow_run_id)
     engine = make_engine()
+    lock_conn = engine.connect()
+    if not acquire_advisory_lock(lock_conn):
+        logger.warning("[PB1][RUN] run lock unavailable -> exit")
+        lock_conn.close()
+        return 0
     run_migrations(engine)
     _write_change_flag(False, ["init"])
-    signal.signal(
-        signal.SIGTERM,
-        lambda *_args: _release_botstate_lock_best_effort("SIGTERM"),
-    )
-    signal.signal(
-        signal.SIGINT,
-        lambda *_args: _release_botstate_lock_best_effort("SIGINT"),
-    )
     metrics: dict[str, int] = {}
     phase_for_log = "none"
     result_status = "UNKNOWN"
     start_ts = time_mod.time()
     try:
-        touched, _did_work, metrics, phase_for_log, result_status = run_once(
+        if smoke_enabled:
+            run_once(args=args, engine=engine, loop_mode=False, window=None)
+            return 0
+        _touched, _did_work, metrics, phase_for_log, result_status = run_once(
             args=args,
             engine=engine,
             loop_mode=False,
             window=None,
-            bot_state_dir=botstate_ctx.bot_state_dir,
             max_seconds=max_seconds,
         )
-        if touched:
-            _write_change_flag(True, ["touched_files"])
-            persist_run_files(
-                botstate_ctx.worktree_dir,
-                touched,
-                message=f"pb1 run {now_kst().isoformat()}",
-            )
-        else:
-            _write_change_flag(False, ["no_changes"])
     except Exception:
         logger.error("[PB1][FATAL_GUARD] unexpected error", exc_info=True)
         result_status = "ERROR"
     finally:
-        release_botstate_lock(botstate_ctx.worktree_dir, owner, workflow_run_id)
+        try:
+            release_advisory_lock(lock_conn)
+        except Exception:
+            logger.exception("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed")
+        lock_conn.close()
         elapsed = time_mod.time() - start_ts
         logger.info(
             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",

@@ -5,13 +5,14 @@ import json
 import logging
 from pathlib import Path
 
+from trader.botstate_paths import runtime_root
 from trader.utils.json_sanitize import to_jsonable
 
 logger = logging.getLogger(__name__)
 
 
 def event_path(as_of: str) -> Path:
-    return Path("bot_state/runtime/events") / f"pb1_{as_of}.jsonl"
+    return runtime_root() / "runtime" / "events" / f"pb1_{as_of}.jsonl"
 
 
 def emit_event(*, as_of: str, event: str, **fields) -> tuple[bool, Exception | None]:

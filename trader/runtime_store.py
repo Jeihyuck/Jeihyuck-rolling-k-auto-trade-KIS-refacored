@@ -44,7 +44,6 @@ class RuntimeStore:
         if base_dir is None:
             base_dir = bot_state_dir if bot_state_dir is not None else get_botstate_root()
         self.base_dir = Path(base_dir)
-        self.bot_state_dir = self.base_dir
 
     def _normalize_rel(self, path: Path) -> Path:
         raw = Path(path)
@@ -66,7 +65,7 @@ class RuntimeStore:
         abs_path = (self.base_dir / rel).resolve()
         exists = abs_path.exists()
         logger.info(
-            "[UNIVERSE][LOAD] bot_state_dir=%s rel=%s abs=%s exists=%s",
+            "[UNIVERSE][LOAD] base_dir=%s rel=%s abs=%s exists=%s",
             self.base_dir,
             rel,
             abs_path,
@@ -248,9 +247,6 @@ class RuntimeStore:
             logger.exception("[UNIVERSE][REBUILD_FAIL] import_error=1")
             return meta
 
-        prev_bot_state = os.environ.get("BOT_STATE_DIR")
-        os.environ["BOT_STATE_DIR"] = str(self.base_dir)
-        os.environ.setdefault("BOTSTATE_ROOT", str(self.base_dir))
         try:
             universe_build.build_universe(
                 as_of_date=as_of,
@@ -260,11 +256,6 @@ class RuntimeStore:
             )
         except Exception:
             logger.exception("[UNIVERSE][REBUILD_FAIL] build_error=1")
-        finally:
-            if prev_bot_state is None:
-                os.environ.pop("BOT_STATE_DIR", None)
-            else:
-                os.environ["BOT_STATE_DIR"] = prev_bot_state
 
         members, post_meta = self.load_today_universe(as_of)
         today_path = Path(post_meta.get("today_path") or "")

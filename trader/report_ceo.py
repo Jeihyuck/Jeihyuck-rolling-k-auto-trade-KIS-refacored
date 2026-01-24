@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import logging
 
-from trader.botstate_paths import get_botstate_root
+from trader.botstate_paths import runtime_root
 
 logger = logging.getLogger(__name__)
 
@@ -266,9 +266,7 @@ def _mk_md_table(rows: List[List[str]]) -> str:
 
 
 def _load_universe_sanitize(as_of: date) -> Dict[str, Any] | None:
-    base_dir = Path(os.getenv("BOT_STATE_DIR", "")).expanduser()
-    if not str(base_dir):
-        base_dir = get_botstate_root()
+    base_dir = runtime_root()
     path = base_dir / "runtime" / f"universe_sanitize_{as_of.isoformat()}.json"
     if not path.exists():
         return None

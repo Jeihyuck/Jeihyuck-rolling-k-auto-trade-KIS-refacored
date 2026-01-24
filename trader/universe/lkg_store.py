@@ -7,14 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from trader.botstate_paths import botstate_path
+from trader.botstate_paths import runtime_root
 
 logger = logging.getLogger(__name__)
 
 _LKG_ROOT = Path(
     os.getenv("UNIVERSE_LKG_DIR")
     or os.getenv("UNIVERSE_LKG_ROOT")
-    or botstate_path("universe_lkg")
+    or (runtime_root() / "universe_lkg")
 )
 
 
