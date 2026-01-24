@@ -45,3 +45,6 @@ _botstate_worktree/**/bot_state/runtime/ohlcv_cache/**
 !bot_state/runtime/diagnostics/*.flag
 bot_state/universe_lkg/**
 !bot_state/universe_lkg/**/latest.json
+
+# SSOT: bot_state must not live in repo
+/bot_state/

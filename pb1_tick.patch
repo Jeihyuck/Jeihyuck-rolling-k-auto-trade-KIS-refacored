@@ -1,44 +1,131 @@
 diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b68ea2fbf5 100644
+index f46f44437a08ffa19ea0dfae841c4ee3cb4f55db..1bdceace6132bce4c28e64e770b5877bc875953c 100644
 --- a/.github/workflows/trade-runner.yml
 +++ b/.github/workflows/trade-runner.yml
-@@ -239,50 +239,61 @@ jobs:
+@@ -51,99 +51,106 @@ on:
+     # KST 15:00~15:30  => UTC 06:00~06:30 (Mon~Fri UTC)
+     - cron: "0-30/5 6 * * 1-5"
+     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
+     - cron: "29 6 * * 1-5"
  
-           if git -C "$BOTSTATE_WORKTREE_DIR" diff --cached --quiet; then
-             echo "[PERSIST] nothing to commit"
-           else
-             git -C "$BOTSTATE_WORKTREE_DIR" config user.email "actions@github.com"
-             git -C "$BOTSTATE_WORKTREE_DIR" config user.name "github-actions"
-             git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: universe build $(date -u +%F)"
-             git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
-           fi
+ defaults:
+   run:
+     shell: bash
+     working-directory: repo
  
-       - name: Verify persisted universe (botstate)
-         if: env.SHOULD_BUILD_UNIVERSE == '1'
+ jobs:
+   universe_build:
+     runs-on: ubuntu-latest
+     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
+     timeout-minutes: 15
+ 
+     env:
+       TZ: Asia/Seoul
+       PYTHONUNBUFFERED: "1"
+       PYTHONPATH: ${{ github.workspace }}/repo
+       BOT_STATE_HARD_RESET: ${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}
+       FORCE_NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
+       NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
+       NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
+ 
+-      STATE_PATH: "bot_state/runtime/state.json"
+-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+-      TRADER_CACHE_ROOT: "bot_state/runtime"
+-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+       PAPER_MAX_CAPITAL_KRW: "10000000"
+ 
+       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+     steps:
+       - name: Checkout code (always run nullim code)
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "nullim"
+           path: repo
+ 
+       - name: Checkout bot-state branch
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "bot-state"
+           path: botstate
+           token: ${{ secrets.GITHUB_TOKEN }}
+ 
+       - name: Compute BOT_STATE_DIR (runtime)
+         shell: bash
          run: |
            set -euo pipefail
-           python - << 'PY'
-           import json
-           import os
+           BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
+           echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
+           echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
+           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
+           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
+           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
  
-           env = (os.getenv("KIS_ENV") or "practice").lower()
-           path = f"botstate/bot_state/universe_lkg/{env}/best_k_meta/latest.json"
-           with open(path, "r", encoding="utf-8") as handle:
-               data = json.load(handle)
-           print("[VERIFY] lkg members=", len(data.get("members", [])))
-           PY
- 
-+      - name: Assert no repo/bot_state usage
-+        if: always()
++      - name: Set SSOT absolute paths (universe_build)
 +        shell: bash
 +        run: |
 +          set -euo pipefail
-+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-+            echo "ERROR: repo/bot_state path detected. SSOT violated."
-+            exit 1
-+          fi
-+          echo "OK: no repo/bot_state usage."
++          {
++            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
++            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
++            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
++            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
++          } >> "$GITHUB_ENV"
 +
+       - name: Restore bot_state into workspace
+         run: |
+           set -euo pipefail
+           mkdir -p "$BOT_STATE_DIR"
+           if [ -d ../botstate/bot_state ]; then
+             rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
+           fi
+           echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
+ 
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Cache pip
+         uses: actions/cache@v4
+         with:
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+           restore-keys: |
+             ${{ runner.os }}-pip-
+ 
+       - name: Install deps
+         run: |
+           set -euo pipefail
+@@ -272,55 +279,51 @@ jobs:
+             echo "ERROR: repo/bot_state exists. SSOT violated."
+             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
+             exit 1
+           fi
+           # additionally fail if tracked by git (defensive)
+           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+             echo "ERROR: repo contains tracked bot_state. SSOT violated."
+             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+             exit 1
+           fi
+           echo "OK: SSOT holds (no repo/bot_state)."
+ 
    trade_tick:
      runs-on: ubuntu-latest
      if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
@@ -52,11 +139,11 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
        FORCE_STRATEGY_MODE: ""
        FORCE_PB1_PHASE: ""
  
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+-      STATE_PATH: "bot_state/runtime/state.json"
+-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
        PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+-      TRADER_CACHE_ROOT: "bot_state/runtime"
+-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
        PAPER_MAX_CAPITAL_KRW: "10000000"
  
        ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
@@ -64,7 +151,25 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
        MIGRATE_MODE: "AUTO"
        PERSIST_MODE: "ON_CHANGE"
        PB1_ALLOW_PREOPEN_ENTRY: "1"
-@@ -342,129 +353,129 @@ jobs:
+       PB1_PREOPEN_START: "08:45"
+       PB1_PREOPEN_END: "09:00"
+       PB1_REQUIRE_BALANCE_FOR_ENTRY: "1"
+       PB1_PREOPEN_REQUIRE_BALANCE: "1"
+ 
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+ 
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+ 
+@@ -362,50 +365,58 @@ jobs:
            set -euo pipefail
            REPO_DIR="${GITHUB_WORKSPACE}/repo"
            BOTSTATE_REPO_DIR="${GITHUB_WORKSPACE}/botstate"
@@ -90,146 +195,40 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
            echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
            echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
  
-+      - name: Setup Python
-+        uses: actions/setup-python@v5
-+        with:
-+          python-version: "3.11"
++          # --- SSOT absolute paths (critical) ---
++          {
++            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
++            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
++            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
++            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
++          } >> "$GITHUB_ENV"
 +
-+      - name: Cache pip
-+        uses: actions/cache@v4
-+        with:
-+          path: ~/.cache/pip
-+          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-+          restore-keys: |
-+            ${{ runner.os }}-pip-
-+
-+      - name: Install deps
-+        run: |
-+          set -euo pipefail
-+          python -m pip install --upgrade pip
-+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-+
-+      - name: Precheck env (fail fast)
-+        run: |
-+          set -euo pipefail
-+          echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-+          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-+            if [ -z "${!k:-}" ]; then
-+              echo "::error::Missing required secret/env: $k"
-+              exit 1
-+            fi
-+          done
-+          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
-+        env:
-+          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-+
-       - name: Prepare bot_state dir (always)
-         shell: bash
-         run: |
-           set -euo pipefail
-           mkdir -p "$BOT_STATE_DIR"
-           touch "$BOT_STATE_DIR/.gitkeep"
-           # 기본 ignore (원하면 확장)
-           if [ ! -f "$BOT_STATE_DIR/.gitignore" ]; then
-             printf "runtime/\n*.sqlite3\n__pycache__/\n" > "$BOT_STATE_DIR/.gitignore"
-           fi
-           ls -la "$BOT_STATE_DIR" || true
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
  
-       - name: Restore bot_state cache
+       - name: Cache pip
          uses: actions/cache@v4
          with:
-           path: ${{ steps.botstate_paths.outputs.bot_state_dir }}
-           key: botstate-${{ github.ref_name }}-${{ github.run_id }}
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
            restore-keys: |
-             botstate-${{ github.ref_name }}-
+             ${{ runner.os }}-pip-
  
-       - name: Restore bot_state into workspace
+       - name: Install deps
          run: |
            set -euo pipefail
-           if [ -d "$BOTSTATE_REPO_DIR/bot_state" ]; then
-             rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' "$BOTSTATE_REPO_DIR/bot_state/" "$BOT_STATE_DIR/"
-           fi
-           echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
-           ls -al "$BOT_STATE_DIR/.gitignore" || true
-           ls -al "$BOT_STATE_DIR/.gitkeep" || true
-           git status --porcelain || true
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
  
--      - name: Setup Python
--        uses: actions/setup-python@v5
--        with:
--          python-version: "3.11"
--
--      - name: Cache pip
--        uses: actions/cache@v4
--        with:
--          path: ~/.cache/pip
--          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
--          restore-keys: |
--            ${{ runner.os }}-pip-
--
--      - name: Install deps
--        run: |
--          set -euo pipefail
--          python -m pip install --upgrade pip
--          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
--
-       - name: Hard reset bot_state (one-shot)
+       - name: Precheck env (fail fast)
          run: |
            set -euo pipefail
-           if [ "${{ github.event.inputs.BOT_STATE_HARD_RESET || '0' }}" = "1" ]; then
-             echo "[RESET] hard reset bot_state"
-             python -m trader.tools.reset_bot_state --bot-state-dir "$BOT_STATE_DIR" --yes
-           fi
-           if [[ "${PBCORE_DB_URL:-}" =~ ^postgres ]]; then
-             echo "[RESET] postgres mode -> skip sqlite placeholder"
-           else
-             mkdir -p "$BOT_STATE_DIR/db"
-             touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
-           fi
-           chmod -R u+rwX "$BOT_STATE_DIR" || true
- 
--      - name: Precheck env (fail fast)
--        run: |
--          set -euo pipefail
--          echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
--          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
--            if [ -z "${!k:-}" ]; then
--              echo "::error::Missing required secret/env: $k"
--              exit 1
--            fi
--          done
--          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
--        env:
--          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
--
-       - name: Resolve market-aware runtime mode
-         run: |
-           set -euo pipefail
-           python - << 'PY'
-           import os
- 
-           from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
- 
-           force_mode = (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper()
-           force_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
- 
-           now = now_kst()
-           is_weekday = is_trading_weekday(now)
-           window = calc_market_window_kst(now)
-           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
- 
-           mode = "LIVE" if in_market else "DIAG"
-           if force_mode in {"LIVE", "DIAG", "INTENT_ONLY", "INTENT"}:
-               mode = "LIVE" if force_mode == "LIVE" else "DIAG"
- 
-           if force_phase in {"entry", "exit", "verify"}:
-               pb1_phase = force_phase
-           else:
-               pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
- 
-@@ -497,50 +508,51 @@ jobs:
-         run: |
-           set -euo pipefail
+           echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+           for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+             if [ -z "${!k:-}" ]; then
+@@ -519,55 +530,55 @@ jobs:
  
            # KST 날짜 계산
            KST_DATE="$(python - <<'PY'
@@ -253,13 +252,17 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
          env:
            BOTSTATE_WORKTREE_DIR: ${{ steps.botstate_paths.outputs.botstate_worktree_dir }}
            BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
-+          NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
+           NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
            DATABASE_URL: ${{ secrets.DATABASE_URL }}
-           TRADER_CACHE_ROOT: ${{ steps.botstate_paths.outputs.bot_state_dir }}/runtime
-           UNIVERSE_LKG_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}/universe_lkg
+-          TRADER_CACHE_ROOT: ${{ steps.botstate_paths.outputs.bot_state_dir }}/runtime
+-          UNIVERSE_LKG_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}/universe_lkg
++          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
++          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
            PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-           STATE_PATH: bot_state/runtime/state.json
-           LOT_STATE_PATH: bot_state/runtime/lot_state.json
+-          STATE_PATH: bot_state/runtime/state.json
+-          LOT_STATE_PATH: bot_state/runtime/lot_state.json
++          STATE_PATH: ${{ env.STATE_PATH }}
++          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
            STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
            LIVE_TRADING_ENABLED: "1"
          run: |
@@ -279,43 +282,24 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
            else
              echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
              echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=false"
-@@ -572,50 +584,61 @@ jobs:
-         if: always()
-         run: |
-           set -euo pipefail
-           echo "=== bot_state tree ==="
-           find "$BOT_STATE_DIR" -maxdepth 3 -type f -print || true
-           echo "=== git status (workspace) ==="
-           git status --porcelain || true
- 
-       - name: Persist bot_state to bot-state branch
-         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' }}
-         shell: bash
-         run: |
-           set -euo pipefail
-           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
- 
-           # 변경 없으면 종료
-           if [ -z "$(git -C "$BOTSTATE_WORKTREE_DIR" status --porcelain)" ]; then
-             echo "[PERSIST] no changes -> skip"
-             exit 0
            fi
  
-           git -C "$BOTSTATE_WORKTREE_DIR" add -A
-           git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
-           git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
+       - name: Verify hard reset markers (workflow_dispatch)
+         if: github.event_name == 'workflow_dispatch' && env.BOT_STATE_HARD_RESET == '1'
+         run: |
+           set -euo pipefail
+@@ -626,55 +637,51 @@ jobs:
+             echo "ERROR: repo/bot_state exists. SSOT violated."
+             ls -la "$GITHUB_WORKSPACE/repo/bot_state" || true
+             exit 1
+           fi
+           if git -C "$GITHUB_WORKSPACE/repo" ls-files --error-unmatch "bot_state" >/dev/null 2>&1; then
+             echo "ERROR: repo contains tracked bot_state. SSOT violated."
+             git -C "$GITHUB_WORKSPACE/repo" ls-files "bot_state" || true
+             exit 1
+           fi
+           echo "OK: SSOT holds (no repo/bot_state)."
  
-+      - name: Assert no repo/bot_state usage
-+        if: always()
-+        shell: bash
-+        run: |
-+          set -euo pipefail
-+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-+            echo "ERROR: repo/bot_state path detected. SSOT violated."
-+            exit 1
-+          fi
-+          echo "OK: no repo/bot_state usage."
-+
    close_cancel:
      runs-on: ubuntu-latest
      if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
@@ -330,208 +314,225 @@ index 2e5316ce8818be5e3440810435f45de3760c1ad4..ac533e06757229b1dabadb83256625b6
        FORCE_STRATEGY_MODE: ""
        FORCE_PB1_PHASE: ""
  
-       STATE_PATH: "bot_state/runtime/state.json"
-       LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
+-      STATE_PATH: "bot_state/runtime/state.json"
+-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
        PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-       TRADER_CACHE_ROOT: "bot_state/runtime"
-       UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
+-      TRADER_CACHE_ROOT: "bot_state/runtime"
+-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
        PAPER_MAX_CAPITAL_KRW: "10000000"
  
        ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
        COMPILE_CHECK_ENABLED: "0"
        MIGRATE_MODE: "AUTO"
        PERSIST_MODE: "ON_CHANGE"
-@@ -753,27 +776,38 @@ jobs:
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
  
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
+       PB1_CLOSE_CANCEL_ONLY: "1"
  
-           # 1) untracked 포함 bot_state 전체 stage
-           git add -A bot_state
+       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+       KIS_ENV: ${{ secrets.KIS_ENV }}
+       CANO: ${{ secrets.CANO }}
+       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+       KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
  
-           # 2) staged 변경이 없으면 스킵
-           if git diff --cached --quiet; then
-             echo "[PERSIST] no staged changes -> skip"
-           else
-             git config user.email "actions@github.com"
-             git config user.name "github-actions[bot]"
-             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-             git push origin HEAD:bot-state
-           fi
+       APP_KEY: ${{ secrets.KIS_APP_KEY }}
+       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
  
-           # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
-           if [[ -n "$(git status --porcelain)" ]]; then
-             echo "::error::botstate worktree dirty after persist"
-             git status --porcelain | head -n 200
-             exit 1
-           fi
+       BOTSTATE_LOCK_TTL_SEC: "1500"
+       BOTSTATE_LOCK_BUFFER_SEC: "240"
+       BOTSTATE_LOCK_RETRY_TOTAL_SEC: "55"
+@@ -691,94 +698,105 @@ jobs:
+       - name: Checkout code (always run nullim code)
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "nullim"
+           path: repo
  
-+      - name: Assert no repo/bot_state usage
-+        if: always()
+       - name: Checkout bot-state branch
+         uses: actions/checkout@v4
+         with:
+           fetch-depth: 0
+           ref: "bot-state"
+           path: botstate
+ 
+       - name: Compute BOT_STATE_DIR (runtime)
+         shell: bash
+         run: |
+           set -euo pipefail
+           BOTSTATE_WORKTREE_DIR="${GITHUB_WORKSPACE}/botstate"
+           echo "BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR}" >> "$GITHUB_ENV"
+           echo "BOT_STATE_DIR=${BOTSTATE_WORKTREE_DIR}/bot_state" >> "$GITHUB_ENV"
+           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
+           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
+           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
+ 
++      - name: Set SSOT absolute paths (close_cancel)
 +        shell: bash
 +        run: |
 +          set -euo pipefail
-+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
-+            echo "ERROR: repo/bot_state path detected. SSOT violated."
-+            exit 1
-+          fi
-+          echo "OK: no repo/bot_state usage."
++          {
++            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
++            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
++            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
++            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
++          } >> "$GITHUB_ENV"
 +
+       - name: Restore bot_state into workspace
+         run: |
+           set -euo pipefail
+           mkdir -p "$BOT_STATE_DIR"
+           if [ -d ../botstate/bot_state ]; then
+             rsync -a --delete --exclude='.gitkeep' --exclude='.gitignore' ../botstate/bot_state/ "$BOT_STATE_DIR/"
+           fi
+           echo "[RESTORE] bot_state restored -> $BOT_STATE_DIR"
  
-           
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index ae8788b1c7828d211f68981f1c416b04bb31c543..eb3468aeb6b153ae0c5a1f0a120769639f7e6b68 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -1986,50 +1986,91 @@ def run_once(
-         window_context = window_label or "unknown"
-         current_code = engine_runner.current_code if engine_runner else None
-         top_candidates = engine_runner.top_candidates if engine_runner else []
-         logger.error(
-             "[PB1][FAIL][CONTEXT] phase=%s window=%s current_code=%s top_candidates=%s",
-             phase_context,
-             window_context,
-             current_code,
-             top_candidates,
-         )
-         if run_record_id:
-             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-             _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="failed", now=now)
-         raise
-     finally:
-         release_lock(engine, lock_key)
-     metrics = {
-         "balance_api_calls": result.balance_api_calls if result else 0,
-         "balance_cache_hits": result.balance_cache_hits if result else 0,
-         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
-     }
-     result_status = result.status if result else "UNKNOWN"
-     return touched_files, did_work, metrics, phase_for_log, result_status
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
  
+       - name: Cache pip
+         uses: actions/cache@v4
+         with:
+           path: ~/.cache/pip
+           key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+           restore-keys: |
+             ${{ runner.os }}-pip-
  
-+def _run_nontrading_smoke_if_needed(
-+    *,
-+    runtime_store: RuntimeStore,
-+    engine,
-+    now: datetime,
-+    strategy_mode: str,
-+) -> bool:
-+    if strategy_mode != "DIAG":
-+        return False
-+    _, trading_day, _market_window, _mode_source = resolve_strategy_mode(
-+        now_kst=now,
-+        force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
-+    )
-+    if trading_day:
-+        return False
-+    as_of = now.date().isoformat()
-+    smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
-+    if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
-+        logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
-+        return False
-+    run_nontrading_smoke_once(
-+        runtime_store=runtime_store,
-+        engine=engine,
-+        now=now,
-+        env=(os.getenv("KIS_ENV") or "practice").lower(),
-+        strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
-+        as_of=as_of,
-+        timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
-+        db_store=NONTRADING_SMOKE_DB_STORE,
-+        force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-+    )
-+    write_nontrading_smoke_flag(
-+        runtime_store,
-+        now=now,
-+        run_id=os.getenv("GITHUB_RUN_ID", "local"),
-+        sha=os.getenv("GITHUB_SHA", "unknown"),
-+        as_of=as_of,
-+    )
-+    return True
+       - name: Install deps
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+ 
+       - name: Configure git identity for botstate commits
+         run: |
+           git config --global user.email "actions@github.com"
+           git config --global user.name "github-actions[bot]"
+ 
+       - name: Run PB1 close-cancel (auto window)
+         run: |
+           set -euo pipefail
+           python -m trader.pb1_runner --window auto --phase auto
+         env:
+           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
+-          TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
+-          UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
++          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
++          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
+           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+-          STATE_PATH: bot_state/runtime/state.json
+-          LOT_STATE_PATH: bot_state/runtime/lot_state.json
++          STATE_PATH: ${{ env.STATE_PATH }}
++          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
+ 
+       - name: Detect botstate git repo
+         id: botstate_git
+         shell: bash
+         run: |
+           set -euo pipefail
+           if [ -n "${BOTSTATE_WORKTREE_DIR:-}" ] && [ -d "${BOTSTATE_WORKTREE_DIR}/.git" ]; then
+             echo "is_git_repo=true" >> "$GITHUB_OUTPUT"
+           else
+             echo "is_git_repo=false" >> "$GITHUB_OUTPUT"
+           fi
+           echo "[BOTSTATE_GUARD] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-<empty>} is_git_repo=$(cat $GITHUB_OUTPUT | tail -n 1)"
+ 
+       - name: Persist bot_state (guarded)
+         if: ${{ steps.botstate_git.outputs.is_git_repo == 'true' && env.PERSIST_MODE != 'OFF' }}
+         env:
+           BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
+         run: |
+           set -euo pipefail
+           echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
+           if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
+             echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
+             exit 0
+           fi
+ 
+diff --git a/.gitignore b/.gitignore
+index 75a95b310e181dabe94f9bdb52a30db951d67b9f..14b7839b18d5aa8cfd94d3706aabed029e06fcb8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,25 +23,28 @@ bot_state/
+ **/*.sqlite3-wal
+ **/*.sqlite3-shm
+ **/*.db
+ **/*.db-wal
+ **/*.db-shm
+ 
+ # bot_state db files
+ bot_state/db/**
+ _botstate_worktree/**/bot_state/db/**
+ bot_state/archive/**
+ _botstate_worktree/**/bot_state/archive/**
+ bot_state/runtime/ohlcv_cache/**
+ _botstate_worktree/**/bot_state/runtime/ohlcv_cache/**
+ 
+ # Allow tracking runtime universe outputs in bot_state
+ !bot_state/
+ !bot_state/runtime/
+ !bot_state/runtime/state.json
+ !bot_state/runtime/lot_state.json
+ !bot_state/runtime/universe/
+ !bot_state/runtime/universe/**
+ !bot_state/runtime/diagnostics/
+ !bot_state/runtime/diagnostics/*.flag
+ bot_state/universe_lkg/**
+ !bot_state/universe_lkg/**/latest.json
 +
-+
- def _run_loop(*, args: argparse.Namespace) -> None:
-     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
-     run_loop_minutes, loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
-     now = _get_now_kst()
-     _, close_dt = _market_session(now)
-     if max_seconds > 0:
-         persist_interval = max(120, min(persist_interval, 240))
-     logger.info(
-         "[PB1][LOOP] enabled interval=%s persist_interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
-         loop_interval,
-         persist_interval,
-         close_dt.isoformat(),
-         loop_max_minutes,
-         run_loop_minutes,
-     )
-     logger.info(
-         "[PB1][LOOP] start now_kst=%s max_seconds=%s",
-         now.isoformat(),
-         max_seconds,
-     )
- 
-     total_start_ts = time_mod.monotonic()
-     owner = os.getenv("GITHUB_ACTOR", "local")
-     workflow_run_id = os.getenv("GITHUB_RUN_ID", "local")
-@@ -2090,50 +2131,58 @@ def _run_loop(*, args: argparse.Namespace) -> None:
-             logger=logger,
-             runtime_store=runtime_store,
-             kis_factory=kis_factory,
-         )
-     exit_reason = "unknown"
-     stop_requested = {"value": False}
-     balance_api_calls = 0
-     balance_cache_hits = 0
-     balance_tick_cache_hits = 0
-     last_phase = "none"
- 
-     def _request_stop(reason: str) -> None:
-         if stop_requested["value"]:
-             return
-         stop_requested["value"] = True
-         logger.warning("[PB1][SIGNAL] %s -> stopping loop", reason)
- 
-     signal.signal(signal.SIGTERM, lambda *_args: (_request_stop("SIGTERM"), _release_botstate_lock_best_effort("SIGTERM")))
-     signal.signal(signal.SIGINT, lambda *_args: (_request_stop("SIGINT"), _release_botstate_lock_best_effort("SIGINT")))
-     try:
-         while True:
-             if stop_requested["value"]:
-                 exit_reason = "sigterm"
-                 break
-             now = _get_now_kst()
-+            if _run_nontrading_smoke_if_needed(
-+                runtime_store=runtime_store,
-+                engine=engine,
-+                now=now,
-+                strategy_mode=strategy_mode,
-+            ):
-+                exit_reason = "nontrading_smoke_done"
-+                break
-             if now >= close_dt:
-                 logger.info("[PB1][LOOP] market closed -> exit")
-                 exit_reason = "market_closed"
-                 break
-             elapsed_seconds = time_mod.monotonic() - loop_started_ts
-             if max_seconds > 0 and elapsed_seconds >= max_seconds:
-                 logger.info("[PB1][LOOP] max_seconds=%s exiting", max_seconds)
-                 exit_reason = "loop_timeout"
-                 break
-             if loop_max_minutes > 0:
-                 elapsed_min = (time_mod.monotonic() - loop_started_ts) / 60
-                 if elapsed_min >= loop_max_minutes:
-                     logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
-                     exit_reason = "loop_timeout"
-                     break
-             window = decide_window(now=now, override=args.window)
-             if window is None:
-                 if max_seconds > 0 and os.getenv("PB1_LOOP_WAIT_OUTSIDE", "0") != "1":
-                     next_start = _next_window_start(
-                         now,
-                         [
-                             _parse_hhmm_to_time(MORNING_WINDOW_START),
-                             _parse_hhmm_to_time(PB1_MORNING_WINDOW_END),
-                             _parse_hhmm_to_time(PB1_ENTRY_WINDOW_END),
-                         ],
++# SSOT: bot_state must not live in repo
++/bot_state/
+diff --git a/bot_state/.gitignore b/bot_state/.gitignore
+deleted file mode 100644
+index 452db34f42e8a20d7e471cb1464c0f59f29ab473..0000000000000000000000000000000000000000
+--- a/bot_state/.gitignore
++++ /dev/null
+@@ -1,36 +0,0 @@
+-runtime/
+-runtime/**
+-
+-!runtime/
+-!runtime/universe/
+-!runtime/universe/**
+-!runtime/diagnostics/
+-!runtime/diagnostics/*.flag
+-!runtime/state.json
+-!runtime/lot_state.json
+-
+-# Large caches must not be committed
+-runtime/ohlcv_cache/
+-runtime/ohlcv_cache/**
+-
+-# Keep only latest universe snapshots
+-universe_lkg/**
+-!universe_lkg/**/latest.json
+-
+-# --- never commit these ---
+-archive/**
+-runtime/ohlcv_cache/**
+-db/*.sqlite3
+-db/*.sqlite3-*
+-db/*.db
+-db/*.db-*
+-db/*.readonly.bak*
+-db/*.bak*
+-
+-# Runtime DB artifacts (should never be created)
+-**/*.sqlite3
+-**/*.sqlite3-wal
+-**/*.sqlite3-shm
+-**/*.db
+-**/*.db-wal
+-**/*.db-shm
+diff --git a/bot_state/.gitkeep b/bot_state/.gitkeep
+deleted file mode 100644
+index 8b137891791fe96927ad78e64b0aad7bded08bdc..0000000000000000000000000000000000000000
+--- a/bot_state/.gitkeep
++++ /dev/null
+@@ -1 +0,0 @@
+-

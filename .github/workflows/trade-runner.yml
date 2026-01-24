@@ -73,11 +73,7 @@ jobs:
       NONTRADING_SMOKE_DB_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_DB_STORE || '1' }}
       NONTRADING_SMOKE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_SMOKE_FORCE_REBUILD || '0' }}
 
-      STATE_PATH: "bot_state/runtime/state.json"
-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-      TRADER_CACHE_ROOT: "bot_state/runtime"
-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
 
       EMERGENCY_UNIVERSE_BUILD: ${{ inputs.EMERGENCY_UNIVERSE_BUILD }}
@@ -121,6 +117,17 @@ jobs:
           mkdir -p "${BOTSTATE_WORKTREE_DIR}/bot_state"
           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
+
+      - name: Set SSOT absolute paths (universe_build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
+            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
+            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
+            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
+          } >> "$GITHUB_ENV"
 
       - name: Restore bot_state into workspace
         run: |
@@ -294,11 +301,7 @@ jobs:
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
 
-      STATE_PATH: "bot_state/runtime/state.json"
-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-      TRADER_CACHE_ROOT: "bot_state/runtime"
-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
 
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
@@ -383,6 +386,14 @@ jobs:
           echo "[BOTSTATE_PATHS] BOTSTATE_REPO_DIR=$BOTSTATE_REPO_DIR"
           echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
           echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
+
+          # --- SSOT absolute paths (critical) ---
+          {
+            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
+            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
+            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
+            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
+          } >> "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -541,11 +552,11 @@ jobs:
           BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
           NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          TRADER_CACHE_ROOT: ${{ steps.botstate_paths.outputs.bot_state_dir }}/runtime
-          UNIVERSE_LKG_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}/universe_lkg
+          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
+          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          STATE_PATH: bot_state/runtime/state.json
-          LOT_STATE_PATH: bot_state/runtime/lot_state.json
+          STATE_PATH: ${{ env.STATE_PATH }}
+          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           LIVE_TRADING_ENABLED: "1"
         run: |
@@ -648,11 +659,7 @@ jobs:
       FORCE_STRATEGY_MODE: ""
       FORCE_PB1_PHASE: ""
 
-      STATE_PATH: "bot_state/runtime/state.json"
-      LOT_STATE_PATH: "bot_state/runtime/lot_state.json"
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-      TRADER_CACHE_ROOT: "bot_state/runtime"
-      UNIVERSE_LKG_DIR: "bot_state/universe_lkg"
       PAPER_MAX_CAPITAL_KRW: "10000000"
 
       ALLOW_UNIVERSE_BUILD_IN_TRADE: "0"
@@ -713,6 +720,17 @@ jobs:
           echo "[BOTSTATE_WORKTREE_DIR]=${BOTSTATE_WORKTREE_DIR}"
           echo "[BOT_STATE_DIR]=${BOTSTATE_WORKTREE_DIR}/bot_state"
 
+      - name: Set SSOT absolute paths (close_cancel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "TRADER_CACHE_ROOT=${BOT_STATE_DIR}/runtime"
+            echo "UNIVERSE_LKG_DIR=${BOT_STATE_DIR}/universe_lkg"
+            echo "STATE_PATH=${BOT_STATE_DIR}/runtime/state.json"
+            echo "LOT_STATE_PATH=${BOT_STATE_DIR}/runtime/lot_state.json"
+          } >> "$GITHUB_ENV"
+
       - name: Restore bot_state into workspace
         run: |
           set -euo pipefail
@@ -752,11 +770,11 @@ jobs:
           python -m trader.pb1_runner --window auto --phase auto
         env:
           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-          TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
-          UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
+          TRADER_CACHE_ROOT: ${{ env.TRADER_CACHE_ROOT }}
+          UNIVERSE_LKG_DIR: ${{ env.UNIVERSE_LKG_DIR }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          STATE_PATH: bot_state/runtime/state.json
-          LOT_STATE_PATH: bot_state/runtime/lot_state.json
+          STATE_PATH: ${{ env.STATE_PATH }}
+          LOT_STATE_PATH: ${{ env.LOT_STATE_PATH }}
 
       - name: Detect botstate git repo
         id: botstate_git
