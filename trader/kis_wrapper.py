@@ -2030,8 +2030,23 @@ class KisAPI:
         return snap_copy
 
     # --- 호환 셔임(기존 trader.py 호출 대응) ---
-    def get_balance(self) -> Dict[str, object]:
-        return self.get_balance_cached()
+    def get_balance(self, force: bool = False, **kwargs) -> Dict[str, object]:
+        """
+        force=True: 캐시 무시하고 강제 조회.
+        과거/미래 호출부 호환을 위해 **kwargs 허용(알 수 없는 인자 무시).
+        """
+        force = bool(
+            force
+            or kwargs.get("force_refresh", False)
+            or kwargs.get("bypass_cache", False)
+        )
+        return_source = bool(kwargs.get("return_source", False))
+        return_raw = bool(kwargs.get("return_raw", False))
+        return self.get_balance_cached(
+            force=force,
+            return_source=return_source,
+            return_raw=return_raw,
+        )
 
     def get_balance_all(self) -> Dict[str, object]:
         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""

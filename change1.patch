@@ -1,92 +1,74 @@
-diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
-index 6e1464145f959f585e59bb1ecb02f6c2cb298f38..f5ac1e50564faaaa205dbb5d27a8ae7e139c93cd 100644
---- a/trader/pb1_runner.py
-+++ b/trader/pb1_runner.py
-@@ -1393,83 +1393,87 @@ def run_once(
-         try:
-             if kis:
-                 try:
-                     reconcile_today(
-                         engine=engine,
-                         kis=kis,
-                         env=(os.getenv("KIS_ENV") or "practice").lower(),
-                         run_id=run_id,
-                         strategy="pb1_pullback_close",
-                     )
-                 except Exception:
-                     logger.exception("[PB1][EXIT_SHORTCIRCUIT] reconcile_today failed")
-             try:
-                 close_stale_positions(
-                     engine=engine,
-                     env=(os.getenv("KIS_ENV") or "practice").lower(),
-                     strategy="pb1_pullback_close",
-                     reason="exit_phase",
-                     ts=now,
-                 )
-             except Exception:
-                 logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
-             _write_last_db_write(runtime_store, run_id=run_id, reason="exit_shortcircuit", now=now)
-             logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
-             return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
-+        except Exception:
-+            logger.exception("[PB1][EXIT_SHORTCIRCUIT] failed")
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index da9fbe86704af6c08e8f954744c0c120cd697b71..2d0140ef513632616dc98affbe65a95fc66b73d4 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -2008,52 +2008,67 @@ class KisAPI:
+                 else:
+                     reason = "normalize_failed"
+                 logger.warning("[BALANCE][CACHE][INVALID] reason=%s source=api", reason)
+             else:
+                 cache_value = _deepcopy_json(normalized)
+                 self._balance_cache = cache_value
+                 self._balance_cache_at = now_kst()
+                 snap = normalized
+         except KisBalanceUnavailable as e:
+             logger.error("[GET_BALANCE_FAIL] %s", e)
+             raise
+         except KisTemporaryError as e:
+             logger.error("[GET_BALANCE_FAIL] %s", e)
+             raise KisBalanceUnavailable(str(e)) from e
+         except Exception as e:
+             logger.error("[GET_BALANCE_FAIL] %s", e)
+             raise KisBalanceUnavailable(str(e)) from e
+         snap_copy = _deepcopy_json(snap)
+         if return_source and return_raw:
+             return snap_copy, source, _deepcopy_json(raw_snapshot or snap_copy)
+         if return_source:
+             return snap_copy, source
+         return snap_copy
  
-     if should_degrade(remaining_s):
-         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
-         kis = None
-         try:
-             kis = KisAPI()
-         except Exception:
-             logger.exception("[PB1][DEGRADED] KIS init failed")
-         run_id = os.getenv("GITHUB_RUN_ID", "local")
-         try:
-             if kis:
-                 try:
-                     reconcile_today(
-                         engine=engine,
-                         kis=kis,
-                         env=(os.getenv("KIS_ENV") or "practice").lower(),
-                         run_id=run_id,
-                         strategy="pb1_pullback_close",
-                     )
-                 except Exception:
-                     logger.exception("[PB1][DEGRADED] reconcile_today failed")
-             try:
-                 close_stale_positions(
-                     engine=engine,
-                     env=(os.getenv("KIS_ENV") or "practice").lower(),
-                     strategy="pb1_pullback_close",
-                     reason="budget_degraded",
-                     ts=now,
-                 )
-             except Exception:
-                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
-             _write_last_db_write(runtime_store, run_id=run_id, reason="budget_degraded", now=now)
-             return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
-+        except Exception:
-+            logger.exception("[PB1][DEGRADED] failed")
+     # --- 호환 셔임(기존 trader.py 호출 대응) ---
+-    def get_balance(self) -> Dict[str, object]:
+-        return self.get_balance_cached()
++    def get_balance(self, force: bool = False, **kwargs) -> Dict[str, object]:
++        """
++        force=True: 캐시 무시하고 강제 조회.
++        과거/미래 호출부 호환을 위해 **kwargs 허용(알 수 없는 인자 무시).
++        """
++        force = bool(
++            force
++            or kwargs.get("force_refresh", False)
++            or kwargs.get("bypass_cache", False)
++        )
++        return_source = bool(kwargs.get("return_source", False))
++        return_raw = bool(kwargs.get("return_raw", False))
++        return self.get_balance_cached(
++            force=force,
++            return_source=return_source,
++            return_raw=return_raw,
++        )
  
-     if not loop_mode:
-         allow_missing = market_window == "preopen"
-         ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
+     def get_balance_all(self) -> Dict[str, object]:
+         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
+         return self.get_balance_cached()
  
-     logger.info(
-         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
-         event_name_lower or "unknown",
-         now.isoformat(),
-         trading_day,
-         market_window,
-         window_label,
-         phase_for_log,
-         phase_reason,
-         dry_run,
-         os.getenv("DISABLE_LIVE_TRADING"),
-         os.getenv("LIVE_TRADING_ENABLED"),
-         os.getenv("STRATEGY_MODE"),
-         os.getenv("PB1_ENTRY_ENABLED"),
-         dry_run_reasons or ["live"],
-     )
+     def get_balance_snapshot_safe(self) -> dict:
+         """
+         잔고조회 결과에서 '총액/주문가능/예수금'을 최대한 안전하게 추출한다.
+         실패해도 예외를 최소화하고, 원인 확인을 위한 raw_keys를 남긴다.
+         """
+         raw = self.get_balance_cached(force=True)
+         snap = {
+             "total_asset_krw": None,
+             "total_eval_krw": None,
+             "cash_total_krw": None,
+             "orderable_cash_krw": None,
+             "deposit_like_krw": None,
+             "raw_keys": [],
+         }
  
-     if non_trading_day:
-         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
-         if diag_enabled:
+         if not isinstance(raw, dict):
+             return snap
+ 
+         snap["raw_keys"] = sorted(list(raw.keys()))
+         summary = raw.get("output2")
