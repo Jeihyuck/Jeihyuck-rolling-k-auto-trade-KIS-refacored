@@ -3,23 +3,32 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
-from trader.db.utils import is_postgres_url
-
-
 def _db_echo() -> bool:
     return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
 
 
+def _pick_db_url() -> str:
+    # ✅ 하나로 통일: PBCORE_DB_URL을 1순위로 강제
+    for key in ("PBCORE_DB_URL", "DATABASE_URL", "TRADER_DB_URL", "DB_URL", "SQLALCHEMY_DATABASE_URL"):
+        v = (os.getenv(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def get_db_url() -> str:
-    url = os.getenv("PBCORE_DB_URL", "").strip()
+    url = _pick_db_url()
     if not url:
         raise RuntimeError(
-            "PBCORE_DB_URL is required. Set GitHub Actions secret 'PBCORE_DB_URL' "
-            "and inject it as env in the workflow."
+            "Postgres DB URL missing. Set one of: PBCORE_DB_URL (preferred), DATABASE_URL, TRADER_DB_URL, DB_URL."
         )
-    if not is_postgres_url(url):
-        raise RuntimeError("SQLite is forbidden. Use Postgres only.")
-    return url
+
+    u = url.lower()
+    if u.startswith("postgresql://") or u.startswith("postgres://"):
+        return url
+
+    # sqlite거나 다른 스킴이면 금지
+    raise RuntimeError(f"SQLite is forbidden. Use Postgres only. Got url={url.split('@')[0]}***")
 
 
 def make_engine() -> Engine:
