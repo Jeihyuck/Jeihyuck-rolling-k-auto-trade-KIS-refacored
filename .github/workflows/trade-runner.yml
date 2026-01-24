@@ -261,6 +261,17 @@ jobs:
           print("[VERIFY] lkg members=", len(data.get("members", [])))
           PY
 
+      - name: Assert no repo/bot_state usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
+            echo "ERROR: repo/bot_state path detected. SSOT violated."
+            exit 1
+          fi
+          echo "OK: no repo/bot_state usage."
+
   trade_tick:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
@@ -364,6 +375,39 @@ jobs:
           echo "[BOTSTATE_PATHS] BOTSTATE_WORKTREE_DIR=$BOTSTATE_WORKTREE_DIR"
           echo "[BOTSTATE_PATHS] BOT_STATE_DIR=$BOT_STATE_DIR"
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Precheck env (fail fast)
+        run: |
+          set -euo pipefail
+          echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
+          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
+            if [ -z "${!k:-}" ]; then
+              echo "::error::Missing required secret/env: $k"
+              exit 1
+            fi
+          done
+          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+        env:
+          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
+
       - name: Prepare bot_state dir (always)
         shell: bash
         run: |
@@ -395,25 +439,6 @@ jobs:
           ls -al "$BOT_STATE_DIR/.gitkeep" || true
           git status --porcelain || true
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install deps
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
       - name: Hard reset bot_state (one-shot)
         run: |
           set -euo pipefail
@@ -428,20 +453,6 @@ jobs:
             touch "$BOT_STATE_DIR/db/pbcore.sqlite3"
           fi
           chmod -R u+rwX "$BOT_STATE_DIR" || true
-
-      - name: Precheck env (fail fast)
-        run: |
-          set -euo pipefail
-          echo "[PRECHECK] KIS_ENV=${KIS_ENV:-}"
-          for k in APP_KEY APP_SECRET API_BASE_URL CANO ACNT_PRDT_CD KIS_ENV; do
-            if [ -z "${!k:-}" ]; then
-              echo "::error::Missing required secret/env: $k"
-              exit 1
-            fi
-          done
-          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
-        env:
-          BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
 
       - name: Resolve market-aware runtime mode
         run: |
@@ -519,6 +530,7 @@ jobs:
         env:
           BOTSTATE_WORKTREE_DIR: ${{ steps.botstate_paths.outputs.botstate_worktree_dir }}
           BOT_STATE_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}
+          NONTRADING_SMOKE_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.VERIFY_NONTRADING_SMOKE || '0' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRADER_CACHE_ROOT: ${{ steps.botstate_paths.outputs.bot_state_dir }}/runtime
           UNIVERSE_LKG_DIR: ${{ steps.botstate_paths.outputs.bot_state_dir }}/universe_lkg
@@ -593,6 +605,17 @@ jobs:
           git -C "$BOTSTATE_WORKTREE_DIR" add -A
           git -C "$BOTSTATE_WORKTREE_DIR" commit -m "bot_state: ${GITHUB_RUN_ID}/${GITHUB_JOB} $(date -u +%F_%T)" || true
           git -C "$BOTSTATE_WORKTREE_DIR" push origin HEAD:bot-state
+
+      - name: Assert no repo/bot_state usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
+            echo "ERROR: repo/bot_state path detected. SSOT violated."
+            exit 1
+          fi
+          echo "OK: no repo/bot_state usage."
 
   close_cancel:
     runs-on: ubuntu-latest
@@ -774,6 +797,17 @@ jobs:
             git status --porcelain | head -n 200
             exit 1
           fi
+
+      - name: Assert no repo/bot_state usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R "/repo/bot_state" -n "$GITHUB_WORKSPACE" -I --exclude-dir=.git 2>/dev/null; then
+            echo "ERROR: repo/bot_state path detected. SSOT violated."
+            exit 1
+          fi
+          echo "OK: no repo/bot_state usage."
 
 
           

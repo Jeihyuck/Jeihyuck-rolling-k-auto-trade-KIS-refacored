@@ -2008,6 +2008,47 @@ def run_once(
     return touched_files, did_work, metrics, phase_for_log, result_status
 
 
+def _run_nontrading_smoke_if_needed(
+    *,
+    runtime_store: RuntimeStore,
+    engine,
+    now: datetime,
+    strategy_mode: str,
+) -> bool:
+    if strategy_mode != "DIAG":
+        return False
+    _, trading_day, _market_window, _mode_source = resolve_strategy_mode(
+        now_kst=now,
+        force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
+    )
+    if trading_day:
+        return False
+    as_of = now.date().isoformat()
+    smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
+    if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
+        logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
+        return False
+    run_nontrading_smoke_once(
+        runtime_store=runtime_store,
+        engine=engine,
+        now=now,
+        env=(os.getenv("KIS_ENV") or "practice").lower(),
+        strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
+        as_of=as_of,
+        timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+        db_store=NONTRADING_SMOKE_DB_STORE,
+        force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
+    )
+    write_nontrading_smoke_flag(
+        runtime_store,
+        now=now,
+        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+        sha=os.getenv("GITHUB_SHA", "unknown"),
+        as_of=as_of,
+    )
+    return True
+
+
 def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     persist_interval = _parse_int_env("PB1_PERSIST_INTERVAL_SEC", 300)
@@ -2112,6 +2153,14 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 exit_reason = "sigterm"
                 break
             now = _get_now_kst()
+            if _run_nontrading_smoke_if_needed(
+                runtime_store=runtime_store,
+                engine=engine,
+                now=now,
+                strategy_mode=strategy_mode,
+            ):
+                exit_reason = "nontrading_smoke_done"
+                break
             if now >= close_dt:
                 logger.info("[PB1][LOOP] market closed -> exit")
                 exit_reason = "market_closed"
