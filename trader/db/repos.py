@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import logging
 import os
 import time
@@ -35,6 +35,14 @@ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+
+
+def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 def ensure_run(
@@ -228,6 +236,7 @@ class UniverseRepo:
         reason: str | None = None,
     ) -> str | None:
         members_list = list(members)
+        as_of_d = _as_date(as_of_date)
         db_url = str(self.engine.url)
         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
         strategy_key = self._strategy_key(env, strategy)
@@ -238,7 +247,7 @@ class UniverseRepo:
                         and_(
                             self._schema.universe_runs.c.strategy == strategy_key,
                             self._schema.universe_runs.c.provider == provider,
-                            self._schema.universe_runs.c.as_of == as_of_date,
+                            self._schema.universe_runs.c.as_of == as_of_d,
                         )
                     )
                 ).scalar()
@@ -249,7 +258,7 @@ class UniverseRepo:
                         run_id=run_id,
                         strategy=strategy_key,
                         provider=provider,
-                        as_of=as_of_date,
+                        as_of=as_of_d,
                         created_ts=now_kst().isoformat(),
                     )
                 )

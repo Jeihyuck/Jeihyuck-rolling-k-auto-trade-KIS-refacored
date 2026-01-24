@@ -390,10 +390,12 @@ class KisAPI:
         """
         return False
 
-    def __init__(self):
+    def __init__(self, kis_env: str | None = None, **kwargs):
+        if kis_env is None and "env" in kwargs:
+            kis_env = kwargs.pop("env")
         self.CANO = safe_strip(CANO)
         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
-        self.env = safe_strip(KIS_ENV or "practice").lower()
+        self.env = safe_strip(kis_env or KIS_ENV or "practice").lower()
         if self.env not in ("practice", "real"):
             self.env = "practice"
 

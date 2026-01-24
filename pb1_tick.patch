@@ -1,298 +1,340 @@
-diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
-index b02b8c1d9c2f5f3a63e3fc7f4fbf54feb120f4da..3ffd2fc0f1d79ff5684875afae251b6fcc26ee96 100644
---- a/.github/workflows/trade-runner.yml
-+++ b/.github/workflows/trade-runner.yml
-@@ -476,54 +476,68 @@ jobs:
-             echo "[RESET][HARD][FLAG] $reset_flag"
-             cat "$reset_flag"
-           else
-             echo "::error::reset flag missing: $reset_flag"
-             exit 1
-           fi
- 
-       - name: Inspect bot_state git status (post tick)
-         if: always()
-         run: |
-           set -euo pipefail
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[BOTSTATE][GIT] workdir=$(pwd)"
-           git status --porcelain | head -n 200 || true
-           git diff --cached --name-only | head -n 200 || true
- 
-       - name: Debug bot_state contents (after run)
-         if: always()
-         run: |
-           set -euo pipefail
-           echo "=== bot_state tree ==="
-           find bot_state -maxdepth 3 -type f -print || true
-           echo "=== git status (workspace) ==="
-           git status --porcelain || true
- 
--      - name: Persist bot_state (stage untracked + commit/push)
-+      - name: Persist bot_state (guarded)
-         if: always() && (env.PERSIST_MODE != 'OFF')
-+        env:
-+          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
-         run: |
-           set -euo pipefail
-+          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
-+          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
-+            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
-+            exit 0
-+          fi
+diff --git a/migrations/0011_universe_as_of_date.sql b/migrations/0011_universe_as_of_date.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..91eedbc18208992bf09cb2e0ee2da73026d2dce4
+--- /dev/null
++++ b/migrations/0011_universe_as_of_date.sql
+@@ -0,0 +1,60 @@
++-- Align universe as_of columns to DATE where present
++DO $$
++BEGIN
++  IF EXISTS (
++    SELECT 1
++    FROM information_schema.columns
++    WHERE table_name = 'universe_runs'
++      AND column_name = 'as_of'
++  ) THEN
++    IF EXISTS (
++      SELECT 1
++      FROM information_schema.columns
++      WHERE table_name = 'universe_runs'
++        AND column_name = 'as_of'
++        AND data_type <> 'date'
++    ) THEN
++      ALTER TABLE universe_runs
++        ALTER COLUMN as_of TYPE date
++        USING (as_of::date);
++    END IF;
++  END IF;
 +
-+          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
-+            echo "[PERSIST] ok: worktree is a git repo -> run persist"
-+          else
-+            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
-+            exit 0
-+          fi
- 
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
- 
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
- 
-           # 1) untracked 포함 bot_state 전체 stage
-           git add -A bot_state
- 
-           # 2) staged 변경이 없으면 스킵
-           if git diff --cached --quiet; then
-             echo "[PERSIST] no staged changes -> skip"
-           else
-             git config user.email "actions@github.com"
-             git config user.name "github-actions[bot]"
-             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-             git push origin HEAD:bot-state
-           fi
- 
-           # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
-           if [[ -n "$(git status --porcelain)" ]]; then
-             echo "::error::botstate worktree dirty after persist"
-             git status --porcelain | head -n 200
-             exit 1
-@@ -631,54 +645,68 @@ jobs:
-             ${{ runner.os }}-pip-
- 
-       - name: Install deps
-         run: |
-           set -euo pipefail
-           python -m pip install --upgrade pip
-           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
- 
-       - name: Configure git identity for botstate commits
-         run: |
-           git config --global user.email "actions@github.com"
-           git config --global user.name "github-actions[bot]"
- 
-       - name: Run PB1 close-cancel (auto window)
-         run: |
-           set -euo pipefail
-           python -m trader.pb1_runner --window auto --phase auto
-         env:
-           BOT_STATE_DIR: ${{ env.BOT_STATE_DIR }}
-           TRADER_CACHE_ROOT: ${{ env.BOT_STATE_DIR }}/runtime
-           UNIVERSE_LKG_DIR: ${{ env.BOT_STATE_DIR }}/universe_lkg
-           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-           STATE_PATH: bot_state/runtime/state.json
-           LOT_STATE_PATH: bot_state/runtime/lot_state.json
- 
--      - name: Persist bot_state (stage untracked + commit/push)
-+      - name: Persist bot_state (guarded)
-         if: always() && (env.PERSIST_MODE != 'OFF')
-+        env:
-+          BOTSTATE_WORKTREE_DIR: ${{ env.BOTSTATE_WORKTREE_DIR }}
-         run: |
-           set -euo pipefail
-+          echo "[PERSIST] BOTSTATE_WORKTREE_DIR=${BOTSTATE_WORKTREE_DIR:-}"
-+          if [ -z "${BOTSTATE_WORKTREE_DIR:-}" ]; then
-+            echo "[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty"
-+            exit 0
-+          fi
++  IF EXISTS (
++    SELECT 1
++    FROM information_schema.columns
++    WHERE table_name = 'universe_current'
++      AND column_name = 'as_of'
++  ) THEN
++    IF EXISTS (
++      SELECT 1
++      FROM information_schema.columns
++      WHERE table_name = 'universe_current'
++        AND column_name = 'as_of'
++        AND data_type <> 'date'
++    ) THEN
++      ALTER TABLE universe_current
++        ALTER COLUMN as_of TYPE date
++        USING (as_of::date);
++    END IF;
++  END IF;
 +
-+          if [ -f "$BOTSTATE_WORKTREE_DIR/.git" ] || [ -d "$BOTSTATE_WORKTREE_DIR/.git" ]; then
-+            echo "[PERSIST] ok: worktree is a git repo -> run persist"
-+          else
-+            echo "[PERSIST] skip: worktree is not a git repo (PB1 likely exited early)"
-+            exit 0
-+          fi
- 
-           cd "$BOTSTATE_WORKTREE_DIR"
-           echo "[PERSIST] workdir=$(pwd)"
-           git status --porcelain | head -n 50 || true
- 
-           python -m trader.botstate_persist --message "botstate: persist $GITHUB_RUN_ID $(date -Iseconds)" --soft-fail
- 
-           # 1) untracked 포함 bot_state 전체 stage
-           git add -A bot_state
- 
-           # 2) staged 변경이 없으면 스킵
-           if git diff --cached --quiet; then
-             echo "[PERSIST] no staged changes -> skip"
-           else
-             git config user.email "actions@github.com"
-             git config user.name "github-actions[bot]"
-             git commit -m "bot_state: persist runtime/universe/lkg [skip ci]" || true
-             git push origin HEAD:bot-state
-           fi
- 
-           # 3) 최종 clean 보장 (여기서 실패하면 진짜 문제)
-           if [[ -n "$(git status --porcelain)" ]]; then
-             echo "::error::botstate worktree dirty after persist"
-             git status --porcelain | head -n 200
-             exit 1
-diff --git a/trader/botstate_persist.py b/trader/botstate_persist.py
-index d3e5bad5890b64a6ff92b73d7e9f9617c2a7a4e5..ccd9ed7cc4060191e1f63080804d028a385d1c67 100644
---- a/trader/botstate_persist.py
-+++ b/trader/botstate_persist.py
-@@ -1,49 +1,54 @@
++  IF EXISTS (
++    SELECT 1
++    FROM information_schema.columns
++    WHERE table_name = 'universe_members'
++      AND column_name = 'as_of'
++  ) THEN
++    IF EXISTS (
++      SELECT 1
++      FROM information_schema.columns
++      WHERE table_name = 'universe_members'
++        AND column_name = 'as_of'
++        AND data_type <> 'date'
++    ) THEN
++      ALTER TABLE universe_members
++        ALTER COLUMN as_of TYPE date
++        USING (as_of::date);
++    END IF;
++  END IF;
++END $$;
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 14042a64aa8ffdd9de97c4a316a60d7ddd7154c9..0cab9dd67f4ca1ebbbd36b2f2b820b667cbdbeaa 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -1,64 +1,72 @@
  from __future__ import annotations
  
- import argparse
+-from datetime import datetime, timedelta
++from datetime import date, datetime, timedelta
  import logging
  import os
- import sys
- from datetime import datetime
- from pathlib import Path
- from zoneinfo import ZoneInfo
+ import time
+ from typing import Any, Dict, Iterable, List, Optional
+ from uuid import UUID, uuid4
  
- from trader.botstate_paths import botstate_path, get_botstate_root
- from trader.botstate_sync import (
-     acquire_lock,
-     BotStatePersistError,
-     persist_run_files,
-     release_lock,
-     resolve_botstate_worktree_dir,
-     setup_worktree,
+ import sqlalchemy as sa
+ from sqlalchemy.exc import OperationalError, StatementError
+ from sqlalchemy import Engine, and_, func, select
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ 
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+     UNIVERSE_MEMBERS,
+     UNIVERSE_CURRENT,
+     UNIVERSE_RUNS,
+     SchemaTables,
+     schema_for_engine,
+     uuid_value_for_url,
  )
+ from .migrate import run_migrations
+ from trader.time_utils import now_kst
+ from trader.db.json_safe import json_sanitize
  
  logger = logging.getLogger(__name__)
- KST = ZoneInfo("Asia/Seoul")
+ ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
  
  
-+def _is_git_repo(path: str) -> bool:
-+    repo_path = Path(path)
-+    return (repo_path / ".git").is_file() or (repo_path / ".git").is_dir()
+ def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
+     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+ 
+ 
++def _as_date(value: Any) -> date:
++    if isinstance(value, datetime):
++        return value.date()
++    if isinstance(value, date):
++        return value
++    return date.fromisoformat(str(value)[:10])
 +
 +
- def _add_if_exists(paths: list[Path], candidate: Path) -> None:
-     if candidate.is_file():
-         paths.append(candidate)
+ def ensure_run(
+     conn: sa.Connection,
+     schema: SchemaTables,
+     *,
+     run_id: str,
+     env: str,
+     run_window: str | None,
+     strategy: str,
+     ts: datetime,
+     database_url: str,
+ ) -> None:
+     if not run_id or not strategy:
+         return
+     values = {
+         "run_id": uuid_value_for_url(database_url, run_id),
+         "env": env,
+         "strategy": strategy,
+         "run_window": run_window,
+         "phase": None,
+         "event_name": "ledger_event",
+         "dry_run": False,
+         "config_json": {},
+         "started_at": ts,
+     }
+     if conn.dialect.name == "postgresql":
+@@ -206,72 +214,73 @@ class UniverseRepo:
+                 payload["env"] = env
+                 payload["strategy"] = strategy
+                 results.append(payload)
+             return results
  
+     def get_current_universe_members(self, env: str, strategy: str) -> list[dict]:
+         strategy_key = self._strategy_key(env, strategy)
+         stmt = select(self._schema.universe_current.c.run_id).where(self._schema.universe_current.c.strategy == strategy_key)
+         with self.engine.begin() as conn:
+             run_id = conn.execute(stmt).scalar()
+         if not run_id:
+             return []
+         return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
  
- def _add_glob(paths: list[Path], base_dir: Path, pattern: str) -> None:
-     for path in base_dir.glob(pattern):
-         if path.is_file():
-             paths.append(path)
- 
- 
- def _collect_paths(base_dir: Path) -> list[Path]:
-     paths: list[Path] = []
-     bot_root = get_botstate_root()
-     _add_if_exists(paths, bot_root / "runtime/state.json")
-     _add_if_exists(paths, bot_root / "runtime/lot_state.json")
-     _add_glob(paths, bot_root, "runtime/universe/*.json")
-     _add_glob(paths, bot_root, "runtime/universe/**/*.json")
-     _add_glob(paths, bot_root, "runtime/universe_build_done_*.flag")
-     _add_glob(paths, bot_root, "runtime/universe_sanitize_*.json")
-     _add_glob(paths, bot_root, "runtime/reports/**/*.json")
-     _add_glob(paths, bot_root, "runtime/status/*.json")
-     _add_glob(paths, bot_root, "runtime/status/*.flag")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/latest.json")
-     _add_glob(paths, bot_root, "universe_lkg/**/best_k_meta/history/*.json")
-@@ -55,50 +60,58 @@ def _collect_paths(base_dir: Path) -> list[Path]:
-     _add_if_exists(paths, base_dir / "trader/logs/ledger.jsonl")
-     return paths
- 
- 
- def _resolve_owner() -> str:
-     return os.getenv("GITHUB_ACTOR", "local")
- 
- 
- def _resolve_run_id() -> str:
-     return os.getenv("GITHUB_RUN_ID", datetime.now(tz=KST).strftime("%Y%m%d%H%M%S"))
- 
- 
- def main() -> int:
-     parser = argparse.ArgumentParser(description="Persist bot_state files using the bot-state worktree")
-     parser.add_argument("--message", required=True, help="Commit message for bot_state persist")
-     parser.add_argument(
-         "--soft-fail",
-         action="store_true",
-         help="Log errors and exit 0 instead of failing the job",
-     )
-     args = parser.parse_args()
- 
-     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
- 
-     try:
-+        worktree_env = os.environ.get("BOTSTATE_WORKTREE_DIR", "").strip()
-+        if not worktree_env:
-+            logger.info("[PERSIST] skip: BOTSTATE_WORKTREE_DIR is empty")
-+            return 0
-+        if not _is_git_repo(worktree_env):
-+            logger.info("[PERSIST] skip: worktree is not a git repo (PB1 exited early)")
-+            return 0
-+
-         base_dir = Path.cwd().resolve()
-         worktree_dir = resolve_botstate_worktree_dir(base_dir)
-         setup_worktree(base_dir, worktree_dir, target_branch="bot-state")
- 
-         owner = _resolve_owner()
-         run_id = _resolve_run_id()
- 
-         if not acquire_lock(worktree_dir, owner=owner, run_id=run_id, ttl_sec=None):
-             logger.error("[BOTSTATE][PERSIST] lock_unavailable owner=%s run_id=%s", owner, run_id)
-             return 1
- 
+     def store_universe_snapshot(
+         self,
+         *,
+         env: str,
+         strategy: str,
+         as_of_date: str,
+         provider: str,
+         members: Iterable[dict],
+         reason: str | None = None,
+     ) -> str | None:
+         members_list = list(members)
++        as_of_d = _as_date(as_of_date)
+         db_url = str(self.engine.url)
+         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+         strategy_key = self._strategy_key(env, strategy)
          try:
-             files = _collect_paths(base_dir)
-             if not files:
-                 logger.info("[BOTSTATE][PERSIST] no_files_found base_dir=%s", base_dir)
-                 return 0
-             try:
-                 persist_run_files(worktree_dir, files, args.message)
-             except BotStatePersistError as exc:
-                 if exc.require_persist and not exc.dirty_by_stat:
-                     logger.warning(
-                         "[BOTSTATE][PERSIST][EMPTY_STAGE][WARN] require_persist=1 dirty_by_stat=0 -> skip"
+             with self.engine.begin() as conn:
+                 existing = conn.execute(
+                     select(self._schema.universe_runs.c.run_id).where(
+                         and_(
+                             self._schema.universe_runs.c.strategy == strategy_key,
+                             self._schema.universe_runs.c.provider == provider,
+-                            self._schema.universe_runs.c.as_of == as_of_date,
++                            self._schema.universe_runs.c.as_of == as_of_d,
+                         )
                      )
-                     return 0
-                 raise
-diff --git a/trader/db/engine.py b/trader/db/engine.py
-index 5e1185ec5aa64e01d09dfcd728e0aaa8cf17a79f..c3f23814aea0e35b743302b0b315e74f7a2b15cc 100644
---- a/trader/db/engine.py
-+++ b/trader/db/engine.py
-@@ -1,27 +1,30 @@
- import os
+                 ).scalar()
+                 if existing:
+                     conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                 conn.execute(
+                     sa.insert(self._schema.universe_runs).values(
+                         run_id=run_id,
+                         strategy=strategy_key,
+                         provider=provider,
+-                        as_of=as_of_date,
++                        as_of=as_of_d,
+                         created_ts=now_kst().isoformat(),
+                     )
+                 )
+                 for rank, member in enumerate(members_list, start=1):
+                     meta = member.get("meta_json") or {}
+                     conn.execute(
+                         sa.insert(self._schema.universe_members).values(
+                             run_id=uuid_value_for_url(db_url, run_id),
+                             stock_code=str(member.get("code") or "").zfill(6),
+                             name=member.get("name") or meta.get("name"),
+                             market=member.get("market"),
+                             rank=member.get("rank") if member.get("rank") is not None else rank,
+                             market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
+                             reason=member.get("reason") or reason,
+                         )
+                     )
+                 if self.engine.dialect.name == "postgresql":
+                     insert_stmt = pg_insert(self._schema.universe_current).values(
+                         strategy=strategy_key,
+                         run_id=uuid_value_for_url(db_url, run_id),
+                         updated_ts=now_kst().isoformat(),
+                     )
+                 else:
+                     insert_stmt = sa.insert(self._schema.universe_current).values(
+                         strategy=strategy_key,
+diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
+index 26a29b957d1f37a8804cfa63ba0815de20fada83..ade8ac240ef6850673b1a5f8e36854d5ccc9b2f8 100644
+--- a/trader/kis_wrapper.py
++++ b/trader/kis_wrapper.py
+@@ -368,54 +368,56 @@ TR_MAP = {
  
- from sqlalchemy import create_engine
- from sqlalchemy.engine import Engine
+ 
+ def _pick_tr(env: str, key: str) -> List[str]:
+     try:
+         return TR_MAP[env][key]
+     except Exception:
+         return []
  
  
- def _db_echo() -> bool:
-     return os.getenv("DB_ECHO", "false").lower() in {"1", "true", "yes", "on"}
+ # --- KisAPI 이하 실전 전체 로직 ---
+ class KisAPI:
+     _token_cache = {"token": None, "expires_at": 0, "issued_at": 0}
+     _cache_path: Path | None = None
+     _token_lock = threading.Lock()
  
+     def should_cooldown(self, now_kst: datetime | None = None) -> bool:
+         """
+         VWAP / 롤링K 메인 루프에서 '잠깐 쉬어야 하는 구간'을 체크하는 헬퍼.
  
- def get_db_url() -> str:
-     url = os.getenv("PBCORE_DB_URL", "").strip()
-     if not url:
--        raise RuntimeError("PBCORE_DB_URL is required. SQLite fallback is disabled by design.")
-+        raise RuntimeError(
-+            "PBCORE_DB_URL is required. Set GitHub Actions secret 'PBCORE_DB_URL' "
-+            "and inject it as env in the workflow."
-+        )
-     if url.startswith("sqlite:"):
-         raise RuntimeError("SQLite is forbidden. Use Postgres only.")
-     return url
+         지금은 최소 구현 버전:
+         - 항상 False를 리턴해서 쿨다운을 사용하지 않는다.
+         - 나중에 점심시간 / 장 마감 직전 / 과열 구간 등 세부 로직을 여기로 옮기면 된다.
+         """
+         return False
  
+-    def __init__(self):
++    def __init__(self, kis_env: str | None = None, **kwargs):
++        if kis_env is None and "env" in kwargs:
++            kis_env = kwargs.pop("env")
+         self.CANO = safe_strip(CANO)
+         self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
+-        self.env = safe_strip(KIS_ENV or "practice").lower()
++        self.env = safe_strip(kis_env or KIS_ENV or "practice").lower()
+         if self.env not in ("practice", "real"):
+             self.env = "practice"
  
- def make_engine() -> Engine:
-     url = get_db_url()
-     return create_engine(
-         url,
-         echo=_db_echo(),
-         pool_pre_ping=True,
-         pool_recycle=1800,
+         # [CHG] 세션 생성 → 멤버로 보관
+         self.session = _build_session()
+ 
+         # [NEW] 네트워크 안전 요청 백오프/세션리셋 파라미터
+         self._safe_attempts = max(1, _env_int("KIS_HTTP_MAX_RETRIES", 5))
+         self._safe_backoff_base = _env_float("KIS_HTTP_BACKOFF_BASE_SEC", 1.2)
+         self._safe_backoff_cap = _env_float("KIS_HTTP_BACKOFF_CAP_SEC", 8.0)
+         self._safe_max_seconds = _env_float("KIS_HTTP_MAX_SECONDS", 18.0)
+ 
+         self._limiter = _RateLimiter(min_interval_sec=0.20)
+         self._recent_sells: Dict[str, float] = {}
+         self._recent_sells_lock = threading.Lock()
+         self._recent_sells_cooldown = 60.0
+ 
+         self._last_cash: Optional[int] = None  # ✅ 예수금 캐시(네트워크 실패/0원 응답 대응)
+         self._balance_cache: Optional[dict] = None
+         self._balance_cache_at: Optional[datetime] = None
+         self._orderable_cash_cache: Optional[int] = None
+         self._orderable_cash_cache_at: Optional[datetime] = None
+         self._orderable_cash_cache_ttl_sec = 5.0
+         self.safe_mode = False
+         self._load_safe_mode_state()
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index 36f582b94c3afc12f4f3bb1658af9c5dd7170805..eb54b5a6cf5e5c8230b04c16c27751fe7538c22a 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -622,51 +622,51 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
+         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
+         stats["total_raw"],
+         stats["invalid_format"],
+         stats["insufficient_history"],
+         stats["final"],
      )
+     invalid_codes = sanitize_detail.get("invalid_format_codes") or []
+     insufficient_codes = sanitize_detail.get("insufficient_history_codes") or []
+     if invalid_codes:
+         logger.info(
+             "[UNIVERSE][DROP] reason=invalid_format count=%s sample=%s",
+             len(invalid_codes),
+             invalid_codes[: min(5, len(invalid_codes))],
+         )
+     if insufficient_codes:
+         logger.info(
+             "[UNIVERSE][DROP] reason=insufficient_history count=%s sample=%s",
+             len(insufficient_codes),
+             insufficient_codes[: min(5, len(insufficient_codes))],
+         )
+ 
+     validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
+     kis_validator: KisAPI | None = None
+     if validate_kis:
+         try:
+-            kis_validator = kis_provider.kis if kis_provider else KisAPI(env=env)
++            kis_validator = kis_provider.kis if kis_provider else KisAPI(kis_env=env)
+         except Exception as exc:
+             logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
+             kis_validator = None
+     if validate_kis:
+         members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
+         if dropped_tradeable:
+             stats["not_tradeable"] = len(dropped_tradeable)
+             sanitize_detail["dropped"].extend(dropped_tradeable)
+             sanitize_detail["kept"] = [m.get("code") for m in members]
+             logger.info(
+                 "[UNIVERSE][DROP] reason=not_tradeable count=%s sample=%s",
+                 len(dropped_tradeable),
+                 dropped_tradeable[: min(5, len(dropped_tradeable))],
+             )
+ 
+     if not members:
+         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
+         raise RuntimeError("universe_members_empty")
+ 
+     repo.store_universe_snapshot(
+         env=env,
+         strategy=strategy,
+         as_of_date=as_of_date,
+         provider=source,
+         members=members,

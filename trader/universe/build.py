@@ -644,7 +644,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     kis_validator: KisAPI | None = None
     if validate_kis:
         try:
-            kis_validator = kis_provider.kis if kis_provider else KisAPI(env=env)
+            kis_validator = kis_provider.kis if kis_provider else KisAPI(kis_env=env)
         except Exception as exc:
             logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
             kis_validator = None
