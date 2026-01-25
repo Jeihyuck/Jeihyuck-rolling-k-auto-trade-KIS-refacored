@@ -87,7 +87,7 @@ def test_run_once_continues_after_reconcile_temp_error(tmp_path, monkeypatch):
         engine=engine,
         loop_mode=False,
         window=WindowDecision(name="day", phase="trade"),
-        bot_state_dir=tmp_path,
+        runtime_dir=tmp_path,
     )
 
     assert dummy_kis.inquire_called is True

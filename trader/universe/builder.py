@@ -33,7 +33,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", default="best_k_meta")
     parser.add_argument("--as-of", dest="as_of", default=None)
     parser.add_argument("--provider", default=None)
-    parser.add_argument("--save-lkg", action="store_true")
     return parser.parse_args()
 
 

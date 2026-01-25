@@ -29,7 +29,6 @@ from urllib.parse import urlparse
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
-from trader.botstate_paths import botstate_path
 from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
 
@@ -39,7 +38,6 @@ _DAILY_CAP_WARNED = False
 _BALANCE_CACHE_INVALID_LOGGED = False
 _KIS_BREAKER_LOCK = threading.Lock()
 _KIS_BREAKER_STATE: dict | None = None
-_KIS_BREAKER_PATH: Path | None = None
 _KIS_BREAKER_WINDOW_SEC = int(os.getenv("KIS_BREAKER_WINDOW_SEC", "300") or "300")
 _KIS_BREAKER_THRESHOLD = int(os.getenv("KIS_BREAKER_THRESHOLD", "10") or "10")
 _KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
@@ -151,32 +149,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _resolve_breaker_path() -> Path:
-    global _KIS_BREAKER_PATH
-    if _KIS_BREAKER_PATH is None:
-        _KIS_BREAKER_PATH = botstate_path("runtime", "kis_breaker.json")
-        _KIS_BREAKER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return _KIS_BREAKER_PATH
-
-
 def _load_breaker_state() -> dict:
     global _KIS_BREAKER_STATE
     if _KIS_BREAKER_STATE is not None:
         return _KIS_BREAKER_STATE
-    path = _resolve_breaker_path()
-    if path.exists():
-        try:
-            _KIS_BREAKER_STATE = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            _KIS_BREAKER_STATE = None
     if not isinstance(_KIS_BREAKER_STATE, dict):
         _KIS_BREAKER_STATE = {"endpoints": {}}
     return _KIS_BREAKER_STATE
 
 
 def _save_breaker_state(state: dict) -> None:
-    path = _resolve_breaker_path()
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    global _KIS_BREAKER_STATE
+    _KIS_BREAKER_STATE = state
 
 
 def _breaker_key(method: str, url: str) -> str:

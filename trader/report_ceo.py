@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import logging
 
-from trader.botstate_paths import runtime_root
+from trader.runtime_paths import runtime_root
 
 logger = logging.getLogger(__name__)
 

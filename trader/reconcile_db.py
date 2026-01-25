@@ -13,12 +13,12 @@ EMPTY_STREAK_MIN = 2
 EMPTY_STREAK_MAX = 3
 
 
-def _guard_path(bot_state_dir: Path) -> Path:
-    return bot_state_dir / RECONCILE_GUARD_FILE
+def _guard_path(runtime_dir: Path) -> Path:
+    return runtime_dir / RECONCILE_GUARD_FILE
 
 
-def load_reconcile_guard(bot_state_dir: Path) -> dict:
-    path = _guard_path(bot_state_dir)
+def load_reconcile_guard(runtime_dir: Path) -> dict:
+    path = _guard_path(runtime_dir)
     if not path.exists():
         return {}
     try:
@@ -28,8 +28,8 @@ def load_reconcile_guard(bot_state_dir: Path) -> dict:
         return {}
 
 
-def save_reconcile_guard(bot_state_dir: Path, payload: dict) -> Path:
-    path = _guard_path(bot_state_dir)
+def save_reconcile_guard(runtime_dir: Path, payload: dict) -> Path:
+    path = _guard_path(runtime_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -37,7 +37,7 @@ def save_reconcile_guard(bot_state_dir: Path, payload: dict) -> Path:
 
 def evaluate_stale_db_guard(
     *,
-    bot_state_dir: Path,
+    runtime_dir: Path,
     tick_ts: datetime,
     kis_holdings_empty: bool,
     orders_count: int,
@@ -45,7 +45,7 @@ def evaluate_stale_db_guard(
     had_kis_error: bool,
     min_empty_ticks: int = EMPTY_STREAK_MIN,
 ) -> tuple[bool, str, dict]:
-    guard = load_reconcile_guard(bot_state_dir)
+    guard = load_reconcile_guard(runtime_dir)
     empty_streak = int(guard.get("empty_streak") or 0)
 
     if kis_holdings_empty and not had_kis_error:
@@ -65,7 +65,7 @@ def evaluate_stale_db_guard(
     if orders_count > 0 or fills_count > 0:
         guard["last_order_or_fill_ts"] = tick_ts.isoformat()
 
-    save_reconcile_guard(bot_state_dir, guard)
+    save_reconcile_guard(runtime_dir, guard)
 
     if had_kis_error:
         return False, "kis_error", guard

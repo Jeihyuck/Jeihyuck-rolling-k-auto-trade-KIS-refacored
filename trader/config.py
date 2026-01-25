@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
 
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, get_cache_root
+from trader.runtime_paths import ensure_not_repo_tracked_path, get_cache_root, runtime_path
 from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
 
 # =========================
@@ -129,10 +129,6 @@ CONFIG = {
     "ENABLE_BREAKOUT": "false",
     "LEDGER_LOOKBACK_DAYS": "120",
     "LEDGER_BASE_DIR": "trader_ledger",
-    "BOT_STATE_RESET": "0",
-    "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
-    "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
-    "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
     "PAPER_RESET_AUTO_PURGE": "0",
     "PAPER_RESET_EVENT_ONLY_IN_PRACTICE": "1",
     "PB1_CAPITAL_MODE": "CASH",
@@ -301,7 +297,7 @@ LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path(__file__).parent / "trade_state.json"  # legacy; position state uses STATE_PATH
 STATE_DIR_RAW = _cfg("STATE_DIR")
-STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else botstate_path("runtime")
+STATE_DIR = Path(STATE_DIR_RAW) if STATE_DIR_RAW else runtime_path("runtime")
 STATE_PATH = Path(_cfg("STATE_PATH") or STATE_DIR / "state.json")
 ensure_not_repo_tracked_path(STATE_PATH)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -430,10 +426,10 @@ def _resolve_min_order_krw() -> float:
 
 MIN_ORDER_KRW = _resolve_min_order_krw()
 STRATEGY_INTENTS_PATH = Path(
-    _cfg("STRATEGY_INTENTS_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_PATH"]).parts)
+    _cfg("STRATEGY_INTENTS_PATH") or runtime_path(*Path(CONFIG["STRATEGY_INTENTS_PATH"]).parts)
 )
 STRATEGY_INTENTS_STATE_PATH = Path(
-    _cfg("STRATEGY_INTENTS_STATE_PATH") or botstate_path(*Path(CONFIG["STRATEGY_INTENTS_STATE_PATH"]).parts)
+    _cfg("STRATEGY_INTENTS_STATE_PATH") or runtime_path(*Path(CONFIG["STRATEGY_INTENTS_STATE_PATH"]).parts)
 )
 STRATEGY_MAX_OPEN_INTENTS = int(_cfg("STRATEGY_MAX_OPEN_INTENTS") or "20")
 STRATEGY_MAX_POSITION_PCT = float(_cfg("STRATEGY_MAX_POSITION_PCT") or "0.10")
@@ -593,12 +589,8 @@ DISABLE_KOSPI_ENGINE = _cfg_bool("DISABLE_KOSPI_ENGINE")
 ENABLE_BREAKOUT = _cfg_bool("ENABLE_BREAKOUT")
 PB1_ENTRY_ENABLED = _cfg_bool("PB1_ENTRY_ENABLED", fallback=True)
 LEDGER_LOOKBACK_DAYS = int(_cfg("LEDGER_LOOKBACK_DAYS") or "120")
-LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or botstate_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
+LEDGER_BASE_DIR = Path(_cfg("LEDGER_BASE_DIR") or runtime_path(*Path(CONFIG["LEDGER_BASE_DIR"]).parts))
 ensure_not_repo_tracked_path(LEDGER_BASE_DIR)
-BOT_STATE_RESET = _cfg_bool("BOT_STATE_RESET")
-BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH = _cfg_bool("BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH", fallback=True)
-BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS = _cfg_bool("BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS", fallback=True)
-BOT_STATE_RESET_CASH_MAX_KRW = int(_cfg("BOT_STATE_RESET_CASH_MAX_KRW") or "15000000")
 PAPER_MAX_CAPITAL_KRW = int(_cfg("PAPER_MAX_CAPITAL_KRW") or "10000000")
 PAPER_RESET_AUTO_PURGE = _cfg_bool("PAPER_RESET_AUTO_PURGE", fallback=False)
 PAPER_RESET_EVENT_ONLY_IN_PRACTICE = _cfg_bool("PAPER_RESET_EVENT_ONLY_IN_PRACTICE", fallback=True)
@@ -621,8 +613,7 @@ PB1_PREOPEN_LIMIT_BUFFER_PCT = float(_cfg("PB1_PREOPEN_LIMIT_BUFFER_PCT") or "0.
 PB1_REQUIRE_BALANCE_FOR_ENTRY = _cfg_bool("PB1_REQUIRE_BALANCE_FOR_ENTRY", fallback=True)
 
 logger.info(
-    "[CONFIG] BOT_STATE_RESET=%s CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
-    int(BOT_STATE_RESET),
+    "[CONFIG] CAPITAL_MODE=%s ENTRY_CAPITAL=%s RESERVE=%s",
     PB1_CAPITAL_MODE,
     int(PB1_ENTRY_CAPITAL_KRW) if PB1_ENTRY_CAPITAL_KRW is not None else None,
     PB1_CASH_RESERVE_PCT,

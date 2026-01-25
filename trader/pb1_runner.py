@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import subprocess
 import signal
 import traceback
 import time as time_mod
@@ -16,10 +15,6 @@ from zoneinfo import ZoneInfo
 from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
-    BOT_STATE_RESET,
-    BOT_STATE_RESET_CASH_MAX_KRW,
-    BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
-    BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
     CLOSE_AUCTION_END,
     CLOSE_AUCTION_START,
     DIAGNOSTIC_MODE,
@@ -36,8 +31,6 @@ from trader.config import (
     NONTRADING_SMOKE_FORCE,
     NONTRADING_SMOKE_FORCE_REBUILD,
     NONTRADING_SMOKE_TIMEOUT_SEC,
-    EMERGENCY_UNIVERSE_BUILD,
-    FORCE_UNIVERSE_REBUILD,
     PB1_ALLOW_PREOPEN_ENTRY,
     PB1_PREOPEN_END,
     PB1_PREOPEN_MAX_NEW_POSITIONS,
@@ -56,7 +49,7 @@ from trader.config import (
     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
 )
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, runtime_root
+from trader.runtime_paths import runtime_root
 from trader.db.engine import make_engine
 from trader.db.health import assert_db_ready
 from trader.db.locks import acquire_advisory_lock, release_advisory_lock
@@ -76,23 +69,12 @@ from trader.diagnostics.nontrading_smoke import (
     write_nontrading_smoke_flag,
 )
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
-from trader.ledger.store import LedgerStore
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_kis, reconcile_today
 from trader.reconcile_db import close_stale_positions
-from trader.reset_utils import (
-    detect_account_fp,
-    load_reset_guard,
-    purge_bot_state,
-    record_purge_event,
-    should_purge_on_empty_kis_holdings,
-    update_reset_guard_from_balance,
-)
-from trader.runtime_store import DEFAULT_UNIVERSE_STRATEGY, RuntimeStore
+from trader.universe.build import build_universe
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
-from trader.eventlog import emit_event
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
-from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision, decide_window
 
 logger = logging.getLogger(__name__)
@@ -102,6 +84,7 @@ _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
 BALANCE_STATE_UNKNOWN = "UNKNOWN"
+DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
 
 
 def _deepcopy_json(value):
@@ -111,39 +94,9 @@ def _deepcopy_json(value):
         return value
 
 
-def _balance_snapshot_ttl_sec() -> int:
-    return _parse_int_env("PB1_BALANCE_SNAPSHOT_TTL_SEC", 120)
-
-
-def _load_stale_balance_snapshot(
-    runtime_store: RuntimeStore,
-    now: datetime,
-) -> tuple[dict | None, str | None, datetime | None]:
-    payload = runtime_store.load_balance_snapshot()
-    if not payload:
-        return None, None, None
-    ts_raw = payload.get("timestamp_kst")
-    if not ts_raw:
-        return None, None, None
-    try:
-        ts = datetime.fromisoformat(ts_raw)
-    except ValueError:
-        return None, None, None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=ZoneInfo("Asia/Seoul"))
-    age_sec = (now - ts).total_seconds()
-    if age_sec > _balance_snapshot_ttl_sec():
-        return None, None, None
-    snapshot = payload.get("normalized") or payload.get("raw")
-    if not isinstance(snapshot, dict):
-        return None, None, None
-    return snapshot, "snapshot", ts
-
-
 def get_balance_state(
     *,
     kis: KisAPI,
-    runtime_store: RuntimeStore,
     now: datetime,
 ) -> tuple[str, dict | None, str | None]:
     try:
@@ -160,47 +113,25 @@ def get_balance_state(
             raise KisBalanceUnavailable("balance_output1_not_list")
         if not isinstance(balance_snapshot_raw.get("output2"), dict):
             raise KisBalanceUnavailable("balance_output2_not_dict")
-        runtime_store.save_balance_snapshot(
-            raw_snapshot=raw_snapshot or balance_snapshot_raw,
-            normalized_snapshot=balance_snapshot_raw,
-            source="api" if balance_source == "api" else "cache",
-            timestamp_kst=now.isoformat(),
-        )
-        update_reset_guard_from_balance(
-            runtime_store.base_dir,
-            now_kst=now,
-            kis_output1=balance_snapshot_raw.get("output1") or [],
-        )
         return BALANCE_STATE_OK, balance_snapshot_raw, balance_source
     except KisBalanceUnavailable as exc:
         logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
     except Exception:
         logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
-
-    stale_snapshot, stale_source, stale_ts = _load_stale_balance_snapshot(runtime_store, now)
-    if stale_snapshot:
-        update_reset_guard_from_balance(
-            runtime_store.base_dir,
-            now_kst=stale_ts or now,
-            kis_output1=stale_snapshot.get("output1") or [],
-        )
-        return BALANCE_STATE_STALE_OK, stale_snapshot, stale_source
     return BALANCE_STATE_UNKNOWN, None, None
 
 
-def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
+def _diag_balance_probe_once_safe(*, logger, runtime_root_dir: Path, kis_factory):
     """
     DIAG에서 잔고/예수금/주문가능을 1회만 조회하고, flag 파일로 중복 실행 방지.
     - 전역변수/스코프 의존 금지
-    - BOT_STATE_DIR 같은 파이썬 변수 사용 금지 (환경변수도 optional fallback)
+    - 런타임 경로를 하드코딩하지 않고 runtime_root 사용
     """
     import os
     import json
     import time
 
-    runtime_dir = Path(runtime_store.base_dir) / "runtime"
-
-    diag_dir = runtime_dir / "diagnostics"
+    diag_dir = runtime_root_dir / "runtime" / "diagnostics"
     diag_dir.mkdir(parents=True, exist_ok=True)
 
     flag_path = diag_dir / "diag_balance_once.flag"
@@ -275,26 +206,13 @@ def _diag_balance_probe_once_safe(*, logger, runtime_store, kis_factory):
         logger.warning("[DIAG][BALANCE] failed to save raw json: %s", e)
 
 
-def universe_build_flag(as_of: str) -> Path:
-    return botstate_path("runtime", f"universe_build_done_{as_of}.flag")
-
-
-def nontrading_universe_smoke_flag(as_of: str) -> Path:
-    return botstate_path("runtime", "diagnostics", f"nontrading_universe_smoke_done_{as_of}.flag")
-
-
 def ensure_universe_built_once(
-    runtime_store: RuntimeStore | None = None,
     *,
+    engine,
     env: str | None = None,
     strategy: str | None = None,
     as_of: str | None = None,
-    force: bool = False,
-    allow_missing: bool = False,
 ) -> None:
-    if runtime_store is None:
-        raise ValueError("runtime_store is required for ensure_universe_built_once")
-
     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
     if env is not None:
         env = env.strip()
@@ -305,383 +223,49 @@ def ensure_universe_built_once(
     assert strategy, "strategy is required"
     assert as_of, "as_of is required"
 
-    log.info(
-        "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
-        type(runtime_store).__name__,
-        env,
-        strategy,
-        as_of,
-        force,
-    )
-
-    ok, meta = runtime_store.universe_check(as_of)
-    flag = universe_build_flag(as_of)
-
-    if not force:
-        if not ok and not allow_missing and not (EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
-            return
-        if meta.get("have_today"):
-            return
-        if flag.exists():
-            return
-
-    reason = "force" if force else "auto_missing_today"
-    flag.parent.mkdir(parents=True, exist_ok=True)
-    flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
-    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s", as_of, reason)
-    runtime_store.ensure_universe(
-        as_of=as_of,
-        env=env,
-        strategy=strategy,
-        force_rebuild=force or FORCE_UNIVERSE_REBUILD,
-        emergency_build=EMERGENCY_UNIVERSE_BUILD,
-    )
-
-
-def run_nontrading_universe_smoke(
-    *,
-    runtime_store: RuntimeStore,
-    engine,
-    now: datetime,
-    env: str,
-    strategy: str,
-    force_rebuild: bool,
-    db_store: bool,
-    timeout_sec: int,
-) -> bool:
-    as_of = now.date().isoformat()
-    done_flag = nontrading_universe_smoke_flag(as_of)
-    if done_flag.exists() and not force_rebuild:
-        logger.info(
-            "[SMOKE][NONTRADING][SKIP] as_of=%s reason=already_done flag=%s",
-            as_of,
-            done_flag,
-        )
-        return False
-
-    if force_rebuild and done_flag.exists():
-        try:
-            done_flag.unlink()
-        except Exception:
-            logger.warning("[SMOKE][NONTRADING][FLAG][REMOVE_FAIL] as_of=%s flag=%s", as_of, done_flag)
-
-    cmd = [
-        "python",
-        "-m",
-        "trader.universe.build",
-        "--env",
-        env,
-        "--strategy",
-        strategy,
-        "--date",
-        as_of,
-    ]
-    logger.info(
-        "[SMOKE][NONTRADING][BUILD] as_of=%s env=%s strategy=%s timeout_sec=%s force_rebuild=%s cmd=%s",
-        as_of,
-        env,
-        strategy,
-        timeout_sec,
-        int(force_rebuild),
-        cmd,
-    )
-    env_vars = os.environ.copy()
-    env_vars["TRADER_RUNTIME_DIR"] = str(runtime_store.base_dir)
-    try:
-        subprocess.run(
-            cmd,
-            check=False,
-            cwd=str(Path(runtime_store.base_dir).parent),
-            env=env_vars,
-            timeout=timeout_sec,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=build_timeout timeout_sec=%s",
-            as_of,
-            timeout_sec,
-        )
-        return False
-
-    members, meta = runtime_store.load_today_universe(as_of)
-    have_today = bool(meta.get("have_today"))
-    today_path = meta.get("today_path")
-    logger.info(
-        "[SMOKE][NONTRADING][RUNTIME] as_of=%s have_today=%s members=%s path=%s",
-        as_of,
-        int(have_today),
-        len(members),
-        today_path,
-    )
-    if not have_today:
-        logger.warning(
-            "[SMOKE][NONTRADING][FAIL] as_of=%s reason=runtime_missing path=%s",
-            as_of,
-            today_path,
-        )
-        return False
-
-    payload: dict = {}
-    if today_path:
-        try:
-            payload = json.loads(Path(today_path).read_text(encoding="utf-8"))
-        except Exception:
-            logger.exception("[SMOKE][NONTRADING][LOAD_FAIL] as_of=%s path=%s", as_of, today_path)
-
-    payload_members = payload.get("members") if isinstance(payload, dict) else None
-    if isinstance(payload_members, list):
-        members = payload_members
-
-    provider = payload.get("source") if isinstance(payload, dict) else None
-    if not provider:
-        provider = "runtime"
-
-    db_store_ok = False
-    if db_store:
-        try:
-            repo = UniverseRepo(engine)
-            repo.store_universe_snapshot(
-                env=env,
-                strategy=strategy,
-                as_of_date=as_of,
-                provider=provider,
-                members=members,
-                reason="nontrading_smoke",
-            )
-            db_store_ok = True
-        except Exception:
-            logger.exception("[SMOKE][NONTRADING][DB_STORE][FAIL] as_of=%s env=%s strategy=%s", as_of, env, strategy)
-
-    runtime_store.touch_flag(
-        Path("runtime") / "diagnostics" / f"nontrading_universe_smoke_done_{as_of}.flag",
-        content=f"done as_of={as_of} members={len(members)} db_store={int(db_store_ok)}\n",
-    )
-    logger.info(
-        "[SMOKE][NONTRADING][OK] universe_built=1 db_store=%s members=%s as_of=%s",
-        int(db_store_ok),
-        len(members),
-        as_of,
-    )
-    return True
+    log.info("[UNIVERSE][ENSURE][DB] env=%s strategy=%s as_of=%s", env, strategy, as_of)
+    repo = UniverseRepo(engine)
+    members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+    if members:
+        return
+    diag_mode = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
+    emergency = os.getenv("EMERGENCY_UNIVERSE_BUILD", "0") == "1"
+    if emergency and diag_mode:
+        logger.warning("[UNIVERSE][ENSURE][EMERGENCY_BUILD] env=%s strategy=%s as_of=%s", env, strategy, as_of)
+        build_universe(as_of_date=as_of, env=env, strategy=strategy)
+        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+    if not members:
+        raise RuntimeError(f"missing universe in DB: env={env} strategy={strategy} as_of={as_of}")
 
 
 def _load_universe_context(
     *,
-    runtime_store: RuntimeStore,
+    engine,
     as_of: str,
     env: str,
     strategy: str,
 ) -> UniverseContext:
-    runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
-    ok, meta = runtime_store.universe_check(as_of)
-    selected_path = meta.get("selected_path")
-    if not ok or not selected_path or not os.path.exists(selected_path):
-        raise RuntimeError(f"Universe missing: cannot trade as_of={as_of} path={selected_path}")
-    try:
-        with open(selected_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception as exc:
-        raise RuntimeError(f"Universe load failed: cannot trade as_of={as_of} path={selected_path}") from exc
-    if isinstance(data, dict):
-        universe = data
-        members = data.get("members")
-    else:
-        universe = {"members": data}
-        members = data
-    if not isinstance(members, list):
-        raise RuntimeError(f"Universe malformed: cannot trade as_of={as_of} path={selected_path}")
-    if len(members) == 0:
+    repo = UniverseRepo(engine)
+    members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+    if not members:
         logger.warning(
-            "[PB1][UNIVERSE][EMPTY_OK] as_of=%s path=%s reason=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
+            "[PB1][UNIVERSE][EMPTY_OK] as_of=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
             as_of,
-            selected_path,
-            universe.get("reason"),
         )
         return UniverseContext(
-            as_of_date=universe.get("as_of"),
+            as_of_date=as_of,
             members=[],
-            selected_path=selected_path,
-            meta=meta,
+            selected_path=None,
+            meta={"source": "db", "as_of": as_of},
             is_empty=True,
         )
-    universe_as_of = universe.get("as_of") or (members[0].get("as_of_date") if members else None)
     return UniverseContext(
-        as_of_date=universe_as_of,
+        as_of_date=as_of,
         members=members,
-        selected_path=selected_path,
-        meta=meta,
+        selected_path=None,
+        meta={"source": "db", "as_of": as_of},
         is_empty=False,
     )
-
-
-def _write_account_reset_event(base_dir: Path, payload: dict) -> Path:
-    events_dir = base_dir / "runtime" / "events"
-    events_dir.mkdir(parents=True, exist_ok=True)
-    path = events_dir / f"account_reset_{now_kst().date().isoformat()}.jsonl"
-    ensure_not_repo_tracked_path(path)
-    payload = to_jsonable(payload)
-    line = json.dumps(payload, ensure_ascii=False)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-    logger.info("[PB1][RESET][EVENT] path=%s payload=%s", path, payload)
-    return path
-
-
-def _handle_missing_positions_reset(
-    *,
-    balance_snapshot: dict | None,
-    env: str,
-    strategy: str,
-    run_id: str | None,
-    engine,
-    kis: KisAPI | None,
-    orders_count: int,
-    fills_count: int,
-    positions_repo: PositionsRepo,
-    ledger_repo: LedgerEventsRepo,
-    bot_state_dir: Path,
-    reset_on_missing_positions: bool,
-    force_safe_exit: bool,
-    allow_stale_purge: bool | None,
-    stale_guard_reason: str | None,
-) -> bool:
-    if not balance_snapshot:
-        return False
-    holdings_rows = balance_snapshot.get("output1") or []
-    kis_codes = {str(row.get("pdno") or row.get("code") or "").zfill(6) for row in holdings_rows}
-    kis_codes = {code for code in kis_codes if code}
-    if kis_codes:
-        return False
-    positions = positions_repo.list_positions(env, strategy)
-    position_codes = {str(p.get("code") or "").zfill(6) for p in positions if int(p.get("qty") or 0) > 0}
-    if not position_codes:
-        return False
-    if orders_count > 0 or fills_count > 0:
-        logger.info(
-            "[PB1][RESET][SKIP] holdings_empty=1 recent_orders=%s recent_fills=%s -> no stale reset",
-            orders_count,
-            fills_count,
-        )
-        return False
-    if allow_stale_purge is False:
-        logger.info(
-            "[PB1][RESET][SKIP] holdings_empty=1 stale_guard=%s -> no stale reset",
-            stale_guard_reason or "guard_block",
-        )
-        return False
-    ledger_store = LedgerStore(LEDGER_BASE_DIR, env=env, run_id=run_id)
-    ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-    ledger_codes = {code for (code, sid, mode) in ledger_positions.keys() if code}
-    missing_codes = sorted(position_codes | ledger_codes)
-    if not missing_codes:
-        return False
-    if not reset_on_missing_positions and not force_safe_exit:
-        closed_count = close_stale_positions(
-            engine=engine,
-            env=env,
-            strategy=strategy,
-            reason="STALE_DB_BUT_KIS_EMPTY",
-            ts=now_kst(),
-        )
-        for code in missing_codes:
-            ledger_repo.append_event(
-                env=env,
-                run_id=run_id,
-                strategy=strategy,
-                event_type="AUTO_CLOSED_STALE_KIS_EMPTY",
-                ts=now_kst(),
-                code=code,
-                sid=1,
-                mode=1,
-                ok=True,
-                reasons=["AUTO_CLOSED_STALE_KIS_EMPTY"],
-                payload_json={
-                    "source": "stale_db_autoclose",
-                    "orders": orders_count,
-                    "fills": fills_count,
-                },
-            )
-        ledger_repo.append_event(
-            env=env,
-            run_id=run_id,
-            strategy=strategy,
-            event_type="STALE_DB_SOFT_RESET",
-            ts=now_kst(),
-            ok=True,
-            reasons=["holdings_empty", "soft_close", "orphan_marked"],
-            payload_json={
-                "closed_positions": closed_count,
-                "missing_codes": missing_codes,
-                "orders": orders_count,
-                "fills": fills_count,
-                "reason": "STALE_DB_BUT_KIS_EMPTY",
-            },
-        )
-        emit_event(
-            as_of=now_kst().date().isoformat(),
-            event="stale_db_autoclosed",
-            env=env,
-            strategy=strategy,
-            kis_holdings_count=len(holdings_rows),
-            missing_codes=missing_codes,
-            ledger_position_count=len(ledger_codes),
-            db_position_count=len(position_codes),
-            closed_positions=closed_count,
-            orders=orders_count,
-            fills=fills_count,
-            reason="AUTO_CLOSED_STALE_KIS_EMPTY",
-        )
-        logger.warning(
-            "[PB1][RESET][STALE_DB] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s reason=%s",
-            env,
-            missing_codes,
-            closed_count,
-            "STALE_DB_BUT_KIS_EMPTY",
-        )
-        if kis is not None:
-            try:
-                reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
-            except Exception:
-                logger.exception("[PB1][RESET][STALE_DB] reconcile_today failed")
-        return False
-    closed_count = 0
-    if position_codes:
-        closed_count = positions_repo.close_positions(env=env, strategy=strategy, codes=sorted(position_codes))
-    for code in missing_codes:
-        ledger_repo.append_event(
-            env=env,
-            run_id=run_id,
-            strategy=strategy,
-            event_type="ACCOUNT_RESET_POSITION_CLOSED",
-            ts=now_kst(),
-            code=code,
-            sid=1,
-            mode=1,
-            ok=True,
-            reasons=["account_reset_or_position_missing"],
-            payload_json={"source": "missing_position_reset"},
-        )
-    _write_account_reset_event(
-        bot_state_dir,
-        {
-            "ts": now_kst().isoformat(),
-            "env": env,
-            "strategy": strategy,
-            "reason": "account_reset_or_position_missing",
-            "kis_holdings_count": len(holdings_rows),
-            "missing_codes": missing_codes,
-            "ledger_position_count": len(ledger_codes),
-            "db_position_count": len(position_codes),
-            "closed_positions": closed_count,
-        },
-    )
-    logger.warning(
-        "[PB1][RESET][SAFE_EXIT] env=%s holdings_empty=1 missing_positions=%s closed_db_positions=%s",
-        env,
-        missing_codes,
-        closed_count,
-    )
-    return True
 
 
 def _resolve_market_context(
@@ -949,29 +533,16 @@ def _write_change_flag(changed: bool, reasons: list[str]) -> None:
     logger.info("[PB1][CHANGE] changed=%s reasons=%s", int(changed), reasons)
 
 
-def _runtime_meta_path(bot_state_dir: Path) -> Path:
-    return bot_state_dir / "runtime" / "runtime_meta.json"
-
-
-def _load_runtime_meta(bot_state_dir: Path) -> dict:
-    path = _runtime_meta_path(bot_state_dir)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("[STATE][META][LOAD_FAIL] path=%s", path)
-        return {}
-
-
-def _write_runtime_meta(bot_state_dir: Path, payload: dict) -> None:
-    path = _runtime_meta_path(bot_state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _write_last_db_write(runtime_store: RuntimeStore, *, run_id: str | None, reason: str, now: datetime) -> Path:
-    return runtime_store.write_status_last_db_write(run_id=run_id, reason=reason, ts=now.isoformat())
+def _write_last_db_write(runtime_root_dir: Path, *, run_id: str | None, reason: str, now: datetime) -> Path:
+    payload = {
+        "run_id": run_id,
+        "reason": reason,
+        "ts": now.isoformat(),
+    }
+    target = runtime_root_dir / "runtime" / "status" / "last_db_write.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
 
 
 def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
@@ -1016,7 +587,7 @@ def run_once(
     engine,
     loop_mode: bool = False,
     window: WindowDecision | None = None,
-    bot_state_dir: Path | None = None,
+    runtime_dir: Path | None = None,
     max_seconds: int = 0,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     now = _get_now_kst()
@@ -1032,8 +603,7 @@ def run_once(
     trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
     run_start_ts = time_mod.time()
     as_of = now.date().isoformat()
-    resolved_bot_state_dir = bot_state_dir or runtime_root()
-    runtime_store = RuntimeStore(base_dir=resolved_bot_state_dir)
+    runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
     if close_cancel_only:
@@ -1183,12 +753,12 @@ def run_once(
         exit_status = "NONTRADING_DAY_EXIT"
         if mode == "DIAG":
             as_of = now.date().isoformat()
-            smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
+            smoke_flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of)
             if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
                 logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
             else:
                 run_nontrading_smoke_once(
-                    runtime_store=runtime_store,
+                    runtime_root_dir=runtime_root_dir,
                     engine=engine,
                     now=now,
                     env=(os.getenv("KIS_ENV") or "practice").lower(),
@@ -1199,7 +769,7 @@ def run_once(
                     force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
                 )
                 write_nontrading_smoke_flag(
-                    runtime_store,
+                    runtime_root_dir,
                     now=now,
                     run_id=os.getenv("GITHUB_RUN_ID", "local"),
                     sha=os.getenv("GITHUB_SHA", "unknown"),
@@ -1392,7 +962,7 @@ def run_once(
                 )
             except Exception:
                 logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
-            _write_last_db_write(runtime_store, run_id=run_id, reason="exit_shortcircuit", now=now)
+            _write_last_db_write(runtime_root_dir, run_id=run_id, reason="exit_shortcircuit", now=now)
             logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
             return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
         except Exception:
@@ -1428,14 +998,13 @@ def run_once(
                 )
             except Exception:
                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
-            _write_last_db_write(runtime_store, run_id=run_id, reason="budget_degraded", now=now)
+            _write_last_db_write(runtime_root_dir, run_id=run_id, reason="budget_degraded", now=now)
             return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
         except Exception:
             logger.exception("[PB1][DEGRADED] failed")
 
     if not loop_mode:
-        allow_missing = market_window == "preopen"
-        ensure_universe_built_once(runtime_store=runtime_store, as_of=as_of, allow_missing=allow_missing)
+        ensure_universe_built_once(engine=engine, as_of=as_of)
 
     logger.info(
         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
@@ -1478,7 +1047,7 @@ def run_once(
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
-                    runtime_store=runtime_store,
+                    engine=engine,
                     as_of=as_of,
                     env=kis_env or "practice",
                     strategy=universe_strategy,
@@ -1511,7 +1080,6 @@ def run_once(
             _log_balance_cache(force=False)
             balance_state, balance_snapshot_raw, balance_source = get_balance_state(
                 kis=kis,
-                runtime_store=runtime_store,
                 now=now,
             )
         logger.info(
@@ -1596,112 +1164,6 @@ def run_once(
                 entry_block_reason or "unknown",
             )
 
-        reset_reason = None
-        account_fp_now = None
-        dnca_total = None
-        if kis and balance_snapshot_raw:
-            account_fp_now = detect_account_fp(kis.env, kis.CANO, kis.ACNT_PRDT_CD, api_base_url)
-            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
-            runtime_fp = runtime_meta.get("account_fp")
-            if BOT_STATE_RESET:
-                reset_reason = "env_reset"
-            elif BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH and runtime_fp and runtime_fp != account_fp_now:
-                reset_reason = "account_fp_mismatch"
-            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS and balance_state == BALANCE_STATE_OK:
-                kis_holdings = balance_snapshot_raw.get("output1") or []
-                ledger_store = LedgerStore(LEDGER_BASE_DIR, env=kis_env or "practice", run_id=workflow_run_id)
-                ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-                ledger_positions_count = sum(
-                    1 for state in ledger_positions.values() if int(state.get("total_qty") or 0) > 0
-                )
-                dnca_total = _extract_dnca_total(balance_snapshot_raw)
-                reset_guard = load_reset_guard(resolved_bot_state_dir)
-                last_seen_positions_count = reset_guard.get("last_seen_positions_count")
-                last_balance_had_positions = reset_guard.get("last_balance_had_positions")
-                should_purge, purge_reason = should_purge_on_empty_kis_holdings(
-                    kis_output1=kis_holdings,
-                    ledger_positions_count=ledger_positions_count,
-                    last_seen_positions_count=last_seen_positions_count,
-                    last_balance_had_positions=last_balance_had_positions,
-                    now_kst=now,
-                    reason_ctx=reset_guard,
-                )
-                is_paper_env = (kis_env or "").lower() != "real"
-                if len(kis_holdings) == 0:
-                    if is_paper_env and dnca_total == PAPER_MAX_CAPITAL_KRW:
-                        reset_reason = "paper_reset_detected"
-                        logger.warning(
-                            "[PB1][RESET][DETECTED] reason=paper_reset dnca_tot_amt=%s",
-                            dnca_total,
-                        )
-                    elif not should_purge:
-                        logger.info(
-                            "[STATE][PURGE][SKIP] reason=%s kis_holdings_count=%s ledger_positions_count=%s last_seen_positions_count=%s last_balance_had_positions=%s",
-                            purge_reason,
-                            len(kis_holdings),
-                            ledger_positions_count,
-                            last_seen_positions_count,
-                            last_balance_had_positions,
-                        )
-                    elif dnca_total is None or dnca_total <= BOT_STATE_RESET_CASH_MAX_KRW:
-                        reset_reason = "empty_kis_holdings_detected"
-                    else:
-                        logger.info(
-                            "[STATE][PURGE][SKIP] reason=dnca_total_above_threshold kis_holdings_count=%s ledger_positions_count=%s last_seen_positions_count=%s last_balance_had_positions=%s dnca_total=%s",
-                            len(kis_holdings),
-                            ledger_positions_count,
-                            last_seen_positions_count,
-                            last_balance_had_positions,
-                            dnca_total,
-                        )
-            elif BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS and balance_state != BALANCE_STATE_OK:
-                logger.warning(
-                    "[STATE][PURGE][SKIP] reason=balance_not_ok state=%s",
-                    balance_state,
-                )
-
-        if reset_reason:
-            if reset_reason == "paper_reset_detected":
-                if (kis_env or "").lower() == "practice" and PAPER_RESET_EVENT_ONLY_IN_PRACTICE:
-                    _write_account_reset_event(
-                        resolved_bot_state_dir,
-                        {
-                            "ts": now.isoformat(),
-                            "env": kis_env or "practice",
-                            "strategy": "pb1_pullback_close",
-                            "reason": reset_reason,
-                            "action": "event_only",
-                            "dnca_total": dnca_total,
-                        },
-                    )
-                    logger.warning("[PB1][RESET] paper_reset_detected in practice -> event_only")
-                    reset_reason = None
-                elif not PAPER_RESET_AUTO_PURGE:
-                    _write_account_reset_event(
-                        resolved_bot_state_dir,
-                        {
-                            "ts": now.isoformat(),
-                            "env": kis_env or "practice",
-                            "strategy": "pb1_pullback_close",
-                            "reason": reset_reason,
-                            "action": "event_only",
-                            "dnca_total": dnca_total,
-                        },
-                    )
-                    logger.warning("[PB1][RESET] paper_reset_detected -> auto_purge disabled event_only")
-                    reset_reason = None
-        if reset_reason:
-            archive_dir = resolved_bot_state_dir / "archive" / f"reset_{now.strftime('%Y%m%d_%H%M%S')}"
-            purge_bot_state(resolved_bot_state_dir, archive_dir, reason=reset_reason)
-            run_migrations(engine)
-            meta_payload = {"account_fp": account_fp_now} if account_fp_now else {}
-            _write_runtime_meta(resolved_bot_state_dir, meta_payload)
-            record_purge_event(resolved_bot_state_dir, now_kst=now, reason=reset_reason)
-        elif account_fp_now:
-            runtime_meta = _load_runtime_meta(resolved_bot_state_dir)
-            if runtime_meta.get("account_fp") != account_fp_now:
-                _write_runtime_meta(resolved_bot_state_dir, {"account_fp": account_fp_now})
-
         run_record_id = runs_repo.start_run(
             env=kis_env or "practice",
             strategy="pb1_pullback_close",
@@ -1721,8 +1183,6 @@ def run_once(
             },
         )
         db_write_reasons.append("run_start")
-        reset_on_missing_positions = env_bool("PB1_RESET_ON_MISSING_POSITIONS", False)
-        force_safe_exit = env_bool("PB1_FORCE_SAFE_EXIT", False)
         reconcile_result: dict | None = None
         if kis:
             try:
@@ -1734,7 +1194,7 @@ def run_once(
                     strategy="pb1_pullback_close",
                     tick_ts=now,
                     balance_snapshot=balance_snapshot_raw,
-                    bot_state_dir=str(resolved_bot_state_dir),
+                    runtime_dir=str(runtime_root_dir),
                 )
                 db_write_reasons.append("reconcile")
                 if not reconcile_result.get("ok", True):
@@ -1750,39 +1210,11 @@ def run_once(
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
-        todays_orders = orders_repo.list_today_orders(kis_env or "practice")
-        todays_fills = fills_repo.list_today_fills(kis_env or "practice")
-        if balance_state == BALANCE_STATE_OK:
-            if _handle_missing_positions_reset(
-                balance_snapshot=balance_snapshot_raw,
-                env=kis_env or "practice",
-                strategy="pb1_pullback_close",
-                run_id=run_record_id,
-                engine=engine,
-                kis=kis,
-                orders_count=len(todays_orders),
-                fills_count=len(todays_fills),
-                positions_repo=positions_repo,
-                ledger_repo=ledger_repo,
-                bot_state_dir=resolved_bot_state_dir,
-                reset_on_missing_positions=reset_on_missing_positions,
-                force_safe_exit=force_safe_exit,
-                allow_stale_purge=(reconcile_result or {}).get("allow_purge"),
-                stale_guard_reason=(reconcile_result or {}).get("guard_reason"),
-            ):
-                if env_bool("PRACTICE_RESET_DAY", False):
-                    logger.warning("[PB1][RESET][ENTRY_BLOCKED] PRACTICE_RESET_DAY=1 -> entry_disabled")
-                runs_repo.finish_run(run_record_id, status="RESET_ABORT", notes="account_reset_or_position_missing")
-                db_write_reasons.append("reset_abort")
-                _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="reset_abort", now=now)
-                return [], True, {}, phase_for_log, "RESET_ABORT"
-        else:
-            logger.warning("[PB1][BALANCE][DEGRADED] state=%s -> skip reset/reconcile", balance_state)
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             db_write_reasons.append("balance_degraded")
-            _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="balance_degraded", now=now)
+            _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
             return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
 
         engine_runner = PB1Engine(
@@ -1814,7 +1246,7 @@ def run_once(
         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
         db_write_reasons.append("run_finish")
         _write_last_db_write(
-            runtime_store,
+            runtime_root_dir,
             run_id=str(run_record_id),
             reason=",".join(db_write_reasons),
             now=now,
@@ -1835,7 +1267,7 @@ def run_once(
         )
         if run_record_id:
             runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
-            _write_last_db_write(runtime_store, run_id=str(run_record_id), reason="failed", now=now)
+            _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="failed", now=now)
         raise
     finally:
         pass
@@ -1850,7 +1282,7 @@ def run_once(
 
 def _run_nontrading_smoke_if_needed(
     *,
-    runtime_store: RuntimeStore,
+    runtime_root_dir: Path,
     engine,
     now: datetime,
     strategy_mode: str,
@@ -1864,12 +1296,12 @@ def _run_nontrading_smoke_if_needed(
     if trading_day:
         return False
     as_of = now.date().isoformat()
-    smoke_flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of)
+    smoke_flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of)
     if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
         logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
         return False
     run_nontrading_smoke_once(
-        runtime_store=runtime_store,
+        runtime_root_dir=runtime_root_dir,
         engine=engine,
         now=now,
         env=(os.getenv("KIS_ENV") or "practice").lower(),
@@ -1880,7 +1312,7 @@ def _run_nontrading_smoke_if_needed(
         force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
     )
     write_nontrading_smoke_flag(
-        runtime_store,
+        runtime_root_dir,
         now=now,
         run_id=os.getenv("GITHUB_RUN_ID", "local"),
         sha=os.getenv("GITHUB_SHA", "unknown"),
@@ -1922,10 +1354,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     loop_started_ts = total_start_ts
     loop_deadline = None
     loop_deadline_ts = None
+    runtime_root_dir = runtime_root()
     try:
         run_migrations(engine)
         _write_change_flag(False, ["init"])
-        runtime_store = RuntimeStore(base_dir=runtime_root())
         trade_start_ts = time_mod.monotonic()
         loop_started_ts = trade_start_ts
         loop_deadline_ts = trade_start_ts + max_seconds if max_seconds > 0 else None
@@ -1944,11 +1376,9 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             loop_deadline.isoformat() if loop_deadline else "none",
             max_seconds,
         )
-        loop_window = detect_window(now_kst_value, preopen_start=PB1_PREOPEN_START, preopen_end=PB1_PREOPEN_END)
         ensure_universe_built_once(
-            runtime_store=runtime_store,
+            engine=engine,
             as_of=now_kst_value.date().isoformat(),
-            allow_missing=loop_window == "preopen",
         )
         strategy_mode = (
             getattr(args, "strategy_mode", None)
@@ -1962,7 +1392,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             logger.info("[DIAG][BALANCE] probe_once start")
             _diag_balance_probe_once_safe(
                 logger=logger,
-                runtime_store=runtime_store,
+                runtime_root_dir=runtime_root_dir,
                 kis_factory=kis_factory,
             )
         stop_requested = {"value": False}
@@ -1981,7 +1411,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 break
             now = _get_now_kst()
             if _run_nontrading_smoke_if_needed(
-                runtime_store=runtime_store,
+                runtime_root_dir=runtime_root_dir,
                 engine=engine,
                 now=now,
                 strategy_mode=strategy_mode,

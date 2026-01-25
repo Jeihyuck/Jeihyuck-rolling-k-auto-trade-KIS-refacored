@@ -1,2 +1,2 @@
 -- UUID defaults and conversion are now handled at the application layer.
--- This migration intentionally contains no DDL to keep SQLite/PG compatibility.
+-- This migration intentionally contains no DDL; schema changes are handled in later migrations.

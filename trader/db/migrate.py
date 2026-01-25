@@ -1,19 +1,14 @@
 import glob
-import hashlib
 import re
 import logging
 import os
-from pathlib import Path
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
 
-from trader.botstate_paths import runtime_root
 
 
 logger = logging.getLogger(__name__)
-MIGRATION_VERSION = "v1"
-
 
 def split_postgres_sql(sql: str) -> list[str]:
     statements: list[str] = []
@@ -152,46 +147,12 @@ def _strip_sql_comments(sql: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-def _schema_stamp_path() -> Path:
-    cache_root = Path(os.getenv("TRADER_CACHE_ROOT") or runtime_root() / "runtime")
-    return cache_root / "schema_version.txt"
-
-
-def _compute_migration_version(migrations_dir: str) -> str:
-    hasher = hashlib.sha256()
-    hasher.update(MIGRATION_VERSION.encode("utf-8"))
-    migration_files = sorted(Path(migrations_dir).glob("*.sql"))
-    for path in migration_files:
-        hasher.update(path.name.encode("utf-8"))
-        try:
-            hasher.update(path.read_bytes())
-        except FileNotFoundError:
-            continue
-    return hasher.hexdigest()
-
-
 def _should_skip_migrations(engine: Engine, migrations_dir: str) -> bool:
     mode = os.getenv("MIGRATE_MODE", "AUTO").upper()
     if mode == "OFF":
         logger.info("[DB][MIGRATE][SKIP] reason=disabled")
         return True
-    if mode != "AUTO":
-        return False
-    stamp_path = _schema_stamp_path()
-    if not stamp_path.exists():
-        return False
-    stamp_version = stamp_path.read_text(encoding="utf-8").strip()
-    current_version = _compute_migration_version(migrations_dir)
-    if stamp_version == current_version:
-        logger.info("[DB][MIGRATE][SKIP] reason=up_to_date")
-        return True
     return False
-
-
-def _write_schema_stamp(migrations_dir: str) -> None:
-    stamp_path = _schema_stamp_path()
-    stamp_path.parent.mkdir(parents=True, exist_ok=True)
-    stamp_path.write_text(_compute_migration_version(migrations_dir), encoding="utf-8")
 
 
 def _ensure_schema_migrations_table(conn: sa.Connection) -> None:
@@ -289,7 +250,6 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
                     snippet,
                 )
                 raise
-    _write_schema_stamp(migrations_dir)
     logger.info("[DB][MIGRATE][MIGRATE OK] count=%s", len(migration_files))
 
 

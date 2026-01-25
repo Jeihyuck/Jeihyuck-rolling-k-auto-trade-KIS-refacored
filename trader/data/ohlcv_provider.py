@@ -8,7 +8,7 @@ from typing import Iterable, List, Protocol
 
 import pandas as pd
 
-from trader.botstate_paths import get_ohlcv_cache_dir
+from trader.runtime_paths import get_ohlcv_cache_dir
 from trader.time_utils import now_kst
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv

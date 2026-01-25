@@ -9,9 +9,6 @@ def clear_env(monkeypatch):
     for k in [
         "PBCORE_DB_URL",
         "DATABASE_URL",
-        "TRADER_DB_URL",
-        "DB_URL",
-        "SQLALCHEMY_DATABASE_URL",
     ]:
         monkeypatch.delenv(k, raising=False)
 
@@ -25,7 +22,7 @@ def test_reject_non_postgres_scheme(monkeypatch):
     monkeypatch.setenv("PBCORE_DB_URL", "mysql://user:pass@localhost:3306/db")
     with pytest.raises(RuntimeError) as e:
         get_db_url()
-    assert "Postgres only" in str(e.value)
+    assert "postgres-only" in str(e.value)
 
 
 def test_missing_db_url(monkeypatch):

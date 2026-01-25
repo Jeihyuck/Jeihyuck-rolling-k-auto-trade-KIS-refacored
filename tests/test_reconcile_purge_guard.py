@@ -10,7 +10,7 @@ from trader.reconcile_db import evaluate_stale_db_guard
 def test_kis_holdings_empty_requires_consecutive_ticks(tmp_path):
     now = datetime.utcnow()
     allow, reason, guard = evaluate_stale_db_guard(
-        bot_state_dir=tmp_path,
+        runtime_dir=tmp_path,
         tick_ts=now,
         kis_holdings_empty=True,
         orders_count=0,
@@ -22,7 +22,7 @@ def test_kis_holdings_empty_requires_consecutive_ticks(tmp_path):
     assert guard["empty_streak"] == 1
 
     allow, reason, guard = evaluate_stale_db_guard(
-        bot_state_dir=tmp_path,
+        runtime_dir=tmp_path,
         tick_ts=now + timedelta(seconds=30),
         kis_holdings_empty=True,
         orders_count=0,
@@ -37,7 +37,7 @@ def test_kis_holdings_empty_requires_consecutive_ticks(tmp_path):
 def test_kis_error_blocks_purge(tmp_path):
     now = datetime.utcnow()
     allow, reason, guard = evaluate_stale_db_guard(
-        bot_state_dir=tmp_path,
+        runtime_dir=tmp_path,
         tick_ts=now,
         kis_holdings_empty=True,
         orders_count=0,

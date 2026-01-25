@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List
 import numpy as np
 import pandas as pd
 
-from trader.botstate_paths import close_entry_orders_path
+from trader.runtime_paths import close_entry_orders_path
 from trader.config import (
     CAP_CAP,
     LEDGER_BASE_DIR,

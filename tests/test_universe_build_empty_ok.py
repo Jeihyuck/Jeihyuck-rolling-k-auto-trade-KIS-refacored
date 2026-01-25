@@ -9,7 +9,6 @@ from trader.universe import build
 @pytest.fixture(autouse=True)
 def reset_env(tmp_path, monkeypatch):
     monkeypatch.setenv("PBCORE_DB_URL", "postgresql+psycopg://user:pass@localhost:5432/pbcore")
-    monkeypatch.setenv("ALLOW_UNIVERSE_DB_FAIL", "1")
     monkeypatch.setenv("UNIVERSE_VALIDATE_KIS", "0")
     yield
 

@@ -7,11 +7,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
+from trader.config import EMERGENCY_UNIVERSE_BUILD
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.db.repos import LedgerEventsRepo
 from trader.kis_wrapper import KisAPI
-from trader.runtime_store import RuntimeStore
+from trader.universe.build import build_universe
+from trader.db.repos import UniverseRepo
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +25,20 @@ def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> 
     return now.date().isoformat()
 
 
-def nontrading_smoke_flag_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
+def nontrading_smoke_flag_path(runtime_root_dir: Path, *, as_of: str | None = None) -> Path:
     suffix = _nontrading_smoke_suffix(as_of)
     return (
-        Path(runtime_store.base_dir)
+        runtime_root_dir
         / "runtime"
         / "diagnostics"
         / f"nontrading_smoke_once_{suffix}.flag"
     )
 
 
-def nontrading_smoke_result_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
+def nontrading_smoke_result_path(runtime_root_dir: Path, *, as_of: str | None = None) -> Path:
     suffix = _nontrading_smoke_suffix(as_of)
     return (
-        Path(runtime_store.base_dir)
+        runtime_root_dir
         / "runtime"
         / "diagnostics"
         / f"nontrading_smoke_result_{suffix}.json"
@@ -45,14 +46,14 @@ def nontrading_smoke_result_path(runtime_store: RuntimeStore, *, as_of: str | No
 
 
 def write_nontrading_smoke_flag(
-    runtime_store: RuntimeStore,
+    runtime_root_dir: Path,
     *,
     now: datetime,
     run_id: str,
     sha: str,
     as_of: str | None = None,
 ) -> Path:
-    flag = nontrading_smoke_flag_path(runtime_store, as_of=as_of or now.date().isoformat())
+    flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of or now.date().isoformat())
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(f"{now.isoformat()} run_id={run_id} sha={sha}\n", encoding="utf-8")
     return flag
@@ -77,7 +78,7 @@ def _select_probe_codes(members: list[dict], limit: int = 3) -> list[str]:
 
 def run_nontrading_smoke_once(
     *,
-    runtime_store: RuntimeStore,
+    runtime_root_dir: Path,
     engine,
     now: datetime,
     env: str,
@@ -104,24 +105,17 @@ def run_nontrading_smoke_once(
 
     try:
         _check_timeout("universe_load")
-        members, meta = runtime_store.load_today_universe(as_of)
-        if not members and (force_rebuild or EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
-            runtime_store.ensure_universe(
-                as_of=as_of,
-                env=env,
-                strategy=strategy,
-                force_rebuild=True,
-            )
-            members, meta = runtime_store.load_today_universe(as_of)
-        if not members:
-            members, meta = runtime_store.load_universe_for_trading(as_of)
+        repo = UniverseRepo(engine)
+        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+        if not members and (force_rebuild or (EMERGENCY_UNIVERSE_BUILD and os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG")):
+            build_universe(as_of_date=as_of, env=env, strategy=strategy)
+            members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
         member_count = len(members)
         result["steps"]["universe"] = {
             "members": member_count,
-            "today_path": meta.get("today_path"),
-            "selected_path": meta.get("selected_path"),
+            "source": "db",
         }
-        logger.info("[NONTRADING_SMOKE][UNIVERSE] members=%s", member_count)
+        logger.info("[NONTRADING_SMOKE][UNIVERSE][DB] members=%s", member_count)
         if member_count <= 0:
             raise RuntimeError("nontrading_smoke empty universe")
 
@@ -197,7 +191,7 @@ def run_nontrading_smoke_once(
         elapsed = time.monotonic() - start_ts
         result["elapsed_sec"] = round(elapsed, 3)
         try:
-            result_path = nontrading_smoke_result_path(runtime_store, as_of=as_of)
+            result_path = nontrading_smoke_result_path(runtime_root_dir, as_of=as_of)
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         except Exception:

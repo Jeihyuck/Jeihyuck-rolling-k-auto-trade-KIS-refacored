@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Iterable
 
-from trader.botstate_paths import botstate_path
+from trader.runtime_paths import runtime_path
 from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ def run_minervini_report(
     report_dir: str | Path | None = None,
 ) -> str | None:
     as_of = as_of or now_kst().date().isoformat()
-    report_root = Path(report_dir) if report_dir else botstate_path("runtime", "reports", "minervini", as_of)
+    report_root = Path(report_dir) if report_dir else runtime_path("runtime", "reports", "minervini", as_of)
     report_root.mkdir(parents=True, exist_ok=True)
     report_path = report_root / "minervini_report.json"
 

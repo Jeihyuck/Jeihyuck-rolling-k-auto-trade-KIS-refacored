@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import logging
-import os
 import time
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
@@ -25,12 +24,10 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
-from .migrate import run_migrations
 from trader.time_utils import now_kst
 from trader.db.json_safe import json_sanitize
 
 logger = logging.getLogger(__name__)
-ALLOW_UNIVERSE_DB_FAIL = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "1") not in {"0", "false", "FALSE"}
 
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
@@ -241,6 +238,28 @@ class UniverseRepo:
             return []
         return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
 
+    def get_universe_members(self, *, env: str, strategy: str, as_of_date: str) -> list[dict]:
+        strategy_key = self._strategy_key(env, strategy)
+        as_of_d = _as_date(as_of_date)
+        stmt = (
+            select(self._schema.universe_runs.c.run_id)
+            .where(
+                and_(
+                    self._schema.universe_runs.c.strategy == strategy_key,
+                    self._schema.universe_runs.c.as_of == as_of_d,
+                )
+            )
+            .order_by(self._schema.universe_runs.c.created_ts.desc())
+        )
+        with self.engine.begin() as conn:
+            run_id = conn.execute(stmt).scalar()
+        if not run_id:
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0", as_of_date)
+            return []
+        members = self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
+        logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
+        return members
+
     def store_universe_snapshot(
         self,
         *,
@@ -250,7 +269,7 @@ class UniverseRepo:
         provider: str,
         members: Iterable[dict],
         reason: str | None = None,
-    ) -> str | None:
+    ) -> str:
         members_list = list(members)
         as_of_d = _as_date(as_of_date)
         db_url = str(self.engine.url)
@@ -312,8 +331,6 @@ class UniverseRepo:
             return str(run_id)
         except Exception:
             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
-            if ALLOW_UNIVERSE_DB_FAIL:
-                return None
             raise
 
     def cleanup_old_runs(self, *, retain_days: int = 30) -> None:

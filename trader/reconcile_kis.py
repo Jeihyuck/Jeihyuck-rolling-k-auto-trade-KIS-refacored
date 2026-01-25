@@ -6,7 +6,7 @@ from typing import Any
 from pathlib import Path
 
 from trader.config import MARKET_MAP
-from trader.botstate_paths import runtime_root
+from trader.runtime_paths import runtime_root
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.kis_wrapper import KisAPI, KisTemporaryError
@@ -186,7 +186,7 @@ def reconcile_kis(
     strategy: str,
     tick_ts: datetime,
     balance_snapshot: dict | None = None,
-    bot_state_dir: str | None = None,
+    runtime_dir: str | None = None,
 ) -> dict[str, object]:
     holdings_error = None
     holdings_rows: list[dict] = []
@@ -224,9 +224,9 @@ def reconcile_kis(
     guard_result = None
     guard_reason = None
     allow_purge = None
-    runtime_dir = Path(bot_state_dir) if bot_state_dir else runtime_root()
+    runtime_dir = Path(runtime_dir) if runtime_dir else runtime_root()
     allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
-        bot_state_dir=runtime_dir,
+        runtime_dir=runtime_dir,
         tick_ts=tick_ts,
         kis_holdings_empty=len(holdings_rows) == 0,
         orders_count=orders_count,

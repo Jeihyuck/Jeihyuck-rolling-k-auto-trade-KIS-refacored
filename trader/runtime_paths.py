@@ -27,10 +27,6 @@ def runtime_root() -> Path:
     return (Path(base) / "trader_runtime").expanduser().resolve()
 
 
-def get_botstate_root() -> Path:
-    return runtime_root()
-
-
 def ensure_not_repo_tracked_path(path: Path) -> None:
     repo_root = _repo_root()
     seeds_dir = (repo_root / "trader" / "universe" / "seeds").resolve()
@@ -39,12 +35,12 @@ def ensure_not_repo_tracked_path(path: Path) -> None:
         raise RuntimeError(f"Refusing to write to repo-tracked seed path: {target}")
 
 
-def botstate_path(*parts: str) -> Path:
-    root = get_botstate_root()
+def runtime_path(*parts: str) -> Path:
+    root = runtime_root()
     path = root.joinpath(*parts)
     resolved = path.expanduser().resolve()
     if not _is_relative_to(resolved, root):
-        raise RuntimeError(f"Botstate path must stay under {root}: {resolved}")
+        raise RuntimeError(f"Runtime path must stay under {root}: {resolved}")
     ensure_not_repo_tracked_path(resolved)
     return path
 
@@ -54,7 +50,7 @@ def get_cache_root() -> Path:
     if env_root:
         root = Path(env_root).expanduser().resolve()
     else:
-        root = get_botstate_root() / "runtime"
+        root = runtime_root() / "runtime"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -67,6 +63,6 @@ def get_ohlcv_cache_dir() -> Path:
 
 def close_entry_orders_path(order_date: str) -> Path:
     """order_date: 'YYYY-MM-DD'"""
-    path = botstate_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
+    path = runtime_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

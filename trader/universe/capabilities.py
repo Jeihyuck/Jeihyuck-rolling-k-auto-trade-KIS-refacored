@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 ALLOWED_PROVIDER_CHAIN = {
-    "practice": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "lkg", "seed_static"],
-    "real": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top", "lkg", "seed_static"],
+    "practice": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "seed_static"],
+    "real": ["fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top", "seed_static"],
 }
 
 

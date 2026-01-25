@@ -23,10 +23,8 @@ from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
 from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
-from trader.universe.providers.lkg_provider import LKGProvider
 from trader.universe.validation import validate_listed_and_tradeable
-from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, runtime_root
-from trader.runtime_store import RuntimeStore
+from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
 
 from datetime import date
 
@@ -54,7 +52,6 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
         "fdr_kospi100_kosdaq100",
         "fdr_marketcap_top",
         "seed_static",
-        "lkg",
     ]
     ordered = [name for name in preferred if name in chain]
     tail = [name for name in chain if name not in ordered]
@@ -62,12 +59,10 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_MAX_AGE_DAYS = int(os.getenv("UNIVERSE_FALLBACK_MAX_AGE_DAYS", "10"))
-
 
 def _resolve_seed_dir() -> Path:
-    default_dir = runtime_root() / "universe_lkg"
-    seed_dir = Path(os.getenv("UNIVERSE_LKG_DIR", str(default_dir)))
+    default_dir = runtime_root() / "diagnostics" / "universe_seed"
+    seed_dir = Path(os.getenv("UNIVERSE_SEED_DIR", str(default_dir)))
     seed_dir.mkdir(parents=True, exist_ok=True)
     return seed_dir
 
@@ -77,7 +72,6 @@ SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
 TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
 DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
-ENABLE_LKG = os.getenv("UNIVERSE_ENABLE_LKG", "1").lower() not in {"0", "false", "off"}
 TICKER_PATTERN = re.compile(r"^\d{6}$")
 
 
@@ -240,39 +234,8 @@ def _sanitize_members(
     )
 
 
-def _write_runtime_universe(
-    *,
-    runtime_store: RuntimeStore,
-    as_of_date: str,
-    env: str,
-    strategy: str,
-    payload: dict | None,
-    members: list[dict],
-    source: str,
-    params: dict,
-) -> Path:
-    data = {
-        "as_of": as_of_date,
-        "env": env,
-        "strategy": strategy,
-        "source": source,
-        "params": params,
-        "payload": payload or {},
-        "members": members,
-    }
-    path = runtime_store.save_json(Path("runtime") / "universe" / f"{as_of_date}.json", data)
-    logger.info(
-        "[UNIVERSE][RUNTIME][SAVE] path=%s members=%s source=%s exists_after=%s",
-        path,
-        len(members),
-        source,
-        int(path.exists()),
-    )
-    return path
-
-
 def _write_universe_sanitize_report(*, as_of_date: str, keep_codes: list[str], dropped: list[dict]) -> Path:
-    path = botstate_path("runtime", f"universe_sanitize_{as_of_date}.json")
+    path = runtime_path("runtime", f"universe_sanitize_{as_of_date}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"as_of": as_of_date, "kept": keep_codes, "dropped": dropped}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -282,7 +245,6 @@ def _write_universe_sanitize_report(*, as_of_date: str, keep_codes: list[str], d
 
 def _write_universe_drop_diagnostics(
     *,
-    runtime_store: RuntimeStore,
     as_of_date: str,
     source: str,
     invalid_format_codes: list[str],
@@ -294,7 +256,9 @@ def _write_universe_drop_diagnostics(
         "source": source,
         "as_of": as_of_date,
     }
-    path = runtime_store.save_json(Path("runtime") / "diagnostics" / f"universe_drop_{as_of_date}.json", payload)
+    path = runtime_path("runtime", "diagnostics", f"universe_drop_{as_of_date}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info(
         "[UNIVERSE][SANITIZE][DIAGNOSTICS] path=%s invalid_format=%s insufficient_history=%s",
         path,
@@ -367,38 +331,6 @@ def _load_static_seed() -> dict | None:
             "seed_path_kospi": str(SEED_PATH_KOSPI),
             "seed_path_kosdaq": str(SEED_PATH_KOSDAQ),
         },
-    }
-
-
-def _fallback_from_lkg(provider: LKGProvider, env: str, strategy: str, *, reference_as_of: str, max_age_days: int) -> dict | None:
-    payload = provider.load(env, strategy)
-    if not payload:
-        return None
-
-    cached_as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
-    ref_d = _parse_as_of_date(reference_as_of)
-    got_d = _parse_as_of_date(str(cached_as_of or ""))
-    if ref_d and got_d:
-        age = (ref_d - got_d).days
-        if age > int(max_age_days):
-            logger.info(
-                "[UNIVERSE][LKG][STALE] env=%s strategy=%s cached_as_of=%s reference_as_of=%s age_days=%s max_age_days=%s",
-                env,
-                strategy,
-                cached_as_of,
-                reference_as_of,
-                age,
-                max_age_days,
-            )
-            return None
-
-    payload_norm = _normalize_payload(payload.get("payload"))
-    members = payload.get("members") or _build_members_from_payload(payload_norm.get("selected_by_market"))
-    return {
-        "payload": payload_norm,
-        "members": members,
-        "source": "fallback:lkg",
-        "params": payload.get("params") or {"as_of": payload.get("as_of")},
     }
 
 
@@ -514,7 +446,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
-    runtime_store = RuntimeStore(base_dir=runtime_root())
 
     payload: dict | None = None
     members: list[dict] = []
@@ -555,19 +486,12 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             last_reason = f"kis_init_fail:{exc}"
             logger.warning("[UNIVERSE][KIS][INIT_FAIL] env=%s err=%s", env, exc)
 
-    lkg_provider = LKGProvider(enabled=ENABLE_LKG)
     today = now_kst().date()
     as_of_day = _parse_as_of_date(as_of_date) or today
     for provider_name in preferred_chain:
         result: dict | None = None
         reason: str | None = None
 
-        if as_of_day == today and provider_name in {"lkg"}:
-            logger.info(
-                "[UNIVERSE][PROVIDER][SKIP] provider=%s reason=today_requires_fresh",
-                provider_name,
-            )
-            continue
         if provider_name == "fdr_kospi100_kosdaq100":
             result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
         elif provider_name == "fdr_marketcap_top":
@@ -577,9 +501,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                 reason = last_reason or "kis_provider_unavailable"
             else:
                 result, reason = _build_from_kis(kis_provider, as_of_date)
-        elif provider_name == "lkg":
-            result = _fallback_from_lkg(lkg_provider, env=env, strategy=strategy, reference_as_of=as_of_date, max_age_days=FALLBACK_MAX_AGE_DAYS)
-            reason = "lkg_hit" if result else "lkg_miss"
         elif provider_name == "seed_static":
             result = _load_static_seed()
             reason = "seed_static" if result else "seed_missing"
@@ -594,12 +515,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             params.update(result.get("params") or {})
             last_reason = reason or provider_name
             logger.info("[UNIVERSE][PROVIDER][SUCCESS] env=%s provider=%s reason=%s members=%s", env, provider_name, last_reason, len(members))
-            if source in {"fdr_kospi100_kosdaq100", "fdr_marketcap_top", "kis_marketcap_top"}:
-                if ENABLE_LKG:
-                    try:
-                        lkg_provider.save(env, strategy, result)
-                    except Exception:
-                        logger.exception("[UNIVERSE][LKG][SAVE_FAIL] env=%s strategy=%s", env, strategy)
             break
 
         last_reason = reason or provider_name
@@ -673,29 +588,17 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         source,
         last_reason or "n/a",
     )
-    _write_runtime_universe(
-        runtime_store=runtime_store,
-        as_of_date=as_of_date,
-        env=env,
-        strategy=strategy,
-        payload=payload,
-        members=members,
-        source=source,
-        params=params,
-    )
     _write_universe_sanitize_report(
         as_of_date=as_of_date,
         keep_codes=sanitize_detail.get("kept") or [],
         dropped=sanitize_detail.get("dropped") or [],
     )
     _write_universe_drop_diagnostics(
-        runtime_store=runtime_store,
         as_of_date=as_of_date,
         source=source,
         invalid_format_codes=sanitize_detail.get("invalid_format_codes") or [],
         insufficient_history_codes=sanitize_detail.get("insufficient_history_codes") or [],
     )
-    runtime_store.touch_flag(Path("runtime") / f"universe_build_done_{as_of_date}.flag")
     return members
 
 
