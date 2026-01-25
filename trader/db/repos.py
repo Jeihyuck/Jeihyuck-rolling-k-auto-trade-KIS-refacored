@@ -759,7 +759,14 @@ class LedgerEventsRepo:
         for attempt in range(1, max_attempts + 1):
             try:
                 with self.engine.begin() as conn:
-                    logger.info("[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s event_type=%s", attempt, env, event_type)
+                    logger.info(
+                        "[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
+                        attempt,
+                        env,
+                        run_id,
+                        strategy,
+                        event_type,
+                    )
                     if run_id is not None and strategy:
                         ensure_run(
                             conn,
@@ -775,18 +782,48 @@ class LedgerEventsRepo:
                     return str(res.scalar())
             except Exception as exc:
                 last_exc = exc
-                if _is_in_failed_transaction_error(exc):
-                    logger.info(
-                        "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s event_type=%s",
-                        attempt,
-                        env,
-                        event_type,
-                    )
-                else:
+                if attempt == 1:
                     logger.exception(
-                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s event_type=%s err=%s sql=%s payload=%s",
+                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",
                         attempt,
                         env,
+                        run_id,
+                        strategy,
+                        event_type,
+                        stmt,
+                        payload,
+                    )
+                if _is_in_failed_transaction_error(exc):
+                    if attempt > 1:
+                        logger.warning(
+                            "[DB][LEDGER_EVENT][RETRY-IFT] attempt=%s err_type=%s err=%s",
+                            attempt,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        logger.info(
+                            "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
+                            attempt,
+                            env,
+                            run_id,
+                            strategy,
+                            event_type,
+                        )
+                    try:
+                        self.engine.dispose()
+                    except Exception as dispose_exc:
+                        logger.warning(
+                            "[DB][LEDGER_EVENT][DISPOSE-FAIL] err_type=%s err=%s",
+                            type(dispose_exc).__name__,
+                            dispose_exc,
+                        )
+                elif attempt > 1:
+                    logger.exception(
+                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s run_id=%s strategy=%s event_type=%s err=%s sql=%s payload=%s",
+                        attempt,
+                        env,
+                        run_id,
+                        strategy,
                         event_type,
                         exc,
                         stmt,
@@ -796,9 +833,17 @@ class LedgerEventsRepo:
                     time.sleep(base_backoff * (2 ** (attempt - 1)))
         if db_store_required and last_exc is not None:
             raise last_exc
+        if last_exc is not None:
+            logger.warning(
+                "[DB][LEDGER_EVENT][LAST_ERROR] err_type=%s err=%s",
+                type(last_exc).__name__,
+                last_exc,
+            )
         logger.warning(
-            "[DB][LEDGER_EVENT][SKIP] env=%s event_type=%s required=%s attempts=%s",
+            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s",
             env,
+            run_id,
+            strategy,
             event_type,
             int(db_store_required),
             max_attempts,

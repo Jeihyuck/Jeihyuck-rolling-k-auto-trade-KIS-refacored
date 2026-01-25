@@ -1,112 +1,147 @@
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index 0df62a2e68f7ba7208c0dce3e7e3c644ce3a74cf..320b0888c1475547384020dc3d29c0946259ad01 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -6,50 +6,51 @@
- # - 잔고/주문
- # - ✅ 예수금: output2.ord_psbl_cash 우선 사용 (fallback: nrcvb_buy_amt → dnca_tot_amt, 최후: 최근 캐시)
- # - ✅ SSL EOF/JSON Decode 등 일시 오류 내성 강화
- # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
- # - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
- # - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+diff --git a/trader/db/repos.py b/trader/db/repos.py
+index 89a7b06a4cfd535d1bb87c9a3b6f81dae941c443..c276f1d80f781a2977767023221b5c51c2bd02b7 100644
+--- a/trader/db/repos.py
++++ b/trader/db/repos.py
+@@ -737,90 +737,135 @@ class LedgerEventsRepo:
+         payload = {
+             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+             "env": env,
+             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+             "event_type": event_type,
+             "ts": ts,
+             "code": code,
+             "market": market,
+             "sid": sid,
+             "mode": mode,
+             "side": side,
+             "qty": qty,
+             "price": price,
+             "kis_odno": kis_odno,
+             "client_order_key": client_order_key,
+             "ok": ok,
+             "reasons": safe_reasons,
+             "stage": stage,
+             "payload_json": safe_payload_json,
+         }
+         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+         last_exc: Exception | None = None
+         for attempt in range(1, max_attempts + 1):
+             try:
+                 with self.engine.begin() as conn:
+-                    logger.info("[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s event_type=%s", attempt, env, event_type)
++                    logger.info(
++                        "[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
++                        attempt,
++                        env,
++                        run_id,
++                        strategy,
++                        event_type,
++                    )
+                     if run_id is not None and strategy:
+                         ensure_run(
+                             conn,
+                             self._schema,
+                             run_id=run_id,
+                             env=env,
+                             run_window=run_window,
+                             strategy=strategy,
+                             ts=ts,
+                             database_url=db_url,
+                         )
+                     res = conn.execute(stmt)
+                     return str(res.scalar())
+             except Exception as exc:
+                 last_exc = exc
+-                if _is_in_failed_transaction_error(exc):
+-                    logger.info(
+-                        "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s event_type=%s",
++                if attempt == 1:
++                    logger.exception(
++                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",
+                         attempt,
+                         env,
++                        run_id,
++                        strategy,
+                         event_type,
++                        stmt,
++                        payload,
+                     )
+-                else:
++                if _is_in_failed_transaction_error(exc):
++                    if attempt > 1:
++                        logger.warning(
++                            "[DB][LEDGER_EVENT][RETRY-IFT] attempt=%s err_type=%s err=%s",
++                            attempt,
++                            type(exc).__name__,
++                            exc,
++                        )
++                        logger.info(
++                            "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
++                            attempt,
++                            env,
++                            run_id,
++                            strategy,
++                            event_type,
++                        )
++                    try:
++                        self.engine.dispose()
++                    except Exception as dispose_exc:
++                        logger.warning(
++                            "[DB][LEDGER_EVENT][DISPOSE-FAIL] err_type=%s err=%s",
++                            type(dispose_exc).__name__,
++                            dispose_exc,
++                        )
++                elif attempt > 1:
+                     logger.exception(
+-                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s event_type=%s err=%s sql=%s payload=%s",
++                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s run_id=%s strategy=%s event_type=%s err=%s sql=%s payload=%s",
+                         attempt,
+                         env,
++                        run_id,
++                        strategy,
+                         event_type,
+                         exc,
+                         stmt,
+                         payload,
+                     )
+                 if attempt < max_attempts:
+                     time.sleep(base_backoff * (2 ** (attempt - 1)))
+         if db_store_required and last_exc is not None:
+             raise last_exc
++        if last_exc is not None:
++            logger.warning(
++                "[DB][LEDGER_EVENT][LAST_ERROR] err_type=%s err=%s",
++                type(last_exc).__name__,
++                last_exc,
++            )
+         logger.warning(
+-            "[DB][LEDGER_EVENT][SKIP] env=%s event_type=%s required=%s attempts=%s",
++            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s",
+             env,
++            run_id,
++            strategy,
+             event_type,
+             int(db_store_required),
+             max_attempts,
+         )
+         return None
  
- import os
- import json
- import time
- import random
- import logging
- import threading
- import copy
- from datetime import datetime, timedelta
- from pathlib import Path
- from typing import Dict, List, Optional, Tuple, Any
  
- import requests
- import pytz
- from requests.adapters import HTTPAdapter
- from urllib3.util.retry import Retry
- from urllib.parse import urlparse
+ class PositionsRepo:
+     def __init__(self, engine: Engine):
+         self.engine = engine
+         self._schema = schema_for_engine(engine)
  
- from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
-+from trader.runtime_paths import runtime_path
- from trader.time_utils import is_trading_day, is_trading_window, now_kst
- from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
- from trader.fills import append_fill
- 
- logger = logging.getLogger(__name__)
- _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
- _DAILY_CAP_WARNED = False
- _BALANCE_CACHE_INVALID_LOGGED = False
- _KIS_BREAKER_LOCK = threading.Lock()
- _KIS_BREAKER_STATE: dict | None = None
- _KIS_BREAKER_WINDOW_SEC = int(os.getenv("KIS_BREAKER_WINDOW_SEC", "300") or "300")
- _KIS_BREAKER_THRESHOLD = int(os.getenv("KIS_BREAKER_THRESHOLD", "10") or "10")
- _KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
- _KIS_TEMP_ERROR_CODES: set[str] = {
-     code.strip()
-     for code in (os.getenv("KIS_TEMP_ERROR_CODES") or "").split(",")
-     if code.strip()
- }
- 
- 
- class KisTemporaryError(Exception):
-     """429/5xx/timeout 등 재시도 가능한 오류."""
- 
- 
- class KisAuthError(Exception):
-@@ -60,50 +61,54 @@ class KisPermanentError(Exception):
-     """기타 4xx 등 영구 오류."""
- 
- 
- class KisBalanceUnavailable(KisTemporaryError):
-     """잔고 조회 실패."""
- 
- 
- class NetTemporaryError(KisTemporaryError):
-     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
- 
- 
- class DataEmptyError(Exception):
-     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
-     pass
- 
- 
- class DataShortError(Exception):
-     """정상응답이나 캔들이 need_n 미만."""
-     pass
- 
- 
- class OrderBlockedError(RuntimeError):
-     """주문 하드 가드에 의해 차단된 경우."""
- 
- 
-+def botstate_path(*parts: str) -> Path:
-+    return runtime_path(*parts)
-+
-+
- def _build_session():
-     s = requests.Session()
-     retry = Retry(
-         total=0, connect=0, read=0, status=0,
-         backoff_factor=0,
-         status_forcelist=[],
-         allowed_methods=["GET", "POST"],
-         raise_on_status=False,
-     )
-     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-     s.mount("https://", adapter)
-     s.mount("http://", adapter)
-     s.headers.update({"User-Agent": "RKMax/1.0", "Connection": "keep-alive"})
-     return s
- 
- 
- SESSION = _build_session()
- 
- 
- def _get_json(url, params=None, timeout=(3.0, 7.0)):
-     try:
-         r = SESSION.get(url, params=params, timeout=timeout)
-         r.raise_for_status()
-         return r.json()
-     except requests.exceptions.SSLError as e:
-
+     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
+         stmt = select(self._schema.positions).where(
+             and_(
+                 self._schema.positions.c.env == env,
+                 self._schema.positions.c.strategy == strategy,
+                 self._schema.positions.c.sid == sid,
+                 self._schema.positions.c.mode == mode,
+                 self._schema.positions.c.code == code,
+             )
+         )
+         with self.engine.begin() as conn:
+             row = conn.execute(stmt).mappings().first()
+             return dict(row) if row else None
