@@ -6,6 +6,7 @@ import os
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
 
+from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
