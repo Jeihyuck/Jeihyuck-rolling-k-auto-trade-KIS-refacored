@@ -50,6 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
+
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
@@ -96,7 +97,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Guard: postgres-only
+      - name: "Guard: postgres-only"
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -127,6 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
     timeout-minutes: 25
+
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
@@ -152,12 +154,10 @@ jobs:
       DIAG_REHEARSAL_KIS_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_REHEARSAL_KIS_CALLS || '1' }}
       NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
 
-      # PB1 runtime limits
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
 
-      # enforce DB-only behavior in code
       UNIVERSE_SOURCE: "DB_ONLY"
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
@@ -195,7 +195,7 @@ jobs:
           echo "TRADER_RUNTIME_DIR=${RUNNER_TEMP}/trader_runtime" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/trader_runtime/runtime/diagnostics"
 
-      - name: Guard: postgres-only
+      - name: "Guard: postgres-only"
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -228,7 +228,7 @@ jobs:
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
 
-      - name: Gate: disable live trading in DIAG
+      - name: "Gate: disable live trading in DIAG"
         run: |
           set -euo pipefail
           if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "DIAG" ]; then
@@ -261,6 +261,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
     timeout-minutes: 15
+
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
@@ -301,7 +302,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Guard: postgres-only
+      - name: "Guard: postgres-only"
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
