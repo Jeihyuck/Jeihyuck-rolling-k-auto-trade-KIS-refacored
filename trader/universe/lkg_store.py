@@ -4,10 +4,12 @@ import json
 import logging
 import os
 from datetime import datetime
+from hashlib import sha1
 from pathlib import Path
 from typing import Optional
 
 from trader.botstate_paths import runtime_root
+from trader.config import UNIVERSE_NAMESPACE_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +22,30 @@ _LKG_ROOT = Path(
 
 def lkg_path(env: str, strategy: str) -> Path:
     env_norm = (env or "practice").lower()
+    namespace = _resolve_namespace(env_norm)
     strategy_norm = strategy or "default"
-    return _LKG_ROOT / env_norm / strategy_norm / "latest.json"
+    return _LKG_ROOT / namespace / strategy_norm / "latest.json"
 
 
 def _history_path(env: str, strategy: str, as_of: str | None) -> Path:
     env_norm = (env or "practice").lower()
+    namespace = _resolve_namespace(env_norm)
     strategy_norm = strategy or "default"
     ts = as_of or datetime.utcnow().date().isoformat()
-    return _LKG_ROOT / env_norm / strategy_norm / "history" / f"{ts}.json"
+    return _LKG_ROOT / namespace / strategy_norm / "history" / f"{ts}.json"
+
+
+def _resolve_namespace(env_norm: str) -> str:
+    mode = (UNIVERSE_NAMESPACE_MODE or "ACCOUNT_ENV").upper()
+    if mode == "ACCOUNT_ENV":
+        cano = (os.getenv("CANO") or "").strip()
+        acnt = (os.getenv("ACNT_PRDT_CD") or "").strip()
+        raw = f"{env_norm}:{cano}:{acnt}"
+        digest = sha1(raw.encode("utf-8")).hexdigest()[:10]
+        return digest
+    if mode == "ENV":
+        return env_norm
+    return env_norm
 
 
 def load_lkg(env: str, strategy: str) -> Optional[dict]:

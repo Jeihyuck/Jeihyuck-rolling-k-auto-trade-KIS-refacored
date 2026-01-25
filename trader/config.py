@@ -107,6 +107,9 @@ CONFIG = {
     "NONTRADING_SMOKE_DB_STORE": "1",
     "NONTRADING_SMOKE_FORCE_REBUILD": "0",
     "NONTRADING_SMOKE_TIMEOUT_SEC": "180",
+    "EMERGENCY_UNIVERSE_BUILD": "0",
+    "FORCE_UNIVERSE_REBUILD": "0",
+    "UNIVERSE_NAMESPACE_MODE": "ACCOUNT_ENV",
     # === Strategy intent/exec defaults ===
     "ENABLED_STRATEGIES": "",
     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
@@ -473,6 +476,18 @@ logger.info(
     NONTRADING_SMOKE_DB_STORE,
     NONTRADING_SMOKE_FORCE_REBUILD,
     NONTRADING_SMOKE_TIMEOUT_SEC,
+)
+
+_emergency_universe_default = True if DIAG_ENABLED else _default_bool("EMERGENCY_UNIVERSE_BUILD", False)
+EMERGENCY_UNIVERSE_BUILD = env_bool("EMERGENCY_UNIVERSE_BUILD", default=_emergency_universe_default)
+FORCE_UNIVERSE_REBUILD = _cfg_bool("FORCE_UNIVERSE_REBUILD")
+UNIVERSE_NAMESPACE_MODE = (_cfg("UNIVERSE_NAMESPACE_MODE") or "ACCOUNT_ENV").strip().upper()
+
+logger.info(
+    "[CONFIG][UNIVERSE] emergency_build=%s force_rebuild=%s namespace_mode=%s",
+    EMERGENCY_UNIVERSE_BUILD,
+    FORCE_UNIVERSE_REBUILD,
+    UNIVERSE_NAMESPACE_MODE,
 )
 
 # 전략별 레짐 축소 우선순위

@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.db.repos import LedgerEventsRepo
 from trader.kis_wrapper import KisAPI
@@ -104,8 +105,13 @@ def run_nontrading_smoke_once(
     try:
         _check_timeout("universe_load")
         members, meta = runtime_store.load_today_universe(as_of)
-        if not members and force_rebuild:
-            runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
+        if not members and (force_rebuild or EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
+            runtime_store.ensure_universe(
+                as_of=as_of,
+                env=env,
+                strategy=strategy,
+                force_rebuild=True,
+            )
             members, meta = runtime_store.load_today_universe(as_of)
         if not members:
             members, meta = runtime_store.load_universe_for_trading(as_of)

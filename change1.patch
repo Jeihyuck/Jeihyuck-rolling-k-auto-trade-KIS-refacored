@@ -1,74 +1,914 @@
-diff --git a/trader/kis_wrapper.py b/trader/kis_wrapper.py
-index da9fbe86704af6c08e8f954744c0c120cd697b71..2d0140ef513632616dc98affbe65a95fc66b73d4 100644
---- a/trader/kis_wrapper.py
-+++ b/trader/kis_wrapper.py
-@@ -2008,52 +2008,67 @@ class KisAPI:
-                 else:
-                     reason = "normalize_failed"
-                 logger.warning("[BALANCE][CACHE][INVALID] reason=%s source=api", reason)
-             else:
-                 cache_value = _deepcopy_json(normalized)
-                 self._balance_cache = cache_value
-                 self._balance_cache_at = now_kst()
-                 snap = normalized
-         except KisBalanceUnavailable as e:
-             logger.error("[GET_BALANCE_FAIL] %s", e)
-             raise
-         except KisTemporaryError as e:
-             logger.error("[GET_BALANCE_FAIL] %s", e)
-             raise KisBalanceUnavailable(str(e)) from e
-         except Exception as e:
-             logger.error("[GET_BALANCE_FAIL] %s", e)
-             raise KisBalanceUnavailable(str(e)) from e
-         snap_copy = _deepcopy_json(snap)
-         if return_source and return_raw:
-             return snap_copy, source, _deepcopy_json(raw_snapshot or snap_copy)
-         if return_source:
-             return snap_copy, source
-         return snap_copy
+diff --git a/tests/test_universe_ensure_build.py b/tests/test_universe_ensure_build.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23deee20d85d855dcc5fc2c90c0fc30d8d149f0b
+--- /dev/null
++++ b/tests/test_universe_ensure_build.py
+@@ -0,0 +1,88 @@
++import importlib
++import json
++import sys
++from hashlib import sha1
++from pathlib import Path
++
++sys.path.append(str(Path(__file__).resolve().parents[1]))
++
++
++def _reload_modules():
++    import trader.runtime_store as runtime_store
++    import trader.universe.build as universe_build
++    import trader.universe.lkg_store as lkg_store
++
++    importlib.reload(lkg_store)
++    importlib.reload(runtime_store)
++    importlib.reload(universe_build)
++    return runtime_store, universe_build, lkg_store
++
++
++def test_ensure_universe_builds_and_saves(tmp_path, monkeypatch):
++    runtime_root = tmp_path / "runtime"
++    monkeypatch.setenv("TRADER_RUNTIME_DIR", str(runtime_root))
++    monkeypatch.setenv("KIS_ENV", "practice")
++    monkeypatch.setenv("CANO", "12345678")
++    monkeypatch.setenv("ACNT_PRDT_CD", "01")
++
++    runtime_store, universe_build, lkg_store = _reload_modules()
++    monkeypatch.setattr(runtime_store, "EMERGENCY_UNIVERSE_BUILD", True)
++    monkeypatch.setattr(runtime_store, "FORCE_UNIVERSE_REBUILD", False)
++    monkeypatch.setattr(lkg_store, "UNIVERSE_NAMESPACE_MODE", "ACCOUNT_ENV")
++
++    members = [{"code": "000001"}]
++    monkeypatch.setattr(universe_build, "build_universe", lambda **_kwargs: members)
++
++    store = runtime_store.RuntimeStore(runtime_root)
++    meta = store.ensure_universe(as_of="2025-01-02", env="practice", strategy="best_k_meta")
++
++    today_path = runtime_root / "runtime" / "universe" / "2025-01-02.json"
++    assert meta.get("ok") is True
++    assert today_path.exists()
++    payload = json.loads(today_path.read_text(encoding="utf-8"))
++    assert payload["members"] == members
++
++    lkg_path = lkg_store.lkg_path("practice", "best_k_meta")
++    assert lkg_path.exists()
++    lkg_payload = json.loads(lkg_path.read_text(encoding="utf-8"))
++    assert lkg_payload["members"] == members
++
++
++def test_ensure_universe_empty_members_keeps_missing(tmp_path, monkeypatch):
++    runtime_root = tmp_path / "runtime"
++    monkeypatch.setenv("TRADER_RUNTIME_DIR", str(runtime_root))
++    monkeypatch.setenv("KIS_ENV", "practice")
++    monkeypatch.setenv("CANO", "12345678")
++    monkeypatch.setenv("ACNT_PRDT_CD", "01")
++
++    runtime_store, universe_build, lkg_store = _reload_modules()
++    monkeypatch.setattr(runtime_store, "EMERGENCY_UNIVERSE_BUILD", True)
++    monkeypatch.setattr(runtime_store, "FORCE_UNIVERSE_REBUILD", False)
++    monkeypatch.setattr(lkg_store, "UNIVERSE_NAMESPACE_MODE", "ACCOUNT_ENV")
++
++    monkeypatch.setattr(universe_build, "build_universe", lambda **_kwargs: [])
++
++    store = runtime_store.RuntimeStore(runtime_root)
++    meta = store.ensure_universe(as_of="2025-01-03", env="practice", strategy="best_k_meta")
++
++    today_path = runtime_root / "runtime" / "universe" / "2025-01-03.json"
++    assert meta.get("ok") is False
++    assert not today_path.exists()
++
++
++def test_universe_namespace_is_stable(monkeypatch):
++    monkeypatch.setenv("TRADER_RUNTIME_DIR", "/tmp/runtime")
++    monkeypatch.setenv("KIS_ENV", "practice")
++    monkeypatch.setenv("CANO", "12345678")
++    monkeypatch.setenv("ACNT_PRDT_CD", "01")
++
++    _, _, lkg_store = _reload_modules()
++    monkeypatch.setattr(lkg_store, "UNIVERSE_NAMESPACE_MODE", "ACCOUNT_ENV")
++
++    path_first = lkg_store.lkg_path("practice", "best_k_meta")
++    path_second = lkg_store.lkg_path("practice", "best_k_meta")
++
++    raw = "practice:12345678:01"
++    expected = sha1(raw.encode("utf-8")).hexdigest()[:10]
++    assert expected in str(path_first)
++    assert path_first == path_second
+diff --git a/trader/config.py b/trader/config.py
+index 3493e3deb565e404dc519f1310a80ad7406d4a4b..ca99dc912899eb12dc3017b75a9ce2532b74a2d9 100644
+--- a/trader/config.py
++++ b/trader/config.py
+@@ -85,50 +85,53 @@ CONFIG = {
+     # Subject flow gate 기본값
+     "MIN_SMART_MONEY_RATIO_KOSPI": "0.02",
+     "MIN_SMART_MONEY_RATIO_KOSDAQ": "0.03",
+     "SUBJECT_FLOW_TIMEOUT_SEC": "1.2",
+     "SUBJECT_FLOW_RETRY": "1",
+     "SUBJECT_FLOW_CACHE_TTL_SEC": "60",
+     "SUBJECT_FLOW_FAIL_POLICY": "CACHE",
+     "SUBJECT_FLOW_EMPTY_POLICY": "TREAT_AS_FAIL",
+     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
+     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
+     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+     "EMERGENCY_GLOBAL_SELL": "false",
+     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
+     # Diagnostics
+     "DIAGNOSTIC_MODE": "false",
+     "DIAGNOSTIC_ONLY": "false",
+     "DIAGNOSTIC_FORCE_RUN": "false",
+     "DIAGNOSTIC_DUMP_PATH": "",
+     "DIAGNOSTIC_TARGET_MARKETS": "",
+     "DIAGNOSTIC_MAX_SYMBOLS": "200",
+     "FORCE_NONTRADING_UNIVERSE_SMOKE": "0",
+     "NONTRADING_SMOKE_FORCE": "0",
+     "NONTRADING_SMOKE_DB_STORE": "1",
+     "NONTRADING_SMOKE_FORCE_REBUILD": "0",
+     "NONTRADING_SMOKE_TIMEOUT_SEC": "180",
++    "EMERGENCY_UNIVERSE_BUILD": "0",
++    "FORCE_UNIVERSE_REBUILD": "0",
++    "UNIVERSE_NAMESPACE_MODE": "ACCOUNT_ENV",
+     # === Strategy intent/exec defaults ===
+     "ENABLED_STRATEGIES": "",
+     "STRATEGY_MODE": "INTENT_ONLY",  # INTENT_ONLY | LIVE
+     "STRATEGY_DRY_RUN": "true",
+     "STRATEGY_INTENTS_PATH": "runtime/strategy_intents.jsonl",
+     "STRATEGY_INTENTS_STATE_PATH": "runtime/strategy_intents_state.json",
+     "STRATEGY_MAX_OPEN_INTENTS": "20",
+     "STRATEGY_MAX_POSITION_PCT": "0.10",
+     "STRATEGY_ALLOW_SELL_ONLY": "false",
+     "STRATEGY_WEIGHTS": "",
+     "DISABLE_KOSDAQ_LOOP": "false",
+     "DISABLE_KOSPI_ENGINE": "false",
+     "ACTIVE_STRATEGIES": "1",  # CSV of strategy IDs eligible for managed exits/entries
+     "ALLOW_ADOPT_UNMANAGED": "false",
+     "STATE_PATH": "runtime/state.json",
+     # PB1 close-pullback defaults
+     "ENABLE_BREAKOUT": "false",
+     "LEDGER_LOOKBACK_DAYS": "120",
+     "LEDGER_BASE_DIR": "trader_ledger",
+     "BOT_STATE_RESET": "0",
+     "BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH": "1",
+     "BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS": "1",
+     "BOT_STATE_RESET_CASH_MAX_KRW": "15000000",
+     "PAPER_RESET_AUTO_PURGE": "0",
+     "PAPER_RESET_EVENT_ONLY_IN_PRACTICE": "1",
+@@ -453,50 +456,62 @@ if DIAGNOSTIC_MODE:
+     STRATEGY_ALLOW_SELL_ONLY = True
  
-     # --- 호환 셔임(기존 trader.py 호출 대응) ---
--    def get_balance(self) -> Dict[str, object]:
--        return self.get_balance_cached()
-+    def get_balance(self, force: bool = False, **kwargs) -> Dict[str, object]:
-+        """
-+        force=True: 캐시 무시하고 강제 조회.
-+        과거/미래 호출부 호환을 위해 **kwargs 허용(알 수 없는 인자 무시).
-+        """
-+        force = bool(
-+            force
-+            or kwargs.get("force_refresh", False)
-+            or kwargs.get("bypass_cache", False)
-+        )
-+        return_source = bool(kwargs.get("return_source", False))
-+        return_raw = bool(kwargs.get("return_raw", False))
-+        return self.get_balance_cached(
-+            force=force,
-+            return_source=return_source,
-+            return_raw=return_raw,
-+        )
+ logger.info(
+     "[DIAG][CONFIG] mode=%s only=%s force_run=%s dump_dir=%s enabled=%s",
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     DIAGNOSTIC_FORCE_RUN,
+     str(DIAGNOSTIC_DUMP_DIR),
+     DIAG_ENABLED,
+ )
  
-     def get_balance_all(self) -> Dict[str, object]:
-         """trader.py의 _fetch_balances에서 우선 호출되는 호환용 메서드."""
-         return self.get_balance_cached()
+ FORCE_NONTRADING_UNIVERSE_SMOKE = _cfg_bool("FORCE_NONTRADING_UNIVERSE_SMOKE")
+ NONTRADING_SMOKE_FORCE = _cfg_bool("NONTRADING_SMOKE_FORCE") or FORCE_NONTRADING_UNIVERSE_SMOKE
+ NONTRADING_SMOKE_DB_STORE = _cfg_bool("NONTRADING_SMOKE_DB_STORE")
+ NONTRADING_SMOKE_FORCE_REBUILD = _cfg_bool("NONTRADING_SMOKE_FORCE_REBUILD")
+ NONTRADING_SMOKE_TIMEOUT_SEC = int(_cfg("NONTRADING_SMOKE_TIMEOUT_SEC") or "180")
  
-     def get_balance_snapshot_safe(self) -> dict:
-         """
-         잔고조회 결과에서 '총액/주문가능/예수금'을 최대한 안전하게 추출한다.
-         실패해도 예외를 최소화하고, 원인 확인을 위한 raw_keys를 남긴다.
-         """
-         raw = self.get_balance_cached(force=True)
-         snap = {
-             "total_asset_krw": None,
-             "total_eval_krw": None,
-             "cash_total_krw": None,
-             "orderable_cash_krw": None,
-             "deposit_like_krw": None,
-             "raw_keys": [],
+ logger.info(
+     "[CONFIG][NONTRADING_SMOKE] force=%s db_store=%s force_rebuild=%s timeout_sec=%s",
+     NONTRADING_SMOKE_FORCE,
+     NONTRADING_SMOKE_DB_STORE,
+     NONTRADING_SMOKE_FORCE_REBUILD,
+     NONTRADING_SMOKE_TIMEOUT_SEC,
+ )
+ 
++_emergency_universe_default = True if DIAG_ENABLED else _default_bool("EMERGENCY_UNIVERSE_BUILD", False)
++EMERGENCY_UNIVERSE_BUILD = env_bool("EMERGENCY_UNIVERSE_BUILD", default=_emergency_universe_default)
++FORCE_UNIVERSE_REBUILD = _cfg_bool("FORCE_UNIVERSE_REBUILD")
++UNIVERSE_NAMESPACE_MODE = (_cfg("UNIVERSE_NAMESPACE_MODE") or "ACCOUNT_ENV").strip().upper()
++
++logger.info(
++    "[CONFIG][UNIVERSE] emergency_build=%s force_rebuild=%s namespace_mode=%s",
++    EMERGENCY_UNIVERSE_BUILD,
++    FORCE_UNIVERSE_REBUILD,
++    UNIVERSE_NAMESPACE_MODE,
++)
++
+ # 전략별 레짐 축소 우선순위
+ def _parse_strategy_priority(raw: str) -> list[int]:
+     priorities: list[int] = []
+     for item in raw.split(","):
+         item = item.strip()
+         if not item:
+             continue
+         try:
+             value = int(item)
+         except ValueError:
+             continue
+         if 1 <= value <= 5 and value not in priorities:
+             priorities.append(value)
+     return priorities or [5, 4, 3, 2, 1]
+ 
+ 
+ STRATEGY_REDUCTION_PRIORITY = _parse_strategy_priority(
+     _cfg("STRATEGY_REDUCTION_PRIORITY")
+ )
+ 
+ 
+ def _parse_active_strategies(raw: str) -> set[int]:
+     strategies: set[int] = set()
+     for item in (raw or "").split(","):
+         item = item.strip()
+diff --git a/trader/diagnostics/nontrading_smoke.py b/trader/diagnostics/nontrading_smoke.py
+index a58a8ecbd5a87c78699f66c2e5db895af9631e2e..645dd692aa9da19c7ff5045a35f3696ae15e0ddc 100644
+--- a/trader/diagnostics/nontrading_smoke.py
++++ b/trader/diagnostics/nontrading_smoke.py
+@@ -1,34 +1,35 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ import time
+ from datetime import datetime
+ from pathlib import Path
+ 
++from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.db.repos import LedgerEventsRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.runtime_store import RuntimeStore
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> str:
+     if as_of:
+         return as_of
+     if now is None:
+         now = datetime.now()
+     return now.date().isoformat()
+ 
+ 
+ def nontrading_smoke_flag_path(runtime_store: RuntimeStore, *, as_of: str | None = None) -> Path:
+     suffix = _nontrading_smoke_suffix(as_of)
+     return (
+         Path(runtime_store.base_dir)
+         / "runtime"
+         / "diagnostics"
+         / f"nontrading_smoke_once_{suffix}.flag"
+     )
+ 
+@@ -82,52 +83,57 @@ def run_nontrading_smoke_once(
+     env: str,
+     strategy: str,
+     as_of: str,
+     timeout_sec: int,
+     db_store: bool,
+     force_rebuild: bool,
+ ) -> dict:
+     start_ts = time.monotonic()
+     result: dict = {"ok": False, "steps": {}}
+     logger.info(
+         "[NONTRADING_SMOKE][START] as_of=%s timeout_sec=%s db_store=%s force_rebuild=%s",
+         as_of,
+         timeout_sec,
+         int(db_store),
+         int(force_rebuild),
+     )
+ 
+     def _check_timeout(stage: str) -> None:
+         elapsed = time.monotonic() - start_ts
+         if elapsed > timeout_sec:
+             raise TimeoutError(f"nontrading_smoke timeout stage={stage} elapsed={elapsed:.1f}s")
+ 
+     try:
+         _check_timeout("universe_load")
+         members, meta = runtime_store.load_today_universe(as_of)
+-        if not members and force_rebuild:
+-            runtime_store.ensure_universe(as_of=as_of, env=env, strategy=strategy)
++        if not members and (force_rebuild or EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
++            runtime_store.ensure_universe(
++                as_of=as_of,
++                env=env,
++                strategy=strategy,
++                force_rebuild=True,
++            )
+             members, meta = runtime_store.load_today_universe(as_of)
+         if not members:
+             members, meta = runtime_store.load_universe_for_trading(as_of)
+         member_count = len(members)
+         result["steps"]["universe"] = {
+             "members": member_count,
+             "today_path": meta.get("today_path"),
+             "selected_path": meta.get("selected_path"),
          }
+         logger.info("[NONTRADING_SMOKE][UNIVERSE] members=%s", member_count)
+         if member_count <= 0:
+             raise RuntimeError("nontrading_smoke empty universe")
  
-         if not isinstance(raw, dict):
-             return snap
+         _check_timeout("probe_prepare")
+         try:
+             kis = KisAPI(env=env)
+         except Exception as exc:
+             logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
+             kis = None
+         providers = [KISOHLCVProvider(kis)] if kis else []
+         providers.append(KRXOHLCVProvider())
+         chain = ChainOHLCVProvider(providers, env=env)
  
-         snap["raw_keys"] = sorted(list(raw.keys()))
-         summary = raw.get("output2")
+         codes = _select_probe_codes(members, limit=3)
+         if not codes:
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index f5ac1e50564faaaa205dbb5d27a8ae7e139c93cd..090d49ca561c2fb2d36b47bad9d93ecee3b2e036 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -14,50 +14,52 @@ from pathlib import Path
+ from zoneinfo import ZoneInfo
+ 
+ from trader.config import (
+     AFTERNOON_WINDOW_END,
+     AFTERNOON_WINDOW_START,
+     BOT_STATE_RESET,
+     BOT_STATE_RESET_CASH_MAX_KRW,
+     BOT_STATE_RESET_ON_ACCOUNT_FP_MISMATCH,
+     BOT_STATE_RESET_ON_EMPTY_KIS_HOLDINGS,
+     CLOSE_AUCTION_END,
+     CLOSE_AUCTION_START,
+     DIAGNOSTIC_MODE,
+     DIAGNOSTIC_ONLY,
+     LEDGER_BASE_DIR,
+     LEDGER_LOOKBACK_DAYS,
+     MARKET_CLOSE_HHMM,
+     MARKET_OPEN_HHMM,
+     MORNING_EXIT_END,
+     MORNING_EXIT_START,
+     MORNING_WINDOW_END,
+     MORNING_WINDOW_START,
+     NONTRADING_SMOKE_DB_STORE,
+     NONTRADING_SMOKE_FORCE,
+     NONTRADING_SMOKE_FORCE_REBUILD,
+     NONTRADING_SMOKE_TIMEOUT_SEC,
++    EMERGENCY_UNIVERSE_BUILD,
++    FORCE_UNIVERSE_REBUILD,
+     PB1_ALLOW_PREOPEN_ENTRY,
+     PB1_PREOPEN_END,
+     PB1_PREOPEN_MAX_NEW_POSITIONS,
+     PB1_PREOPEN_REQUIRE_BALANCE,
+     PB1_PREOPEN_START,
+     PB1_ENTRY_ENABLED,
+     PB1_ENTRY_WINDOW_END,
+     PB1_EXIT_WINDOW_END,
+     PB1_MORNING_WINDOW_END,
+     PB1_REQUIRE_BALANCE_FOR_ENTRY,
+     PB1_FORCE_ENTRY_ON_PUSH,
+     PB1_MAX_WAIT_FOR_WINDOW_MIN,
+     PB1_WAIT_FOR_WINDOW,
+     PAPER_MAX_CAPITAL_KRW,
+     PAPER_RESET_AUTO_PURGE,
+     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
+     resolve_strategy_mode,
+ )
+ from trader.botstate_paths import botstate_path, ensure_not_repo_tracked_path, runtime_root
+ from trader.db.engine import make_engine
+ from trader.db.health import assert_db_ready
+ from trader.db.locks import acquire_advisory_lock, release_advisory_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import (
+     FillsRepo,
+@@ -294,90 +296,68 @@ def ensure_universe_built_once(
+         raise ValueError("runtime_store is required for ensure_universe_built_once")
+ 
+     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
+     if env is not None:
+         env = env.strip()
+     strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
+     as_of = as_of or _get_now_kst().date().isoformat()
+ 
+     assert env, "env is required"
+     assert strategy, "strategy is required"
+     assert as_of, "as_of is required"
+ 
+     log.info(
+         "[UNIVERSE][ENSURE] runtime_store=%s env=%s strategy=%s as_of=%s force=%s",
+         type(runtime_store).__name__,
+         env,
+         strategy,
+         as_of,
+         force,
+     )
+ 
+     ok, meta = runtime_store.universe_check(as_of)
+     flag = universe_build_flag(as_of)
+ 
+     if not force:
+-        if not ok and not allow_missing:
++        if not ok and not allow_missing and not (EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
+             return
+-
+         if meta.get("have_today"):
+             return
+-
+         if flag.exists():
+             return
+ 
+     reason = "force" if force else "auto_missing_today"
+     flag.parent.mkdir(parents=True, exist_ok=True)
+     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
+-
+-    cmd = [
+-        "python",
+-        "-m",
+-        "trader.universe.build",
+-        "--env",
+-        env,
+-        "--strategy",
+-        strategy,
+-        "--date",
+-        as_of,
+-    ]
+-    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
+-    runtime_dir = Path(runtime_store.base_dir).resolve()
+-    env_vars = os.environ.copy()
+-    env_vars["TRADER_RUNTIME_DIR"] = str(runtime_dir)
+-    subprocess.run(cmd, check=False, cwd=str(runtime_dir.parent), env=env_vars)
+-    _, post_meta = runtime_store.load_today_universe(as_of)
+-    if post_meta.get("have_today"):
+-        log.info(
+-            "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
+-            post_meta.get("today_path"),
+-        )
+-    else:
+-        log.warning(
+-            "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
+-            post_meta.get("today_path"),
+-        )
++    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s", as_of, reason)
++    runtime_store.ensure_universe(
++        as_of=as_of,
++        env=env,
++        strategy=strategy,
++        force_rebuild=force or FORCE_UNIVERSE_REBUILD,
++        emergency_build=EMERGENCY_UNIVERSE_BUILD,
++    )
+ 
+ 
+ def run_nontrading_universe_smoke(
+     *,
+     runtime_store: RuntimeStore,
+     engine,
+     now: datetime,
+     env: str,
+     strategy: str,
+     force_rebuild: bool,
+     db_store: bool,
+     timeout_sec: int,
+ ) -> bool:
+     as_of = now.date().isoformat()
+     done_flag = nontrading_universe_smoke_flag(as_of)
+     if done_flag.exists() and not force_rebuild:
+         logger.info(
+             "[SMOKE][NONTRADING][SKIP] as_of=%s reason=already_done flag=%s",
+             as_of,
+             done_flag,
+         )
+         return False
+ 
+     if force_rebuild and done_flag.exists():
+         try:
+diff --git a/trader/runtime_store.py b/trader/runtime_store.py
+index 2f3cbe035d26d1410203fc4182b7843360bbd588..a638885c056633a145c31758ded31c3bde12ad9e 100644
+--- a/trader/runtime_store.py
++++ b/trader/runtime_store.py
+@@ -1,37 +1,37 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from datetime import date
+ from pathlib import Path
+ from typing import Any
+ 
+ from trader.botstate_paths import botstate_path, get_botstate_root
+-from trader.config import UNIVERSE_POOL_SIZE
+-from trader.universe.lkg_store import lkg_path
++from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD, UNIVERSE_POOL_SIZE
++from trader.universe.lkg_store import lkg_path, save_lkg
+ 
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+ MIN_UNIVERSE_MEMBERS = int(os.getenv("MIN_UNIVERSE_MEMBERS", str(UNIVERSE_POOL_SIZE)))
+ 
+ def _resolve_universe_env() -> str:
+     return (os.getenv("KIS_ENV") or "practice").lower()
+ 
+ 
+ def _resolve_universe_strategy() -> str:
+     return os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+ 
+ 
+ def universe_today_path(as_of: str) -> Path:
+     return botstate_path("runtime", "universe", f"{as_of}.json")
+ 
+ 
+ def universe_lkg_path() -> Path:
+     env = _resolve_universe_env()
+     strategy = _resolve_universe_strategy()
+     return lkg_path(env, strategy)
+ 
+ 
+ def balance_snapshot_path(base_dir: Path | None = None) -> Path:
+@@ -59,50 +59,80 @@ class RuntimeStore:
+         if parts and parts[0] == "bot_state":
+             return Path(*parts[1:])
+         return raw
+ 
+     def _resolve_universe_path(self, raw_path: Path) -> tuple[Path, Path]:
+         rel = self._normalize_rel(raw_path)
+         abs_path = (self.base_dir / rel).resolve()
+         exists = abs_path.exists()
+         logger.info(
+             "[UNIVERSE][LOAD] base_dir=%s rel=%s abs=%s exists=%s",
+             self.base_dir,
+             rel,
+             abs_path,
+             int(exists),
+         )
+         if not exists:
+             self._log_dir_snapshot()
+         return abs_path, rel
+ 
+     def save_json(self, rel: str | Path, data: Any) -> Path:
+         target = self.base_dir / self._normalize_rel(Path(rel))
+         target.parent.mkdir(parents=True, exist_ok=True)
+         target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+         return target
+ 
++    def save_universe(
++        self,
++        *,
++        as_of: str,
++        env: str,
++        strategy: str,
++        members: list[dict],
++        source: str,
++        params: dict | None = None,
++        payload: dict | None = None,
++    ) -> Path:
++        data = {
++            "as_of": as_of,
++            "env": env,
++            "strategy": strategy,
++            "source": source,
++            "params": params or {"as_of": as_of},
++            "payload": payload or {},
++            "members": members,
++        }
++        path = self.save_json(Path("runtime") / "universe" / f"{as_of}.json", data)
++        logger.info("[UNIVERSE][SAVE] today_path=%s members=%s", path, len(members))
++        return path
++
++    def save_universe_lkg(self, *, env: str, strategy: str, payload: dict) -> Path:
++        save_lkg(env, strategy, payload)
++        path = lkg_path(env, strategy)
++        logger.info("[UNIVERSE][SAVE] lkg_path=%s members=%s", path, len(payload.get("members") or []))
++        return path
++
+     def save_balance_snapshot(
+         self,
+         *,
+         raw_snapshot: dict,
+         normalized_snapshot: dict,
+         source: str,
+         timestamp_kst: str,
+     ) -> Path:
+         payload = {
+             "timestamp_kst": timestamp_kst,
+             "source": source,
+             "raw": raw_snapshot,
+             "normalized": normalized_snapshot,
+         }
+         path = balance_snapshot_path(self.base_dir)
+         path.parent.mkdir(parents=True, exist_ok=True)
+         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+         return path
+ 
+     def load_balance_snapshot(self) -> dict | None:
+         path = balance_snapshot_path(self.base_dir)
+         if not path.exists():
+             return None
+         try:
+             return json.loads(path.read_text(encoding="utf-8"))
+@@ -202,112 +232,143 @@ class RuntimeStore:
+             )
+         return ok, meta
+ 
+     def load_universe_for_trading(self, as_of: str) -> tuple[list[dict], dict]:
+         ok, meta = self.universe_check(as_of)
+         if not ok:
+             return [], meta
+         today = Path(meta["today_path"])
+         p = today if today.exists() else Path(meta["lkg_path"])
+         meta["selected_path"] = str(p)
+         with p.open("r", encoding="utf-8") as f:
+             data = json.load(f)
+         members = data.get("members") if isinstance(data, dict) else data
+         if not isinstance(members, list):
+             members = []
+         meta["members"] = len(members)
+         return members, meta
+ 
+     def ensure_universe(
+         self,
+         *,
+         as_of: str,
+         env: str,
+         strategy: str,
+         provider_override: str | None = None,
++        force_rebuild: bool | None = None,
++        emergency_build: bool | None = None,
+     ) -> dict:
++        if force_rebuild is None:
++            force_rebuild = FORCE_UNIVERSE_REBUILD
++        if emergency_build is None:
++            emergency_build = EMERGENCY_UNIVERSE_BUILD
++
+         ok, meta = self.universe_check(as_of)
+-        if not ok:
+-            return meta
+         today_members = int(meta.get("members") or 0)
+-        if today_members > 0:
++        if ok and today_members > 0 and not force_rebuild:
+             return meta
+-        if not meta.get("have_today"):
++
++        should_build = force_rebuild or emergency_build
++        if not should_build:
+             return meta
+ 
+         flag_rel = Path("runtime") / "status" / f"universe_rebuild_{as_of}.flag"
+         flag = self.base_dir / flag_rel
+-        if flag.exists() and today_members > 0:
++        if flag.exists() and today_members > 0 and not force_rebuild:
+             logger.info("[UNIVERSE][REBUILD_SKIP] as_of=%s flag=%s", as_of, flag)
+             return meta
+ 
+-        logger.info("[UNIVERSE][EMPTY_FATAL] today_universe_members=0 -> rebuild_once")
++        logger.info(
++            "[UNIVERSE][BUILD] start as_of=%s env=%s strategy=%s force=%s emergency=%s",
++            as_of,
++            env,
++            strategy,
++            int(force_rebuild),
++            int(emergency_build),
++        )
+         try:
+             from trader.universe import build as universe_build
+         except Exception:
+-            logger.exception("[UNIVERSE][REBUILD_FAIL] import_error=1")
++            logger.exception("[UNIVERSE][BUILD][FAIL] import_error=1")
+             return meta
+ 
+         try:
+-            universe_build.build_universe(
++            members = universe_build.build_universe(
+                 as_of_date=as_of,
+                 env=env,
+                 strategy=strategy,
+                 provider_override=provider_override,
+             )
+         except Exception:
+-            logger.exception("[UNIVERSE][REBUILD_FAIL] build_error=1")
++            logger.exception("[UNIVERSE][BUILD][FAIL] build_error=1")
++            return meta
+ 
+-        members, post_meta = self.load_today_universe(as_of)
+-        today_path = Path(post_meta.get("today_path") or "")
+-        source = None
++        if not members:
++            logger.warning("[UNIVERSE][BUILD][FAIL] reason=empty_members")
++            return meta
++
++        logger.info("[UNIVERSE][BUILD] done members=%s", len(members))
++
++        today_path = self._today_path(as_of)
++        payload_source = "ensure_universe"
++        payload_params: dict = {"as_of": as_of}
++        payload_body: dict = {}
+         try:
+             if today_path.exists():
+                 data = json.loads(today_path.read_text(encoding="utf-8"))
+                 if isinstance(data, dict):
+-                    source = data.get("source")
++                    payload_source = data.get("source") or payload_source
++                    payload_params = data.get("params") or payload_params
++                    payload_body = data.get("payload") or payload_body
+         except Exception:
+-            logger.exception("[UNIVERSE][REBUILD][LOAD_FAIL] as_of=%s", as_of)
+-        if members:
+-            logger.info(
+-                "[UNIVERSE][REBUILD_DONE] members=%s provider=%s",
+-                len(members),
+-                source or "unknown",
+-            )
+-            if len(members) >= MIN_UNIVERSE_MEMBERS:
+-                self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
+-        else:
+-            logger.warning("[UNIVERSE][REBUILD_FAILED] members=0 -> skip trading")
+-            if today_path.exists():
+-                try:
+-                    today_path.unlink()
+-                    logger.info("[UNIVERSE][EMPTY_FATAL] removed_empty_today path=%s", today_path)
+-                except Exception:
+-                    logger.exception("[UNIVERSE][EMPTY_FATAL] failed_remove_today path=%s", today_path)
+-            post_ok, post_meta = self.universe_check(as_of)
+-            if post_ok:
+-                return post_meta
++            logger.exception("[UNIVERSE][SAVE][LOAD_FAIL] as_of=%s", as_of)
++
++        self.save_universe(
++            as_of=as_of,
++            env=env,
++            strategy=strategy,
++            members=members,
++            source=payload_source,
++            params=payload_params,
++            payload=payload_body,
++        )
++        lkg_payload = {
++            "as_of": as_of,
++            "env": env,
++            "strategy": strategy,
++            "source": payload_source,
++            "params": payload_params,
++            "payload": payload_body,
++            "members": members,
++        }
++        self.save_universe_lkg(env=env, strategy=strategy, payload=lkg_payload)
++        if len(members) >= MIN_UNIVERSE_MEMBERS:
++            self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
++
++        post_ok, post_meta = self.universe_check(as_of)
++        if not post_ok:
++            raise RuntimeError(f"Universe build persisted but missing: as_of={as_of}")
+         post_meta["members"] = len(members)
+         return post_meta
+ 
+     def load_today_universe(self, as_of: str) -> tuple[list[dict], dict]:
+         today_raw = self._today_path(as_of)
+         today, today_rel = self._resolve_universe_path(today_raw)
+         meta = {
+             "as_of": as_of,
+             "today_path": str(today),
+             "today_rel": str(today_rel),
+             "have_today": today.exists(),
+         }
+         members: list[dict] = []
+         if meta["have_today"]:
+             try:
+                 with today.open("r", encoding="utf-8") as handle:
+                     data = json.load(handle)
+                 loaded = data.get("members") if isinstance(data, dict) else data
+                 if isinstance(loaded, list):
+                     members = loaded
+             except Exception:
+                 logger.exception("[UNIVERSE][LOAD_TODAY][FAIL] path=%s", today)
+         meta["members"] = len(members)
+         return members, meta
+ 
+diff --git a/trader/universe/builder.py b/trader/universe/builder.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c13ca1f9aaccd305517c0092c28663c8a1de05dd
+--- /dev/null
++++ b/trader/universe/builder.py
+@@ -0,0 +1,54 @@
++from __future__ import annotations
++
++import argparse
++import logging
++import os
++from datetime import date
++
++from trader.universe import build as universe_build
++
++logger = logging.getLogger(__name__)
++
++
++def build_universe_best_k_meta(
++    *,
++    as_of: date,
++    env: str,
++    universe_pool: int,
++    **kwargs,
++) -> list[dict]:
++    """Build a universe snapshot and return members for best_k_meta."""
++    _ = universe_pool
++    return universe_build.build_universe(
++        as_of_date=as_of.isoformat(),
++        env=env,
++        strategy=kwargs.get("strategy") or "best_k_meta",
++        provider_override=kwargs.get("provider_override"),
++    )
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Build universe snapshots and persist outputs")
++    parser.add_argument("--env", default=os.getenv("KIS_ENV") or "practice")
++    parser.add_argument("--strategy", default="best_k_meta")
++    parser.add_argument("--as-of", dest="as_of", default=None)
++    parser.add_argument("--provider", default=None)
++    parser.add_argument("--save-lkg", action="store_true")
++    return parser.parse_args()
++
++
++def main() -> None:
++    logging.basicConfig(level=logging.INFO)
++    args = _parse_args()
++    as_of = args.as_of or date.today().isoformat()
++    members = universe_build.build_universe(
++        as_of_date=as_of,
++        env=args.env,
++        strategy=args.strategy,
++        provider_override=args.provider,
++    )
++    logger.info("[UNIVERSE][BUILDER] as_of=%s members=%s", as_of, len(members))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/trader/universe/lkg_store.py b/trader/universe/lkg_store.py
+index 5170771e7fd236f5394b28e13a7a30619e89cf00..8180fe51b685ee12b9ed6a1c049c05e2bd19d2a0 100644
+--- a/trader/universe/lkg_store.py
++++ b/trader/universe/lkg_store.py
+@@ -1,56 +1,73 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ from datetime import datetime
++from hashlib import sha1
+ from pathlib import Path
+ from typing import Optional
+ 
+ from trader.botstate_paths import runtime_root
++from trader.config import UNIVERSE_NAMESPACE_MODE
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _LKG_ROOT = Path(
+     os.getenv("UNIVERSE_LKG_DIR")
+     or os.getenv("UNIVERSE_LKG_ROOT")
+     or (runtime_root() / "universe_lkg")
+ )
+ 
+ 
+ def lkg_path(env: str, strategy: str) -> Path:
+     env_norm = (env or "practice").lower()
++    namespace = _resolve_namespace(env_norm)
+     strategy_norm = strategy or "default"
+-    return _LKG_ROOT / env_norm / strategy_norm / "latest.json"
++    return _LKG_ROOT / namespace / strategy_norm / "latest.json"
+ 
+ 
+ def _history_path(env: str, strategy: str, as_of: str | None) -> Path:
+     env_norm = (env or "practice").lower()
++    namespace = _resolve_namespace(env_norm)
+     strategy_norm = strategy or "default"
+     ts = as_of or datetime.utcnow().date().isoformat()
+-    return _LKG_ROOT / env_norm / strategy_norm / "history" / f"{ts}.json"
++    return _LKG_ROOT / namespace / strategy_norm / "history" / f"{ts}.json"
++
++
++def _resolve_namespace(env_norm: str) -> str:
++    mode = (UNIVERSE_NAMESPACE_MODE or "ACCOUNT_ENV").upper()
++    if mode == "ACCOUNT_ENV":
++        cano = (os.getenv("CANO") or "").strip()
++        acnt = (os.getenv("ACNT_PRDT_CD") or "").strip()
++        raw = f"{env_norm}:{cano}:{acnt}"
++        digest = sha1(raw.encode("utf-8")).hexdigest()[:10]
++        return digest
++    if mode == "ENV":
++        return env_norm
++    return env_norm
+ 
+ 
+ def load_lkg(env: str, strategy: str) -> Optional[dict]:
+     path = lkg_path(env, strategy)
+     try:
+         if not path.exists():
+             logger.info("[UNIVERSE][LKG][MISS] env=%s strategy=%s path=%s", env, strategy, path)
+             return None
+         payload = json.loads(path.read_text(encoding="utf-8"))
+         as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
+         logger.info("[UNIVERSE][LKG][HIT] env=%s strategy=%s as_of=%s", env, strategy, as_of or "unknown")
+         return payload
+     except Exception:
+         logger.exception("[UNIVERSE][LKG][LOAD_FAIL] env=%s strategy=%s path=%s", env, strategy, path)
+         return None
+ 
+ 
+ def save_lkg(env: str, strategy: str, payload: dict) -> None:
+     path = lkg_path(env, strategy)
+     try:
+         path.parent.mkdir(parents=True, exist_ok=True)
+         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+         as_of = payload.get("params", {}).get("as_of") or payload.get("as_of")
+         logger.info("[UNIVERSE][LKG][SAVE] path=%s members=%s", path, len(payload.get("members") or []))
+         hist = _history_path(env, strategy, as_of)

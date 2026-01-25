@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from trader.botstate_paths import botstate_path, get_botstate_root
-from trader.config import UNIVERSE_POOL_SIZE
-from trader.universe.lkg_store import lkg_path
+from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD, UNIVERSE_POOL_SIZE
+from trader.universe.lkg_store import lkg_path, save_lkg
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,36 @@ class RuntimeStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return target
+
+    def save_universe(
+        self,
+        *,
+        as_of: str,
+        env: str,
+        strategy: str,
+        members: list[dict],
+        source: str,
+        params: dict | None = None,
+        payload: dict | None = None,
+    ) -> Path:
+        data = {
+            "as_of": as_of,
+            "env": env,
+            "strategy": strategy,
+            "source": source,
+            "params": params or {"as_of": as_of},
+            "payload": payload or {},
+            "members": members,
+        }
+        path = self.save_json(Path("runtime") / "universe" / f"{as_of}.json", data)
+        logger.info("[UNIVERSE][SAVE] today_path=%s members=%s", path, len(members))
+        return path
+
+    def save_universe_lkg(self, *, env: str, strategy: str, payload: dict) -> Path:
+        save_lkg(env, strategy, payload)
+        path = lkg_path(env, strategy)
+        logger.info("[UNIVERSE][SAVE] lkg_path=%s members=%s", path, len(payload.get("members") or []))
+        return path
 
     def save_balance_snapshot(
         self,
@@ -224,68 +254,99 @@ class RuntimeStore:
         env: str,
         strategy: str,
         provider_override: str | None = None,
+        force_rebuild: bool | None = None,
+        emergency_build: bool | None = None,
     ) -> dict:
+        if force_rebuild is None:
+            force_rebuild = FORCE_UNIVERSE_REBUILD
+        if emergency_build is None:
+            emergency_build = EMERGENCY_UNIVERSE_BUILD
+
         ok, meta = self.universe_check(as_of)
-        if not ok:
-            return meta
         today_members = int(meta.get("members") or 0)
-        if today_members > 0:
+        if ok and today_members > 0 and not force_rebuild:
             return meta
-        if not meta.get("have_today"):
+
+        should_build = force_rebuild or emergency_build
+        if not should_build:
             return meta
 
         flag_rel = Path("runtime") / "status" / f"universe_rebuild_{as_of}.flag"
         flag = self.base_dir / flag_rel
-        if flag.exists() and today_members > 0:
+        if flag.exists() and today_members > 0 and not force_rebuild:
             logger.info("[UNIVERSE][REBUILD_SKIP] as_of=%s flag=%s", as_of, flag)
             return meta
 
-        logger.info("[UNIVERSE][EMPTY_FATAL] today_universe_members=0 -> rebuild_once")
+        logger.info(
+            "[UNIVERSE][BUILD] start as_of=%s env=%s strategy=%s force=%s emergency=%s",
+            as_of,
+            env,
+            strategy,
+            int(force_rebuild),
+            int(emergency_build),
+        )
         try:
             from trader.universe import build as universe_build
         except Exception:
-            logger.exception("[UNIVERSE][REBUILD_FAIL] import_error=1")
+            logger.exception("[UNIVERSE][BUILD][FAIL] import_error=1")
             return meta
 
         try:
-            universe_build.build_universe(
+            members = universe_build.build_universe(
                 as_of_date=as_of,
                 env=env,
                 strategy=strategy,
                 provider_override=provider_override,
             )
         except Exception:
-            logger.exception("[UNIVERSE][REBUILD_FAIL] build_error=1")
+            logger.exception("[UNIVERSE][BUILD][FAIL] build_error=1")
+            return meta
 
-        members, post_meta = self.load_today_universe(as_of)
-        today_path = Path(post_meta.get("today_path") or "")
-        source = None
+        if not members:
+            logger.warning("[UNIVERSE][BUILD][FAIL] reason=empty_members")
+            return meta
+
+        logger.info("[UNIVERSE][BUILD] done members=%s", len(members))
+
+        today_path = self._today_path(as_of)
+        payload_source = "ensure_universe"
+        payload_params: dict = {"as_of": as_of}
+        payload_body: dict = {}
         try:
             if today_path.exists():
                 data = json.loads(today_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    source = data.get("source")
+                    payload_source = data.get("source") or payload_source
+                    payload_params = data.get("params") or payload_params
+                    payload_body = data.get("payload") or payload_body
         except Exception:
-            logger.exception("[UNIVERSE][REBUILD][LOAD_FAIL] as_of=%s", as_of)
-        if members:
-            logger.info(
-                "[UNIVERSE][REBUILD_DONE] members=%s provider=%s",
-                len(members),
-                source or "unknown",
-            )
-            if len(members) >= MIN_UNIVERSE_MEMBERS:
-                self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
-        else:
-            logger.warning("[UNIVERSE][REBUILD_FAILED] members=0 -> skip trading")
-            if today_path.exists():
-                try:
-                    today_path.unlink()
-                    logger.info("[UNIVERSE][EMPTY_FATAL] removed_empty_today path=%s", today_path)
-                except Exception:
-                    logger.exception("[UNIVERSE][EMPTY_FATAL] failed_remove_today path=%s", today_path)
-            post_ok, post_meta = self.universe_check(as_of)
-            if post_ok:
-                return post_meta
+            logger.exception("[UNIVERSE][SAVE][LOAD_FAIL] as_of=%s", as_of)
+
+        self.save_universe(
+            as_of=as_of,
+            env=env,
+            strategy=strategy,
+            members=members,
+            source=payload_source,
+            params=payload_params,
+            payload=payload_body,
+        )
+        lkg_payload = {
+            "as_of": as_of,
+            "env": env,
+            "strategy": strategy,
+            "source": payload_source,
+            "params": payload_params,
+            "payload": payload_body,
+            "members": members,
+        }
+        self.save_universe_lkg(env=env, strategy=strategy, payload=lkg_payload)
+        if len(members) >= MIN_UNIVERSE_MEMBERS:
+            self.touch_flag(flag_rel, content=f"attempted as_of={as_of}\n")
+
+        post_ok, post_meta = self.universe_check(as_of)
+        if not post_ok:
+            raise RuntimeError(f"Universe build persisted but missing: as_of={as_of}")
         post_meta["members"] = len(members)
         return post_meta
 

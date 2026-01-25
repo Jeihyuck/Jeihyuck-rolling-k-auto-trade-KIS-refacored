@@ -36,6 +36,8 @@ from trader.config import (
     NONTRADING_SMOKE_FORCE,
     NONTRADING_SMOKE_FORCE_REBUILD,
     NONTRADING_SMOKE_TIMEOUT_SEC,
+    EMERGENCY_UNIVERSE_BUILD,
+    FORCE_UNIVERSE_REBUILD,
     PB1_ALLOW_PREOPEN_ENTRY,
     PB1_PREOPEN_END,
     PB1_PREOPEN_MAX_NEW_POSITIONS,
@@ -316,46 +318,24 @@ def ensure_universe_built_once(
     flag = universe_build_flag(as_of)
 
     if not force:
-        if not ok and not allow_missing:
+        if not ok and not allow_missing and not (EMERGENCY_UNIVERSE_BUILD or FORCE_UNIVERSE_REBUILD):
             return
-
         if meta.get("have_today"):
             return
-
         if flag.exists():
             return
 
     reason = "force" if force else "auto_missing_today"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(f"attempted reason={reason}\n", encoding="utf-8")
-
-    cmd = [
-        "python",
-        "-m",
-        "trader.universe.build",
-        "--env",
-        env,
-        "--strategy",
-        strategy,
-        "--date",
-        as_of,
-    ]
-    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s cmd=%s", as_of, reason, cmd)
-    runtime_dir = Path(runtime_store.base_dir).resolve()
-    env_vars = os.environ.copy()
-    env_vars["TRADER_RUNTIME_DIR"] = str(runtime_dir)
-    subprocess.run(cmd, check=False, cwd=str(runtime_dir.parent), env=env_vars)
-    _, post_meta = runtime_store.load_today_universe(as_of)
-    if post_meta.get("have_today"):
-        log.info(
-            "[UNIVERSE][POST_BUILD_CHECK] have_today=1 path=%s",
-            post_meta.get("today_path"),
-        )
-    else:
-        log.warning(
-            "[UNIVERSE][POST_BUILD_CHECK][FAIL] today universe missing after build -> likely not persisted path=%s",
-            post_meta.get("today_path"),
-        )
+    log.warning("[UNIVERSE][BUILD_TRIGGER] as_of=%s reason=%s", as_of, reason)
+    runtime_store.ensure_universe(
+        as_of=as_of,
+        env=env,
+        strategy=strategy,
+        force_rebuild=force or FORCE_UNIVERSE_REBUILD,
+        emergency_build=EMERGENCY_UNIVERSE_BUILD,
+    )
 
 
 def run_nontrading_universe_smoke(
