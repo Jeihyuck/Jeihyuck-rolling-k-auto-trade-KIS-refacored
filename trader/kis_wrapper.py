@@ -28,6 +28,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+from trader.runtime_paths import runtime_path
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
 from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
@@ -80,6 +81,10 @@ class DataShortError(Exception):
 
 class OrderBlockedError(RuntimeError):
     """주문 하드 가드에 의해 차단된 경우."""
+
+
+def botstate_path(*parts: str) -> Path:
+    return runtime_path(*parts)
 
 
 def _build_session():
