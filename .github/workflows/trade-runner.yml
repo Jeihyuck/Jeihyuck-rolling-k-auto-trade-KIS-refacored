@@ -161,7 +161,6 @@ jobs:
       LIVE_TRADING_ENABLED: "1"
       DISABLE_LIVE_TRADING: "0"
       STRATEGY_MODE: "LIVE"
-      NO_TRADE: "0"
 
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
@@ -253,33 +252,58 @@ jobs:
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
           PY
 
-      - name: "Gate: disable live trading in DIAG"
+      - name: Decide LIVE or NO_TRADE (KST)
         id: gate
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "DIAG" ]; then
-            echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
-            echo "no_trade=1" >> "$GITHUB_OUTPUT"
-            echo "NO_TRADE=1" >> "$GITHUB_ENV"
-          else
-            echo "LIVE_TRADING_ENABLED=1" >> "$GITHUB_ENV"
-            echo "no_trade=0" >> "$GITHUB_OUTPUT"
-            echo "NO_TRADE=0" >> "$GITHUB_ENV"
-          fi
+          python - << 'PY'
+          from datetime import datetime, time
+          import zoneinfo, sys
+
+          kst = zoneinfo.ZoneInfo("Asia/Seoul")
+          now = datetime.now(kst)
+
+          # 1) weekday check (Mon=0..Sun=6)
+          is_weekday = now.weekday() < 5
+
+          # 2) session window (KOSPI/KOSDAQ 09:00~15:30)
+          start = time(9, 0)
+          end   = time(15, 30)
+          in_session = (start <= now.time() <= end)
+
+          live_ok = is_weekday and in_session
+
+          print(f"[GATE] now_kst={now.isoformat()} is_weekday={is_weekday} in_session={in_session} live_ok={live_ok}")
+
+          # GitHub output
+          with open("${GITHUB_OUTPUT}", "a", encoding="utf-8") as f:
+            f.write(f"live_ok={'true' if live_ok else 'false'}\n")
+          PY
 
       - name: DB universe precheck
         run: |
           set -euo pipefail
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
-      - name: Run (DB-only)
-        if: steps.gate.outputs.no_trade != '1'
+      - name: Run LIVE (trade loop)
+        if: ${{ steps.gate.outputs.live_ok == 'true' }}
         env:
-          LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
+          STRATEGY_MODE: LIVE
+          DRY_RUN: "0"
+          LIVE_TRADING_ENABLED: "1"
+          DISABLE_LIVE_TRADING: "0"
+          DB_ONLY: "0"
         run: |
           set -euo pipefail
-          echo "[RUN] mode=$EFFECTIVE_STRATEGY_MODE window=$MARKET_WINDOW phase=$PB1_PHASE_DEFAULT db_only=1"
+          echo "[RUN] LIVE allowed by gate"
           python -m trader.run --window auto --phase auto
+
+      - name: NO_TRADE (outside session)
+        if: ${{ steps.gate.outputs.live_ok != 'true' }}
+        run: |
+          set -euo pipefail
+          echo "[NO_TRADE] Outside trading session (KST). Skip running live trading."
 
       - name: Scan for SQLite artifacts
         if: always()
