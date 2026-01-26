@@ -40,13 +40,14 @@ def main() -> int:
     
     # DB schema validation
     with engine.connect() as conn:
-        result = conn.execute("""
+        sql = """
             select table_name, column_name, data_type, is_nullable, column_default
             from information_schema.columns
             where table_name in ('ledger_events','positions','runs')
               and column_name in ('ok','tp1_done','tp2_done','dry_run')
             order by table_name, column_name;
-        """)
+        """
+        result = conn.exec_driver_sql(sql)
         expected = {
             ('ledger_events', 'ok'): ('boolean', 'NO', 'true'),
             ('runs', 'dry_run'): ('boolean', 'NO', 'false'),
