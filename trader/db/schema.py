@@ -79,6 +79,9 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("provider", sa.String, nullable=False),
         sa.Column("as_of", sa.Date, nullable=False),
         sa.Column("created_ts", sa.Text, nullable=False),
+        sa.Column("status", sa.String, nullable=False, default="SUCCESS"),
+        sa.Column("error_reason", sa.Text),
+        sa.Column("members_count", sa.Integer),
         uuid_col("run_id", primary_key=True),
         sa.UniqueConstraint("strategy", "provider", "as_of", name="ux_universe_runs_key"),
     )

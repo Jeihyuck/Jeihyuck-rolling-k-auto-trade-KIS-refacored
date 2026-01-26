@@ -73,6 +73,7 @@ from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_kis, reconcile_today
 from trader.reconcile_db import close_stale_positions
 from trader.universe.build import build_universe
+from trader.universe.mode import is_db_only_mode
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
@@ -92,6 +93,34 @@ def _deepcopy_json(value):
         return copy.deepcopy(value)
     except Exception:
         return value
+
+
+def _log_db_only_universe_precheck(
+    *,
+    repo: UniverseRepo,
+    env: str,
+    strategy: str,
+    namespace: str = "default",
+) -> None:
+    snapshot = repo.get_current_universe_snapshot(env, strategy)
+    if not snapshot:
+        logger.warning(
+            "[UNIVERSE][LOAD][DB_ONLY][MISS] source=db_only env=%s strategy=%s namespace=%s",
+            env,
+            strategy,
+            namespace,
+        )
+        return
+    logger.info(
+        "[UNIVERSE][LOAD][DB_ONLY] source=db_only env=%s strategy=%s namespace=%s run_id=%s as_of=%s members=%s sample=%s",
+        env,
+        strategy,
+        namespace,
+        snapshot.get("run_id"),
+        snapshot.get("as_of"),
+        snapshot.get("members_count"),
+        snapshot.get("sample_codes"),
+    )
 
 
 def get_balance_state(
@@ -228,6 +257,26 @@ def ensure_universe_built_once(
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
     if members:
         return
+    if is_db_only_mode():
+        fallback = repo.get_current_universe_snapshot(env, strategy)
+        if fallback and fallback.get("members"):
+            logger.warning(
+                "[UNIVERSE][ENSURE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
+                fallback.get("run_id"),
+                fallback.get("as_of"),
+                fallback.get("members_count"),
+            )
+            return
+        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
+        if latest and latest.get("members"):
+            logger.warning(
+                "[UNIVERSE][ENSURE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
+                latest.get("run_id"),
+                latest.get("as_of"),
+                latest.get("members_count"),
+            )
+            return
+        raise RuntimeError(f"missing universe in DB (db_only): env={env} strategy={strategy} as_of={as_of}")
     diag_mode = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
     emergency = os.getenv("EMERGENCY_UNIVERSE_BUILD", "0") == "1"
     if emergency and diag_mode:
@@ -247,6 +296,39 @@ def _load_universe_context(
 ) -> UniverseContext:
     repo = UniverseRepo(engine)
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+    if not members and is_db_only_mode():
+        fallback = repo.get_current_universe_snapshot(env, strategy)
+        if fallback and fallback.get("members"):
+            logger.warning(
+                "[PB1][UNIVERSE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
+                fallback.get("run_id"),
+                fallback.get("as_of"),
+                fallback.get("members_count"),
+            )
+            return UniverseContext(
+                as_of_date=str(fallback.get("as_of") or as_of),
+                members=fallback.get("members") or [],
+                selected_path=None,
+                meta={"source": "db_only", "as_of": fallback.get("as_of")},
+                is_empty=False,
+            )
+        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
+        if latest and latest.get("members"):
+            logger.warning(
+                "[PB1][UNIVERSE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
+                latest.get("run_id"),
+                latest.get("as_of"),
+                latest.get("members_count"),
+            )
+            return UniverseContext(
+                as_of_date=str(latest.get("as_of") or as_of),
+                members=latest.get("members") or [],
+                selected_path=None,
+                meta={"source": "db_only", "as_of": latest.get("as_of")},
+                is_empty=False,
+            )
+        logger.error("[PB1][UNIVERSE][DB_ONLY][MISS] env=%s strategy=%s as_of=%s", env, strategy, as_of)
+        raise RuntimeError("db_only_universe_missing")
     if not members:
         logger.warning(
             "[PB1][UNIVERSE][EMPTY_OK] as_of=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
@@ -430,7 +512,7 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
     try:
         members = repo.get_current_universe_members(kis_env, "best_k_meta")
         if not members:
-            if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
+            if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1" and not is_db_only_mode():
                 from trader.universe import build as universe_build
 
                 universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
@@ -1004,6 +1086,13 @@ def run_once(
             logger.exception("[PB1][DEGRADED] failed")
 
     if not loop_mode:
+        if is_db_only_mode():
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            _log_db_only_universe_precheck(
+                repo=UniverseRepo(engine),
+                env=kis_env or "practice",
+                strategy=universe_strategy,
+            )
         ensure_universe_built_once(engine=engine, as_of=as_of)
 
     logger.info(

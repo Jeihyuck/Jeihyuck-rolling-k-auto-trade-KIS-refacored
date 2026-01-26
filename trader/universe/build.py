@@ -25,6 +25,7 @@ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
+from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
 
 from datetime import date
 
@@ -146,6 +147,31 @@ def _filter_tradeable_members(
             continue
         dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
     return kept, dropped
+
+
+def _load_fallback_universe_from_db(
+    *,
+    repo: UniverseRepo,
+    env: str,
+    strategy: str,
+    as_of_date: str,
+) -> list[dict]:
+    snapshot = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of_date)
+    if not snapshot:
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][MISS] env=%s strategy=%s as_of=%s",
+            env,
+            strategy,
+            as_of_date,
+        )
+        return []
+    logger.warning(
+        "[UNIVERSE][FALLBACK][DB] using run_id=%s as_of=%s members=%s",
+        snapshot.get("run_id"),
+        snapshot.get("as_of"),
+        snapshot.get("members_count"),
+    )
+    return snapshot.get("members") or []
 
 
 
@@ -568,16 +594,53 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     if not members:
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
+        error_reason = f"provider_empty:{last_reason or source}"
+        try:
+            repo.record_universe_run_failure(
+                env=env,
+                strategy=strategy,
+                as_of_date=as_of_date,
+                provider=source,
+                error_reason=error_reason,
+                members_count=0,
+            )
+        except Exception:
+            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+        allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE"
+        if allow_fallback:
+            fallback_members = _load_fallback_universe_from_db(
+                repo=repo,
+                env=env,
+                strategy=strategy,
+                as_of_date=as_of_date,
+            )
+            if fallback_members:
+                return fallback_members
         raise RuntimeError("universe_members_empty")
 
-    repo.store_universe_snapshot(
-        env=env,
-        strategy=strategy,
-        as_of_date=as_of_date,
-        provider=source,
-        members=members,
-        reason=last_reason,
-    )
+    try:
+        repo.store_universe_snapshot(
+            env=env,
+            strategy=strategy,
+            as_of_date=as_of_date,
+            provider=source,
+            members=members,
+            reason=last_reason,
+        )
+    except Exception as exc:
+        error_reason = f"store_fail:{exc}"
+        try:
+            repo.record_universe_run_failure(
+                env=env,
+                strategy=strategy,
+                as_of_date=as_of_date,
+                provider=source,
+                error_reason=error_reason,
+                members_count=len(members),
+            )
+        except Exception:
+            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+        raise
     repo.cleanup_old_runs(retain_days=int(os.getenv("UNIVERSE_RETENTION_DAYS", "30")))
     logger.info(
         "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",

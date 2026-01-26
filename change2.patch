@@ -1,147 +1,1515 @@
+diff --git a/.github/workflows/trade-runner.yml b/.github/workflows/trade-runner.yml
+index 9e5f25b3f52d590e2b062d9ec39b10119ceafeed..274c43eea35dcb8cb0299f8bc2ebc43588de1806 100644
+--- a/.github/workflows/trade-runner.yml
++++ b/.github/workflows/trade-runner.yml
+@@ -215,51 +215,57 @@ jobs:
+           python - << 'PY'
+           import os
+           from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+           now = now_kst()
+           is_weekday = is_trading_weekday(now)
+           window = calc_market_window_kst(now)
+           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
+           mode = "LIVE" if in_market else "DIAG"
+           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+           print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}")
+           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
+               f.write(f"MARKET_WINDOW={window}\n")
+               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+           PY
+ 
+       - name: "Gate: disable live trading in DIAG"
+         run: |
+           set -euo pipefail
+           if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "DIAG" ]; then
+             echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
+           else
+             echo "LIVE_TRADING_ENABLED=1" >> "$GITHUB_ENV"
+           fi
+ 
++      - name: DB universe precheck
++        run: |
++          set -euo pipefail
++          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
++
+       - name: Run (DB-only)
++        if: env.NO_TRADE != '1'
+         env:
+           LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
+         run: |
+           set -euo pipefail
+           echo "[RUN] mode=$EFFECTIVE_STRATEGY_MODE window=$MARKET_WINDOW phase=$PB1_PHASE_DEFAULT db_only=1"
+           python -m trader.run --window auto --phase auto
+ 
+       - name: Scan for SQLite artifacts
+         if: always()
+         run: |
+           set -euo pipefail
+           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+           if [ -n "$hits" ]; then
+             echo "::error::SQLite artifacts detected (forbidden):"
+             echo "$hits"
+             exit 1
+           fi
+           echo "OK: no sqlite artifacts."
+ 
+   close_cancel:
+     runs-on: ubuntu-latest
+     if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
+     timeout-minutes: 15
+ 
+     env:
+diff --git a/migrations/0012_universe_runs_status.sql b/migrations/0012_universe_runs_status.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..62add9b716d434b4c283cb7c35579ea83d73738a
+--- /dev/null
++++ b/migrations/0012_universe_runs_status.sql
+@@ -0,0 +1,11 @@
++-- Add status tracking to universe runs
++
++ALTER TABLE universe_runs
++  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'SUCCESS';
++
++ALTER TABLE universe_runs
++  ADD COLUMN IF NOT EXISTS error_reason TEXT;
++
++ALTER TABLE universe_runs
++  ADD COLUMN IF NOT EXISTS members_count INTEGER;
++
 diff --git a/trader/db/repos.py b/trader/db/repos.py
-index 89a7b06a4cfd535d1bb87c9a3b6f81dae941c443..c276f1d80f781a2977767023221b5c51c2bd02b7 100644
+index c276f1d80f781a2977767023221b5c51c2bd02b7..3fb3d5b41dbe93fd6ac44de3e84422389d5967a6 100644
 --- a/trader/db/repos.py
 +++ b/trader/db/repos.py
-@@ -737,90 +737,135 @@ class LedgerEventsRepo:
-         payload = {
-             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-             "env": env,
-             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-             "event_type": event_type,
-             "ts": ts,
-             "code": code,
-             "market": market,
-             "sid": sid,
-             "mode": mode,
-             "side": side,
-             "qty": qty,
-             "price": price,
-             "kis_odno": kis_odno,
-             "client_order_key": client_order_key,
-             "ok": ok,
-             "reasons": safe_reasons,
-             "stage": stage,
-             "payload_json": safe_payload_json,
-         }
-         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
-         last_exc: Exception | None = None
-         for attempt in range(1, max_attempts + 1):
-             try:
-                 with self.engine.begin() as conn:
--                    logger.info("[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s event_type=%s", attempt, env, event_type)
-+                    logger.info(
-+                        "[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
-+                        attempt,
-+                        env,
-+                        run_id,
-+                        strategy,
-+                        event_type,
-+                    )
-                     if run_id is not None and strategy:
-                         ensure_run(
-                             conn,
-                             self._schema,
-                             run_id=run_id,
-                             env=env,
-                             run_window=run_window,
-                             strategy=strategy,
-                             ts=ts,
-                             database_url=db_url,
+@@ -1,36 +1,36 @@
+ from __future__ import annotations
+ 
+ from datetime import date, datetime, timedelta
+ import logging, os
+ import time
+ from typing import Any, Dict, Iterable, List, Optional
+ from uuid import UUID, uuid4
+ 
+ import sqlalchemy as sa
+ from sqlalchemy.exc import OperationalError, StatementError
+-from sqlalchemy import Engine, and_, func, select
++from sqlalchemy import Engine, and_, func, or_, select
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ 
+ from .schema import (
+     FILLS,
+     LEDGER_EVENTS,
+     ORDERS,
+     POSITIONS,
+     RUNS,
+     UNIVERSE_MEMBERS,
+     UNIVERSE_CURRENT,
+     UNIVERSE_RUNS,
+     SchemaTables,
+     schema_for_engine,
+     uuid_value_for_url,
+ )
+ from trader.time_utils import now_kst
+ from trader.db.json_safe import json_sanitize
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
+     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
+ 
+ 
+@@ -216,143 +216,287 @@ class UniverseRepo:
+             )
+             .where(self._schema.universe_members.c.run_id == run_id)
+             .order_by(self._schema.universe_members.c.rank.nullsfirst())
+         )
+         with self.engine.begin() as conn:
+             rows = conn.execute(stmt).mappings().all()
+             results: list[dict] = []
+             for row in rows:
+                 payload = dict(row)
+                 payload["code"] = payload.pop("stock_code")
+                 payload["as_of_date"] = payload.pop("as_of")
+                 payload["env"] = env
+                 payload["strategy"] = strategy
+                 results.append(payload)
+             return results
+ 
+     def get_current_universe_members(self, env: str, strategy: str) -> list[dict]:
+         strategy_key = self._strategy_key(env, strategy)
+         stmt = select(self._schema.universe_current.c.run_id).where(self._schema.universe_current.c.strategy == strategy_key)
+         with self.engine.begin() as conn:
+             run_id = conn.execute(stmt).scalar()
+         if not run_id:
+             return []
+         return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
+ 
++    def get_current_universe_snapshot(self, env: str, strategy: str) -> dict | None:
++        strategy_key = self._strategy_key(env, strategy)
++        members_count_sq = (
++            select(
++                self._schema.universe_members.c.run_id,
++                func.count().label("members_count"),
++            )
++            .group_by(self._schema.universe_members.c.run_id)
++            .subquery()
++        )
++        stmt = (
++            select(
++                self._schema.universe_current.c.run_id,
++                self._schema.universe_runs.c.as_of,
++                self._schema.universe_runs.c.provider,
++                self._schema.universe_runs.c.status,
++                members_count_sq.c.members_count,
++            )
++            .select_from(
++                self._schema.universe_current.join(
++                    self._schema.universe_runs,
++                    self._schema.universe_current.c.run_id == self._schema.universe_runs.c.run_id,
++                ).outerjoin(
++                    members_count_sq,
++                    members_count_sq.c.run_id == self._schema.universe_runs.c.run_id,
++                )
++            )
++            .where(self._schema.universe_current.c.strategy == strategy_key)
++        )
++        with self.engine.begin() as conn:
++            row = conn.execute(stmt).mappings().first()
++        if not row:
++            return None
++        run_id = str(row["run_id"])
++        members = self._fetch_members_for_run(run_id, env=env, strategy=strategy)
++        return {
++            "run_id": run_id,
++            "as_of": row.get("as_of"),
++            "provider": row.get("provider"),
++            "status": row.get("status"),
++            "members_count": len(members),
++            "members": members,
++            "sample_codes": [m.get("code") for m in members[:5]],
++        }
++
++    def get_latest_successful_universe_snapshot(
++        self,
++        *,
++        env: str,
++        strategy: str,
++        as_of_date: str,
++        limit: int = 10,
++    ) -> dict | None:
++        strategy_key = self._strategy_key(env, strategy)
++        as_of_d = _as_date(as_of_date)
++        stmt = (
++            select(
++                self._schema.universe_runs.c.run_id,
++                self._schema.universe_runs.c.as_of,
++                self._schema.universe_runs.c.provider,
++                self._schema.universe_runs.c.status,
++            )
++            .where(
++                and_(
++                    self._schema.universe_runs.c.strategy == strategy_key,
++                    self._schema.universe_runs.c.as_of <= as_of_d,
++                    or_(
++                        self._schema.universe_runs.c.status == "SUCCESS",
++                        self._schema.universe_runs.c.status.is_(None),
++                    ),
++                )
++            )
++            .order_by(self._schema.universe_runs.c.as_of.desc(), self._schema.universe_runs.c.created_ts.desc())
++            .limit(limit)
++        )
++        with self.engine.begin() as conn:
++            rows = conn.execute(stmt).mappings().all()
++        for row in rows:
++            run_id = str(row["run_id"])
++            members = self._fetch_members_for_run(run_id, env=env, strategy=strategy)
++            if members:
++                return {
++                    "run_id": run_id,
++                    "as_of": row.get("as_of"),
++                    "provider": row.get("provider"),
++                    "status": row.get("status"),
++                    "members_count": len(members),
++                    "members": members,
++                    "sample_codes": [m.get("code") for m in members[:5]],
++                }
++        return None
++
+     def get_universe_members(self, *, env: str, strategy: str, as_of_date: str) -> list[dict]:
+         strategy_key = self._strategy_key(env, strategy)
+         as_of_d = _as_date(as_of_date)
+         stmt = (
+             select(self._schema.universe_runs.c.run_id)
+             .where(
+                 and_(
+                     self._schema.universe_runs.c.strategy == strategy_key,
+                     self._schema.universe_runs.c.as_of == as_of_d,
+                 )
+             )
+             .order_by(self._schema.universe_runs.c.created_ts.desc())
+         )
+         with self.engine.begin() as conn:
+             run_id = conn.execute(stmt).scalar()
+         if not run_id:
+             logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0", as_of_date)
+             return []
+         members = self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
+         logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
+         return members
+ 
+     def store_universe_snapshot(
+         self,
+         *,
+         env: str,
+         strategy: str,
+         as_of_date: str,
+         provider: str,
+         members: Iterable[dict],
+         reason: str | None = None,
+     ) -> str:
+         members_list = list(members)
+         as_of_d = _as_date(as_of_date)
+         db_url = str(self.engine.url)
+         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+         strategy_key = self._strategy_key(env, strategy)
++        members_count = len(members_list)
+         try:
+             with self.engine.begin() as conn:
+                 existing = conn.execute(
+                     select(self._schema.universe_runs.c.run_id).where(
+                         and_(
+                             self._schema.universe_runs.c.strategy == strategy_key,
+                             self._schema.universe_runs.c.provider == provider,
+                             self._schema.universe_runs.c.as_of == as_of_d,
                          )
-                     res = conn.execute(stmt)
-                     return str(res.scalar())
-             except Exception as exc:
-                 last_exc = exc
--                if _is_in_failed_transaction_error(exc):
--                    logger.info(
--                        "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s event_type=%s",
-+                if attempt == 1:
-+                    logger.exception(
-+                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",
-                         attempt,
-                         env,
-+                        run_id,
-+                        strategy,
-                         event_type,
-+                        stmt,
-+                        payload,
+                     )
+                 ).scalar()
+                 if existing:
+                     conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                 conn.execute(
+                     sa.insert(self._schema.universe_runs).values(
+                         run_id=run_id,
+                         strategy=strategy_key,
+                         provider=provider,
+                         as_of=as_of_d,
+                         created_ts=now_kst().isoformat(),
++                        status="STARTED",
++                        members_count=0,
+                     )
+                 )
+                 for rank, member in enumerate(members_list, start=1):
+                     meta = member.get("meta_json") or {}
+                     conn.execute(
+                         sa.insert(self._schema.universe_members).values(
+                             run_id=uuid_value_for_url(db_url, run_id),
+                             stock_code=str(member.get("code") or "").zfill(6),
+                             name=member.get("name") or meta.get("name"),
+                             market=member.get("market"),
+                             rank=member.get("rank") if member.get("rank") is not None else rank,
+                             market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
+                             reason=member.get("reason") or reason,
+                         )
+                     )
+-                if self.engine.dialect.name == "postgresql":
+-                    insert_stmt = pg_insert(self._schema.universe_current).values(
+-                        strategy=strategy_key,
+-                        run_id=uuid_value_for_url(db_url, run_id),
+-                        updated_ts=now_kst().isoformat(),
++                if members_count > 0:
++                    if self.engine.dialect.name == "postgresql":
++                        insert_stmt = pg_insert(self._schema.universe_current).values(
++                            strategy=strategy_key,
++                            run_id=uuid_value_for_url(db_url, run_id),
++                            updated_ts=now_kst().isoformat(),
++                        )
++                    else:
++                        insert_stmt = sa.insert(self._schema.universe_current).values(
++                            strategy=strategy_key,
++                            run_id=uuid_value_for_url(db_url, run_id),
++                            updated_ts=now_kst().isoformat(),
++                        )
++                    conn.execute(
++                        insert_stmt.on_conflict_do_update(
++                            index_elements=[self._schema.universe_current.c.strategy],
++                            set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
++                        )
                      )
 -                else:
-+                if _is_in_failed_transaction_error(exc):
-+                    if attempt > 1:
-+                        logger.warning(
-+                            "[DB][LEDGER_EVENT][RETRY-IFT] attempt=%s err_type=%s err=%s",
-+                            attempt,
-+                            type(exc).__name__,
-+                            exc,
+-                    insert_stmt = sa.insert(self._schema.universe_current).values(
+-                        strategy=strategy_key,
+-                        run_id=uuid_value_for_url(db_url, run_id),
+-                        updated_ts=now_kst().isoformat(),
++                conn.execute(
++                    sa.update(self._schema.universe_runs)
++                    .where(self._schema.universe_runs.c.run_id == run_id)
++                    .values(status="SUCCESS", error_reason=None, members_count=members_count)
++                )
++            return str(run_id)
++        except Exception:
++            logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
++            raise
++
++    def record_universe_run_failure(
++        self,
++        *,
++        env: str,
++        strategy: str,
++        as_of_date: str,
++        provider: str,
++        error_reason: str,
++        members_count: int = 0,
++    ) -> str:
++        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
++        strategy_key = self._strategy_key(env, strategy)
++        as_of_d = _as_date(as_of_date)
++        try:
++            with self.engine.begin() as conn:
++                existing = conn.execute(
++                    select(self._schema.universe_runs.c.run_id).where(
++                        and_(
++                            self._schema.universe_runs.c.strategy == strategy_key,
++                            self._schema.universe_runs.c.provider == provider,
++                            self._schema.universe_runs.c.as_of == as_of_d,
 +                        )
-+                        logger.info(
-+                            "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
-+                            attempt,
-+                            env,
-+                            run_id,
-+                            strategy,
-+                            event_type,
-+                        )
-+                    try:
-+                        self.engine.dispose()
-+                    except Exception as dispose_exc:
-+                        logger.warning(
-+                            "[DB][LEDGER_EVENT][DISPOSE-FAIL] err_type=%s err=%s",
-+                            type(dispose_exc).__name__,
-+                            dispose_exc,
-+                        )
-+                elif attempt > 1:
-                     logger.exception(
--                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s event_type=%s err=%s sql=%s payload=%s",
-+                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s run_id=%s strategy=%s event_type=%s err=%s sql=%s payload=%s",
-                         attempt,
-                         env,
-+                        run_id,
-+                        strategy,
-                         event_type,
-                         exc,
-                         stmt,
-                         payload,
                      )
-                 if attempt < max_attempts:
-                     time.sleep(base_backoff * (2 ** (attempt - 1)))
-         if db_store_required and last_exc is not None:
-             raise last_exc
-+        if last_exc is not None:
-+            logger.warning(
-+                "[DB][LEDGER_EVENT][LAST_ERROR] err_type=%s err=%s",
-+                type(last_exc).__name__,
-+                last_exc,
-+            )
-         logger.warning(
--            "[DB][LEDGER_EVENT][SKIP] env=%s event_type=%s required=%s attempts=%s",
-+            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s",
-             env,
-+            run_id,
-+            strategy,
-             event_type,
-             int(db_store_required),
-             max_attempts,
-         )
-         return None
++                ).scalar()
++                if existing:
++                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                 conn.execute(
+-                    insert_stmt.on_conflict_do_update(
+-                        index_elements=[self._schema.universe_current.c.strategy],
+-                        set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
++                    sa.insert(self._schema.universe_runs).values(
++                        run_id=run_id,
++                        strategy=strategy_key,
++                        provider=provider,
++                        as_of=as_of_d,
++                        created_ts=now_kst().isoformat(),
++                        status="FAIL",
++                        error_reason=error_reason,
++                        members_count=members_count,
+                     )
+                 )
+             return str(run_id)
+         except Exception:
+-            logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
++            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+             raise
+ 
+     def cleanup_old_runs(self, *, retain_days: int = 30) -> None:
+         cutoff = (now_kst() - timedelta(days=retain_days)).isoformat()
+         with self.engine.begin() as conn:
+             current_runs = select(self._schema.universe_current.c.run_id)
+             conn.execute(
+                 sa.delete(self._schema.universe_runs).where(
+                     and_(
+                         self._schema.universe_runs.c.created_ts < cutoff,
+                         self._schema.universe_runs.c.run_id.not_in(current_runs),
+                     )
+                 )
+             )
  
  
- class PositionsRepo:
+ class OrdersRepo:
      def __init__(self, engine: Engine):
          self.engine = engine
          self._schema = schema_for_engine(engine)
  
-     def _get_position_row(self, env: str, strategy: str, sid: int, mode: int, code: str) -> Optional[dict]:
-         stmt = select(self._schema.positions).where(
-             and_(
-                 self._schema.positions.c.env == env,
-                 self._schema.positions.c.strategy == strategy,
-                 self._schema.positions.c.sid == sid,
-                 self._schema.positions.c.mode == mode,
-                 self._schema.positions.c.code == code,
-             )
+     def create_intent_idempotent(
+         self,
+         env: str,
+         run_id: str,
+diff --git a/trader/db/schema.py b/trader/db/schema.py
+index 5685b9b8c864f4efb81f945ca6ffe3c0619b25ab..8d05152ff820098058c70557172ab5102699a5c8 100644
+--- a/trader/db/schema.py
++++ b/trader/db/schema.py
+@@ -57,50 +57,53 @@ def _build_schema(database_url: str) -> SchemaTables:
+         uuid_col("run_id", primary_key=True),
+         sa.Column("env", sa.String, nullable=False),
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("run_window", sa.String),
+         sa.Column("phase", sa.String),
+         sa.Column("event_name", sa.String),
+         sa.Column("dry_run", sa.Boolean, nullable=False, default=False),
+         sa.Column("git_sha", sa.String),
+         sa.Column("workflow", sa.String),
+         sa.Column("workflow_run_id", sa.String),
+         sa.Column("workflow_attempt", sa.Integer),
+         sa.Column("config_json", sa.JSON, nullable=False, default=dict),
+         sa.Column("status", sa.String, nullable=False, default="STARTED"),
+         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+         sa.Column("finished_at", sa.DateTime(timezone=True)),
+         sa.Column("notes", sa.Text),
+     )
+ 
+     universe_runs = sa.Table(
+         "universe_runs",
+         metadata,
+         sa.Column("strategy", sa.String, nullable=False),
+         sa.Column("provider", sa.String, nullable=False),
+         sa.Column("as_of", sa.Date, nullable=False),
+         sa.Column("created_ts", sa.Text, nullable=False),
++        sa.Column("status", sa.String, nullable=False, default="SUCCESS"),
++        sa.Column("error_reason", sa.Text),
++        sa.Column("members_count", sa.Integer),
+         uuid_col("run_id", primary_key=True),
+         sa.UniqueConstraint("strategy", "provider", "as_of", name="ux_universe_runs_key"),
+     )
+ 
+     universe_members = sa.Table(
+         "universe_members",
+         metadata,
+         sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
+         sa.Column("stock_code", sa.String, nullable=False),
+         sa.Column("name", sa.String),
+         sa.Column("market", sa.String),
+         sa.Column("rank", sa.Integer),
+         sa.Column("market_cap", sa.Float),
+         sa.Column("reason", sa.String),
+         sa.PrimaryKeyConstraint("run_id", "stock_code"),
+     )
+ 
+     universe_current = sa.Table(
+         "universe_current",
+         metadata,
+         sa.Column("strategy", sa.String, primary_key=True),
+         sa.Column("run_id", uuid_type, sa.ForeignKey("universe_runs.run_id"), nullable=False),
+         sa.Column("updated_ts", sa.Text, nullable=False),
+     )
+ 
+diff --git a/trader/diagnostics/nontrading_smoke.py b/trader/diagnostics/nontrading_smoke.py
+index c216d5c9b65b0b312ba37ab8d5ea42e43c51df7f..3220aa598ee0127ab3e919be6f54ea1c08f65a5e 100644
+--- a/trader/diagnostics/nontrading_smoke.py
++++ b/trader/diagnostics/nontrading_smoke.py
+@@ -1,39 +1,40 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import os
+ import time
+ from datetime import datetime
+ from pathlib import Path
+ 
+ from trader.config import EMERGENCY_UNIVERSE_BUILD
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+ from trader.db.repos import LedgerEventsRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.universe.build import build_universe
++from trader.universe.mode import is_db_only_mode
+ from trader.db.repos import UniverseRepo
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def _nontrading_smoke_suffix(as_of: str | None, now: datetime | None = None) -> str:
+     if as_of:
+         return as_of
+     if now is None:
+         now = datetime.now()
+     return now.date().isoformat()
+ 
+ 
+ def nontrading_smoke_flag_path(runtime_root_dir: Path, *, as_of: str | None = None) -> Path:
+     suffix = _nontrading_smoke_suffix(as_of)
+     return (
+         runtime_root_dir
+         / "runtime"
+         / "diagnostics"
+         / f"nontrading_smoke_once_{suffix}.flag"
+     )
+ 
+ 
+ def nontrading_smoke_result_path(runtime_root_dir: Path, *, as_of: str | None = None) -> Path:
+     suffix = _nontrading_smoke_suffix(as_of)
+@@ -85,51 +86,53 @@ def run_nontrading_smoke_once(
+     strategy: str,
+     as_of: str,
+     timeout_sec: int,
+     db_store: bool,
+     force_rebuild: bool,
+ ) -> dict:
+     start_ts = time.monotonic()
+     result: dict = {"ok": False, "steps": {}}
+     logger.info(
+         "[NONTRADING_SMOKE][START] as_of=%s timeout_sec=%s db_store=%s force_rebuild=%s",
+         as_of,
+         timeout_sec,
+         int(db_store),
+         int(force_rebuild),
+     )
+ 
+     def _check_timeout(stage: str) -> None:
+         elapsed = time.monotonic() - start_ts
+         if elapsed > timeout_sec:
+             raise TimeoutError(f"nontrading_smoke timeout stage={stage} elapsed={elapsed:.1f}s")
+ 
+     try:
+         _check_timeout("universe_load")
+         repo = UniverseRepo(engine)
+         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+-        if not members and (force_rebuild or (EMERGENCY_UNIVERSE_BUILD and os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG")):
++        if not members and not is_db_only_mode() and (
++            force_rebuild or (EMERGENCY_UNIVERSE_BUILD and os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG")
++        ):
+             build_universe(as_of_date=as_of, env=env, strategy=strategy)
+             members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+         member_count = len(members)
+         result["steps"]["universe"] = {
+             "members": member_count,
+             "source": "db",
+         }
+         logger.info("[NONTRADING_SMOKE][UNIVERSE][DB] members=%s", member_count)
+         if member_count <= 0:
+             raise RuntimeError("nontrading_smoke empty universe")
+ 
+         _check_timeout("probe_prepare")
+         try:
+             kis = KisAPI(env=env)
+         except Exception as exc:
+             logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
+             kis = None
+         providers = [KISOHLCVProvider(kis)] if kis else []
+         providers.append(KRXOHLCVProvider())
+         chain = ChainOHLCVProvider(providers, env=env)
+ 
+         codes = _select_probe_codes(members, limit=3)
+         if not codes:
+             raise RuntimeError("nontrading_smoke missing probe codes")
+         probe_rows: dict[str, int] = {}
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 7116f9a0bec8ba747d84bf263aca44831d0e30ec..864259bab226969055a1c7cf4cfef75143c61a42 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -51,71 +51,100 @@ from trader.config import (
+ )
+ from trader.runtime_paths import runtime_root
+ from trader.db.engine import make_engine
+ from trader.db.health import assert_db_ready
+ from trader.db.locks import acquire_advisory_lock, release_advisory_lock
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import (
+     FillsRepo,
+     LedgerEventsRepo,
+     OrdersRepo,
+     PositionsRepo,
+     ReconcileLogRepo,
+     RunsRepo,
+     UniverseRepo,
+ )
+ from trader.diagnostics.nontrading_smoke import (
+     nontrading_smoke_flag_path,
+     run_nontrading_smoke_once,
+     write_nontrading_smoke_flag,
+ )
+ from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
+ from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
+ from trader.reconcile_kis import reconcile_kis, reconcile_today
+ from trader.reconcile_db import close_stale_positions
+ from trader.universe.build import build_universe
++from trader.universe.mode import is_db_only_mode
+ from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+ from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+ from trader.window_router import WindowDecision, decide_window
+ 
+ logger = logging.getLogger(__name__)
+ log = logger
+ 
+ _WINDOW_MISMATCH_LOGGED = False
+ BALANCE_STATE_OK = "OK"
+ BALANCE_STATE_STALE_OK = "STALE_OK"
+ BALANCE_STATE_UNKNOWN = "UNKNOWN"
+ DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+ 
+ 
+ def _deepcopy_json(value):
+     try:
+         return copy.deepcopy(value)
+     except Exception:
+         return value
+ 
+ 
++def _log_db_only_universe_precheck(
++    *,
++    repo: UniverseRepo,
++    env: str,
++    strategy: str,
++    namespace: str = "default",
++) -> None:
++    snapshot = repo.get_current_universe_snapshot(env, strategy)
++    if not snapshot:
++        logger.warning(
++            "[UNIVERSE][LOAD][DB_ONLY][MISS] source=db_only env=%s strategy=%s namespace=%s",
++            env,
++            strategy,
++            namespace,
++        )
++        return
++    logger.info(
++        "[UNIVERSE][LOAD][DB_ONLY] source=db_only env=%s strategy=%s namespace=%s run_id=%s as_of=%s members=%s sample=%s",
++        env,
++        strategy,
++        namespace,
++        snapshot.get("run_id"),
++        snapshot.get("as_of"),
++        snapshot.get("members_count"),
++        snapshot.get("sample_codes"),
++    )
++
++
+ def get_balance_state(
+     *,
+     kis: KisAPI,
+     now: datetime,
+ ) -> tuple[str, dict | None, str | None]:
+     try:
+         balance_snapshot_raw, balance_source, raw_snapshot = kis.get_balance_cached(
+             force=False,
+             return_source=True,
+             return_raw=True,
          )
-         with self.engine.begin() as conn:
-             row = conn.execute(stmt).mappings().first()
-             return dict(row) if row else None
+         balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
+         raw_snapshot = _deepcopy_json(raw_snapshot)
+         if not isinstance(balance_snapshot_raw, dict):
+             raise KisBalanceUnavailable("balance_snapshot_not_dict")
+         if not isinstance(balance_snapshot_raw.get("output1"), list):
+             raise KisBalanceUnavailable("balance_output1_not_list")
+         if not isinstance(balance_snapshot_raw.get("output2"), dict):
+             raise KisBalanceUnavailable("balance_output2_not_dict")
+         return BALANCE_STATE_OK, balance_snapshot_raw, balance_source
+     except KisBalanceUnavailable as exc:
+         logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
+     except Exception:
+         logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
+     return BALANCE_STATE_UNKNOWN, None, None
+@@ -206,69 +235,122 @@ def _diag_balance_probe_once_safe(*, logger, runtime_root_dir: Path, kis_factory
+         logger.warning("[DIAG][BALANCE] failed to save raw json: %s", e)
+ 
+ 
+ def ensure_universe_built_once(
+     *,
+     engine,
+     env: str | None = None,
+     strategy: str | None = None,
+     as_of: str | None = None,
+ ) -> None:
+     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
+     if env is not None:
+         env = env.strip()
+     strategy = strategy or os.getenv("STRATEGY_NAME", DEFAULT_UNIVERSE_STRATEGY)
+     as_of = as_of or _get_now_kst().date().isoformat()
+ 
+     assert env, "env is required"
+     assert strategy, "strategy is required"
+     assert as_of, "as_of is required"
+ 
+     log.info("[UNIVERSE][ENSURE][DB] env=%s strategy=%s as_of=%s", env, strategy, as_of)
+     repo = UniverseRepo(engine)
+     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+     if members:
+         return
++    if is_db_only_mode():
++        fallback = repo.get_current_universe_snapshot(env, strategy)
++        if fallback and fallback.get("members"):
++            logger.warning(
++                "[UNIVERSE][ENSURE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
++                fallback.get("run_id"),
++                fallback.get("as_of"),
++                fallback.get("members_count"),
++            )
++            return
++        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
++        if latest and latest.get("members"):
++            logger.warning(
++                "[UNIVERSE][ENSURE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
++                latest.get("run_id"),
++                latest.get("as_of"),
++                latest.get("members_count"),
++            )
++            return
++        raise RuntimeError(f"missing universe in DB (db_only): env={env} strategy={strategy} as_of={as_of}")
+     diag_mode = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
+     emergency = os.getenv("EMERGENCY_UNIVERSE_BUILD", "0") == "1"
+     if emergency and diag_mode:
+         logger.warning("[UNIVERSE][ENSURE][EMERGENCY_BUILD] env=%s strategy=%s as_of=%s", env, strategy, as_of)
+         build_universe(as_of_date=as_of, env=env, strategy=strategy)
+         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+     if not members:
+         raise RuntimeError(f"missing universe in DB: env={env} strategy={strategy} as_of={as_of}")
+ 
+ 
+ def _load_universe_context(
+     *,
+     engine,
+     as_of: str,
+     env: str,
+     strategy: str,
+ ) -> UniverseContext:
+     repo = UniverseRepo(engine)
+     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
++    if not members and is_db_only_mode():
++        fallback = repo.get_current_universe_snapshot(env, strategy)
++        if fallback and fallback.get("members"):
++            logger.warning(
++                "[PB1][UNIVERSE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
++                fallback.get("run_id"),
++                fallback.get("as_of"),
++                fallback.get("members_count"),
++            )
++            return UniverseContext(
++                as_of_date=str(fallback.get("as_of") or as_of),
++                members=fallback.get("members") or [],
++                selected_path=None,
++                meta={"source": "db_only", "as_of": fallback.get("as_of")},
++                is_empty=False,
++            )
++        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
++        if latest and latest.get("members"):
++            logger.warning(
++                "[PB1][UNIVERSE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
++                latest.get("run_id"),
++                latest.get("as_of"),
++                latest.get("members_count"),
++            )
++            return UniverseContext(
++                as_of_date=str(latest.get("as_of") or as_of),
++                members=latest.get("members") or [],
++                selected_path=None,
++                meta={"source": "db_only", "as_of": latest.get("as_of")},
++                is_empty=False,
++            )
++        logger.error("[PB1][UNIVERSE][DB_ONLY][MISS] env=%s strategy=%s as_of=%s", env, strategy, as_of)
++        raise RuntimeError("db_only_universe_missing")
+     if not members:
+         logger.warning(
+             "[PB1][UNIVERSE][EMPTY_OK] as_of=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
+             as_of,
+         )
+         return UniverseContext(
+             as_of_date=as_of,
+             members=[],
+             selected_path=None,
+             meta={"source": "db", "as_of": as_of},
+             is_empty=True,
+         )
+     return UniverseContext(
+         as_of_date=as_of,
+         members=members,
+         selected_path=None,
+         meta={"source": "db", "as_of": as_of},
+         is_empty=False,
+     )
+ 
+ 
+ def _resolve_market_context(
+     *,
+     now: datetime,
+     trading_day: bool,
+@@ -408,51 +490,51 @@ def _log_balance_cache(force: bool) -> None:
+     logger.info("[BALANCE][CACHE] hit=%s", not force)
+ 
+ 
+ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
+     token_ok = balance_ok = universe_ok = pretrade_ok = False
+     kis: KisAPI | None = None
+     members: list[dict] = []
+     try:
+         kis = KisAPI()
+         token_ok = True
+     except Exception as exc:
+         logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
+ 
+     if kis:
+         try:
+             _log_balance_cache(force=True)
+             snap = kis.get_balance_cached(force=True)
+             balance_ok = bool(snap)
+         except Exception:
+             logger.exception("[SMOKE][FAIL] balance")
+ 
+     repo = UniverseRepo(engine)
+     try:
+         members = repo.get_current_universe_members(kis_env, "best_k_meta")
+         if not members:
+-            if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1":
++            if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1" and not is_db_only_mode():
+                 from trader.universe import build as universe_build
+ 
+                 universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
+                 members = repo.get_current_universe_members(kis_env, "best_k_meta")
+             else:
+                 logger.info("[UNIVERSE][SKIP] forbidden during trade path")
+         universe_ok = bool(members)
+     except Exception:
+         logger.exception("[SMOKE][FAIL] universe")
+ 
+     if kis:
+         try:
+             code = members[0]["code"] if members else "005930"
+             quote = kis.get_price_quote(code, diag_mode=True, attempts=1)
+             pretrade_ok = bool(quote)
+         except Exception:
+             logger.exception("[SMOKE][FAIL] pretrade")
+ 
+     status = token_ok and balance_ok and universe_ok and pretrade_ok
+     if status:
+         logger.info(
+             "[SMOKE][PASS] token=%s balance=%s universe=%s pretrade=%s",
+             token_ok,
+             balance_ok,
+             universe_ok,
+@@ -982,50 +1064,57 @@ def run_once(
+                     reconcile_today(
+                         engine=engine,
+                         kis=kis,
+                         env=(os.getenv("KIS_ENV") or "practice").lower(),
+                         run_id=run_id,
+                         strategy="pb1_pullback_close",
+                     )
+                 except Exception:
+                     logger.exception("[PB1][DEGRADED] reconcile_today failed")
+             try:
+                 close_stale_positions(
+                     engine=engine,
+                     env=(os.getenv("KIS_ENV") or "practice").lower(),
+                     strategy="pb1_pullback_close",
+                     reason="budget_degraded",
+                     ts=now,
+                 )
+             except Exception:
+                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
+             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="budget_degraded", now=now)
+             return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
+         except Exception:
+             logger.exception("[PB1][DEGRADED] failed")
+ 
+     if not loop_mode:
++        if is_db_only_mode():
++            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
++            _log_db_only_universe_precheck(
++                repo=UniverseRepo(engine),
++                env=kis_env or "practice",
++                strategy=universe_strategy,
++            )
+         ensure_universe_built_once(engine=engine, as_of=as_of)
+ 
+     logger.info(
+         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
+         event_name_lower or "unknown",
+         now.isoformat(),
+         trading_day,
+         market_window,
+         window_label,
+         phase_for_log,
+         phase_reason,
+         dry_run,
+         os.getenv("DISABLE_LIVE_TRADING"),
+         os.getenv("LIVE_TRADING_ENABLED"),
+         os.getenv("STRATEGY_MODE"),
+         os.getenv("PB1_ENTRY_ENABLED"),
+         dry_run_reasons or ["live"],
+     )
+ 
+     if non_trading_day:
+         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
+         if diag_enabled:
+             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
+ 
+     runs_repo = RunsRepo(engine)
+diff --git a/trader/universe/build.py b/trader/universe/build.py
+index 4a202d3e49755aadf96e0101b3aa00f0bc66c114..c7cff5ff994af8d9f20bacc96b560bc1ab1eeab9 100644
+--- a/trader/universe/build.py
++++ b/trader/universe/build.py
+@@ -3,50 +3,51 @@ from __future__ import annotations
+ import argparse
+ import csv
+ import json
+ import logging
+ import os
+ import re
+ from pathlib import Path
+ from typing import Iterable
+ 
+ 
+ from trader.config import (
+     PB1_MIN_CANDLES,
+ )
+ from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
+ from trader.db.engine import make_engine
+ from trader.db.migrate import run_migrations
+ from trader.db.repos import UniverseRepo
+ from trader.kis_wrapper import KisAPI
+ from trader.time_utils import now_kst
+ from trader.universe.capabilities import providers_for_env
+ from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
+ from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
+ from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+ from trader.universe.validation import validate_listed_and_tradeable
+ from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
++from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
+ 
+ from datetime import date
+ 
+ 
+ def _parse_as_of_date(val: str) -> date | None:
+     """Best-effort parse for YYYY-MM-DD or YYYYMMDD."""
+     from datetime import datetime as _datetime
+ 
+     if not val:
+         return None
+     s = str(val).strip()
+     try:
+         if "-" in s:
+             return _datetime.fromisoformat(s).date()
+         if len(s) == 8 and s.isdigit():
+             return _datetime.strptime(s, "%Y%m%d").date()
+         return _datetime.fromisoformat(s).date()
+     except Exception:
+         return None
+ 
+ 
+ def _prefer_provider_order(chain: list[str]) -> list[str]:
+     """Prefer live providers first, then static, then caches."""
+     preferred = [
+         "fdr_kospi100_kosdaq100",
+@@ -126,50 +127,75 @@ def _dedup(seq: Iterable[str]) -> list[str]:
+             seen.add(val)
+             uniq.append(val)
+     return uniq
+ 
+ 
+ def _filter_tradeable_members(
+     members: list[dict],
+     *,
+     kis: KisAPI | None,
+ ) -> tuple[list[dict], list[dict]]:
+     if not kis:
+         logger.warning("[UNIVERSE][TRADEABLE][SKIP] kis_unavailable=1")
+         return members, []
+     kept: list[dict] = []
+     dropped: list[dict] = []
+     for member in members:
+         code = str(member.get("code") or "").zfill(6)
+         ok, reason = validate_listed_and_tradeable(kis, code)
+         if ok:
+             kept.append(member)
+             continue
+         dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
+     return kept, dropped
+ 
+ 
++def _load_fallback_universe_from_db(
++    *,
++    repo: UniverseRepo,
++    env: str,
++    strategy: str,
++    as_of_date: str,
++) -> list[dict]:
++    snapshot = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of_date)
++    if not snapshot:
++        logger.error(
++            "[UNIVERSE][FALLBACK][DB][MISS] env=%s strategy=%s as_of=%s",
++            env,
++            strategy,
++            as_of_date,
++        )
++        return []
++    logger.warning(
++        "[UNIVERSE][FALLBACK][DB] using run_id=%s as_of=%s members=%s",
++        snapshot.get("run_id"),
++        snapshot.get("as_of"),
++        snapshot.get("members_count"),
++    )
++    return snapshot.get("members") or []
++
++
+ 
+ 
+ def _load_seed_rows(path: Path) -> list[dict]:
+     if not path.exists():
+         return []
+     rows: list[dict] = []
+     try:
+         with path.open(encoding="utf-8") as f:
+             # CSV with header: code,name
+             reader = csv.DictReader(f)
+             has_code_header = reader.fieldnames and any(fn.lower() == "code" for fn in reader.fieldnames)
+             if has_code_header:
+                 for row in reader:
+                     code = str(row.get("code") or "").strip()
+                     if not code:
+                         continue
+                     rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+             else:
+                 f.seek(0)
+                 for line in f:
+                     code = line.strip()
+                     if code:
+                         rows.append({"code": code.zfill(6), "name": None})
+     except Exception:
+         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
+@@ -546,60 +572,97 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override:
+             insufficient_codes[: min(5, len(insufficient_codes))],
+         )
+ 
+     validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
+     kis_validator: KisAPI | None = None
+     if validate_kis:
+         try:
+             kis_validator = kis_provider.kis if kis_provider else KisAPI(kis_env=env)
+         except Exception as exc:
+             logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
+             kis_validator = None
+     if validate_kis:
+         members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
+         if dropped_tradeable:
+             stats["not_tradeable"] = len(dropped_tradeable)
+             sanitize_detail["dropped"].extend(dropped_tradeable)
+             sanitize_detail["kept"] = [m.get("code") for m in members]
+             logger.info(
+                 "[UNIVERSE][DROP] reason=not_tradeable count=%s sample=%s",
+                 len(dropped_tradeable),
+                 dropped_tradeable[: min(5, len(dropped_tradeable))],
+             )
+ 
+     if not members:
+         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
++        error_reason = f"provider_empty:{last_reason or source}"
++        try:
++            repo.record_universe_run_failure(
++                env=env,
++                strategy=strategy,
++                as_of_date=as_of_date,
++                provider=source,
++                error_reason=error_reason,
++                members_count=0,
++            )
++        except Exception:
++            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
++        allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE"
++        if allow_fallback:
++            fallback_members = _load_fallback_universe_from_db(
++                repo=repo,
++                env=env,
++                strategy=strategy,
++                as_of_date=as_of_date,
++            )
++            if fallback_members:
++                return fallback_members
+         raise RuntimeError("universe_members_empty")
+ 
+-    repo.store_universe_snapshot(
+-        env=env,
+-        strategy=strategy,
+-        as_of_date=as_of_date,
+-        provider=source,
+-        members=members,
+-        reason=last_reason,
+-    )
++    try:
++        repo.store_universe_snapshot(
++            env=env,
++            strategy=strategy,
++            as_of_date=as_of_date,
++            provider=source,
++            members=members,
++            reason=last_reason,
++        )
++    except Exception as exc:
++        error_reason = f"store_fail:{exc}"
++        try:
++            repo.record_universe_run_failure(
++                env=env,
++                strategy=strategy,
++                as_of_date=as_of_date,
++                provider=source,
++                error_reason=error_reason,
++                members_count=len(members),
++            )
++        except Exception:
++            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
++        raise
+     repo.cleanup_old_runs(retain_days=int(os.getenv("UNIVERSE_RETENTION_DAYS", "30")))
+     logger.info(
+         "[UNIVERSE][BUILT] env=%s strategy=%s as_of=%s members=%s source=%s reason=%s",
+         env,
+         strategy,
+         as_of_date,
+         len(members),
+         source,
+         last_reason or "n/a",
+     )
+     _write_universe_sanitize_report(
+         as_of_date=as_of_date,
+         keep_codes=sanitize_detail.get("kept") or [],
+         dropped=sanitize_detail.get("dropped") or [],
+     )
+     _write_universe_drop_diagnostics(
+         as_of_date=as_of_date,
+         source=source,
+         invalid_format_codes=sanitize_detail.get("invalid_format_codes") or [],
+         insufficient_history_codes=sanitize_detail.get("insufficient_history_codes") or [],
+     )
+     return members
+ 
+ 
+ def main() -> None:
+diff --git a/trader/universe/db_check.py b/trader/universe/db_check.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..825a8180e742b222ceb32aa46c7ee1b6273a3549
+--- /dev/null
++++ b/trader/universe/db_check.py
+@@ -0,0 +1,69 @@
++from __future__ import annotations
++
++import argparse
++import logging
++import os
++
++from trader.db.engine import make_engine
++from trader.db.migrate import run_migrations
++from trader.db.repos import UniverseRepo
++from trader.universe.mode import resolve_strategy_mode
++
++logger = logging.getLogger(__name__)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="DB universe precheck")
++    parser.add_argument("--env", required=True, help="Environment key (practice/real)")
++    parser.add_argument("--strategy", required=True, help="Strategy key")
++    parser.add_argument("--mode", help="Strategy mode (LIVE/DIAG). Defaults to env")
++    return parser.parse_args()
++
++
++def _write_env_flag(flag: str, value: str) -> None:
++    github_env = os.getenv("GITHUB_ENV")
++    if not github_env:
++        return
++    try:
++        with open(github_env, "a", encoding="utf-8") as f:
++            f.write(f"{flag}={value}\n")
++    except Exception:
++        logger.exception("[UNIVERSE][DB_CHECK][ENV_FAIL] flag=%s value=%s", flag, value)
++
++
++def main() -> int:
++    logging.basicConfig(level=logging.INFO)
++    args = parse_args()
++    mode = (args.mode or resolve_strategy_mode() or "LIVE").upper()
++    engine = make_engine()
++    run_migrations(engine)
++    repo = UniverseRepo(engine)
++    snapshot = repo.get_current_universe_snapshot(args.env, args.strategy)
++    if not snapshot or not snapshot.get("members"):
++        logger.error(
++            "[UNIVERSE][DB_CHECK][MISSING] env=%s strategy=%s mode=%s",
++            args.env,
++            args.strategy,
++            mode,
++        )
++        if mode == "LIVE":
++            logger.warning("[UNIVERSE][DB_CHECK][NO_TRADE] mode=LIVE -> skipping trade")
++            _write_env_flag("NO_TRADE", "1")
++            return 0
++        return 1
++    logger.info(
++        "[UNIVERSE][DB_CHECK][OK] env=%s strategy=%s mode=%s run_id=%s as_of=%s members=%s sample=%s",
++        args.env,
++        args.strategy,
++        mode,
++        snapshot.get("run_id"),
++        snapshot.get("as_of"),
++        snapshot.get("members_count"),
++        snapshot.get("sample_codes"),
++    )
++    _write_env_flag("NO_TRADE", "0")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/trader/universe/mode.py b/trader/universe/mode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1398a4f474764d1d857fda99994f469f89300f36
+--- /dev/null
++++ b/trader/universe/mode.py
+@@ -0,0 +1,12 @@
++from __future__ import annotations
++
++import os
++
++
++def is_db_only_mode() -> bool:
++    source = (os.getenv("UNIVERSE_SOURCE") or "").strip().upper()
++    return source == "DB_ONLY" or os.getenv("DB_ONLY") == "1" or os.getenv("UNIVERSE_DB_ONLY") == "1"
++
++
++def resolve_strategy_mode() -> str:
++    return (os.getenv("EFFECTIVE_STRATEGY_MODE") or os.getenv("STRATEGY_MODE") or "").strip().upper()
+diff --git a/trader/universe/providers/fdr_kospi_kosdaq_100.py b/trader/universe/providers/fdr_kospi_kosdaq_100.py
+index 03069b1ef2334d2ad070a898471470800137c21e..c1a3f03e3c93b5ce785b5d1f60dde395fc89f1a7 100644
+--- a/trader/universe/providers/fdr_kospi_kosdaq_100.py
++++ b/trader/universe/providers/fdr_kospi_kosdaq_100.py
+@@ -1,162 +1,226 @@
+ from __future__ import annotations
+ 
+ import logging
+ from collections import Counter
+ from typing import Iterable
+ 
+ import pandas as pd
+ 
+ from trader.universe.providers.fdr_marketcap_top import (
+     CODE_COLUMNS,
+     MARKET_CAP_COLUMNS,
+     MARKET_COLUMNS,
+     NAME_COLUMNS,
+     _filter_market,
+     _find_column,
+-    _normalize_code,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
+ STATUS_COLUMNS = (
+     "거래정지",
+     "거래정지여부",
+     "관리종목",
+     "관리종목여부",
+     "상장폐지",
+     "상장폐지여부",
+     "정리매매",
+     "정리매매여부",
+     "투자주의",
+     "투자경고",
+     "투자위험",
+     "투자주의종목",
+     "투자경고종목",
+     "투자위험종목",
+ )
+ 
+ 
+ def _is_flagged(row: pd.Series, columns: Iterable[str]) -> bool:
+     for col in columns:
+         if col not in row:
+             continue
+         val = row.get(col)
+         if val is None:
+             continue
+         if isinstance(val, (int, float)) and val != 0:
+             return True
+         if isinstance(val, str) and val.strip() and val.strip().upper() not in {"N", "NO", "0", "FALSE", "F"}:
+             return True
+         if isinstance(val, bool) and val:
+             return True
+     return False
+ 
+ 
++def _normalize_code(series: pd.Series) -> pd.Series:
++    s = series.astype(str).str.strip()
++    s = s.str.extract(r"(\d+)")[0]
++    s = s.fillna("")
++    s = s.str.zfill(6)
++    s = s.where(s.str.match(r"^\d{6}$"), "")
++    return s
++
++
++def _normalize_marcap(series: pd.Series) -> pd.Series:
++    s = series.astype(str).str.strip()
++    s = s.str.replace(",", "", regex=False)
++    s = s.replace({"": None, "nan": None, "NaN": None, "-": None})
++    return pd.to_numeric(s, errors="coerce")
++
++
+ def _normalize_rows(
+     df: pd.DataFrame,
+     *,
+-    code_col: str,
+     name_col: str | None,
+-    cap_col: str,
+-    market_col: str,
+-    market_name: str,
+-    target: int,
+ ) -> tuple[list[dict], Counter[str]]:
+     rows: list[dict] = []
+     dropped: Counter[str] = Counter()
+     seen: set[str] = set()
+-    status_cols = [col for col in STATUS_COLUMNS if col in df.columns]
+     for _, row in df.iterrows():
+-        if len(rows) >= target:
+-            break
+-        market_val = str(row.get(market_col) or "").upper()
+-        if market_name.upper() not in market_val:
+-            dropped["non_target_market"] += 1
+-            continue
+-        if status_cols and _is_flagged(row, status_cols):
+-            dropped["flagged"] += 1
+-            continue
+-        code = _normalize_code(row.get(code_col))
++        code = row.get("code_norm")
+         if not code:
+             dropped["invalid_code"] += 1
+             continue
+-        try:
+-            marcap = float(row.get(cap_col))
+-        except Exception:
+-            marcap = 0.0
+-        if pd.isna(marcap) or marcap <= 0:
+-            dropped["nan_marcap"] += 1
+-            continue
+         if code in seen:
+             dropped["dup_code"] += 1
+             continue
+         seen.add(code)
+         name = None
+         if name_col:
+             raw_name = row.get(name_col)
+             if raw_name is not None:
+                 name = str(raw_name).strip() or None
+         rows.append({"code": code, "name": name})
+     return rows, dropped
+ 
+ 
+ def fetch_kospi100_kosdaq100(*, target: int = 100) -> dict[str, list[dict]]:
+     """Return top 100 market-cap rows for KOSPI/KOSDAQ using FinanceDataReader."""
+     try:
+         import FinanceDataReader as fdr
+     except Exception:
+         logger.exception("[UNIVERSE][FDR-KOSPI100] FinanceDataReader import failed")
+         raise
+ 
+     logger.info("[UNIVERSE][FDR-KOSPI100][START] target=%s", target)
+     listing = fdr.StockListing("KRX")
+     logger.info("[UNIVERSE][FDR-KOSPI100][LISTING] rows=%s cols=%s", len(listing), list(listing.columns))
+ 
+     market_col = _find_column(listing.columns, MARKET_COLUMNS, "market")
+     cap_col = _find_column(listing.columns, MARKET_CAP_COLUMNS, "market cap")
+     code_col = _find_column(listing.columns, CODE_COLUMNS, "code")
+     name_col = None
+     try:
+         name_col = _find_column(listing.columns, NAME_COLUMNS, "name")
+     except RuntimeError:
+         name_col = None
+ 
+     results: dict[str, list[dict]] = {}
+     for market_name in ("KOSPI", "KOSDAQ"):
+         market_df = _filter_market(listing, market_col, market_name)
+-        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce")
+-        market_df = market_df.sort_values(cap_col, ascending=False)
++        raw_dtypes = market_df[[code_col, cap_col]].dtypes.astype(str).to_dict()
++        logger.info("[UNIVERSE][FDR-KOSPI100][DTYPE] market=%s raw_dtype=%s", market_name, raw_dtypes)
++
++        market_df = market_df.copy()
++        market_df["code_norm"] = _normalize_code(market_df[code_col])
++        market_df["marcap_norm"] = _normalize_marcap(market_df[cap_col])
++
++        nan_rate = float(market_df["marcap_norm"].isna().mean()) if len(market_df) else 0.0
++        invalid_code_rate = float((market_df["code_norm"] == "").mean()) if len(market_df) else 0.0
++
++        sample_rows = []
++        for _, row in market_df.head(5).iterrows():
++            sample_rows.append(
++                {
++                    "code_raw": row.get(code_col),
++                    "marcap_raw": row.get(cap_col),
++                    "code_norm": row.get("code_norm"),
++                    "marcap_norm": row.get("marcap_norm"),
++                }
++            )
++        logger.info(
++            "[UNIVERSE][FDR-KOSPI100][SAMPLE][RAW] market=%s samples=%s",
++            market_name,
++            sample_rows,
++        )
++
++        status_cols = [col for col in STATUS_COLUMNS if col in market_df.columns]
++        if status_cols:
++            market_df["flagged"] = market_df.apply(lambda row: _is_flagged(row, status_cols), axis=1)
++        else:
++            market_df["flagged"] = False
++
++        invalid_code = int((market_df["code_norm"] == "").sum())
++        nan_marcap = int((market_df["marcap_norm"].isna() | (market_df["marcap_norm"] <= 0)).sum())
++        flagged = int(market_df["flagged"].sum())
++        cleaned = market_df[
++            (market_df["code_norm"] != "")
++            & market_df["marcap_norm"].notna()
++            & (market_df["marcap_norm"] > 0)
++            & (~market_df["flagged"])
++        ].copy()
++        dup_before = len(cleaned)
++        cleaned = cleaned.drop_duplicates(subset=["code_norm"], keep="first")
++        dup_code = dup_before - len(cleaned)
++
++        logger.info(
++            "[UNIVERSE][FDR-KOSPI100][CLEAN] market=%s raw_rows=%s valid_rows=%s nan_marcap=%s invalid_code=%s nan_rate=%.4f invalid_rate=%.4f flagged=%s dup_code=%s",
++            market_name,
++            len(market_df),
++            len(cleaned),
++            nan_marcap,
++            invalid_code,
++            nan_rate,
++            invalid_code_rate,
++            flagged,
++            dup_code,
++        )
++
++        cleaned = cleaned.sort_values("marcap_norm", ascending=False)
+         candidate_limit = max(target * 3, target)
++        candidate_limit = min(candidate_limit, len(cleaned))
+         logger.info(
+             "[UNIVERSE][FDR-KOSPI100][SORT] market=%s column=%s order=desc target=%s candidate_limit=%s",
+             market_name,
+             cap_col,
+             target,
+             candidate_limit,
+         )
+-        top_df = market_df.head(candidate_limit)
++
++        selected_df = cleaned.head(candidate_limit)
++        while len(selected_df) < target and candidate_limit < len(cleaned):
++            candidate_limit = min(candidate_limit * 2, len(cleaned))
++            logger.info(
++                "[UNIVERSE][FDR-KOSPI100][FILLDOWN] market=%s expanded_candidate_limit=%s",
++                market_name,
++                candidate_limit,
++            )
++            selected_df = cleaned.head(candidate_limit)
++        selected_df = selected_df.head(target)
+         rows, dropped = _normalize_rows(
+-            top_df,
+-            code_col=code_col,
++            selected_df,
+             name_col=name_col,
+-            cap_col=cap_col,
+-            market_col=market_col,
+-            market_name=market_name,
+-            target=target,
++        )
++        dropped.update(
++            {
++                "nan_marcap": nan_marcap,
++                "invalid_code": invalid_code,
++                "flagged": flagged,
++                "dup_code": dup_code,
++            }
+         )
+         sample_codes = [row["code"] for row in rows[:5]]
+         logger.info("[UNIVERSE][FDR-KOSPI100][SAMPLE] market=%s codes=%s", market_name, sample_codes)
+         logger.info("[UNIVERSE][FDR-KOSPI100][SELECTED] market=%s count=%s", market_name, len(rows))
+         if len(rows) < target:
+             logger.warning(
+                 "[UNIVERSE][FDR-KOSPI100][FILLDOWN][WARN] market=%s target=%s selected=%s dropped=%s",
+                 market_name,
+                 target,
+                 len(rows),
+                 dict(dropped),
+             )
+         results[market_name] = rows
+ 
+     total_count = sum(len(rows) for rows in results.values())
+     logger.info("[UNIVERSE][FDR-KOSPI100][DONE] total=%s", total_count)
+     return results

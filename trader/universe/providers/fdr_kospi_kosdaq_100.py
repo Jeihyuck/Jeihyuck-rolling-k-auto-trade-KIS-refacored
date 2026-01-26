@@ -13,7 +13,6 @@ from trader.universe.providers.fdr_marketcap_top import (
     NAME_COLUMNS,
     _filter_market,
     _find_column,
-    _normalize_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,40 +51,34 @@ def _is_flagged(row: pd.Series, columns: Iterable[str]) -> bool:
     return False
 
 
+def _normalize_code(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    s = s.str.extract(r"(\d+)")[0]
+    s = s.fillna("")
+    s = s.str.zfill(6)
+    s = s.where(s.str.match(r"^\d{6}$"), "")
+    return s
+
+
+def _normalize_marcap(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    s = s.str.replace(",", "", regex=False)
+    s = s.replace({"": None, "nan": None, "NaN": None, "-": None})
+    return pd.to_numeric(s, errors="coerce")
+
+
 def _normalize_rows(
     df: pd.DataFrame,
     *,
-    code_col: str,
     name_col: str | None,
-    cap_col: str,
-    market_col: str,
-    market_name: str,
-    target: int,
 ) -> tuple[list[dict], Counter[str]]:
     rows: list[dict] = []
     dropped: Counter[str] = Counter()
     seen: set[str] = set()
-    status_cols = [col for col in STATUS_COLUMNS if col in df.columns]
     for _, row in df.iterrows():
-        if len(rows) >= target:
-            break
-        market_val = str(row.get(market_col) or "").upper()
-        if market_name.upper() not in market_val:
-            dropped["non_target_market"] += 1
-            continue
-        if status_cols and _is_flagged(row, status_cols):
-            dropped["flagged"] += 1
-            continue
-        code = _normalize_code(row.get(code_col))
+        code = row.get("code_norm")
         if not code:
             dropped["invalid_code"] += 1
-            continue
-        try:
-            marcap = float(row.get(cap_col))
-        except Exception:
-            marcap = 0.0
-        if pd.isna(marcap) or marcap <= 0:
-            dropped["nan_marcap"] += 1
             continue
         if code in seen:
             dropped["dup_code"] += 1
@@ -124,9 +117,67 @@ def fetch_kospi100_kosdaq100(*, target: int = 100) -> dict[str, list[dict]]:
     results: dict[str, list[dict]] = {}
     for market_name in ("KOSPI", "KOSDAQ"):
         market_df = _filter_market(listing, market_col, market_name)
-        market_df[cap_col] = pd.to_numeric(market_df[cap_col], errors="coerce")
-        market_df = market_df.sort_values(cap_col, ascending=False)
+        raw_dtypes = market_df[[code_col, cap_col]].dtypes.astype(str).to_dict()
+        logger.info("[UNIVERSE][FDR-KOSPI100][DTYPE] market=%s raw_dtype=%s", market_name, raw_dtypes)
+
+        market_df = market_df.copy()
+        market_df["code_norm"] = _normalize_code(market_df[code_col])
+        market_df["marcap_norm"] = _normalize_marcap(market_df[cap_col])
+
+        nan_rate = float(market_df["marcap_norm"].isna().mean()) if len(market_df) else 0.0
+        invalid_code_rate = float((market_df["code_norm"] == "").mean()) if len(market_df) else 0.0
+
+        sample_rows = []
+        for _, row in market_df.head(5).iterrows():
+            sample_rows.append(
+                {
+                    "code_raw": row.get(code_col),
+                    "marcap_raw": row.get(cap_col),
+                    "code_norm": row.get("code_norm"),
+                    "marcap_norm": row.get("marcap_norm"),
+                }
+            )
+        logger.info(
+            "[UNIVERSE][FDR-KOSPI100][SAMPLE][RAW] market=%s samples=%s",
+            market_name,
+            sample_rows,
+        )
+
+        status_cols = [col for col in STATUS_COLUMNS if col in market_df.columns]
+        if status_cols:
+            market_df["flagged"] = market_df.apply(lambda row: _is_flagged(row, status_cols), axis=1)
+        else:
+            market_df["flagged"] = False
+
+        invalid_code = int((market_df["code_norm"] == "").sum())
+        nan_marcap = int((market_df["marcap_norm"].isna() | (market_df["marcap_norm"] <= 0)).sum())
+        flagged = int(market_df["flagged"].sum())
+        cleaned = market_df[
+            (market_df["code_norm"] != "")
+            & market_df["marcap_norm"].notna()
+            & (market_df["marcap_norm"] > 0)
+            & (~market_df["flagged"])
+        ].copy()
+        dup_before = len(cleaned)
+        cleaned = cleaned.drop_duplicates(subset=["code_norm"], keep="first")
+        dup_code = dup_before - len(cleaned)
+
+        logger.info(
+            "[UNIVERSE][FDR-KOSPI100][CLEAN] market=%s raw_rows=%s valid_rows=%s nan_marcap=%s invalid_code=%s nan_rate=%.4f invalid_rate=%.4f flagged=%s dup_code=%s",
+            market_name,
+            len(market_df),
+            len(cleaned),
+            nan_marcap,
+            invalid_code,
+            nan_rate,
+            invalid_code_rate,
+            flagged,
+            dup_code,
+        )
+
+        cleaned = cleaned.sort_values("marcap_norm", ascending=False)
         candidate_limit = max(target * 3, target)
+        candidate_limit = min(candidate_limit, len(cleaned))
         logger.info(
             "[UNIVERSE][FDR-KOSPI100][SORT] market=%s column=%s order=desc target=%s candidate_limit=%s",
             market_name,
@@ -134,15 +185,28 @@ def fetch_kospi100_kosdaq100(*, target: int = 100) -> dict[str, list[dict]]:
             target,
             candidate_limit,
         )
-        top_df = market_df.head(candidate_limit)
+
+        selected_df = cleaned.head(candidate_limit)
+        while len(selected_df) < target and candidate_limit < len(cleaned):
+            candidate_limit = min(candidate_limit * 2, len(cleaned))
+            logger.info(
+                "[UNIVERSE][FDR-KOSPI100][FILLDOWN] market=%s expanded_candidate_limit=%s",
+                market_name,
+                candidate_limit,
+            )
+            selected_df = cleaned.head(candidate_limit)
+        selected_df = selected_df.head(target)
         rows, dropped = _normalize_rows(
-            top_df,
-            code_col=code_col,
+            selected_df,
             name_col=name_col,
-            cap_col=cap_col,
-            market_col=market_col,
-            market_name=market_name,
-            target=target,
+        )
+        dropped.update(
+            {
+                "nan_marcap": nan_marcap,
+                "invalid_code": invalid_code,
+                "flagged": flagged,
+                "dup_code": dup_code,
+            }
         )
         sample_codes = [row["code"] for row in rows[:5]]
         logger.info("[UNIVERSE][FDR-KOSPI100][SAMPLE] market=%s codes=%s", market_name, sample_codes)

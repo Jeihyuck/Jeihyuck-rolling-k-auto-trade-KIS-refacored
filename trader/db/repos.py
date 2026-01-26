@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError
-from sqlalchemy import Engine, and_, func, select
+from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
@@ -238,6 +238,98 @@ class UniverseRepo:
             return []
         return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
 
+    def get_current_universe_snapshot(self, env: str, strategy: str) -> dict | None:
+        strategy_key = self._strategy_key(env, strategy)
+        members_count_sq = (
+            select(
+                self._schema.universe_members.c.run_id,
+                func.count().label("members_count"),
+            )
+            .group_by(self._schema.universe_members.c.run_id)
+            .subquery()
+        )
+        stmt = (
+            select(
+                self._schema.universe_current.c.run_id,
+                self._schema.universe_runs.c.as_of,
+                self._schema.universe_runs.c.provider,
+                self._schema.universe_runs.c.status,
+                members_count_sq.c.members_count,
+            )
+            .select_from(
+                self._schema.universe_current.join(
+                    self._schema.universe_runs,
+                    self._schema.universe_current.c.run_id == self._schema.universe_runs.c.run_id,
+                ).outerjoin(
+                    members_count_sq,
+                    members_count_sq.c.run_id == self._schema.universe_runs.c.run_id,
+                )
+            )
+            .where(self._schema.universe_current.c.strategy == strategy_key)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        if not row:
+            return None
+        run_id = str(row["run_id"])
+        members = self._fetch_members_for_run(run_id, env=env, strategy=strategy)
+        return {
+            "run_id": run_id,
+            "as_of": row.get("as_of"),
+            "provider": row.get("provider"),
+            "status": row.get("status"),
+            "members_count": len(members),
+            "members": members,
+            "sample_codes": [m.get("code") for m in members[:5]],
+        }
+
+    def get_latest_successful_universe_snapshot(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of_date: str,
+        limit: int = 10,
+    ) -> dict | None:
+        strategy_key = self._strategy_key(env, strategy)
+        as_of_d = _as_date(as_of_date)
+        stmt = (
+            select(
+                self._schema.universe_runs.c.run_id,
+                self._schema.universe_runs.c.as_of,
+                self._schema.universe_runs.c.provider,
+                self._schema.universe_runs.c.status,
+            )
+            .where(
+                and_(
+                    self._schema.universe_runs.c.strategy == strategy_key,
+                    self._schema.universe_runs.c.as_of <= as_of_d,
+                    or_(
+                        self._schema.universe_runs.c.status == "SUCCESS",
+                        self._schema.universe_runs.c.status.is_(None),
+                    ),
+                )
+            )
+            .order_by(self._schema.universe_runs.c.as_of.desc(), self._schema.universe_runs.c.created_ts.desc())
+            .limit(limit)
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        for row in rows:
+            run_id = str(row["run_id"])
+            members = self._fetch_members_for_run(run_id, env=env, strategy=strategy)
+            if members:
+                return {
+                    "run_id": run_id,
+                    "as_of": row.get("as_of"),
+                    "provider": row.get("provider"),
+                    "status": row.get("status"),
+                    "members_count": len(members),
+                    "members": members,
+                    "sample_codes": [m.get("code") for m in members[:5]],
+                }
+        return None
+
     def get_universe_members(self, *, env: str, strategy: str, as_of_date: str) -> list[dict]:
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
@@ -275,6 +367,7 @@ class UniverseRepo:
         db_url = str(self.engine.url)
         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
         strategy_key = self._strategy_key(env, strategy)
+        members_count = len(members_list)
         try:
             with self.engine.begin() as conn:
                 existing = conn.execute(
@@ -295,6 +388,8 @@ class UniverseRepo:
                         provider=provider,
                         as_of=as_of_d,
                         created_ts=now_kst().isoformat(),
+                        status="STARTED",
+                        members_count=0,
                     )
                 )
                 for rank, member in enumerate(members_list, start=1):
@@ -310,27 +405,76 @@ class UniverseRepo:
                             reason=member.get("reason") or reason,
                         )
                     )
-                if self.engine.dialect.name == "postgresql":
-                    insert_stmt = pg_insert(self._schema.universe_current).values(
-                        strategy=strategy_key,
-                        run_id=uuid_value_for_url(db_url, run_id),
-                        updated_ts=now_kst().isoformat(),
-                    )
-                else:
-                    insert_stmt = sa.insert(self._schema.universe_current).values(
-                        strategy=strategy_key,
-                        run_id=uuid_value_for_url(db_url, run_id),
-                        updated_ts=now_kst().isoformat(),
+                if members_count > 0:
+                    if self.engine.dialect.name == "postgresql":
+                        insert_stmt = pg_insert(self._schema.universe_current).values(
+                            strategy=strategy_key,
+                            run_id=uuid_value_for_url(db_url, run_id),
+                            updated_ts=now_kst().isoformat(),
+                        )
+                    else:
+                        insert_stmt = sa.insert(self._schema.universe_current).values(
+                            strategy=strategy_key,
+                            run_id=uuid_value_for_url(db_url, run_id),
+                            updated_ts=now_kst().isoformat(),
+                        )
+                    conn.execute(
+                        insert_stmt.on_conflict_do_update(
+                            index_elements=[self._schema.universe_current.c.strategy],
+                            set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
+                        )
                     )
                 conn.execute(
-                    insert_stmt.on_conflict_do_update(
-                        index_elements=[self._schema.universe_current.c.strategy],
-                        set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
-                    )
+                    sa.update(self._schema.universe_runs)
+                    .where(self._schema.universe_runs.c.run_id == run_id)
+                    .values(status="SUCCESS", error_reason=None, members_count=members_count)
                 )
             return str(run_id)
         except Exception:
             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+            raise
+
+    def record_universe_run_failure(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of_date: str,
+        provider: str,
+        error_reason: str,
+        members_count: int = 0,
+    ) -> str:
+        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
+        strategy_key = self._strategy_key(env, strategy)
+        as_of_d = _as_date(as_of_date)
+        try:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    select(self._schema.universe_runs.c.run_id).where(
+                        and_(
+                            self._schema.universe_runs.c.strategy == strategy_key,
+                            self._schema.universe_runs.c.provider == provider,
+                            self._schema.universe_runs.c.as_of == as_of_d,
+                        )
+                    )
+                ).scalar()
+                if existing:
+                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                conn.execute(
+                    sa.insert(self._schema.universe_runs).values(
+                        run_id=run_id,
+                        strategy=strategy_key,
+                        provider=provider,
+                        as_of=as_of_d,
+                        created_ts=now_kst().isoformat(),
+                        status="FAIL",
+                        error_reason=error_reason,
+                        members_count=members_count,
+                    )
+                )
+            return str(run_id)
+        except Exception:
+            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
             raise
 
     def cleanup_old_runs(self, *, retain_days: int = 30) -> None:

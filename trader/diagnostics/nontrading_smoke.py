@@ -12,6 +12,7 @@ from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRX
 from trader.db.repos import LedgerEventsRepo
 from trader.kis_wrapper import KisAPI
 from trader.universe.build import build_universe
+from trader.universe.mode import is_db_only_mode
 from trader.db.repos import UniverseRepo
 
 logger = logging.getLogger(__name__)
@@ -107,7 +108,9 @@ def run_nontrading_smoke_once(
         _check_timeout("universe_load")
         repo = UniverseRepo(engine)
         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
-        if not members and (force_rebuild or (EMERGENCY_UNIVERSE_BUILD and os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG")):
+        if not members and not is_db_only_mode() and (
+            force_rebuild or (EMERGENCY_UNIVERSE_BUILD and os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG")
+        ):
             build_universe(as_of_date=as_of, env=env, strategy=strategy)
             members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
         member_count = len(members)

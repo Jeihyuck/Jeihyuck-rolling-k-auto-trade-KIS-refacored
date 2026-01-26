@@ -237,7 +237,13 @@ jobs:
             echo "LIVE_TRADING_ENABLED=1" >> "$GITHUB_ENV"
           fi
 
+      - name: DB universe precheck
+        run: |
+          set -euo pipefail
+          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
+
       - name: Run (DB-only)
+        if: env.NO_TRADE != '1'
         env:
           LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
         run: |
