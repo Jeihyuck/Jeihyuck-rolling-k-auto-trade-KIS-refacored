@@ -154,6 +154,15 @@ jobs:
       DIAG_REHEARSAL_KIS_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_REHEARSAL_KIS_CALLS || '1' }}
       NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
 
+      # [5] GitHub Actions / 실행 env도 LIVE로 고정
+      DB_ONLY: "0"
+      NONTRADING_SMOKE: "0"
+      DRY_RUN: "0"
+      LIVE_TRADING_ENABLED: "1"
+      DISABLE_LIVE_TRADING: "0"
+      STRATEGY_MODE: "LIVE"
+      NO_TRADE: "0"
+
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
@@ -204,6 +213,22 @@ jobs:
             exit 1
           fi
 
+      - name: "Guard: LIVE env precheck"
+        run: |
+          set -euo pipefail
+          violations=()
+          [ "${DB_ONLY:-}" = "1" ] && violations+=("DB_ONLY=1")
+          [ "${NONTRADING_SMOKE:-}" = "1" ] && violations+=("NONTRADING_SMOKE=1")
+          [ "${DRY_RUN:-}" = "1" ] && violations+=("DRY_RUN=1")
+          [ "${LIVE_TRADING_ENABLED:-}" != "1" ] && violations+=("LIVE_TRADING_ENABLED != '1'")
+          [ "${DISABLE_LIVE_TRADING:-}" = "1" ] && violations+=("DISABLE_LIVE_TRADING=1")
+          [ "${STRATEGY_MODE:-}" != "LIVE" ] && violations+=("STRATEGY_MODE != 'LIVE'")
+          if [ ${#violations[@]} -gt 0 ]; then
+            echo "::error::LIVE env violations: ${violations[*]}"
+            exit 1
+          fi
+          echo "[PRECHECK] LIVE env ok"
+
       - name: Precheck import (fail fast)
         run: |
           set -euo pipefail
@@ -229,12 +254,17 @@ jobs:
           PY
 
       - name: "Gate: disable live trading in DIAG"
+        id: gate
         run: |
           set -euo pipefail
           if [ "${EFFECTIVE_STRATEGY_MODE:-}" = "DIAG" ]; then
             echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
+            echo "no_trade=1" >> "$GITHUB_OUTPUT"
+            echo "NO_TRADE=1" >> "$GITHUB_ENV"
           else
             echo "LIVE_TRADING_ENABLED=1" >> "$GITHUB_ENV"
+            echo "no_trade=0" >> "$GITHUB_OUTPUT"
+            echo "NO_TRADE=0" >> "$GITHUB_ENV"
           fi
 
       - name: DB universe precheck
@@ -243,7 +273,7 @@ jobs:
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
       - name: Run (DB-only)
-        if: env.NO_TRADE != '1'
+        if: steps.gate.outputs.no_trade != '1'
         env:
           LIVE_TRADING_ENABLED: ${{ env.LIVE_TRADING_ENABLED }}
         run: |

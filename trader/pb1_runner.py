@@ -678,6 +678,23 @@ def run_once(
         if value:
             workflow_run_id = str(value)
             break
+    
+    # [1] LIVE 강제 정책: STRATEGY_MODE=LIVE일 때 env 검증
+    if os.getenv("STRATEGY_MODE") == "LIVE":
+        violations = []
+        if os.getenv("LIVE_TRADING_ENABLED") != "1":
+            violations.append("LIVE_TRADING_ENABLED != '1'")
+        if os.getenv("DISABLE_LIVE_TRADING") == "1":
+            violations.append("DISABLE_LIVE_TRADING == '1'")
+        if os.getenv("DRY_RUN") == "1":
+            violations.append("DRY_RUN == '1'")
+        if os.getenv("DB_ONLY") == "1":
+            violations.append("DB_ONLY == '1'")
+        if os.getenv("NONTRADING_SMOKE") == "1":
+            violations.append("NONTRADING_SMOKE == '1'")
+        if violations:
+            raise RuntimeError(f"LIVE mode violations: {', '.join(violations)}")
+    
     now = _get_now_kst()
     if now.tzinfo is None:
         now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
@@ -1188,6 +1205,18 @@ def run_once(
         user_entry_enabled = bool(entry_flag.value)
         entry_allowed_this_tick = user_entry_enabled
         entry_block_reason = None
+        
+        # [2] 거래시간 체크: LIVE 모드에서 장중 여부 판정
+        if mode == "LIVE":
+            is_weekday = now.weekday() < 5  # Mon-Fri
+            market_open = datetime.strptime("09:00", "%H:%M").time()
+            market_close = datetime.strptime("15:20", "%H:%M").time()
+            in_market_hours = is_weekday and (market_open <= now.time() < market_close)
+            if not in_market_hours:
+                logger.info("[PB1][LIVE][OUT_OF_MARKET] now=%s weekday=%s -> no entry/exit", now.isoformat(), is_weekday)
+                entry_allowed_this_tick = False
+                entry_block_reason = entry_block_reason or "out_of_market_hours"
+        
         if not user_entry_enabled:
             entry_allowed_this_tick = False
             entry_block_reason = "entry_disabled"

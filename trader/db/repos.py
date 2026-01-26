@@ -150,6 +150,8 @@ class RunsRepo:
         workflow_attempt: int | None,
         config_json: dict | None,
     ) -> str:
+        # Handle dry_run type compatibility: try bool first, fallback to int if column is INTEGER
+        dry_run_value = dry_run
         values = {
             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
             "env": env,
@@ -157,7 +159,7 @@ class RunsRepo:
             "run_window": run_window,
             "phase": phase,
             "event_name": event_name,
-            "dry_run": dry_run,
+            "dry_run": dry_run_value,
             "git_sha": git_sha,
             "workflow": workflow,
             "workflow_run_id": workflow_run_id,
@@ -174,9 +176,18 @@ class RunsRepo:
                     return str(run_id)
                 except OperationalError:
                     raise
-                except Exception:
-                    conn.execute(stmt)
-                    return str(run_id)
+                except Exception as e:
+                    # If type mismatch, try with int conversion
+                    if "dry_run" in str(e) and isinstance(dry_run_value, bool):
+                        dry_run_value = int(dry_run)
+                        values["dry_run"] = dry_run_value
+                        stmt = sa.insert(self._schema.runs).values(**values)
+                        conn.rollback()  # Rollback failed transaction
+                        res = conn.execute(stmt.returning(self._schema.runs.c.run_id))
+                        run_id = res.scalar() or run_id
+                        return str(run_id)
+                    else:
+                        raise
         return str(run_id)
 
     def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
