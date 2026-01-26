@@ -257,29 +257,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python - << 'PY'
-          from datetime import datetime, time
-          import zoneinfo, sys
 
-          kst = zoneinfo.ZoneInfo("Asia/Seoul")
-          now = datetime.now(kst)
+          # KST 기준 현재 시각/요일
+          NOW_KST="$(TZ=Asia/Seoul date +'%Y-%m-%dT%H:%M:%S%z')"
+          DOW="$(TZ=Asia/Seoul date +%u)"          # 1=Mon ... 7=Sun
+          HHMM="$(TZ=Asia/Seoul date +%H%M)"       # e.g. 1122
 
-          # 1) weekday check (Mon=0..Sun=6)
-          is_weekday = now.weekday() < 5
+          is_weekday=false
+          if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ]; then is_weekday=true; fi
 
-          # 2) session window (KOSPI/KOSDAQ 09:00~15:30)
-          start = time(9, 0)
-          end   = time(15, 30)
-          in_session = (start <= now.time() <= end)
+          in_session=false
+          # 09:00~15:15 (15:15 컷오프)
+          if (( 10#$HHMM >= 900 )) && (( 10#$HHMM <= 1515 )); then in_session=true; fi
 
-          live_ok = is_weekday and in_session
+          live_ok=false
+          if [ "$is_weekday" = "true" ] && [ "$in_session" = "true" ]; then live_ok=true; fi
 
-          print(f"[GATE] now_kst={now.isoformat()} is_weekday={is_weekday} in_session={in_session} live_ok={live_ok}")
+          echo "[GATE] now_kst=$NOW_KST dow=$DOW hhmm=$HHMM is_weekday=$is_weekday in_session=$in_session live_ok=$live_ok"
 
-          # GitHub output
-          with open("${GITHUB_OUTPUT}", "a", encoding="utf-8") as f:
-            f.write(f"live_ok={'true' if live_ok else 'false'}\n")
-          PY
+          # ✅ 이게 핵심: 반드시 GitHub step output으로 기록
+          echo "live_ok=$live_ok" >> "$GITHUB_OUTPUT"
+
+      - name: Debug gate output
+        shell: bash
+        run: |
+          echo "gate.live_ok='${{ steps.gate.outputs.live_ok }}'"
 
       - name: DB universe precheck
         run: |
@@ -288,22 +290,24 @@ jobs:
 
       - name: Run LIVE (trade loop)
         if: ${{ steps.gate.outputs.live_ok == 'true' }}
+        shell: bash
         env:
           STRATEGY_MODE: LIVE
           DRY_RUN: "0"
           LIVE_TRADING_ENABLED: "1"
           DISABLE_LIVE_TRADING: "0"
-          DB_ONLY: "0"
         run: |
           set -euo pipefail
-          echo "[RUN] LIVE allowed by gate"
-          python -m trader.run --window auto --phase auto
+          echo "[RUN] LIVE step starting"
+          python -m trader.pb1_runner
 
       - name: NO_TRADE (outside session)
         if: ${{ steps.gate.outputs.live_ok != 'true' }}
+        shell: bash
         run: |
           set -euo pipefail
-          echo "[NO_TRADE] Outside trading session (KST). Skip running live trading."
+          now_kst="$(TZ=Asia/Seoul date +'%Y-%m-%dT%H:%M:%S%z')"
+          echo "[NO_TRADE] $now_kst - Outside trading session (KST 09:00-15:15 weekdays only). Skip running live trading."
 
       - name: Scan for SQLite artifacts
         if: always()
