@@ -3644,6 +3644,18 @@ class PB1Engine:
             self.dry_run,
             self.env,
         )
+        # 타입 검증: orders 테이블의 시간 컬럼 타입 확인
+        try:
+            with self.engine.begin() as conn:
+                result = conn.execute("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_name='orders'
+                      AND column_name IN ('created_at','updated_at','submitted_at','acked_at');
+                """).fetchall()
+            logger.info("[PB1][SCHEMA_CHECK] orders timestamp columns: %s", dict(result))
+        except Exception as e:
+            logger.warning("[PB1][SCHEMA_CHECK][FAIL] %s", str(e))
         regime = {"regime": "UNKNOWN"}
         risk_mult = float(REGIME_MIN_RISK)
         regime_df, _ = self._fetch_daily(REGIME_INDEX, count=max(REGIME_MA_SLOW + 5, 260))
@@ -3997,7 +4009,13 @@ class PB1Engine:
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             open_orders = self.orders_repo.get_open_orders(self.env)
             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
-            today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+            try:
+                today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+            except Exception as e:
+                logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
+                if self.flags.live_trading_enabled and not self.flags.dry_run and self.flags.run_mode == "LIVE":
+                    raise
+                today_orders = []
             today_buy_codes = {row.get("code") for row in today_orders if row.get("code")}
             today_spent = 0.0
             for row in today_orders:

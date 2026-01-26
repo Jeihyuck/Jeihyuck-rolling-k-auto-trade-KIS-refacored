@@ -650,11 +650,13 @@ class OrdersRepo:
         now = now_kst()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
-        conditions = [self._schema.orders.c.env == env, self._schema.orders.c.created_at >= start, self._schema.orders.c.created_at < end]
+        start_bp = sa.bindparam("created_at_1", start, type_=sa.DateTime(timezone=True))
+        end_bp = sa.bindparam("created_at_2", end, type_=sa.DateTime(timezone=True))
+        conditions = [self._schema.orders.c.env == sa.bindparam("env_1", env), self._schema.orders.c.created_at >= start_bp, self._schema.orders.c.created_at < end_bp]
         if side:
-            conditions.append(self._schema.orders.c.side == side)
+            conditions.append(self._schema.orders.c.side == sa.bindparam("side_1", side))
         if code:
-            conditions.append(self._schema.orders.c.code == code)
+            conditions.append(self._schema.orders.c.code == sa.bindparam("code_1", code))
         if status_exclude:
             conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
         stmt = select(self._schema.orders).where(and_(*conditions))
