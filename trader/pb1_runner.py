@@ -1262,7 +1262,7 @@ def run_once(
             dry_run=dry_run,
             git_sha=os.getenv("GITHUB_SHA"),
             workflow=os.getenv("GITHUB_WORKFLOW"),
-            workflow_run_id=workflow_run_id,
+            workflow_run_id=os.getenv("GITHUB_RUN_ID", "local"),
             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
             config_json={
                 "dry_run_reasons": dry_run_reasons,

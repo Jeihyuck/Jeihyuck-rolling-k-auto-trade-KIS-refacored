@@ -55,7 +55,13 @@ def make_engine() -> sa.Engine:
     url = get_db_url()
     try:
         # SQLAlchemy 엔진 생성 (psycopg v3 지원)
-        return sa.create_engine(url, pool_pre_ping=True)
+        return sa.create_engine(
+            url,
+            connect_args={"prepare_threshold": 0},
+            execution_options={"compiled_cache": None},
+            pool_pre_ping=True,
+            pool_recycle=300,
+        )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Postgres driver missing. Install psycopg[binary]. "
