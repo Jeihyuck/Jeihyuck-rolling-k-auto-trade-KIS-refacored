@@ -7,6 +7,9 @@ concurrency:
   group: trade-runner
   cancel-in-progress: true
 
+env:
+  NO_TRADE: "0"
+
 on:
   push:
     branches: [ "nullim", "main" ]
@@ -166,6 +169,8 @@ jobs:
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
 
+      PB1_PRICE_PROBE: "1"
+
       UNIVERSE_SOURCE: "DB_ONLY"
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
@@ -234,6 +239,7 @@ jobs:
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
 
       - name: Resolve market-aware runtime mode
+        id: market_mode
         run: |
           set -euo pipefail
           python - << 'PY'
@@ -245,43 +251,15 @@ jobs:
           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
           mode = "LIVE" if in_market else "DIAG"
           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
-          print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase}")
+          live_ok = "true" if in_market else "false"
+          print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} live_ok={live_ok}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"live_ok={live_ok}\n")
           PY
-
-      - name: Decide LIVE or NO_TRADE (KST)
-        id: gate
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # KST 기준 현재 시각/요일
-          NOW_KST="$(TZ=Asia/Seoul date +'%Y-%m-%dT%H:%M:%S%z')"
-          DOW="$(TZ=Asia/Seoul date +%u)"          # 1=Mon ... 7=Sun
-          HHMM="$(TZ=Asia/Seoul date +%H%M)"       # e.g. 1122
-
-          is_weekday=false
-          if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ]; then is_weekday=true; fi
-
-          in_session=false
-          # 09:00~15:15 (15:15 컷오프)
-          if (( 10#$HHMM >= 900 )) && (( 10#$HHMM <= 1515 )); then in_session=true; fi
-
-          live_ok=false
-          if [ "$is_weekday" = "true" ] && [ "$in_session" = "true" ]; then live_ok=true; fi
-
-          echo "[GATE] now_kst=$NOW_KST dow=$DOW hhmm=$HHMM is_weekday=$is_weekday in_session=$in_session live_ok=$live_ok"
-
-          # ✅ 이게 핵심: 반드시 GitHub step output으로 기록
-          echo "live_ok=$live_ok" >> "$GITHUB_OUTPUT"
-
-      - name: Debug gate output
-        shell: bash
-        run: |
-          echo "gate.live_ok='${{ steps.gate.outputs.live_ok }}'"
 
       - name: DB universe precheck
         run: |
@@ -289,7 +267,7 @@ jobs:
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
       - name: Run LIVE (trade loop)
-        if: ${{ steps.gate.outputs.live_ok == 'true' }}
+        if: ${{ steps.market_mode.outputs.live_ok == 'true' }}
         shell: bash
         env:
           STRATEGY_MODE: LIVE
@@ -302,7 +280,7 @@ jobs:
           python -m trader.pb1_runner
 
       - name: NO_TRADE (outside session)
-        if: ${{ steps.gate.outputs.live_ok != 'true' }}
+        if: ${{ steps.market_mode.outputs.live_ok != 'true' }}
         shell: bash
         run: |
           set -euo pipefail

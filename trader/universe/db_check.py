@@ -37,6 +37,36 @@ def main() -> int:
     mode = (args.mode or resolve_strategy_mode() or "LIVE").upper()
     engine = make_engine()
     run_migrations(engine)
+    
+    # DB schema validation
+    with engine.connect() as conn:
+        result = conn.execute("""
+            select table_name, column_name, data_type, is_nullable, column_default
+            from information_schema.columns
+            where table_name in ('ledger_events','positions','runs')
+              and column_name in ('ok','tp1_done','tp2_done','dry_run')
+            order by table_name, column_name;
+        """)
+        expected = {
+            ('ledger_events', 'ok'): ('boolean', 'NO', 'true'),
+            ('runs', 'dry_run'): ('boolean', 'NO', 'false'),
+            ('positions', 'tp1_done'): ('boolean', 'NO', 'false'),
+            ('positions', 'tp2_done'): ('boolean', 'NO', 'false'),
+        }
+        for row in result:
+            table_name, column_name, data_type, is_nullable, column_default = row
+            key = (table_name, column_name)
+            if key in expected:
+                exp_data_type, exp_nullable, exp_default = expected[key]
+                if data_type != exp_data_type or is_nullable != exp_nullable or column_default != exp_default:
+                    logger.error(
+                        "[UNIVERSE][DB_CHECK][SCHEMA_FAIL] table=%s column=%s expected=(%s,%s,%s) actual=(%s,%s,%s)",
+                        table_name, column_name, exp_data_type, exp_nullable, exp_default,
+                        data_type, is_nullable, column_default
+                    )
+                    return 1
+        logger.info("[UNIVERSE][DB_CHECK][SCHEMA_OK] boolean columns validated")
+    
     repo = UniverseRepo(engine)
     snapshot = repo.get_current_universe_snapshot(args.env, args.strategy)
     if not snapshot or not snapshot.get("members"):

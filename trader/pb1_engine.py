@@ -2068,12 +2068,23 @@ class PB1Engine:
                     self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
                     return None
                 if quote.get("ask") is None or quote.get("bid") is None:
+                    reasons = quote.get("reasons", [])
+                    raw_summary = {}
+                    if "raw" in quote and isinstance(quote["raw"], dict):
+                        raw = quote["raw"]
+                        raw_summary = {
+                            "rt_cd": raw.get("rt_cd"),
+                            "msg_cd": raw.get("msg_cd"),
+                            "msg1": raw.get("msg1"),
+                        }
                     self._warn_once(
                         f"quote_missing_book:{code}",
-                        "[PB1][PRICE][WARN] code=%s ask=%s bid=%s",
+                        "[PB1][PRICE][WARN] code=%s ask=%s bid=%s reasons=%s raw=%s",
                         code,
                         quote.get("ask"),
                         quote.get("bid"),
+                        reasons,
+                        raw_summary,
                     )
                 return price_val
             except Exception:
@@ -2094,6 +2105,50 @@ class PB1Engine:
             return float(ohlcv_close), "ohlcv_close"
         logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
         return None, None
+
+    def _run_price_probe(self) -> None:
+        """가격 API 진단용 프로브: LIVE에서 주문 없이 가격 호출만 검증."""
+        if not self.kis:
+            return
+        probe_codes = []
+        # 보유종목 우선
+        if hasattr(self, '_balance_positions') and self._balance_positions:
+            probe_codes.extend(list(self._balance_positions.keys())[:2])
+        # 유니버스에서 추가
+        if hasattr(self, '_universe') and self._universe:
+            universe_codes = [u.get('code') for u in self._universe if u.get('code')][:3]
+            probe_codes.extend(universe_codes[:3 - len(probe_codes)])
+        # 중복 제거
+        probe_codes = list(dict.fromkeys(probe_codes))[:3]
+        
+        if not probe_codes:
+            logger.info("[PB1][PRICE_PROBE] no codes to probe")
+            return
+        
+        logger.info("[PB1][PRICE_PROBE] probing codes=%s", probe_codes)
+        for code in probe_codes:
+            try:
+                quote = self.kis.get_quote_safe(code, diag_mode=False)
+                ask = quote.get("ask")
+                bid = quote.get("bid")
+                reasons = quote.get("reasons", [])
+                if ask is None or bid is None:
+                    raw_summary = {}
+                    if "raw" in quote and isinstance(quote["raw"], dict):
+                        raw = quote["raw"]
+                        raw_summary = {
+                            "rt_cd": raw.get("rt_cd"),
+                            "msg_cd": raw.get("msg_cd"),
+                            "msg1": raw.get("msg1"),
+                        }
+                    logger.error(
+                        "[PB1][PRICE_PROBE][FAIL] code=%s ask=%s bid=%s reasons=%s raw=%s",
+                        code, ask, bid, reasons, raw_summary
+                    )
+                else:
+                    logger.info("[PB1][PRICE_PROBE][OK] code=%s ask=%s bid=%s", code, ask, bid)
+            except Exception as exc:
+                logger.error("[PB1][PRICE_PROBE][EXCEPTION] code=%s err=%s", code, repr(exc))
 
     def _calc_order_price(
         self,
@@ -3616,6 +3671,10 @@ class PB1Engine:
             entry_enabled=self.entry_enabled,
             entry_block_reason=entry_reason if not entry_allowed else None,
         )
+
+        # Price probe hook for LIVE mode diagnostics
+        if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry"} and not self.dry_run:
+            self._run_price_probe()
 
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             skip_entry_scan = True

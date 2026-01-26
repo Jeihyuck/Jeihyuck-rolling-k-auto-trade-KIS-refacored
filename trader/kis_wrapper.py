@@ -472,6 +472,42 @@ class KisAPI:
         except Exception:
             logger.warning("[SAFE_MODE][WRITE_FAIL]", exc_info=True)
 
+    def _log_kis_resp(self, tag: str, code: str | None, params: dict, resp: dict | None, elapsed_ms: float, extra: dict | None = None) -> None:
+        """KIS API 응답 로깅 헬퍼 (개인정보 제외, 디버깅용)."""
+        if resp is None or not isinstance(resp, dict):
+            resp_summary = repr(resp)
+        else:
+            resp_summary = {}
+            # 우선순위 키들
+            for key in ["rt_cd", "msg_cd", "msg1"]:
+                if key in resp:
+                    resp_summary[key] = resp[key]
+            # output/output1/output2가 있으면 첫 1개만 / 키 목록 + 대표값 3개
+            for out_key in ["output", "output1", "output2"]:
+                if out_key in resp and isinstance(resp[out_key], dict):
+                    out = resp[out_key]
+                    resp_summary[out_key] = {
+                        "keys": list(out.keys())[:10],  # 키 목록 (최대 10개)
+                        "sample_values": {k: out.get(k) for k in list(out.keys())[:3]}  # 대표값 3개
+                    }
+                    break  # 첫 번째 output만
+
+        log_data = {
+            "tag": tag,
+            "code": code,
+            "params": params,
+            "resp": resp_summary,
+            "elapsed_ms": elapsed_ms,
+        }
+        if extra:
+            log_data.update(extra)
+
+        # 정상(rt_cd=="0")이면 DEBUG, 아니면 WARNING + tag에 FAIL
+        if isinstance(resp, dict) and str(resp.get("rt_cd")) == "0":
+            logger.debug(f"[KIS][{tag}] %s", log_data)
+        else:
+            logger.warning(f"[KIS][{tag}][FAIL] %s", log_data)
+
     # ===== [NEW] 안전요청 & 세션리셋 =====
     def _reset_session(self):
         try:
@@ -1013,6 +1049,7 @@ class KisAPI:
         반환 예: {"last": 12345.0, "bid": 12340.0, "ask": 12350.0, "raw": {...}, ...}
         diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
         """
+        start_time = time.time()
         c = safe_strip(code)
         if not c:
             return {}
@@ -1063,6 +1100,9 @@ class KisAPI:
                 break
             time.sleep(0.6 * attempt + random.uniform(0, 0.2))
 
+        elapsed_ms = (time.time() - start_time) * 1000
+        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
+
         if raw_output is None:
             if diag_mode:
                 return {}
@@ -1101,27 +1141,59 @@ class KisAPI:
 
     def get_quote_safe(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
         quote: dict | None = None
+        reasons = []
         try:
             quote = self.get_price_quote(code, diag_mode=diag_mode, attempts=attempts)
         except Exception as exc:
+            reasons.append("HTTP_ERROR")
             if diag_mode:
                 logger.warning("[KIS][QUOTE][WARN] code=%s err=%s", code, repr(exc))
-                return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+                return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
             raise
         if not isinstance(quote, dict):
-            return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+            reasons.append("MISSING_OUTPUT")
+            return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
+        
         ask = quote.get("ask")
         bid = quote.get("bid")
         prpr = quote.get("prpr") or quote.get("stck_prpr") or quote.get("last")
         quote.setdefault("prpr", prpr)
+        
         if ask is not None or bid is not None:
             quote["fallback_used"] = "quote"
             return quote
+        
+        # ask/bid가 None인 경우 reasons 수집
+        raw = quote.get("raw", {})
+        if not raw:
+            reasons.append("MISSING_OUTPUT")
+        else:
+            # rt_cd 체크
+            if str(raw.get("rt_cd", "")) != "0":
+                reasons.append("KIS_RT_CD_NOT_0")
+            # 필드 존재 체크
+            if ask is None and "askp1" not in raw and "askp" not in raw and "ask" not in raw:
+                reasons.append("MISSING_FIELDS")
+            if bid is None and "bidp1" not in raw and "bidp" not in raw and "bid" not in raw:
+                reasons.append("MISSING_FIELDS")
+            # 값이 0이나 빈 문자열인지 체크
+            for field in ["askp1", "askp", "ask", "bidp1", "bidp", "bid"]:
+                val = raw.get(field)
+                if val is not None and (val == 0 or val == "" or str(val).strip() == ""):
+                    reasons.append("ZERO_OR_BLANK")
+                    break
+            # 장외/휴장 메시지 체크
+            msg1 = str(raw.get("msg1", "")).lower()
+            if any(keyword in msg1 for keyword in ["휴장", "장종료", "장전", "단일가", "거래정지"]):
+                reasons.append("AFTER_HOURS")
+        
         if prpr is not None:
             price_only = self.get_price_only(code, attempts=attempts)
             if price_only.get("prpr") is not None:
+                price_only["reasons"] = reasons
                 return price_only
-        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none"}
+        
+        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
 
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
@@ -1636,8 +1708,10 @@ class KisAPI:
 
     def get_best_ask(self, code: str) -> Optional[float]:
         """최우선 매도호가(askp1)."""
+        start_time = time.time()
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
         self._limiter.wait("orderbook-best")
+        resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
             markets = ["J", "U"]
@@ -1652,19 +1726,26 @@ class KisAPI:
                             "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
                         )
                         data = resp.json()
+                        resp_data = data
                     except Exception:
                         continue
                     if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        elapsed_ms = (time.time() - start_time) * 1000
+                        self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
                         try:
                             return float(data["output"].get("askp1"))
                         except Exception:
                             return None
+        elapsed_ms = (time.time() - start_time) * 1000
+        self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         return None
 
     def get_best_bid(self, code: str) -> Optional[float]:
         """최우선 매수호가(bidp1)."""
+        start_time = time.time()
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
         self._limiter.wait("orderbook-best")
+        resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
             markets = ["J", "U"]
@@ -1679,13 +1760,18 @@ class KisAPI:
                             "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
                         )
                         data = resp.json()
+                        resp_data = data
                     except Exception:
                         continue
                     if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                        elapsed_ms = (time.time() - start_time) * 1000
+                        self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
                         try:
                             return float(data["output"].get("bidp1"))
                         except Exception:
                             return None
+        elapsed_ms = (time.time() - start_time) * 1000
+        self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         return None
 
     def get_index_quote(self, index_code: str) -> Dict[str, Optional[float]]:
