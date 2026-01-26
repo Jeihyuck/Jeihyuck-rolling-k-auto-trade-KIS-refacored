@@ -51,13 +51,32 @@ def get_db_url() -> str:
     return url
 
 
+def _connect_args_for_db_url(db_url: str) -> dict:
+    """
+    Supabase pooler(6543, PgBouncer) 환경에서 psycopg3 prepared statement 충돌 방지.
+    - psycopg3 문서: PgBouncer/풀러 사용 시 prepared statements 비활성화 권고
+      -> prepare_threshold=None
+    """
+    connect_args: dict = {}
+    # 강제 플래그가 있으면 최우선
+    if os.getenv("DB_DISABLE_PREPARED_STATEMENTS", "0") in {"1", "true", "TRUE"}:
+        connect_args["prepare_threshold"] = None
+        return connect_args
+
+    # URL 기반 자동 감지
+    if "pooler.supabase.com" in (db_url or "") or ":6543" in (db_url or ""):
+        connect_args["prepare_threshold"] = None
+    return connect_args
+
+
 def make_engine() -> sa.Engine:
     url = get_db_url()
     try:
         # SQLAlchemy 엔진 생성 (psycopg v3 지원)
+        connect_args = _connect_args_for_db_url(url)
         return sa.create_engine(
             url,
-            connect_args={"prepare_threshold": 0},
+            connect_args=connect_args,
             execution_options={"compiled_cache": None},
             pool_pre_ping=True,
             pool_recycle=300,

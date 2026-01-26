@@ -175,6 +175,8 @@ jobs:
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
 
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -267,7 +269,7 @@ jobs:
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
       - name: Run LIVE (trade loop)
-        if: ${{ steps.market_mode.outputs.live_ok == 'true' }}
+        if: ${{ steps['market_mode'].outputs.live_ok == 'true' }}
         shell: bash
         env:
           STRATEGY_MODE: LIVE
@@ -280,7 +282,7 @@ jobs:
           python -m trader.pb1_runner
 
       - name: NO_TRADE (outside session)
-        if: ${{ steps.market_mode.outputs.live_ok != 'true' }}
+        if: ${{ steps['market_mode'].outputs.live_ok != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
