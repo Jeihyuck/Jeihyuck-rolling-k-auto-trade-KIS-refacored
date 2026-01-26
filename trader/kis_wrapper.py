@@ -472,41 +472,21 @@ class KisAPI:
         except Exception:
             logger.warning("[SAFE_MODE][WRITE_FAIL]", exc_info=True)
 
-    def _log_kis_resp(self, tag: str, code: str | None, params: dict, resp: dict | None, elapsed_ms: float, extra: dict | None = None) -> None:
-        """KIS API 응답 로깅 헬퍼 (개인정보 제외, 디버깅용)."""
-        if resp is None or not isinstance(resp, dict):
-            resp_summary = repr(resp)
-        else:
-            resp_summary = {}
-            # 우선순위 키들
-            for key in ["rt_cd", "msg_cd", "msg1"]:
-                if key in resp:
-                    resp_summary[key] = resp[key]
-            # output/output1/output2가 있으면 첫 1개만 / 키 목록 + 대표값 3개
-            for out_key in ["output", "output1", "output2"]:
-                if out_key in resp and isinstance(resp[out_key], dict):
-                    out = resp[out_key]
-                    resp_summary[out_key] = {
-                        "keys": list(out.keys())[:10],  # 키 목록 (최대 10개)
-                        "sample_values": {k: out.get(k) for k in list(out.keys())[:3]}  # 대표값 3개
-                    }
-                    break  # 첫 번째 output만
-
-        log_data = {
-            "tag": tag,
-            "code": code,
-            "params": params,
-            "resp": resp_summary,
-            "elapsed_ms": elapsed_ms,
-        }
-        if extra:
-            log_data.update(extra)
-
-        # 정상(rt_cd=="0")이면 DEBUG, 아니면 WARNING + tag에 FAIL
-        if isinstance(resp, dict) and str(resp.get("rt_cd")) == "0":
-            logger.debug(f"[KIS][{tag}] %s", log_data)
-        else:
-            logger.warning(f"[KIS][{tag}][FAIL] %s", log_data)
+    def _get_tick_size(self, price: float) -> int:
+        """가격에 따른 호가단위(틱사이즈) 반환."""
+        tick_table = [
+            (1_000_000, 1_000),
+            (500_000, 500),
+            (100_000, 100),
+            (10_000, 50),
+            (1_000, 10),
+            (100, 1),
+            (0, 1),
+        ]
+        for base, tick in tick_table:
+            if price >= base:
+                return tick
+        return 1
 
     # ===== [NEW] 안전요청 & 세션리셋 =====
     def _reset_session(self):
@@ -563,7 +543,13 @@ class KisAPI:
                     **kwargs,
                 )
                 status = resp.status_code
+                elapsed_ms = (time.monotonic() - start_ts) * 1000
+                params = kwargs.get("params", {}) or {}
+                json_data = kwargs.get("json", {}) or {}
+                headers_masked = {k: "***" if "auth" in k.lower() or "token" in k.lower() else v for k, v in (kwargs.get("headers", {}) or {}).items()}
                 if status in (401, 403):
+                    logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
+                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
                     if not auth_refreshed and "/oauth2/token" not in url:
                         auth_refreshed = True
                         logger.warning("[NET:AUTH] status=%s url=%s -> refresh token", status, url)
@@ -571,19 +557,30 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
+                    logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
+                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisTemporaryError(f"HTTP {status} for {url}")
                 try:
                     body = resp.json()
-                except Exception:
+                except Exception as json_err:
+                    logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s json_parse_err=%s",
+                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], json_err)
                     body = None
                 if isinstance(body, dict):
                     msg_cd = str(body.get("msg_cd") or "").strip()
                     msg_text = str(body.get("msg1") or "").lower()
+                    rt_cd = str(body.get("rt_cd") or "").strip()
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
+                                       method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연")):
+                        logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
+                                       method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError("BODY_TEMP_ERROR msg1")
                 if 400 <= status < 500:
+                    logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
+                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisPermanentError(f"HTTP {status} for {url}")
                 _breaker_record_success(method, url)
                 return resp
@@ -1714,7 +1711,7 @@ class KisAPI:
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "U"]
+            markets = ["J", "Q", "U"]
             c = code.strip()
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
@@ -1738,6 +1735,15 @@ class KisAPI:
                             return None
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
+        # [PATCH] Fallback to current price
+        logger.warning("[ASKBID][FALLBACK] code=%s -> trying current price", code)
+        quote = self.get_price_quote(code, diag_mode=True)
+        if quote and quote.get("last"):
+            prpr = quote["last"]
+            tick_size = self._get_tick_size(prpr)
+            pseudo_ask = prpr + tick_size
+            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f tick_size=%d -> ask=%.0f", code, prpr, tick_size, pseudo_ask)
+            return pseudo_ask
         return None
 
     def get_best_bid(self, code: str) -> Optional[float]:
@@ -1748,7 +1754,7 @@ class KisAPI:
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "U"]
+            markets = ["J", "Q", "U"]
             c = code.strip()
             codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
             for market_div in markets:
@@ -1772,6 +1778,14 @@ class KisAPI:
                             return None
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
+        # [PATCH] Fallback to current price
+        logger.warning("[ASKBID][FALLBACK] code=%s -> trying current price", code)
+        quote = self.get_price_quote(code, diag_mode=True)
+        if quote and quote.get("last"):
+            prpr = quote["last"]
+            pseudo_bid = prpr
+            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f -> bid=%.0f", code, prpr, pseudo_bid)
+            return pseudo_bid
         return None
 
     def get_index_quote(self, index_code: str) -> Dict[str, Optional[float]]:

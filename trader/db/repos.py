@@ -357,10 +357,48 @@ class UniverseRepo:
         with self.engine.begin() as conn:
             run_id = conn.execute(stmt).scalar()
         if not run_id:
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0", as_of_date)
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no run)", as_of_date)
+            # [PATCH] Fallback to latest non-empty as_of
+            fallback_stmt = (
+                select(self._schema.universe_runs.c.as_of, self._schema.universe_runs.c.run_id)
+                .where(self._schema.universe_runs.c.strategy == strategy_key)
+                .order_by(self._schema.universe_runs.c.as_of.desc())
+            )
+            with self.engine.begin() as conn:
+                candidates = conn.execute(fallback_stmt).fetchall()
+            for row in candidates:
+                fallback_run_id = str(row["run_id"])
+                fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
+                if fallback_members:
+                    logger.info("[UNIVERSE][DB][LOAD][FALLBACK] as_of=%s -> %s members=%s", as_of_date, row["as_of"], len(fallback_members))
+                    return fallback_members
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no fallback)", as_of_date)
             return []
         members = self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
-        logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
+        if not members:
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0", as_of_date)
+            # [PATCH] Fallback to latest non-empty as_of
+            fallback_stmt = (
+                select(self._schema.universe_runs.c.as_of, self._schema.universe_runs.c.run_id)
+                .where(
+                    and_(
+                        self._schema.universe_runs.c.strategy == strategy_key,
+                        self._schema.universe_runs.c.as_of < as_of_d,
+                    )
+                )
+                .order_by(self._schema.universe_runs.c.as_of.desc())
+            )
+            with self.engine.begin() as conn:
+                candidates = conn.execute(fallback_stmt).fetchall()
+            for row in candidates:
+                fallback_run_id = str(row["run_id"])
+                fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
+                if fallback_members:
+                    logger.info("[UNIVERSE][DB][LOAD][FALLBACK] as_of=%s -> %s members=%s", as_of_date, row["as_of"], len(fallback_members))
+                    return fallback_members
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no fallback)", as_of_date)
+        else:
+            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
         return members
 
     def store_universe_snapshot(

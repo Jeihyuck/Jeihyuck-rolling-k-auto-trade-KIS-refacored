@@ -470,6 +470,13 @@ class PB1Engine:
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
+        self.engine = universe_repo.engine  # [PATCH] Set engine from repo
+        self.window = window
+        self.window_label = window_label
+        self.phase = phase
+        self.dry_run = dry_run
+        self.env = env
+        self.run_id = run_id
         self.balance_api_calls = 0
         self.balance_cache_hits = 0
         self.balance_tick_cache_hits = 0
@@ -2068,6 +2075,7 @@ class PB1Engine:
                     self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
                     return None
                 if quote.get("ask") is None or quote.get("bid") is None:
+                    self.askbid_fail_count += 1  # [PATCH] 회로차단기: 호가 실패 카운트
                     reasons = quote.get("reasons", [])
                     raw_summary = {}
                     if "raw" in quote and isinstance(quote["raw"], dict):
@@ -3613,6 +3621,7 @@ class PB1Engine:
         self._setup_reason_counter.clear()
         self.current_code = None
         self.top_candidates = []
+        self.askbid_fail_count = 0  # [PATCH] 회로차단기용 실패 카운트
         final_status = "OK"
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
@@ -3655,7 +3664,8 @@ class PB1Engine:
                 """).fetchall()
             logger.info("[PB1][SCHEMA_CHECK] orders timestamp columns: %s", dict(result))
         except Exception as e:
-            logger.warning("[PB1][SCHEMA_CHECK][FAIL] %s", str(e))
+            logger.warning("[PB1][SCHEMA_CHECK][FAIL] Failed to check schema via self.engine: %s. Available alternatives: universe_repo.engine=%s, orders_repo.engine=%s", 
+                           str(e), hasattr(self.universe_repo, 'engine'), hasattr(self.orders_repo, 'engine'))
         regime = {"regime": "UNKNOWN"}
         risk_mult = float(REGIME_MIN_RISK)
         regime_df, _ = self._fetch_daily(REGIME_INDEX, count=max(REGIME_MA_SLOW + 5, 260))
@@ -4565,6 +4575,13 @@ class PB1Engine:
         self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
+        # [PATCH] 요약 로그 추가
+        candidates_ok = len([c for c in self.top_candidates if c.get('priced', False)])
+        priced_ok = len([c for c in self.top_candidates if c.get('ask') is not None and c.get('bid') is not None])
+        intents_created = len(self._intents_created) if hasattr(self, '_intents_created') else 0
+        intents_skipped = self._setup_reason_counter.most_common(3)
+        logger.info("[PB1][TICK_SUMMARY] candidates_ok=%d priced_ok=%d intents_created=%d intents_skipped_reason_top3=%s",
+                    candidates_ok, priced_ok, intents_created, intents_skipped)
         return RunResult(
             status=final_status,
             notes=final_notes,
