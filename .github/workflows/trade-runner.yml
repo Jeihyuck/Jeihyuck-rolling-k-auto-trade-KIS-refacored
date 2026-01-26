@@ -9,6 +9,7 @@ concurrency:
 
 env:
   NO_TRADE: "0"
+  DB_DISABLE_PREPARED_STATEMENTS: "1"
 
 on:
   push:
