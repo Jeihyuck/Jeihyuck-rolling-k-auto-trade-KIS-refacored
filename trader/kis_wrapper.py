@@ -626,7 +626,7 @@ class KisAPI:
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
                                        method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
-                    if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연")):
+                    if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
                                        method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError("BODY_TEMP_ERROR msg1")
@@ -1108,6 +1108,12 @@ class KisAPI:
         반환 예: {"last": 12345.0, "bid": 12340.0, "ask": 12350.0, "raw": {...}, ...}
         diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
         """
+        # 캐시 확인
+        cache_key = ("inquire-price", code)
+        cached = price_cache.get(cache_key)
+        if cached:
+            return cached
+
         start_time = time.time()
         c = safe_strip(code)
         if not c:
@@ -1208,6 +1214,8 @@ class KisAPI:
         quote.setdefault("stck_prpr", last_price)
         quote.setdefault("prpr", last_price)
         quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
+        # 캐시 set
+        price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
         return quote
 
     def get_price_only(self, code: str, *, attempts: int = 2) -> dict:

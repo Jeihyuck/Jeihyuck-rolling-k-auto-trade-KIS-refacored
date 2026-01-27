@@ -1421,9 +1421,24 @@ class ReconcileLogRepo:
         action: str,
         details_json: dict | None,
     ) -> None:
-        stmt = sa.insert(self._schema.reconcile_log).values(**payload)
-        with self.engine.begin() as conn:
-            conn.execute(stmt)
+        tbl = self._schema.reconcile_log
+        # 1) payload를 항상 생성
+        payload = {
+            "env": env,
+            "strategy": strategy,
+            "tick_ts": tick_ts,
+            "action": action,
+            "details_json": json_sanitize(details_json or {}),
+        }
+        # 2) 실제 테이블 컬럼만 남김
+        cols = set(tbl.c.keys())
+        payload = {k: v for k, v in payload.items() if k in cols}
+        try:
+            stmt = sa.insert(tbl).values(**payload)
+            with self.engine.begin() as conn:
+                conn.execute(stmt)
+        except Exception:
+            logger.exception("[RECONCILE_LOG][APPEND][FAIL] payload_keys=%s", list(payload.keys()))
 
 
 def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
@@ -1450,3 +1465,28 @@ def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date
             }
             for row in rows
         ]
+
+
+def upsert_price_daily(engine: Engine, candles: List[Dict[str, Any]], market: str, code: str) -> None:
+    if not candles:
+        return
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        for candle in candles:
+            payload = {
+                "market": market,
+                "code": code,
+                "date": candle["date"],
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+                "value": candle.get("value"),
+                "source": "KIS",
+            }
+            stmt = pg_insert(schema.price_daily).values(**payload).on_conflict_do_update(
+                index_elements=["market", "code", "date"],
+                set_={k: v for k, v in payload.items() if k not in ["market", "code", "date"]}
+            )
+            conn.execute(stmt)

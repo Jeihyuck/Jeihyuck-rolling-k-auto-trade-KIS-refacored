@@ -13,10 +13,10 @@ from trader.time_utils import now_kst
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv
 from trader.db.engine import make_engine
-from trader.db.repos import load_price_daily
+from trader.db.repos import load_price_daily, upsert_price_daily
 from trader.cache_ttl import daily_cache, DAILY_BAR_TTL_SEC
 from trader.rate_limit import get_kis_gate
-from trader.config import ALLOW_KIS_DAILY_FALLBACK
+from trader.config import ALLOW_KIS_DAILY_FALLBACK, MARKET_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,14 @@ class KISOHLCVProvider:
         try:
             candles = self.kis.get_daily_candles(symbol, count=max(days, 120))  # type: ignore[attr-defined]
             logger.info("[OHLCV][KIS][FALLBACK] symbol=%s days=%d rows=%d", symbol, days, len(candles))
+            # DB upsert for self-healing
+            if candles:
+                market = MARKET_MAP.get(symbol, "KOSPI")
+                try:
+                    upsert_price_daily(engine, candles, market, symbol)
+                    logger.debug("[OHLCV][DB][UPSERT] symbol=%s rows=%d", symbol, len(candles))
+                except Exception as exc:
+                    logger.debug("[OHLCV][DB][UPSERT_FAIL] symbol=%s err=%s", symbol, exc)
         except Exception as exc:
             self._warn_once(f"fail:{symbol}", "[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": str(exc), "volume_missing": True})
