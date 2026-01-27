@@ -30,6 +30,16 @@ from trader.utils.ids import assert_uuid
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "RunsRepo",
+    "UniverseRepo",
+    "OrdersRepo",
+    "FillsRepo",
+    "PositionsRepo",
+    "LedgerEventsRepo",
+    "ReconcileLogRepo",
+]
+
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
@@ -1266,6 +1276,9 @@ class LedgerEventsRepo:
             max_attempts,
         )
         return None
+
+
+class PositionsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
