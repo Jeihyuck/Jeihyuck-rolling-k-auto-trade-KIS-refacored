@@ -294,14 +294,32 @@ class UniverseRepo:
             "sample_codes": [m.get("code") for m in members[:5]],
         }
 
-    def get_latest_successful_universe_snapshot(
+    def get_latest_universe_members(
         self,
         *,
         env: str,
         strategy: str,
         as_of_date: str,
-        limit: int = 10,
-    ) -> dict | None:
+    ) -> list[dict]:
+        """Get the most recent universe members for as_of <= as_of_date."""
+        strategy_key = self._strategy_key(env, strategy)
+        as_of_d = _as_date(as_of_date)
+        stmt = (
+            select(self._schema.universe_runs.c.run_id)
+            .where(
+                and_(
+                    self._schema.universe_runs.c.strategy == strategy_key,
+                    self._schema.universe_runs.c.as_of <= as_of_d,
+                )
+            )
+            .order_by(self._schema.universe_runs.c.as_of.desc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            run_id = conn.execute(stmt).scalar()
+        if not run_id:
+            return []
+        return self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
         stmt = (
@@ -365,7 +383,8 @@ class UniverseRepo:
                 .order_by(self._schema.universe_runs.c.as_of.desc())
             )
             with self.engine.begin() as conn:
-                candidates = conn.execute(fallback_stmt.mappings()).fetchall()
+                result = conn.execute(fallback_stmt)
+                candidates = result.mappings().all()
             for row in candidates:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
@@ -389,7 +408,8 @@ class UniverseRepo:
                 .order_by(self._schema.universe_runs.c.as_of.desc())
             )
             with self.engine.begin() as conn:
-                candidates = conn.execute(fallback_stmt.mappings()).fetchall()
+                result = conn.execute(fallback_stmt)
+                candidates = result.mappings().all()
             for row in candidates:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
@@ -401,16 +421,23 @@ class UniverseRepo:
             logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
         return members
 
-    def store_universe_snapshot(
+    def save_universe_run_and_members(
         self,
         *,
         env: str,
         strategy: str,
-        as_of_date: str,
-        provider: str,
-        members: Iterable[dict],
-        reason: str | None = None,
-    ) -> str:
+        as_of: str,
+        members: list[dict],
+    ) -> None:
+        """Upsert universe run and members in a transaction."""
+        self.store_universe_snapshot(
+            env=env,
+            strategy=strategy,
+            as_of_date=as_of,
+            provider="auto_build",
+            members=members,
+            reason="auto_build_from_ensure",
+        )
         members_list = list(members)
         as_of_d = _as_date(as_of_date)
         db_url = str(self.engine.url)

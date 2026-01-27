@@ -241,7 +241,7 @@ def ensure_universe_built_once(
     env: str | None = None,
     strategy: str | None = None,
     as_of: str | None = None,
-) -> None:
+) -> list[dict]:
     env = env or os.getenv("KIS_ENV") or os.getenv("ENV")
     if env is not None:
         env = env.strip()
@@ -254,38 +254,35 @@ def ensure_universe_built_once(
 
     log.info("[UNIVERSE][ENSURE][DB] env=%s strategy=%s as_of=%s", env, strategy, as_of)
     repo = UniverseRepo(engine)
+    
+    # Step A) 오늘 유니버스 DB 로드
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
     if members:
-        return
-    if is_db_only_mode():
-        fallback = repo.get_current_universe_snapshot(env, strategy)
-        if fallback and fallback.get("members"):
-            logger.warning(
-                "[UNIVERSE][ENSURE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
-                fallback.get("run_id"),
-                fallback.get("as_of"),
-                fallback.get("members_count"),
-            )
-            return
-        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
-        if latest and latest.get("members"):
-            logger.warning(
-                "[UNIVERSE][ENSURE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
-                latest.get("run_id"),
-                latest.get("as_of"),
-                latest.get("members_count"),
-            )
-            return
-        raise RuntimeError(f"missing universe in DB (db_only): env={env} strategy={strategy} as_of={as_of}")
-    diag_mode = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
-    emergency = os.getenv("EMERGENCY_UNIVERSE_BUILD", "0") == "1"
-    if emergency and diag_mode:
-        logger.warning("[UNIVERSE][ENSURE][EMERGENCY_BUILD] env=%s strategy=%s as_of=%s", env, strategy, as_of)
-        build_universe(as_of_date=as_of, env=env, strategy=strategy)
-        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
-    if not members:
-        logger.error("[UNIVERSE][ENSURE][MISSING] env=%s strategy=%s as_of=%s - trading will be suspended", env, strategy, as_of)
-        return  # Do not raise, allow PB1 to handle empty universe
+        return members
+
+    # Step B) 없으면(빈 리스트) 오늘 유니버스 build & persist 시도
+    try:
+        from trader.universe import build as universe_build
+        built = universe_build.build_universe(as_of_date=as_of, env=env, strategy=strategy)
+        if built:
+            repo.save_universe_run_and_members(env=env, strategy=strategy, as_of=as_of, members=built)
+            members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+            if members:
+                return members
+    except Exception as exc:
+        logger.warning("[UNIVERSE][BUILD][FAIL] env=%s strategy=%s as_of=%s err=%s", env, strategy, as_of, exc)
+
+    # Step C) build 실패 또는 DB 오류면 “최근 유니버스 fallback”
+    allow_fallback = os.getenv("ALLOW_UNIVERSE_DB_FAIL", "0") == "1"
+    if allow_fallback:
+        latest = repo.get_latest_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+        if latest:
+            logger.warning("[UNIVERSE][FALLBACK] using latest as_of<=%s count=%d", as_of, len(latest))
+            return latest
+
+    # Step D) fallback도 없으면 “이번 루프 스킵(거래 안 함) + 다음 루프에서 재시도”
+    logger.error("[UNIVERSE][EMPTY] no universe available. skip this cycle and retry next loop.")
+    return []
 
 
 def _load_universe_context(
@@ -1117,7 +1114,10 @@ def run_once(
                 env=kis_env or "practice",
                 strategy=universe_strategy,
             )
-        ensure_universe_built_once(engine=engine, as_of=as_of)
+        universe_members = ensure_universe_built_once(engine=engine, as_of=as_of)
+        if not universe_members:
+            logger.warning("[PB1] universe empty -> skip trading cycle")
+            return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
 
     logger.info(
         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
