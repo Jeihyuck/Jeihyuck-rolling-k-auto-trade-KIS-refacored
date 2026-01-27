@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from sqlalchemy.exc import OperationalError, StatementError
+from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
 from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -25,6 +25,8 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
+from trader.db.json_safe import json_sanitize
+from trader.time_utils import now_kst
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 
@@ -262,13 +264,32 @@ class RunsRepo:
             "status": "STARTED",
             **kwargs
         }
-        stmt = sa.insert(self._schema.runs).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[self._schema.runs.c.run_id],
-            set_=values
-        )
         with self.engine.begin() as conn:
-            conn.execute(stmt)
+            if conn.dialect.name == "postgresql":
+                # Use PostgreSQL-specific upsert
+                pk_cols = list(self._schema.runs.primary_key.columns)
+                update_map = {k: pg_insert(self._schema.runs).excluded[k] 
+                             for k in values.keys() if k not in {col.name for col in pk_cols}}
+                stmt = pg_insert(self._schema.runs).values(**values).on_conflict_do_update(
+                    index_elements=pk_cols,
+                    set_=update_map
+                )
+                conn.execute(stmt)
+            else:
+                # Fallback upsert for non-PostgreSQL dialects (SQLite, etc.)
+                try:
+                    conn.execute(sa.insert(self._schema.runs).values(**values))
+                except IntegrityError:
+                    # If insert fails, update existing row
+                    pk_cols = list(self._schema.runs.primary_key.columns)
+                    update_values = {k: v for k, v in values.items() 
+                                    if k not in {col.name for col in pk_cols}}
+                    where_clause = and_(
+                        *[self._schema.runs.c[col.name] == values[col.name] for col in pk_cols]
+                    )
+                    conn.execute(
+                        sa.update(self._schema.runs).where(where_clause).values(**update_values)
+                    )
 
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
@@ -525,6 +546,10 @@ class UniverseRepo:
             members=members,
             reason="auto_build_from_ensure",
         )
+        # Copilot patch: undefined 변수 및 UPSERT 안전화
+        as_of_date = as_of_date if 'as_of_date' in locals() else as_of
+        provider = provider if 'provider' in locals() and provider else "auto_build"
+        reason = reason if 'reason' in locals() and reason else "auto_build_from_ensure"
         members_list = list(members)
         as_of_d = _as_date(as_of_date)
         db_url = str(self.engine.url)
@@ -574,19 +599,27 @@ class UniverseRepo:
                             strategy=strategy_key,
                             run_id=uuid_value_for_url(db_url, run_id),
                             updated_ts=now_kst().isoformat(),
-                        )
-                    else:
-                        insert_stmt = sa.insert(self._schema.universe_current).values(
-                            strategy=strategy_key,
-                            run_id=uuid_value_for_url(db_url, run_id),
-                            updated_ts=now_kst().isoformat(),
-                        )
-                    conn.execute(
-                        insert_stmt.on_conflict_do_update(
+                        ).on_conflict_do_update(
                             index_elements=[self._schema.universe_current.c.strategy],
-                            set_={"run_id": uuid_value_for_url(db_url, run_id), "updated_ts": now_kst().isoformat()},
+                            set_={
+                                "run_id": uuid_value_for_url(db_url, run_id),
+                                "updated_ts": now_kst().isoformat(),
+                            },
                         )
-                    )
+                        conn.execute(insert_stmt)
+                    else:
+                        conn.execute(
+                            sa.delete(self._schema.universe_current).where(
+                                self._schema.universe_current.c.strategy == strategy_key
+                            )
+                        )
+                        conn.execute(
+                            sa.insert(self._schema.universe_current).values(
+                                strategy=strategy_key,
+                                run_id=uuid_value_for_url(db_url, run_id),
+                                updated_ts=now_kst().isoformat(),
+                            )
+                        )
                 conn.execute(
                     sa.update(self._schema.universe_runs)
                     .where(self._schema.universe_runs.c.run_id == run_id)
@@ -923,23 +956,38 @@ class OrdersRepo:
             "acked_at": acked_at,
             "updated_at": func.now(),
         }
-        insert_stmt: sa.Insert
-        if self.engine.dialect.name == "postgresql":
-            insert_stmt = pg_insert(self._schema.orders).values(**payload)
-        else:
-            insert_stmt = sa.insert(self._schema.orders).values(**payload)
-        stmt = insert_stmt.on_conflict_do_update(
-            index_elements=conflict_cols,
-            set_=update_cols,
-        ).returning(self._schema.orders.c.order_id)
         with self.engine.begin() as conn:
-            try:
+            if conn.dialect.name == "postgresql":
+                # Use PostgreSQL-specific upsert with on_conflict_do_update
+                stmt = pg_insert(self._schema.orders).values(**payload).on_conflict_do_update(
+                    index_elements=conflict_cols,
+                    set_=update_cols,
+                ).returning(self._schema.orders.c.order_id)
                 res = conn.execute(stmt)
                 order_id = res.scalar()
                 if order_id:
                     return str(order_id)
-            except Exception:
-                pass
+            else:
+                # Fallback upsert for non-PostgreSQL dialects
+                try:
+                    stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
+                    res = conn.execute(stmt)
+                    order_id = res.scalar()
+                    if order_id:
+                        return str(order_id)
+                except IntegrityError:
+                    # Update existing row
+                    where_conditions = [self._schema.orders.c[col] == payload[col] for col in conflict_cols]
+                    conn.execute(
+                        sa.update(self._schema.orders).where(and_(*where_conditions)).values(**update_cols)
+                    )
+                    existing = conn.execute(
+                        select(self._schema.orders.c.order_id).where(and_(*where_conditions))
+                    ).scalar()
+                    if existing:
+                        return str(existing)
+            
+            # Fallback query if stmt didn't return anything
             existing = conn.execute(
                 select(self._schema.orders.c.order_id).where(
                     and_(
@@ -1045,23 +1093,38 @@ class FillsRepo:
             "raw_json": safe_raw_json,
             "broker_fill_id": broker_fill_id,
         }
-        insert_stmt: sa.Insert
-        if self.engine.dialect.name == "postgresql":
-            insert_stmt = pg_insert(self._schema.fills).values(**payload)
-        else:
-            insert_stmt = sa.insert(self._schema.fills).values(**payload)
-        stmt = insert_stmt.on_conflict_do_update(
-            index_elements=conflict_cols,
-            set_=update_cols,
-        ).returning(self._schema.fills.c.fill_id)
         with self.engine.begin() as conn:
-            try:
+            if conn.dialect.name == "postgresql":
+                # Use PostgreSQL-specific upsert with on_conflict_do_update
+                stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
+                    index_elements=conflict_cols,
+                    set_=update_cols,
+                ).returning(self._schema.fills.c.fill_id)
                 res = conn.execute(stmt)
                 fill_id = res.scalar()
                 if fill_id:
                     return str(fill_id)
-            except Exception:
-                pass
+            else:
+                # Fallback upsert for non-PostgreSQL dialects
+                try:
+                    stmt = sa.insert(self._schema.fills).values(**payload).returning(self._schema.fills.c.fill_id)
+                    res = conn.execute(stmt)
+                    fill_id = res.scalar()
+                    if fill_id:
+                        return str(fill_id)
+                except IntegrityError:
+                    # Update existing row
+                    where_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
+                    conn.execute(
+                        sa.update(self._schema.fills).where(and_(*where_conditions)).values(**update_cols)
+                    )
+                    existing = conn.execute(
+                        select(self._schema.fills.c.fill_id).where(and_(*where_conditions))
+                    ).scalar()
+                    if existing:
+                        return str(existing)
+            
+            # Fallback query if stmt didn't return anything
             existing = None
             if trade_id:
                 existing = conn.execute(
@@ -1781,11 +1844,28 @@ def upsert_price_daily(engine: Engine, candles: List[Dict[str, Any]], market: st
                 "value": candle.get("value"),
                 "source": "KIS",
             }
-            stmt = pg_insert(schema.price_daily).values(**payload).on_conflict_do_update(
-                index_elements=["market", "code", "date"],
-                set_={k: v for k, v in payload.items() if k not in ["market", "code", "date"]}
-            )
-            conn.execute(stmt)
+            conflict_cols = ["market", "code", "date"]
+            update_cols = {k: v for k, v in payload.items() if k not in conflict_cols}
+            
+            if conn.dialect.name == "postgresql":
+                # Use PostgreSQL-specific upsert
+                stmt = pg_insert(schema.price_daily).values(**payload).on_conflict_do_update(
+                    index_elements=conflict_cols,
+                    set_=update_cols
+                )
+                conn.execute(stmt)
+            else:
+                # Fallback upsert for non-PostgreSQL dialects
+                try:
+                    conn.execute(sa.insert(schema.price_daily).values(**payload))
+                except IntegrityError:
+                    # Update existing row
+                    where_clause = and_(
+                        schema.price_daily.c.market == market,
+                        schema.price_daily.c.code == code,
+                        schema.price_daily.c.date == candle["date"]
+                    )
+                    conn.execute(sa.update(schema.price_daily).where(where_clause).values(**update_cols))
 
 
 # Backward compatibility alias

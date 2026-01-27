@@ -49,22 +49,11 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import inspect
+          from trader.db.engine import make_engine
           from trader.db.health import assert_db_ready
 
-          # signature-safe: 파라미터 개수에 따라 분기
-          sig = inspect.signature(assert_db_ready)
-          params = list(sig.parameters.values())
-          
-          if len(params) == 0:
-              # 인자 없음
-              assert_db_ready()
-          else:
-              # 인자 필요 (backward compatibility)
-              from trader.db.engine import make_engine
-              engine = make_engine()
-              assert_db_ready(engine)
-          
+          engine = make_engine()
+          assert_db_ready(engine)
           print("DB connectivity OK")
           PY
 
