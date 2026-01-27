@@ -14,7 +14,7 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
 
-from trader.runtime_paths import close_entry_orders_path
+from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.config import (
     CAP_CAP,
     LEDGER_BASE_DIR,
@@ -1331,6 +1331,24 @@ class PB1Engine:
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
+        # Limit OHLCV queries to holdings + top candidates from previous run
+        holdings_codes = set(str(row.get("pdno") or "").zfill(6) for row in self._holdings_summary.get("output1", []))
+        top_candidates_path = runtime_path("top_candidates.json")
+        prev_top_codes = set()
+        if top_candidates_path.exists():
+            try:
+                with open(top_candidates_path) as f:
+                    prev_top_candidates = json.load(f)
+                prev_top_codes = set(c.get("code") for c in prev_top_candidates if c.get("code"))
+            except Exception:
+                logger.warning("[PB1][TOP_CANDIDATES][LOAD_FAIL] %s", top_candidates_path)
+        relevant_codes = holdings_codes | prev_top_codes
+        if relevant_codes:
+            members = [m for m in members if str(m.get("code") or "").zfill(6) in relevant_codes]
+            logger.info("[PB1][CANDIDATES][LIMITED] holdings=%s prev_top=%s total_members=%s", len(holdings_codes), len(prev_top_codes), len(members))
+        else:
+            logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
+
         candidates: List[CandidateFeature] = []
         required_candles = max(self.min_candles, 252)
         bench_df, _ = self._fetch_daily(RS_BENCHMARK, count=260)

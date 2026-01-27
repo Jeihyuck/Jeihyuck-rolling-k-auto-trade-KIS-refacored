@@ -49,7 +49,7 @@ from trader.config import (
     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
 )
-from trader.runtime_paths import runtime_root
+from trader.runtime_paths import runtime_root, runtime_path
 from trader.db.engine import make_engine
 from trader.db.health import assert_db_ready
 from trader.db.locks import acquire_advisory_lock, release_advisory_lock
@@ -665,6 +665,7 @@ def run_once(
     *,
     args: argparse.Namespace,
     engine,
+    ctx: RunContext,
     loop_mode: bool = False,
     window: WindowDecision | None = None,
     runtime_dir: Path | None = None,
@@ -1142,6 +1143,14 @@ def run_once(
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
 
     runs_repo = RunsRepo(engine)
+    # Ensure run row exists early to prevent FK errors
+    runs_repo.upsert_run(
+        run_id=ctx.run_id,
+        env=ctx.env,
+        strategy=ctx.strategy,
+        workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
+        ts_start=ctx.started_at,
+    )
     universe_repo = UniverseRepo(engine)
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
@@ -1367,6 +1376,15 @@ def run_once(
             result = engine_runner.run_close_cancel()
         else:
             result = engine_runner.run()
+        # Save top_candidates for next run to limit OHLCV queries
+        if engine_runner and hasattr(engine_runner, 'top_candidates'):
+            top_candidates_path = runtime_path("top_candidates.json")
+            try:
+                with open(top_candidates_path, 'w') as f:
+                    json.dump(engine_runner.top_candidates, f)
+                logger.info("[PB1][TOP_CANDIDATES][SAVE] saved %s to %s", len(engine_runner.top_candidates), top_candidates_path)
+            except Exception as exc:
+                logger.warning("[PB1][TOP_CANDIDATES][SAVE_FAIL] %s", exc)
         did_work = True
         runs_repo.finish_run(run_record_id, status=result.status, notes=result.notes)
         db_write_reasons.append("run_finish")
@@ -1728,11 +1746,12 @@ def main() -> int:
     start_ts = time_mod.time()
     try:
         if smoke_enabled:
-            run_once(args=args, engine=engine, loop_mode=False, window=None)
+            run_once(args=args, engine=engine, ctx=ctx, loop_mode=False, window=None)
             return 0
         _touched, _did_work, metrics, phase_for_log, result_status = run_once(
             args=args,
             engine=engine,
+            ctx=ctx,
             loop_mode=False,
             window=None,
             max_seconds=max_seconds,

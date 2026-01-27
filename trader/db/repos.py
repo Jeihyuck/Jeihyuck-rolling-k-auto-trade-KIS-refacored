@@ -38,6 +38,7 @@ __all__ = [
     "PositionsRepo",
     "LedgerEventsRepo",
     "ReconcileLogRepo",
+    "PositionRepo",  # Backward compatibility
 ]
 
 
@@ -241,6 +242,48 @@ class RunsRepo:
                 .where(self._schema.runs.c.run_id == run_id)
                 .values(status=status, finished_at=func.now(), notes=notes),
             )
+
+    def upsert_run(
+        self,
+        run_id: str,
+        env: str,
+        strategy: str,
+        workflow_run_id: str | None = None,
+        ts_start: datetime | None = None,
+        mode: str | None = None,
+        **kwargs
+    ) -> None:
+        values = {
+            "run_id": _coerce_uuid(run_id, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+            "env": env,
+            "strategy": strategy,
+            "workflow_run_id": workflow_run_id,
+            "started_at": ts_start or func.now(),
+            "status": "STARTED",
+            **kwargs
+        }
+        stmt = sa.insert(self._schema.runs).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[self._schema.runs.c.run_id],
+            set_=values
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+
+    def ensure_run_exists(self, run_id: str) -> None:
+        # Check if run exists, if not, insert minimal row
+        stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
+        with self.engine.begin() as conn:
+            exists = conn.execute(stmt).first() is not None
+            if not exists:
+                # Insert minimal row
+                values = {
+                    "run_id": _coerce_uuid(run_id, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    "env": "unknown",
+                    "strategy": "unknown",
+                    "status": "STARTED",
+                }
+                conn.execute(sa.insert(self._schema.runs).values(**values))
 
 
 class UniverseRepo:
@@ -645,6 +688,21 @@ class OrdersRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def ensure_run_exists(self, run_id: str) -> None:
+        # Check if run exists, if not, insert minimal row
+        stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
+        with self.engine.begin() as conn:
+            exists = conn.execute(stmt).first() is not None
+            if not exists:
+                # Insert minimal row
+                values = {
+                    "run_id": _coerce_uuid(run_id, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    "env": "unknown",
+                    "strategy": "unknown",
+                    "status": "STARTED",
+                }
+                conn.execute(sa.insert(self._schema.runs).values(**values))
+
     def create_intent_idempotent(
         self,
         env: str,
@@ -666,6 +724,8 @@ class OrdersRepo:
     ) -> tuple[str, bool]:
         db_url = str(self.engine.url)
         original_request_json = request_json
+        if run_id:
+            self.ensure_run_exists(run_id)
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -896,6 +956,21 @@ class FillsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def ensure_run_exists(self, run_id: str) -> None:
+        # Check if run exists, if not, insert minimal row
+        stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
+        with self.engine.begin() as conn:
+            exists = conn.execute(stmt).first() is not None
+            if not exists:
+                # Insert minimal row
+                values = {
+                    "run_id": _coerce_uuid(run_id, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    "env": "unknown",
+                    "strategy": "unknown",
+                    "status": "STARTED",
+                }
+                conn.execute(sa.insert(self._schema.runs).values(**values))
+
     def list_today_fills(
         self,
         env: str,
@@ -937,6 +1012,8 @@ class FillsRepo:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
         safe_raw_json = json_sanitize(raw_json or {})
+        if run_id:
+            self.ensure_run_exists(run_id)
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -1000,6 +1077,21 @@ class LedgerEventsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def ensure_run_exists(self, run_id: str) -> None:
+        # Check if run exists, if not, insert minimal row
+        stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
+        with self.engine.begin() as conn:
+            exists = conn.execute(stmt).first() is not None
+            if not exists:
+                # Insert minimal row
+                values = {
+                    "run_id": _coerce_uuid(run_id, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    "env": "unknown",
+                    "strategy": "unknown",
+                    "status": "STARTED",
+                }
+                conn.execute(sa.insert(self._schema.runs).values(**values))
+
     def append_event(
         self,
         *,
@@ -1029,6 +1121,8 @@ class LedgerEventsRepo:
         base_backoff = float(os.getenv("DB_WRITE_BACKOFF_SEC", "0.2"))
         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
         safe_reasons = json_sanitize(reasons or [])
+        if run_id:
+            self.ensure_run_exists(run_id)
         payload = {
             "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -1692,3 +1786,7 @@ def upsert_price_daily(engine: Engine, candles: List[Dict[str, Any]], market: st
                 set_={k: v for k, v in payload.items() if k not in ["market", "code", "date"]}
             )
             conn.execute(stmt)
+
+
+# Backward compatibility alias
+PositionRepo = PositionsRepo
