@@ -44,7 +44,7 @@ _KIS_BREAKER_THRESHOLD = int(os.getenv("KIS_BREAKER_THRESHOLD", "10") or "10")
 _KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
 _KIS_TEMP_ERROR_CODES: set[str] = {
     code.strip()
-    for code in (os.getenv("KIS_TEMP_ERROR_CODES") or "").split(",")
+    for code in (os.getenv("KIS_TEMP_ERROR_CODES") or "EGW00201").split(",")
     if code.strip()
 }
 
@@ -415,7 +415,10 @@ class KisAPI:
         self._safe_backoff_cap = _env_float("KIS_HTTP_BACKOFF_CAP_SEC", 8.0)
         self._safe_max_seconds = _env_float("KIS_HTTP_MAX_SECONDS", 18.0)
 
-        self._limiter = _RateLimiter(min_interval_sec=0.20)
+        qps = _env_float("KIS_QPS", 5.0)
+        min_interval_sec = 1.0 / qps if qps > 0 else 0.20
+        self._limiter = _RateLimiter(min_interval_sec=min_interval_sec)
+        self._concurrency_sem = threading.Semaphore(_env_int("KIS_CONCURRENCY", 2))
         self._recent_sells: Dict[str, float] = {}
         self._recent_sells_lock = threading.Lock()
         self._recent_sells_cooldown = 60.0
@@ -487,6 +490,17 @@ class KisAPI:
             if price >= base:
                 return tick
         return 1
+
+    def _log_kis_resp(self, operation: str, code: str, params: dict, data: dict | None, elapsed_ms: float):
+        """Log KIS response for debugging, masking sensitive info."""
+        if not data:
+            logger.debug("[KIS][%s][FAIL] code=%s elapsed_ms=%.0f", operation, code, elapsed_ms)
+            return
+        rt_cd = data.get("rt_cd")
+        msg1 = data.get("msg1", "")
+        # Mask sensitive info if any
+        safe_data = {"rt_cd": rt_cd, "msg1": msg1[:100]}  # Truncate long messages
+        logger.debug("[KIS][%s][RESP] code=%s rt_cd=%s msg1=%s elapsed_ms=%.0f", operation, code, rt_cd, msg1, elapsed_ms)
 
     # ===== [NEW] 안전요청 & 세션리셋 =====
     def _reset_session(self):
@@ -1065,37 +1079,60 @@ class KisAPI:
             except Exception:
                 return None
 
+        retry_max = _env_int("KIS_RETRY_MAX", 5)
+        base_sleep = _env_float("KIS_RETRY_BASE_SLEEP", 1.2)
+        jitter = _env_float("KIS_RETRY_JITTER", 0.5)
+        attempts = max(attempts, retry_max)
         for attempt in range(1, attempts + 1):
-            self._limiter.wait("price-quote")
-            for tr in _pick_tr(self.env, "PRICE"):
-                headers = self._headers(tr)
-                for market_div in markets:
-                    for code_fmt in code_variants:
-                        params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                        try:
-                            resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
-                            data = resp.json()
-                        except Exception as exc:
-                            last_error = exc
-                            if diag_mode:
-                                logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
-                                return {}
-                            continue
-                        if "초당 거래건수" in (data.get("msg1") or ""):
-                            time.sleep(0.35 + random.uniform(0, 0.15))
-                            continue
-                        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                            raw_output = dict(data["output"])
+            with self._concurrency_sem:
+                self._limiter.wait("price-quote")
+                for tr in _pick_tr(self.env, "PRICE"):
+                    headers = self._headers(tr)
+                    for market_div in markets:
+                        for code_fmt in code_variants:
+                            params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
+                            try:
+                                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                                data = resp.json()
+                            except KisTemporaryError as exc:
+                                last_error = exc
+                                if diag_mode:
+                                    logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
+                                    return {}
+                                sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
+                                time.sleep(sleep_time)
+                                continue
+                            except Exception as exc:
+                                last_error = exc
+                                if diag_mode:
+                                    logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
+                                    return {}
+                                continue
+                            if "초당 거래건수" in (data.get("msg1") or ""):
+                                # Rate limit 초과 시 TEMP_ERROR로 처리
+                                last_error = KisTemporaryError("Rate limit exceeded")
+                                if diag_mode:
+                                    logger.warning("[KIS][QUOTE][RATE_LIMIT] diag mode code=%s attempt=%s", code, attempt)
+                                    return {}
+                                sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
+                                time.sleep(sleep_time)
+                                continue
+                            if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                                raw_output = dict(data["output"])
+                                break
+                        if raw_output is not None:
                             break
                     if raw_output is not None:
                         break
-                if raw_output is not None:
-                    break
             if raw_output is not None:
                 break
             if diag_mode:
                 break
-            time.sleep(0.6 * attempt + random.uniform(0, 0.2))
+            sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
+            time.sleep(sleep_time)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
 
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)

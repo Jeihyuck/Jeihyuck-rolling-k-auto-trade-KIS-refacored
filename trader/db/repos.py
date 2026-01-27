@@ -365,7 +365,7 @@ class UniverseRepo:
                 .order_by(self._schema.universe_runs.c.as_of.desc())
             )
             with self.engine.begin() as conn:
-                candidates = conn.execute(fallback_stmt).fetchall()
+                candidates = conn.execute(fallback_stmt.mappings()).fetchall()
             for row in candidates:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
@@ -389,7 +389,7 @@ class UniverseRepo:
                 .order_by(self._schema.universe_runs.c.as_of.desc())
             )
             with self.engine.begin() as conn:
-                candidates = conn.execute(fallback_stmt).fetchall()
+                candidates = conn.execute(fallback_stmt.mappings()).fetchall()
             for row in candidates:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
@@ -437,8 +437,8 @@ class UniverseRepo:
                         provider=provider,
                         as_of=as_of_d,
                         created_ts=now_kst().isoformat(),
-                        status="STARTED",
-                        members_count=0,
+                        status="OK",
+                        members_count=members_count,
                     )
                 )
                 for rank, member in enumerate(members_list, start=1):
@@ -483,16 +483,45 @@ class UniverseRepo:
             logger.exception("[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
             raise
 
-    def record_universe_run_failure(
+    def start_universe_run(
         self,
         *,
         env: str,
         strategy: str,
         as_of_date: str,
         provider: str,
-        error_reason: str,
-        members_count: int = 0,
     ) -> str:
+        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
+        strategy_key = self._strategy_key(env, strategy)
+        as_of_d = _as_date(as_of_date)
+        try:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    select(self._schema.universe_runs.c.run_id).where(
+                        and_(
+                            self._schema.universe_runs.c.strategy == strategy_key,
+                            self._schema.universe_runs.c.provider == provider,
+                            self._schema.universe_runs.c.as_of == as_of_d,
+                        )
+                    )
+                ).scalar()
+                if existing:
+                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                conn.execute(
+                    sa.insert(self._schema.universe_runs).values(
+                        run_id=run_id,
+                        strategy=strategy_key,
+                        provider=provider,
+                        as_of=as_of_d,
+                        created_ts=now_kst().isoformat(),
+                        status="RUNNING",
+                        members_count=0,
+                    )
+                )
+            return str(run_id)
+        except Exception:
+            logger.exception("[UNIVERSE][RUN][START_FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
+            raise
         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)

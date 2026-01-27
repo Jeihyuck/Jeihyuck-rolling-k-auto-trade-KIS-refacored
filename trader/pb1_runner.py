@@ -284,7 +284,8 @@ def ensure_universe_built_once(
         build_universe(as_of_date=as_of, env=env, strategy=strategy)
         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
     if not members:
-        raise RuntimeError(f"missing universe in DB: env={env} strategy={strategy} as_of={as_of}")
+        logger.error("[UNIVERSE][ENSURE][MISSING] env=%s strategy=%s as_of=%s - trading will be suspended", env, strategy, as_of)
+        return  # Do not raise, allow PB1 to handle empty universe
 
 
 def _load_universe_context(

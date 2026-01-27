@@ -487,6 +487,14 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         provider_override or DEFAULT_PROVIDER,
     )
 
+    # Start run in RUNNING status
+    try:
+        run_id = repo.start_universe_run(env=env, strategy=strategy, as_of_date=as_of_date, provider=source)
+        logger.info("[UNIVERSE][RUN][STARTED] run_id=%s", run_id)
+    except Exception as exc:
+        logger.warning("[UNIVERSE][RUN][START_FAIL] err=%s", exc)
+        # Continue anyway
+
     allowed_chain = providers_for_env(env)
     if provider_override:
         if provider_override not in allowed_chain:
@@ -572,7 +580,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             insufficient_codes[: min(5, len(insufficient_codes))],
         )
 
-    validate_kis = os.getenv("UNIVERSE_VALIDATE_KIS", "1").lower() in {"1", "true", "yes", "on"}
+    validate_kis = os.getenv("UNIVERSE_VALIDATE_WITH_KIS", "0").lower() in {"1", "true", "yes", "on"}
     kis_validator: KisAPI | None = None
     if validate_kis:
         try:
