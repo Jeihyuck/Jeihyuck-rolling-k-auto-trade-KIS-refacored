@@ -28,6 +28,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
+from trader.kis_rate_limiter import get_kis_limiter
 from trader.runtime_paths import runtime_path
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
 from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
@@ -446,6 +447,10 @@ class KisAPI:
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
 
+        # Daily chart cache: key -> (data, ts)
+        self._daily_chart_cache: Dict[Tuple[str, str, str, str, str], Tuple[List[Dict[str, Any]], float]] = {}
+        self._daily_chart_ttl = 10 * 60  # 10분 TTL
+
         # [NEW] 호가 조회 404 쿨다운 캐시
         self.askbid_unavailable_cache: Dict[str, float] = {}  # code -> unavailable_until_timestamp
         self.askbid_cooldown_sec = int(os.getenv("KIS_ASKBID_COOLDOWN_SEC", "3600"))  # 기본 1시간
@@ -550,6 +555,21 @@ class KisAPI:
         start_ts = time.monotonic()
         auth_refreshed = False
         reset_done = False
+        consecutive_temp_failures = 0
+
+        # Apply rate limiter based on endpoint
+        parsed = urlparse(url)
+        path = parsed.path
+        limiter_key = None
+        if "inquire-price" in path:
+            limiter_key = "PRICE"
+        elif "inquire-daily-itemchartprice" in path:
+            limiter_key = "DAILY_CHART"
+        elif "inquire-asking-price-exp-ccn" in path:
+            limiter_key = "HOGA"
+        if limiter_key:
+            get_kis_limiter().acquire(limiter_key)
+
         breaker_open, breaker_until = _breaker_check(method, url)
         if breaker_open:
             logger.warning(
@@ -610,26 +630,30 @@ class KisAPI:
                                    method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisPermanentError(f"HTTP {status} for {url}")
                 _breaker_record_success(method, url)
+                consecutive_temp_failures = 0  # Reset on success
                 return resp
             except requests.exceptions.SSLError as e:
                 logger.warning("[NET:SSL_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
                 last_err = e
-                if reset_on_error and not reset_done:
+                consecutive_temp_failures += 1
+                if reset_on_error and not reset_done and consecutive_temp_failures >= 2:
                     self._reset_session()
                     reset_done = True
             except requests.exceptions.RequestException as e:
                 logger.warning("[NET:REQ_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
                 last_err = e
-                if reset_on_error and not reset_done:
+                consecutive_temp_failures += 1
+                if reset_on_error and not reset_done and consecutive_temp_failures >= 2:
                     self._reset_session()
                     reset_done = True
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
                 last_err = e
-                if reset_on_error and not reset_done:
+                consecutive_temp_failures += 1
+                if reset_on_error and not reset_done and consecutive_temp_failures >= 2:
                     self._reset_session()
                     reset_done = True
             except KisAuthError:
@@ -641,6 +665,8 @@ class KisAPI:
             if i >= attempts:
                 break
             delay = min(self._safe_backoff_cap, self._safe_backoff_base * (2 ** (i - 1)))
+            if "초당" in str(last_err).lower():
+                delay = random.uniform(2, 6)  # Special backoff for rate limit
             jitter = random.uniform(0.0, delay * 0.25)
             sleep_s = delay + jitter
             logger.warning(
@@ -1035,9 +1061,13 @@ class KisAPI:
             logger.debug("[PRICE_ONCE_EX] %s/%s %s → %s", market_div, code_fmt, tr_id, e)
             return None
 
+        if resp.status_code != 200 or data.get("rt_cd") != "0":
+            logger.warning("[PRICE][FAIL] status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
+                           resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
+            return None
         if "초당 거래건수" in (data.get("msg1") or ""):
             return None
-        if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+        if data.get("output"):
             try:
                 px = float(data["output"].get("stck_prpr") or 0)
                 return px if px > 0 else None
@@ -1134,6 +1164,11 @@ class KisAPI:
                             if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                                 raw_output = dict(data["output"])
                                 break
+                            else:
+                                # Log failure
+                                logger.warning("[KIS][QUOTE][FAIL] code=%s status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
+                                               code, resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
+                                continue
                         if raw_output is not None:
                             break
                     if raw_output is not None:
@@ -1232,6 +1267,62 @@ class KisAPI:
                 return price_only
         
         return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
+
+    def get_quote(self, code: str) -> dict:
+        """
+        Get quote with last, ask, bid. If ask/bid missing from inquire-price, fallback to inquire-asking-price-exp-ccn.
+        Returns: {"last": int, "ask": Optional[int], "bid": Optional[int], "src": "..."}
+        """
+        c = safe_strip(code)
+        if not c:
+            raise ValueError("Invalid code")
+
+        # Try inquire-price
+        try:
+            quote = self.get_price_quote(c, diag_mode=False, attempts=1)
+            last = safe_int(quote.get("stck_prpr") or quote.get("prpr") or quote.get("last"))
+            ask = safe_int(quote.get("askp1") or quote.get("askp") or quote.get("ask"))
+            bid = safe_int(quote.get("bidp1") or quote.get("bidp") or quote.get("bid"))
+            if last is not None:
+                if ask is not None or bid is not None:
+                    return {"last": last, "ask": ask, "bid": bid, "src": "inquire-price"}
+                # Fallback to hoga
+                try:
+                    hoga = self._get_hoga_quote(c)
+                    ask = safe_int(hoga.get("askp1"))
+                    bid = safe_int(hoga.get("bidp1"))
+                    return {"last": last, "ask": ask, "bid": bid, "src": "hoga-fallback"}
+                except Exception as e:
+                    logger.warning("[QUOTE][HOGA_FAIL] code=%s err=%s", c, e)
+                    return {"last": last, "ask": None, "bid": None, "src": "price-only"}
+            else:
+                raise RuntimeError("No last price")
+        except Exception as e:
+            logger.warning("[QUOTE][PRICE_FAIL] code=%s err=%s", c, e)
+            # Try hoga only
+            try:
+                hoga = self._get_hoga_quote(c)
+                last = safe_int(hoga.get("stck_prpr"))
+                ask = safe_int(hoga.get("askp1"))
+                bid = safe_int(hoga.get("bidp1"))
+                return {"last": last, "ask": ask, "bid": bid, "src": "hoga-only"}
+            except Exception as e2:
+                logger.warning("[QUOTE][HOGA_FAIL] code=%s err=%s", c, e2)
+                raise RuntimeError(f"Failed to get quote for {c}")
+
+    def _get_hoga_quote(self, code: str) -> dict:
+        """Get hoga quote using inquire-asking-price-exp-ccn"""
+        tr_id = _pick_tr(self.env, "ORDERBOOK")[0]  # FHKST01010200
+        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        headers = self._headers(tr_id)
+        params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code}  # Assume J, can adjust
+        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+        data = resp.json()
+        if resp.status_code != 200 or data.get("rt_cd") != "0":
+            logger.warning("[HOGA][FAIL] status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
+                           resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
+            raise RuntimeError("Hoga API failed")
+        return data.get("output", {})
 
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
@@ -1348,6 +1439,13 @@ class KisAPI:
         back_days = max(200, count * 4 + 100)
         from_ymd = (now_kst - timedelta(days=back_days)).strftime("%Y%m%d")
 
+        # Cache key
+        cache_key = (iscd, from_ymd, to_ymd, "D", "0")
+        cached_data, cached_ts = self._daily_chart_cache.get(cache_key, (None, 0))
+        if cached_data and (time.time() - cached_ts) < self._daily_chart_ttl:
+            logger.debug("[DAILY_CACHE_HIT] %s", iscd)
+            return cached_data[-count:] if len(cached_data) > count else cached_data
+
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
 
@@ -1433,6 +1531,9 @@ class KisAPI:
                         raise DataEmptyError(f"A{iscd} 0 candles")
                     if len(rows) < 21:
                         raise DataShortError(f"A{iscd} {len(rows)} candles (<21)")
+
+                    # Cache the full result
+                    self._daily_chart_cache[cache_key] = (rows, time.time())
 
                     need = max(count, 21)
                     return rows[-need:][-count:]
