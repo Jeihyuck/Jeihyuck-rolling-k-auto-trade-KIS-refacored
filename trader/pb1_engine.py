@@ -2172,7 +2172,11 @@ class PB1Engine:
         if ask and ask > 0:
             return ask, "ask"
         if prpr and prpr > 0:
-            return prpr, "prpr"
+            # [NEW] 호가 없을 때 slippage 적용 (매수 시 보수적으로)
+            slippage_bps = float(os.getenv("PB1_ORDER_SLIPPAGE_BPS", "10")) / 10000.0  # 기본 10bps
+            order_price = prpr * (1 + slippage_bps)
+            logger.info("[PB1][PRICE][FALLBACK] code=%s using prpr=%.0f with slippage %.2f%% -> %.0f", code, prpr, slippage_bps * 10000, order_price)
+            return order_price, "prpr_slippage"
         if close and close > 0:
             return close, "daily_close"
         logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)

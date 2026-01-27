@@ -360,7 +360,7 @@ TR_MAP = {
         "ORDER_SELL": [os.getenv("KIS_TR_ID_ORDER_SELL", "VTTC0011U"), "VTTC0801U"],
         "BALANCE": [os.getenv("KIS_TR_ID_BALANCE", "VTTC8434R")],
         "PRICE": [os.getenv("KIS_TR_ID_PRICE", "FHKST01010100")],
-        "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "FHKST01010200")],
+        "ORDERBOOK": [os.getenv("KIS_TR_ID_ORDERBOOK", "VHKST01010200")],
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
         "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER", "VTTC8908R")],
@@ -445,6 +445,10 @@ class KisAPI:
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
+
+        # [NEW] 호가 조회 404 쿨다운 캐시
+        self.askbid_unavailable_cache: Dict[str, float] = {}  # code -> unavailable_until_timestamp
+        self.askbid_cooldown_sec = int(os.getenv("KIS_ASKBID_COOLDOWN_SEC", "3600"))  # 기본 1시간
 
     def _safe_mode_path(self) -> Path:
         path = botstate_path("runtime", "status", "kis_safe_mode.json")
@@ -1158,17 +1162,7 @@ class KisAPI:
         bid_price = _to_float(raw_output.get("bidp1") or raw_output.get("bidp") or raw_output.get("bid"))
         ask_price = _to_float(raw_output.get("askp1") or raw_output.get("askp") or raw_output.get("ask"))
 
-        # 호가가 없으면 별도 조회로 보강(실패 무시)
-        if bid_price is None:
-            try:
-                bid_price = self.get_best_bid(c)
-            except Exception:
-                bid_price = None
-        if ask_price is None:
-            try:
-                ask_price = self.get_best_ask(c)
-            except Exception:
-                ask_price = None
+        # [REMOVED] 호가가 없으면 별도 조회로 보강 - fallback 시 재호출 방지
 
         quote: dict = {**raw_output}
         quote.setdefault("stck_prpr", last_price)
@@ -1302,28 +1296,24 @@ class KisAPI:
 
     def get_orderbook_strength(self, code: str) -> Optional[float]:
         base = normalize_base_url(API_BASE_URL)
-        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-asking-price"
         self._limiter.wait("orderbook")
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "U"]
             c = code.strip()
-            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-            for market_div in markets:
-                for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                    try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
-                        data = resp.json()
-                    except Exception:
-                        continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        out = data["output"]
-                        bid = sum(float(out.get(f"bidp_rsqn{i}") or 0) for i in range(1, 6))
-                        ask = sum(float(out.get(f"askp_rsqn{i}") or 0) for i in range(1, 6))
-                        if (bid + ask) > 0:
-                            return 100.0 * bid / max(1.0, ask)
+            params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": c}
+            try:
+                # [CHG] 안전요청 사용
+                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                data = resp.json()
+            except Exception:
+                continue
+            if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                out = data["output"]
+                bid = sum(float(out.get(f"bidp_rsqn{i}") or 0) for i in range(1, 6))
+                ask = sum(float(out.get(f"askp_rsqn{i}") or 0) for i in range(1, 6))
+                if (bid + ask) > 0:
+                    return 100.0 * bid / max(1.0, ask)
         return None
 
     # === 일봉 ===
@@ -1754,46 +1744,62 @@ class KisAPI:
 
     def get_best_ask(self, code: str) -> Optional[float]:
         """최우선 매도호가(askp1)."""
+        # [NEW] 쿨다운 캐시 체크
+        now = time.time()
+        if code in self.askbid_unavailable_cache:
+            until = self.askbid_unavailable_cache[code]
+            if now < until:
+                remaining_sec = int(until - now)
+                logger.info("[ASKBID][SKIP] code=%s remaining_sec=%d", code, remaining_sec)
+                # Fallback to current price
+                quote = self.get_price_quote(code, diag_mode=True)
+                if quote and quote.get("last"):
+                    prpr = quote["last"]
+                    tick_size = self._get_tick_size(prpr)
+                    pseudo_ask = prpr + tick_size
+                    return pseudo_ask
+                return None
+            else:
+                del self.askbid_unavailable_cache[code]
+
         start_time = time.time()
         base = normalize_base_url(API_BASE_URL)
-        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-asking-price"
         self._limiter.wait("orderbook-best")
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "Q", "U"]
             c = code.strip()
-            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-            for market_div in markets:
-                for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                    try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request(
-                            "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
-                        )
-                        data = resp.json()
-                        resp_data = data
-                    except Exception:
-                        continue
-                    if resp.status_code == 404:
-                        logger.warning("[ASKBID][404] code=%s url=%s -> immediate fallback to current price", code, url)
-                        quote = self.get_price_quote(code, diag_mode=True)
-                        if quote and quote.get("last"):
-                            prpr = quote["last"]
-                            tick_size = self._get_tick_size(prpr)
-                            pseudo_ask = prpr + tick_size
-                            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f tick_size=%d -> ask=%.0f", code, prpr, tick_size, pseudo_ask)
-                            return pseudo_ask
-                        return None
-                    elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        elapsed_ms = (time.time() - start_time) * 1000
-                        self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
-                        try:
-                            return float(data["output"].get("askp1"))
-                        except Exception:
-                            return None
-                    # else continue
+            params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": c}
+            try:
+                # [CHG] 안전요청 사용
+                resp = self._safe_request(
+                    "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
+                )
+                data = resp.json()
+                resp_data = data
+            except Exception:
+                continue
+            if resp.status_code == 404:
+                # [NEW] 404 영구 실패로 캐시 등록
+                self.askbid_unavailable_cache[code] = time.time() + self.askbid_cooldown_sec
+                logger.warning("[ASKBID][COOLDOWN] code=%s until=%s reason=404", code, datetime.fromtimestamp(self.askbid_unavailable_cache[code]).strftime('%Y-%m-%d %H:%M:%S'))
+                quote = self.get_price_quote(code, diag_mode=True)
+                if quote and quote.get("last"):
+                    prpr = quote["last"]
+                    tick_size = self._get_tick_size(prpr)
+                    pseudo_ask = prpr + tick_size
+                    logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f tick_size=%d -> ask=%.0f", code, prpr, tick_size, pseudo_ask)
+                    return pseudo_ask
+                return None
+            elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                elapsed_ms = (time.time() - start_time) * 1000
+                self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
+                try:
+                    return float(data["output"].get("askp1"))
+                except Exception:
+                    return None
+            # else continue
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         # [PATCH] Fallback to current price
@@ -1809,45 +1815,60 @@ class KisAPI:
 
     def get_best_bid(self, code: str) -> Optional[float]:
         """최우선 매수호가(bidp1)."""
+        # [NEW] 쿨다운 캐시 체크
+        now = time.time()
+        if code in self.askbid_unavailable_cache:
+            until = self.askbid_unavailable_cache[code]
+            if now < until:
+                remaining_sec = int(until - now)
+                logger.info("[ASKBID][SKIP] code=%s remaining_sec=%d", code, remaining_sec)
+                # Fallback to current price
+                quote = self.get_price_quote(code, diag_mode=True)
+                if quote and quote.get("last"):
+                    prpr = quote["last"]
+                    pseudo_bid = prpr
+                    return pseudo_bid
+                return None
+            else:
+                del self.askbid_unavailable_cache[code]
+
         start_time = time.time()
         base = normalize_base_url(API_BASE_URL)
-        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-asking-price"
         self._limiter.wait("orderbook-best")
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
-            markets = ["J", "Q", "U"]
             c = code.strip()
-            codes = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-            for market_div in markets:
-                for code_fmt in codes:
-                    params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
-                    try:
-                        # [CHG] 안전요청 사용
-                        resp = self._safe_request(
-                            "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
-                        )
-                        data = resp.json()
-                        resp_data = data
-                    except Exception:
-                        continue
-                    if resp.status_code == 404:
-                        logger.warning("[ASKBID][404] code=%s url=%s -> immediate fallback to current price", code, url)
-                        quote = self.get_price_quote(code, diag_mode=True)
-                        if quote and quote.get("last"):
-                            prpr = quote["last"]
-                            pseudo_bid = prpr
-                            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f -> bid=%.0f", code, prpr, pseudo_bid)
-                            return pseudo_bid
-                        return None
-                    elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
-                        elapsed_ms = (time.time() - start_time) * 1000
-                        self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
-                        try:
-                            return float(data["output"].get("bidp1"))
-                        except Exception:
-                            return None
-                    # else continue
+            params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": c}
+            try:
+                # [CHG] 안전요청 사용
+                resp = self._safe_request(
+                    "GET", url, headers=headers, params=params, timeout=(3.0, 5.0)
+                )
+                data = resp.json()
+                resp_data = data
+            except Exception:
+                continue
+            if resp.status_code == 404:
+                # [NEW] 404 영구 실패로 캐시 등록
+                self.askbid_unavailable_cache[code] = time.time() + self.askbid_cooldown_sec
+                logger.warning("[ASKBID][COOLDOWN] code=%s until=%s reason=404", code, datetime.fromtimestamp(self.askbid_unavailable_cache[code]).strftime('%Y-%m-%d %H:%M:%S'))
+                quote = self.get_price_quote(code, diag_mode=True)
+                if quote and quote.get("last"):
+                    prpr = quote["last"]
+                    pseudo_bid = prpr
+                    logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f -> bid=%.0f", code, prpr, pseudo_bid)
+                    return pseudo_bid
+                return None
+            elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                elapsed_ms = (time.time() - start_time) * 1000
+                self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
+                try:
+                    return float(data["output"].get("bidp1"))
+                except Exception:
+                    return None
+            # else continue
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         # [PATCH] Fallback to current price
@@ -2812,4 +2833,27 @@ class KisAPI:
         try:
             return bool(order_resp and isinstance(order_resp, dict) and order_resp.get("rt_cd") == "0")
         except Exception:
+            return False
+
+    def smoke_test_askbid(self, code: str = "005930") -> bool:
+        """
+        호가 조회 smoke test: 404 캐시 동작 확인.
+        """
+        logger.info("[SMOKE][ASKBID] Testing code=%s", code)
+        try:
+            ask1 = self.get_best_ask(code)
+            bid1 = self.get_best_bid(code)
+            logger.info("[SMOKE][ASKBID] First call: ask=%.0f bid=%.0f", ask1 or 0, bid1 or 0)
+            # 두 번째 호출: 캐시되어 API 호출 안 함
+            ask2 = self.get_best_ask(code)
+            bid2 = self.get_best_bid(code)
+            logger.info("[SMOKE][ASKBID] Second call: ask=%.0f bid=%.0f", ask2 or 0, bid2 or 0)
+            # 캐시 상태 확인
+            if code in self.askbid_unavailable_cache:
+                logger.info("[SMOKE][ASKBID] Cache hit for code=%s", code)
+            else:
+                logger.info("[SMOKE][ASKBID] No cache for code=%s", code)
+            return True
+        except Exception as e:
+            logger.error("[SMOKE][ASKBID] Failed: %s", repr(e))
             return False
