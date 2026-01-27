@@ -36,6 +36,8 @@ from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SU
 from trader.fills import append_fill
 from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
+from trader.rate_limit import get_kis_gate
+from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
@@ -1480,6 +1482,12 @@ class KisAPI:
             logger.debug("[DAILY_CACHE_HIT] %s", iscd)
             return cached_data[-count:] if len(cached_data) > count else cached_data
 
+        # ---- (4) 게이트 확인 ----
+        gate = get_kis_gate()
+        if not gate.allow("inquire-daily"):
+            logger.warning("[DAILY_GATE_BLOCKED] %s", iscd)
+            raise NetTemporaryError(f"GATE_BLOCKED {iscd}")
+
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")
 
@@ -1659,6 +1667,48 @@ class KisAPI:
                 if attempt >= attempts:
                     return {"ok": False, "error": str(e), "inv": None}
                 time.sleep(0.2 * (2 ** (attempt - 1)))
+
+    def get_price_snapshot(self, code: str, market: str = "J") -> dict:
+        """
+        KIS 현재가 조회 (inquire-price) + 캐시/게이트 적용
+        - 중복 호출 방지, 레이트리밋 감지
+        - 실패 시 {"ok": False, "reason": "..."} 반환
+        """
+        gate = get_kis_gate()
+        cache_key = ("inquire-price", code)
+
+        # 캐시 확인
+        cached = price_cache.get(cache_key)
+        if cached:
+            return cached
+
+        # 게이트 확인
+        if not gate.allow("inquire-price"):
+            return {"ok": False, "reason": "RATE_LIMIT_GATE_BLOCKED"}
+
+        try:
+            # 기존 inquire_price 로직 호출 (수정 필요)
+            result = self.get_price_quote(code)  # 또는 get_quote_safe
+            if result and result.get("stck_prpr"):
+                snapshot = {
+                    "ok": True,
+                    "code": code,
+                    "last": float(result["stck_prpr"]),
+                    "bid": float(result.get("stck_hgpr") or 0),  # 조정 필요
+                    "ask": float(result.get("stck_lwpr") or 0),  # 조정 필요
+                    "raw": result
+                }
+                price_cache.set(cache_key, snapshot, PRICE_SNAPSHOT_TTL_SEC)
+                return snapshot
+            else:
+                return {"ok": False, "reason": "EMPTY_RESPONSE", "raw": result}
+        except Exception as e:
+            reason = str(e)
+            if "초당 거래건수" in reason:
+                gate.penalize("inquire-price", KIS_RATE_LIMIT_COOLDOWN_SEC)
+                reason = "RATE_LIMIT"
+            logger.warning("[PRICE_SNAPSHOT_FAIL] %s reason=%s", code, reason)
+            return {"ok": False, "reason": reason, "raw": {}}
 
     # === ATR ===
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:

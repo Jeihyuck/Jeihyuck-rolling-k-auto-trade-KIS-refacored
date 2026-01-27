@@ -12,6 +12,11 @@ from trader.runtime_paths import get_ohlcv_cache_dir
 from trader.time_utils import now_kst
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv
+from trader.db.engine import make_engine
+from trader.db.repos import load_price_daily
+from trader.cache_ttl import daily_cache, DAILY_BAR_TTL_SEC
+from trader.rate_limit import get_kis_gate
+from trader.config import ALLOW_KIS_DAILY_FALLBACK
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +47,57 @@ class KISOHLCVProvider:
         logger.warning(message, *args)
 
     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
+        cache_key = ("daily", symbol, days)
+        cached = daily_cache.get(cache_key)
+        if cached:
+            logger.debug("[OHLCV][CACHE][HIT] symbol=%s days=%d", symbol, days)
+            return cached
+
+        # DB 우선 조회
+        try:
+            engine = make_engine()
+            end_date = now_kst().date()
+            start_date = end_date - timedelta(days=max(days, 120))
+            candles = load_price_daily(engine, symbol, start_date, end_date)
+            if len(candles) >= days:
+                df = pd.DataFrame(candles)
+                raw_keys = list(df.columns)
+                df_norm, meta = normalize_ohlcv(df)
+                df_norm = df_norm.tail(days) if days else df_norm
+                meta.update({
+                    "provider": self.name,
+                    "source": "db",
+                    "raw_keys": raw_keys,
+                    "rows": len(df_norm),
+                })
+                result = OHLCVResult(df_norm, meta)
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                logger.info("[OHLCV][DB][HIT] symbol=%s days=%d rows=%d", symbol, days, len(df_norm))
+                return result
+            else:
+                logger.debug("[OHLCV][DB][MISS] symbol=%s days=%d db_rows=%d", symbol, days, len(candles))
+        except Exception as exc:
+            logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
+
+        # KIS fallback
+        if not ALLOW_KIS_DAILY_FALLBACK:
+            logger.warning("[OHLCV][DB][NO_FALLBACK] symbol=%s days=%d", symbol, days)
+            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "db", "error": "no_fallback", "volume_missing": True})
+
+        gate = get_kis_gate()
+        if not gate.allow("inquire-daily"):
+            logger.warning("[OHLCV][KIS][GATE_BLOCKED] symbol=%s", symbol)
+            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "gate_blocked", "volume_missing": True})
+
         try:
             candles = self.kis.get_daily_candles(symbol, count=max(days, 120))  # type: ignore[attr-defined]
-        except Exception as exc:  # pragma: no cover - network dependent
+            logger.info("[OHLCV][KIS][FALLBACK] symbol=%s days=%d rows=%d", symbol, days, len(candles))
+        except Exception as exc:
             self._warn_once(f"fail:{symbol}", "[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
-            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": str(exc), "volume_missing": True})
+            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": str(exc), "volume_missing": True})
 
         if not candles:
-            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": self.name, "error": "empty", "volume_missing": True})
+            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "empty", "volume_missing": True})
 
         df = pd.DataFrame(candles)
         raw_keys = list(df.columns)
@@ -58,12 +106,14 @@ class KISOHLCVProvider:
         meta.update(
             {
                 "provider": self.name,
-                "source": self.name,
+                "source": "kis",
                 "raw_keys": raw_keys,
                 "rows": len(df_norm),
             }
         )
-        return OHLCVResult(df_norm, meta)
+        result = OHLCVResult(df_norm, meta)
+        daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+        return result
 
 
 class KRXOHLCVProvider:

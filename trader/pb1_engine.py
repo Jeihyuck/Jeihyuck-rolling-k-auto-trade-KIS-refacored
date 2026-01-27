@@ -57,6 +57,8 @@ from trader.config import (
     ENTRY_COND_MODE,
     PB1_LOG_ENTRY_GATE,
     PB1_LOG_DROP_REASONS_TOPN,
+    PB1_MAX_DAILY_FETCH_PER_TICK,
+    PB1_MAX_PRICE_FETCH_PER_TICK,
     MIN_ORDER_KRW,
     MINERVINI_ADD_ON_R,
     MINERVINI_BREAKOUT_VOL_MULT,
@@ -505,6 +507,8 @@ class PB1Engine:
         self.reject_reason_samples: dict[str, list[str]] = {}
         self.total_candidates = 0
         self.ok_count = 0
+        self.daily_fetch_count = 0
+        self.price_fetch_count = 0
         self._now_kst = now_kst_value or now_kst()
         self._today = self._now_kst.date().isoformat()
         self.entry_mode = PB1_ENTRY_MODE
@@ -1313,6 +1317,7 @@ class PB1Engine:
         )
 
     def _fetch_daily(self, code: str, count: int = 260) -> tuple[pd.DataFrame, Dict]:
+        self.daily_fetch_count += 1
         try:
             result = self.ohlcv_provider.get_ohlcv(code, count)
         except Exception:

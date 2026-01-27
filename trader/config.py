@@ -208,6 +208,13 @@ CONFIG = {
     "PB1_VOL_MAX": "1.00",
     "PB1_VOLU_MAX": "0.98",
     "PB1_VOLU_MAX_INTRADAY": "1.05",
+    # 추가 환경변수
+    "ALLOW_KIS_DAILY_FALLBACK": "0",
+    "PB1_MAX_DAILY_FETCH_PER_TICK": "20",
+    "PB1_MAX_PRICE_FETCH_PER_TICK": "30",
+    "KIS_RATE_LIMIT_COOLDOWN_SEC": "8",
+    "PRICE_SNAPSHOT_TTL_SEC": "2",
+    "DAILY_BAR_TTL_SEC": "1800",
     # Minervini v2 tuning
     "MINERVINI_RS_MIN": "0.80",
     "MINERVINI_MAX_PYRAMID": "3",
@@ -741,6 +748,13 @@ PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
 PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
+# 추가 상수
+ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
+PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
+PB1_MAX_PRICE_FETCH_PER_TICK = int(_cfg("PB1_MAX_PRICE_FETCH_PER_TICK") or "30")
+KIS_RATE_LIMIT_COOLDOWN_SEC = float(_cfg("KIS_RATE_LIMIT_COOLDOWN_SEC") or "8")
+PRICE_SNAPSHOT_TTL_SEC = float(_cfg("PRICE_SNAPSHOT_TTL_SEC") or "2")
+DAILY_BAR_TTL_SEC = float(_cfg("DAILY_BAR_TTL_SEC") or "1800")
 
 logger.info(
     "[CONFIG][PB1] entry_mode=%s require_both=%s entry_cond_mode=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",

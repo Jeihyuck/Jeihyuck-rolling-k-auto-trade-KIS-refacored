@@ -16,6 +16,7 @@ from .schema import (
     LEDGER_EVENTS,
     ORDERS,
     POSITIONS,
+    PRICE_DAILY,
     RUNS,
     UNIVERSE_MEMBERS,
     UNIVERSE_CURRENT,
@@ -1420,13 +1421,32 @@ class ReconcileLogRepo:
         action: str,
         details_json: dict | None,
     ) -> None:
-        payload = {
-            "env": env,
-            "strategy": strategy,
-            "tick_ts": tick_ts,
-            "action": action,
-            "details_json": details_json or {},
-        }
         stmt = sa.insert(self._schema.reconcile_log).values(**payload)
         with self.engine.begin() as conn:
             conn.execute(stmt)
+
+
+def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    schema = schema_for_engine(engine)
+    stmt = sa.select(schema.price_daily).where(
+        and_(
+            schema.price_daily.c.code == code,
+            schema.price_daily.c.date >= start_date,
+            schema.price_daily.c.date <= end_date,
+        )
+    ).order_by(schema.price_daily.c.date)
+    with engine.connect() as conn:
+        result = conn.execute(stmt)
+        rows = result.fetchall()
+        return [
+            {
+                "date": row.date.strftime("%Y%m%d"),
+                "open": float(row.open) if row.open else None,
+                "high": float(row.high) if row.high else None,
+                "low": float(row.low) if row.low else None,
+                "close": float(row.close) if row.close else None,
+                "volume": float(row.volume) if row.volume else None,
+                "value": float(row.value) if row.value else None,
+            }
+            for row in rows
+        ]
