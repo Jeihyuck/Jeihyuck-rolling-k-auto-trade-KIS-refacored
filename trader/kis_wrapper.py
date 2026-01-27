@@ -26,6 +26,7 @@ import pytz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urlparse
+import sqlalchemy as sa
 
 from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_ENV
 from trader.kis_rate_limiter import get_kis_limiter
@@ -33,6 +34,8 @@ from trader.runtime_paths import runtime_path
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
 from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
 from trader.fills import append_fill
+from trader.db.engine import make_engine
+from trader.db.schema import PRICE_DAILY
 
 logger = logging.getLogger(__name__)
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
@@ -1431,6 +1434,7 @@ class KisAPI:
         # ---- (1) 파라미터 구성 ----
         market_code = "J"                         # 시장코드: J 고정
         iscd = code.strip().lstrip("A")          # 종목코드: 'A' 제거(6자리)
+        market = MARKET_MAP.get(iscd, "KOSPI")   # 시장 결정
 
         # 기간: 충분히 넉넉하게(휴장/결측 대비)
         kst = pytz.timezone("Asia/Seoul")
@@ -1439,7 +1443,37 @@ class KisAPI:
         back_days = max(200, count * 4 + 100)
         from_ymd = (now_kst - timedelta(days=back_days)).strftime("%Y%m%d")
 
-        # Cache key
+        # ---- (2) DB 캐시 조회 ----
+        try:
+            engine = make_engine()
+            with engine.connect() as conn:
+                result = conn.execute(
+                    sa.select(PRICE_DAILY).where(
+                        PRICE_DAILY.c.market == market,
+                        PRICE_DAILY.c.code == iscd,
+                        PRICE_DAILY.c.date >= from_ymd,
+                        PRICE_DAILY.c.date <= to_ymd
+                    ).order_by(PRICE_DAILY.c.date)
+                )
+                db_rows = result.fetchall()
+                if len(db_rows) >= count:
+                    cached_data = [
+                        {
+                            "date": row.date.strftime("%Y%m%d"),
+                            "open": float(row.open) if row.open else None,
+                            "high": float(row.high) if row.high else None,
+                            "low": float(row.low) if row.low else None,
+                            "close": float(row.close) if row.close else None,
+                            "volume": float(row.volume) if row.volume else None,
+                        }
+                        for row in db_rows
+                    ]
+                    logger.debug("[DAILY_DB_CACHE_HIT] %s count=%d", iscd, len(cached_data))
+                    return cached_data[-count:]
+        except Exception as e:
+            logger.debug("[DAILY_DB_CACHE_SKIP] %s err=%s", iscd, e)
+
+        # ---- (3) 런타임 캐시 조회 ----
         cache_key = (iscd, from_ymd, to_ymd, "D", "0")
         cached_data, cached_ts = self._daily_chart_cache.get(cache_key, (None, 0))
         if cached_data and (time.time() - cached_ts) < self._daily_chart_ttl:
@@ -1466,39 +1500,22 @@ class KisAPI:
                 "fid_period_div_code": "D",
             }
 
-            for attempt in range(1, 4):  # 가벼운 재시도
-                try:
-                    # [CHG] 안전요청 사용
-                    resp = self._safe_request(
-                        "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    logger.debug("[DAILY_RAW_JSON] %s TR=%s attempt=%d → %s", iscd, tr, attempt, data)
-                except requests.exceptions.SSLError as e:
-                    last_err = e
-                    logger.warning("[NET:SSL_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except requests.exceptions.RequestException as e:
-                    last_err = e
-                    logger.warning("[NET:REQ_ERROR] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-                except ValueError as e:
-                    last_err = e
-                    logger.warning("[NET:JSON_DECODE] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.35 + random.uniform(0, 0.15))
-                    continue
-                except Exception as e:
-                    last_err = e
-                    logger.warning("[NET:UNEXPECTED] DAILY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
-                    continue
-
-                if "초당 거래건수" in str(data.get("msg1") or ""):
-                    time.sleep(0.35 + random.uniform(0, 0.15))
-                    continue
+            try:
+                # [CHG] 안전요청 사용 (재시도는 _safe_request에서)
+                resp = self._safe_request(
+                    "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                logger.debug("[DAILY_RAW_JSON] %s TR=%s → %s", iscd, tr, data)
+            except KisTemporaryError as e:
+                last_err = e
+                logger.warning("[DAILY_TEMP_FAIL] %s TR=%s err=%s", iscd, tr, e)
+                continue
+            except Exception as e:
+                last_err = e
+                logger.warning("[DAILY_FAIL] %s TR=%s err=%s", iscd, tr, e)
+                continue
 
                 arr = data.get("output2") or data.get("output1") or data.get("output")
 
@@ -1513,6 +1530,7 @@ class KisAPI:
                             c = r.get("stck_clpr")
                             v = r.get("acml_vol") or r.get("stck_vol") or r.get("stck_trqu")
                             vol_val = float(v) if v is not None else None
+                            val_val = float(r.get("stck_trqu")) if r.get("stck_trqu") else None
                             if d and o is not None and h is not None and l is not None and c is not None:
                                 rows.append({
                                     "date": d,
@@ -1521,6 +1539,7 @@ class KisAPI:
                                     "low": float(l),
                                     "close": float(c),
                                     "volume": vol_val,
+                                    "value": val_val,
                                 })
                         except Exception as e:
                             logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
@@ -1531,6 +1550,41 @@ class KisAPI:
                         raise DataEmptyError(f"A{iscd} 0 candles")
                     if len(rows) < 21:
                         raise DataShortError(f"A{iscd} {len(rows)} candles (<21)")
+
+                    # ---- (4) DB upsert ----
+                    try:
+                        engine = make_engine()
+                        with engine.connect() as conn:
+                            for row in rows:
+                                conn.execute(
+                                    sa.insert(PRICE_DAILY).values(
+                                        market=market,
+                                        code=iscd,
+                                        date=row["date"],
+                                        open=row["open"],
+                                        high=row["high"],
+                                        low=row["low"],
+                                        close=row["close"],
+                                        volume=row["volume"],
+                                        value=row["value"],
+                                        source="KIS"
+                                    ).on_conflict_do_update(
+                                        index_elements=["market", "code", "date"],
+                                        set_={
+                                            "open": sa.text("EXCLUDED.open"),
+                                            "high": sa.text("EXCLUDED.high"),
+                                            "low": sa.text("EXCLUDED.low"),
+                                            "close": sa.text("EXCLUDED.close"),
+                                            "volume": sa.text("EXCLUDED.volume"),
+                                            "value": sa.text("EXCLUDED.value"),
+                                            "source": sa.text("EXCLUDED.source"),
+                                        }
+                                    )
+                                )
+                            conn.commit()
+                            logger.debug("[DAILY_DB_UPSERT] %s rows=%d", iscd, len(rows))
+                    except Exception as e:
+                        logger.debug("[DAILY_DB_UPSERT_SKIP] %s err=%s", iscd, e)
 
                     # Cache the full result
                     self._daily_chart_cache[cache_key] = (rows, time.time())

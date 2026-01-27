@@ -40,6 +40,7 @@ class SchemaTables:
     positions: sa.Table
     ledger_events: sa.Table
     reconcile_log: sa.Table
+    price_daily: sa.Table
     uses_native_uuid: bool
 
 
@@ -251,6 +252,22 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
+    price_daily = sa.Table(
+        "price_daily",
+        metadata,
+        sa.Column("market", sa.String, nullable=False),
+        sa.Column("code", sa.String, nullable=False),
+        sa.Column("date", sa.Date, nullable=False),
+        sa.Column("open", sa.Numeric, nullable=True),
+        sa.Column("high", sa.Numeric, nullable=True),
+        sa.Column("low", sa.Numeric, nullable=True),
+        sa.Column("close", sa.Numeric, nullable=True),
+        sa.Column("volume", sa.Numeric, nullable=True),
+        sa.Column("value", sa.Numeric, nullable=True),
+        sa.Column("source", sa.String, nullable=False, default="KIS"),
+        sa.PrimaryKeyConstraint("market", "code", "date"),
+    )
+
     return SchemaTables(
         database_url=database_url,
         metadata=metadata,
@@ -263,6 +280,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         positions=positions,
         ledger_events=ledger_events,
         reconcile_log=reconcile_log,
+        price_daily=price_daily,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -299,3 +317,4 @@ FILLS = DEFAULT_SCHEMA.fills
 POSITIONS = DEFAULT_SCHEMA.positions
 LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
 RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
+PRICE_DAILY = DEFAULT_SCHEMA.price_daily

@@ -501,6 +501,10 @@ class PB1Engine:
         providers.append(KRXOHLCVProvider())
         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
         self._setup_reason_counter: Counter[str] = Counter()
+        self.reject_reason_counts: dict[str, int] = {}
+        self.reject_reason_samples: dict[str, list[str]] = {}
+        self.total_candidates = 0
+        self.ok_count = 0
         self._now_kst = now_kst_value or now_kst()
         self._today = self._now_kst.date().isoformat()
         self.entry_mode = PB1_ENTRY_MODE
@@ -633,22 +637,44 @@ class PB1Engine:
     def _resolve_strict_thresholds(self) -> FilterThresholds:
         return self.filter_thresholds
 
-    def _record_setup_reasons(self, reasons: Iterable[str]) -> None:
+    def _record_setup_reasons(self, reasons: Iterable[str], code: str | None = None) -> None:
         for reason in reasons:
             if not reason:
                 continue
             self._setup_reason_counter[reason] += 1
+            if reason not in self.reject_reason_counts:
+                self.reject_reason_counts[reason] = 0
+                self.reject_reason_samples[reason] = []
+            self.reject_reason_counts[reason] += 1
+            if code and len(self.reject_reason_samples[reason]) < 5:
+                self.reject_reason_samples[reason].append(code)
 
     def _log_reason_summary(self, note: str | None = None) -> None:
-        if not self._setup_reason_counter:
+        total_rejected = sum(self.reject_reason_counts.values())
+        total_candidates = total_rejected + (self._setup_reason_counter.total() - total_rejected)  # wait, better to track total
+        # Actually, track total candidates separately
+        # For now, assume we have total from somewhere
+        # Wait, in the code, we need to count total
+        # Let's add self.total_candidates = 0
+        # In __init__, self.total_candidates = 0
+        # In _log_setup, self.total_candidates += 1
+        # Then use it.
+
+        # For simplicity, use sum of ok and rejected
+        # But to match the example, [PB1][REJECT_SUMMARY] total=198 ok=10 rejected=188
+        # So need total and ok count.
+
+        # Add self.ok_count = 0
+        # In _log_setup, if cf.setup_ok: self.ok_count += 1
+
+        if not self.reject_reason_counts:
             return
-        top = self._setup_reason_counter.most_common(3)
-        logger.info(
-            "[PB1][SETUP-REASONS] total_bad=%s top3=%s%s",
-            sum(self._setup_reason_counter.values()),
-            top,
-            f" note={note}" if note else "",
-        )
+        sorted_reasons = sorted(self.reject_reason_counts.items(), key=lambda x: x[1], reverse=True)
+        logger.info("[PB1][REJECT_SUMMARY] total=%s ok=%s rejected=%s", self.total_candidates, self.ok_count, total_rejected)
+        for reason, count in sorted_reasons:
+            samples = self.reject_reason_samples.get(reason, [])
+            sample_str = f" sample={samples}" if samples else ""
+            logger.info("[PB1][REJECT_REASON] %s=%s%s", reason, count, sample_str)
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
@@ -1254,9 +1280,14 @@ class PB1Engine:
         return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
 
     def _log_setup(self, cf: CandidateFeature) -> None:
+        self.total_candidates += 1
+        if cf.setup_ok:
+            self.ok_count += 1
         prefix = "[PB1][SETUP-OK]" if cf.setup_ok else "[PB1][SETUP-BAD]"
         if not cf.setup_ok:
-            self._record_setup_reasons(cf.reasons or ["unspecified_fail"])
+            self._record_setup_reasons(cf.reasons or ["unspecified_fail"], cf.code)
+        if not cf.setup_ok and not env_bool("PB1_VERBOSE", False):
+            return
         logger.info(
             "%s code=%s market=%s mode=%s reasons=%s features=%s",
             prefix,
