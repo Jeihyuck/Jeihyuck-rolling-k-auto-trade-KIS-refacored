@@ -87,6 +87,14 @@ def botstate_path(*parts: str) -> Path:
     return runtime_path(*parts)
 
 
+def normalize_base_url(url: str) -> str:
+    """API_BASE_URL을 정규화하여 /uapi 중복을 방지."""
+    url = url.rstrip("/")
+    if url.endswith("/uapi"):
+        url = url[:-5]
+    return url
+
+
 def _build_session():
     s = requests.Session()
     retry = Retry(
@@ -550,6 +558,7 @@ class KisAPI:
         last_err: Exception | None = None
         for i in range(1, attempts + 1):
             try:
+                logger.info("[KIS][FINAL_URL] %s %s", method, url)
                 resp = self.session.request(
                     method,
                     url,
@@ -1066,7 +1075,8 @@ class KisAPI:
             return {}
         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
         markets = ("J", "U")
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        base = normalize_base_url(API_BASE_URL)
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
         raw_output: dict | None = None
 
@@ -1259,7 +1269,8 @@ class KisAPI:
         if cached:
             return cached
 
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+        base = normalize_base_url(API_BASE_URL)
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         self._limiter.wait("quotes-open")
         for tr in _pick_tr(self.env, "PRICE"):
             headers = self._headers(tr)
@@ -1290,7 +1301,8 @@ class KisAPI:
         return None
 
     def get_orderbook_strength(self, code: str) -> Optional[float]:
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        base = normalize_base_url(API_BASE_URL)
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
         self._limiter.wait("orderbook")
         for tr in _pick_tr(self.env, "ORDERBOOK"):
             headers = self._headers(tr)
@@ -1743,7 +1755,8 @@ class KisAPI:
     def get_best_ask(self, code: str) -> Optional[float]:
         """최우선 매도호가(askp1)."""
         start_time = time.time()
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        base = normalize_base_url(API_BASE_URL)
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
         self._limiter.wait("orderbook-best")
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
@@ -1763,13 +1776,24 @@ class KisAPI:
                         resp_data = data
                     except Exception:
                         continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                    if resp.status_code == 404:
+                        logger.warning("[ASKBID][404] code=%s url=%s -> immediate fallback to current price", code, url)
+                        quote = self.get_price_quote(code, diag_mode=True)
+                        if quote and quote.get("last"):
+                            prpr = quote["last"]
+                            tick_size = self._get_tick_size(prpr)
+                            pseudo_ask = prpr + tick_size
+                            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f tick_size=%d -> ask=%.0f", code, prpr, tick_size, pseudo_ask)
+                            return pseudo_ask
+                        return None
+                    elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                         elapsed_ms = (time.time() - start_time) * 1000
                         self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
                         try:
                             return float(data["output"].get("askp1"))
                         except Exception:
                             return None
+                    # else continue
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         # [PATCH] Fallback to current price
@@ -1786,7 +1810,8 @@ class KisAPI:
     def get_best_bid(self, code: str) -> Optional[float]:
         """최우선 매수호가(bidp1)."""
         start_time = time.time()
-        url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-askprice"
+        base = normalize_base_url(API_BASE_URL)
+        url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-askprice"
         self._limiter.wait("orderbook-best")
         resp_data = None
         for tr in _pick_tr(self.env, "ORDERBOOK"):
@@ -1806,13 +1831,23 @@ class KisAPI:
                         resp_data = data
                     except Exception:
                         continue
-                    if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
+                    if resp.status_code == 404:
+                        logger.warning("[ASKBID][404] code=%s url=%s -> immediate fallback to current price", code, url)
+                        quote = self.get_price_quote(code, diag_mode=True)
+                        if quote and quote.get("last"):
+                            prpr = quote["last"]
+                            pseudo_bid = prpr
+                            logger.warning("[ASKBID][FALLBACK] code=%s prpr=%.0f -> bid=%.0f", code, prpr, pseudo_bid)
+                            return pseudo_bid
+                        return None
+                    elif resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                         elapsed_ms = (time.time() - start_time) * 1000
                         self._log_kis_resp("ASKBID", code, params, data, elapsed_ms)
                         try:
                             return float(data["output"].get("bidp1"))
                         except Exception:
                             return None
+                    # else continue
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("ASKBID", code, params if 'params' in locals() else {}, resp_data, elapsed_ms)
         # [PATCH] Fallback to current price

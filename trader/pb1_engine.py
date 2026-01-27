@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
+import sqlalchemy as sa
+from sqlalchemy import inspect
 
 from trader.runtime_paths import close_entry_orders_path
 from trader.config import (
@@ -470,7 +472,7 @@ class PB1Engine:
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
-        self.engine = universe_repo.engine  # [PATCH] Set engine from repo
+        self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
         self.window = window
         self.window_label = window_label
         self.phase = phase
@@ -3655,14 +3657,11 @@ class PB1Engine:
         )
         # 타입 검증: orders 테이블의 시간 컬럼 타입 확인
         try:
-            with self.engine.begin() as conn:
-                result = conn.execute("""
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_name='orders'
-                      AND column_name IN ('created_at','updated_at','submitted_at','acked_at');
-                """).fetchall()
-            logger.info("[PB1][SCHEMA_CHECK] orders timestamp columns: %s", dict(result))
+            cols = {c["name"] for c in inspect(self.engine).get_columns("orders")}
+            required = {"created_at","updated_at","submitted_at","acked_at"}
+            ok = required.issubset(cols)
+            cols_missing = required - cols
+            logger.info("[PB1][SCHEMA_CHECK] orders columns check: ok=%s, missing=%s", ok, cols_missing)
         except Exception as e:
             logger.warning("[PB1][SCHEMA_CHECK][FAIL] Failed to check schema via self.engine: %s. Available alternatives: universe_repo.engine=%s, orders_repo.engine=%s", 
                            str(e), hasattr(self.universe_repo, 'engine'), hasattr(self.orders_repo, 'engine'))
