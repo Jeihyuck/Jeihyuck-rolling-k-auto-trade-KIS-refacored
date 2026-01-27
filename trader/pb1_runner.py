@@ -71,7 +71,7 @@ from trader.diagnostics.nontrading_smoke import (
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_kis, reconcile_today
-from trader.reconcile_db import close_stale_positions
+from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
@@ -1715,6 +1715,13 @@ def main() -> int:
         return 0
     run_migrations(engine)
     _write_change_flag(False, ["init"])
+    # Create RunContext
+    env = os.getenv("ENV", "live")
+    strategy = os.getenv("STRATEGY", "best_k_meta")
+    gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
+    git_sha = os.getenv("GITHUB_SHA")
+    ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
+    logger.info("[RUN_CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s", ctx.run_id, ctx.env, ctx.strategy, ctx.gh_run_number, ctx.git_sha)
     metrics: dict[str, int] = {}
     phase_for_log = "none"
     result_status = "UNKNOWN"

@@ -25,8 +25,8 @@ from .schema import (
     schema_for_engine,
     uuid_value_for_url,
 )
-from trader.time_utils import now_kst
-from trader.db.json_safe import json_sanitize
+from trader.run_context import RunContext
+from trader.utils.ids import assert_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,39 @@ def ensure_run(
     }
     if conn.dialect.name == "postgresql":
         insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_nothing(index_elements=["run_id"])
+    else:
+        insert_stmt = sa.insert(schema.runs).values(**values)
+    try:
+        conn.execute(insert_stmt)
+    except Exception:
+        return
+
+
+def ensure_run_from_context(
+    conn: sa.Connection,
+    schema: SchemaTables,
+    ctx: RunContext,
+    database_url: str,
+) -> None:
+    assert_uuid(ctx.run_id)
+    values = {
+        "run_id": uuid_value_for_url(database_url, ctx.run_id),
+        "env": ctx.env,
+        "strategy": ctx.strategy,
+        "run_window": ctx.window,
+        "phase": ctx.phase,
+        "event_name": "ledger_event",
+        "dry_run": ctx.dry_run,
+        "workflow_run_id": str(ctx.gh_run_number) if ctx.gh_run_number else None,
+        "git_sha": ctx.git_sha,
+        "config_json": {},
+        "started_at": ctx.started_at,
+    }
+    if conn.dialect.name == "postgresql":
+        insert_stmt = pg_insert(schema.runs).values(**values).on_conflict_do_update(
+            index_elements=["run_id"],
+            set_={"workflow_run_id": values["workflow_run_id"], "git_sha": values["git_sha"]}
+        )
     else:
         insert_stmt = sa.insert(schema.runs).values(**values)
     try:
@@ -1102,8 +1135,137 @@ class LedgerEventsRepo:
         )
         return None
 
-
-class PositionsRepo:
+    def append_event_from_context(
+        self,
+        ctx: RunContext,
+        event_type: str,
+        ts: datetime,
+        code: str | None = None,
+        market: str | None = None,
+        sid: int | None = None,
+        mode: int | None = None,
+        side: str | None = None,
+        qty: int | None = None,
+        price: float | None = None,
+        kis_odno: str | None = None,
+        client_order_key: str | None = None,
+        ok: bool = True,
+        reasons: list[str] | None = None,
+        stage: str | None = None,
+        payload_json: dict | None = None,
+    ) -> str | None:
+        assert_uuid(ctx.run_id)
+        db_url = str(self.engine.url)
+        db_store_required = os.getenv("DB_STORE_REQUIRED", "0") not in {"0", "false", "FALSE"}
+        max_attempts = int(os.getenv("DB_WRITE_MAX_ATTEMPTS", "2"))
+        base_backoff = float(os.getenv("DB_WRITE_BACKOFF_SEC", "0.2"))
+        safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
+        safe_reasons = json_sanitize(reasons or [])
+        payload = {
+            "ledger_event_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+            "env": ctx.env,
+            "run_id": uuid_value_for_url(db_url, ctx.run_id),
+            "event_type": event_type,
+            "ts": ts,
+            "code": code,
+            "market": market,
+            "sid": sid,
+            "mode": mode,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "kis_odno": kis_odno,
+            "client_order_key": client_order_key,
+            "ok": ok,
+            "reasons": safe_reasons,
+            "stage": stage,
+            "payload_json": safe_payload_json,
+        }
+        stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with self.engine.begin() as conn:
+                    ensure_run_from_context(conn, self._schema, ctx, db_url)
+                    logger.info(
+                        "[DB][LEDGER_EVENT][APPEND] attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
+                        attempt,
+                        ctx.env,
+                        ctx.run_id,
+                        ctx.strategy,
+                        event_type,
+                    )
+                    res = conn.execute(stmt)
+                    return str(res.scalar())
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 1:
+                    logger.exception(
+                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",
+                        attempt,
+                        ctx.env,
+                        ctx.run_id,
+                        ctx.strategy,
+                        event_type,
+                        stmt,
+                        payload,
+                    )
+                if _is_in_failed_transaction_error(exc):
+                    if attempt > 1:
+                        logger.warning(
+                            "[DB][LEDGER_EVENT][RETRY-IFT] attempt=%s err_type=%s err=%s",
+                            attempt,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        logger.info(
+                            "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
+                            attempt,
+                            ctx.env,
+                            ctx.run_id,
+                            ctx.strategy,
+                            event_type,
+                        )
+                    try:
+                        self.engine.dispose()
+                    except Exception as dispose_exc:
+                        logger.warning(
+                            "[DB][LEDGER_EVENT][DISPOSE-FAIL] err_type=%s err=%s",
+                            type(dispose_exc).__name__,
+                            dispose_exc,
+                        )
+                elif attempt > 1:
+                    logger.exception(
+                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s run_id=%s strategy=%s event_type=%s err=%s sql=%s payload=%s",
+                        attempt,
+                        ctx.env,
+                        ctx.run_id,
+                        ctx.strategy,
+                        event_type,
+                        exc,
+                        stmt,
+                        payload,
+                    )
+                if attempt < max_attempts:
+                    time.sleep(base_backoff * (2 ** (attempt - 1)))
+        if db_store_required and last_exc is not None:
+            raise last_exc
+        if last_exc is not None:
+            logger.warning(
+                "[DB][LEDGER_EVENT][LAST_ERROR] err_type=%s err=%s",
+                type(last_exc).__name__,
+                last_exc,
+            )
+        logger.warning(
+            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s",
+            ctx.env,
+            ctx.run_id,
+            ctx.strategy,
+            event_type,
+            int(db_store_required),
+            max_attempts,
+        )
+        return None
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
@@ -1426,6 +1588,33 @@ class ReconcileLogRepo:
         payload = {
             "env": env,
             "strategy": strategy,
+            "tick_ts": tick_ts,
+            "action": action,
+            "details_json": json_sanitize(details_json or {}),
+        }
+        # 2) 실제 테이블 컬럼만 남김
+        cols = set(tbl.c.keys())
+        payload = {k: v for k, v in payload.items() if k in cols}
+        try:
+            stmt = sa.insert(tbl).values(**payload)
+            with self.engine.begin() as conn:
+                conn.execute(stmt)
+        except Exception:
+            logger.exception("[RECONCILE_LOG][APPEND][FAIL] payload_keys=%s", list(payload.keys()))
+
+    def append_log_from_context(
+        self,
+        ctx: RunContext,
+        action: str,
+        tick_ts: datetime,
+        details_json: dict | None = None,
+    ) -> None:
+        assert_uuid(ctx.run_id)
+        tbl = self._schema.reconcile_log
+        # 1) payload를 항상 생성
+        payload = {
+            "env": ctx.env,
+            "strategy": ctx.strategy,
             "tick_ts": tick_ts,
             "action": action,
             "details_json": json_sanitize(details_json or {}),

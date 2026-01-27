@@ -9,8 +9,7 @@ from trader.config import MARKET_MAP
 from trader.runtime_paths import runtime_root
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
 from trader.reconcile_db import evaluate_stale_db_guard
-from trader.kis_wrapper import KisAPI, KisTemporaryError
-from trader.time_utils import now_kst
+from trader.run_context import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +73,7 @@ def _normalize_code(value: Any) -> str:
     return str(value or "").strip().zfill(6)
 
 
-def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strategy: str) -> dict[str, object]:
+def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     today = now_kst().strftime("%Y%m%d")
     degraded_reason: str | None = None
     try:
@@ -111,7 +110,7 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
 
         orders_repo.upsert_reconciled_order(
             env=env,
-            run_id=run_id,
+            run_id=ctx.run_id,
             strategy=strategy,
             sid=1,
             mode=1,
@@ -137,7 +136,7 @@ def reconcile_today(*, engine, kis: KisAPI, env: str, run_id: str | None, strate
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
-                run_id=run_id,
+                run_id=ctx.run_id,
                 order_id=None,
                 kis_odno=kis_odno,
                 trade_id=str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None,
@@ -253,11 +252,10 @@ def reconcile_kis(
         )
 
     reconcile_repo = ReconcileLogRepo(engine)
-    reconcile_repo.append_log(
-        env=env,
-        strategy=strategy,
-        tick_ts=tick_ts,
+    reconcile_repo.append_log_from_context(
+        ctx=ctx,
         action="reconcile_kis",
+        tick_ts=now_kst(),
         details_json={
             "orders": orders_count,
             "fills": fills_count,
