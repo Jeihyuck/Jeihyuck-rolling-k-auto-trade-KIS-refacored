@@ -26,23 +26,40 @@ BEGIN
   END IF;
 
   --------------------------------------------------------------------
-  -- 1) Drop all FKs referencing runs(run_id)
+  -- 1) Drop all FKs referencing public.runs(run_id) (pg_catalog 기반, 누락 방지)
   --------------------------------------------------------------------
   FOR fk IN
-    SELECT tc.constraint_name, tc.table_schema, tc.table_name
-    FROM information_schema.table_constraints tc
-    JOIN information_schema.constraint_column_usage ccu
-      ON ccu.constraint_name = tc.constraint_name
-     AND ccu.table_schema = tc.table_schema
-    WHERE tc.constraint_type = 'FOREIGN KEY'
-      AND ccu.table_schema='public'
-      AND ccu.table_name='runs'
-      AND ccu.column_name='run_id'
+    SELECT
+      n.nspname  AS table_schema,
+      c.relname  AS table_name,
+      con.conname AS constraint_name
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE con.contype = 'f'
+      AND con.confrelid = 'public.runs'::regclass
   LOOP
+    RAISE NOTICE 'Dropping FK: %.% -> %', fk.table_schema, fk.table_name, fk.constraint_name;
     EXECUTE 'ALTER TABLE '
       || quote_ident(fk.table_schema) || '.' || quote_ident(fk.table_name)
       || ' DROP CONSTRAINT ' || quote_ident(fk.constraint_name);
   END LOOP;
+
+  --------------------------------------------------------------------
+  -- 1.5) 방어적 점검: FK가 남아있는지 확인
+  --------------------------------------------------------------------
+  DECLARE
+    remaining_fk_count INTEGER;
+  BEGIN
+    SELECT COUNT(*) INTO remaining_fk_count
+    FROM pg_constraint con
+    WHERE con.contype = 'f'
+      AND con.confrelid = 'public.runs'::regclass;
+    
+    IF remaining_fk_count > 0 THEN
+      RAISE EXCEPTION 'FK constraints still reference runs(run_id) after drop attempt: % remaining', remaining_fk_count;
+    END IF;
+  END;
 
   --------------------------------------------------------------------
   -- 2) Mapping legacy text run_id -> uuid
@@ -129,7 +146,7 @@ BEGIN
   EXECUTE 'ALTER TABLE public.runs ALTER COLUMN run_id TYPE UUID USING run_id::uuid';
 
   --------------------------------------------------------------------
-  -- 5) Recreate FKs (convention-based)
+  -- 5) Recreate FKs with IF NOT EXISTS protection
   --------------------------------------------------------------------
   FOR t IN
     SELECT table_schema, table_name
@@ -139,10 +156,24 @@ BEGIN
       AND table_name <> 'runs'
     GROUP BY table_schema, table_name
   LOOP
-    EXECUTE
-      'ALTER TABLE ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
-      || ' ADD CONSTRAINT ' || quote_ident(t.table_name || '_run_id_fkey')
-      || ' FOREIGN KEY (run_id) REFERENCES public.runs(run_id) ON DELETE CASCADE';
+    -- Check if FK already exists before creating
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE con.contype = 'f'
+        AND n.nspname = t.table_schema
+        AND c.relname = t.table_name
+        AND con.conname = t.table_name || '_run_id_fkey'
+    ) THEN
+      RAISE NOTICE 'Creating FK: %.% -> runs(run_id)', t.table_schema, t.table_name;
+      EXECUTE
+        'ALTER TABLE ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
+        || ' ADD CONSTRAINT ' || quote_ident(t.table_name || '_run_id_fkey')
+        || ' FOREIGN KEY (run_id) REFERENCES public.runs(run_id) ON DELETE CASCADE';
+    ELSE
+      RAISE NOTICE 'FK already exists: %.%_run_id_fkey', t.table_schema, t.table_name;
+    END IF;
   END LOOP;
 
 END $$;
