@@ -175,6 +175,15 @@ def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
         return
+    
+    # Guard: psycopg placeholder trap
+    # psycopg3 only allows %s/%b/%t placeholders; any %I/%L etc will explode.
+    bad = ["%I", "%L", "%Q", "%R"]
+    if any(x in cleaned for x in bad):
+        raise RuntimeError(
+            f"[MIGRATE] Forbidden percent-format token found in SQL (psycopg placeholder trap): {bad}"
+        )
+    
     try:
         conn.exec_driver_sql(cleaned)
     except Exception as exc:
