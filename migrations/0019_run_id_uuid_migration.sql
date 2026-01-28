@@ -42,7 +42,7 @@ BEGIN
     -- verify all are uuid-shaped before casting
     IF EXISTS (
       SELECT 1 FROM public.runs
-      WHERE run_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      WHERE run_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
     ) THEN
       RAISE EXCEPTION 'runs.run_id contains non-uuid strings but mapping empty?';
     END IF;
@@ -77,17 +77,12 @@ BEGIN
       WHERE table_schema='public' AND table_name='runs'
         AND column_name NOT IN ('run_id','workflow_run_id');
 
-      sql := format(
-        'INSERT INTO public.runs (run_id, workflow_run_id%s%s)
-         SELECT m.new_run_id::text, m.old_run_id%s%s
-         FROM public.runs r
-         JOIN run_id_mapping m ON m.old_run_id = r.run_id::text
-         ON CONFLICT DO NOTHING',
-        CASE WHEN cols IS NULL THEN '' ELSE ', ' END,
-        COALESCE(cols,''),
-        CASE WHEN cols_select IS NULL THEN '' ELSE ', ' END,
-        COALESCE(cols_select,'')
-      );
+      sql := 'INSERT INTO public.runs (run_id, workflow_run_id' ||
+             CASE WHEN cols IS NULL THEN '' ELSE ', ' || cols END ||
+             ') SELECT m.new_run_id, m.old_run_id' ||
+             CASE WHEN cols_select IS NULL THEN '' ELSE ', ' || cols_select END ||
+             ' FROM public.runs r JOIN run_id_mapping m ON m.old_run_id = r.run_id::text' ||
+             ' ON CONFLICT DO NOTHING';
 
       EXECUTE sql;
     END;
@@ -105,13 +100,10 @@ BEGIN
           AND column_name='run_id'
           AND table_name <> 'runs'
       LOOP
-        upd_sql := format(
-          'UPDATE %I.%I t
-           SET run_id = m.new_run_id::text
-           FROM run_id_mapping m
-           WHERE t.run_id::text = m.old_run_id',
-          rec.table_schema, rec.table_name
-        );
+        upd_sql := 'UPDATE ' || quote_ident(rec.table_schema) || '.' || quote_ident(rec.table_name) || ' t ' ||
+                   'SET run_id = m.new_run_id ' ||
+                   'FROM run_id_mapping m ' ||
+                   'WHERE t.run_id::text = m.old_run_id';
         EXECUTE upd_sql;
       END LOOP;
     END;
@@ -164,24 +156,19 @@ BEGIN
 
       IF run_id_udt <> 'uuid' THEN
         -- assert all are uuid-shaped
-        cast_sql := format(
-          'DO $x$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM %I.%I
-               WHERE run_id IS NOT NULL
-                 AND run_id::text !~ ''^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{3}-[0-9a-f]{12}$''
-             ) THEN
-               RAISE EXCEPTION ''Cannot cast %.% run_id to UUID: non-uuid strings remain.'';
-             END IF;
-           END $x$;',
-          rec2.table_schema, rec2.table_name, rec2.table_schema, rec2.table_name
-        );
+        cast_sql := 'DO $x$ BEGIN ' ||
+                    'IF EXISTS ( ' ||
+                    'SELECT 1 FROM ' || quote_ident(rec2.table_schema) || '.' || quote_ident(rec2.table_name) || ' ' ||
+                    'WHERE run_id IS NOT NULL ' ||
+                    'AND run_id::text !~ ''^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'' ' ||
+                    ') THEN ' ||
+                    'RAISE EXCEPTION ''Cannot cast ' || rec2.table_schema || '.' || rec2.table_name || ' run_id to UUID: non-uuid strings remain.''; ' ||
+                    'END IF; ' ||
+                    'END $x$;';
         EXECUTE cast_sql;
 
-        EXECUTE format(
-          'ALTER TABLE %I.%I ALTER COLUMN run_id TYPE UUID USING run_id::uuid',
-          rec2.table_schema, rec2.table_name
-        );
+        EXECUTE 'ALTER TABLE ' || quote_ident(rec2.table_schema) || '.' || quote_ident(rec2.table_name) ||
+                ' ALTER COLUMN run_id TYPE UUID USING run_id::uuid';
       END IF;
     END LOOP;
   END;
