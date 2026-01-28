@@ -74,6 +74,9 @@ def _normalize_code(value: Any) -> str:
 
 
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
+    env = ctx.env
+    run_id = ctx.run_id
+    strategy = ctx.strategy
     today = now_kst().strftime("%Y%m%d")
     degraded_reason: str | None = None
     try:
@@ -202,7 +205,14 @@ def reconcile_kis(
         holdings_rows = []
 
     try:
-        reconcile_result = reconcile_today(engine=engine, kis=kis, env=env, run_id=run_id, strategy=strategy)
+        ctx = RunContext(
+            run_id=run_id or "unknown",
+            env=env,
+            strategy=strategy,
+            started_at=tick_ts,
+            dry_run=False,
+        )
+        reconcile_result = reconcile_today(engine=engine, kis=kis, ctx=ctx)
     except Exception as exc:
         logger.error("[KIS][HTTP][FAIL_SOFT] step=reconcile_today err=%s", exc, exc_info=True)
         reconcile_result = {"ok": False, "reason": "reconcile_today_failed", "err": str(exc)}

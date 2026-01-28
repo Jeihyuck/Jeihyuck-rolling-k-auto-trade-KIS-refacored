@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -10,6 +11,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from trader.db.schema import METADATA
 from trader.kis_wrapper import KisTemporaryError
 from trader.reconcile_kis import reconcile_today
+from trader.run_context import RunContext
 
 
 def test_reconcile_today_returns_ok_on_temp_error(tmp_path):
@@ -23,12 +25,17 @@ def test_reconcile_today_returns_ok_on_temp_error(tmp_path):
         def inquire_daily_ccld(self, **_kwargs):
             raise KisTemporaryError("HTTP 500")
 
+    ctx = RunContext(
+        run_id="test-run",
+        env="practice",
+        strategy="pb1_pullback_close",
+        started_at=datetime.now(),
+        dry_run=False,
+    )
     result = reconcile_today(
         engine=engine,
         kis=DummyKis(),
-        env="practice",
-        run_id=None,
-        strategy="pb1_pullback_close",
+        ctx=ctx,
     )
 
     assert result["ok"] is True

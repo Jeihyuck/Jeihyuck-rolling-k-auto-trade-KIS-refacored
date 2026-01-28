@@ -71,6 +71,7 @@ from trader.diagnostics.nontrading_smoke import (
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.reconcile_kis import reconcile_kis, reconcile_today
+from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
@@ -1044,16 +1045,24 @@ def run_once(
         except Exception:
             logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
         run_id = os.getenv("GITHUB_RUN_ID", "local")
+        reconcile_ok = False
+        close_stale_ok = False
         try:
             if kis:
                 try:
+                    ctx = RunContext(
+                        run_id=run_id,
+                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        strategy="pb1_pullback_close",
+                        started_at=now,
+                        dry_run=False,
+                    )
                     reconcile_today(
                         engine=engine,
                         kis=kis,
-                        env=(os.getenv("KIS_ENV") or "practice").lower(),
-                        run_id=run_id,
-                        strategy="pb1_pullback_close",
+                        ctx=ctx,
                     )
+                    reconcile_ok = True
                 except Exception:
                     logger.exception("[PB1][EXIT_SHORTCIRCUIT] reconcile_today failed")
             try:
@@ -1064,9 +1073,16 @@ def run_once(
                     reason="exit_phase",
                     ts=now,
                 )
+                close_stale_ok = True
             except Exception:
                 logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="exit_shortcircuit", now=now)
+            if not reconcile_ok or not close_stale_ok:
+                logger.error(
+                    "[PB1][EXIT_SHORTCIRCUIT][PARTIAL_FAIL] reconcile_ok=%s close_stale_ok=%s - continuing with caution",
+                    reconcile_ok,
+                    close_stale_ok,
+                )
             logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
             return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
         except Exception:
@@ -1080,16 +1096,24 @@ def run_once(
         except Exception:
             logger.exception("[PB1][DEGRADED] KIS init failed")
         run_id = os.getenv("GITHUB_RUN_ID", "local")
+        reconcile_ok = False
+        close_stale_ok = False
         try:
             if kis:
                 try:
+                    ctx = RunContext(
+                        run_id=run_id,
+                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        strategy="pb1_pullback_close",
+                        started_at=now,
+                        dry_run=False,
+                    )
                     reconcile_today(
                         engine=engine,
                         kis=kis,
-                        env=(os.getenv("KIS_ENV") or "practice").lower(),
-                        run_id=run_id,
-                        strategy="pb1_pullback_close",
+                        ctx=ctx,
                     )
+                    reconcile_ok = True
                 except Exception:
                     logger.exception("[PB1][DEGRADED] reconcile_today failed")
             try:
@@ -1100,9 +1124,16 @@ def run_once(
                     reason="budget_degraded",
                     ts=now,
                 )
+                close_stale_ok = True
             except Exception:
                 logger.exception("[PB1][DEGRADED] close_stale_positions failed")
             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="budget_degraded", now=now)
+            if not reconcile_ok or not close_stale_ok:
+                logger.error(
+                    "[PB1][DEGRADED][PARTIAL_FAIL] reconcile_ok=%s close_stale_ok=%s - continuing with caution",
+                    reconcile_ok,
+                    close_stale_ok,
+                )
             return [], True, {}, phase_for_log, "DEGRADED_BUDGET"
         except Exception:
             logger.exception("[PB1][DEGRADED] failed")
@@ -1719,9 +1750,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     finally:
         try:
             release_advisory_lock(lock_conn)
-        except Exception:
-            logger.exception("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed")
-        lock_conn.close()
+        except Exception as exc:
+            logger.warning("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed (ignoring): %s", exc)
+        try:
+            lock_conn.close()
+        except Exception as exc:
+            logger.warning("[PB1][LOCK][CLOSE_FAIL] lock connection close failed (ignoring): %s", exc)
 
 
 def _exit_code_for_status(status: str) -> int:
@@ -1779,9 +1813,12 @@ def main() -> int:
     finally:
         try:
             release_advisory_lock(lock_conn)
-        except Exception:
-            logger.exception("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed")
-        lock_conn.close()
+        except Exception as exc:
+            logger.warning("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed (ignoring): %s", exc)
+        try:
+            lock_conn.close()
+        except Exception as exc:
+            logger.warning("[PB1][LOCK][CLOSE_FAIL] lock connection close failed (ignoring): %s", exc)
         elapsed = time_mod.time() - start_ts
         logger.info(
             "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
