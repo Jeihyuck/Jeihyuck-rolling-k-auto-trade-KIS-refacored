@@ -1498,6 +1498,22 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     loop_deadline = None
     loop_deadline_ts = None
     runtime_root_dir = runtime_root()
+    
+    # Create RunContext for loop mode
+    env = os.getenv("ENV", "live")
+    strategy = os.getenv("STRATEGY", "best_k_meta")
+    gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
+    git_sha = os.getenv("GITHUB_SHA")
+    ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
+    logger.info(
+        "[PB1][LOOP][CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s",
+        ctx.run_id,
+        ctx.env,
+        ctx.strategy,
+        ctx.gh_run_number,
+        ctx.git_sha,
+    )
+    
     try:
         run_migrations(engine)
         _write_change_flag(False, ["init"])
@@ -1646,6 +1662,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 _touched, _did_work, metrics, last_phase, result_status = run_once(
                     args=args,
                     engine=engine,
+                    ctx=ctx,
                     loop_mode=True,
                     window=window,
                     max_seconds=remaining_budget_s,
