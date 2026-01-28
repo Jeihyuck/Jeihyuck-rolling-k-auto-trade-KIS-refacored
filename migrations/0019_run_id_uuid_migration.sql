@@ -86,16 +86,20 @@ BEGIN
     END IF;
 
     -- assert remaining values uuid-shaped
-    EXECUTE
-      'DO $x$ BEGIN '
-      || 'IF EXISTS ('
-      || '  SELECT 1 FROM ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
-      || '  WHERE run_id IS NOT NULL '
-      || '    AND run_id::text !~ ''^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'''
-      || ') THEN '
-      || '  RAISE EXCEPTION ''Cannot cast %.% run_id to UUID: non-uuid strings remain.''; '
-      || 'END IF; '
-      || 'END $x$;';
+    DECLARE
+      bad_count INTEGER;
+    BEGIN
+      EXECUTE
+        'SELECT COUNT(*) FROM ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
+        || ' WHERE run_id IS NOT NULL '
+        || '   AND run_id::text !~ ''^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'''
+      INTO bad_count;
+      
+      IF bad_count > 0 THEN
+        RAISE EXCEPTION 'Cannot cast run_id to UUID in table: non-uuid strings remain'
+          USING HINT = 'Table: ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name);
+      END IF;
+    END;
 
     EXECUTE
       'ALTER TABLE ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
