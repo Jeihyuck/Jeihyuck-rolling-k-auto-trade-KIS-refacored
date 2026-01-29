@@ -71,10 +71,12 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     ma20 = _ma(close, 20)
     atr14 = _atr(df, 14)
 
-    # 52주 고저는 252일 이상 데이터가 있을 때만 계산
-    # 200일 데이터로는 왜곡되므로 None 처리
-    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else None
-    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else None
+    # 52주 고저 계산: 252일 이상 데이터가 있으면 정확한 52주 사용,
+    # 없으면 120일(또는 min_candles) fallback으로 고저값 계산
+    lookback = 252 if len(df) >= 252 else max(120, 60)  # 120일 또는 60일 중 큰 값
+    hi_52w = float(close.rolling(lookback).max().iloc[-1]) if len(df) >= lookback else None
+    lo_52w = float(close.rolling(lookback).min().iloc[-1]) if len(df) >= lookback else None
+    hi_52w_available = int(len(df) >= 252)  # 정확한 52주 데이터 여부
 
     dollar_vol_50 = float((close * vol).rolling(50).mean().iloc[-1]) if len(df) >= 50 else float("nan")
     value20 = float((close * vol).rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")
@@ -101,6 +103,7 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "atr_pct": atr_ratio,  # ratio (0~1) 저장
         "hi_52w": hi_52w,
         "lo_52w": lo_52w,
+        "hi_52w_available": hi_52w_available,  # 252일 데이터 보유 여부
         "dollar_vol_50": dollar_vol_50,
         "value20": value20,
         "vol20": vol20,

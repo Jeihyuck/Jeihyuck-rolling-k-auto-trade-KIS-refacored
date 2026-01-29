@@ -1361,9 +1361,11 @@ class PB1Engine:
         df_norm = result.df.sort_values("date").tail(count)
         meta = result.meta or {}
         meta.setdefault("volume_missing", df_norm["volume"].isna().all() if "volume" in df_norm.columns else True)
-        # 데이터 품질 로그
-        logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_available=%d",
-                    code, count, len(df_norm), 1 if len(df_norm) >= 252 else 0)
+        # 데이터 품질 로그: 252일(정확한 52주) 또는 120일(fallback) 여부 표시
+        has_full_52w = 1 if len(df_norm) >= 252 else 0
+        has_fallback = 1 if len(df_norm) >= 120 else 0
+        logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d",
+                    code, count, len(df_norm), has_full_52w, has_fallback)
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
@@ -1386,7 +1388,8 @@ class PB1Engine:
             logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
 
         candidates: List[CandidateFeature] = []
-        required_candles = max(self.min_candles, 252)
+        # 최소 캔들 수 조건 완화: 120일 또는 200일 데이터만으로도 후보 선정 가능
+        required_candles = self.min_candles
         bench_df, _ = self._fetch_daily(RS_BENCHMARK)
         bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
         rs_prices: dict[str, pd.Series] = {}
@@ -3175,9 +3178,8 @@ class PB1Engine:
             decision_reasons = ["STOP_HIT"]
             should_sell = True
             stage = "STOP"
-        elif window_tag != "close":
-            decision_reasons = ["sell_disabled"]
         else:
+            # 매도 제한 해제: 시간대와 무관하게 exit 조건만 충족하면 매도 주문 생성
             close_px = features.get("close")
             ma50 = features.get("ma50")
             ma20 = features.get("ma20")
