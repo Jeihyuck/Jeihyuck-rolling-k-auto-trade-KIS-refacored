@@ -715,6 +715,184 @@ class UniverseRepo:
                 )
             )
 
+    def store_universe_snapshot(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of_date: str,
+        provider: str,
+        members: list[dict],
+        reason: str | None = None,
+    ) -> None:
+        """
+        Store universe snapshot to DB (UNIVERSE_RUNS + UNIVERSE_MEMBERS + UNIVERSE_CURRENT).
+        This is a compatibility wrapper for build.py calls.
+        """
+        members_list = list(members)
+        as_of_d = _as_date(as_of_date)
+        db_url = str(self.engine.url)
+        run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+        strategy_key = self._strategy_key(env, strategy)
+        members_count = len(members_list)
+        
+        try:
+            with self.engine.begin() as conn:
+                # Delete existing run with same (strategy, provider, as_of) to avoid duplicates
+                existing = conn.execute(
+                    select(self._schema.universe_runs.c.run_id).where(
+                        and_(
+                            self._schema.universe_runs.c.strategy == strategy_key,
+                            self._schema.universe_runs.c.provider == provider,
+                            self._schema.universe_runs.c.as_of == as_of_d,
+                        )
+                    )
+                ).scalar()
+                if existing:
+                    conn.execute(
+                        sa.delete(self._schema.universe_members).where(
+                            self._schema.universe_members.c.run_id == existing
+                        )
+                    )
+                    conn.execute(
+                        sa.delete(self._schema.universe_runs).where(
+                            self._schema.universe_runs.c.run_id == existing
+                        )
+                    )
+                
+                # Insert new run
+                conn.execute(
+                    sa.insert(self._schema.universe_runs).values(
+                        run_id=run_id,
+                        strategy=strategy_key,
+                        provider=provider,
+                        as_of=as_of_d,
+                        created_ts=now_kst().isoformat(),
+                        status="SUCCESS",
+                        members_count=members_count,
+                    )
+                )
+                
+                # Insert members
+                for rank, member in enumerate(members_list, start=1):
+                    meta = member.get("meta_json") or {}
+                    conn.execute(
+                        sa.insert(self._schema.universe_members).values(
+                            run_id=uuid_value_for_url(db_url, run_id),
+                            stock_code=str(member.get("code") or "").zfill(6),
+                            name=member.get("name") or meta.get("name"),
+                            market=member.get("market"),
+                            rank=member.get("rank") if member.get("rank") is not None else rank,
+                            market_cap=member.get("market_cap") or meta.get("market_cap") or meta.get("mktcap"),
+                            reason=member.get("reason") or reason,
+                        )
+                    )
+                
+                # Update UNIVERSE_CURRENT pointer (UPSERT)
+                if members_count > 0:
+                    if self.engine.dialect.name == "postgresql":
+                        insert_stmt = pg_insert(self._schema.universe_current).values(
+                            strategy=strategy_key,
+                            run_id=uuid_value_for_url(db_url, run_id),
+                            updated_ts=now_kst().isoformat(),
+                        ).on_conflict_do_update(
+                            index_elements=[self._schema.universe_current.c.strategy],
+                            set_={
+                                "run_id": uuid_value_for_url(db_url, run_id),
+                                "updated_ts": now_kst().isoformat(),
+                            },
+                        )
+                        conn.execute(insert_stmt)
+                    else:
+                        # SQLite/others: delete + insert
+                        conn.execute(
+                            sa.delete(self._schema.universe_current).where(
+                                self._schema.universe_current.c.strategy == strategy_key
+                            )
+                        )
+                        conn.execute(
+                            sa.insert(self._schema.universe_current).values(
+                                strategy=strategy_key,
+                                run_id=uuid_value_for_url(db_url, run_id),
+                                updated_ts=now_kst().isoformat(),
+                            )
+                        )
+            
+            logger.info(
+                "[UNIVERSE][STORE][OK] env=%s strategy=%s as_of=%s members=%s run_id=%s",
+                env, strategy, as_of_date, members_count, run_id
+            )
+        except Exception:
+            logger.exception(
+                "[UNIVERSE][STORE][FAIL] env=%s strategy=%s as_of=%s",
+                env, strategy, as_of_date
+            )
+            raise
+
+    def record_universe_run_failure(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of_date: str,
+        provider: str,
+        error_reason: str,
+        members_count: int = 0,
+    ) -> None:
+        """
+        Record universe build failure in UNIVERSE_RUNS.
+        This method MUST NOT raise exceptions to prevent double-failure.
+        """
+        try:
+            as_of_d = _as_date(as_of_date)
+            db_url = str(self.engine.url)
+            run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+            strategy_key = self._strategy_key(env, strategy)
+            
+            with self.engine.begin() as conn:
+                # Delete existing run with same (strategy, provider, as_of)
+                existing = conn.execute(
+                    select(self._schema.universe_runs.c.run_id).where(
+                        and_(
+                            self._schema.universe_runs.c.strategy == strategy_key,
+                            self._schema.universe_runs.c.provider == provider,
+                            self._schema.universe_runs.c.as_of == as_of_d,
+                        )
+                    )
+                ).scalar()
+                if existing:
+                    conn.execute(
+                        sa.delete(self._schema.universe_runs).where(
+                            self._schema.universe_runs.c.run_id == existing
+                        )
+                    )
+                
+                # Insert failure record
+                conn.execute(
+                    sa.insert(self._schema.universe_runs).values(
+                        run_id=run_id,
+                        strategy=strategy_key,
+                        provider=provider,
+                        as_of=as_of_d,
+                        created_ts=now_kst().isoformat(),
+                        status="FAILED",
+                        error_reason=error_reason,
+                        members_count=members_count,
+                    )
+                )
+            
+            logger.info(
+                "[UNIVERSE][RUN][FAIL_RECORDED] env=%s strategy=%s as_of=%s reason=%s",
+                env, strategy, as_of_date, error_reason
+            )
+        except Exception:
+            # CRITICAL: Never raise from this method to prevent double-failure
+            logger.error(
+                "[UNIVERSE][RUN][FAIL_LOG_ERROR] env=%s strategy=%s as_of=%s error=%s",
+                env, strategy, as_of_date, error_reason,
+                exc_info=True
+            )
+
 
 class OrdersRepo:
     def __init__(self, engine: Engine):

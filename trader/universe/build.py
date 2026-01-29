@@ -604,14 +604,17 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         error_reason = f"provider_empty:{last_reason or source}"
         try:
-            repo.record_universe_run_failure(
-                env=env,
-                strategy=strategy,
-                as_of_date=as_of_date,
-                provider=source,
-                error_reason=error_reason,
-                members_count=0,
-            )
+            if hasattr(repo, "record_universe_run_failure"):
+                repo.record_universe_run_failure(
+                    env=env,
+                    strategy=strategy,
+                    as_of_date=as_of_date,
+                    provider=source,
+                    error_reason=error_reason,
+                    members_count=0,
+                )
+            else:
+                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] record_universe_run_failure not available")
         except Exception:
             logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
         allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE"
@@ -638,14 +641,17 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     except Exception as exc:
         error_reason = f"store_fail:{exc}"
         try:
-            repo.record_universe_run_failure(
-                env=env,
-                strategy=strategy,
-                as_of_date=as_of_date,
-                provider=source,
-                error_reason=error_reason,
-                members_count=len(members),
-            )
+            if hasattr(repo, "record_universe_run_failure"):
+                repo.record_universe_run_failure(
+                    env=env,
+                    strategy=strategy,
+                    as_of_date=as_of_date,
+                    provider=source,
+                    error_reason=error_reason,
+                    members_count=len(members),
+                )
+            else:
+                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] record_universe_run_failure not available")
         except Exception:
             logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
         raise
