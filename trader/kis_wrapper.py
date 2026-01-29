@@ -1160,8 +1160,15 @@ class KisAPI:
         return lo
 
     # === 시세 ===
-    def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Optional[float]:
-        """단일 TR/마켓/코드 조합으로 현재가 1회 조회(성공시 float 반환, 실패/0원시 None)."""
+    def _inquire_price_once(self, tr_id: str, market_div: str, code_fmt: str) -> Tuple[Optional[float], str]:
+        """
+        단일 TR/마켓/코드 조합으로 현재가 1회 조회.
+        반환: (가격, 오류코드)
+        - 성공: (price, "OK")
+        - KIS 초당 제한: (None, "RATE_LIMIT")
+        - HTTP 오류: (None, "HTTP_FAIL")
+        - 파싱 실패: (None, "PARSE_FAIL")
+        """
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = self._headers(tr_id)
         params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
@@ -1171,41 +1178,50 @@ class KisAPI:
             data = resp.json()
         except Exception as e:
             logger.debug("[PRICE_ONCE_EX] %s/%s %s → %s", market_div, code_fmt, tr_id, e)
-            return None
+            return (None, "HTTP_FAIL")
 
         if resp.status_code != 200 or data.get("rt_cd") != "0":
+            msg_cd = data.get("msg_cd", "")
             logger.warning("[PRICE][FAIL] status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
-                           resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
-            return None
+                           resp.status_code, data.get("rt_cd"), msg_cd, data.get("msg1"), resp.text[:300])
+            # EGW002 또는 초당 거래건수 메시지 체크
+            if msg_cd.startswith("EGW002") or "초당 거래건수" in (data.get("msg1") or ""):
+                return (None, "RATE_LIMIT")
+            return (None, "HTTP_FAIL")
         if "초당 거래건수" in (data.get("msg1") or ""):
-            return None
+            return (None, "RATE_LIMIT")
         if data.get("output"):
             try:
                 px = float(data["output"].get("stck_prpr") or 0)
-                return px if px > 0 else None
+                if px > 0:
+                    return (px, "OK")
+                return (None, "PARSE_FAIL")
             except Exception:
-                return None
-        return None
+                return (None, "PARSE_FAIL")
+        return (None, "PARSE_FAIL")
 
     def get_last_price(self, code: str, *, attempts: int = 2) -> float:
         """
-        견고한 현재가 조회:
-        - J/U 교차 + 'A' 접두/무접두 교차
-        - 0원/실패 시 지수 백오프 후 재시도
+        견고한 현재가 조회 - get_price_snapshot()을 사용하여 중복 호출 방지.
         """
         c = safe_strip(code)
-        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-        markets = ("J", "U")
-        tr_list = _pick_tr(self.env, "PRICE")
-        for round_i in range(attempts):
-            for tr in tr_list:
-                for m in markets:
-                    for cf in code_variants:
-                        px = self._inquire_price_once(tr, m, cf)
-                        if px and px > 0:
-                            return px
-            # 백오프 후 재시도
-            time.sleep(0.6 * (1.5 ** round_i) + random.uniform(0, 0.2))
+        if not c:
+            raise ValueError(f"Invalid code: {code}")
+        
+        # get_price_snapshot()을 통해 캐시된 가격 조회
+        quote = self.get_price_snapshot(c, market="J")
+        
+        # prpr 또는 last 값 추출
+        price = quote.get("prpr") or quote.get("last")
+        if price and price > 0:
+            return float(price)
+        
+        # U 마켓 시도
+        quote = self.get_price_snapshot(c, market="U")
+        price = quote.get("prpr") or quote.get("last")
+        if price and price > 0:
+            return float(price)
+        
         raise RuntimeError(f"invalid last price 0 for {code}")
 
     def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:

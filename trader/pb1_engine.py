@@ -2195,6 +2195,19 @@ class PB1Engine:
             return None
         
         if self.kis:
+            # ✅ 서킷 브레이커 체크
+            try:
+                from trader.kis_wrapper import _price_cache
+                if _price_cache.is_circuit_open():
+                    self._warn_once(
+                        "price_circuit_open",
+                        "[PB1][PRICE][CIRCUIT_OPEN] skip price fetch until circuit closes (until=%.0f)",
+                        _price_cache.circuit_until,
+                    )
+                    return None
+            except Exception as e:
+                logger.debug("[PB1][PRICE][CIRCUIT_CHECK_FAIL] %s", e)
+            
             try:
                 self.price_fetch_count += 1
                 
@@ -2224,6 +2237,20 @@ class PB1Engine:
                 return None
                 
             except Exception as exc:
+                # ✅ RATE_LIMIT 감지 시 서킷 오픈
+                exc_str = str(exc).lower()
+                if "rate_limit" in exc_str or "egw002" in exc_str or "초당" in exc_str:
+                    try:
+                        from trader.kis_wrapper import _price_cache
+                        _price_cache.open_circuit()
+                        logger.warning(
+                            "[PB1][PRICE][RATE_LIMIT] code=%s opened circuit for %ss err=%s",
+                            code,
+                            _price_cache.circuit_sec,
+                            repr(exc),
+                        )
+                    except Exception as e2:
+                        logger.debug("[PB1][PRICE][CIRCUIT_OPEN_FAIL] %s", e2)
                 self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s err=%s", code, repr(exc))
         return None
 
