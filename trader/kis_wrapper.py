@@ -670,8 +670,9 @@ class KisAPI:
             if i >= attempts:
                 break
             delay = min(self._safe_backoff_cap, self._safe_backoff_base * (2 ** (i - 1)))
-            if "초당" in str(last_err).lower():
-                delay = random.uniform(2, 6)  # Special backoff for rate limit
+            # 500 에러(초당 거래건수 초과) 시 더 긴 백오프
+            if "초당" in str(last_err).lower() or isinstance(last_err, KisTemporaryError):
+                delay = random.uniform(1.5, 3.0)  # 강력한 백오프 (rate limit 보호)
             jitter = random.uniform(0.0, delay * 0.25)
             sleep_s = delay + jitter
             logger.warning(
@@ -1107,12 +1108,22 @@ class KisAPI:
 
         반환 예: {"last": 12345.0, "bid": 12340.0, "ask": 12350.0, "raw": {...}, ...}
         diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
+        - 캐시 우선, 게이트 + 스로틀링 적용
         """
         # 캐시 확인
         cache_key = ("inquire-price", code)
         cached = price_cache.get(cache_key)
         if cached:
             return cached
+
+        # 게이트 + 스로틀링
+        gate = get_kis_gate()
+        if not gate.allow("inquire-price"):
+            logger.warning("[PRICE_GATE_BLOCKED] %s", code)
+            return {}
+        sleep_time = gate.wait_if_needed("inquire-price")
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
         start_time = time.time()
         c = safe_strip(code)
@@ -1490,11 +1501,16 @@ class KisAPI:
             logger.debug("[DAILY_CACHE_HIT] %s", iscd)
             return cached_data[-count:] if len(cached_data) > count else cached_data
 
-        # ---- (4) 게이트 확인 ----
+        # ---- (4) 게이트 확인 및 스로틀링 ----
         gate = get_kis_gate()
         if not gate.allow("inquire-daily"):
             logger.warning("[DAILY_GATE_BLOCKED] %s", iscd)
             raise NetTemporaryError(f"GATE_BLOCKED {iscd}")
+        
+        # 최소 간격 보장 (스로틀링)
+        sleep_time = gate.wait_if_needed("inquire-daily")
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         self._limiter.wait("daily")

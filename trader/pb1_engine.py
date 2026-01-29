@@ -1932,33 +1932,58 @@ class PB1Engine:
                 cf.features["score_below_cut"] = True
         filtered: List[CandidateFeature] = []
         # ATR% 상한 단위 가드 (config가 6, 7, 8 등으로 오면 0.06, 0.07, 0.08로 교정)
-        atr_pct_max = PB1_MAX_ATR_PCT
-        if atr_pct_max > 1.0:
-            atr_pct_max = atr_pct_max / 100.0
+        atr_max_ratio = PB1_MAX_ATR_PCT
+        if atr_max_ratio > 1.0:
+            atr_max_ratio = atr_max_ratio / 100.0
         for cf in ok_list:
             if not cf.setup_ok:
                 continue
-            atr_pct = cf.features.get("atr_pct")
+            atr_ratio = cf.features.get("atr_pct")  # ratio (0~1)
             value20 = cf.features.get("value20")
             risk_reasons: list[str] = []
-            atr_missing = atr_pct is None or (isinstance(atr_pct, float) and atr_pct != atr_pct)
+            atr_missing = atr_ratio is None or (isinstance(atr_ratio, float) and atr_ratio != atr_ratio)
             value_missing = value20 is None or (isinstance(value20, float) and value20 != value20)
+            
+            # ATR 스케일 방어 (데이터 이상 감지)
+            if not atr_missing:
+                atr_val = float(atr_ratio)
+                close_val = cf.features.get("close", 0.0)
+                atr_abs = cf.features.get("atr14", 0.0)
+                
+                # 스케일 이상: ratio > 0.5 (50%) 같은 비정상 값
+                if atr_val > 0.5:
+                    logger.warning(
+                        "[PB1][SCALE_SUSPECT] code=%s atr_ratio=%.4f (%.2f%%) atr=%.1f close=%.1f - 단위 혼선 의심",
+                        self._display_code(cf.code), atr_val, atr_val * 100, atr_abs, close_val
+                    )
+                    risk_reasons.append("invalid_atr")
+                elif close_val <= 0:
+                    risk_reasons.append("invalid_close")
+                elif atr_abs <= 0:
+                    risk_reasons.append("invalid_atr")
+            
             if atr_missing:
                 risk_reasons.append("atr_pct_missing")
-            elif float(atr_pct) > float(atr_pct_max):
+            elif float(atr_ratio) > float(atr_max_ratio):
                 risk_reasons.append("atr_pct_too_high")
             if value_missing:
                 risk_reasons.append("value20_missing")
             elif float(value20) < float(PB1_MIN_VALUE20):
                 risk_reasons.append("liquidity_too_low")
 
+            # 로그: atr, close, ratio, pct 모두 표시
+            atr_abs = cf.features.get("atr14", 0.0)
+            close_val = cf.features.get("close", 0.0)
             logger.info(
-                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr_pct=%.2f%% atr_pct_max=%.2f%%",
+                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr=%.1f close=%.1f atr_ratio=%.4f atr_pct=%.2f%% atr_max=%.2f%%",
                 self._display_code(cf.code),
                 int(not risk_reasons),
                 risk_reasons or ["ok"],
-                float(atr_pct) * 100 if atr_pct is not None else None,
-                float(atr_pct_max) * 100,
+                atr_abs,
+                close_val,
+                float(atr_ratio) if atr_ratio is not None else 0.0,
+                float(atr_ratio) * 100 if atr_ratio is not None else 0.0,
+                float(atr_max_ratio) * 100,
             )
 
             if risk_reasons:
@@ -2100,13 +2125,13 @@ class PB1Engine:
             cf.features["stop_price"] = float(stop0)
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
             logger.info(
-                "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f value20=%s tick_budget=%.0f",
+                "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f%% value20=%s tick_budget=%.0f",
                 cf.code,
                 float(cf.features.get("score") or 0.0),
                 float(cf.features.get("planned_cap") or 0.0),
                 cf.planned_qty,
                 cf.planned_value,
-                float(cf.features.get("atr_pct") or 0.0),
+                float(cf.features.get("atr_pct") or 0.0) * 100,  # ratio -> %
                 cf.features.get("value20"),
                 tick_budget,
             )
@@ -2114,8 +2139,19 @@ class PB1Engine:
         return candidates
 
     def _mark_price(self, code: str) -> float | None:
+        # Tick 내 최대 조회 수 제한 (안전장치)
+        if self.price_fetch_count >= PB1_MAX_PRICE_FETCH_PER_TICK:
+            self._warn_once(
+                "price_probe_limit",
+                "[PB1][PRICE][LIMIT] price_fetch_count=%s >= max=%s -> skip_price_probe",
+                self.price_fetch_count,
+                PB1_MAX_PRICE_FETCH_PER_TICK,
+            )
+            return None
+        
         if self.kis:
             try:
+                self.price_fetch_count += 1
                 diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
                 quote = self.kis.get_quote_safe(code, diag_mode=diag_mode)
                 if not isinstance(quote, dict):

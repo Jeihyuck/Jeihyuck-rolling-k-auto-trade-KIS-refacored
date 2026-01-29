@@ -83,7 +83,8 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
 
     atr_value = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else float("nan")
     last_close = float(close.iloc[-1])
-    atr_pct = float((atr_value / last_close) * 100.0) if last_close and np.isfinite(atr_value) else float("nan")
+    # ATR ratio (0~1) 계산 - 비교는 ratio끼리, 표시만 %화
+    atr_ratio = float(atr_value / last_close) if (last_close and last_close > 0 and np.isfinite(atr_value)) else float("nan")
 
     return {
         "close": last_close,
@@ -92,7 +93,7 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "ma200": float(ma200.iloc[-1]),
         "ma200_slope": ma200_slope,
         "atr14": atr_value,
-        "atr_pct": atr_pct,
+        "atr_pct": atr_ratio,  # ratio (0~1) 저장
         "hi_52w": hi_52w,
         "lo_52w": lo_52w,
         "dollar_vol_50": dollar_vol_50,

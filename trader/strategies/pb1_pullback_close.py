@@ -81,7 +81,7 @@ def compute_features(daily_df: pd.DataFrame, *, min_candles: int = PB1_MIN_CANDL
         "ma50": float(last["ma50"]),
         "ma10": float(last["ma10"]),
         "atr14": float(last["atr14"]),
-        "atr_pct": _pct(float(last["atr14"]), float(last["close"])),
+        "atr_pct": float(last["atr14"]) / float(last["close"]) if float(last["close"]) > 0 else 0.0,  # ratio (0~1)
         "vol_contraction": float(last["vol_contraction"]),
         "volu_contraction": float(last["volu_contraction"]),
         "ma20_slope": slope,
@@ -182,8 +182,9 @@ def score_setup(features: Dict[str, float], market: str) -> float:
     s_vol = max(0.0, min(1.0, (0.9 - vol_c) / 0.4))        # vol_c 0.5~0.9
     s_volu = max(0.0, min(1.0, (0.9 - volu_c) / 0.4))      # volu_c 0.5~0.9
 
-    # 4) ATR%: 너무 크면 감점 (2~6%가 이상적이라 가정)
-    s_atr = max(0.0, min(1.0, (6.0 - atr_pct) / 4.0))
+    # 4) ATR%: 너무 크면 감점 (2~6%가 이상적이라 가정 -> 0.02~0.06 ratio)
+    # atr_pct가 0.06 이하면 최고 점수, 0.10이면 0점
+    s_atr = max(0.0, min(1.0, (0.06 - atr_pct) / 0.04))
 
     score = 100.0 * (
         0.35 * s_trend +

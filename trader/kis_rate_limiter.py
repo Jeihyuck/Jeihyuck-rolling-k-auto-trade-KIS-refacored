@@ -83,17 +83,17 @@ class KisRateLimiter:
       - "HOGA"
 
     Env overrides (float allowed):
-      - KIS_RPS_PRICE (default 3)
+      - KIS_RPS_PRICE (default 2.5)
       - KIS_RPS_DAILY_CHART (default 1)
-      - KIS_RPS_HOGA (default 2)
-      - KIS_RPS_JITTER_MAX (default 0.2 seconds)
+      - KIS_RPS_HOGA (default 1.5)
+      - KIS_RPS_JITTER_MAX (default 0.3 seconds)
     """
 
     def __init__(self) -> None:
-        self.rps_price = float(os.getenv("KIS_RPS_PRICE", "3"))
+        self.rps_price = float(os.getenv("KIS_RPS_PRICE", "2.5"))
         self.rps_daily_chart = float(os.getenv("KIS_RPS_DAILY_CHART", "1"))
-        self.rps_hoga = float(os.getenv("KIS_RPS_HOGA", "2"))
-        self.jitter_max = float(os.getenv("KIS_RPS_JITTER_MAX", "0.2"))
+        self.rps_hoga = float(os.getenv("KIS_RPS_HOGA", "1.5"))
+        self.jitter_max = float(os.getenv("KIS_RPS_JITTER_MAX", "0.3"))
 
         def _cap(rps: float) -> int:
             # allow small bursts; ensure >= 1
