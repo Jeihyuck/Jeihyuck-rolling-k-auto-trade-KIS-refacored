@@ -71,8 +71,10 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     ma20 = _ma(close, 20)
     atr14 = _atr(df, 14)
 
-    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else float("nan")
-    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else float("nan")
+    # 52주 고저는 252일 이상 데이터가 있을 때만 계산
+    # 200일 데이터로는 왜곡되므로 None 처리
+    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else None
+    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else None
 
     dollar_vol_50 = float((close * vol).rolling(50).mean().iloc[-1]) if len(df) >= 50 else float("nan")
     value20 = float((close * vol).rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")

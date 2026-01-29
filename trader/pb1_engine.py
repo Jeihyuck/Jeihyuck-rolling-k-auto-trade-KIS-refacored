@@ -57,6 +57,7 @@ from trader.config import (
     ENTRY_COND_MODE,
     PB1_LOG_ENTRY_GATE,
     PB1_LOG_DROP_REASONS_TOPN,
+    PB1_OHLCV_DAYS_BASE,
     PB1_MAX_DAILY_FETCH_PER_TICK,
     PB1_MAX_PRICE_FETCH_PER_TICK,
     MIN_ORDER_KRW,
@@ -1316,7 +1317,10 @@ class PB1Engine:
             },
         )
 
-    def _fetch_daily(self, code: str, count: int = 260) -> tuple[pd.DataFrame, Dict]:
+    def _fetch_daily(self, code: str, count: int | None = None) -> tuple[pd.DataFrame, Dict]:
+        """OHLCV 로딩 (기본 PB1_OHLCV_DAYS_BASE일 윈도우로 안정화)"""
+        if count is None:
+            count = int(PB1_OHLCV_DAYS_BASE)
         self.daily_fetch_count += 1
         try:
             result = self.ohlcv_provider.get_ohlcv(code, count)
@@ -1328,6 +1332,9 @@ class PB1Engine:
         df_norm = result.df.sort_values("date").tail(count)
         meta = result.meta or {}
         meta.setdefault("volume_missing", df_norm["volume"].isna().all() if "volume" in df_norm.columns else True)
+        # 데이터 품질 로그
+        logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_available=%d",
+                    code, count, len(df_norm), 1 if len(df_norm) >= 252 else 0)
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
@@ -1351,14 +1358,14 @@ class PB1Engine:
 
         candidates: List[CandidateFeature] = []
         required_candles = max(self.min_candles, 252)
-        bench_df, _ = self._fetch_daily(RS_BENCHMARK, count=260)
+        bench_df, _ = self._fetch_daily(RS_BENCHMARK)
         bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
         rs_prices: dict[str, pd.Series] = {}
         for m in members:
             code = str(m.get("code") or "").zfill(6)
             market = m.get("market") or ""
             try:
-                df, meta = self._fetch_daily(code, count=260)
+                df, meta = self._fetch_daily(code)
                 if df.empty:
                     reasons = ["data_empty"]
                     cf = CandidateFeature(
@@ -2052,7 +2059,7 @@ class PB1Engine:
                 cf.setup_ok = False
                 cf.reasons.append("order_price_missing")
                 continue
-            df, _ = self._fetch_daily(cf.code, count=260)
+            df, _ = self._fetch_daily(cf.code)
             if df.empty:
                 cf.setup_ok = False
                 cf.reasons.append("stop_calc_fail")
@@ -3534,7 +3541,7 @@ class PB1Engine:
         holdings = list(holdings_rows or [])
         pos_list = self._positions_with_meta(positions)
         for pos in pos_list:
-            df, _ = self._fetch_daily(pos["code"], count=260)
+            df, _ = self._fetch_daily(pos["code"])
             if df.empty:
                 continue
             try:
@@ -4347,7 +4354,7 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
-                df, _ = self._fetch_daily(cf.code, count=260)
+                df, _ = self._fetch_daily(cf.code)
                 if df.empty:
                     self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
                     self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
@@ -4621,7 +4628,7 @@ class PB1Engine:
                             continue
                         if mark > last_add_price * (1.0 + float(self.minervini_config.add_on_max_extension)):
                             continue
-                        df, _ = self._fetch_daily(code, count=260)
+                        df, _ = self._fetch_daily(code)
                         if df.empty:
                             continue
                         feats = compute_features(df)

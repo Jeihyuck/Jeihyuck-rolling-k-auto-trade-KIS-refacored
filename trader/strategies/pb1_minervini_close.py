@@ -68,8 +68,10 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     ma200 = _ma(close, 200)
     atr14 = _atr(df, 14)
 
-    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else float("nan")
-    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else float("nan")
+    # 52주 고저는 252일 이상 데이터가 있을 때만 계산
+    # 200일 데이터로는 왜곡되므로 None 처리
+    hi_52w = float(close.rolling(252).max().iloc[-1]) if len(df) >= 252 else None
+    lo_52w = float(close.rolling(252).min().iloc[-1]) if len(df) >= 252 else None
 
     # 거래대금(대략): close*volume (원 단위 가정) — 데이터 스케일에 맞춰 조정 가능
     dollar_vol_50 = float((close * vol).rolling(50).mean().iloc[-1]) if len(df) >= 50 else float("nan")
@@ -120,9 +122,10 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
         reasons.append("trend_template_fail")
     if not (ma200_slope > 0):
         reasons.append("ma200_not_rising")
-    if not (np.isfinite(hi_52w) and c >= hi_52w * 0.75):
+    # 52주 고저: None이면 스킵 (탈락시키지 않음)
+    if hi_52w is not None and not (np.isfinite(hi_52w) and c >= hi_52w * 0.75):
         reasons.append("too_far_from_52w_high")
-    if not (np.isfinite(lo_52w) and c >= lo_52w * 1.30):
+    if lo_52w is not None and not (np.isfinite(lo_52w) and c >= lo_52w * 1.30):
         reasons.append("not_enough_off_52w_low")
     if not (np.isfinite(dv50) and dv50 >= cfg.min_dollar_vol_50d):
         reasons.append("illiquid")

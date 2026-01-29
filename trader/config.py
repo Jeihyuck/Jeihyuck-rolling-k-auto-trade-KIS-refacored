@@ -188,6 +188,8 @@ CONFIG = {
     "PB1_SWING_TRAIL_MA": "20",
     "PB1_TIME_STOP_DAYS": "10",
     "PB1_MIN_CANDLES": "60",
+    # OHLCV 로딩 기본 윈도우 (200일로 안정화)
+    "PB1_OHLCV_DAYS_BASE": "200",
     # PB1 "최고 눌림목" 랭킹/사이징 튜닝
     "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
     "PB1_MIN_SCORE": "70",             # 점수 컷(0~100)
@@ -748,6 +750,7 @@ PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
 PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
+PB1_OHLCV_DAYS_BASE = int(_cfg("PB1_OHLCV_DAYS_BASE") or "200")
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
