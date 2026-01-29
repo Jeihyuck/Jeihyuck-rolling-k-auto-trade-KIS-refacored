@@ -11,8 +11,16 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
-from trader.kis_wrapper import KisAPI
-from trader.errors import KisTemporaryError
+
+# Import KisAPI and KisTemporaryError from kis_wrapper
+try:
+    from trader.kis_wrapper import KisAPI, KisTemporaryError
+except ImportError:
+    # Fallback for module reorganization
+    from trader.kis_wrapper import KisAPI
+    class KisTemporaryError(RuntimeError):
+        """Fallback KisTemporaryError if not found in kis_wrapper"""
+        pass
 
 logger = logging.getLogger(__name__)
 
