@@ -9,6 +9,7 @@
 # - ✅ 시세 0원 방지(J↔U, A접두/무접두 교차, 지수 백오프 재시도)
 # - ✅ 잔고 페이징(ctx_area_*) , empty 순간응답 디바운스
 # - ✅ [NEW] 세션 리셋/지수형 백오프를 포함한 안전요청(_safe_request), 체결 후 잔고 동기화(refresh_after_order)
+# - ✅ [PATCH] 가격조회 TTL 캐시 + inflight 공유 + 레이트리미터 + 서킷 브레이커
 
 import os
 import json
@@ -17,6 +18,7 @@ import random
 import logging
 import threading
 import copy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -244,6 +246,110 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+# ========================================================================
+# 가격조회 TTL 캐시 + 레이트리미터 + 서킷 브레이커
+# ========================================================================
+
+class _TokenBucket:
+    """thread-safe token bucket rate limiter"""
+    def __init__(self, rate: float, burst: int):
+        self.rate = float(rate)
+        self.capacity = int(burst)
+        self.tokens = float(burst)
+        self.updated = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> float:
+        """returns sleep seconds needed (0 if ok)"""
+        now = time.time()
+        with self.lock:
+            elapsed = now - self.updated
+            self.updated = now
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return 0.0
+            need = 1.0 - self.tokens
+            wait = need / self.rate if self.rate > 0 else 1.0
+            self.tokens = 0.0
+            return max(0.0, wait)
+
+
+@dataclass
+class _PriceRow:
+    ts: float
+    data: dict
+
+
+class _PriceCache:
+    """
+    - TTL cache: same code within TTL won't re-call API
+    - inflight: concurrent callers share the same result
+    - circuit breaker: after EGW002, pause calls for a while
+    """
+    def __init__(self, ttl_sec: float, circuit_sec: float):
+        self.ttl = float(ttl_sec)
+        self.circuit_sec = float(circuit_sec)
+        self.cache: Dict[Tuple[str, str], _PriceRow] = {}
+        self.inflight: Dict[Tuple[str, str], threading.Event] = {}
+        self.inflight_result: Dict[Tuple[str, str], dict] = {}
+        self.lock = threading.Lock()
+        self.circuit_until = 0.0
+
+    def is_circuit_open(self) -> bool:
+        return time.time() < self.circuit_until
+
+    def open_circuit(self):
+        self.circuit_until = max(self.circuit_until, time.time() + self.circuit_sec)
+
+    def get_cached(self, key: Tuple[str, str]) -> Optional[dict]:
+        row = self.cache.get(key)
+        if not row:
+            return None
+        if time.time() - row.ts <= self.ttl:
+            return row.data
+        return None
+
+    def set_cached(self, key: Tuple[str, str], data: dict):
+        self.cache[key] = _PriceRow(ts=time.time(), data=data)
+
+    def begin_inflight(self, key: Tuple[str, str]) -> Optional[threading.Event]:
+        """
+        If already inflight, returns its event (caller should wait).
+        Else creates inflight and returns None (caller becomes leader).
+        """
+        with self.lock:
+            ev = self.inflight.get(key)
+            if ev:
+                return ev
+            ev = threading.Event()
+            self.inflight[key] = ev
+            return None
+
+    def finish_inflight(self, key: Tuple[str, str], data: dict):
+        with self.lock:
+            self.inflight_result[key] = data
+            ev = self.inflight.pop(key, None)
+            if ev:
+                ev.set()
+
+    def wait_inflight(self, key: Tuple[str, str], ev: threading.Event, timeout: float = 5.0) -> dict:
+        ok = ev.wait(timeout=timeout)
+        with self.lock:
+            return self.inflight_result.pop(key, {}) if ok else {}
+
+
+# 환경변수에서 설정 로드
+_PRICE_TTL_SEC = _env_float("PRICE_TTL_SEC", 2)
+_PRICE_QPS = _env_float("PRICE_QPS", 3)
+_PRICE_BURST = _env_int("PRICE_BURST", 3)
+_PRICE_CIRCUIT_SEC = _env_float("PRICE_CIRCUIT_SEC", 15)
+
+# 전역 인스턴스 생성
+_price_rl = _TokenBucket(rate=_PRICE_QPS, burst=_PRICE_BURST)
+_price_cache = _PriceCache(ttl_sec=_PRICE_TTL_SEC, circuit_sec=_PRICE_CIRCUIT_SEC)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -1694,45 +1800,70 @@ class KisAPI:
 
     def get_price_snapshot(self, code: str, market: str = "J") -> dict:
         """
-        KIS 현재가 조회 (inquire-price) + 캐시/게이트 적용
-        - 중복 호출 방지, 레이트리밋 감지
-        - 실패 시 {"ok": False, "reason": "..."} 반환
+        Single source of truth for inquire-price.
+        - rate limited
+        - ttl cached
+        - inflight dedup
+        - circuit breaker on EGW002
+        Returns dict with keys: ask, bid, prpr, last, raw (may be empty on error).
         """
-        gate = get_kis_gate()
-        cache_key = ("inquire-price", code)
+        key = (market, code)
 
-        # 캐시 확인
-        cached = price_cache.get(cache_key)
-        if cached:
+        # 1) circuit open: do not hammer
+        if _price_cache.is_circuit_open():
+            logger.warning("[PRICE][CIRCUIT_OPEN] skip inquire-price key=%s until=%.0f", key, _price_cache.circuit_until)
+            cached = _price_cache.get_cached(key)
+            return cached or {}
+
+        # 2) ttl cache
+        cached = _price_cache.get_cached(key)
+        if cached is not None:
+            logger.info("[PRICE][CACHE_HIT] code=%s ttl=%ss", code, _PRICE_TTL_SEC)
             return cached
 
-        # 게이트 확인
-        if not gate.allow("inquire-price"):
-            return {"ok": False, "reason": "RATE_LIMIT_GATE_BLOCKED"}
+        # 3) inflight dedup
+        ev = _price_cache.begin_inflight(key)
+        if ev is not None:
+            data = _price_cache.wait_inflight(key, ev)
+            if data:
+                logger.info("[PRICE][INFLIGHT_JOIN] code=%s", code)
+            return data
 
+        # leader does the call
         try:
-            # 기존 inquire_price 로직 호출 (수정 필요)
-            result = self.get_price_quote(code)  # 또는 get_quote_safe
-            if result and result.get("stck_prpr"):
-                snapshot = {
-                    "ok": True,
-                    "code": code,
-                    "last": float(result["stck_prpr"]),
-                    "bid": float(result.get("stck_hgpr") or 0),  # 조정 필요
-                    "ask": float(result.get("stck_lwpr") or 0),  # 조정 필요
-                    "raw": result
-                }
-                price_cache.set(cache_key, snapshot, PRICE_SNAPSHOT_TTL_SEC)
-                return snapshot
-            else:
-                return {"ok": False, "reason": "EMPTY_RESPONSE", "raw": result}
-        except Exception as e:
-            reason = str(e)
-            if "초당 거래건수" in reason:
-                gate.penalize("inquire-price", KIS_RATE_LIMIT_COOLDOWN_SEC)
-                reason = "RATE_LIMIT"
-            logger.warning("[PRICE_SNAPSHOT_FAIL] %s reason=%s", code, reason)
-            return {"ok": False, "reason": reason, "raw": {}}
+            # 4) global rate limit
+            sleep_s = _price_rl.acquire()
+            if sleep_s > 0:
+                logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
+                time.sleep(sleep_s)
+
+            # 5) 기존 get_price_quote 호출
+            data = self.get_price_quote(code, diag_mode=False, attempts=2)
+
+            # 6) EGW002 guard (초당 제한)
+            msg_cd = str(data.get("msg_cd", ""))
+            rt_cd = str(data.get("rt_cd", ""))
+            msg1 = str(data.get("msg1", ""))
+            
+            if rt_cd != "0" and msg_cd.startswith("EGW002"):
+                logger.warning("[PRICE][RATE_LIMITED] code=%s msg_cd=%s -> open circuit %ss", code, msg_cd, _PRICE_CIRCUIT_SEC)
+                _price_cache.open_circuit()
+            elif "초당 거래건수" in msg1:
+                logger.warning("[PRICE][RATE_LIMITED] code=%s msg1=%s -> open circuit %ss", code, msg1, _PRICE_CIRCUIT_SEC)
+                _price_cache.open_circuit()
+
+            _price_cache.set_cached(key, data or {})
+            return data or {}
+
+        except Exception as exc:
+            logger.warning("[PRICE][EXCEPTION] code=%s err=%s", code, repr(exc))
+            # 예외 발생 시 빈 dict 반환
+            empty = {}
+            _price_cache.set_cached(key, empty)
+            return empty
+
+        finally:
+            _price_cache.finish_inflight(key, _price_cache.get_cached(key) or {})
 
     # === ATR ===
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:
@@ -1955,20 +2086,23 @@ class KisAPI:
         """
         간이 스냅샷: 현재가 및 최우선 호가를 묶어서 제공.
         반환 예: {'tp': 12345.0, 'ap': 12350.0, 'bp': 12340.0, 'close': 12345.0}
+        ✅ 내부적으로 get_price_snapshot을 사용하여 중복 호출 방지
         """
         out: Dict[str, Any] = {}
         try:
-            out["tp"] = float(self.get_last_price(code))
-        except Exception:
-            out["tp"] = None
-        try:
-            ask = self.get_best_ask(code)
-            bid = self.get_best_bid(code)
-            out["ap"] = float(ask) if ask is not None else None
-            out["bp"] = float(bid) if bid is not None else None
-        except Exception:
-            out["ap"], out["bp"] = None, None
-        out["close"] = out.get("tp")
+            # ✅ 단일 스냅샷 조회
+            snapshot = self.get_price_snapshot(code, market="J")
+            tp = snapshot.get("last") or snapshot.get("prpr") or snapshot.get("stck_prpr")
+            ap = snapshot.get("ask") or snapshot.get("askp1") or snapshot.get("askp")
+            bp = snapshot.get("bid") or snapshot.get("bidp1") or snapshot.get("bidp")
+            
+            out["tp"] = float(tp) if tp else None
+            out["ap"] = float(ap) if ap else None
+            out["bp"] = float(bp) if bp else None
+            out["close"] = out.get("tp")
+        except Exception as exc:
+            logger.warning("[QUOTE_SNAPSHOT][FAIL] code=%s err=%s", code, repr(exc))
+            out["tp"], out["ap"], out["bp"], out["close"] = None, None, None, None
         return out
 
     def get_best_ask(self, code: str) -> Optional[float]:

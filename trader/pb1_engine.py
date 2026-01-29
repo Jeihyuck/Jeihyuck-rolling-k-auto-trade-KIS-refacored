@@ -436,6 +436,35 @@ def round_to_tick(price: float) -> int:
     return _round_to_tick(price, mode="up")
 
 
+def _extract_px_from_snapshot(snapshot: dict) -> tuple[float | None, float | None, float | None]:
+    """
+    Extract (ask, bid, prpr) from snapshot dict.
+    Returns (ask, bid, prpr) as floats or None.
+    """
+    def _to_float(x):
+        try:
+            return float(x) if x not in (None, "", {}) else None
+        except Exception:
+            return None
+
+    # snapshot may have keys: ask, bid, last, prpr, stck_prpr, raw, etc.
+    ask = snapshot.get("ask") or snapshot.get("askp") or snapshot.get("ask_prc") or snapshot.get("askp1")
+    bid = snapshot.get("bid") or snapshot.get("bidp") or snapshot.get("bid_prc") or snapshot.get("bidp1")
+    prpr = snapshot.get("prpr") or snapshot.get("stck_prpr") or snapshot.get("last")
+    
+    # If raw is present, try to extract from raw too
+    if "raw" in snapshot and isinstance(snapshot["raw"], dict):
+        raw = snapshot["raw"]
+        if ask is None:
+            ask = raw.get("askp1") or raw.get("askp") or raw.get("ask")
+        if bid is None:
+            bid = raw.get("bidp1") or raw.get("bidp") or raw.get("bid")
+        if prpr is None:
+            prpr = raw.get("stck_prpr") or raw.get("prpr") or raw.get("last")
+
+    return _to_float(ask), _to_float(bid), _to_float(prpr)
+
+
 class PB1Engine:
     STRATEGY_NAME = "pb1_pullback_close"
     UNIVERSE_STRATEGY = "best_k_meta"
@@ -2019,14 +2048,23 @@ class PB1Engine:
         max_pos_krw = tick_budget * float(PB1_MAX_POS_PCT)
         for cf in ranked:
             daily_close = self._to_float(cf.features.get("close"))
-            quote = self.kis.get_quote_safe(cf.code, diag_mode=True) if self.kis else {}
-            if isinstance(quote, dict) and quote.get("fallback_used") not in {None, "none", "quote"}:
+            # ✅ 단일 스냅샷 조회 (중복 호출 방지)
+            snapshot = self.kis.get_price_snapshot(cf.code, market="J") if self.kis else {}
+            ask, bid, prpr = _extract_px_from_snapshot(snapshot)
+            
+            # 호가 없으면 prpr로 처리
+            fallback_used = None
+            if ask is None or bid is None:
+                fallback_used = "prpr_only"
                 logger.info(
-                    "[PB1][PRICE][FALLBACK] code=%s used=%s px=%s",
+                    "[PB1][PRICE][FALLBACK] code=%s used=prpr_only prpr=%s",
                     cf.code,
-                    quote.get("fallback_used"),
-                    quote.get("prpr") or quote.get("last"),
+                    prpr,
                 )
+            
+            # quote dict 형식으로 변환 (기존 코드와 호환)
+            quote = snapshot
+            
             order_px, source = self._calc_order_price(cf.code, quote, daily_close)
             if order_px is None:
                 cf.setup_ok = False
@@ -2159,47 +2197,34 @@ class PB1Engine:
         if self.kis:
             try:
                 self.price_fetch_count += 1
-                diag_mode = self.dry_run or self.phase == "verify" or (self.window and self.window.name == "diagnostic")
-                quote = self.kis.get_quote_safe(code, diag_mode=diag_mode)
-                if not isinstance(quote, dict):
-                    self._warn_once(f"quote_non_dict:{code}", "[PB1][PRICE][WARN] code=%s non-dict quote", code)
-                    return None
-                price = quote.get("last")
-                if price is None:
-                    price = quote.get("stck_prpr") or quote.get("prpr")
-                    if price is None:
-                        self._warn_once(
-                            f"quote_missing_last:{code}", "[PB1][PRICE][WARN] code=%s missing_last keys=%s", code, list(quote.keys())
-                        )
+                
+                # ✅ 단일 스냅샷 조회 (중복 호출 방지)
+                snapshot = self.kis.get_price_snapshot(code, market="J")
+                ask, bid, prpr = _extract_px_from_snapshot(snapshot)
+                
+                # ask/bid 없으면 prpr로 처리 (재호출 금지)
+                if ask is None or bid is None:
+                    self.askbid_fail_count += 1
+                    if prpr is None:
+                        logger.warning("[PB1][PRICE][SKIP] code=%s no ask/bid/prpr snapshot=%s", code, snapshot)
                         return None
-                try:
-                    price_val = float(price)
-                except Exception:
-                    self._warn_once(f"quote_invalid_price:{code}", "[PB1][PRICE][WARN] code=%s invalid price=%s", code, price)
-                    return None
-                if quote.get("ask") is None or quote.get("bid") is None:
-                    self.askbid_fail_count += 1  # [PATCH] 회로차단기: 호가 실패 카운트
-                    reasons = quote.get("reasons", [])
-                    raw_summary = {}
-                    if "raw" in quote and isinstance(quote["raw"], dict):
-                        raw = quote["raw"]
-                        raw_summary = {
-                            "rt_cd": raw.get("rt_cd"),
-                            "msg_cd": raw.get("msg_cd"),
-                            "msg1": raw.get("msg1"),
-                        }
-                    self._warn_once(
-                        f"quote_missing_book:{code}",
-                        "[PB1][PRICE][WARN] code=%s ask=%s bid=%s reasons=%s raw=%s",
-                        code,
-                        quote.get("ask"),
-                        quote.get("bid"),
-                        reasons,
-                        raw_summary,
-                    )
-                return price_val
-            except Exception:
-                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s", code)
+                    # prpr만 있으면 prpr 사용
+                    logger.info("[PB1][PRICE][FALLBACK_PRPR] code=%s prpr=%.0f (no ask/bid)", code, prpr)
+                    return prpr
+                
+                # ask가 있으면 ask 사용
+                if ask and ask > 0:
+                    return ask
+                
+                # fallback to prpr
+                if prpr and prpr > 0:
+                    return prpr
+                
+                logger.warning("[PB1][PRICE][WARN] code=%s no valid price ask=%s bid=%s prpr=%s", code, ask, bid, prpr)
+                return None
+                
+            except Exception as exc:
+                self._warn_once(f"quote_fail:{code}", "[PB1][PRICE][FAIL] code=%s err=%s", code, repr(exc))
         return None
 
     def _resolve_price_with_fallback(self, code: str, *, ohlcv_close: float | None = None) -> tuple[float | None, str | None]:
@@ -2239,22 +2264,14 @@ class PB1Engine:
         logger.info("[PB1][PRICE_PROBE] probing codes=%s", probe_codes)
         for code in probe_codes:
             try:
-                quote = self.kis.get_quote_safe(code, diag_mode=False)
-                ask = quote.get("ask")
-                bid = quote.get("bid")
-                reasons = quote.get("reasons", [])
+                # ✅ 단일 스냅샷 조회
+                snapshot = self.kis.get_price_snapshot(code, market="J")
+                ask, bid, prpr = _extract_px_from_snapshot(snapshot)
+                
                 if ask is None or bid is None:
-                    raw_summary = {}
-                    if "raw" in quote and isinstance(quote["raw"], dict):
-                        raw = quote["raw"]
-                        raw_summary = {
-                            "rt_cd": raw.get("rt_cd"),
-                            "msg_cd": raw.get("msg_cd"),
-                            "msg1": raw.get("msg1"),
-                        }
                     logger.error(
-                        "[PB1][PRICE_PROBE][FAIL] code=%s ask=%s bid=%s reasons=%s raw=%s",
-                        code, ask, bid, reasons, raw_summary
+                        "[PB1][PRICE_PROBE][FAIL] code=%s ask=%s bid=%s prpr=%s",
+                        code, ask, bid, prpr
                     )
                 else:
                     logger.info("[PB1][PRICE_PROBE][OK] code=%s ask=%s bid=%s", code, ask, bid)
@@ -3733,6 +3750,15 @@ class PB1Engine:
         final_notes: str | None = None
         entry_allowed = self.entry_enabled
         entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
+        
+        # ✅ 서킷 브레이커 체크: EGW002 발생 시 신규진입 중단
+        if self.kis and hasattr(self.kis, '_price_cache'):
+            from trader.kis_wrapper import _price_cache
+            if _price_cache.is_circuit_open():
+                logger.warning("[PB1][DEGRADED] price circuit open -> skip new entries this tick")
+                entry_allowed = False
+                entry_reason = "price_circuit_open"
+        
         entry_summary_emitted = False
         entry_decision_emitted = False
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
