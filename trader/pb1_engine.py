@@ -1931,6 +1931,10 @@ class PB1Engine:
                 cf.reasons.append("score_below_cut")
                 cf.features["score_below_cut"] = True
         filtered: List[CandidateFeature] = []
+        # ATR% 상한 단위 가드 (config가 6, 7, 8 등으로 오면 0.06, 0.07, 0.08로 교정)
+        atr_pct_max = PB1_MAX_ATR_PCT
+        if atr_pct_max > 1.0:
+            atr_pct_max = atr_pct_max / 100.0
         for cf in ok_list:
             if not cf.setup_ok:
                 continue
@@ -1941,7 +1945,7 @@ class PB1Engine:
             value_missing = value20 is None or (isinstance(value20, float) and value20 != value20)
             if atr_missing:
                 risk_reasons.append("atr_pct_missing")
-            elif float(atr_pct) > float(PB1_MAX_ATR_PCT):
+            elif float(atr_pct) > float(atr_pct_max):
                 risk_reasons.append("atr_pct_too_high")
             if value_missing:
                 risk_reasons.append("value20_missing")
@@ -1949,12 +1953,12 @@ class PB1Engine:
                 risk_reasons.append("liquidity_too_low")
 
             logger.info(
-                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr_pct=%s atr_pct_max=%s",
+                "[PB1][RISK_GATE] code=%s ok=%s reasons=%s atr_pct=%.2f%% atr_pct_max=%.2f%%",
                 self._display_code(cf.code),
                 int(not risk_reasons),
                 risk_reasons or ["ok"],
-                float(atr_pct) if atr_pct is not None else None,
-                float(PB1_MAX_ATR_PCT),
+                float(atr_pct) * 100 if atr_pct is not None else None,
+                float(atr_pct_max) * 100,
             )
 
             if risk_reasons:
@@ -3924,6 +3928,17 @@ class PB1Engine:
             available_cash_krw,
             tick_budget_krw,
             allow_add_to_existing,
+        )
+        # ATR% 상한 검증 로그 (raw=config에서 읽은 원본, used=가드 후 실제 사용값)
+        atr_pct_max_raw = PB1_MAX_ATR_PCT
+        atr_pct_max_used = atr_pct_max_raw
+        if atr_pct_max_used > 1.0:  # 단위 혼선 방지: 6, 7, 8 등 -> 0.06, 0.07, 0.08로 교정
+            atr_pct_max_used = atr_pct_max_used / 100.0
+        logger.info(
+            "[PB1][ATR_MAX] raw=%.2f used=%.2f pct=%.2f%%",
+            atr_pct_max_raw,
+            atr_pct_max_used,
+            atr_pct_max_used * 100,
         )
         holdings = list(holdings_rows or [])
         if not holdings and self.kis:
