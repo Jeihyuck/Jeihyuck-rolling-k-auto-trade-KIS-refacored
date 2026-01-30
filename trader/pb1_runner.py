@@ -75,7 +75,7 @@ from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
-from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -85,6 +85,61 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 
 logger = logging.getLogger(__name__)
 log = logger
+
+
+def resolve_auto_strategy_mode(mode_env: str) -> str:
+    """
+    AUTO 모드 결정: 시간 기반으로 LIVE/DIAG 결정.
+    
+    Args:
+        mode_env: STRATEGY_MODE 환경변수 값
+    
+    Returns:
+        "LIVE" or "DIAG"
+    
+    정책:
+        - mode_env가 "LIVE" 또는 "DIAG"이면 그대로 사용
+        - mode_env가 "AUTO"이면:
+            - 장중(09:00~15:20, 월~금): "LIVE"
+            - 장외(주말, 장시작 전, 장마감 후): "DIAG"
+    """
+    mode_env = (mode_env or "").strip().upper()
+    if mode_env in ("LIVE", "DIAG"):
+        logger.info("[AUTO_MODE] mode=%s (forced)", mode_env)
+        return mode_env
+    
+    # AUTO 모드: 시간 기반 결정
+    is_market_open = is_market_open_kst(now_kst())
+    resolved_mode = "LIVE" if is_market_open else "DIAG"
+    logger.info(
+        "[AUTO_MODE] mode=AUTO resolved=%s is_market_open=%s now=%s",
+        resolved_mode,
+        is_market_open,
+        now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    return resolved_mode
+
+
+def compute_loop_deadline(now: datetime) -> datetime:
+    """
+    루프 종료 시각 계산: 장 마감 - grace_min.
+    
+    Args:
+        now: 현재 KST 시각
+    
+    Returns:
+        루프 종료 시각 (KST)
+    """
+    grace_min = int(os.getenv("PB1_LOOP_GRACE_MIN", "3"))
+    market_close = market_close_dt_kst(now)
+    deadline = market_close - timedelta(minutes=grace_min)
+    logger.info(
+        "[LOOP_DEADLINE] market_close=%s grace_min=%s deadline=%s",
+        market_close.strftime("%H:%M:%S"),
+        grace_min,
+        deadline.strftime("%H:%M:%S"),
+    )
+    return deadline
 
 _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
@@ -696,6 +751,24 @@ def _parse_optional_int_env(name: str) -> int | None:
 
 
 def _resolve_loop_limits() -> tuple[int, int, int, bool]:
+    """
+    루프 제한 시간 계산.
+    
+    Returns:
+        (run_loop_minutes, max_minutes, max_seconds, run_loop_configured)
+    
+    정책:
+        - PB1_LOOP_MODE=UNTIL_CLOSE: 장 마감까지 루프 (max_minutes=0으로 무제한)
+        - 기존 PB1_RUN_LOOP_MINUTES/PB1_MAX_MINUTES 설정 유지
+    """
+    loop_mode = os.getenv("PB1_LOOP_MODE", "").upper()
+    
+    # UNTIL_CLOSE 모드: 장 마감까지 무제한
+    if loop_mode == "UNTIL_CLOSE":
+        logger.info("[LOOP_LIMITS] mode=UNTIL_CLOSE -> max_minutes=0 (unlimited until close)")
+        return 0, 0, 0, True
+    
+    # 기존 로직 (하위 호환)
     run_loop_minutes_env = _parse_optional_int_env("PB1_RUN_LOOP_MINUTES")
     if run_loop_minutes_env is None:
         run_loop_minutes_env = _parse_optional_int_env("RUN_LOOP_MINUTES")
@@ -1624,15 +1697,28 @@ def _run_nontrading_smoke_if_needed(
 def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     run_loop_minutes, loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
+    loop_mode = os.getenv("PB1_LOOP_MODE", "").upper()
     now = _get_now_kst()
-    _, close_dt = _market_session(now)
-    logger.info(
-        "[PB1][LOOP] enabled interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
-        loop_interval,
-        close_dt.isoformat(),
-        loop_max_minutes,
-        run_loop_minutes,
-    )
+    
+    # ✅ UNTIL_CLOSE 모드: 장 마감까지 루프
+    if loop_mode == "UNTIL_CLOSE":
+        loop_deadline_dt = compute_loop_deadline(now)
+        logger.info(
+            "[PB1][LOOP] mode=UNTIL_CLOSE interval=%s deadline=%s",
+            loop_interval,
+            loop_deadline_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    else:
+        # 기존 로직 (max_minutes 기반)
+        _, close_dt = _market_session(now)
+        logger.info(
+            "[PB1][LOOP] enabled interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
+            loop_interval,
+            close_dt.isoformat(),
+            loop_max_minutes,
+            run_loop_minutes,
+        )
+    
     logger.info(
         "[PB1][LOOP] start now_kst=%s max_seconds=%s",
         now.isoformat(),
@@ -1726,6 +1812,15 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 exit_reason = "sigterm"
                 break
             now = _get_now_kst()
+            
+            # ✅ UNTIL_CLOSE 모드: deadline 체크
+            if loop_mode == "UNTIL_CLOSE":
+                if now >= loop_deadline_dt:
+                    logger.info("[PB1][LOOP] deadline reached -> exit now=%s deadline=%s",
+                                now.strftime("%H:%M:%S"), loop_deadline_dt.strftime("%H:%M:%S"))
+                    exit_reason = "loop_deadline"
+                    break
+            
             if _run_nontrading_smoke_if_needed(
                 runtime_root_dir=runtime_root_dir,
                 engine=engine,
@@ -1734,10 +1829,15 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             ):
                 exit_reason = "nontrading_smoke_done"
                 break
-            if now >= close_dt:
-                logger.info("[PB1][LOOP] market closed -> exit")
-                exit_reason = "market_closed"
-                break
+            
+            # 기존 close_dt 체크 (UNTIL_CLOSE가 아닐 때만)
+            if loop_mode != "UNTIL_CLOSE":
+                _, close_dt = _market_session(now)
+                if now >= close_dt:
+                    logger.info("[PB1][LOOP] market closed -> exit")
+                    exit_reason = "market_closed"
+                    break
+            
             elapsed_seconds = time_mod.monotonic() - loop_started_ts
             if max_seconds > 0 and elapsed_seconds >= max_seconds:
                 logger.info("[PB1][LOOP] max_seconds=%s exiting", max_seconds)
@@ -1901,11 +2001,30 @@ def main() -> int:
     # else: TRADE_INTRADAY (기존 로직)
     logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
     
+    # ✅ AUTO 모드 결정 및 환경변수 고정
+    mode_env = os.getenv("STRATEGY_MODE", "AUTO")
+    resolved_mode = resolve_auto_strategy_mode(mode_env)
+    os.environ["STRATEGY_MODE"] = resolved_mode
+    logger.info(
+        "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True",
+        mode_env,
+        resolved_mode,
+    )
+    
     args = parse_args()
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
-    run_loop = os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
+    
+    # ✅ PB1_LOOP_ENABLED 또는 loop_configured로 루프 활성화
+    loop_enabled = os.getenv("PB1_LOOP_ENABLED", "0") == "1"
+    run_loop = loop_enabled or os.getenv("PB1_RUN_LOOP", "0") == "1" or loop_configured
+    
+    # ✅ DIAG 모드에서는 루프 비활성화 (한 번만 실행)
+    if resolved_mode == "DIAG":
+        logger.info("[PB1][DIAG] mode=DIAG -> disable loop (run once)")
+        run_loop = False
+    
     if run_loop and not smoke_enabled:
         try:
             _run_loop(args=args)

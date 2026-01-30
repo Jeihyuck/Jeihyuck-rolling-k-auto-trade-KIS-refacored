@@ -1,14 +1,18 @@
-name: PB1 Trade Intraday (5-minute intervals)
+name: PB1 Trade Intraday (Continuous Loop)
 
 on:
-  schedule:
-    # 5분마다 실행 (월-금)
-    - cron: "*/5 * * * 1-5"
-  workflow_dispatch:  # 수동 실행 허용
+  workflow_dispatch:  # 수동 실행 (확인 후 schedule 추가)
+  # schedule:
+  #   - cron: "55 23 * * 0-4"  # KST 08:55 (UTC 23:55) 월~금 - 시동용
+
+concurrency:
+  group: trade_tick_live
+  cancel-in-progress: true
 
 jobs:
   trade-intraday:
     runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6시간 (장중 연속 루프용)
     
     steps:
       - name: Checkout code
@@ -24,11 +28,9 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run intraday trading
+      - name: Run PB1 Auto Loop
         run: |
           set -euo pipefail
-          export PB1_JOB=TRADE_INTRADAY
-          export STRATEGY_MODE=LIVE
           python -m trader.pb1_runner
         env:
           APP_KEY: ${{ secrets.APP_KEY }}
@@ -40,6 +42,22 @@ jobs:
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
           ENV: ${{ secrets.KIS_ENV }}
           STRATEGY: best_k_meta
+          
+          # 자동 모드 결정 (장중=LIVE, 장외=DIAG)
+          STRATEGY_MODE: AUTO
+          
+          # 루프 설정
+          PB1_LOOP_ENABLED: "1"
+          PB1_LOOP_INTERVAL_SEC: "30"        # 30초 간격 (나중에 조정 가능)
+          PB1_LOOP_MODE: "UNTIL_CLOSE"       # 장마감까지 계속
+          PB1_LOOP_GRACE_MIN: "3"            # 마감 직전 여유
+          
+          # DIAG 모드 설정
+          KIS_BLOCK_ALL_ON_DIAG: "1"         # DIAG일 때 KIS 하드블록
+          DIAG_SIM_MODE: "1"
+          PB1_DIAG_RUN_FULL: "1"
+          PB1_DIAG_WRITE_SIM_ORDERS: "1"
+          DIAG_ALLOW_KIS_MARKETDATA: "0"
           
           # 매매 활성화
           LIVE_TRADING_ENABLED: "1"

@@ -42,6 +42,21 @@ from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 
 logger = logging.getLogger(__name__)
+
+# ✅ Export public exceptions
+__all__ = [
+    "KisAPI",
+    "KisTemporaryError",
+    "KisAuthError",
+    "KisPermanentError",
+    "KisBalanceUnavailable",
+    "NetTemporaryError",
+    "DataEmptyError",
+    "DataShortError",
+    "OrderBlockedError",
+    "KISBlockedError",
+]
+
 _ORDER_BLOCK_STATE: Dict[str, Any] = {"date": None, "reason": None}
 _DAILY_CAP_WARNED = False
 _BALANCE_CACHE_INVALID_LOGGED = False
@@ -89,6 +104,11 @@ class DataShortError(Exception):
 
 class OrderBlockedError(RuntimeError):
     """주문 하드 가드에 의해 차단된 경우."""
+
+
+class KISBlockedError(RuntimeError):
+    """DIAG 모드에서 KIS API 차단."""
+    pass
 
 
 def botstate_path(*parts: str) -> Path:
@@ -646,9 +666,20 @@ class KisAPI:
     def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
+        - DIAG 모드에서 KIS API 하드 블록 (환경변수 제어)
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
+        # ✅ DIAG 모드 KIS API 차단
+        strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+        block_on_diag = os.getenv("KIS_BLOCK_ALL_ON_DIAG", "1") == "1"
+        allow_marketdata = os.getenv("DIAG_ALLOW_KIS_MARKETDATA", "0") == "1"
+        
+        if strategy_mode == "DIAG" and block_on_diag:
+            # 시세 조회 허용 옵션 체크
+            if not allow_marketdata:
+                raise KISBlockedError(f"KIS API blocked in DIAG mode: {method} {url}")
+        
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
             logger.warning("[NET][DIAG] KIS calls disabled; skipping request method=%s url=%s", method, url)
 

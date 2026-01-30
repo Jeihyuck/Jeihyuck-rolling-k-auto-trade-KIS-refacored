@@ -92,3 +92,36 @@ def calc_market_window_kst(dt: datetime) -> str:
     if time(15, 15) <= t <= time(15, 30):
         return "close"
     return "after"
+
+
+def is_market_open_kst(dt: datetime | None = None) -> bool:
+    """
+    장중 여부 판단 (AUTO 모드 결정용).
+    
+    Returns:
+        True: 장중 (09:00~15:20, 월~금)
+        False: 장외 (주말, 장시작 전, 장마감 후)
+    """
+    dt = dt or now_kst()
+    
+    # 거래일 여부 확인
+    if not is_trading_weekday(dt):
+        return False
+    
+    # 장중 시간 확인 (09:00~15:20)
+    t = dt.time()
+    return MARKET_OPEN <= t <= MARKET_CLOSE
+
+
+def market_close_dt_kst(dt: datetime) -> datetime:
+    """
+    주어진 날짜의 장 마감 시각(15:15) 반환.
+    
+    Args:
+        dt: KST 기준 datetime
+    
+    Returns:
+        같은 날 15:15:00 KST
+    """
+    return dt.replace(hour=15, minute=15, second=0, microsecond=0)
+
