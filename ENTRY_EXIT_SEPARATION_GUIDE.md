@@ -6,7 +6,127 @@
 
 ## 주요 변경사항
 
-### 1. EXIT/ENTRY PASS 완전 분리 ✅
+### 1. ENTRY Pipeline 계측 로그 (8종 필수) ✅
+
+**변경 위치**: `trader/pb1_engine.py::run()`, `_compute_candidates()`
+
+**목적**: "매수 0건" 문제 진단을 위한 완전한 파이프라인 가시성 확보
+
+**추가된 로그**:
+
+1. **[ENTRY][CANDIDATES]** (line ~4346)
+   ```python
+   logger.info(
+       "[ENTRY][CANDIDATES] trace=%s start universe=%s data_ok=%s dt_minervini=%.2f",
+       trace_id, len(members), data_ok_count, dt_minervini
+   )
+   ```
+   - Minervini 실행 직후 초기 카운트
+   - `dt_minervini`: Minervini 실행 시간 (초)
+
+2. **[MINERVINI][ENTER]** (line ~1371)
+   ```python
+   logger.info(
+       "[MINERVINI][ENTER] trace=%s universe=%s rs_min=%.0f vcp_lookback=%s",
+       trace_id, before_minervini, rs_min_percentile * 100, VCP_LOOKBACK
+   )
+   ```
+   - Minervini 필터 호출 확인
+   - `t_minervini_enter = time_module.monotonic()` 시작 시간 기록
+
+3. **[MINERVINI][APPLY]** (line ~1612)
+   ```python
+   logger.info(
+       "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
+       before_minervini, rs_min_percentile * 100, VCP_LOOKBACK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS
+   )
+   ```
+   - Minervini 필터 설정 기록
+
+4. **[MINERVINI][RESULT]** (line ~1621)
+   ```python
+   logger.info(
+       "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s skipped=%s degraded=%s sample=%s",
+       before_minervini, after_rs, rs_fail_count, after_vcp, vcp_fail_count, both_pass, skipped_count, degraded_count, sample_codes
+   )
+   ```
+   - RS/VCP 필터 통과 결과 상세
+
+5. **[MINERVINI][EXIT]** (line ~1633)
+   ```python
+   logger.info(
+       "[MINERVINI][EXIT] passed=%s failed=%s dt=%.2f",
+       both_pass, before_minervini - both_pass, dt_minervini_total
+   )
+   ```
+   - Minervini 최종 요약 + 시간 측정
+   - `dt_minervini_total = time_module.monotonic() - t_minervini_enter`
+
+6. **[ENTRY][PB1_FILTER]** (line ~4366)
+   ```python
+   logger.info(
+       "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
+       trace_id, data_ok_count, setup_ok_count, dt_pb1_filter, selected_tier, relax_passes_used
+   )
+   ```
+   - PB1 필터 성능 측정
+   - `dt_pb1_filter = time_module.monotonic() - t_pb1_start`
+
+7. **[ORDER][BUILD]** (line ~4917)
+   ```python
+   logger.info(
+       "[ORDER][BUILD] trace=%s count=%s symbols=%s",
+       trace_id, len(orderable_candidates), ",".join(order_symbols[:10])
+   )
+   ```
+   - 주문 생성 단계
+   - `dt_order_build = time_module.monotonic() - t_order_build`
+
+8. **[ORDER][SUBMIT]** (line ~4948)
+   ```python
+   logger.info(
+       "[ORDER][SUBMIT] trace=%s submitted=%s failed=%s dt_build=%.2f dt_submit=%.2f",
+       trace_id, submitted_count, failed_count, dt_order_build, dt_order_submit
+   )
+   ```
+   - 주문 제출 결과
+   - `dt_order_submit = time_module.monotonic() - t_order_submit`
+
+**추가 진단 로그**:
+
+- **[ENTRY][NO_BUY]** (line ~4737)
+  ```python
+  logger.warning(
+      "[ENTRY][NO_BUY] trace=%s reason=%s candidates=%s setup_ok=%s after_risk=%s cash=%s drop_top3=%s",
+      trace_id, no_buy_reason, len(candidates), len(setup_ok_codes), after_risk_check_count, available_cash_krw, drop_reason_counter.most_common(3)
+  )
+  ```
+  - `orderable_candidates`가 0일 때 이유 분석
+  - **Reason Codes**:
+    - `EMPTY_AFTER_MINERVINI`: Minervini 후 후보 0
+    - `EMPTY_AFTER_PB1_FILTER`: PB1 필터 후 후보 0
+    - `OHLCV_INSUFFICIENT`: data_ok 후보 0
+    - `ORDER_SUBMIT_BLOCKED`: entry_allowed=False
+    - `CASH_INSUFFICIENT`: available_cash_krw <= 0
+    - `EMPTY_AFTER_RANK`: after_risk_check_count == 0
+    - `DROP:xxx`: drop_reason_counter 최빈값
+
+**시간 측정 변수**:
+- `t_minervini_enter`, `dt_minervini`: Minervini 필터 시간
+- `t_pb1_start`, `dt_pb1_filter`: PB1 필터 시간
+- `t_order_build`, `dt_order_build`: 주문 생성 시간
+- `t_order_submit`, `dt_order_submit`: 주문 제출 시간
+
+**trace_id 형식**:
+```python
+trace_id = f"{run_id}:{self._today}:{timestamp_ms}"
+```
+- 모든 로그에 `trace=%s` 파라미터 포함
+- 동일 실행의 모든 로그를 추적 가능
+
+---
+
+### 2. EXIT/ENTRY PASS 완전 분리 ✅
 
 **변경 위치**: `trader/pb1_engine.py::run()`
 
@@ -25,7 +145,7 @@
 [PASS][ENTRY][END] buys=... skipped_dup=... candidates=...
 ```
 
-### 2. Dedupe 키 스키마 개선 ✅
+### 3. Dedupe 키 스키마 개선 ✅
 
 **변경 위치**: `trader/pb1_engine.py::_client_order_key()`
 

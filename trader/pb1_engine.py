@@ -1607,6 +1607,8 @@ class PB1Engine:
         skipped_count = len([cf for cf in candidates if not cf.features.get("data_ok")])
         degraded_count = 1 if bench_insufficient and degraded_ok else 0
         
+        dt_minervini_total = time_module.monotonic() - t_minervini_enter
+        
         logger.info(
             "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
             before_minervini,
@@ -1626,6 +1628,12 @@ class PB1Engine:
             skipped_count,
             degraded_count,
             sample_codes,
+        )
+        logger.info(
+            "[MINERVINI][EXIT] passed=%s failed=%s dt=%.2f",
+            both_pass,
+            before_minervini - both_pass,
+            dt_minervini_total,
         )
         
         if debug_mode:
@@ -4246,6 +4254,25 @@ class PB1Engine:
         entry_pass_ok = True
         entry_pass_buys = 0
         entry_pass_skipped = 0
+        
+        # 계측 변수 초기화
+        import time as time_module
+        trace_id = f"{self.run_id or 'NORUN'}:{self._today}:{int(time_module.time() * 1000) % 100000}"
+        t0_entry = time_module.monotonic()
+        dt_minervini = 0.0
+        dt_pb1_filter = 0.0
+        dt_rank_pick = 0.0
+        dt_order_build = 0.0
+        dt_order_submit = 0.0
+        
+        logger.info(
+            "[ENTRY][PIPE][START] trace=%s universe=%s slots=%s tick_budget=%.0f entry_allowed=%s",
+            trace_id,
+            len(members) if 'members' in locals() else 0,
+            slots_remaining,
+            tick_budget_krw,
+            entry_allowed,
+        )
         logger.info("[PASS][ENTRY][START] phase=%s entry_allowed=%s slots_remaining=%s", self.phase, entry_allowed, slots_remaining)
         
         members = self._load_universe()
@@ -4304,12 +4331,26 @@ class PB1Engine:
         orderable_candidates: list[CandidateFeature] = []
         minervini_report_path: str | None = None
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
+            # Minervini 적용 전 시간 기록
+            t_minervini_start = time_module.monotonic()
+            
             candidates = self._compute_candidates(members)
+            
+            # Minervini 적용 시간 기록 (_compute_candidates 내부에서 Minervini 수행)
+            dt_minervini = time_module.monotonic() - t_minervini_start
             
             # [ENTRY][CANDIDATES] 초기 카운트
             data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
-            logger.info("[ENTRY][CANDIDATES] start universe=%s data_ok=%s", len(members), data_ok_count)
+            logger.info(
+                "[ENTRY][CANDIDATES] trace=%s start universe=%s data_ok=%s dt_minervini=%.2f",
+                trace_id,
+                len(members),
+                data_ok_count,
+                dt_minervini,
+            )
             
+            # PB1 필터 시간 기록
+            t_pb1_start = time_module.monotonic()
             (
                 candidates,
                 selected_tier,
@@ -4320,6 +4361,17 @@ class PB1Engine:
                 applied_min_score,
                 applied_require_both,
             ) = self._select_candidates_with_fallback(candidates)
+            dt_pb1_filter = time_module.monotonic() - t_pb1_start
+            
+            logger.info(
+                "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
+                trace_id,
+                data_ok_count,
+                len([c for c in candidates if c.setup_ok]),
+                dt_pb1_filter,
+                selected_tier,
+                relax_passes_used,
+            )
             if not any(c.setup_ok for c in candidates):
                 self._apply_score_fallback(candidates)
             setup_ok_codes = [c.code for c in candidates if c.setup_ok]
@@ -4675,28 +4727,30 @@ class PB1Engine:
             
             # [ENTRY][NO_BUY] 후보가 0일 때 이유 출력
             if not orderable_candidates:
-                no_buy_reason = "unknown"
+                no_buy_reason = "UNKNOWN"
                 if not candidates:
-                    no_buy_reason = "minervini_empty"
+                    no_buy_reason = "EMPTY_AFTER_MINERVINI"
                 elif not setup_ok_codes:
-                    no_buy_reason = "pb1_conditions_empty"
+                    no_buy_reason = "EMPTY_AFTER_PB1_FILTER"
                 elif data_ok_count == 0:
-                    no_buy_reason = "ohlcv_missing"
+                    no_buy_reason = "OHLCV_INSUFFICIENT"
                 elif not entry_allowed:
-                    no_buy_reason = "entry_disabled"
+                    no_buy_reason = "ORDER_SUBMIT_BLOCKED"
                 elif available_cash_krw <= 0:
-                    no_buy_reason = "cash_insufficient"
+                    no_buy_reason = "CASH_INSUFFICIENT"
                 elif after_risk_check_count == 0:
-                    no_buy_reason = "risk_filter"
+                    no_buy_reason = "EMPTY_AFTER_RANK"
                 elif drop_reason_counter:
                     top_reason = drop_reason_counter.most_common(1)[0][0] if drop_reason_counter else "unknown"
-                    no_buy_reason = f"drop:{top_reason}"
+                    no_buy_reason = f"DROP:{top_reason}"
                 logger.warning(
-                    "[ENTRY][NO_BUY] reason=%s candidates=%s setup_ok=%s after_risk=%s drop_top3=%s",
+                    "[ENTRY][NO_BUY] trace=%s reason=%s candidates=%s setup_ok=%s after_risk=%s cash=%s drop_top3=%s",
+                    trace_id,
                     no_buy_reason,
                     len(candidates),
                     len(setup_ok_codes),
                     after_risk_check_count,
+                    available_cash_krw,
                     drop_reason_counter.most_common(3),
                 )
 
@@ -4856,11 +4910,47 @@ class PB1Engine:
                         ok_setups=ok_count,
                         blocked_by=blocked_by,
                     )
+                
+                # [ORDER][BUILD] - 주문 생성 시작
+                t_order_build = time_module.monotonic()
+                order_symbols = [cf.code for cf in orderable_candidates]
+                logger.info(
+                    "[ORDER][BUILD] trace=%s count=%s symbols=%s",
+                    trace_id,
+                    len(orderable_candidates),
+                    ",".join(order_symbols[:10]) + ("..." if len(order_symbols) > 10 else ""),
+                )
+                dt_order_build = time_module.monotonic() - t_order_build
+                
+                # [ORDER][SUBMIT] - 주문 제출
+                t_order_submit = time_module.monotonic()
+                submitted_count = 0
+                failed_count = 0
                 for cf in orderable_candidates:
-                    if self.window_internal == "close":
-                        self._place_entry_close(cf)
-                    else:
-                        self._place_entry(cf)
+                    try:
+                        if self.window_internal == "close":
+                            self._place_entry_close(cf)
+                        else:
+                            self._place_entry(cf)
+                        submitted_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        logger.exception(
+                            "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
+                            trace_id,
+                            cf.code,
+                            str(e),
+                        )
+                dt_order_submit = time_module.monotonic() - t_order_submit
+                
+                logger.info(
+                    "[ORDER][SUBMIT] trace=%s submitted=%s failed=%s dt_build=%.2f dt_submit=%.2f",
+                    trace_id,
+                    submitted_count,
+                    failed_count,
+                    dt_order_build,
+                    dt_order_submit,
+                )
                 if entry_allowed and self.phase == "entry" and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
@@ -4951,10 +5041,22 @@ class PB1Engine:
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
         
-        # ENTRY PASS 종료
-        entry_pass_buys = len(orderable_candidates)
+        # ENTRY PASS 종료 계측
+        entry_pass_buys = len(orderable_candidates) if 'orderable_candidates' in locals() else 0
+        dt_total_entry = time_module.monotonic() - t0_entry
+        
+        logger.info(
+            "[ENTRY][PIPE][END] trace=%s total_dt=%.2f minervini_dt=%.2f pb1_dt=%.2f rank_dt=%.2f build_dt=%.2f submit_dt=%.2f",
+            trace_id,
+            dt_total_entry,
+            dt_minervini,
+            dt_pb1_filter,
+            dt_rank_pick,
+            dt_order_build,
+            dt_order_submit,
+        )
         logger.info("[PASS][ENTRY][END] buys=%s skipped_dup=%s candidates=%s", 
-                   entry_pass_buys, entry_pass_skipped, len(candidates))
+                   entry_pass_buys, entry_pass_skipped, len(candidates) if 'candidates' in locals() else 0)
         
         # [PATCH] 요약 로그 추가
         candidates_ok = len([c for c in self.top_candidates if c.get('priced', False)])
