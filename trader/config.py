@@ -751,6 +751,16 @@ PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
 PB1_LOG_DROP_REASONS_TOPN = int(_cfg("PB1_LOG_DROP_REASONS_TOPN") or "10")
 PB1_OHLCV_DAYS_BASE = int(_cfg("PB1_OHLCV_DAYS_BASE") or "200")
+
+# === [NEW] PB1 Watchlist 환경변수 ===
+PB1_WATCHLIST_ENABLED = _cfg_bool("PB1_WATCHLIST_ENABLED", fallback=True)
+PB1_WATCHLIST_TOPK = int(_cfg("PB1_WATCHLIST_TOPK") or "50")
+PB1_WATCHLIST_FINALN = int(_cfg("PB1_WATCHLIST_FINALN") or "30")
+PB1_WATCHLIST_MIN_PRICE = float(_cfg("PB1_WATCHLIST_MIN_PRICE") or "2000")
+PB1_WATCHLIST_LIQ_DAYS = int(_cfg("PB1_WATCHLIST_LIQ_DAYS") or "20")
+PB1_WATCHLIST_MIN_ROWS = int(_cfg("PB1_WATCHLIST_MIN_ROWS") or "30")
+PB1_WATCHLIST_FORCE_REBUILD = _cfg_bool("PB1_WATCHLIST_FORCE_REBUILD", fallback=False)
+
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
@@ -760,7 +770,7 @@ PRICE_SNAPSHOT_TTL_SEC = float(_cfg("PRICE_SNAPSHOT_TTL_SEC") or "2")
 DAILY_BAR_TTL_SEC = float(_cfg("DAILY_BAR_TTL_SEC") or "1800")
 
 logger.info(
-    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_cond_mode=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s",
+    "[CONFIG][PB1] entry_mode=%s require_both=%s entry_cond_mode=%s entry_budget_pct=%.2f max_pos_pct=%.2f vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f pullback_min=%.3f pullback_max=%.3f require_both_contractions=%s min_score_base=%.1f min_score_floor=%.1f min_score_step=%.1f failmode_soft=%s relax_passes=%s min_candidates=%s watchlist_enabled=%s watchlist_topk=%s watchlist_finaln=%s",
     PB1_ENTRY_MODE,
     int(PB1_REQUIRE_BOTH),
     ENTRY_COND_MODE,
@@ -778,6 +788,9 @@ logger.info(
     int(PB1_FAILMODE_SOFT),
     PB1_RELAX_MAX_PASSES,
     PB1_MIN_CANDIDATES,
+    int(PB1_WATCHLIST_ENABLED),
+    PB1_WATCHLIST_TOPK,
+    PB1_WATCHLIST_FINALN,
 )
 logger.info(
     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",

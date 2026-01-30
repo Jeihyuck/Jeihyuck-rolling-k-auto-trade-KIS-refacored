@@ -106,7 +106,7 @@ from trader.config import (
     VCP_MIN_SCORE,
     resolve_market_window,
 )
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI
 from trader.ledger.store import LedgerStore
@@ -137,6 +137,7 @@ from trader.utils.env import env_bool
 from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
+from trader.watchlist_builder import load_today_watchlist_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -3965,6 +3966,53 @@ class PB1Engine:
         }
         return members
 
+    def _load_today_watchlist_members(self) -> tuple[list[dict], str]:
+        """오늘 watchlist를 로드하고, 없으면 fallback 전략 적용."""
+        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        if not watchlist_enabled:
+            logger.info("[PB1][WATCHLIST] disabled -> use full universe")
+            members = self._load_universe()
+            return members, "universe_full"
+        
+        # 전체 유니버스 로드 (watchlist 생성/fallback에 필요)
+        full_members = self._load_universe()
+        
+        # Watchlist 로드
+        try:
+            watchlist, source = load_today_watchlist_with_fallback(
+                engine=self.engine,
+                env=self.env,
+                strategy=self.strategy,
+                today=self._today,
+                members=full_members,
+                ohlcv_provider=self._fetch_daily,
+                minervini_config=self.minervini_config,
+            )
+        except Exception as exc:
+            logger.error("[PB1][WATCHLIST][LOAD_FAIL] err=%s -> fallback to full universe", exc)
+            return full_members, "universe_fallback"
+        
+        if not watchlist:
+            logger.warning("[PB1][WATCHLIST] empty -> fallback to full universe")
+            return full_members, "universe_fallback_empty"
+        
+        # Watchlist를 members 형식으로 변환
+        members = [
+            {
+                "code": w["code"],
+                "rank": w.get("rank"),
+                "name": self._code_name_map.get(w["code"], ""),
+                "meta_json": w.get("meta"),
+            }
+            for w in watchlist
+        ]
+        
+        logger.info(
+            "[PB1][WATCHLIST] size=%s source=%s as_of=%s",
+            len(members), source, self._today
+        )
+        return members, source
+
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
         marks = self._fetch_marks([p["code"] for p in positions], fallback)
@@ -4159,6 +4207,21 @@ class PB1Engine:
         if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry"} and not self.dry_run:
             self._run_price_probe()
 
+        # ✅ Watchlist 적용 여부 결정
+        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        if watchlist_enabled and self.phase in {"prep", "entry"}:
+            logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
+            # Watchlist로 members 대체
+            members, watchlist_source = self._load_today_watchlist_members()
+            logger.info(
+                "[PB1][WATCHLIST] loaded=%s source=%s",
+                len(members), watchlist_source
+            )
+        else:
+            # 기존 로직: 전체 유니버스 사용
+            members = self._load_universe()
+            logger.info("[PB1][UNIVERSE] loaded=%s (watchlist disabled)", len(members))
+        
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             skip_entry_scan = True
             entry_allowed = False

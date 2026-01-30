@@ -41,6 +41,7 @@ class SchemaTables:
     ledger_events: sa.Table
     reconcile_log: sa.Table
     price_daily: sa.Table
+    pb1_watchlist: sa.Table
     uses_native_uuid: bool
 
 
@@ -268,6 +269,21 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.PrimaryKeyConstraint("market", "code", "date"),
     )
 
+    pb1_watchlist = sa.Table(
+        "pb1_watchlist",
+        metadata,
+        sa.Column("env", sa.String, nullable=False),
+        sa.Column("strategy", sa.String, nullable=False),
+        sa.Column("as_of", sa.Date, nullable=False),
+        sa.Column("code", sa.String, nullable=False),
+        sa.Column("rank", sa.Integer, nullable=False),
+        sa.Column("score", sa.Float, nullable=True),
+        sa.Column("meta", sa.JSON, nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.PrimaryKeyConstraint("env", "strategy", "as_of", "code"),
+        sa.Index("ix_pb1_watchlist_lookup", "env", "strategy", "as_of"),
+    )
+
     return SchemaTables(
         database_url=database_url,
         metadata=metadata,
@@ -281,6 +297,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         ledger_events=ledger_events,
         reconcile_log=reconcile_log,
         price_daily=price_daily,
+        pb1_watchlist=pb1_watchlist,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -318,3 +335,4 @@ POSITIONS = DEFAULT_SCHEMA.positions
 LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
 RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 PRICE_DAILY = DEFAULT_SCHEMA.price_daily
+PB1_WATCHLIST = DEFAULT_SCHEMA.pb1_watchlist

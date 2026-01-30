@@ -21,6 +21,7 @@ from .schema import (
     UNIVERSE_MEMBERS,
     UNIVERSE_CURRENT,
     UNIVERSE_RUNS,
+    PB1_WATCHLIST,
     SchemaTables,
     schema_for_engine,
     uuid_value_for_url,
@@ -41,6 +42,9 @@ __all__ = [
     "LedgerEventsRepo",
     "ReconcileLogRepo",
     "PositionRepo",  # Backward compatibility
+    "WatchlistRepo",
+    "save_watchlist",
+    "load_watchlist",
 ]
 
 
@@ -2048,3 +2052,151 @@ def upsert_price_daily(engine: Engine, candles: List[Dict[str, Any]], market: st
 
 # Backward compatibility alias
 PositionRepo = PositionsRepo
+
+
+# ========================================
+# PB1 Watchlist Repository
+# ========================================
+
+class WatchlistRepo:
+    """PB1 Watchlist 전용 repo."""
+    
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+    
+    def save_watchlist(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date,
+        members: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Watchlist를 DB에 upsert.
+        members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        """
+        if not members:
+            logger.warning("[WATCHLIST][SAVE] empty members -> skip")
+            return
+        
+        schema = self._schema
+        with self.engine.begin() as conn:
+            # 기존 당일 watchlist 삭제
+            delete_stmt = sa.delete(schema.pb1_watchlist).where(
+                and_(
+                    schema.pb1_watchlist.c.env == env,
+                    schema.pb1_watchlist.c.strategy == strategy,
+                    schema.pb1_watchlist.c.as_of == as_of,
+                )
+            )
+            conn.execute(delete_stmt)
+            
+            # 새 watchlist 삽입
+            rows = [
+                {
+                    "env": env,
+                    "strategy": strategy,
+                    "as_of": as_of,
+                    "code": str(m["code"]).zfill(6),
+                    "rank": m.get("rank", 0),
+                    "score": m.get("score"),
+                    "meta": json_sanitize(m.get("meta")),
+                }
+                for m in members
+            ]
+            if rows:
+                conn.execute(sa.insert(schema.pb1_watchlist), rows)
+        
+        logger.info(
+            "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
+            env, strategy, as_of, len(members)
+        )
+    
+    def load_watchlist(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date,
+    ) -> List[Dict[str, Any]]:
+        """
+        특정 날짜의 watchlist 조회.
+        반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        """
+        schema = self._schema
+        with self.engine.connect() as conn:
+            stmt = (
+                select(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.as_of == as_of,
+                    )
+                )
+                .order_by(schema.pb1_watchlist.c.rank)
+            )
+            rows = conn.execute(stmt).fetchall()
+        
+        result = [
+            {
+                "code": row.code,
+                "rank": row.rank,
+                "score": float(row.score) if row.score else None,
+                "meta": row.meta,
+            }
+            for row in rows
+        ]
+        logger.info(
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+            env, strategy, as_of, len(result)
+        )
+        return result
+    
+    def get_latest_watchlist_date(
+        self,
+        *,
+        env: str,
+        strategy: str,
+    ) -> Optional[date]:
+        """가장 최근 watchlist의 as_of 날짜 반환."""
+        schema = self._schema
+        with self.engine.connect() as conn:
+            stmt = (
+                select(func.max(schema.pb1_watchlist.c.as_of))
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                    )
+                )
+            )
+            result = conn.execute(stmt).scalar()
+        return result
+
+
+def save_watchlist(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    members: List[Dict[str, Any]],
+) -> None:
+    """Standalone save_watchlist function."""
+    repo = WatchlistRepo(engine)
+    repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
+
+
+def load_watchlist(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+) -> List[Dict[str, Any]]:
+    """Standalone load_watchlist function."""
+    repo = WatchlistRepo(engine)
+    return repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
