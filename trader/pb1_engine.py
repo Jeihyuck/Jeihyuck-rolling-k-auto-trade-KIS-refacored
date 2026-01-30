@@ -3309,7 +3309,12 @@ class PB1Engine:
             )
 
         if decision_reasons and decision_reasons[0] in {"STOP_HIT", "FAILED_BREAKOUT"}:
-            cooldown_until = (self._now_kst.date().isoformat() if REENTRY_COOLDOWN_DAYS <= 0 else (self._now_kst.date() + pd.Timedelta(days=REENTRY_COOLDOWN_DAYS)).date().isoformat())
+            # NOTE: self._now_kst is datetime (tz-aware). Avoid calling .date() twice.
+            #       Use datetime + Timedelta then .date() to get a stable "YYYY-MM-DD".
+            if REENTRY_COOLDOWN_DAYS <= 0:
+                cooldown_until = self._now_kst.date().isoformat()
+            else:
+                cooldown_until = (self._now_kst + pd.Timedelta(days=REENTRY_COOLDOWN_DAYS)).date().isoformat()
             self.positions_repo.update_position_fields(
                 env=self.env,
                 strategy=self.STRATEGY_NAME,
