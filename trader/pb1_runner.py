@@ -1052,42 +1052,52 @@ def run_once(
                 )
                 action = "run" if trading_day else "smoke"
                 logger.info("[PB1][WAIT][DONE] now_kst=%s window=%s phase=%s", now.isoformat(), window_label, phase_for_log)
+    
+    # ✅ 장외 스킵은 LIVE 모드에서만 적용 (DIAG는 계속 실행)
     if not trading_day:
-        exit_status = "NONTRADING_DAY_EXIT"
+        # DIAG 모드: 장외라도 엔진 실행 (단 KIS API는 차단됨)
         if mode == "DIAG":
+            logger.info(
+                "[PB1][DIAG][NONTRADING_DAY] mode=DIAG continue execution (KIS blocked)",
+            )
+            # nontrading_smoke는 실행하되, 엔진도 계속 진행
+            exit_status = "DIAG_NONTRADING_CONTINUE"
             as_of = now.date().isoformat()
             smoke_flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of)
-            if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
-                logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
-            else:
-                run_nontrading_smoke_once(
-                    runtime_root_dir=runtime_root_dir,
-                    engine=engine,
-                    now=now,
-                    env=(os.getenv("KIS_ENV") or "practice").lower(),
-                    strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
-                    as_of=as_of,
-                    timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
-                    db_store=NONTRADING_SMOKE_DB_STORE,
-                    force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
-                )
-                write_nontrading_smoke_flag(
-                    runtime_root_dir,
-                    now=now,
-                    run_id=os.getenv("GITHUB_RUN_ID", "local"),
-                    sha=os.getenv("GITHUB_SHA", "unknown"),
-                    as_of=as_of,
-                )
-                exit_status = "NONTRADING_SMOKE_DONE"
-        if loop_mode:
-            logger.info("[PB1][LOOP] non-trading-day -> skip")
+            if not smoke_flag.exists() or NONTRADING_SMOKE_FORCE:
+                try:
+                    run_nontrading_smoke_once(
+                        runtime_root_dir=runtime_root_dir,
+                        engine=engine,
+                        now=now,
+                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        strategy=os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY,
+                        as_of=as_of,
+                        timeout_sec=NONTRADING_SMOKE_TIMEOUT_SEC,
+                        db_store=NONTRADING_SMOKE_DB_STORE,
+                        force_rebuild=NONTRADING_SMOKE_FORCE_REBUILD,
+                    )
+                    write_nontrading_smoke_flag(
+                        runtime_root_dir,
+                        now=now,
+                        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                        sha=os.getenv("GITHUB_SHA", "unknown"),
+                        as_of=as_of,
+                    )
+                except Exception as exc:
+                    logger.warning("[NONTRADING_SMOKE][FAIL] err=%s", exc)
+            # ✅ DIAG는 계속 실행 (return 하지 않음)
         else:
-            logger.info("[PB1][SKIP] non-trading-day -> skip")
-        logger.info(
-            "[PB1][EXIT] reason=%s",
-            "nontrading_smoke_done" if exit_status == "NONTRADING_SMOKE_DONE" else "nontrading_day_exit",
-        )
-        return [], False, {}, phase_for_log, exit_status
+            # LIVE 모드: 장외면 스킵
+            exit_status = "NONTRADING_DAY_EXIT"
+            if loop_mode:
+                logger.info("[PB1][LOOP] non-trading-day -> skip (LIVE mode)")
+            else:
+                logger.info("[PB1][SKIP] non-trading-day -> skip (LIVE mode)")
+            logger.info(
+                "[PB1][EXIT] reason=nontrading_day_exit mode=LIVE",
+            )
+            return [], False, {}, phase_for_log, exit_status
 
     if action == "smoke":
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
@@ -1650,6 +1660,23 @@ def run_once(
         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
     }
     result_status = result.status if result else "UNKNOWN"
+    
+    # ✅ DIAG 모드 실행 요약 로그
+    if mode == "DIAG":
+        logger.info(
+            "[DIAG_SUMMARY] status=%s phase=%s did_work=%s metrics=%s",
+            result_status,
+            phase_for_log,
+            did_work,
+            metrics,
+        )
+        if engine_runner:
+            logger.info(
+                "[DIAG_SUMMARY][ENGINE] top_candidates=%s current_code=%s",
+                len(engine_runner.top_candidates) if hasattr(engine_runner, 'top_candidates') else 0,
+                engine_runner.current_code if hasattr(engine_runner, 'current_code') else None,
+            )
+    
     return touched_files, did_work, metrics, phase_for_log, result_status
 
 

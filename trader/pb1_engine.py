@@ -108,7 +108,7 @@ from trader.config import (
 )
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-from trader.kis_wrapper import KisAPI
+from trader.kis_wrapper import KisAPI, KISBlockedError
 from trader.ledger.store import LedgerStore
 from trader.universe.validation import validate_tradeable
 from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter

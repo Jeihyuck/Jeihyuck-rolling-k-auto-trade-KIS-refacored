@@ -1,8 +1,9 @@
-# 연속 루프 구현 완료 (5분 크론 제약 제거)
+# 연속 루프 구현 완료 (5분 크론 제약 제거 + DIAG 모드 완전 실행)
 
 ## 📋 요약
 
 GitHub Actions의 5분 크론을 제거하고, 한 번 실행으로 장중 연속 감시/매매가 가능하도록 시스템을 재설계했습니다.
+**DIAG 모드에서도 엔진이 끝까지 실행**되며, KIS API만 차단되어 로직 전체를 검증할 수 있습니다.
 
 ---
 
@@ -210,10 +211,12 @@ on:
 23:00 → GitHub Actions 크론 시작 (토요일)
 23:00 → AUTO 모드 → DIAG 결정
 23:00 → 루프 비활성화 (run_loop=False)
-23:00 → run_once() 1회만 실행
-  - 후보 선정 (KIS API 차단 → 에러)
-  - 로직은 끝까지 실행
-  - SIM 주문 기록 (선택)
+23:00 → run_once() 1회 실행
+  ✅ 후보 선정 (DB 기반, KIS API 차단)
+  ✅ 돌파 조건 판단
+  ✅ 주문서 생성
+  ✅ SIM 주문 기록 (orders 테이블)
+  ✅ [DIAG_SUMMARY] 로그 출력
 23:00 → 종료
 ```
 
@@ -300,6 +303,54 @@ on:
 
 ---
 
+## 🎯 DIAG 모드 완전 실행 (핵심 개선)
+
+### 문제
+기존에는 **장외면 무조건 스킵**하여 DIAG 모드에서도 엔진이 실행되지 않았습니다.
+
+### 해결
+[trader/pb1_runner.py](trader/pb1_runner.py)의 `run_once()` 함수에서:
+
+**Before**:
+```python
+if not trading_day:
+    # LIVE, DIAG 구분 없이 무조건 return
+    return [], False, {}, phase_for_log, "NONTRADING_DAY_EXIT"
+```
+
+**After**:
+```python
+if not trading_day:
+    if mode == "DIAG":
+        # ✅ DIAG는 계속 실행 (KIS API만 차단)
+        logger.info("[PB1][DIAG][NONTRADING_DAY] mode=DIAG continue execution")
+        # smoke 실행 후 엔진도 계속 진행
+    else:
+        # LIVE만 스킵
+        logger.info("[PB1][SKIP] non-trading-day -> skip (LIVE mode)")
+        return [], False, {}, phase_for_log, "NONTRADING_DAY_EXIT"
+```
+
+### 결과
+- ✅ DIAG에서도 후보 선정, 돌파 판단, 주문서 생성까지 **끝까지 실행**
+- ✅ KIS API 호출만 `KISBlockedError`로 차단
+- ✅ 로직 검증 및 SIM 주문 기록 가능
+
+### DIAG 실행 확인 로그
+
+반드시 다음 로그가 보여야 합니다:
+
+```
+[PB1][DIAG][NONTRADING_DAY] mode=DIAG continue execution (KIS blocked)
+[PB1][RUN-START] ... STRATEGY_MODE=DIAG ...
+[CANDIDATE] ... (후보/점수)
+[ORDER_PLAN] ... (예산/수량)
+[DIAG_SUMMARY] status=... phase=... did_work=...
+[DIAG_SUMMARY][ENGINE] top_candidates=... current_code=...
+```
+
+---
+
 ## 📝 변경 파일 목록
 
 1. [.github/workflows/trade_intraday.yml](.github/workflows/trade_intraday.yml)
@@ -312,6 +363,8 @@ on:
    - `compute_loop_deadline()` 추가
    - `_resolve_loop_limits()` UNTIL_CLOSE 지원
    - `main()` AUTO 모드 결정 및 고정
+   - **`run_once()` 장외 스킵을 LIVE에만 적용** ⭐
+   - **DIAG 모드 요약 로그 추가** ⭐
 
 3. [trader/kis_wrapper.py](trader/kis_wrapper.py)
    - `KISBlockedError` 예외 추가
@@ -326,14 +379,36 @@ on:
    - `is_market_open_kst()` 추가
    - `market_close_dt_kst()` 추가
 
+6. [trader/pb1_engine.py](trader/pb1_engine.py)
+   - `KISBlockedError` import 추가
+   - DIAG 모드 KIS API 에러 처리 준비
+
 ---
 
 ## 🚨 주의사항
 
 1. **첫 실행은 반드시 수동으로**: `workflow_dispatch`로 "잘 도는지" 확인 후 자동 시동
-2. **DIAG 모드 에러는 정상**: KIS API 차단으로 인한 에러는 예상된 동작
-3. **루프 간격 조정**: 초기 30초 → 안정화 후 60초 등 조정 가능
-4. **타임아웃 여유**: 360분(6시간)은 충분하지만, 플랫폼 제한 고려
+2. **DIAG 모드 로그 확인**: 장외 실행 시 `[DIAG_SUMMARY]` 로그가 반드시 보여야 함
+3. **KIS API 차단은 정상**: `KISBlockedError`는 DIAG에서 예상된 동작
+4. **루프 간격 조정**: 초기 30초 → 안정화 후 60초 등 조정 가능
+5. **타임아웃 여유**: 360분(6시간)은 충분하지만, 플랫폼 제한 고려
+
+---
+
+## 🔍 DIAG 모드 검증 체크리스트
+
+DIAG 모드가 제대로 실행되었는지 확인하려면 다음 로그가 **반드시** 보여야 합니다:
+
+- [ ] `[PB1][DIAG][NONTRADING_DAY] mode=DIAG continue execution`
+- [ ] `[PB1][RUN-START] ... STRATEGY_MODE=DIAG ...`
+- [ ] `[PB1][WATCHLIST][LOAD] ...` 또는 `[WATCHLIST][BUILD][DONE] ...`
+- [ ] `[ENTRY][PIPE][START] ...` (엔트리 파이프라인 시작)
+- [ ] `[CANDIDATE] ...` (후보/점수/필터 결과)
+- [ ] `[ORDER_PLAN] ...` (예산/수량 산정)
+- [ ] `[DIAG_SUMMARY] status=... phase=... did_work=...`
+- [ ] `[DIAG_SUMMARY][ENGINE] top_candidates=... current_code=...`
+
+**하나라도 없으면 DIAG 실행이 안 된 것입니다.**
 
 ---
 
