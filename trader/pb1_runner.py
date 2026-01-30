@@ -1099,7 +1099,7 @@ def run_once(
                     write_nontrading_smoke_flag(
                         runtime_root_dir,
                         now=now,
-                        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                        run_id=os.getenv("TRADER_RUN_ID", "local"),
                         sha=os.getenv("GITHUB_SHA", "unknown"),
                         as_of=as_of,
                     )
@@ -1291,7 +1291,7 @@ def run_once(
             kis = KisAPI()
         except Exception:
             logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
-        run_id = os.getenv("GITHUB_RUN_ID", "local")
+        run_id = os.getenv("TRADER_RUN_ID", "local")
         reconcile_ok = False
         close_stale_ok = False
         try:
@@ -1342,7 +1342,7 @@ def run_once(
             kis = KisAPI()
         except Exception:
             logger.exception("[PB1][DEGRADED] KIS init failed")
-        run_id = os.getenv("GITHUB_RUN_ID", "local")
+        run_id = os.getenv("TRADER_RUN_ID", "local")
         reconcile_ok = False
         close_stale_ok = False
         try:
@@ -1764,7 +1764,7 @@ def _run_nontrading_smoke_if_needed(
     write_nontrading_smoke_flag(
         runtime_root_dir,
         now=now,
-        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+        run_id=os.getenv("TRADER_RUN_ID", "local"),
         sha=os.getenv("GITHUB_SHA", "unknown"),
         as_of=as_of,
     )
@@ -1819,12 +1819,21 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     loop_deadline_ts = None
     runtime_root_dir = runtime_root()
     
+    # ✅ run_id SSOT: TRADER_RUN_ID를 사용하여 통일
+    from uuid import uuid4
+    run_id = os.getenv("TRADER_RUN_ID")
+    if not run_id:
+        run_id = str(uuid4())
+        os.environ["TRADER_RUN_ID"] = run_id
+    
     # Create RunContext for loop mode
     env = os.getenv("ENV", "live")
     strategy = os.getenv("STRATEGY", "best_k_meta")
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     git_sha = os.getenv("GITHUB_SHA")
     ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
+    # ✅ RunContext의 run_id를 TRADER_RUN_ID로 강제 교체
+    ctx.run_id = run_id
     logger.info(
         "[PB1][LOOP][CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s",
         ctx.run_id,
@@ -2116,12 +2125,22 @@ def main() -> int:
         return 0
     run_migrations(engine)
     _write_change_flag(False, ["init"])
+    
+    # ✅ run_id SSOT: TRADER_RUN_ID를 사용하여 통일
+    from uuid import uuid4
+    run_id = os.getenv("TRADER_RUN_ID")
+    if not run_id:
+        run_id = str(uuid4())
+        os.environ["TRADER_RUN_ID"] = run_id
+    
     # Create RunContext
     env = os.getenv("ENV", "live")
     strategy = os.getenv("STRATEGY", "best_k_meta")
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     git_sha = os.getenv("GITHUB_SHA")
     ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
+    # ✅ RunContext의 run_id를 TRADER_RUN_ID로 강제 교체
+    ctx.run_id = run_id
     logger.info("[RUN_CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s", ctx.run_id, ctx.env, ctx.strategy, ctx.gh_run_number, ctx.git_sha)
     metrics: dict[str, int] = {}
     phase_for_log = "none"

@@ -28,7 +28,7 @@ class LedgerStore:
     def __init__(self, base_dir: Path, env: str = "paper", run_id: str | None = None) -> None:
         self.base_dir = Path(base_dir)
         self.env = env
-        self.run_id = run_id or os.getenv("GITHUB_RUN_ID", str(uuid.uuid4()))
+        self.run_id = run_id or os.getenv("TRADER_RUN_ID", str(uuid.uuid4()))
         self.today = _today_str()
 
     def _run_file(self, kind: str) -> Path:

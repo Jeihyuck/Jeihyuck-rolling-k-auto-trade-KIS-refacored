@@ -1417,6 +1417,32 @@ class LedgerEventsRepo:
                     return str(res.scalar())
             except Exception as exc:
                 last_exc = exc
+                # FK 위반 시 runs 테이블 upsert 재시도
+                is_fk_violation = (
+                    isinstance(exc, IntegrityError) and 
+                    "foreign key" in str(exc).lower() and 
+                    "run_id" in str(exc).lower()
+                )
+                if is_fk_violation and attempt == 1:
+                    logger.warning(
+                        "[DB][LEDGER_EVENT][FK-VIOLATION] run_id=%s not in runs table, will ensure_run and retry",
+                        run_id,
+                    )
+                    try:
+                        with self.engine.begin() as conn:
+                            ensure_run(
+                                conn,
+                                self._schema,
+                                run_id=run_id,
+                                env=env,
+                                run_window=run_window,
+                                strategy=strategy or "unknown",
+                                ts=ts,
+                                database_url=db_url,
+                            )
+                        continue  # retry
+                    except Exception as ensure_exc:
+                        logger.exception("[DB][LEDGER_EVENT][ENSURE_RUN_FAIL] err=%s", ensure_exc)
                 if attempt == 1:
                     logger.exception(
                         "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",

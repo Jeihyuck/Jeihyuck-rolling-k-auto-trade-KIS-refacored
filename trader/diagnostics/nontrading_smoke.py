@@ -123,11 +123,17 @@ def run_nontrading_smoke_once(
             raise RuntimeError("nontrading_smoke empty universe")
 
         _check_timeout("probe_prepare")
-        try:
-            kis = KisAPI(env=env)
-        except Exception as exc:
-            logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
-            kis = None
+        # DIAG 모드에서는 KIS HTTP 경로 진입 최소화
+        is_diag = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
+        kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "0") != "0"
+        kis = None
+        if not is_diag and kis_http_enabled:
+            try:
+                kis = KisAPI(env=env)
+            except Exception as exc:
+                logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
+        else:
+            logger.info("[NONTRADING_SMOKE][PROBE] KIS skipped (DIAG=%s, HTTP=%s)", is_diag, kis_http_enabled)
         providers = [KISOHLCVProvider(kis)] if kis else []
         providers.append(KRXOHLCVProvider())
         chain = ChainOHLCVProvider(providers, env=env)
@@ -157,9 +163,11 @@ def run_nontrading_smoke_once(
             _check_timeout("db_store")
             try:
                 repo = LedgerEventsRepo(engine)
+                # TRADER_RUN_ID를 사용하여 run_id 통일
+                run_id = os.getenv("TRADER_RUN_ID") or "local"
                 event_id = repo.append_event(
                     env=env,
-                    run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                    run_id=run_id,
                     strategy=strategy,
                     run_window=None,
                     event_type="NONTRADING_SMOKE",
