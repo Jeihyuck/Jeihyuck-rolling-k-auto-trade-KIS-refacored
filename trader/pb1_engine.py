@@ -1357,6 +1357,52 @@ class PB1Engine:
             },
         )
 
+    def _prefilter_members_fast(self, members: List[dict]) -> List[dict]:
+        """
+        빠른 프리필터: 최근 30일 거래대금 기준으로 상위 N개만 스캔.
+        - OHLCV가 없으면 즉시 스킵(프리필터 점수 0)
+        - 30일만 가져오므로 200일 풀 계산보다 훨씬 빠름
+        """
+        import os
+        limit = int(os.getenv("PB1_UNIVERSE_SCAN_LIMIT", "50"))
+        lb = int(os.getenv("PB1_PREFILTER_LOOKBACK_DAYS", "30"))
+        
+        scored: List[tuple[float, dict]] = []
+        for member in members:
+            code = str(member.get("code") or "").zfill(6)
+            try:
+                df, _ = self._fetch_daily(code, count=lb)
+                if df is None or len(df) < max(10, lb // 2):
+                    continue
+                # 거래대금 proxy: close * volume
+                if "close" not in df.columns or "volume" not in df.columns:
+                    continue
+                close_series = df["close"].astype(float)
+                vol_series = df["volume"].astype(float)
+                tv = float((close_series * vol_series).tail(20).mean())
+                scored.append((tv, member))
+            except Exception:
+                # 프리필터에서 죽으면 안 됨: 그냥 스킵
+                continue
+        
+        scored.sort(reverse=True, key=lambda x: x[0])
+        top = [m for _, m in scored[:limit]]
+        
+        # benchmark 포함 보장 (예: 229200)
+        benchmark_codes = [RS_BENCHMARK, "229200", "005930"]
+        for bcode in benchmark_codes:
+            if any(str(m.get("code") or "").zfill(6) == bcode for m in members):
+                if not any(str(m.get("code") or "").zfill(6) == bcode for m in top):
+                    bench_member = next((m for m in members if str(m.get("code") or "").zfill(6) == bcode), None)
+                    if bench_member:
+                        top = [bench_member] + top
+        
+        logger.info(
+            "[PB1][PREFILTER] total=%s limit=%s selected=%s lookback_days=%s",
+            len(members), limit, len(top), lb
+        )
+        return top
+
     def _fetch_daily(self, code: str, count: int | None = None) -> tuple[pd.DataFrame, Dict]:
         """OHLCV 로딩 (기본 PB1_OHLCV_DAYS_BASE일 윈도우로 안정화)"""
         if count is None:
@@ -1388,6 +1434,11 @@ class PB1Engine:
         candidates: List[CandidateFeature] = []
         members_list = list(members)  # Iterable → list 변환
         universe_count = len(members_list)
+        
+        # ✅ 프리필터 적용 (Top N으로 제한)
+        if os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
+            members_list = self._prefilter_members_fast(members_list)
+            logger.info("[PB1][CANDIDATES][PREFILTER] universe=%s -> filtered=%s", universe_count, len(members_list))
         
         try:
             # Limit OHLCV queries to holdings + top candidates from previous run
@@ -1439,7 +1490,18 @@ class PB1Engine:
             
             rs_prices: dict[str, pd.Series] = {}
             checked_count = 0
+            
+            # ✅ 조기 종료 설정
+            early_stop = os.getenv("PB1_CANDIDATE_EARLY_STOP", "1") == "1"
+            early_n = int(os.getenv("PB1_EARLY_STOP_CANDIDATES", "12"))
+            
             for m in members_list:
+                # ✅ 조기 종료 체크 (충분한 후보 확보 시)
+                if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
+                    reason = "EARLY_STOP_CANDIDATES_SUFFICIENT"
+                    logger.info("[PB1][CANDIDATES][EARLY_STOP] candidates=%s early_n=%s", len(candidates), early_n)
+                    break
+                
                 # ✅ 시간 예산 체크 (10개마다)
                 checked_count += 1
                 if checked_count % 10 == 0 and time.monotonic() > deadline:
@@ -1453,20 +1515,17 @@ class PB1Engine:
                 code = str(m.get("code") or "").zfill(6)
                 market = m.get("market") or ""
                 try:
+                    # ✅ OHLCV 결측 즉시 스킵 (보장 모드)
                     df, meta = self._fetch_daily(code)
-                    if df.empty:
-                        reasons = ["data_empty"]
-                        cf = CandidateFeature(
-                            code=code,
-                            market=market,
-                            features={"reasons": reasons, "data_ok": False},
-                            setup_ok=False,
-                            reasons=reasons,
-                            mode=1,
-                            mode_reasons=["default_day_mode"],
-                        )
-                        candidates.append(cf)
+                    if df is None or df.empty or len(df) < 120:
+                        # 120일 미만이면 VCP/Minervini 점수 계산이 의미 없음
+                        if df is None or df.empty:
+                            skip_reason = "data_empty"
+                        else:
+                            skip_reason = "insufficient_data"
+                        logger.debug("[PB1][CANDIDATES][SKIP] code=%s reason=%s rows=%s", code, skip_reason, len(df) if df is not None else 0)
                         continue
+                    
                     if len(df) < required_candles:
                         reasons = ["insufficient_candles"]
                         cf = CandidateFeature(
@@ -1572,8 +1631,9 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     rs_prices[code] = df["close"].reset_index(drop=True)
-                except Exception:
-                    logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
+                except Exception as exc:
+                    # ✅ 개별 종목 예외로 전체 런이 죽지 않게
+                    logger.exception("[PB1][CANDIDATES][COMPUTE_FAILED] code=%s error=%s -> skip", code, exc)
                     continue
             
             if not candidates:
@@ -2618,6 +2678,42 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
         return False
+
+    def _submit_force_buy_order(self, code: str, qty: int) -> None:
+        """
+        FORCE_BUY 스모크 모드: 주문 endpoint까지 도달하는지 검증용.
+        모의투자 전용. 시장가 또는 최우선 매수호가로 1주 강제 주문.
+        """
+        try:
+            # 가격 조회
+            quote = self.kis_api.get_price_snapshot(code, market="J")
+            ask = quote.get("ask")
+            prpr = quote.get("prpr") or quote.get("last")
+            
+            # ask 있으면 ask로, 없으면 prpr + 1틱
+            if ask and ask > 0:
+                price = float(ask)
+            elif prpr and prpr > 0:
+                tick = self.kis_api._get_tick_size(float(prpr))
+                price = float(prpr) + tick
+            else:
+                logger.error("[FORCE_BUY][FAIL] code=%s no_price", code)
+                return
+            
+            logger.warning(
+                "[FORCE_BUY][SUBMIT] code=%s qty=%s price=%.0f mode=SMOKE_TEST",
+                code, qty, price
+            )
+            
+            # 주문 제출 (시장가 선호, 없으면 지정가)
+            resp = self.kis_api.buy_market(code, qty) if hasattr(self.kis_api, 'buy_market') else self.kis_api.buy(code, price, qty)
+            
+            logger.warning(
+                "[FORCE_BUY][RESULT] code=%s resp=%s",
+                code, resp
+            )
+        except Exception as exc:
+            logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
     def _place_entry(self, cf: CandidateFeature) -> None:
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
@@ -4002,7 +4098,11 @@ class PB1Engine:
         if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
             target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
         if not entry_allowed:
-            logger.warning("[PB1][ENTRY_DISABLED] entry_allowed=0 reason=%s -> skip new entries", entry_reason)
+            logger.warning(
+                "[PB1][ENTRY_DISABLED][REASON] entry_allowed=0 reason=%s -> skip new entries",
+                entry_reason
+            )
+            logger.info("[PB1][BUY][SKIP] reason=%s details={'entry_allowed': False}", entry_reason)
         if self.phase == "verify":
             entry_allowed = False
             entry_reason = "phase_verify"
@@ -4179,6 +4279,11 @@ class PB1Engine:
             if tick_budget_krw < min_order_krw:
                 logger.warning(
                     "[PB1][BUDGET_PLAN][WARN] tick_budget_below_min_order tick_budget=%s min_order=%s",
+                    tick_budget_krw,
+                    min_order_krw,
+                )
+                logger.info(
+                    "[PB1][BUY][SKIP] reason=tick_budget_too_small details={'tick_budget': %s, 'min_order': %s}",
                     tick_budget_krw,
                     min_order_krw,
                 )
@@ -4916,6 +5021,19 @@ class PB1Engine:
                         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
                         blocked_by = _normalize_entry_block_counts(drop_reason_counter)
                         blocked_by.update(_normalize_entry_block_reasons(no_orders_reasons))
+                        
+                        # ✅ FORCE_BUY 스모크 모드 (주문 endpoint 도달 검증)
+                        if os.getenv("PB1_FORCE_BUY", "0") == "1":
+                            qty = int(os.getenv("PB1_FORCE_BUY_QTY", "1"))
+                            force_list = members if members else []
+                            if force_list:
+                                forced_code = str(force_list[0].get("code") or "").zfill(6)
+                                logger.warning(
+                                    "[PB1][FORCE_BUY][SMOKE] forcing buy code=%s qty=%d reason=verify_order_endpoint",
+                                    forced_code, qty
+                                )
+                                self._submit_force_buy_order(code=forced_code, qty=qty)
+                        
                         _emit_entry_decision(
                             "SKIP",
                             reason="NO_ORDER_INTENTS",
