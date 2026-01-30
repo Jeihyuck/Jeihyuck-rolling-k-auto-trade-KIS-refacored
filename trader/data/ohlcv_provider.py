@@ -16,7 +16,7 @@ from trader.db.engine import make_engine
 from trader.db.repos import load_price_daily, upsert_price_daily
 from trader.cache_ttl import daily_cache, DAILY_BAR_TTL_SEC
 from trader.rate_limit import get_kis_gate
-from trader.config import ALLOW_KIS_DAILY_FALLBACK, MARKET_MAP
+from trader.config import ALLOW_KIS_DAILY_FALLBACK, MARKET_MAP, is_diag_mode
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,25 @@ class KISOHLCVProvider:
         except Exception as exc:
             logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
 
-        # KIS fallback
+        # ====================================================================
+        # [DIAG 방화벽] DIAG 모드일 때는 KIS fallback 절대 금지
+        # ====================================================================
+        if is_diag_mode():
+            logger.debug(
+                "[OHLCV][DIAG][KIS_BLOCKED] symbol=%s days=%d - KIS fallback disabled in DIAG mode",
+                symbol, days
+            )
+            return OHLCVResult(
+                pd.DataFrame(),
+                {
+                    "provider": self.name,
+                    "source": "db_failed_diag_no_kis",
+                    "error": "diag_mode_kis_blocked",
+                    "volume_missing": True,
+                }
+            )
+
+        # KIS fallback (LIVE 모드에서만 실행됨)
         # [FIX] D. day window에서 days <= 120이면 fallback 허용 (watchlist 생성/엔트리에 필수)
         fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 120)
         if not fallback_allowed:

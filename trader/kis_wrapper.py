@@ -1657,6 +1657,20 @@ class KisAPI:
         - 종목코드 'A' 접두사 제거(6자리)
         - 0개 → DataEmptyError, 21개 미만 → DataShortError, 네트워크/게이트웨이 → NetTemporaryError
         """
+        # ====================================================================
+        # [DIAG 방화벽] DIAG 모드에서는 KIS 일봉 API 호출 즉시 차단
+        # ====================================================================
+        from trader.config import is_diag_mode
+        if is_diag_mode():
+            logger.error(
+                "[KIS][DIAG_BLOCKED] get_daily_candles() called in DIAG mode - symbol=%s count=%s",
+                code, count
+            )
+            raise RuntimeError(
+                f"[DIAG_MODE_VIOLATION] KIS daily candles API is forbidden in DIAG mode (symbol={code}). "
+                "Use DB or FDR providers only."
+            )
+        
         # ---- (A) .env 점검: DAILY_CAPITAL 미설정 경고 (함수 최초 1회만) ----
         try:
             global _DAILY_CAP_WARNED

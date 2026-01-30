@@ -71,7 +71,7 @@ defaults:
 jobs:
   universe_build:
     runs-on: ubuntu-latest
-    if: (github.event_name == 'schedule' && github.event.schedule == '45 23 * * 0-4') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
 
     env:
@@ -149,7 +149,6 @@ jobs:
 
   trade_tick:
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
     timeout-minutes: 60
 
     env:
@@ -257,45 +256,6 @@ jobs:
             exit 1
           fi
 
-      - name: "Guard: LIVE env precheck"
-        run: |
-          set -euo pipefail
-          violations=()
-          [ "${DB_ONLY:-}" = "1" ] && violations+=("DB_ONLY=1")
-          [ "${NONTRADING_SMOKE:-}" = "1" ] && violations+=("NONTRADING_SMOKE=1")
-          [ "${DRY_RUN:-}" = "1" ] && violations+=("DRY_RUN=1")
-          [ "${LIVE_TRADING_ENABLED:-}" != "1" ] && violations+=("LIVE_TRADING_ENABLED != '1'")
-          [ "${DISABLE_LIVE_TRADING:-}" = "1" ] && violations+=("DISABLE_LIVE_TRADING=1")
-          [ "${STRATEGY_MODE:-}" != "LIVE" ] && violations+=("STRATEGY_MODE != 'LIVE'")
-          if [ ${#violations[@]} -gt 0 ]; then
-            echo "::error::LIVE env violations: ${violations[*]}"
-            exit 1
-          fi
-          echo "[PRECHECK] LIVE env ok"
-
-      - name: Precheck import (fail fast)
-        run: |
-          set -euo pipefail
-          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
-
-      - name: DB migrate
-        run: |
-          set -euo pipefail
-          python -m trader.db.migrate
-
-      - name: DB universe precheck
-        run: |
-          set -euo pipefail
-          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE:-LIVE}"
-
-      - name: Ensure watchlist (auto build if empty)
-        env:
-          PB1_WATCHLIST_AUTOBUILD: "1"
-        run: |
-          set -euo pipefail
-          echo "[WATCHLIST] Auto-build enabled: PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
-          echo "[WATCHLIST] Will auto-create today's watchlist if missing"
-
       - name: Resolve market-aware runtime mode
         id: market_mode
         run: |
@@ -323,6 +283,45 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"live_ok={live_ok}\n")
           PY
+
+      - name: "Guard: LIVE env precheck"
+        if: env.EFFECTIVE_STRATEGY_MODE == 'LIVE'
+        run: |
+          set -euo pipefail
+          violations=()
+          [ "${DB_ONLY:-}" = "1" ] && violations+=("DB_ONLY=1")
+          [ "${NONTRADING_SMOKE:-}" = "1" ] && violations+=("NONTRADING_SMOKE=1")
+          [ "${DRY_RUN:-}" = "1" ] && violations+=("DRY_RUN=1")
+          [ "${LIVE_TRADING_ENABLED:-}" != "1" ] && violations+=("LIVE_TRADING_ENABLED != '1'")
+          [ "${DISABLE_LIVE_TRADING:-}" = "1" ] && violations+=("DISABLE_LIVE_TRADING=1")
+          if [ ${#violations[@]} -gt 0 ]; then
+            echo "::error::LIVE env violations: ${violations[*]}"
+            exit 1
+          fi
+          echo "[PRECHECK] LIVE env ok"
+
+      - name: Precheck import (fail fast)
+        run: |
+          set -euo pipefail
+          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: DB universe precheck
+        run: |
+          set -euo pipefail
+          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
+
+      - name: Ensure watchlist (auto build if empty)
+        env:
+          PB1_WATCHLIST_AUTOBUILD: "1"
+        run: |
+          set -euo pipefail
+          echo "[WATCHLIST] Auto-build enabled: PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
+          echo "[WATCHLIST] Will auto-create today's watchlist if missing"
 
       - name: DB universe precheck
         run: |
@@ -357,7 +356,7 @@ jobs:
 
   close_cancel:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' && github.event.schedule == '29 6 * * 1-5'
+    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
 
     env:

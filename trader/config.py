@@ -469,6 +469,27 @@ logger.info(
     DIAG_ENABLED,
 )
 
+
+# ====================================================================
+# [NEW] DIAG 모드 판정 헬퍼 (재사용 가능)
+# ====================================================================
+def is_diag_mode() -> bool:
+    """
+    DIAG 모드 여부를 반환.
+    
+    STRATEGY_MODE가 "DIAG" 또는 "INTENT_ONLY"이거나,
+    DIAGNOSTIC_MODE 또는 DIAGNOSTIC_ONLY가 True이면 True 반환.
+    
+    이 함수는 KIS HTTP 호출 차단 로직에서 사용됨.
+    LIVE 모드가 아닌 모든 경우를 DIAG로 간주한다.
+    """
+    return (
+        STRATEGY_MODE in ("DIAG", "INTENT_ONLY") 
+        or DIAGNOSTIC_MODE 
+        or DIAGNOSTIC_ONLY
+    )
+
+
 FORCE_NONTRADING_UNIVERSE_SMOKE = _cfg_bool("FORCE_NONTRADING_UNIVERSE_SMOKE")
 NONTRADING_SMOKE_FORCE = _cfg_bool("NONTRADING_SMOKE_FORCE") or FORCE_NONTRADING_UNIVERSE_SMOKE
 NONTRADING_SMOKE_DB_STORE = _cfg_bool("NONTRADING_SMOKE_DB_STORE")
