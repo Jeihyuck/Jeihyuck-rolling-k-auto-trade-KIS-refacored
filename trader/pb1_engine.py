@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -1379,278 +1380,317 @@ class PB1Engine:
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
-        # Limit OHLCV queries to holdings + top candidates from previous run
-        holdings_codes = set(str(row.get("pdno") or "").zfill(6) for row in self._holdings_summary.get("output1", []))
-        top_candidates_path = runtime_path("top_candidates.json")
-        prev_top_codes = set()
-        if top_candidates_path.exists():
-            try:
-                with open(top_candidates_path) as f:
-                    prev_top_candidates = json.load(f)
-                prev_top_codes = set(c.get("code") for c in prev_top_candidates if c.get("code"))
-            except Exception:
-                logger.warning("[PB1][TOP_CANDIDATES][LOAD_FAIL] %s", top_candidates_path)
-        relevant_codes = holdings_codes | prev_top_codes
-        if relevant_codes:
-            members = [m for m in members if str(m.get("code") or "").zfill(6) in relevant_codes]
-            logger.info("[PB1][CANDIDATES][LIMITED] holdings=%s prev_top=%s total_members=%s", len(holdings_codes), len(prev_top_codes), len(members))
-        else:
-            logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
-
+        # ✅ 타이머 및 시간 예산 설정
+        t0 = time.monotonic()
+        t_minervini_enter = time.monotonic()
+        deadline = t0 + 540.0  # 900초 중 60% = 540초 예산
+        reason = "OK"
         candidates: List[CandidateFeature] = []
-        # 최소 캔들 수 조건 완화: 120일 또는 200일 데이터만으로도 후보 선정 가능
-        required_candles = self.min_candles
-        bench_df, _ = self._fetch_daily(RS_BENCHMARK)
-        bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
+        members_list = list(members)  # Iterable → list 변환
+        universe_count = len(members_list)
         
-        # [MINERVINI] 벤치마크 데이터 부족 감지
-        debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
-        degraded_ok = os.getenv("MINERVINI_DEGRADED_OK", "0") == "1"
-        min_bench_required = max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS)
-        
-        bench_insufficient = len(bench_df) < min_bench_required
-        if bench_insufficient:
-            logger.warning(
-                "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s pass_through=%s",
-                len(bench_df),
-                min_bench_required,
-                degraded_ok,
-            )
-            if not degraded_ok:
-                # STRICT 모드: 벤치마크 데이터 부족 시 후보 비우기
-                logger.error(
-                    "[MINERVINI][STRICT] benchmark data insufficient -> clear candidates (set MINERVINI_DEGRADED_OK=1 to allow)"
-                )
-                # 빈 후보 리스트 반환
-                for cf in candidates:
-                    cf.setup_ok = False
-                    cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
-                return candidates
-        
-        rs_prices: dict[str, pd.Series] = {}
-        for m in members:
-            code = str(m.get("code") or "").zfill(6)
-            market = m.get("market") or ""
-            try:
-                df, meta = self._fetch_daily(code)
-                if df.empty:
-                    reasons = ["data_empty"]
-                    cf = CandidateFeature(
-                        code=code,
-                        market=market,
-                        features={"reasons": reasons, "data_ok": False},
-                        setup_ok=False,
-                        reasons=reasons,
-                        mode=1,
-                        mode_reasons=["default_day_mode"],
-                    )
-                    candidates.append(cf)
-                    continue
-                if len(df) < required_candles:
-                    reasons = ["insufficient_candles"]
-                    cf = CandidateFeature(
-                        code=code,
-                        market=market,
-                        features={"reasons": reasons, "count": len(df), "data_ok": False},
-                        setup_ok=False,
-                        reasons=reasons,
-                        mode=1,
-                        mode_reasons=["default_day_mode"],
-                    )
-                    candidates.append(cf)
-                    continue
+        try:
+            # Limit OHLCV queries to holdings + top candidates from previous run
+            holdings_codes = set(str(row.get("pdno") or "").zfill(6) for row in self._holdings_summary.get("output1", []))
+            top_candidates_path = runtime_path("top_candidates.json")
+            prev_top_codes = set()
+            if top_candidates_path.exists():
                 try:
-                    features = compute_features(df)
-                except ValueError:
-                    reasons = ["insufficient_candles"]
+                    with open(top_candidates_path) as f:
+                        prev_top_candidates = json.load(f)
+                    prev_top_codes = set(c.get("code") for c in prev_top_candidates if c.get("code"))
+                except Exception:
+                    logger.warning("[PB1][TOP_CANDIDATES][LOAD_FAIL] %s", top_candidates_path)
+            relevant_codes = holdings_codes | prev_top_codes
+            if relevant_codes:
+                members_list = [m for m in members_list if str(m.get("code") or "").zfill(6) in relevant_codes]
+                logger.info("[PB1][CANDIDATES][LIMITED] holdings=%s prev_top=%s total_members=%s", len(holdings_codes), len(prev_top_codes), len(members_list))
+            else:
+                logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
+            
+            # 최소 캔들 수 조건 완화: 120일 또는 200일 데이터만으로도 후보 선정 가능
+            required_candles = self.min_candles
+            bench_df, _ = self._fetch_daily(RS_BENCHMARK)
+            bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
+            
+            # [MINERVINI] 벤치마크 데이터 부족 감지
+            debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+            degraded_ok = os.getenv("MINERVINI_DEGRADED_OK", "0") == "1"
+            min_bench_required = max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS)
+        
+            bench_insufficient = len(bench_df) < min_bench_required
+            if bench_insufficient:
+                logger.warning(
+                    "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s pass_through=%s",
+                    len(bench_df),
+                    min_bench_required,
+                    degraded_ok,
+                )
+                if not degraded_ok:
+                    # STRICT 모드: 벤치마크 데이터 부족 시 후보 비우기
+                    logger.error(
+                        "[MINERVINI][STRICT] benchmark data insufficient -> clear candidates (set MINERVINI_DEGRADED_OK=1 to allow)"
+                    )
+                    # 빈 후보 리스트 반환
+                    for cf in candidates:
+                        cf.setup_ok = False
+                        cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
+                    return candidates
+            
+            rs_prices: dict[str, pd.Series] = {}
+            checked_count = 0
+            for m in members_list:
+                # ✅ 시간 예산 체크 (10개마다)
+                checked_count += 1
+                if checked_count % 10 == 0 and time.monotonic() > deadline:
+                    reason = "TIME_BUDGET_EXCEEDED"
+                    logger.warning(
+                        "[ENTRY][CANDIDATES][TIMEOUT] checked=%s/%s elapsed=%.1fs deadline_exceeded=True",
+                        checked_count, universe_count, time.monotonic() - t0
+                    )
+                    break
+                
+                code = str(m.get("code") or "").zfill(6)
+                market = m.get("market") or ""
+                try:
+                    df, meta = self._fetch_daily(code)
+                    if df.empty:
+                        reasons = ["data_empty"]
+                        cf = CandidateFeature(
+                            code=code,
+                            market=market,
+                            features={"reasons": reasons, "data_ok": False},
+                            setup_ok=False,
+                            reasons=reasons,
+                            mode=1,
+                            mode_reasons=["default_day_mode"],
+                        )
+                        candidates.append(cf)
+                        continue
+                    if len(df) < required_candles:
+                        reasons = ["insufficient_candles"]
+                        cf = CandidateFeature(
+                            code=code,
+                            market=market,
+                            features={"reasons": reasons, "count": len(df), "data_ok": False},
+                            setup_ok=False,
+                            reasons=reasons,
+                            mode=1,
+                            mode_reasons=["default_day_mode"],
+                        )
+                        candidates.append(cf)
+                        continue
+                    try:
+                        features = compute_features(df)
+                    except ValueError:
+                        reasons = ["insufficient_candles"]
+                        cf = CandidateFeature(
+                            code=code,
+                            market=market,
+                            features={"reasons": reasons, "count": len(df), "data_ok": False},
+                            setup_ok=False,
+                            reasons=reasons,
+                            mode=1,
+                            mode_reasons=["default_day_mode"],
+                        )
+                        candidates.append(cf)
+                        continue
+                    close_val = features.get("close")
+                    ma200_val = features.get("ma200")
+                    scale_ratio = None
+                    if close_val and ma200_val and np.isfinite(close_val) and np.isfinite(ma200_val) and ma200_val != 0:
+                        scale_ratio = float(close_val) / float(ma200_val)
+                    if scale_ratio is not None and (scale_ratio > 3.5 or scale_ratio < 0.3):
+                        reasons = ["price_scale_outlier"]
+                        cf = CandidateFeature(
+                            code=code,
+                            market=market,
+                            features={
+                                "reasons": reasons,
+                                "data_ok": False,
+                                "scale_ratio": scale_ratio,
+                                "close": close_val,
+                                "ma200": ma200_val,
+                            },
+                            setup_ok=False,
+                            reasons=reasons,
+                            mode=1,
+                            mode_reasons=["default_day_mode"],
+                        )
+                        candidates.append(cf)
+                        continue
+                    gap_pct = None
+                    if len(df) >= 2:
+                        prev_close = float(df["close"].iloc[-2])
+                        open_price = float(df["open"].iloc[-1])
+                        if prev_close > 0:
+                            gap_pct = (open_price - prev_close) / prev_close * 100.0
+                    spread_pct = None
+                    range_pct = None
+                    if len(df) >= 1:
+                        spread_proxy = (df["high"] - df["low"]) / df["close"].replace(0, np.nan) * 100.0
+                        spread_pct = float(spread_proxy.tail(20).mean()) if len(spread_proxy) else None
+                        range_proxy = (df["high"] - df["low"]) / df["close"] * 100.0
+                        range_pct = float(range_proxy.tail(20).mean()) if len(range_proxy) else None
+                    vcp_score = score_vcp(
+                        df,
+                        VCP_LOOKBACK,
+                        VolContractRules(),
+                        PriceTightRules(),
+                    )
+                    pivot_info = find_pivot(df)
+                    pivot = pivot_info.get("pivot_price")
+                    vcp_info = detect_vcp(df, self.minervini_config)
+                    features["market"] = market
+                    features["volume_missing"] = bool(meta.get("volume_missing"))
+                    features["data_ok"] = True
+                    features["vcp_ok"] = bool(vcp_info.get("vcp_ok") or is_vcp_ready(vcp_score, VCP_MIN_SCORE))
+                    features["vcp_score"] = float(vcp_score)
+                    features["vcp_contractions"] = vcp_info.get("contractions")
+                    pivot_val = float(pivot) if pivot and np.isfinite(pivot) else float("nan")
+                    features["pivot"] = pivot_val
+                    features["pivot_scan"] = pivot_val
+                    features["pivot_age"] = pivot_info.get("pivot_date")
+                    features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
+                    features["tight_low"] = pivot_info.get("tight_low")
+                    features["base_high"] = pivot_info.get("base_high")
+                    features["gap_pct"] = gap_pct
+                    features["spread_pct"] = spread_pct
+                    features["range_pct"] = range_pct
+                    features["liq_ok"] = liquidity_filter(df, MIN_AVG_VALUE_KRW)
+                    features["gap_ok"] = gap_filter(df, MAX_GAP_UP_PCT)
+                    features["spread_ok"] = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
+                    features["range_ok"] = range_filter(df, MAX_INTRADAY_RANGE_PCT)
                     cf = CandidateFeature(
                         code=code,
                         market=market,
-                        features={"reasons": reasons, "count": len(df), "data_ok": False},
+                        features=features,
                         setup_ok=False,
-                        reasons=reasons,
+                        reasons=[],
                         mode=1,
-                        mode_reasons=["default_day_mode"],
+                        mode_reasons=["minervini_default"],
                     )
                     candidates.append(cf)
+                    rs_prices[code] = df["close"].reset_index(drop=True)
+                except Exception:
+                    logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
                     continue
-                close_val = features.get("close")
-                ma200_val = features.get("ma200")
-                scale_ratio = None
-                if close_val and ma200_val and np.isfinite(close_val) and np.isfinite(ma200_val) and ma200_val != 0:
-                    scale_ratio = float(close_val) / float(ma200_val)
-                if scale_ratio is not None and (scale_ratio > 3.5 or scale_ratio < 0.3):
-                    reasons = ["price_scale_outlier"]
-                    cf = CandidateFeature(
-                        code=code,
-                        market=market,
-                        features={
-                            "reasons": reasons,
-                            "data_ok": False,
-                            "scale_ratio": scale_ratio,
-                            "close": close_val,
-                            "ma200": ma200_val,
-                        },
-                        setup_ok=False,
-                        reasons=reasons,
-                        mode=1,
-                        mode_reasons=["default_day_mode"],
-                    )
-                    candidates.append(cf)
-                    continue
-                gap_pct = None
-                if len(df) >= 2:
-                    prev_close = float(df["close"].iloc[-2])
-                    open_price = float(df["open"].iloc[-1])
-                    if prev_close > 0:
-                        gap_pct = (open_price - prev_close) / prev_close * 100.0
-                spread_pct = None
-                range_pct = None
-                if len(df) >= 1:
-                    spread_proxy = (df["high"] - df["low"]) / df["close"].replace(0, np.nan) * 100.0
-                    spread_pct = float(spread_proxy.tail(20).mean()) if len(spread_proxy) else None
-                    range_proxy = (df["high"] - df["low"]) / df["close"] * 100.0
-                    range_pct = float(range_proxy.tail(20).mean()) if len(range_proxy) else None
-                vcp_score = score_vcp(
-                    df,
-                    VCP_LOOKBACK,
-                    VolContractRules(),
-                    PriceTightRules(),
-                )
-                pivot_info = find_pivot(df)
-                pivot = pivot_info.get("pivot_price")
-                vcp_info = detect_vcp(df, self.minervini_config)
-                features["market"] = market
-                features["volume_missing"] = bool(meta.get("volume_missing"))
-                features["data_ok"] = True
-                features["vcp_ok"] = bool(vcp_info.get("vcp_ok") or is_vcp_ready(vcp_score, VCP_MIN_SCORE))
-                features["vcp_score"] = float(vcp_score)
-                features["vcp_contractions"] = vcp_info.get("contractions")
-                pivot_val = float(pivot) if pivot and np.isfinite(pivot) else float("nan")
-                features["pivot"] = pivot_val
-                features["pivot_scan"] = pivot_val
-                features["pivot_age"] = pivot_info.get("pivot_date")
-                features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
-                features["tight_low"] = pivot_info.get("tight_low")
-                features["base_high"] = pivot_info.get("base_high")
-                features["gap_pct"] = gap_pct
-                features["spread_pct"] = spread_pct
-                features["range_pct"] = range_pct
-                features["liq_ok"] = liquidity_filter(df, MIN_AVG_VALUE_KRW)
-                features["gap_ok"] = gap_filter(df, MAX_GAP_UP_PCT)
-                features["spread_ok"] = spread_proxy_filter(df, MAX_SPREAD_PROXY_BPS)
-                features["range_ok"] = range_filter(df, MAX_INTRADAY_RANGE_PCT)
-                cf = CandidateFeature(
-                    code=code,
-                    market=market,
-                    features=features,
-                    setup_ok=False,
-                    reasons=[],
-                    mode=1,
-                    mode_reasons=["minervini_default"],
-                )
-                candidates.append(cf)
-                rs_prices[code] = df["close"].reset_index(drop=True)
-            except Exception:
-                logger.exception("[PB1][DAILY] fetch/normalize failed code=%s", code)
-                continue
-        if not candidates:
+            
+            if not candidates:
+                reason = "NO_CANDIDATES_AFTER_OHLCV"
+                return candidates
+            
+            rs_rank = rank_rs(
+                rs_prices,
+                bench_close,
+                lookback_days=RS_LOOKBACK_DAYS,
+                lookback2_days=RS_LOOKBACK2_DAYS,
+                w1=RS_COMPOSITE_W1,
+                w2=RS_COMPOSITE_W2,
+            )
+            rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
+            
+            # [MINERVINI] RS/VCP 필터 적용 전 카운트
+            before_minervini = len([cf for cf in candidates if cf.features.get("data_ok")])
+            debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+            
+            rs_fail_count = 0
+            vcp_fail_count = 0
+            
+            for i, cf in enumerate(candidates):
+                rs_row = rs_map.get(cf.code, {})
+                rs_p = float(rs_row.get("pctile") or 0.0)
+                cf.features["rs_percentile"] = rs_p
+                cf.features["rs_pctile"] = rs_p * 100.0
+                cf.features["rs_comp"] = rs_row.get("composite")
+                vcp_info = {
+                    "score": cf.features.get("vcp_score"),
+                    "vcp_ok": cf.features.get("vcp_ok"),
+                    "contractions": cf.features.get("vcp_contractions"),
+                }
+                
+                # RS/VCP 필터 체크
+                if cf.features.get("data_ok"):
+                    if rs_p < self.minervini_config.rs_min_percentile:
+                        rs_fail_count += 1
+                    if not cf.features.get("vcp_ok"):
+                        vcp_fail_count += 1
+                
+                cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
+                cf.features["score"] = cf.score
+            
+            # [MINERVINI] 필터링 후 통과 종목 수
+            after_rs = before_minervini - rs_fail_count
+            after_vcp = before_minervini - vcp_fail_count
+            both_pass = len([cf for cf in candidates if cf.features.get("data_ok") and 
+                             cf.features.get("rs_percentile", 0) >= self.minervini_config.rs_min_percentile and
+                             cf.features.get("vcp_ok")])
+            
+            sample_codes = [cf.code for cf in sorted(candidates, key=lambda x: x.score or 0, reverse=True)[:5]]
+            
+            skipped_count = len([cf for cf in candidates if not cf.features.get("data_ok")])
+            degraded_count = 1 if bench_insufficient and degraded_ok else 0
+            
+            dt_minervini_total = time.monotonic() - t_minervini_enter
+        
+            logger.info(
+                "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
+                before_minervini,
+                self.minervini_config.rs_min_percentile * 100,
+                VCP_LOOKBACK,
+                RS_LOOKBACK_DAYS,
+                RS_LOOKBACK2_DAYS,
+            )
+            logger.info(
+                "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s skipped=%s degraded=%s sample=%s",
+                before_minervini,
+                after_rs,
+                rs_fail_count,
+                after_vcp,
+                vcp_fail_count,
+                both_pass,
+                skipped_count,
+                degraded_count,
+                sample_codes,
+            )
+            logger.info(
+                "[MINERVINI][EXIT] passed=%s failed=%s dt=%.2f",
+                both_pass,
+                before_minervini - both_pass,
+                dt_minervini_total,
+            )
+            
+            if debug_mode:
+                # 샘플 종목 상세 정보
+                for code in sample_codes[:3]:
+                    cf = next((c for c in candidates if c.code == code), None)
+                    if cf and cf.features.get("data_ok"):
+                        logger.info(
+                            "[MINERVINI][SAMPLE] code=%s rs_pct=%.1f vcp_ok=%s vcp_score=%.1f score=%.1f",
+                            code,
+                            cf.features.get("rs_pctile", 0),
+                            cf.features.get("vcp_ok"),
+                            cf.features.get("vcp_score", 0),
+                            cf.score or 0,
+                        )
             return candidates
-        rs_rank = rank_rs(
-            rs_prices,
-            bench_close,
-            lookback_days=RS_LOOKBACK_DAYS,
-            lookback2_days=RS_LOOKBACK2_DAYS,
-            w1=RS_COMPOSITE_W1,
-            w2=RS_COMPOSITE_W2,
-        )
-        rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
         
-        # [MINERVINI] RS/VCP 필터 적용 전 카운트
-        before_minervini = len([cf for cf in candidates if cf.features.get("data_ok")])
-        debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+        except Exception as exc:
+            reason = f"EXCEPTION:{type(exc).__name__}"
+            logger.exception("[ENTRY][PIPE][ERROR] exception in _compute_candidates: %s", exc)
+            return candidates
         
-        rs_fail_count = 0
-        vcp_fail_count = 0
-        
-        for i, cf in enumerate(candidates):
-            rs_row = rs_map.get(cf.code, {})
-            rs_p = float(rs_row.get("pctile") or 0.0)
-            cf.features["rs_percentile"] = rs_p
-            cf.features["rs_pctile"] = rs_p * 100.0
-            cf.features["rs_comp"] = rs_row.get("composite")
-            vcp_info = {
-                "score": cf.features.get("vcp_score"),
-                "vcp_ok": cf.features.get("vcp_ok"),
-                "contractions": cf.features.get("vcp_contractions"),
-            }
-            
-            # RS/VCP 필터 체크
-            if cf.features.get("data_ok"):
-                if rs_p < self.minervini_config.rs_min_percentile:
-                    rs_fail_count += 1
-                if not cf.features.get("vcp_ok"):
-                    vcp_fail_count += 1
-            
-            cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
-            cf.features["score"] = cf.score
-        
-        # [MINERVINI] 필터링 후 통과 종목 수
-        after_rs = before_minervini - rs_fail_count
-        after_vcp = before_minervini - vcp_fail_count
-        both_pass = len([cf for cf in candidates if cf.features.get("data_ok") and 
-                         cf.features.get("rs_percentile", 0) >= self.minervini_config.rs_min_percentile and
-                         cf.features.get("vcp_ok")])
-        
-        sample_codes = [cf.code for cf in sorted(candidates, key=lambda x: x.score or 0, reverse=True)[:5]]
-        
-        skipped_count = len([cf for cf in candidates if not cf.features.get("data_ok")])
-        degraded_count = 1 if bench_insufficient and degraded_ok else 0
-        
-        dt_minervini_total = time_module.monotonic() - t_minervini_enter
-        
-        logger.info(
-            "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
-            before_minervini,
-            self.minervini_config.rs_min_percentile * 100,
-            VCP_LOOKBACK,
-            RS_LOOKBACK_DAYS,
-            RS_LOOKBACK2_DAYS,
-        )
-        logger.info(
-            "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s skipped=%s degraded=%s sample=%s",
-            before_minervini,
-            after_rs,
-            rs_fail_count,
-            after_vcp,
-            vcp_fail_count,
-            both_pass,
-            skipped_count,
-            degraded_count,
-            sample_codes,
-        )
-        logger.info(
-            "[MINERVINI][EXIT] passed=%s failed=%s dt=%.2f",
-            both_pass,
-            before_minervini - both_pass,
-            dt_minervini_total,
-        )
-        
-        if debug_mode:
-            # 샘플 종목 상세 정보
-            for code in sample_codes[:3]:
-                cf = next((c for c in candidates if c.code == code), None)
-                if cf and cf.features.get("data_ok"):
-                    logger.info(
-                        "[MINERVINI][SAMPLE] code=%s rs_pct=%.1f vcp_ok=%s vcp_score=%.1f score=%.1f",
-                        code,
-                        cf.features.get("rs_pctile", 0),
-                        cf.features.get("vcp_ok"),
-                        cf.features.get("vcp_score", 0),
-                        cf.score or 0,
-                    )
-        
-        return candidates
+        finally:
+            # ✅ 무조건 요약 로그 출력 (성공/실패 모두)
+            total_dt = time.monotonic() - t0
+            candidates_count = len(candidates)
+            logger.info(
+                "[ENTRY][PIPE][END] trace=compute_candidates total_dt=%.2fs reason=%s universe=%s candidates=%s",
+                total_dt,
+                reason,
+                universe_count,
+                candidates_count,
+            )
 
     @staticmethod
     def _clone_candidate(cf: CandidateFeature) -> CandidateFeature:
@@ -4256,26 +4296,27 @@ class PB1Engine:
         entry_pass_skipped = 0
         
         # 계측 변수 초기화
-        import time as time_module
-        trace_id = f"{self.run_id or 'NORUN'}:{self._today}:{int(time_module.time() * 1000) % 100000}"
-        t0_entry = time_module.monotonic()
+        trace_id = f"{self.run_id or 'NORUN'}:{self._today}:{int(time.time() * 1000) % 100000}"
+        t0_entry = time.monotonic()
         dt_minervini = 0.0
         dt_pb1_filter = 0.0
         dt_rank_pick = 0.0
         dt_order_build = 0.0
         dt_order_submit = 0.0
         
+        # ✅ members를 먼저 로드하여 정확한 universe 카운트
+        members = self._load_universe()
+        
         logger.info(
             "[ENTRY][PIPE][START] trace=%s universe=%s slots=%s tick_budget=%.0f entry_allowed=%s",
             trace_id,
-            len(members) if 'members' in locals() else 0,
+            len(members),
             slots_remaining,
             tick_budget_krw,
             entry_allowed,
         )
         logger.info("[PASS][ENTRY][START] phase=%s entry_allowed=%s slots_remaining=%s", self.phase, entry_allowed, slots_remaining)
         
-        members = self._load_universe()
         emit_event(
             as_of=self._today,
             event="PB1_UNIVERSE_STATUS",
@@ -4332,12 +4373,12 @@ class PB1Engine:
         minervini_report_path: str | None = None
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             # Minervini 적용 전 시간 기록
-            t_minervini_start = time_module.monotonic()
+            t_minervini_start = time.monotonic()
             
             candidates = self._compute_candidates(members)
             
             # Minervini 적용 시간 기록 (_compute_candidates 내부에서 Minervini 수행)
-            dt_minervini = time_module.monotonic() - t_minervini_start
+            dt_minervini = time.monotonic() - t_minervini_start
             
             # [ENTRY][CANDIDATES] 초기 카운트
             data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
@@ -4350,7 +4391,7 @@ class PB1Engine:
             )
             
             # PB1 필터 시간 기록
-            t_pb1_start = time_module.monotonic()
+            t_pb1_start = time.monotonic()
             (
                 candidates,
                 selected_tier,
@@ -4361,7 +4402,7 @@ class PB1Engine:
                 applied_min_score,
                 applied_require_both,
             ) = self._select_candidates_with_fallback(candidates)
-            dt_pb1_filter = time_module.monotonic() - t_pb1_start
+            dt_pb1_filter = time.monotonic() - t_pb1_start
             
             logger.info(
                 "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
@@ -4912,7 +4953,7 @@ class PB1Engine:
                     )
                 
                 # [ORDER][BUILD] - 주문 생성 시작
-                t_order_build = time_module.monotonic()
+                t_order_build = time.monotonic()
                 order_symbols = [cf.code for cf in orderable_candidates]
                 logger.info(
                     "[ORDER][BUILD] trace=%s count=%s symbols=%s",
@@ -4920,10 +4961,10 @@ class PB1Engine:
                     len(orderable_candidates),
                     ",".join(order_symbols[:10]) + ("..." if len(order_symbols) > 10 else ""),
                 )
-                dt_order_build = time_module.monotonic() - t_order_build
+                dt_order_build = time.monotonic() - t_order_build
                 
                 # [ORDER][SUBMIT] - 주문 제출
-                t_order_submit = time_module.monotonic()
+                t_order_submit = time.monotonic()
                 submitted_count = 0
                 failed_count = 0
                 for cf in orderable_candidates:
@@ -4941,7 +4982,7 @@ class PB1Engine:
                             cf.code,
                             str(e),
                         )
-                dt_order_submit = time_module.monotonic() - t_order_submit
+                dt_order_submit = time.monotonic() - t_order_submit
                 
                 logger.info(
                     "[ORDER][SUBMIT] trace=%s submitted=%s failed=%s dt_build=%.2f dt_submit=%.2f",
@@ -5043,7 +5084,7 @@ class PB1Engine:
         
         # ENTRY PASS 종료 계측
         entry_pass_buys = len(orderable_candidates) if 'orderable_candidates' in locals() else 0
-        dt_total_entry = time_module.monotonic() - t0_entry
+        dt_total_entry = time.monotonic() - t0_entry
         
         logger.info(
             "[ENTRY][PIPE][END] trace=%s total_dt=%.2f minervini_dt=%.2f pb1_dt=%.2f rank_dt=%.2f build_dt=%.2f submit_dt=%.2f",
