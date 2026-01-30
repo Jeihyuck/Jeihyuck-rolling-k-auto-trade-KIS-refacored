@@ -1156,7 +1156,17 @@ class PB1Engine:
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
-        return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{side.upper()}"
+        """
+        Dedupe key with full separation between EXIT/ENTRY passes.
+        
+        Format: {env}:{strategy}:{date}:{code}:{ACTION}:{SIDE}:{stage}:{window}:{mode}
+        
+        Example EXIT: live:pb1_pullback_close:2026-01-30:323280:EXIT:SELL:TP1:day:1
+        Example ENTRY: live:pb1_pullback_close:2026-01-30:005930:ENTRY:BUY:PB1:day:1
+        """
+        # Determine action type from side and stage
+        action = "EXIT" if side.upper() == "SELL" else "ENTRY"
+        return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{action}:{side.upper()}:{stage}:{window_tag}:{mode}"
 
     def _name_for_code(self, code: str | None) -> str | None:
         if not code:
@@ -1395,15 +1405,27 @@ class PB1Engine:
         
         # [MINERVINI] 벤치마크 데이터 부족 감지
         debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+        degraded_ok = os.getenv("MINERVINI_DEGRADED_OK", "0") == "1"
         min_bench_required = max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS)
-        if len(bench_df) < min_bench_required:
+        
+        bench_insufficient = len(bench_df) < min_bench_required
+        if bench_insufficient:
             logger.warning(
-                "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s",
+                "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s pass_through=%s",
                 len(bench_df),
                 min_bench_required,
+                degraded_ok,
             )
-            if debug_mode:
-                logger.warning("[MINERVINI][DEGRADED] RS calculation may be unreliable due to insufficient benchmark data")
+            if not degraded_ok:
+                # STRICT 모드: 벤치마크 데이터 부족 시 후보 비우기
+                logger.error(
+                    "[MINERVINI][STRICT] benchmark data insufficient -> clear candidates (set MINERVINI_DEGRADED_OK=1 to allow)"
+                )
+                # 빈 후보 리스트 반환
+                for cf in candidates:
+                    cf.setup_ok = False
+                    cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
+                return candidates
         
         rs_prices: dict[str, pd.Series] = {}
         for m in members:
@@ -1582,6 +1604,9 @@ class PB1Engine:
         
         sample_codes = [cf.code for cf in sorted(candidates, key=lambda x: x.score or 0, reverse=True)[:5]]
         
+        skipped_count = len([cf for cf in candidates if not cf.features.get("data_ok")])
+        degraded_count = 1 if bench_insufficient and degraded_ok else 0
+        
         logger.info(
             "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
             before_minervini,
@@ -1591,13 +1616,15 @@ class PB1Engine:
             RS_LOOKBACK2_DAYS,
         )
         logger.info(
-            "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s sample=%s",
+            "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s skipped=%s degraded=%s sample=%s",
             before_minervini,
             after_rs,
             rs_fail_count,
             after_vcp,
             vcp_fail_count,
             both_pass,
+            skipped_count,
+            degraded_count,
             sample_codes,
         )
         
@@ -2545,9 +2572,12 @@ class PB1Engine:
         return False
 
     def _place_entry(self, cf: CandidateFeature) -> None:
+        # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
+        no_trade = os.getenv("NO_TRADE", "0") == "1"
+        
         display_code = self._display_code(cf.code)
         logger.info(
-            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f",
+            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
             ReasonCode.ENTRY_BREAKOUT,
@@ -2557,7 +2587,17 @@ class PB1Engine:
             float(RISK_PER_TRADE_PCT),
             cf.planned_qty,
             float(cf.features.get("planned_cap") or 0.0),
+            no_trade,
         )
+        
+        if no_trade:
+            logger.info(
+                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
+                display_code,
+                cf.planned_qty,
+            )
+            return
+        
         reasons = cf.reasons or []
         features_snapshot = {
             k: cf.features.get(k)
@@ -2999,9 +3039,15 @@ class PB1Engine:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _place_entry_close(self, cf: CandidateFeature) -> None:
+        # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
+        no_trade = os.getenv("NO_TRADE", "0") == "1"
+        
+        # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
+        no_trade = os.getenv("NO_TRADE", "0") == "1"
+        
         display_code = self._display_code(cf.code)
         logger.info(
-            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s",
+            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
             ReasonCode.ENTRY_BREAKOUT,
@@ -3009,7 +3055,26 @@ class PB1Engine:
             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
             float(cf.features.get("stop_price") or 0.0),
             cf.planned_qty,
+            no_trade,
         )
+        
+        if no_trade:
+            logger.info(
+                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
+                display_code,
+                cf.planned_qty,
+            )
+            return
+        
+        
+        if no_trade:
+            logger.info(
+                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
+                display_code,
+                cf.planned_qty,
+            )
+            return
+        
         cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
         ref_daily_close = cf.features.get("close")
         snap = self.kis.get_quote_snapshot(cf.code) if self.kis else {}
@@ -4131,7 +4196,20 @@ class PB1Engine:
         if not holdings and self.kis:
             logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
         marks_fallback: Dict[str, float] = {}
-        positions_for_exit = self._run_exit_always(positions=positions_for_exit, holdings_rows=holdings, marks_fallback=marks_fallback)
+        
+        # ========== EXIT PASS (완전 독립 실행) ==========
+        exit_pass_ok = True
+        exit_pass_sells = 0
+        exit_pass_skipped = 0
+        logger.info("[PASS][EXIT][START] phase=%s existing_positions=%s", self.phase, existing_positions_count)
+        try:
+            positions_for_exit = self._run_exit_always(positions=positions_for_exit, holdings_rows=holdings, marks_fallback=marks_fallback)
+            exit_pass_sells = len([p for p in positions_for_exit if float(p.get("qty", 0)) == 0])
+            logger.info("[PASS][EXIT][END] sells=%s skipped_dup=%s", exit_pass_sells, exit_pass_skipped)
+        except Exception as exit_exc:
+            exit_pass_ok = False
+            logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
+        
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
             return RunResult(
@@ -4164,6 +4242,12 @@ class PB1Engine:
                 balance_tick_cache_hits=self.balance_tick_cache_hits,
             )
 
+        # ========== ENTRY PASS (EXIT와 완전 독립) ==========
+        entry_pass_ok = True
+        entry_pass_buys = 0
+        entry_pass_skipped = 0
+        logger.info("[PASS][ENTRY][START] phase=%s entry_allowed=%s slots_remaining=%s", self.phase, entry_allowed, slots_remaining)
+        
         members = self._load_universe()
         emit_event(
             as_of=self._today,
@@ -4221,6 +4305,11 @@ class PB1Engine:
         minervini_report_path: str | None = None
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             candidates = self._compute_candidates(members)
+            
+            # [ENTRY][CANDIDATES] 초기 카운트
+            data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
+            logger.info("[ENTRY][CANDIDATES] start universe=%s data_ok=%s", len(members), data_ok_count)
+            
             (
                 candidates,
                 selected_tier,
@@ -4583,6 +4672,33 @@ class PB1Engine:
 
             after_buyable_check_count = len(orderable_candidates)
             after_dedup_count = len(orderable_candidates)
+            
+            # [ENTRY][NO_BUY] 후보가 0일 때 이유 출력
+            if not orderable_candidates:
+                no_buy_reason = "unknown"
+                if not candidates:
+                    no_buy_reason = "minervini_empty"
+                elif not setup_ok_codes:
+                    no_buy_reason = "pb1_conditions_empty"
+                elif data_ok_count == 0:
+                    no_buy_reason = "ohlcv_missing"
+                elif not entry_allowed:
+                    no_buy_reason = "entry_disabled"
+                elif available_cash_krw <= 0:
+                    no_buy_reason = "cash_insufficient"
+                elif after_risk_check_count == 0:
+                    no_buy_reason = "risk_filter"
+                elif drop_reason_counter:
+                    top_reason = drop_reason_counter.most_common(1)[0][0] if drop_reason_counter else "unknown"
+                    no_buy_reason = f"drop:{top_reason}"
+                logger.warning(
+                    "[ENTRY][NO_BUY] reason=%s candidates=%s setup_ok=%s after_risk=%s drop_top3=%s",
+                    no_buy_reason,
+                    len(candidates),
+                    len(setup_ok_codes),
+                    after_risk_check_count,
+                    drop_reason_counter.most_common(3),
+                )
 
             ok_count = len([c for c in candidates if c.setup_ok])
             logger.info(
@@ -4834,6 +4950,12 @@ class PB1Engine:
         self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
         final_notes = final_notes or self._universe_as_of or "ok"
         self._log_reason_summary(final_notes)
+        
+        # ENTRY PASS 종료
+        entry_pass_buys = len(orderable_candidates)
+        logger.info("[PASS][ENTRY][END] buys=%s skipped_dup=%s candidates=%s", 
+                   entry_pass_buys, entry_pass_skipped, len(candidates))
+        
         # [PATCH] 요약 로그 추가
         candidates_ok = len([c for c in self.top_candidates if c.get('priced', False)])
         priced_ok = len([c for c in self.top_candidates if c.get('ask') is not None and c.get('bid') is not None])
