@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,23 @@ MARKET_CLOSE = time(15, 20)
 def now_kst() -> datetime:
     """현재 KST 시각을 반환."""
     return datetime.now(tz=KST)
+
+
+def week_monday(d: date) -> date:
+    """
+    주어진 날짜가 속한 주의 월요일을 반환.
+    
+    Args:
+        d: KST 기준 날짜 (date 객체)
+    
+    Returns:
+        해당 주의 월요일 (date 객체)
+    
+    Examples:
+        >>> week_monday(date(2026, 1, 30))  # 목요일
+        date(2026, 1, 27)  # 월요일
+    """
+    return d - timedelta(days=d.weekday())
 
 
 def is_trading_weekday(ts: datetime) -> bool:

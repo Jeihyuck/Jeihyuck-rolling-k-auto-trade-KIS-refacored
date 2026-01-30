@@ -129,7 +129,7 @@ from trader.strategies.pb1_minervini_v2 import (
     score_setup,
     update_trailing_stop,
 )
-from trader.time_utils import now_kst
+from trader.time_utils import now_kst, week_monday
 from trader.core_utils import _round_to_tick
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -3998,14 +3998,24 @@ class PB1Engine:
         return members
 
     def _load_today_watchlist_members(self) -> tuple[list[dict], str]:
-        """오늘 watchlist를 로드하고, 없으면 fallback 전략 적용."""
+        """
+        주간 워치리스트를 로드하고, 없으면 fallback 전략 적용.
+        
+        ✅ 설계 1: 오늘(today)이 아니라 이번 주 월요일(week_monday) 키로 로드
+        ✅ STRICT 기본값 0으로 변경 (절대 엔진 종료하지 않음)
+        ✅ fallback 로직 강화: 유니버스 전체 사용
+        """
         watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
-        watchlist_strict = os.getenv("PB1_WATCHLIST_STRICT", "0") == "1"
+        watchlist_strict = os.getenv("PB1_WATCHLIST_STRICT", "0") == "1"  # ✅ 기본값 0
         
         if not watchlist_enabled:
             logger.info("[PB1][WATCHLIST] disabled -> use full universe")
             members = self._load_universe()
             return members, "universe_full"
+        
+        # ✅ 설계 1: 이번 주 월요일 키 계산
+        today = self._today
+        as_of = week_monday(today)  # ✅ 주간 키로 변경
         
         # 전체 유니버스 로드 (watchlist 생성/fallback에 필요)
         full_members = self._load_universe()
@@ -4016,32 +4026,34 @@ class PB1Engine:
                 engine=self.engine,
                 env=self.env,
                 strategy=self.strategy,
-                today=self._today,
+                today=as_of,  # ✅ 주간 키 전달
                 members=full_members,
                 ohlcv_provider=self._fetch_daily,
                 minervini_config=self.minervini_config,
             )
         except Exception as exc:
-            error_msg = f"[PB1][WATCHLIST][LOAD_FAIL] err={exc}"
-            logger.error(error_msg)
+            error_msg = f"[PB1][WATCHLIST][LOAD_FAIL] as_of={as_of} err={exc}"
+            logger.exception(error_msg)
             
-            # [NEW] E. STRICT 모드: watchlist 실패 시 프로세스 종료
+            # ✅ STRICT 모드: watchlist 실패 시 프로세스 종료
             if watchlist_strict:
                 logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on watchlist failure")
                 raise RuntimeError(f"Watchlist load failed in strict mode: {exc}") from exc
             
-            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe")
-            return full_members, "universe_fallback"
+            # ✅ 절대 죽지 않음: fallback to full universe
+            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe on exception")
+            return full_members, "universe_fallback_on_error"
         
         if not watchlist:
-            warning_msg = "[PB1][WATCHLIST] empty watchlist"
+            warning_msg = f"[PB1][WATCHLIST] empty watchlist as_of={as_of}"
             logger.warning(warning_msg)
             
             if watchlist_strict:
                 logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on empty watchlist")
                 raise RuntimeError("Watchlist is empty in strict mode")
             
-            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe")
+            # ✅ 절대 죽지 않음: fallback to full universe
+            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe on empty")
             return full_members, "universe_fallback_empty"
         
         # Watchlist를 members 형식으로 변환
@@ -4056,8 +4068,8 @@ class PB1Engine:
         ]
         
         logger.info(
-            "[PB1][WATCHLIST] size=%s source=%s as_of=%s strict=%s",
-            len(members), source, self._today, watchlist_strict
+            "[PB1][WATCHLIST] size=%s source=%s as_of=%s (today=%s) strict=%s",
+            len(members), source, as_of, today, watchlist_strict
         )
         return members, source
 
@@ -5027,6 +5039,18 @@ class PB1Engine:
                 selected_thresholds.pullback_min,
                 selected_thresholds.pullback_max,
             )
+            
+            # ✅ 설계 1: 매매 없는 이유를 명확히 로깅
+            logger.info(
+                "[ENTRY][SUMMARY] scanned=%s score_pass=%s trigger_hit=%s blocked=%s final_orders=%s reasons_top=%s",
+                len(candidates),
+                len(setup_ok_codes),
+                after_buyable_check_count,
+                after_buyable_check_count - len(orderable_candidates),
+                len(orderable_candidates),
+                drop_reason_counter.most_common(10),
+            )
+            
             logger.info(
                 "[PB1][CANDIDATES][SNAPSHOT] setup_ok_count=%s setup_ok_sample=%s after_risk_check_count=%s after_buyable_check_count=%s after_dedup_count=%s drop_reasons_topN=%s drop_examples=%s",
                 len(setup_ok_codes),

@@ -18,7 +18,7 @@ from trader.config import (
     RS_MIN_PCTILE,
 )
 from trader.db.repos import WatchlistRepo
-from trader.time_utils import now_kst
+from trader.time_utils import now_kst, week_monday
 from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)

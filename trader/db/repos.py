@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
-from sqlalchemy import Engine, and_, func, or_, select
+from sqlalchemy import Engine, and_, func, or_, select, bindparam
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
@@ -2127,23 +2127,36 @@ class WatchlistRepo:
         """
         특정 날짜의 watchlist 조회.
         반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        
+        ✅ as_of는 DATE 타입으로 강제 (VARCHAR 캐스팅 방지)
         """
+        # ---- as_of 타입 강화 ----
+        if isinstance(as_of, str):
+            # 'YYYY-MM-DD' 문자열 허용
+            as_of = date.fromisoformat(as_of)
+        if not isinstance(as_of, date):
+            raise TypeError(f"as_of must be date, got {type(as_of)}")
+        
         as_of = to_date(as_of)  # Ensure DATE type
         
         schema = self._schema
+        
+        # ✅ bindparam으로 DATE 타입 명시적 강제
+        as_of_bp = bindparam("as_of", value=as_of, type_=sa.Date())
+        
         with self.engine.connect() as conn:
             stmt = (
                 select(schema.pb1_watchlist)
                 .where(
                     and_(
-                        schema.pb1_watchlist.c.env == env,
-                        schema.pb1_watchlist.c.strategy == strategy,
-                        schema.pb1_watchlist.c.as_of == as_of,
+                        schema.pb1_watchlist.c.env == bindparam("env", value=env),
+                        schema.pb1_watchlist.c.strategy == bindparam("strategy", value=strategy),
+                        schema.pb1_watchlist.c.as_of == as_of_bp,  # ✅ DATE bind
                     )
                 )
                 .order_by(schema.pb1_watchlist.c.rank)
             )
-            rows = conn.execute(stmt).fetchall()
+            rows = conn.execute(stmt, {"env": env, "strategy": strategy, "as_of": as_of}).fetchall()
         
         result = [
             {

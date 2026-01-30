@@ -75,9 +75,13 @@ from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
-from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode
 from trader.window_router import WindowDecision, decide_window
+from trader.watchlist_builder import build_and_save_watchlist
+from trader.db.repos import WatchlistRepo
+from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 
 logger = logging.getLogger(__name__)
 log = logger
@@ -87,6 +91,92 @@ BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
 BALANCE_STATE_UNKNOWN = "UNKNOWN"
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+
+
+def _run_build_watchlist_job() -> int:
+    """
+    ✅ 설계 1: 주 1회 워치리스트 빌드 JOB.
+    
+    - 유니버스 로드
+    - Minervini 필터 적용
+    - week_monday(today) 키로 DB에 저장
+    - 주문 없이 종료
+    """
+    logger.info("[WATCHLIST][BUILD_JOB] START")
+    
+    try:
+        from datetime import date
+        
+        # DB 준비
+        assert_db_ready()
+        engine = make_engine()
+        run_migrations(engine)
+        
+        # 환경변수
+        env = os.getenv("ENV", "live")
+        strategy = os.getenv("STRATEGY", "best_k_meta")
+        
+        # 주간 키 계산
+        today = now_kst().date()
+        as_of = week_monday(today)
+        
+        logger.info("[WATCHLIST][BUILD_JOB] env=%s strategy=%s as_of=%s (today=%s)", env, strategy, as_of, today)
+        
+        # 유니버스 로드
+        universe_repo = UniverseRepo(engine)
+        universe_snapshot = universe_repo.get_current_universe_snapshot(env, strategy)
+        
+        if not universe_snapshot or not universe_snapshot.get("members"):
+            logger.error("[WATCHLIST][BUILD_JOB][FAIL] universe empty")
+            return 1
+        
+        members = universe_snapshot["members"]
+        logger.info("[WATCHLIST][BUILD_JOB] universe loaded members=%s", len(members))
+        
+        # OHLCV provider 생성
+        kis = KisAPI()
+        krx_provider = KRXOHLCVProvider()
+        kis_provider = KISOHLCVProvider(kis)
+        ohlcv_provider = ChainOHLCVProvider([krx_provider, kis_provider])
+        
+        def _fetch_daily(code: str, count: int = 100):
+            """pb1_engine._fetch_daily 호환 래퍼"""
+            df = ohlcv_provider.fetch_daily(code, count=count)
+            return df, "chain"
+        
+        # Minervini config
+        minervini_config = MinerviniConfig()
+        minervini_config_dict = {
+            "rs_min": minervini_config.rs_min,
+            "breakout_vol_mult_20": minervini_config.breakout_vol_mult_20,
+            "heavy_vol_mult_10": minervini_config.heavy_vol_mult_10,
+            "add_on_R": minervini_config.add_on_R,
+            "max_pyramid_levels": minervini_config.max_pyramid_levels,
+            "initial_stop_pct": minervini_config.initial_stop_pct,
+            "time_stop_days": minervini_config.time_stop_days,
+            "risk_pct_of_equity": minervini_config.risk_pct_of_equity,
+            "add_on_size_frac": minervini_config.add_on_size_frac,
+            "add_on_max_extension": minervini_config.add_on_max_extension,
+        }
+        
+        # Watchlist 빌드 & 저장
+        watchlist = build_and_save_watchlist(
+            engine=engine,
+            env=env,
+            strategy=strategy,
+            as_of=as_of,  # ✅ 주간 키
+            members=members,
+            ohlcv_provider=_fetch_daily,
+            minervini_config=minervini_config_dict,
+            force_rebuild=True,
+        )
+        
+        logger.info("[WATCHLIST][BUILD_JOB] SUCCESS count=%s as_of=%s", len(watchlist), as_of)
+        return 0
+        
+    except Exception as exc:
+        logger.exception("[WATCHLIST][BUILD_JOB][FAIL] err=%s", exc)
+        return 1
 
 
 def _deepcopy_json(value):
@@ -1801,6 +1891,16 @@ def _exit_code_for_status(status: str) -> int:
 
 
 def main() -> int:
+    # ✅ 설계 1: JOB 모드 분리 (BUILD_WATCHLIST vs TRADE_INTRADAY)
+    job_mode = os.getenv("PB1_JOB", "TRADE_INTRADAY").upper()
+    
+    if job_mode == "BUILD_WATCHLIST":
+        logger.info("[PB1][JOB] mode=BUILD_WATCHLIST -> build weekly watchlist and exit")
+        return _run_build_watchlist_job()
+    
+    # else: TRADE_INTRADAY (기존 로직)
+    logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
+    
     args = parse_args()
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"

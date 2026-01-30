@@ -1,0 +1,71 @@
+name: PB1 Trade Intraday (5-minute intervals)
+
+on:
+  schedule:
+    # 5분마다 실행 (월-금)
+    - cron: "*/5 * * * 1-5"
+  workflow_dispatch:  # 수동 실행 허용
+
+jobs:
+  trade-intraday:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run intraday trading
+        run: |
+          set -euo pipefail
+          export PB1_JOB=TRADE_INTRADAY
+          export STRATEGY_MODE=LIVE
+          python -m trader.pb1_runner
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          KIS_ENV: ${{ secrets.KIS_ENV }}
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          ENV: ${{ secrets.KIS_ENV }}
+          STRATEGY: best_k_meta
+          
+          # 매매 활성화
+          LIVE_TRADING_ENABLED: "1"
+          DISABLE_LIVE_TRADING: "0"
+          
+          # Watchlist 설정 (주간 로드)
+          PB1_WATCHLIST_ENABLED: "1"
+          PB1_WATCHLIST_STRICT: "0"  # ✅ 실패해도 절대 죽지 않음
+          PB1_WATCHLIST_TOPK: "50"
+          PB1_WATCHLIST_FINALN: "25"
+          
+          # Entry 설정
+          PB1_ENTRY_ENABLED: "1"
+          PB1_MAX_POSITIONS: "5"
+          PB1_TARGET_NEW_POSITIONS: "2"
+          PB1_MIN_SCORE_BASE: "65"
+          PB1_REQUIRE_BOTH_CONTRACTIONS: "0"  # 초기엔 완화
+          
+          # 시간 제약 (내부에서 in_market으로 컷)
+          PB1_ENTRY_WINDOW_END: "15:00"
+          PB1_EXIT_WINDOW_END: "15:15"
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-intraday-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 3
