@@ -193,12 +193,23 @@ def compute_pivot(df: pd.DataFrame, cfg: MinerviniConfig) -> Tuple[float, dict]:
 
 
 def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[bool, list[str]]:
+    import logging
+    import os
+    logger = logging.getLogger(__name__)
+    debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+    
     c = feats.get("close")
     ma50, ma150, ma200 = feats.get("ma50"), feats.get("ma150"), feats.get("ma200")
     ma200_slope = feats.get("ma200_slope")
     dv50 = feats.get("dollar_vol_50")
     rs_percentile = feats.get("rs_percentile")
     vcp_ok = feats.get("vcp_ok")
+
+    if debug_mode:
+        logger.info(
+            "[MINERVINI][FILTER][ENTER] c=%.2f ma50=%.2f ma150=%.2f ma200=%.2f rs_pct=%.2f vcp_ok=%s rs_min=%.2f",
+            c or 0, ma50 or 0, ma150 or 0, ma200 or 0, (rs_percentile or 0) * 100, vcp_ok, cfg.rs_min_percentile * 100
+        )
 
     reasons: list[str] = []
 
@@ -216,6 +227,10 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
         reasons.append("vcp_fail")
 
     ok = len(reasons) == 0
+    
+    if debug_mode:
+        logger.info("[MINERVINI][FILTER][RESULT] ok=%s reasons=%s", ok, reasons)
+    
     return ok, reasons
 
 

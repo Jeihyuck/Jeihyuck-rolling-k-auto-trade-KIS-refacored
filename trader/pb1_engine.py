@@ -1392,6 +1392,19 @@ class PB1Engine:
         required_candles = self.min_candles
         bench_df, _ = self._fetch_daily(RS_BENCHMARK)
         bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
+        
+        # [MINERVINI] 벤치마크 데이터 부족 감지
+        debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+        min_bench_required = max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS)
+        if len(bench_df) < min_bench_required:
+            logger.warning(
+                "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s",
+                len(bench_df),
+                min_bench_required,
+            )
+            if debug_mode:
+                logger.warning("[MINERVINI][DEGRADED] RS calculation may be unreliable due to insufficient benchmark data")
+        
         rs_prices: dict[str, pd.Series] = {}
         for m in members:
             code = str(m.get("code") or "").zfill(6)
@@ -1530,6 +1543,14 @@ class PB1Engine:
             w2=RS_COMPOSITE_W2,
         )
         rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
+        
+        # [MINERVINI] RS/VCP 필터 적용 전 카운트
+        before_minervini = len([cf for cf in candidates if cf.features.get("data_ok")])
+        debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+        
+        rs_fail_count = 0
+        vcp_fail_count = 0
+        
         for i, cf in enumerate(candidates):
             rs_row = rs_map.get(cf.code, {})
             rs_p = float(rs_row.get("pctile") or 0.0)
@@ -1541,8 +1562,59 @@ class PB1Engine:
                 "vcp_ok": cf.features.get("vcp_ok"),
                 "contractions": cf.features.get("vcp_contractions"),
             }
+            
+            # RS/VCP 필터 체크
+            if cf.features.get("data_ok"):
+                if rs_p < self.minervini_config.rs_min_percentile:
+                    rs_fail_count += 1
+                if not cf.features.get("vcp_ok"):
+                    vcp_fail_count += 1
+            
             cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
             cf.features["score"] = cf.score
+        
+        # [MINERVINI] 필터링 후 통과 종목 수
+        after_rs = before_minervini - rs_fail_count
+        after_vcp = before_minervini - vcp_fail_count
+        both_pass = len([cf for cf in candidates if cf.features.get("data_ok") and 
+                         cf.features.get("rs_percentile", 0) >= self.minervini_config.rs_min_percentile and
+                         cf.features.get("vcp_ok")])
+        
+        sample_codes = [cf.code for cf in sorted(candidates, key=lambda x: x.score or 0, reverse=True)[:5]]
+        
+        logger.info(
+            "[MINERVINI][APPLY] universe=%s rs_min_pctile=%.0f vcp_lookback=%s lookback_days=%s/%s",
+            before_minervini,
+            self.minervini_config.rs_min_percentile * 100,
+            VCP_LOOKBACK,
+            RS_LOOKBACK_DAYS,
+            RS_LOOKBACK2_DAYS,
+        )
+        logger.info(
+            "[MINERVINI][RESULT] before=%s after_rs=%s dropped_rs=%s after_vcp=%s dropped_vcp=%s both_pass=%s sample=%s",
+            before_minervini,
+            after_rs,
+            rs_fail_count,
+            after_vcp,
+            vcp_fail_count,
+            both_pass,
+            sample_codes,
+        )
+        
+        if debug_mode:
+            # 샘플 종목 상세 정보
+            for code in sample_codes[:3]:
+                cf = next((c for c in candidates if c.code == code), None)
+                if cf and cf.features.get("data_ok"):
+                    logger.info(
+                        "[MINERVINI][SAMPLE] code=%s rs_pct=%.1f vcp_ok=%s vcp_score=%.1f score=%.1f",
+                        code,
+                        cf.features.get("rs_pctile", 0),
+                        cf.features.get("vcp_ok"),
+                        cf.features.get("vcp_score", 0),
+                        cf.score or 0,
+                    )
+        
         return candidates
 
     @staticmethod
@@ -1582,6 +1654,18 @@ class PB1Engine:
                 evaluated.append(clone)
                 continue
             ok, reasons = evaluate_filters(clone.features, cfg)
+            
+            # [MINERVINI] 필터 스킵/무력화 감지
+            debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+            if debug_mode and not ok:
+                logger.info(
+                    "[MINERVINI][FILTER_FAIL] code=%s reasons=%s rs_pct=%.1f vcp_ok=%s",
+                    clone.code,
+                    reasons,
+                    clone.features.get("rs_pctile", 0),
+                    clone.features.get("vcp_ok"),
+                )
+            
             hard_reasons: list[str] = []
             if not clone.features.get("liq_ok", True):
                 reasons.append("liquidity_fail")

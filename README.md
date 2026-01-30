@@ -48,6 +48,19 @@ Key log markers for grep:
 ## Strategy intent mode (single-account multi-strategy)
 - A new `StrategyManager` runs before engine loops and emits **order intents only** into `trader/state/strategy_intents.jsonl` with a cursor in `trader/state/strategy_intents_state.json`.
 - All five strategies (`breakout`~`volatility`) are present but **disabled by default**: `ENABLED_STRATEGIES=""` means no strategies run, and missing weights are treated as zero even when listed.
+
+## Debugging & Development
+
+### Minervini Filter Debug
+Minervini 필터가 실제로 매수 후보를 골라내는지 확인하려면:
+
+```bash
+export MINERVINI_DEBUG=1
+export NO_TRADE=1
+python -m trader.pb1_runner --env live --strategy best_k_meta --once --window morning --phase entry
+```
+
+자세한 내용은 [docs/MINERVINI_DEBUG.md](docs/MINERVINI_DEBUG.md)를 참고하세요.
 - Enable a subset for testing, e.g. `ENABLED_STRATEGIES="momentum"` with optional weights `STRATEGY_WEIGHTS="momentum=0.10"`. Keep `STRATEGY_MODE=INTENT_ONLY` and `STRATEGY_DRY_RUN=true` (defaults) to avoid any KIS orders.
 - PortfolioManager order: strategies → KOSPI → KOSDAQ. During isolated testing use `DISABLE_KOSPI_ENGINE=true` or `DISABLE_KOSDAQ_LOOP=true` to skip respective engines.
 - State sync scripts in `scripts/state_pull_plain.sh` and `scripts/state_push_plain.sh` now copy the intent log/cursor alongside `trader/state/state.json` for diagnostics.
