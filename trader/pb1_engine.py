@@ -6,7 +6,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
 
