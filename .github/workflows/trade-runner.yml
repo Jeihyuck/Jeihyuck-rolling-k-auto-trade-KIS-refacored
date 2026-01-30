@@ -57,8 +57,8 @@ on:
   schedule:
     # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
     - cron: "45 23 * * 0-4"
-    # KST 09:00~14:30  => UTC 00:00~05:30 (Mon~Fri UTC) - 30분 간격
-    - cron: "0,30 0-5 * * 1-5"
+    # KST 09:05 daily start => UTC 00:05 (Mon~Fri UTC)
+    - cron: "5 0 * * 1-5"
     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
     - cron: "29 6 * * 1-5"
 
@@ -201,13 +201,16 @@ jobs:
 
       # PB1 Watchlist configuration
       PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_TOPK: "50"
-      PB1_WATCHLIST_FINALN: "30"
+      PB1_WATCHLIST_AUTOBUILD: "1"  # [NEW] Auto-build watchlist if missing
+      PB1_WATCHLIST_TOPK: "20"  # Reduced for actual trading
+      PB1_WATCHLIST_FINALN: "10"  # Reduced for actual trading
       PB1_WATCHLIST_MIN_PRICE: "2000"
       PB1_WATCHLIST_LIQ_DAYS: "20"
       PB1_WATCHLIST_MIN_ROWS: "30"
       PB1_WATCHLIST_FORCE_REBUILD: "0"
-      PB1_WATCHLIST_STRICT: "1"  # [NEW] E. strict 모드 - watchlist 실패 시 프로세스 종료
+      PB1_WATCHLIST_STRICT: "0"  # [CHANGED] Allow fallback to universe if watchlist fails
+      PB1_MIN_CANDIDATES: "1"  # Allow at least 1 candidate for trading
+      PB1_TARGET_NEW_POSITIONS: "2"  # Limit new positions to prevent overbuying
 
       DB_DISABLE_PREPARED_STATEMENTS: "1"
 
@@ -273,6 +276,24 @@ jobs:
         run: |
           set -euo pipefail
           python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: DB universe precheck
+        run: |
+          set -euo pipefail
+          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE:-LIVE}"
+
+      - name: Ensure watchlist (auto build if empty)
+        env:
+          PB1_WATCHLIST_AUTOBUILD: "1"
+        run: |
+          set -euo pipefail
+          echo "[WATCHLIST] Auto-build enabled: PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
+          echo "[WATCHLIST] Will auto-create today's watchlist if missing"
 
       - name: Resolve market-aware runtime mode
         id: market_mode

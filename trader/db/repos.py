@@ -28,6 +28,7 @@ from .schema import (
 )
 from trader.db.json_safe import json_sanitize
 from trader.time_utils import now_kst
+from trader.time_coerce import to_date
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 
@@ -2077,6 +2078,8 @@ class WatchlistRepo:
         Watchlist를 DB에 upsert.
         members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
         """
+        as_of = to_date(as_of)  # Ensure DATE type
+        
         if not members:
             logger.warning("[WATCHLIST][SAVE] empty members -> skip")
             return
@@ -2125,6 +2128,8 @@ class WatchlistRepo:
         특정 날짜의 watchlist 조회.
         반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
         """
+        as_of = to_date(as_of)  # Ensure DATE type
+        
         schema = self._schema
         with self.engine.connect() as conn:
             stmt = (
@@ -2186,6 +2191,7 @@ def save_watchlist(
     members: List[Dict[str, Any]],
 ) -> None:
     """Standalone save_watchlist function."""
+    as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
     repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
 
@@ -2198,5 +2204,6 @@ def load_watchlist(
     as_of: date,
 ) -> List[Dict[str, Any]]:
     """Standalone load_watchlist function."""
+    as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
     return repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)

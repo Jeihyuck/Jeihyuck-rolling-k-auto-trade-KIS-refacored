@@ -19,6 +19,7 @@ from trader.config import (
 )
 from trader.db.repos import WatchlistRepo
 from trader.time_utils import now_kst
+from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
@@ -392,22 +393,57 @@ def load_today_watchlist_with_fallback(
     members: List[Dict[str, Any]],
     ohlcv_provider: Any,
     minervini_config: Dict[str, Any],
+    auto_build_if_empty: bool = True,
+    strict_fail_on_empty: bool = False,
 ) -> tuple[List[Dict[str, Any]], str]:
     """
-    오늘 watchlist를 로드, 없으면 fallback 전략 적용.
+    오늘 watchlist를 로드, 없으면 자동 생성 또는 fallback 전략 적용.
     
     반환: (watchlist, source)
-    - source: "today" | "prevday" | "fallback"
+    - source: "watchlist_db" | "watchlist_autobuilt" | "prevday" | "fallback" | "watchlist_empty"
     """
+    today = to_date(today)  # Ensure DATE type
     repo = WatchlistRepo(engine)
     
-    # 1. 오늘 watchlist 조회
-    watchlist = repo.load_watchlist(env=env, strategy=strategy, as_of=today)
-    if watchlist:
-        logger.info("[WATCHLIST][CACHE] hit=True source=today as_of=%s", today)
-        return watchlist, "today"
+    def _load():
+        rows = repo.load_watchlist(env=env, strategy=strategy, as_of=today)
+        return rows
     
-    # 2. 전날 watchlist 조회
+    # 1) Try load today's watchlist
+    rows = _load()
+    if rows:
+        logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
+        return rows, "watchlist_db"
+    
+    # 2) If empty and auto_build enabled -> build & save
+    if auto_build_if_empty:
+        logger.warning("[WATCHLIST][AUTO_BUILD] today=%s missing -> building now", today)
+        try:
+            topk = _env_int("PB1_WATCHLIST_TOPK", 50)
+            finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
+            builder = WatchlistBuilder(
+                ohlcv_provider=ohlcv_provider,
+                minervini_config=minervini_config,
+                topk=topk,
+                finaln=finaln,
+                min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
+                liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
+                min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
+            )
+            built = builder.build(members=members, as_of=today)
+            if built:
+                # Save to DB
+                repo.save_watchlist(env=env, strategy=strategy, as_of=today, members=built)
+                logger.info("[WATCHLIST][AUTO_BUILD] saved count=%s -> reloading", len(built))
+                # Reload from DB
+                rows2 = _load()
+                if rows2:
+                    logger.info("[WATCHLIST][AUTO_BUILD] success count=%s", len(rows2))
+                    return rows2, "watchlist_autobuilt"
+        except Exception as exc:
+            logger.error("[WATCHLIST][AUTO_BUILD][FAIL] err=%s", exc, exc_info=True)
+    
+    # 3) Try previous day watchlist
     latest_date = repo.get_latest_watchlist_date(env=env, strategy=strategy)
     if latest_date:
         watchlist = repo.load_watchlist(env=env, strategy=strategy, as_of=latest_date)
@@ -418,7 +454,7 @@ def load_today_watchlist_with_fallback(
             )
             return watchlist, "prevday"
     
-    # 3. Fallback: 거래대금 상위 K
+    # 4) Fallback: liquidity topK
     logger.warning("[WATCHLIST][CACHE] miss -> fallback to liquidity topK")
     try:
         topk = _env_int("PB1_WATCHLIST_TOPK", 50)
@@ -441,4 +477,6 @@ def load_today_watchlist_with_fallback(
         return fallback, "fallback"
     except Exception as exc:
         logger.error("[WATCHLIST][FALLBACK][FAIL] err=%s -> return empty", exc)
-        return [], "fallback_empty"
+        if strict_fail_on_empty:
+            raise RuntimeError(f"Watchlist empty after auto-build: env={env} strategy={strategy} as_of={today}") from exc
+        return [], "watchlist_empty"
