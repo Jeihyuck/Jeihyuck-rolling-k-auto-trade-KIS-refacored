@@ -619,6 +619,36 @@ class PB1Engine:
             logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
             return default
 
+    def _record_simulated_order(
+        self,
+        code: str,
+        side: str,
+        qty: int,
+        limit_price: float,
+        reason: str,
+        mode: str,
+    ) -> None:
+        """DIAG 모드에서 시뮬레이션 주문 DB 기록."""
+        try:
+            with self.engine.begin() as conn:
+                from trader.db.schema import ORDERS
+                conn.execute(
+                    sa.insert(ORDERS).values(
+                        run_id=self.run_id,
+                        code=code,
+                        side=side,
+                        qty=qty,
+                        limit_price=limit_price,
+                        status="SIMULATED",
+                        reason=reason,
+                        mode=mode,
+                        created_at=sa.func.now(),
+                    )
+                )
+                logger.info("[SIM_ORDER][DB_OK] code=%s side=%s qty=%s limit=%.0f", code, side, qty, limit_price)
+        except Exception as exc:
+            logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", code, exc)
+
     def _resolve_entry_cutoff(self) -> tuple[datetime, str]:
         raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
         if not raw:
@@ -2766,13 +2796,40 @@ class PB1Engine:
             no_trade,
         )
         
+        # ✅ DIAG 모드: 주문 생성만 하고 전송은 스킵 (SIM_ORDER 로그 및 DB 기록)
         if no_trade:
-            logger.info(
-                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
-                display_code,
-                cf.planned_qty,
-            )
-            return
+            # DIAG 모드인지 확인
+            strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+            if strategy_mode == "DIAG":
+                # SIM_ORDER 로그 남기기
+                logger.info(
+                    "[SIM_ORDER][BUY] code=%s qty=%s limit=%.0f reason=DIAG_NO_HTTP mode=%s",
+                    display_code,
+                    cf.planned_qty,
+                    float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+                    strategy_mode,
+                )
+                # ✅ DB에 SIMULATED 주문 기록
+                try:
+                    self._record_simulated_order(
+                        code=display_code,
+                        side="BUY",
+                        qty=cf.planned_qty,
+                        limit_price=float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+                        reason="DIAG_NO_HTTP",
+                        mode=strategy_mode,
+                    )
+                except Exception as exc:
+                    logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", display_code, exc)
+                # ✅ 계속 실행하지 않고 return (주문 전송 스킵)
+                return
+            else:
+                logger.info(
+                    "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
+                    display_code,
+                    cf.planned_qty,
+                )
+                return
         
         reasons = cf.reasons or []
         features_snapshot = {
@@ -3218,9 +3275,6 @@ class PB1Engine:
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
-        # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
-        no_trade = os.getenv("NO_TRADE", "0") == "1"
-        
         display_code = self._display_code(cf.code)
         logger.info(
             "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s no_trade=%s",
@@ -3234,22 +3288,40 @@ class PB1Engine:
             no_trade,
         )
         
+        # ✅ DIAG 모드: 주문 생성만 하고 전송은 스킵 (SIM_ORDER 로그 및 DB 기록)
         if no_trade:
-            logger.info(
-                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
-                display_code,
-                cf.planned_qty,
-            )
-            return
-        
-        
-        if no_trade:
-            logger.info(
-                "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
-                display_code,
-                cf.planned_qty,
-            )
-            return
+            # DIAG 모드인지 확인
+            strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+            if strategy_mode == "DIAG":
+                # SIM_ORDER 로그 남기기
+                logger.info(
+                    "[SIM_ORDER][BUY] code=%s qty=%s limit=%.0f reason=DIAG_NO_HTTP mode=%s",
+                    display_code,
+                    cf.planned_qty,
+                    float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+                    strategy_mode,
+                )
+                # ✅ DB에 SIMULATED 주문 기록
+                try:
+                    self._record_simulated_order(
+                        code=display_code,
+                        side="BUY",
+                        qty=cf.planned_qty,
+                        limit_price=float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
+                        reason="DIAG_NO_HTTP",
+                        mode=strategy_mode,
+                    )
+                except Exception as exc:
+                    logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", display_code, exc)
+                # ✅ 계속 실행하지 않고 return (주문 전송 스킵)
+                return
+            else:
+                logger.info(
+                    "[TRADE][SKIP][NO_TRADE] code=%s qty=%s reason=NO_TRADE_MODE",
+                    display_code,
+                    cf.planned_qty,
+                )
+                return
         
         cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
         ref_daily_close = cf.features.get("close")

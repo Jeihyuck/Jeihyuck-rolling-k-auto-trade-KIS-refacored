@@ -54,13 +54,14 @@ on:
         required: false
         default: "1"
 
-  schedule:
-    # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
-    - cron: "45 23 * * 0-4"
-    # KST 09:05 daily start => UTC 00:05 (Mon~Fri UTC)
-    - cron: "5 0 * * 1-5"
-    # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
-    - cron: "29 6 * * 1-5"
+  # schedule 제거: 수동/push 트리거만 허용 (5분 제약 제거)
+  # schedule:
+  #   # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
+  #   - cron: "45 23 * * 0-4"
+  #   # KST 09:05 daily start => UTC 00:05 (Mon~Fri UTC)
+  #   - cron: "5 0 * * 1-5"
+  #   # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
+  #   - cron: "29 6 * * 1-5"
 
 defaults:
   run:
@@ -149,7 +150,7 @@ jobs:
   trade_tick:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule' || github.event.schedule != '45 23 * * 0-4'
-    timeout-minutes: 25
+    timeout-minutes: 60
 
     env:
       TZ: Asia/Seoul
@@ -309,11 +310,13 @@ jobs:
           mode = "LIVE" if in_market else "DIAG"
           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
           live_ok = "true" if in_market else "false"
-          print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} live_ok={live_ok}")
+          kis_http = "1" if in_market else "0"
+          print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+              f.write(f"KIS_HTTP_ENABLED={kis_http}\n")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"live_ok={live_ok}\n")
           PY
@@ -323,26 +326,17 @@ jobs:
           set -euo pipefail
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
-      - name: Run LIVE (trade loop)
-        if: ${{ steps['market_mode'].outputs.live_ok == 'true' }}
+      - name: Run PB1 (AUTO -> LIVE in-market, DIAG after-hours)
         shell: bash
         env:
-          STRATEGY_MODE: LIVE
-          DRY_RUN: "0"
-          LIVE_TRADING_ENABLED: "1"
-          DISABLE_LIVE_TRADING: "0"
+          STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
+          PB1_PHASE_DEFAULT: ${{ env.PB1_PHASE_DEFAULT }}
+          KIS_HTTP_ENABLED: ${{ env.KIS_HTTP_ENABLED }}
+          PB1_DIAG_FULL_EXEC: "1"
         run: |
           set -euo pipefail
-          echo "[RUN] LIVE step starting"
+          echo "[RUNNER] STRATEGY_MODE=${STRATEGY_MODE:-AUTO} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-entry} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-AUTO} PB1_DIAG_FULL_EXEC=${PB1_DIAG_FULL_EXEC}"
           python -m trader.pb1_runner
-
-      - name: NO_TRADE (outside session)
-        if: ${{ steps['market_mode'].outputs.live_ok != 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          now_kst="$(TZ=Asia/Seoul date +'%Y-%m-%dT%H:%M:%S%z')"
-          echo "[NO_TRADE] $now_kst - Outside trading session (KST 09:00-15:15 weekdays only). Skip running live trading."
 
       - name: Scan for SQLite artifacts
         if: always()

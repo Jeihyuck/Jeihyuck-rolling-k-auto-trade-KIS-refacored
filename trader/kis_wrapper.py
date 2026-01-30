@@ -43,6 +43,23 @@ from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 
 logger = logging.getLogger(__name__)
 
+
+# ===== [NEW] KIS HTTP 차단 함수 =====
+def kis_http_enabled() -> bool:
+    """
+    KIS API HTTP 호출 허용 여부 판단.
+    - KIS_HTTP_ENABLED=0/FALSE/NO/OFF → False (차단)
+    - KIS_HTTP_ENABLED=AUTO → STRATEGY_MODE=LIVE일 때만 True
+    - 그 외 → True
+    """
+    v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
+    if v in ("0", "FALSE", "NO", "OFF"):
+        return False
+    if v == "AUTO":
+        return os.getenv("STRATEGY_MODE", "").strip().upper() == "LIVE"
+    return True
+
+
 # ✅ Export public exceptions
 __all__ = [
     "KisAPI",
@@ -666,10 +683,26 @@ class KisAPI:
     def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
+        - KIS_HTTP_ENABLED 체크 (DIAG 모드에서 차단)
         - DIAG 모드에서 KIS API 하드 블록 (환경변수 제어)
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
+        # ✅ KIS_HTTP_ENABLED 차단
+        if not kis_http_enabled():
+            logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=%s", os.getenv("STRATEGY_MODE"), url)
+            
+            # Stub response 반환
+            class _DiagDummyResponse:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def json() -> dict:
+                    return {"_kis_disabled": True, "rt_cd": "0", "msg1": "KIS_HTTP_DISABLED"}
+
+            return _DiagDummyResponse()
+        
         # ✅ DIAG 모드 KIS API 차단
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         block_on_diag = os.getenv("KIS_BLOCK_ALL_ON_DIAG", "1") == "1"
@@ -1235,6 +1268,30 @@ class KisAPI:
         """
         견고한 현재가 조회 - get_price_snapshot()을 사용하여 중복 호출 방지.
         """
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 DB에서 마지막 가격 조회
+        if not kis_http_enabled():
+            logger.warning("[PRICE][HTTP_DISABLED] mode=%s code=%s → using DB last price", os.getenv("STRATEGY_MODE"), code)
+            try:
+                c = safe_strip(code).lstrip("A")
+                engine = make_engine()
+                with engine.connect() as conn:
+                    result = conn.execute(
+                        sa.select(PRICE_DAILY.c.close)
+                        .where(PRICE_DAILY.c.code == c)
+                        .order_by(PRICE_DAILY.c.date.desc())
+                        .limit(1)
+                    )
+                    row = result.fetchone()
+                    if row and row.close:
+                        price = float(row.close)
+                        logger.info("[PRICE][DB_FALLBACK] code=%s price=%s", code, price)
+                        return price
+            except Exception as e:
+                logger.warning("[PRICE][DB_FALLBACK_FAIL] code=%s err=%s", code, e)
+            # DB 조회 실패 시 기본값 반환 (100000원 - 임의)
+            logger.warning("[PRICE][STUB] code=%s → returning stub price 100000", code)
+            return 100000.0
+        
         c = safe_strip(code)
         if not c:
             raise ValueError(f"Invalid code: {code}")
@@ -2472,6 +2529,15 @@ class KisAPI:
         ✅ 페이징/디바운스 적용 잔고 전체 조회
         반환: {'output1': [...], 'output2': {...}, 'ctx_area_fk100': '...', 'ctx_area_nk100': '...'}
         """
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환
+        if not kis_http_enabled():
+            logger.warning("[BALANCE][HTTP_DISABLED] mode=%s → returning stub", os.getenv("STRATEGY_MODE"))
+            return {
+                "output1": [],
+                "output2": [{"dnca_tot_amt": "0", "nxdy_excc_amt": "0", "prvs_rcdl_excc_amt": "0", "ord_psbl_cash": "0"}],
+                "_diag_stub": True,
+            }
+        
         fk = nk = ""
         all_rows: List[dict] = []
         out2_last = None  # 🔸 요약 블록(예수금 등) → '첫 페이지' 것만 유지
