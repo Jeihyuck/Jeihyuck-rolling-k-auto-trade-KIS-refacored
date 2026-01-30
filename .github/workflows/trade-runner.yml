@@ -33,14 +33,32 @@ on:
         description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
         required: false
         default: "0"
+      FORCE_RUN:
+        description: "강제 실행 (장중 체크 우회, 1=활성)"
+        required: false
+        default: "0"
+      WATCHLIST_MODE:
+        description: "Watchlist 모드 (1=소수 종목만, 0=전체 유니버스)"
+        required: false
+        default: "0"
+      WATCHLIST:
+        description: "Watchlist 종목 코드 (쉼표 구분)"
+        required: false
+        default: "005930,000660,035420,035720,005380"
+      LIVE_TRADING_ENABLED:
+        description: "실거래 허용 (1=실거래, 0=DRY_RUN)"
+        required: false
+        default: "0"
+      DRY_RUN:
+        description: "시뮬레이션 모드 (1=시뮬, 0=실거래)"
+        required: false
+        default: "1"
 
   schedule:
     # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
     - cron: "45 23 * * 0-4"
-    # KST 09:00~14:55  => UTC 00:00~05:55 (Mon~Fri UTC)
-    - cron: "*/5 0-5 * * 1-5"
-    # KST 15:00~15:30  => UTC 06:00~06:30 (Mon~Fri UTC)
-    - cron: "0-30/5 6 * * 1-5"
+    # KST 09:00~14:30  => UTC 00:00~05:30 (Mon~Fri UTC) - 30분 간격
+    - cron: "0,30 0-5 * * 1-5"
     # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
     - cron: "29 6 * * 1-5"
 
@@ -158,11 +176,16 @@ jobs:
       DIAG_REHEARSAL_KIS_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_REHEARSAL_KIS_CALLS || '1' }}
       NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
 
+      # [NEW] 강제 실행 및 Watchlist 모드
+      FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_RUN || '0' }}
+      WATCHLIST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST_MODE || '0' }}
+      WATCHLIST: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST || '005930,000660,035420,035720,005380' }}
+
       # [5] GitHub Actions / 실행 env도 LIVE로 고정
       DB_ONLY: "0"
       NONTRADING_SMOKE: "0"
-      DRY_RUN: "0"
-      LIVE_TRADING_ENABLED: "1"
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRY_RUN || '0' }}
+      LIVE_TRADING_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.LIVE_TRADING_ENABLED || '1' }}
       DISABLE_LIVE_TRADING: "0"
       STRATEGY_MODE: "LIVE"
 

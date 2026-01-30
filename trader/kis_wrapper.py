@@ -2787,12 +2787,28 @@ class KisAPI:
                 # 레이트리밋(주문은 별 키)
                 self._limiter.wait("orders")
 
-                # 로깅(민감 Mask)
+                # [NEW] FORCE_RUN 모드에서 주문 직전 로깅 강화
                 log_body_masked = {
                     k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***")
                     for k, v in body.items()
                 }
-                logger.info(f"[주문요청] tr_id={tr_id} ord_dvsn={ord_dvsn} body={log_body_masked}")
+                dry_run = os.getenv("DRY_RUN", "0") == "1"
+                live_trading = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
+                force_run = os.getenv("FORCE_RUN", "0") == "1"
+                
+                logger.info(
+                    "[ORDER_READY] code=%s side=%s qty=%s price=%s tr_id=%s ord_dvsn=%s DRY_RUN=%s LIVE=%s FORCE_RUN=%s body=%s",
+                    body.get("PDNO"),
+                    "SELL" if is_sell else "BUY",
+                    body.get("ORD_QTY"),
+                    body.get("ORD_UNPR"),
+                    tr_id,
+                    ord_dvsn,
+                    dry_run,
+                    live_trading,
+                    force_run,
+                    log_body_masked,
+                )
 
                 # 네트워크/게이트웨이 재시도
                 for attempt in range(1, 4):

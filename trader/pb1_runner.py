@@ -293,6 +293,25 @@ def _load_universe_context(
     env: str,
     strategy: str,
 ) -> UniverseContext:
+    # [NEW] WATCHLIST_MODE=1이면 WATCHLIST env에서 직접 로딩
+    watchlist_mode = os.getenv("WATCHLIST_MODE", "0") == "1"
+    if watchlist_mode:
+        watchlist_codes = os.getenv("WATCHLIST", "005930,000660,035420,035720,005380")
+        codes = [c.strip() for c in watchlist_codes.split(",") if c.strip()]
+        members = [{"code": code, "name": code} for code in codes]
+        logger.info(
+            "[PB1][WATCHLIST_MODE] bypassing universe -> using %d codes: %s",
+            len(codes),
+            codes[:10],
+        )
+        return UniverseContext(
+            as_of_date=as_of,
+            members=members,
+            selected_path=None,
+            meta={"source": "watchlist_env", "codes": codes},
+            is_empty=False,
+        )
+    
     repo = UniverseRepo(engine)
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
     if not members and is_db_only_mode():
@@ -678,6 +697,22 @@ def run_once(
         if value:
             workflow_run_id = str(value)
             break
+    
+    # [NEW] FORCE_RUN, WATCHLIST_MODE 로깅
+    force_run = os.getenv("FORCE_RUN", "0") == "1"
+    watchlist_mode = os.getenv("WATCHLIST_MODE", "0") == "1"
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
+    live_trading = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
+    
+    if force_run or watchlist_mode:
+        logger.info(
+            "[PB1][FORCE_RUN] FORCE_RUN=%s WATCHLIST_MODE=%s WATCHLIST=%s DRY_RUN=%s LIVE_TRADING=%s",
+            force_run,
+            watchlist_mode,
+            os.getenv("WATCHLIST", "")[:100],
+            dry_run,
+            live_trading,
+        )
     
     # [1] LIVE 강제 정책: STRATEGY_MODE=LIVE일 때 env 검증
     if os.getenv("STRATEGY_MODE") == "LIVE":

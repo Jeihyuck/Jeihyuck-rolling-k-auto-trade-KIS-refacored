@@ -840,6 +840,12 @@ def resolve_strategy_mode(
     now_kst = now_kst or datetime.now(KST)
     if now_kst.tzinfo is None:
         now_kst = now_kst.replace(tzinfo=KST)
+    
+    # [NEW] FORCE_RUN=1이면 무조건 장중으로 간주
+    force_run = os.getenv("FORCE_RUN", "0") == "1"
+    if force_run:
+        return "LIVE", True, "day", "force_run"
+    
     trading_day = now_kst.weekday() < 5
     window = resolve_market_window(now_kst, trading_day)
     forced = _normalize_strategy_mode(force_mode_env)
