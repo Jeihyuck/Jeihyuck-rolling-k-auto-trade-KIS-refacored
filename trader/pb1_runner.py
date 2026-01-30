@@ -1099,7 +1099,12 @@ def run_once(
             )
             return [], False, {}, phase_for_log, exit_status
 
-    if action == "smoke":
+    # ✅ DIAG + PB1_DIAG_FULL_EXEC=1이면 smoke 건너뛰고 엔진 실행
+    diag_full = os.getenv("PB1_DIAG_FULL_EXEC", "0") in ("1", "true", "TRUE", "yes", "YES")
+    if action == "smoke" and mode == "DIAG" and diag_full:
+        logger.info("[PB1][DIAG_FULL_EXEC] bypass smoke -> run engine once (no KIS HTTP)")
+        action = "run"  # smoke 건너뛰고 엔진 실행
+    elif action == "smoke":
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
 

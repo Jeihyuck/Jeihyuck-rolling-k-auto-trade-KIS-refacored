@@ -920,6 +920,13 @@ class KisAPI:
             return token
 
     def _issue_token_and_expire(self):
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 더미 토큰 반환
+        if not kis_http_enabled():
+            logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=token -> returning dummy token", os.getenv("STRATEGY_MODE"))
+            from datetime import timedelta, timezone
+            exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+            return "DIAG_DUMMY_TOKEN", 21600  # (token, expires_in)
+        
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
         headers = {"content-type": "application/json"}

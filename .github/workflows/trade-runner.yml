@@ -309,6 +309,9 @@ jobs:
           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
           mode = "LIVE" if in_market else "DIAG"
           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+          # ✅ DIAG 모드에서는 매수 로직도 검증하기 위해 phase를 entry로 설정
+          if mode == "DIAG":
+              pb1_phase = "entry"
           live_ok = "true" if in_market else "false"
           kis_http = "1" if in_market else "0"
           print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}")
