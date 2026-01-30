@@ -537,9 +537,17 @@ def _resolve_market_context(
 
 
 def _resolve_window_label(market_window: str, window: WindowDecision | None) -> str:
+    # ✅ DIAG_FULL_EXEC이면 window 덮어쓰기 방지
+    diag_full_exec = env_bool("PB1_DIAG_FULL_EXEC", False)
+    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+    
     normalized = (market_window or "").strip().lower()
     if normalized in {"morning", "day", "close", "preopen", "after", "afternoon", "off"}:
         if window and window.name and window.name != normalized:
+            # DIAG_FULL_EXEC이면 경고 없이 normalized 사용
+            if diag_full_exec and strategy_mode == "DIAG":
+                return normalized
+            
             global _WINDOW_MISMATCH_LOGGED
             if not _WINDOW_MISMATCH_LOGGED:
                 logger.warning(
@@ -966,6 +974,17 @@ def run_once(
         window_override=args.window,
         phase_seed=phase_seed,
     )
+    
+    # ✅ DIAG_FULL_EXEC: DIAG 모드에서 window/phase 강제 우회
+    diag_full_exec = env_bool("PB1_DIAG_FULL_EXEC", False)
+    if diag_full_exec and mode == "DIAG":
+        logger.info("[PB1][DIAG_FULL_EXEC] force window=day, phase=entry (bypass window/phase gates)")
+        market_window = "day"
+        window_label = "day"
+        resolved_phase = "entry"
+        phase_reason = "diag_full_exec_override"
+        context_reasons.append("diag_full_exec:forced_day_entry")
+    
     if window is not None:
         resolved_window = window
         window_label = _resolve_window_label(market_window, window)
@@ -1632,6 +1651,16 @@ def run_once(
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
             universe_context=universe_ctx,
         )
+        
+        # ✅ DIAG_FULL_EXEC 실행 로그
+        if diag_full_exec and mode == "DIAG":
+            logger.info(
+                "[PB1][DIAG_FULL_EXEC] calling engine.run() window=%s phase=%s dry_run=%s",
+                window_label,
+                phase_override_arg,
+                dry_run,
+            )
+        
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
         else:

@@ -800,11 +800,16 @@ class PB1Engine:
         summary = _as_first_dict(summary_raw)
         selected_key = None
         cash_value = None
-        for key in ("dnca_tot_amt", "ord_psbl_cash"):
+        
+        # ✅ 우선순위 fallback: ord_psbl_cash → dnca_tot_amt → nxdy_excc_amt → prvs_rcdl_excc_amt
+        for key in ("ord_psbl_cash", "dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt"):
             if key in summary:
-                selected_key = key
-                cash_value = self._to_float(summary.get(key))
-                break
+                val = self._to_float(summary.get(key))
+                if val is not None and val > 0:
+                    selected_key = key
+                    cash_value = val
+                    break
+        
         if cash_value is None:
             tot_evlu = self._to_float(summary.get("tot_evlu_amt"))
             scts_evlu = self._to_float(summary.get("scts_evlu_amt"))

@@ -2462,6 +2462,15 @@ class KisAPI:
 
     def _inquire_psbl_order(self, code_hint: str, price_hint: float | None = None) -> dict:
         """주문가능조회 호출."""
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환
+        if not kis_http_enabled():
+            logger.warning("[CASH][PSBL][HTTP_DISABLED] mode=%s → returning stub", os.getenv("STRATEGY_MODE"))
+            return {
+                "output": {"ord_psbl_cash": "10000000"},
+                "rt_cd": "0",
+                "_diag_stub": True,
+            }
+        
         tr_list = _pick_tr(self.env, "PSBL_ORDER")
         if not tr_list:
             raise RuntimeError("PSBL_ORDER TR 미구성")
@@ -2536,12 +2545,19 @@ class KisAPI:
         ✅ 페이징/디바운스 적용 잔고 전체 조회
         반환: {'output1': [...], 'output2': {...}, 'ctx_area_fk100': '...', 'ctx_area_nk100': '...'}
         """
-        # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환 (output2는 list[dict] 형태로 통일)
         if not kis_http_enabled():
             logger.warning("[BALANCE][HTTP_DISABLED] mode=%s → returning stub", os.getenv("STRATEGY_MODE"))
             return {
                 "output1": [],
-                "output2": [{"dnca_tot_amt": "0", "nxdy_excc_amt": "0", "prvs_rcdl_excc_amt": "0", "ord_psbl_cash": "0"}],
+                "output2": [{
+                    "dnca_tot_amt": "10000000",
+                    "nxdy_excc_amt": "10000000",
+                    "prvs_rcdl_excc_amt": "10000000",
+                    "ord_psbl_cash": "10000000",
+                }],
+                "ctx_area_fk100": "",
+                "ctx_area_nk100": "",
                 "_diag_stub": True,
             }
         
@@ -2765,6 +2781,17 @@ class KisAPI:
 
     def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
         """당일 주문/체결 조회."""
+        # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환
+        if not kis_http_enabled():
+            logger.warning("[RECONCILE][HTTP_DISABLED] mode=%s endpoint=inquire-daily-ccld → returning empty", os.getenv("STRATEGY_MODE"))
+            return {
+                "rt_cd": "0",
+                "msg1": "KIS_HTTP_DISABLED",
+                "output1": [],
+                "output2": [],
+                "_diag_stub": True,
+            }
+        
         def _empty_daily_ccld(reason: str) -> dict:
             return {"rt_cd": "-1", "msg": reason, "output1": [], "output2": []}
 
