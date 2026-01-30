@@ -19,12 +19,12 @@ def now_kst() -> datetime:
     return datetime.now(tz=KST)
 
 
-def week_monday(d: date) -> date:
+def week_monday(d: date | datetime | str) -> date:
     """
     주어진 날짜가 속한 주의 월요일을 반환.
     
     Args:
-        d: KST 기준 날짜 (date 객체)
+        d: KST 기준 날짜 (date/datetime/"YYYY-MM-DD" 형식)
     
     Returns:
         해당 주의 월요일 (date 객체)
@@ -32,7 +32,28 @@ def week_monday(d: date) -> date:
     Examples:
         >>> week_monday(date(2026, 1, 30))  # 목요일
         date(2026, 1, 27)  # 월요일
+        >>> week_monday("2026-01-30")  # 문자열도 지원
+        date(2026, 1, 27)
     """
+    if d is None:
+        raise ValueError("week_monday: d is None")
+
+    # normalize string -> date
+    if isinstance(d, str):
+        s = d.strip()
+        # allow full ISO datetime too
+        if "T" in s:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        else:
+            d = date.fromisoformat(s)
+
+    # normalize datetime -> date
+    if isinstance(d, datetime):
+        d = d.date()
+
+    if not isinstance(d, date):
+        raise TypeError(f"week_monday: unsupported type {type(d)} value={d}")
+
     return d - timedelta(days=d.weekday())
 
 

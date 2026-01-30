@@ -494,6 +494,7 @@ class PB1Engine:
         entry_block_reason: str | None = None,
         preopen_max_new_positions: int = 0,
         universe_context: UniverseContext | None = None,
+        diag_full_exec: bool = False,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -508,6 +509,7 @@ class PB1Engine:
         self.env = env
         self.run_id = run_id
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
+        self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
         self.window = window
         self.window_label = window_label
@@ -4092,6 +4094,14 @@ class PB1Engine:
         
         # ✅ 설계 1: 이번 주 월요일 키 계산
         today = self._today
+        
+        # ✅ normalize today to date for watchlist keys
+        if isinstance(today, str):
+            today = today.split("T")[0]
+            today = date.fromisoformat(today)
+        elif isinstance(today, datetime):
+            today = today.date()
+        
         as_of = week_monday(today)  # ✅ 주간 키로 변경
         
         # 전체 유니버스 로드 (watchlist 생성/fallback에 필요)
@@ -4263,6 +4273,9 @@ class PB1Engine:
         entry_allowed = self.entry_enabled
         entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
         
+        # ✅ DIAG_FULL_EXEC: entry gate 우회
+        diag_full_exec = bool(getattr(self, "diag_full_exec", False))
+        
         # ✅ 서킷 브레이커 체크: EGW002 발생 시 신규진입 중단
         if self.kis and hasattr(self.kis, '_price_cache'):
             from trader.kis_wrapper import _price_cache
@@ -4283,17 +4296,33 @@ class PB1Engine:
         if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
             target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
         if not entry_allowed:
-            logger.warning(
-                "[PB1][ENTRY_DISABLED][REASON] entry_allowed=0 reason=%s -> skip new entries",
-                entry_reason
-            )
-            logger.info("[PB1][BUY][SKIP] reason=%s details={'entry_allowed': False}", entry_reason)
+            # ✅ DIAG_FULL_EXEC: entry gate 우회
+            if diag_full_exec and entry_reason in ("entry_cutoff", "window_blocked", "phase_manage", "entry_disabled"):
+                logger.warning(
+                    "[PB1][DIAG_FULL_EXEC] override entry gate reason=%s -> allow entry pipeline (dry_run=%s)",
+                    entry_reason,
+                    self.dry_run
+                )
+                entry_allowed = True
+                entry_reason = "diag_full_exec_override"
+            else:
+                logger.warning(
+                    "[PB1][ENTRY_DISABLED][REASON] entry_allowed=0 reason=%s -> skip new entries",
+                    entry_reason
+                )
+                logger.info("[PB1][BUY][SKIP] reason=%s details={'entry_allowed': False}", entry_reason)
         if self.phase == "verify":
-            entry_allowed = False
-            entry_reason = "phase_verify"
+            if diag_full_exec:
+                logger.warning("[PB1][DIAG_FULL_EXEC] override phase=verify -> allow entry")
+            else:
+                entry_allowed = False
+                entry_reason = "phase_verify"
         if self.phase in {"manage", "exit", "idle"}:
-            entry_allowed = False
-            entry_reason = f"phase_{self.phase}"
+            if diag_full_exec:
+                logger.warning("[PB1][DIAG_FULL_EXEC] override phase=%s -> allow entry", self.phase)
+            else:
+                entry_allowed = False
+                entry_reason = f"phase_{self.phase}"
         logger.info(
             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
             self.window_label,

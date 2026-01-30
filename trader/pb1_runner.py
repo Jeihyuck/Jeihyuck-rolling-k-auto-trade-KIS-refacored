@@ -1650,6 +1650,7 @@ def run_once(
             entry_block_reason=entry_block_reason,
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
             universe_context=universe_ctx,
+            diag_full_exec=diag_full_exec,  # ✅ DIAG 풀패스 플래그 전달
         )
         
         # ✅ DIAG_FULL_EXEC 실행 로그
