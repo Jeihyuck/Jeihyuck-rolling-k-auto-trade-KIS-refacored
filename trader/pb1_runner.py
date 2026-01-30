@@ -1111,13 +1111,13 @@ def run_once(
     # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
         if mode == "DIAG" and diag_full:
-            logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (force window=day)")
-            window = True  # ✅ 강제 통과
-            window_label = "day"
-            # ✅ phase도 강제로 PB1_PHASE_DEFAULT 사용
+            # ✅ window 타입 유지: WindowDecision 객체로 생성
+            from trader.window_router import WindowDecision
             phase_default = os.getenv("PB1_PHASE_DEFAULT", "entry")
+            window = WindowDecision(name="day", phase=phase_default)
+            window_label = window.name
             phase_for_log = phase_default
-            logger.info("[PB1][DIAG_FULL_EXEC] force phase=%s (ignore manage/after)", phase_default)
+            logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
         else:
             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
             return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
@@ -1200,6 +1200,11 @@ def run_once(
 
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_override_arg = resolved_phase
+    
+    # ✅ 방어: window가 bool로 잘못 설정되지 않았는지 체크
+    if isinstance(window, bool):
+        raise RuntimeError(f"BUG: window became bool. check DIAG_FULL override. window={window}")
+    
     if (
         window
         and event_name_lower == "push"
