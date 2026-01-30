@@ -1108,9 +1108,19 @@ def run_once(
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
 
+    # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
-        logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-        return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
+        if mode == "DIAG" and diag_full:
+            logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (force window=day)")
+            window = True  # ✅ 강제 통과
+            window_label = "day"
+            # ✅ phase도 강제로 PB1_PHASE_DEFAULT 사용
+            phase_default = os.getenv("PB1_PHASE_DEFAULT", "entry")
+            phase_for_log = phase_default
+            logger.info("[PB1][DIAG_FULL_EXEC] force phase=%s (ignore manage/after)", phase_default)
+        else:
+            logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+            return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag

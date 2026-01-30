@@ -336,6 +336,8 @@ jobs:
           PB1_PHASE_DEFAULT: ${{ env.PB1_PHASE_DEFAULT }}
           KIS_HTTP_ENABLED: ${{ env.KIS_HTTP_ENABLED }}
           PB1_DIAG_FULL_EXEC: "1"
+          PB1_WINDOW_OVERRIDE: "day"
+          PB1_ALLOW_OUTSIDE_WINDOWS: "1"
         run: |
           set -euo pipefail
           echo "[RUNNER] STRATEGY_MODE=${STRATEGY_MODE:-AUTO} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-entry} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-AUTO} PB1_DIAG_FULL_EXEC=${PB1_DIAG_FULL_EXEC}"
