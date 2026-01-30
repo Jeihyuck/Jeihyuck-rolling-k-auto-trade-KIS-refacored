@@ -207,6 +207,7 @@ jobs:
       PB1_WATCHLIST_LIQ_DAYS: "20"
       PB1_WATCHLIST_MIN_ROWS: "30"
       PB1_WATCHLIST_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_STRICT: "1"  # [NEW] E. strict 모드 - watchlist 실패 시 프로세스 종료
 
       DB_DISABLE_PREPARED_STATEMENTS: "1"
 

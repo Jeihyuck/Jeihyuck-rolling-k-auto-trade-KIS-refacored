@@ -1430,6 +1430,7 @@ def run_once(
             dry_run=dry_run,
             env=kis_env or "practice",
             run_id=run_record_id,
+            strategy=universe_strategy,  # [FIX] watchlist 버그 수정 - strategy 전달
             now_kst_value=now,
             balance_snapshot=balance_snapshot_raw,
             balance_source=balance_source,

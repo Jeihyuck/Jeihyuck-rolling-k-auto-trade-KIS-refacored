@@ -80,7 +80,9 @@ class KISOHLCVProvider:
             logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
 
         # KIS fallback
-        if not ALLOW_KIS_DAILY_FALLBACK:
+        # [FIX] D. day window에서 days <= 120이면 fallback 허용 (watchlist 생성/엔트리에 필수)
+        fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 120)
+        if not fallback_allowed:
             logger.warning("[OHLCV][DB][NO_FALLBACK] symbol=%s days=%d", symbol, days)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "db", "error": "no_fallback", "volume_missing": True})
 

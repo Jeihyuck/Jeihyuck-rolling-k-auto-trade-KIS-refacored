@@ -486,6 +486,7 @@ class PB1Engine:
         dry_run: bool,
         env: str,
         run_id: str,
+        strategy: str | None = None,
         now_kst_value: datetime | None = None,
         balance_snapshot: dict | None = None,
         balance_source: str | None = None,
@@ -506,6 +507,7 @@ class PB1Engine:
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
+        self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
         self.window = window
         self.window_label = window_label
@@ -1745,6 +1747,35 @@ class PB1Engine:
             # ✅ 무조건 요약 로그 출력 (성공/실패 모두)
             total_dt = time.monotonic() - t0
             candidates_count = len(candidates)
+            
+            # [NEW] B. 후보 0명일 때 "왜 0인지" 상세 로그
+            if candidates_count == 0:
+                ohlcv_missing_count = checked_count - len(candidates)
+                ohlcv_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
+                regime_pass_count = len([cf for cf in candidates if cf.features.get("liq_ok") and cf.features.get("gap_ok")])
+                vcp_pass_count = len([cf for cf in candidates if cf.features.get("vcp_ok")])
+                rs_pass_count = len([cf for cf in candidates if cf.features.get("rs_percentile", 0) >= self.minervini_config.rs_min_percentile])
+                final_count = len([cf for cf in candidates if cf.setup_ok])
+                
+                logger.warning(
+                    "[PB1][CANDIDATES=0][BREAKDOWN] universe=%s checked=%s ohlcv_missing=%s ohlcv_ok=%s "
+                    "regime_pass=%s vcp_pass=%s rs_pass=%s final=%s reason=%s",
+                    universe_count,
+                    checked_count,
+                    ohlcv_missing_count,
+                    ohlcv_ok_count,
+                    regime_pass_count,
+                    vcp_pass_count,
+                    rs_pass_count,
+                    final_count,
+                    reason,
+                )
+                
+                # OHLCV 결측 샘플 출력 (최대 5개)
+                skip_samples = [m.get("code") for m in members_list[:5] if m.get("code") not in [cf.code for cf in candidates]]
+                if skip_samples:
+                    logger.warning("[PB1][CANDIDATES=0][OHLCV_SKIP_SAMPLE] codes=%s", skip_samples)
+            
             logger.info(
                 "[ENTRY][PIPE][END] trace=compute_candidates total_dt=%.2fs reason=%s universe=%s candidates=%s",
                 total_dt,
@@ -3969,6 +4000,8 @@ class PB1Engine:
     def _load_today_watchlist_members(self) -> tuple[list[dict], str]:
         """오늘 watchlist를 로드하고, 없으면 fallback 전략 적용."""
         watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        watchlist_strict = os.getenv("PB1_WATCHLIST_STRICT", "0") == "1"
+        
         if not watchlist_enabled:
             logger.info("[PB1][WATCHLIST] disabled -> use full universe")
             members = self._load_universe()
@@ -3989,11 +4022,26 @@ class PB1Engine:
                 minervini_config=self.minervini_config,
             )
         except Exception as exc:
-            logger.error("[PB1][WATCHLIST][LOAD_FAIL] err=%s -> fallback to full universe", exc)
+            error_msg = f"[PB1][WATCHLIST][LOAD_FAIL] err={exc}"
+            logger.error(error_msg)
+            
+            # [NEW] E. STRICT 모드: watchlist 실패 시 프로세스 종료
+            if watchlist_strict:
+                logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on watchlist failure")
+                raise RuntimeError(f"Watchlist load failed in strict mode: {exc}") from exc
+            
+            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe")
             return full_members, "universe_fallback"
         
         if not watchlist:
-            logger.warning("[PB1][WATCHLIST] empty -> fallback to full universe")
+            warning_msg = "[PB1][WATCHLIST] empty watchlist"
+            logger.warning(warning_msg)
+            
+            if watchlist_strict:
+                logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on empty watchlist")
+                raise RuntimeError("Watchlist is empty in strict mode")
+            
+            logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe")
             return full_members, "universe_fallback_empty"
         
         # Watchlist를 members 형식으로 변환
@@ -4008,8 +4056,8 @@ class PB1Engine:
         ]
         
         logger.info(
-            "[PB1][WATCHLIST] size=%s source=%s as_of=%s",
-            len(members), source, self._today
+            "[PB1][WATCHLIST] size=%s source=%s as_of=%s strict=%s",
+            len(members), source, self._today, watchlist_strict
         )
         return members, source
 
