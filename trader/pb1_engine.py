@@ -4264,18 +4264,6 @@ class PB1Engine:
             len(members), source, as_of, today, watchlist_strict
         )
         return members, source
-                "rank": w.get("rank"),
-                "name": self._code_name_map.get(w["code"], ""),
-                "meta_json": w.get("meta"),
-            }
-            for w in watchlist
-        ]
-        
-        logger.info(
-            "[PB1][WATCHLIST] size=%s source=%s as_of=%s (today=%s) strict=%s",
-            len(members), source, as_of, today, watchlist_strict
-        )
-        return members, source
 
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
