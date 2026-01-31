@@ -1,4 +1,4 @@
-name: "Trade Runner (DB-Only SSOT) [5m tick]"
+name: "Trade Runner (Unified: Candidate Pool + Trade Tick)"
 
 permissions:
   contents: write
@@ -12,39 +12,20 @@ env:
   DB_DISABLE_PREPARED_STATEMENTS: "1"
 
 on:
-  push:
-    branches: [ "nullim", "main" ]
-
   workflow_dispatch:
     inputs:
-      EMERGENCY_UNIVERSE_BUILD:
-        description: "Set to 1 to allow one-time emergency universe build when today's DB universe is missing (DIAG only)."
+      MODE:
+        description: "candidate | trade | both"
+        required: true
+        default: "candidate"
+      ENV:
+        description: "LIVE | PAPER"
         required: false
-        default: "0"
-      DIAG_FULL_REHEARSAL:
-        description: "비매매일에도 실전 파이프라인처럼 1회 실행(주문전송 금지)"
-        required: false
-        default: "0"
-      DIAG_REHEARSAL_KIS_CALLS:
-        description: "KIS 잔고/시세 조회를 실제로 호출할지(주문은 절대 안함)"
+        default: "PAPER"
+      FORCE_REBUILD:
+        description: "candidate 강제 재생성 (1=on)"
         required: false
         default: "1"
-      NONTRADING_UNIVERSE_SMOKE:
-        description: "Set to 1 to run non-trading-day universe smoke (DIAG only)."
-        required: false
-        default: "0"
-      FORCE_RUN:
-        description: "강제 실행 (장중 체크 우회, 1=활성)"
-        required: false
-        default: "0"
-      WATCHLIST_MODE:
-        description: "Watchlist 모드 (1=소수 종목만, 0=전체 유니버스)"
-        required: false
-        default: "0"
-      WATCHLIST:
-        description: "Watchlist 종목 코드 (쉼표 구분)"
-        required: false
-        default: "005930,000660,035420,035720,005380"
       LIVE_TRADING_ENABLED:
         description: "실거래 허용 (1=실거래, 0=DRY_RUN)"
         required: false
@@ -54,14 +35,18 @@ on:
         required: false
         default: "1"
 
-  # schedule 제거: 수동/push 트리거만 허용 (5분 제약 제거)
-  # schedule:
-  #   # KST 08:45 universe build => UTC 23:45 (Sun~Thu UTC)
-  #   - cron: "45 23 * * 0-4"
-  #   # KST 09:05 daily start => UTC 00:05 (Mon~Fri UTC)
-  #   - cron: "5 0 * * 1-5"
-  #   # KST 15:29 close-cancel => UTC 06:29 (Mon~Fri UTC)
-  #   - cron: "29 6 * * 1-5"
+  schedule:
+    # 토요일 00:30 KST = 금요일 15:30 UTC : 후보군 생성
+    - cron: "30 15 * * 5"
+    # 월~금 08:55 KST = 23:55 UTC (일~목) : trade tick
+    - cron: "55 23 * * 0-4"
+
+  push:
+    branches: ["nullim"]
+    paths:
+      - "repo/trader/**"
+      - "trader/**"
+      - ".github/workflows/trade-runner.yml"
 
 defaults:
   run:
@@ -69,10 +54,19 @@ defaults:
     working-directory: repo
 
 jobs:
-  universe_build:
+  candidate_pool:
+    name: Candidate Pool Build (weekly or on-demand)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 15
+    timeout-minutes: 30
+
+    # 실행 조건:
+    # - workflow_dispatch: MODE=candidate|both
+    # - push: 항상 실행 (smoke)
+    # - schedule: 토요일 후보군 cron(30 15 * * 5)에서만 실행
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
       TZ: Asia/Seoul
@@ -91,28 +85,39 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      EMERGENCY_UNIVERSE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.EMERGENCY_UNIVERSE_BUILD || '0' }}
+      # 후보군은 무조건 DIAG로 (매매 금지)
+      STRATEGY_MODE: "DIAG"
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+
+      # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
+      KIS_HTTP_ENABLED: "0"
+
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_REBUILD || '1' }}
+      CANDIDATE_POOL_SIZE: "120"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+
+      # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: "nullim"
           path: repo
+          fetch-depth: 1
+          ref: "nullim"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
         run: |
@@ -129,11 +134,55 @@ jobs:
             exit 1
           fi
 
-      - name: Build universe to DB (best_k_meta)
+      - name: DB migrate
         run: |
           set -euo pipefail
-          as_of="$(TZ=Asia/Seoul date +%F)"
-          python -m trader.universe.build --env "${KIS_ENV}" --strategy best_k_meta --date "${as_of}"
+          python -m trader.db.migrate
+
+      - name: Candidate pool build
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Candidate Pool Build"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Force rebuild: ${CANDIDATE_POOL_FORCE_REBUILD}"
+          echo "Pool size target: ${CANDIDATE_POOL_SIZE}"
+          echo "Pool min size: ${CANDIDATE_POOL_MIN_SIZE}"
+          echo "TTL(days): ${CANDIDATE_POOL_TTL_DAYS}"
+          echo "======================================"
+          python -m trader.candidate_pool_builder --build pool --env "${STRATEGY_ENV}"
+
+      - name: Verify pool saved
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import WatchlistRepo
+
+          env = os.getenv("STRATEGY_ENV", "PAPER")
+          strategy_key = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+
+          engine = get_engine()
+          repo = WatchlistRepo(engine)
+
+          latest = repo.get_latest_watchlist_date(env=env, strategy=strategy_key)
+          if not latest:
+              print(f"[VERIFY][FAIL] no candidate pool in DB for {env}/{strategy_key}")
+              sys.exit(1)
+
+          pool = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest) or []
+          print(f"[VERIFY] as_of={latest} size={len(pool)}")
+
+          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+          if len(pool) < min_size:
+              print(f"[VERIFY][FAIL] pool size {len(pool)} < min {min_size}")
+              sys.exit(1)
+
+          print("[VERIFY][OK] candidate pool ready")
+          PY
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -148,8 +197,20 @@ jobs:
           echo "OK: no sqlite artifacts."
 
   trade_tick:
+    name: Trade Tick (daily)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
+    needs: [candidate_pool]
+
+    # 실행 조건:
+    # - workflow_dispatch: MODE=trade|both (candidate가 실패했으면 both는 차단)
+    # - schedule: trade tick cron(55 23 * * 0-4)에서만 실행
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '55 23 * * 0-4') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both') &&
+        (needs.candidate_pool.result == 'success' || needs.candidate_pool.result == 'skipped'))
 
     env:
       TZ: Asia/Seoul
@@ -170,47 +231,41 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      EMERGENCY_UNIVERSE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.EMERGENCY_UNIVERSE_BUILD || '0' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
 
-      DIAG_FULL_REHEARSAL: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_FULL_REHEARSAL || '0' }}
-      DIAG_REHEARSAL_KIS_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.DIAG_REHEARSAL_KIS_CALLS || '1' }}
-      NONTRADING_UNIVERSE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.NONTRADING_UNIVERSE_SMOKE || '0' }}
+      # candidate pool 사용 활성화
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
 
-      # [NEW] 강제 실행 및 Watchlist 모드
-      FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_RUN || '0' }}
-      WATCHLIST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST_MODE || '0' }}
-      WATCHLIST: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST || '005930,000660,035420,035720,005380' }}
-
-      # [5] GitHub Actions / 실행 env도 LIVE로 고정
       DB_ONLY: "0"
       NONTRADING_SMOKE: "0"
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRY_RUN || '0' }}
-      LIVE_TRADING_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.LIVE_TRADING_ENABLED || '1' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN || '0' }}
+      LIVE_TRADING_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.LIVE_TRADING_ENABLED || '1' }}
       DISABLE_LIVE_TRADING: "0"
       STRATEGY_MODE: "LIVE"
 
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
-
       PB1_PRICE_PROBE: "1"
 
       UNIVERSE_SOURCE: "DB_ONLY"
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
 
-      # PB1 Watchlist configuration
       PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_AUTOBUILD: "1"  # [NEW] Auto-build watchlist if missing
-      PB1_WATCHLIST_TOPK: "20"  # Reduced for actual trading
-      PB1_WATCHLIST_FINALN: "10"  # Reduced for actual trading
+      PB1_WATCHLIST_AUTOBUILD: "1"
+      PB1_WATCHLIST_TOPK: "20"
+      PB1_WATCHLIST_FINALN: "10"
       PB1_WATCHLIST_MIN_PRICE: "2000"
       PB1_WATCHLIST_LIQ_DAYS: "20"
       PB1_WATCHLIST_MIN_ROWS: "30"
       PB1_WATCHLIST_FORCE_REBUILD: "0"
-      PB1_WATCHLIST_STRICT: "0"  # [CHANGED] Allow fallback to universe if watchlist fails
-      PB1_MIN_CANDIDATES: "1"  # Allow at least 1 candidate for trading
-      PB1_TARGET_NEW_POSITIONS: "2"  # Limit new positions to prevent overbuying
+      PB1_WATCHLIST_STRICT: "0"
+      PB1_MIN_CANDIDATES: "1"
+      PB1_TARGET_NEW_POSITIONS: "2"
 
       DB_DISABLE_PREPARED_STATEMENTS: "1"
 
@@ -226,14 +281,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('repo/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
         run: |
@@ -260,26 +309,33 @@ jobs:
         id: market_mode
         run: |
           set -euo pipefail
-          python - << 'PY'
+          python - <<'PY'
           import os
           from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+
           now = now_kst()
           is_weekday = is_trading_weekday(now)
           window = calc_market_window_kst(now)
           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
+
           mode = "LIVE" if in_market else "DIAG"
           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
-          # ✅ DIAG 모드에서는 매수 로직도 검증하기 위해 phase를 entry로 설정
+
+          # DIAG에서도 매수/필터 검증하려고 entry로 고정
           if mode == "DIAG":
               pb1_phase = "entry"
+
           live_ok = "true" if in_market else "false"
           kis_http = "1" if in_market else "0"
+
           print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}")
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
               f.write(f"KIS_HTTP_ENABLED={kis_http}\n")
+
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"live_ok={live_ok}\n")
           PY
@@ -315,21 +371,7 @@ jobs:
           set -euo pipefail
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
-      - name: Ensure watchlist (auto build if empty)
-        env:
-          PB1_WATCHLIST_AUTOBUILD: "1"
-        run: |
-          set -euo pipefail
-          echo "[WATCHLIST] Auto-build enabled: PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
-          echo "[WATCHLIST] Will auto-create today's watchlist if missing"
-
-      - name: DB universe precheck
-        run: |
-          set -euo pipefail
-          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
-
       - name: Run PB1 (AUTO -> LIVE in-market, DIAG after-hours)
-        shell: bash
         env:
           STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
           PB1_PHASE_DEFAULT: ${{ env.PB1_PHASE_DEFAULT }}
@@ -339,88 +381,13 @@ jobs:
           PB1_ALLOW_OUTSIDE_WINDOWS: "1"
         run: |
           set -euo pipefail
-          echo "[RUNNER] STRATEGY_MODE=${STRATEGY_MODE:-AUTO} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-entry} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-AUTO} PB1_DIAG_FULL_EXEC=${PB1_DIAG_FULL_EXEC}"
+          echo "======================================"
+          echo "Trade Tick"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Mode: ${STRATEGY_MODE:-AUTO}"
+          echo "PB1_PHASE_DEFAULT: ${PB1_PHASE_DEFAULT:-entry}"
+          echo "KIS_HTTP_ENABLED: ${KIS_HTTP_ENABLED:-AUTO}"
+          echo "======================================"
           python -m trader.pb1_runner
-
-      - name: Scan for SQLite artifacts
-        if: always()
-        run: |
-          set -euo pipefail
-          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
-          if [ -n "$hits" ]; then
-            echo "::error::SQLite artifacts detected (forbidden):"
-            echo "$hits"
-            exit 1
-          fi
-          echo "OK: no sqlite artifacts."
-
-  close_cancel:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 15
-
-    env:
-      TZ: Asia/Seoul
-      PYTHONUNBUFFERED: "1"
-      PYTHONPATH: ${{ github.workspace }}/repo
-
-      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
-      CANO: ${{ secrets.CANO }}
-      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-
-      APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
-
-      UNIVERSE_SOURCE: "DB_ONLY"
-      BOTSTATE_DISABLED: "1"
-      SQLITE_DISABLED: "1"
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: "nullim"
-          path: repo
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: "Guard: postgres-only"
-        run: |
-          set -euo pipefail
-          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
-          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
-            echo "::error::PBCORE_DB_URL must be postgres-only."
-            exit 1
-          fi
-
-      - name: Run close-cancel
-        run: |
-          set -euo pipefail
-          python -m trader.pb1_runner --window auto --phase auto
-
-      - name: Scan for SQLite artifacts
-        if: always()
-        run: |
-          set -euo pipefail
-          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
-          if [ -n "$hits" ]; then
-            echo "::error::SQLite artifacts detected (forbidden):"
-            echo "$hits"
-            exit 1
-          fi
-          echo "OK: no sqlite artifacts."
