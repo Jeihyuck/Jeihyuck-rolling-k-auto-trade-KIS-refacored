@@ -319,15 +319,19 @@ def main():
     
     # 유니버스 로드
     universe_repo = UniverseRepo(engine)
+    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", os.getenv("KIS_ENV", args.env))
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
-    members = universe_repo.get_current_universe_members(env=args.env, strategy=universe_strategy)
+    members = universe_repo.get_current_universe_members(env=universe_env, strategy=universe_strategy)
     
     if not members:
         logger.error("[CANDIDATE_POOL][CLI] no universe members found")
         sys.exit(1)
     
-    logger.info("[CANDIDATE_POOL][CLI] universe loaded: %s members", len(members))
-    print(f"[CANDIDATE_POOL] universe_strategy={universe_strategy} members={len(members)}")
+    logger.info(
+        "[CANDIDATE_POOL][CLI] universe loaded: universe_env=%s universe_strategy=%s members=%s",
+        universe_env, universe_strategy, len(members)
+    )
+    print(f"[CANDIDATE_POOL] universe_env={universe_env} universe_strategy={universe_strategy} members={len(members)}")
     
     # OHLCV 프로바이더 설정
     kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "1") == "1"

@@ -44,9 +44,9 @@ on:
   push:
     branches: ["nullim"]
     paths:
-      - "repo/trader/**"
+      - ".github/workflows/**"
+      - "repo/**"
       - "trader/**"
-      - ".github/workflows/trade-runner.yml"
 
 defaults:
   run:
@@ -98,6 +98,9 @@ jobs:
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
 
+      # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
+      CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
+
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
       CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
@@ -138,6 +141,70 @@ jobs:
         run: |
           set -euo pipefail
           python -m trader.db.migrate
+
+      - name: Debug DB target
+        run: |
+          set -euo pipefail
+          echo "[DEBUG] PBCORE_DB_URL=${PBCORE_DB_URL:0:30}..."
+          echo "[DEBUG] STRATEGY_ENV=${STRATEGY_ENV}"
+          echo "[DEBUG] KIS_ENV=${KIS_ENV}"
+          echo "[DEBUG] CANDIDATE_POOL_UNIVERSE_ENV=${CANDIDATE_POOL_UNIVERSE_ENV}"
+          echo "[DEBUG] CANDIDATE_POOL_UNIVERSE_STRATEGY=${CANDIDATE_POOL_UNIVERSE_STRATEGY}"
+
+      - name: Ensure universe exists in DB (build if missing)
+        run: |
+          set -euo pipefail
+
+          UENV="${CANDIDATE_POOL_UNIVERSE_ENV:-${KIS_ENV}}"
+          USTRAT="${CANDIDATE_POOL_UNIVERSE_STRATEGY:-best_k_meta}"
+
+          echo "[UNIVERSE][ENSURE] env=${UENV} strategy=${USTRAT}"
+
+          # 1) 먼저 존재 여부 체크 (DB에 멤버가 1개라도 있으면 OK)
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import UniverseRepo
+
+          uenv = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV") or os.getenv("KIS_ENV")
+          ustrat = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY","best_k_meta")
+
+          engine = get_engine()
+          repo = UniverseRepo(engine)
+          members = repo.get_current_universe_members(env=uenv, strategy=ustrat) or []
+          print(f"[UNIVERSE][CHECK] env={uenv} strategy={ustrat} members={len(members)}")
+          sys.exit(0 if len(members) > 0 else 2)
+          PY
+          rc=$?
+
+          if [ "$rc" -eq 0 ]; then
+            echo "[UNIVERSE][ENSURE] already exists"
+            exit 0
+          fi
+
+          echo "[UNIVERSE][ENSURE] missing -> running universe build..."
+
+          # 2) 기존 universe build 커맨드 호출
+          python -m trader.universe.build --env "${UENV}" --strategy "${USTRAT}"
+
+          # 3) 빌드 후 재검증
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import UniverseRepo
+
+          uenv = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV") or os.getenv("KIS_ENV")
+          ustrat = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY","best_k_meta")
+
+          engine = get_engine()
+          repo = UniverseRepo(engine)
+          members = repo.get_current_universe_members(env=uenv, strategy=ustrat) or []
+          print(f"[UNIVERSE][VERIFY] env={uenv} strategy={ustrat} members={len(members)}")
+          if len(members) == 0:
+              print("[UNIVERSE][FAIL] still empty after build")
+              sys.exit(1)
+          print("[UNIVERSE][OK] ready")
+          PY
 
       - name: Candidate pool build
         run: |
