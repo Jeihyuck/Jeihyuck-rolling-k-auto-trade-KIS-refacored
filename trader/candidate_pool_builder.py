@@ -173,7 +173,7 @@ def build_and_save_candidate_pool(
         후보군 종목코드 리스트
     """
     repo = WatchlistRepo(engine)
-    strategy = CANDIDATE_POOL_STRATEGY_KEY
+    strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
     
     # 이미 당일 후보군이 있으면 재사용
     if not force_rebuild:
@@ -201,7 +201,7 @@ def build_and_save_candidate_pool(
         logger.error("[CANDIDATE_POOL][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
     
-    # DB에 저장 (WATCHLIST 테이블에 strategy=best_k_meta__pool로 저장)
+    # DB에 저장 (WATCHLIST 테이블에 저장)
     pool_members = [{"code": code} for code in pool_codes]
     repo.save_watchlist(
         env=env,
@@ -211,8 +211,8 @@ def build_and_save_candidate_pool(
     )
     
     logger.info(
-        "[CANDIDATE_POOL][SAVE] env=%s strategy=%s as_of=%s count=%s",
-        env, strategy, as_of, len(pool_codes)
+        "[CANDIDATE_POOL][SAVE] env=%s strategy=%s size=%s as_of=%s",
+        env, strategy, len(pool_codes), as_of
     )
     
     return pool_codes
@@ -241,7 +241,7 @@ def load_candidate_pool(
         - reason: "hit" | "expired" | "missing" | "too_small"
     """
     repo = WatchlistRepo(engine)
-    strategy = CANDIDATE_POOL_STRATEGY_KEY
+    strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
     
     # 최신 후보군 날짜 조회
     latest_date = repo.get_latest_watchlist_date(env=env, strategy=strategy)
@@ -324,14 +324,14 @@ def main():
     members = universe_repo.get_current_universe_members(env=universe_env, strategy=universe_strategy)
     
     if not members:
-        logger.error("[CANDIDATE_POOL][CLI] no universe members found")
+        logger.error("[CANDIDATE_POOL][UNIVERSE] no members found env=%s strategy=%s", universe_env, universe_strategy)
         sys.exit(1)
     
     logger.info(
-        "[CANDIDATE_POOL][CLI] universe loaded: universe_env=%s universe_strategy=%s members=%s",
+        "[CANDIDATE_POOL][UNIVERSE] env=%s strategy=%s members=%s",
         universe_env, universe_strategy, len(members)
     )
-    print(f"[CANDIDATE_POOL] universe_env={universe_env} universe_strategy={universe_strategy} members={len(members)}")
+    print(f"[CANDIDATE_POOL][UNIVERSE] env={universe_env} strategy={universe_strategy} members={len(members)}")
     
     # OHLCV 프로바이더 설정
     kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "1") == "1"
