@@ -59,6 +59,7 @@ jobs:
       CANDIDATE_POOL_SIZE: "120"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
 
       # Strategy key base
       STRATEGY_KEY: "best_k_meta"
@@ -137,17 +138,6 @@ jobs:
           print(f"[VERIFY][OK] Pool size {pool_size} meets minimum requirement")
           print(f"[VERIFY][NOW] now_kst={now_kst().isoformat()} prev_business_day={prev_business_day(now_kst().date())}")
           PY
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "======================================"
-          echo "Candidate Pool Build Summary"
-          echo "======================================"
-          echo "Status: ${{ job.status }}"
-          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Env: ${STRATEGY_ENV}"
-          echo "======================================
 
       - name: Summary
         if: always()
