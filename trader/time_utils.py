@@ -146,3 +146,30 @@ def market_close_dt_kst(dt: datetime) -> datetime:
     """
     return dt.replace(hour=15, minute=15, second=0, microsecond=0)
 
+
+def prev_business_day(d: date) -> date:
+    """
+    주어진 날짜의 이전 영업일(월~금) 반환.
+    
+    Args:
+        d: 기준 날짜
+    
+    Returns:
+        이전 영업일 (date 객체)
+    
+    Examples:
+        >>> prev_business_day(date(2026, 2, 3))  # 화요일
+        date(2026, 2, 2)  # 월요일
+        >>> prev_business_day(date(2026, 2, 1))  # 일요일
+        date(2026, 1, 31)  # 금요일
+        >>> prev_business_day(date(2026, 2, 2))  # 월요일
+        date(2026, 1, 31)  # 금요일
+    """
+    prev = d - timedelta(days=1)
+    
+    # 주말이면 금요일까지 거슬러 올라감
+    while prev.weekday() >= 5:  # 토(5), 일(6)
+        prev -= timedelta(days=1)
+    
+    return prev
+

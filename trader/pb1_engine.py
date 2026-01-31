@@ -1475,6 +1475,16 @@ class PB1Engine:
         members_list = list(members)  # Iterable → list 변환
         universe_count = len(members_list)
         
+        # ✅ 가드: 후보군 사용 시 195 universe 재검사 방지
+        from trader.config import CANDIDATE_POOL_ENABLED
+        if CANDIDATE_POOL_ENABLED and universe_count > 150:
+            logger.error(
+                "[CANDIDATE_POOL][GUARD] CRITICAL: universe_count=%s exceeds 150, "
+                "candidate pool system should have reduced this! "
+                "Check _load_today_watchlist_members logic.",
+                universe_count
+            )
+        
         # ✅ 프리필터 적용 (Top N으로 제한)
         if os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
             members_list = self._prefilter_members_fast(members_list)
@@ -4078,42 +4088,141 @@ class PB1Engine:
 
     def _load_today_watchlist_members(self) -> tuple[list[dict], str]:
         """
-        주간 워치리스트를 로드하고, 없으면 fallback 전략 적용.
+        ✅ NEW: 후보군(Candidate Pool) 우선 사용 로직.
         
-        ✅ 설계 1: 오늘(today)이 아니라 이번 주 월요일(week_monday) 키로 로드
-        ✅ STRICT 기본값 0으로 변경 (절대 엔진 종료하지 않음)
-        ✅ fallback 로직 강화: 유니버스 전체 사용
+        1. 후보군이 유효하면 → 후보군 사용
+        2. 후보군 없음/만료/작음 + ENABLED=1 → 가벼운 스캔으로 후보군 생성 후 사용
+        3. 최종 fallback → 195 유니버스 사용 (EMERGENCY)
         """
-        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
-        watchlist_strict = os.getenv("PB1_WATCHLIST_STRICT", "0") == "1"  # ✅ 기본값 0
+        from trader.candidate_pool_builder import (
+            load_candidate_pool,
+            build_and_save_candidate_pool,
+            CandidatePoolBuilder,
+        )
+        from trader.config import (
+            CANDIDATE_POOL_ENABLED,
+            CANDIDATE_POOL_FORCE_REBUILD,
+            CANDIDATE_POOL_MIN_SIZE,
+        )
         
-        if not watchlist_enabled:
-            logger.info("[PB1][WATCHLIST] disabled -> use full universe")
-            members = self._load_universe()
-            return members, "universe_full"
+        # ✅ 후보군 시스템 비활성화 시 기존 워치리스트 로직 사용
+        if not CANDIDATE_POOL_ENABLED:
+            logger.info("[CANDIDATE_POOL] disabled -> fallback to legacy watchlist logic")
+            return self._load_legacy_watchlist_members()
         
-        # ✅ 설계 1: 이번 주 월요일 키 계산
         today = self._today
         
-        # ✅ normalize today to date for watchlist keys
+        # normalize today to date
         if isinstance(today, str):
             today = today.split("T")[0]
             today = date.fromisoformat(today)
         elif isinstance(today, datetime):
             today = today.date()
         
-        as_of = week_monday(today)  # ✅ 주간 키로 변경
-        
-        # 전체 유니버스 로드 (watchlist 생성/fallback에 필요)
+        # 전체 유니버스 로드 (후보군 생성에 필요)
         full_members = self._load_universe()
         
-        # Watchlist 로드
+        # ✅ STEP 1: 후보군 로드 (TTL 검사 포함)
+        pool_codes, pool_as_of, pool_reason = load_candidate_pool(
+            engine=self.engine,
+            env=self.env,
+            today=today,
+        )
+        
+        # ✅ STEP 2: 후보군이 유효하면 사용
+        if pool_reason == "hit" and pool_codes:
+            logger.info(
+                "[CANDIDATE_POOL][USAGE] candidates_universe_size=%s as_of=%s (NOT 195)",
+                len(pool_codes), pool_as_of
+            )
+            members = [
+                {
+                    "code": code,
+                    "name": self._code_name_map.get(code, ""),
+                }
+                for code in pool_codes
+            ]
+            return members, f"candidate_pool_hit"
+        
+        # ✅ STEP 3: 후보군 없음/만료/작음 → 가벼운 스캔으로 생성
+        logger.warning(
+            "[CANDIDATE_POOL][MISS] reason=%s -> rebuild_light_scan",
+            pool_reason
+        )
+        
+        try:
+            # 후보군 생성 (가벼운 스캔)
+            force_rebuild = CANDIDATE_POOL_FORCE_REBUILD
+            pool_codes = build_and_save_candidate_pool(
+                engine=self.engine,
+                env=self.env,
+                as_of=today,
+                members=full_members,
+                ohlcv_provider=self._fetch_daily,
+                force_rebuild=force_rebuild,
+            )
+            
+            if pool_codes and len(pool_codes) >= CANDIDATE_POOL_MIN_SIZE:
+                logger.info(
+                    "[CANDIDATE_POOL][BUILD][SUCCESS] generated=%s saved to DB",
+                    len(pool_codes)
+                )
+                members = [
+                    {
+                        "code": code,
+                        "name": self._code_name_map.get(code, ""),
+                    }
+                    for code in pool_codes
+                ]
+                return members, f"candidate_pool_autobuilt"
+            else:
+                logger.warning(
+                    "[CANDIDATE_POOL][BUILD][TOO_SMALL] generated=%s min=%s -> fallback to universe",
+                    len(pool_codes) if pool_codes else 0,
+                    CANDIDATE_POOL_MIN_SIZE
+                )
+        except Exception as exc:
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL] err=%s -> fallback to universe",
+                exc, exc_info=True
+            )
+        
+        # ✅ STEP 4: 최종 fallback → 195 유니버스 사용 (EMERGENCY)
+        logger.error(
+            "[CANDIDATE_POOL][EMERGENCY] fallback to full universe (195) - THIS SHOULD BE RARE!"
+        )
+        return full_members, "universe_emergency_fallback"
+    
+    def _load_legacy_watchlist_members(self) -> tuple[list[dict], str]:
+        """
+        기존 워치리스트 로직 (CANDIDATE_POOL_ENABLED=0일 때 사용).
+        """
+        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        watchlist_strict = os.getenv("PB1_WATCHLIST_STRICT", "0") == "1"
+        
+        if not watchlist_enabled:
+            logger.info("[PB1][WATCHLIST] disabled -> use full universe")
+            members = self._load_universe()
+            return members, "universe_full"
+        
+        today = self._today
+        
+        if isinstance(today, str):
+            today = today.split("T")[0]
+            today = date.fromisoformat(today)
+        elif isinstance(today, datetime):
+            today = today.date()
+        
+        as_of = week_monday(today)
+        
+        full_members = self._load_universe()
+        
         try:
             watchlist, source = load_today_watchlist_with_fallback(
                 engine=self.engine,
                 env=self.env,
                 strategy=self.strategy,
-                today=as_of,  # ✅ 주간 키 전달
+                today=as_of,
                 members=full_members,
                 ohlcv_provider=self._fetch_daily,
                 minervini_config=self.minervini_config,
@@ -4122,12 +4231,10 @@ class PB1Engine:
             error_msg = f"[PB1][WATCHLIST][LOAD_FAIL] as_of={as_of} err={exc}"
             logger.exception(error_msg)
             
-            # ✅ STRICT 모드: watchlist 실패 시 프로세스 종료
             if watchlist_strict:
                 logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on watchlist failure")
                 raise RuntimeError(f"Watchlist load failed in strict mode: {exc}") from exc
             
-            # ✅ 절대 죽지 않음: fallback to full universe
             logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe on exception")
             return full_members, "universe_fallback_on_error"
         
@@ -4139,14 +4246,24 @@ class PB1Engine:
                 logger.error("[PB1][WATCHLIST][STRICT] strict=1 -> exit on empty watchlist")
                 raise RuntimeError("Watchlist is empty in strict mode")
             
-            # ✅ 절대 죽지 않음: fallback to full universe
             logger.warning("[PB1][WATCHLIST] strict=0 -> fallback to full universe on empty")
             return full_members, "universe_fallback_empty"
         
-        # Watchlist를 members 형식으로 변환
         members = [
             {
                 "code": w["code"],
+                "rank": w.get("rank"),
+                "name": self._code_name_map.get(w["code"], ""),
+                "meta_json": w.get("meta"),
+            }
+            for w in watchlist
+        ]
+        
+        logger.info(
+            "[PB1][WATCHLIST] size=%s source=%s as_of=%s (today=%s) strict=%s",
+            len(members), source, as_of, today, watchlist_strict
+        )
+        return members, source
                 "rank": w.get("rank"),
                 "name": self._code_name_map.get(w["code"], ""),
                 "meta_json": w.get("meta"),

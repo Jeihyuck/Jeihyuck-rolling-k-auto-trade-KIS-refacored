@@ -217,6 +217,16 @@ CONFIG = {
     "KIS_RATE_LIMIT_COOLDOWN_SEC": "8",
     "PRICE_SNAPSHOT_TTL_SEC": "2",
     "DAILY_BAR_TTL_SEC": "1800",
+    # Candidate Pool (주말 후보군 생성/주중 후보군 기반 진입)
+    "CANDIDATE_POOL_ENABLED": "1",                    # 후보군 시스템 활성화
+    "CANDIDATE_POOL_TTL_DAYS": "7",                   # 후보군 유효기간(일)
+    "CANDIDATE_POOL_SIZE": "120",                     # 후보군 목표 수
+    "CANDIDATE_POOL_MIN_SIZE": "40",                  # 최소 후보군 수 (이보다 작으면 fallback)
+    "CANDIDATE_POOL_STRATEGY_KEY": "best_k_meta__pool",  # DB 저장 전략키
+    "CANDIDATE_POOL_FORCE_REBUILD": "0",              # 강제 재생성 (DIAG/수동)
+    "CANDIDATE_POOL_MIN_PRICE": "2000.0",             # 후보군 최소 주가
+    "CANDIDATE_POOL_LIQ_DAYS": "20",                  # 유동성 계산 일수
+    "CANDIDATE_POOL_MIN_ROWS": "30",                  # OHLCV 최소 행수
     # Minervini v2 tuning
     "MINERVINI_RS_MIN": "0.80",
     "MINERVINI_MAX_PYRAMID": "3",
@@ -782,6 +792,17 @@ PB1_WATCHLIST_LIQ_DAYS = int(_cfg("PB1_WATCHLIST_LIQ_DAYS") or "20")
 PB1_WATCHLIST_MIN_ROWS = int(_cfg("PB1_WATCHLIST_MIN_ROWS") or "30")
 PB1_WATCHLIST_FORCE_REBUILD = _cfg_bool("PB1_WATCHLIST_FORCE_REBUILD", fallback=False)
 
+# === [NEW] Candidate Pool 환경변수 ===
+CANDIDATE_POOL_ENABLED = _cfg_bool("CANDIDATE_POOL_ENABLED", fallback=True)
+CANDIDATE_POOL_TTL_DAYS = int(_cfg("CANDIDATE_POOL_TTL_DAYS") or "7")
+CANDIDATE_POOL_SIZE = int(_cfg("CANDIDATE_POOL_SIZE") or "120")
+CANDIDATE_POOL_MIN_SIZE = int(_cfg("CANDIDATE_POOL_MIN_SIZE") or "40")
+CANDIDATE_POOL_STRATEGY_KEY = _cfg("CANDIDATE_POOL_STRATEGY_KEY") or "best_k_meta__pool"
+CANDIDATE_POOL_FORCE_REBUILD = _cfg_bool("CANDIDATE_POOL_FORCE_REBUILD", fallback=False)
+CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
+CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")
+CANDIDATE_POOL_MIN_ROWS = int(_cfg("CANDIDATE_POOL_MIN_ROWS") or "30")
+
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
@@ -812,6 +833,15 @@ logger.info(
     int(PB1_WATCHLIST_ENABLED),
     PB1_WATCHLIST_TOPK,
     PB1_WATCHLIST_FINALN,
+)
+logger.info(
+    "[CONFIG][CANDIDATE_POOL] enabled=%s ttl_days=%s size=%s min_size=%s strategy_key=%s force_rebuild=%s",
+    int(CANDIDATE_POOL_ENABLED),
+    CANDIDATE_POOL_TTL_DAYS,
+    CANDIDATE_POOL_SIZE,
+    CANDIDATE_POOL_MIN_SIZE,
+    CANDIDATE_POOL_STRATEGY_KEY,
+    int(CANDIDATE_POOL_FORCE_REBUILD),
 )
 logger.info(
     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
