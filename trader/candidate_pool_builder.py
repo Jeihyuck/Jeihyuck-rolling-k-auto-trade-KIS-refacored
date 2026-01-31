@@ -23,12 +23,104 @@ from trader.config import (
     CANDIDATE_POOL_MIN_PRICE,
     CANDIDATE_POOL_LIQ_DAYS,
     CANDIDATE_POOL_MIN_ROWS,
+    MARKET_MAP,
 )
-from trader.db.repos import WatchlistRepo
+from trader.db.repos import WatchlistRepo, load_price_daily, upsert_price_daily
 from trader.time_utils import now_kst, prev_business_day
 from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
+
+
+def prefetch_ohlcv_to_db(
+    *,
+    engine: Engine,
+    members: List[Dict[str, Any]],
+    days: int = 250,
+) -> None:
+    """
+    유니버스 멤버들의 OHLCV를 FDR로 가져와서 DB에 저장.
+    
+    Actions runner는 깨끗한 환경이므로 DB에 가격 데이터가 없을 수 있음.
+    candidate pool scoring 전에 이 함수를 실행하여 DB를 채운다.
+    
+    Args:
+        engine: DB 엔진
+        members: 유니버스 멤버 리스트
+        days: 가져올 영업일 수 (기본 250일)
+    """
+    try:
+        import FinanceDataReader as fdr
+    except ImportError:
+        logger.warning("[OHLCV][PREFETCH] FinanceDataReader not available, skipping prefetch")
+        return
+    
+    codes = [m["code"] for m in members]
+    logger.info("[OHLCV][PREFETCH][START] codes=%s days=%s", len(codes), days)
+    
+    end_date = now_kst().date()
+    start_date = end_date - timedelta(days=days * 2)  # 영업일 감안하여 2배
+    
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    for code in codes:
+        try:
+            # 이미 DB에 최근 데이터가 있는지 확인
+            existing = load_price_daily(
+                engine, 
+                code, 
+                start_date=end_date - timedelta(days=30), 
+                end_date=end_date
+            )
+            
+            if existing and len(existing) >= 20:
+                # 최근 20일치 데이터가 있으면 스킵
+                skip_count += 1
+                continue
+            
+            # FDR로 가격 데이터 가져오기
+            df = fdr.DataReader(code, start=start_date, end=end_date)
+            
+            if df is None or df.empty:
+                logger.debug("[OHLCV][PREFETCH][EMPTY] code=%s", code)
+                fail_count += 1
+                continue
+            
+            # DataFrame을 candles 형식으로 변환
+            df = df.reset_index()
+            candles = []
+            for _, row in df.iterrows():
+                candles.append({
+                    "date": row.get("Date", row.name).strftime("%Y-%m-%d") if hasattr(row.get("Date", row.name), "strftime") else str(row.get("Date", row.name)),
+                    "open": float(row.get("Open", 0)),
+                    "high": float(row.get("High", 0)),
+                    "low": float(row.get("Low", 0)),
+                    "close": float(row.get("Close", 0)),
+                    "volume": int(row.get("Volume", 0)),
+                })
+            
+            if not candles:
+                fail_count += 1
+                continue
+            
+            # DB에 저장
+            market = MARKET_MAP.get(code, "KOSPI")
+            upsert_price_daily(engine, candles, market, code)
+            success_count += 1
+            
+            logger.debug("[OHLCV][PREFETCH][OK] code=%s rows=%s", code, len(candles))
+            
+        except Exception as exc:
+            logger.debug("[OHLCV][PREFETCH][FAIL] code=%s err=%s", code, exc)
+            fail_count += 1
+            continue
+    
+    logger.info(
+        "[OHLCV][PREFETCH][DONE] total=%s success=%s skip=%s fail=%s",
+        len(codes), success_count, skip_count, fail_count
+    )
 
 
 class CandidatePoolBuilder:
@@ -142,9 +234,31 @@ class CandidatePoolBuilder:
         result_codes = [item["code"] for item in selected]
         
         logger.info(
-            "[CANDIDATE_POOL][BUILD][DONE] as_of=%s selected=%s (from %s scored)",
-            as_of, len(result_codes), len(scored)
+            "[CANDIDATE_POOL][BUILD][DONE] as_of=%s universe_size=%s scored=%s selected=%s",
+            as_of, len(codes), len(scored), len(result_codes)
         )
+        
+        # ✅ scored=0 즉시 실패 처리
+        if len(scored) == 0:
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL] scored=0 from universe_size=%s. "
+                "Possible causes: (1) OHLCV data missing for all symbols, "
+                "(2) env/strategy mismatch between universe and candidate pool, "
+                "(3) network/API failure. "
+                "Check: universe env/strategy, OHLCV provider availability, DB connection.",
+                len(codes)
+            )
+            sys.exit(2)
+        
+        # ✅ selected < min_size 즉시 실패 처리
+        min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+        if len(result_codes) < min_size:
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL] selected=%s < min_size=%s (from %s scored). "
+                "Filter criteria too strict or data quality issue.",
+                len(result_codes), min_size, len(scored)
+            )
+            sys.exit(3)
         
         return result_codes
 
@@ -186,6 +300,13 @@ def build_and_save_candidate_pool(
             )
             return codes
     
+    # ✅ OHLCV 프리패치 (scoring 전에 DB에 가격 데이터 채우기)
+    logger.info("[CANDIDATE_POOL][PREFETCH] starting OHLCV prefetch for %s members", len(members))
+    try:
+        prefetch_ohlcv_to_db(engine=engine, members=members, days=250)
+    except Exception as exc:
+        logger.warning("[CANDIDATE_POOL][PREFETCH][FAIL] err=%s (continuing with existing DB data)", exc)
+    
     # 후보군 생성
     builder = CandidatePoolBuilder(
         ohlcv_provider=ohlcv_provider,
@@ -203,6 +324,12 @@ def build_and_save_candidate_pool(
     
     # DB에 저장 (WATCHLIST 테이블에 저장)
     pool_members = [{"code": code} for code in pool_codes]
+    
+    # ✅ 빈 리스트 체크 (이중 안전장치)
+    if not pool_members:
+        logger.warning("[WATCHLIST][SAVE] empty members -> skip (but this should have failed earlier)")
+        return pool_codes
+    
     repo.save_watchlist(
         env=env,
         strategy=strategy,
@@ -309,6 +436,14 @@ def main():
     
     logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, args.env)
     
+    # 환경 변수 출력 (디버깅용)
+    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", os.getenv("KIS_ENV", args.env))
+    universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
+    logger.info(
+        "[CANDIDATE_POOL][CONFIG] CANDIDATE_POOL_UNIVERSE_ENV=%s CANDIDATE_POOL_UNIVERSE_STRATEGY=%s",
+        universe_env, universe_strategy
+    )
+    
     # DB 연결
     from trader.db.engine import get_engine
     from trader.db.repos import UniverseRepo
@@ -319,12 +454,17 @@ def main():
     
     # 유니버스 로드
     universe_repo = UniverseRepo(engine)
-    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", os.getenv("KIS_ENV", args.env))
-    universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     members = universe_repo.get_current_universe_members(env=universe_env, strategy=universe_strategy)
     
     if not members:
-        logger.error("[CANDIDATE_POOL][UNIVERSE] no members found env=%s strategy=%s", universe_env, universe_strategy)
+        logger.error(
+            "[CANDIDATE_POOL][UNIVERSE][FAIL] no members found. "
+            "env=%s strategy=%s. "
+            "Check: (1) universe_build job ran successfully, "
+            "(2) env/strategy match between universe_build and candidate_pool, "
+            "(3) PBCORE_DB_URL points to correct database",
+            universe_env, universe_strategy
+        )
         sys.exit(1)
     
     logger.info(
