@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
@@ -86,3 +86,15 @@ def make_engine() -> sa.Engine:
             "Postgres driver missing. Install psycopg[binary]. "
             "Ensure psycopg is installed."
         ) from exc
+
+
+# 싱글톤 엔진 인스턴스
+_engine_instance: Optional[sa.Engine] = None
+
+
+def get_engine() -> sa.Engine:
+    """DB 엔진 싱글톤 getter - 모든 코드에서 통일해서 사용."""
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = make_engine()
+    return _engine_instance

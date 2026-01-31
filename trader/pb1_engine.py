@@ -4103,6 +4103,8 @@ class PB1Engine:
             CANDIDATE_POOL_ENABLED,
             CANDIDATE_POOL_FORCE_REBUILD,
             CANDIDATE_POOL_MIN_SIZE,
+            CANDIDATE_POOL_SIZE,
+            CANDIDATE_POOL_MIN_PRICE,
         )
         
         # ✅ 후보군 시스템 비활성화 시 기존 워치리스트 로직 사용
@@ -4187,9 +4189,43 @@ class PB1Engine:
                 exc, exc_info=True
             )
         
-        # ✅ STEP 4: 최종 fallback → 195 유니버스 사용 (EMERGENCY)
+        # ✅ STEP 4: 최종 fallback → 가벼운 프리필터 후 제한된 유니버스 사용 (EMERGENCY)
         logger.error(
-            "[CANDIDATE_POOL][EMERGENCY] fallback to full universe (195) - THIS SHOULD BE RARE!"
+            "[CANDIDATE_POOL][EMERGENCY] fallback to filtered universe - applying lightweight filter to avoid timeout"
+        )
+        
+        # timeout-safe: 195 전체가 아니라 상위 80~100개만 사용 (최소 프리필터)
+        try:
+            builder = CandidatePoolBuilder(
+                ohlcv_provider=self._fetch_daily,
+                target_size=min(CANDIDATE_POOL_SIZE, 100),  # 최대 100개로 제한
+                min_price=CANDIDATE_POOL_MIN_PRICE,
+                liq_days=30,  # 30일로 단축 (timeout 방지)
+                min_rows=30,
+            )
+            emergency_codes = builder.build_light_scan(members=full_members, as_of=today)
+            if emergency_codes:
+                logger.warning(
+                    "[CANDIDATE_POOL][EMERGENCY] filtered universe: %s (from 195)",
+                    len(emergency_codes)
+                )
+                members = [
+                    {
+                        "code": code,
+                        "name": self._code_name_map.get(code, ""),
+                    }
+                    for code in emergency_codes
+                ]
+                return members, "universe_emergency_filtered"
+        except Exception as emergency_exc:
+            logger.error(
+                "[CANDIDATE_POOL][EMERGENCY][FAIL] emergency filter failed: %s",
+                emergency_exc, exc_info=True
+            )
+        
+        # 최종 최후의 수단: 195 전체 (timeout 위험 있음)
+        logger.critical(
+            "[CANDIDATE_POOL][CRITICAL] all fallbacks failed -> using full 195 universe (TIMEOUT RISK!)"
         )
         return full_members, "universe_emergency_fallback"
     

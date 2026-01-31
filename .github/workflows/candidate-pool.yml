@@ -1,23 +1,28 @@
 name: Candidate Pool Weekly Build
 
-# 토요일 KST 00:30 = UTC 금요일 15:30
-# 주말에 후보군 생성하여 DB에 저장
-
 on:
   workflow_dispatch:
     inputs:
       FORCE_REBUILD:
-        description: "강제 재생성 (1=활성)"
+        description: "Force rebuild (1=yes, 0=no)"
         required: false
         default: "1"
       ENV:
-        description: "환경 (LIVE/PAPER)"
+        description: "Environment (LIVE/PAPER)"
         required: false
         default: "PAPER"
 
+  # Sat 00:30 KST = Fri 15:30 UTC
   schedule:
-    # Fri 15:30 UTC = Sat 00:30 KST
     - cron: "30 15 * * 5"
+
+  # (선택) 후보군 로직 관련 파일 변경 시에만 push 트리거
+  push:
+    branches: [ "nullim" ]
+    paths:
+      - "trader/candidate_pool_builder.py"
+      - "trader/candidate_pool/**"
+      - ".github/workflows/candidate-pool.yml"
 
 permissions:
   contents: read
@@ -29,48 +34,47 @@ concurrency:
 defaults:
   run:
     shell: bash
-    working-directory: repo
 
 jobs:
   build_pool:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
-      PYTHONPATH: ${{ github.workspace }}/repo
+      PYTHONPATH: ${{ github.workspace }}
 
-      # DB 연결
+      # DB
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
 
-      # 전략/환경 (schedule에는 inputs가 없으니 안전 분기)
+      # 모드/환경
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
-
-      # KIS HTTP 비활성화 (DIAG 모드에서 KRX fallback 사용)
+      STRATEGY_ENV: ${{ github.event.inputs.ENV || 'PAPER' }}
       KIS_HTTP_ENABLED: "0"
 
-      # 후보군 설정
+      # Candidate Pool
       CANDIDATE_POOL_ENABLED: "1"
-      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_REBUILD || '1' }}
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event.inputs.FORCE_REBUILD || '1' }}
       CANDIDATE_POOL_SIZE: "120"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
+
+      # Strategy key base
+      STRATEGY_KEY: "best_k_meta"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          path: repo
           fetch-depth: 1
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: repo/requirements.txt
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -97,57 +101,53 @@ jobs:
 
       - name: Verify pool saved
         run: |
-          echo "======================================"
-          echo "Verifying candidate pool in DB..."
-          echo "======================================"
-
           python - <<'PY'
-          import os
-          import sys
-
-          # engine getter: 프로젝트에 맞는 위치로 조정 필요할 수 있음
-          # 1순위: trader.db.engine.get_engine
-          # 2순위: trader.db.migrate.get_engine
-          get_engine = None
-          try:
-              from trader.db.engine import get_engine as _get_engine
-              get_engine = _get_engine
-          except Exception:
-              try:
-                  from trader.db.migrate import get_engine as _get_engine
-                  get_engine = _get_engine
-              except Exception as e:
-                  print("[VERIFY][FAIL] get_engine import failed:", repr(e))
-                  sys.exit(1)
-
+          import os, sys
+          from trader.db.engine import get_engine
           from trader.db.repos import WatchlistRepo
-          from trader.config import CANDIDATE_POOL_STRATEGY_KEY
+          from trader.time_utils import prev_business_day, now_kst
 
           env = os.getenv("STRATEGY_ENV", "PAPER")
-          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+          strategy_key = os.getenv("STRATEGY_KEY", "best_k_meta")
+          pool_strategy_key = f"{strategy_key}__pool"
 
           engine = get_engine()
           repo = WatchlistRepo(engine)
 
-          latest_date = repo.get_latest_watchlist_date(env=env, strategy=CANDIDATE_POOL_STRATEGY_KEY)
-          if not latest_date:
-              print("[VERIFY][FAIL] No candidate pool found in DB")
-              sys.exit(1)
+          # 가장 최신 후보군 날짜 조회
+          latest = repo.get_latest_watchlist_date(env=env, strategy=pool_strategy_key)
 
-          pool = repo.load_watchlist(env=env, strategy=CANDIDATE_POOL_STRATEGY_KEY, as_of=latest_date)
-          pool_size = len(pool or [])
-          if pool_size == 0:
-              print(f"[VERIFY][FAIL] Candidate pool is empty (as_of={latest_date})")
-              sys.exit(1)
+          if not latest:
+            print("[VERIFY][FAIL] No candidate pool found in DB")
+            sys.exit(1)
 
-          print(f"[VERIFY][SUCCESS] Candidate pool saved: as_of={latest_date} size={pool_size}")
+          pool = repo.load_watchlist(env=env, strategy=pool_strategy_key, as_of=latest)
+          if not pool:
+            print(f"[VERIFY][FAIL] Candidate pool is empty (as_of={latest})")
+            sys.exit(1)
 
+          pool_size = len(pool)
+          print(f"[VERIFY][SUCCESS] Candidate pool saved: as_of={latest} size={pool_size}")
+
+          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
           if pool_size < min_size:
-              print(f"[VERIFY][FAIL] Pool size {pool_size} is below minimum {min_size}")
-              sys.exit(1)
+            print(f"[VERIFY][FAIL] Pool size {pool_size} is below minimum {min_size}")
+            sys.exit(1)
 
           print(f"[VERIFY][OK] Pool size {pool_size} meets minimum requirement")
+          print(f"[VERIFY][NOW] now_kst={now_kst().isoformat()} prev_business_day={prev_business_day(now_kst().date())}")
           PY
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "======================================"
+          echo "Candidate Pool Build Summary"
+          echo "======================================"
+          echo "Status: ${{ job.status }}"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "======================================
 
       - name: Summary
         if: always()

@@ -310,7 +310,7 @@ def main():
     logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, args.env)
     
     # DB 연결
-    from trader.db.migrate import get_engine
+    from trader.db.engine import get_engine
     from trader.db.repos import UniverseRepo
     from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
     from trader.kis_wrapper import KisAPI
