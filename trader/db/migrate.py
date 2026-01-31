@@ -8,6 +8,9 @@ from sqlalchemy import Engine, text
 
 from pathlib import Path
 
+# Backward-compatible alias for get_engine
+# (다른 코드가 migrate.get_engine을 사용할 수 있어서 호환성 유지)
+from trader.db.engine import get_engine  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
