@@ -18,6 +18,9 @@ def test_build_universe_succeeds_on_empty_payload(monkeypatch):
         def __init__(self, _engine):
             return None
 
+        def start_universe_run(self, **_kwargs):
+            return "fake-run-id"
+
         def store_universe_snapshot(self, **_kwargs):
             return "fake-run"
 

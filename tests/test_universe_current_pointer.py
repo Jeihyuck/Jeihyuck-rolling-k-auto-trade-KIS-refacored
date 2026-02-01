@@ -16,7 +16,14 @@ def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
     run_migrations(engine)
     repo = UniverseRepo(engine)
 
+    run_id1 = repo.start_universe_run(
+        env="practice",
+        strategy="best_k_meta",
+        as_of_date="2025-01-01",
+        provider="seed_static",
+    )
     repo.store_universe_snapshot(
+        run_id=run_id1,
         env="practice",
         strategy="best_k_meta",
         as_of_date="2025-01-01",
@@ -24,7 +31,15 @@ def test_current_universe_excludes_legacy_codes(tmp_path, monkeypatch):
         members=[{"code": "218410", "market": "KOSDAQ"}],
         reason="legacy",
     )
+    
+    run_id2 = repo.start_universe_run(
+        env="practice",
+        strategy="best_k_meta",
+        as_of_date="2025-01-02",
+        provider="seed_static",
+    )
     repo.store_universe_snapshot(
+        run_id=run_id2,
         env="practice",
         strategy="best_k_meta",
         as_of_date="2025-01-02",

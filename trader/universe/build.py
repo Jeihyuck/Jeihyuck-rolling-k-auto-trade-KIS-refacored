@@ -488,12 +488,13 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     )
 
     # Start run in RUNNING status
+    run_id = None
     try:
         run_id = repo.start_universe_run(env=env, strategy=strategy, as_of_date=as_of_date, provider=source)
         logger.info("[UNIVERSE][RUN][STARTED] run_id=%s", run_id)
     except Exception as exc:
         logger.warning("[UNIVERSE][RUN][START_FAIL] err=%s", exc)
-        # Continue anyway
+        # Continue anyway - operations below will fail gracefully if run_id is None
 
     allowed_chain = providers_for_env(env)
     if provider_override:
@@ -604,8 +605,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         error_reason = f"provider_empty:{last_reason or source}"
         try:
-            if hasattr(repo, "record_universe_run_failure"):
+            if run_id and hasattr(repo, "record_universe_run_failure"):
                 repo.record_universe_run_failure(
+                    run_id=run_id,
                     env=env,
                     strategy=strategy,
                     as_of_date=as_of_date,
@@ -614,7 +616,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                     members_count=0,
                 )
             else:
-                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] record_universe_run_failure not available")
+                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] run_id=%s not available or method missing", run_id)
         except Exception:
             logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
         allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE"
@@ -630,7 +632,11 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         raise RuntimeError("universe_members_empty")
 
     try:
+        if not run_id:
+            logger.warning("[UNIVERSE][STORE][SKIP] run_id not available, skipping snapshot")
+            raise RuntimeError("run_id_not_available")
         repo.store_universe_snapshot(
+            run_id=run_id,
             env=env,
             strategy=strategy,
             as_of_date=as_of_date,
@@ -641,8 +647,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     except Exception as exc:
         error_reason = f"store_fail:{exc}"
         try:
-            if hasattr(repo, "record_universe_run_failure"):
+            if run_id and hasattr(repo, "record_universe_run_failure"):
                 repo.record_universe_run_failure(
+                    run_id=run_id,
                     env=env,
                     strategy=strategy,
                     as_of_date=as_of_date,
@@ -651,7 +658,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                     members_count=len(members),
                 )
             else:
-                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] record_universe_run_failure not available")
+                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] run_id=%s not available or method missing", run_id)
         except Exception:
             logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
         raise
