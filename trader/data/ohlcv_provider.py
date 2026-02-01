@@ -195,6 +195,33 @@ class KRXOHLCVProvider:
         )
         return OHLCVResult(df_norm, meta)
 
+    def fetch(self, code: str, start=None, end=None, *, as_of=None, days: int | None = None, **kwargs):
+        """
+        Backward-compatible adapter for older callers expecting provider.fetch(...).
+
+        Candidate pool builder currently calls `provider.fetch` but this provider was refactored
+        to expose `get_ohlcv` / `load` / `read_daily` etc. This adapter routes the call to the
+        canonical implementation so build does not crash.
+        """
+        # Calculate days from start/end if not provided
+        if days is None and start is not None and end is not None:
+            from datetime import datetime
+            if isinstance(start, str):
+                start = datetime.strptime(start, "%Y%m%d").date()
+            if isinstance(end, str):
+                end = datetime.strptime(end, "%Y%m%d").date()
+            days = (end - start).days
+        
+        # Default to 180 days if still not determined
+        if days is None:
+            days = 180
+        
+        # Route to get_ohlcv with symbol parameter
+        result = self.get_ohlcv(symbol=code, days=days)
+        
+        # Return DataFrame (unwrap OHLCVResult for backward compatibility)
+        return result.df if hasattr(result, 'df') else result
+
 
 class ChainOHLCVProvider:
     def __init__(self, providers: Iterable[OHLCVProvider], *, env: str | None = None, cache_dir: Path | None = None) -> None:

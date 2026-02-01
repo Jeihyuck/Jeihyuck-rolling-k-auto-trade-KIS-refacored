@@ -147,6 +147,15 @@ class CandidatePoolBuilder:
                 len(codes), len(sample_codes), sample_codes
             )
             
+            # Provider 진단 정보 추가
+            provider_type = type(self.ohlcv_provider).__name__ if hasattr(self.ohlcv_provider, '__name__') else str(type(self.ohlcv_provider))
+            available_methods = [a for a in ["fetch", "get_ohlcv", "load", "read_daily", "read", "__call__"] 
+                                if hasattr(self.ohlcv_provider, a)]
+            logger.error(
+                "[CANDIDATE_POOL][DIAG][PROVIDER] type=%s available_methods=%s",
+                provider_type, available_methods
+            )
+            
             for code in sample_codes:
                 try:
                     df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
