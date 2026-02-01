@@ -192,7 +192,7 @@ jobs:
   candidate_pool:
     name: Candidate Pool Build (weekly or on-demand)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     
     # ✅ universe_build 완료 후 실행
     needs: [universe_build]
@@ -235,6 +235,8 @@ jobs:
       CANDIDATE_POOL_SIZE: "120"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_PREFETCH_DAYS: "180"
+      CANDIDATE_POOL_PREFETCH_CHUNK: "25"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
       CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
@@ -318,6 +320,12 @@ jobs:
           print("[UNIVERSE][OK] ready for candidate pool build")
           PY
 
+      - name: Heartbeat (keep logs alive)
+        run: |
+          set -euo pipefail
+          ( while true; do echo "[HEARTBEAT] $(date '+%F %T %Z') still running..."; sleep 60; done ) &
+          echo "HEARTBEAT_PID=$!" >> $GITHUB_ENV
+
       - name: Candidate pool build
         run: |
           set -euo pipefail
@@ -332,6 +340,12 @@ jobs:
           echo "TTL(days): ${CANDIDATE_POOL_TTL_DAYS}"
           echo "======================================"
           python -m trader.candidate_pool_builder --build pool --env "${STRATEGY_ENV}"
+
+      - name: Stop Heartbeat
+        if: always()
+        run: |
+          set +e
+          if [ -n "${HEARTBEAT_PID:-}" ]; then kill "${HEARTBEAT_PID}" || true; fi
 
       - name: Verify pool saved
         run: |

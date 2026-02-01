@@ -36,7 +36,7 @@ def prefetch_ohlcv_to_db(
     *,
     engine: Engine,
     members: List[Dict[str, Any]],
-    days: int = 250,
+    days: Optional[int] = None,
 ) -> None:
     """
     유니버스 멤버들의 OHLCV를 FDR로 가져와서 DB에 저장.
@@ -47,79 +47,131 @@ def prefetch_ohlcv_to_db(
     Args:
         engine: DB 엔진
         members: 유니버스 멤버 리스트
-        days: 가져올 영업일 수 (기본 250일)
+        days: 가져올 영업일 수 (기본 180일, 환경변수로 조정 가능)
     """
+    import time
     try:
         import FinanceDataReader as fdr
     except ImportError:
         logger.warning("[OHLCV][PREFETCH] FinanceDataReader not available, skipping prefetch")
         return
     
+    # 환경변수로 days 설정 (250 -> 180으로 기본값 변경)
+    if days is None:
+        days = int(os.getenv("CANDIDATE_POOL_PREFETCH_DAYS", "180"))
+    
+    # chunk size 설정 (기본 25)
+    chunk_size = int(os.getenv("CANDIDATE_POOL_PREFETCH_CHUNK", "25"))
+    
     codes = [m["code"] for m in members]
-    logger.info("[OHLCV][PREFETCH][START] codes=%s days=%s", len(codes), days)
+    total_codes = len(codes)
+    logger.info("[OHLCV][PREFETCH][START] codes=%s days=%s chunk_size=%s", total_codes, days, chunk_size)
     
     end_date = now_kst().date()
     start_date = end_date - timedelta(days=days * 2)  # 영업일 감안하여 2배
     
-    success_count = 0
-    skip_count = 0
-    fail_count = 0
+    total_success = 0
+    total_skip = 0
+    total_fail = 0
     
-    for code in codes:
-        try:
-            # 이미 DB에 최근 데이터가 있는지 확인
-            existing = load_price_daily(
-                engine, 
-                code, 
-                start_date=end_date - timedelta(days=30), 
-                end_date=end_date
-            )
-            
-            if existing and len(existing) >= 20:
-                # 최근 20일치 데이터가 있으면 스킵
-                skip_count += 1
-                continue
-            
-            # FDR로 가격 데이터 가져오기
-            df = fdr.DataReader(code, start=start_date, end=end_date)
-            
-            if df is None or df.empty:
-                logger.debug("[OHLCV][PREFETCH][EMPTY] code=%s", code)
+    overall_start = time.time()
+    
+    # chunk별로 분할 처리
+    for chunk_idx in range(0, total_codes, chunk_size):
+        chunk_codes = codes[chunk_idx:chunk_idx + chunk_size]
+        chunk_num = (chunk_idx // chunk_size) + 1
+        total_chunks = (total_codes + chunk_size - 1) // chunk_size
+        
+        chunk_start = time.time()
+        logger.info(
+            "[OHLCV][PREFETCH][CHUNK] chunk=%s/%s codes=%s (indices %s-%s)",
+            chunk_num, total_chunks, len(chunk_codes), chunk_idx, chunk_idx + len(chunk_codes) - 1
+        )
+        
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+        
+        for code in chunk_codes:
+            try:
+                # 이미 DB에 최근 데이터가 있는지 확인
+                existing = load_price_daily(
+                    engine, 
+                    code, 
+                    start_date=end_date - timedelta(days=30), 
+                    end_date=end_date
+                )
+                
+                if existing and len(existing) >= 20:
+                    # 최근 20일치 데이터가 있으면 스킵
+                    skip_count += 1
+                    continue
+                
+                # FDR로 가격 데이터 가져오기 (timeout 적용)
+                df = None
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        df = fdr.DataReader(code, start=start_date, end=end_date)
+                        break
+                    except Exception as fetch_err:
+                        if attempt < max_retries:
+                            logger.warning(
+                                "[OHLCV][PREFETCH][RETRY] code=%s attempt=%s/%s err=%s",
+                                code, attempt, max_retries, str(fetch_err)[:100]
+                            )
+                            time.sleep(1)  # 재시도 전 대기
+                        else:
+                            raise
+                
+                if df is None or df.empty:
+                    logger.debug("[OHLCV][PREFETCH][EMPTY] code=%s", code)
+                    fail_count += 1
+                    continue
+                
+                # DataFrame을 candles 형식으로 변환
+                df = df.reset_index()
+                candles = []
+                for _, row in df.iterrows():
+                    candles.append({
+                        "date": row.get("Date", row.name).strftime("%Y-%m-%d") if hasattr(row.get("Date", row.name), "strftime") else str(row.get("Date", row.name)),
+                        "open": float(row.get("Open", 0)),
+                        "high": float(row.get("High", 0)),
+                        "low": float(row.get("Low", 0)),
+                        "close": float(row.get("Close", 0)),
+                        "volume": int(row.get("Volume", 0)),
+                    })
+                
+                if not candles:
+                    fail_count += 1
+                    continue
+                
+                # DB에 저장
+                market = MARKET_MAP.get(code, "KOSPI")
+                upsert_price_daily(engine, candles, market, code)
+                success_count += 1
+                
+                logger.debug("[OHLCV][PREFETCH][OK] code=%s rows=%s", code, len(candles))
+                
+            except Exception as exc:
+                logger.warning("[OHLCV][PREFETCH][FAIL] code=%s err=%s", code, str(exc)[:100])
                 fail_count += 1
                 continue
-            
-            # DataFrame을 candles 형식으로 변환
-            df = df.reset_index()
-            candles = []
-            for _, row in df.iterrows():
-                candles.append({
-                    "date": row.get("Date", row.name).strftime("%Y-%m-%d") if hasattr(row.get("Date", row.name), "strftime") else str(row.get("Date", row.name)),
-                    "open": float(row.get("Open", 0)),
-                    "high": float(row.get("High", 0)),
-                    "low": float(row.get("Low", 0)),
-                    "close": float(row.get("Close", 0)),
-                    "volume": int(row.get("Volume", 0)),
-                })
-            
-            if not candles:
-                fail_count += 1
-                continue
-            
-            # DB에 저장
-            market = MARKET_MAP.get(code, "KOSPI")
-            upsert_price_daily(engine, candles, market, code)
-            success_count += 1
-            
-            logger.debug("[OHLCV][PREFETCH][OK] code=%s rows=%s", code, len(candles))
-            
-        except Exception as exc:
-            logger.debug("[OHLCV][PREFETCH][FAIL] code=%s err=%s", code, exc)
-            fail_count += 1
-            continue
+        
+        chunk_elapsed = time.time() - chunk_start
+        total_success += success_count
+        total_skip += skip_count
+        total_fail += fail_count
+        
+        logger.info(
+            "[OHLCV][PREFETCH][CHUNK_DONE] chunk=%s/%s elapsed=%.1fs success=%s skip=%s fail=%s",
+            chunk_num, total_chunks, chunk_elapsed, success_count, skip_count, fail_count
+        )
     
+    overall_elapsed = time.time() - overall_start
     logger.info(
-        "[OHLCV][PREFETCH][DONE] total=%s success=%s skip=%s fail=%s",
-        len(codes), success_count, skip_count, fail_count
+        "[OHLCV][PREFETCH][DONE] total_codes=%s success=%s skip=%s fail=%s elapsed=%.1fs",
+        total_codes, total_success, total_skip, total_fail, overall_elapsed
     )
 
 
@@ -303,7 +355,7 @@ def build_and_save_candidate_pool(
     # ✅ OHLCV 프리패치 (scoring 전에 DB에 가격 데이터 채우기)
     logger.info("[CANDIDATE_POOL][PREFETCH] starting OHLCV prefetch for %s members", len(members))
     try:
-        prefetch_ohlcv_to_db(engine=engine, members=members, days=250)
+        prefetch_ohlcv_to_db(engine=engine, members=members)  # days는 환경변수로 처리
     except Exception as exc:
         logger.warning("[CANDIDATE_POOL][PREFETCH][FAIL] err=%s (continuing with existing DB data)", exc)
     
