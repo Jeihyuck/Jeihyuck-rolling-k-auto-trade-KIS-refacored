@@ -707,7 +707,21 @@ class UniverseRepo:
                       )
                 )
                 
-                # (B) Insert members
+                # (B) Insert members - REPLACE strategy (DELETE old + INSERT new)
+                # Check preexisting members for debugging
+                cnt = conn.execute(
+                    sa.select(sa.func.count()).select_from(self._schema.universe_members)
+                      .where(self._schema.universe_members.c.run_id == uuid_value_for_url(db_url, run_id))
+                ).scalar_one()
+                logger.info(f"[UNIVERSE][STORE] preexisting members for run_id={run_id}: {cnt}")
+                
+                # ✅ RESTART/재실행 대비: 기존 멤버 싹 지우고 다시 넣기
+                conn.execute(
+                    sa.delete(self._schema.universe_members)
+                      .where(self._schema.universe_members.c.run_id == uuid_value_for_url(db_url, run_id))
+                )
+                
+                # Now insert fresh members
                 for rank, member in enumerate(members_list, start=1):
                     meta = member.get("meta_json") or {}
                     conn.execute(
