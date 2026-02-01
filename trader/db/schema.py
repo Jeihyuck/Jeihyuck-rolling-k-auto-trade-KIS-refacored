@@ -42,6 +42,7 @@ class SchemaTables:
     reconcile_log: sa.Table
     price_daily: sa.Table
     pb1_watchlist: sa.Table
+    job_checkpoints: sa.Table
     uses_native_uuid: bool
 
 
@@ -284,6 +285,15 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Index("ix_pb1_watchlist_lookup", "env", "strategy", "as_of"),
     )
 
+    job_checkpoints = sa.Table(
+        "job_checkpoints",
+        metadata,
+        sa.Column("job_key", sa.String(512), primary_key=True),
+        sa.Column("updated_ts", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("payload", sa.JSON, nullable=False, default=dict),
+        sa.Index("ix_job_checkpoints_updated", "updated_ts"),
+    )
+
     return SchemaTables(
         database_url=database_url,
         metadata=metadata,
@@ -298,6 +308,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         reconcile_log=reconcile_log,
         price_daily=price_daily,
         pb1_watchlist=pb1_watchlist,
+        job_checkpoints=job_checkpoints,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -336,3 +347,4 @@ LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
 RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 PRICE_DAILY = DEFAULT_SCHEMA.price_daily
 PB1_WATCHLIST = DEFAULT_SCHEMA.pb1_watchlist
+JOB_CHECKPOINTS = DEFAULT_SCHEMA.job_checkpoints

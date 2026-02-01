@@ -13,6 +13,7 @@ from .schema import (
     UNIVERSE_MEMBERS,
     UNIVERSE_RUNS,
     METADATA,
+    JOB_CHECKPOINTS,
 )
 
 
@@ -35,4 +36,5 @@ __all__ = [
     "UNIVERSE_MEMBERS",
     "UNIVERSE_RUNS",
     "METADATA",
+    "JOB_CHECKPOINTS",
 ]

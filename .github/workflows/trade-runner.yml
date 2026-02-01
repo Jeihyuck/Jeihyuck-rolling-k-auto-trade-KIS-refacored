@@ -189,10 +189,10 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-  candidate_pool:
-    name: Candidate Pool Build (weekly or on-demand)
+  candidate_pool_prefetch:
+    name: Candidate Pool OHLCV Prefetch
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     
     # ✅ universe_build 완료 후 실행
     needs: [universe_build]
@@ -231,12 +231,18 @@ jobs:
       KIS_HTTP_ENABLED: "0"
 
       CANDIDATE_POOL_ENABLED: "1"
-      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_REBUILD || '1' }}
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_REBUILD || '0' }}
       CANDIDATE_POOL_SIZE: "120"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
       CANDIDATE_POOL_PREFETCH_DAYS: "180"
       CANDIDATE_POOL_PREFETCH_CHUNK: "25"
+      
+      # 병렬화/timeout/retry 설정
+      OHLCV_PREFETCH_WORKERS: "6"
+      OHLCV_FETCH_TIMEOUT_SEC: "25"
+      OHLCV_FETCH_RETRIES: "1"
+      OHLCV_PREFETCH_VERBOSE: "0"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
       CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
@@ -282,70 +288,146 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
-      - name: Debug DB target
-        run: |
-          set -euo pipefail
-          echo "[DEBUG] PBCORE_DB_URL=${PBCORE_DB_URL:0:30}..."
-          echo "[DEBUG] STRATEGY_ENV=${STRATEGY_ENV}"
-          echo "[DEBUG] KIS_ENV=${KIS_ENV}"
-          echo "[DEBUG] CANDIDATE_POOL_UNIVERSE_ENV=${CANDIDATE_POOL_UNIVERSE_ENV}"
-          echo "[DEBUG] CANDIDATE_POOL_UNIVERSE_STRATEGY=${CANDIDATE_POOL_UNIVERSE_STRATEGY}"
-
-      - name: Verify universe exists (from universe_build job)
-        run: |
-          set -euo pipefail
-
-          UENV="${CANDIDATE_POOL_UNIVERSE_ENV:-${KIS_ENV}}"
-          USTRAT="${CANDIDATE_POOL_UNIVERSE_STRATEGY:-best_k_meta}"
-
-          echo "[UNIVERSE][CHECK] env=${UENV} strategy=${USTRAT}"
-
-          python - <<'PY'
-          import os, sys
-          from trader.db.engine import get_engine
-          from trader.db.repos import UniverseRepo
-
-          uenv = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV") or os.getenv("KIS_ENV")
-          ustrat = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY","best_k_meta")
-
-          engine = get_engine()
-          repo = UniverseRepo(engine)
-          members = repo.get_current_universe_members(env=uenv, strategy=ustrat) or []
-          print(f"[UNIVERSE][CHECK] env={uenv} strategy={ustrat} members={len(members)}")
-          
-          if len(members) == 0:
-              print("[UNIVERSE][FAIL] no members found (universe_build job should have created it)")
-              sys.exit(1)
-          
-          print("[UNIVERSE][OK] ready for candidate pool build")
-          PY
-
       - name: Heartbeat (keep logs alive)
         run: |
           set -euo pipefail
           ( while true; do echo "[HEARTBEAT] $(date '+%F %T %Z') still running..."; sleep 60; done ) &
           echo "HEARTBEAT_PID=$!" >> $GITHUB_ENV
 
-      - name: Candidate pool build
+      - name: OHLCV Prefetch
         run: |
           set -euo pipefail
           echo "======================================"
-          echo "Candidate Pool Build"
+          echo "OHLCV Prefetch (Incremental + Parallel)"
           echo "======================================"
           echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "Env: ${STRATEGY_ENV}"
           echo "Force rebuild: ${CANDIDATE_POOL_FORCE_REBUILD}"
-          echo "Pool size target: ${CANDIDATE_POOL_SIZE}"
-          echo "Pool min size: ${CANDIDATE_POOL_MIN_SIZE}"
-          echo "TTL(days): ${CANDIDATE_POOL_TTL_DAYS}"
+          echo "Workers: ${OHLCV_PREFETCH_WORKERS}"
+          echo "Timeout: ${OHLCV_FETCH_TIMEOUT_SEC}s"
+          echo "Retries: ${OHLCV_FETCH_RETRIES}"
           echo "======================================"
-          python -m trader.candidate_pool_builder --build pool --env "${STRATEGY_ENV}"
+          python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
 
       - name: Stop Heartbeat
         if: always()
         run: |
           set +e
           if [ -n "${HEARTBEAT_PID:-}" ]; then kill "${HEARTBEAT_PID}" || true; fi
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
+  candidate_pool:
+    name: Candidate Pool Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    # ✅ prefetch 완료 후 실행
+    needs: [candidate_pool_prefetch]
+
+    # 실행 조건: prefetch와 동일
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: ${{ secrets.KIS_ENV }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      # 후보군은 무조건 DIAG로 (매매 금지)
+      STRATEGY_MODE: "DIAG"
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+
+      # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
+      KIS_HTTP_ENABLED: "0"
+
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_REBUILD || '0' }}
+      CANDIDATE_POOL_SIZE: "120"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+
+      # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
+      CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
+
+      # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Candidate pool build (build-only)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Candidate Pool Build (build-only mode)"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Pool size target: ${CANDIDATE_POOL_SIZE}"
+          echo "Pool min size: ${CANDIDATE_POOL_MIN_SIZE}"
+          echo "TTL(days): ${CANDIDATE_POOL_TTL_DAYS}"
+          echo "======================================"
+          python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
 
       - name: Verify pool saved
         run: |

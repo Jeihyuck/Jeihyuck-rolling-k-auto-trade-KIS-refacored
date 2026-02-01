@@ -2161,3 +2161,89 @@ def load_watchlist(
     as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
     return repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+
+
+# ========================================
+# OHLCV Helper Functions
+# ========================================
+
+def get_ohlcv_last_date(engine: Engine, stock_code: str) -> Optional[date]:
+    """
+    주어진 종목의 DB에 저장된 OHLCV 마지막 날짜를 조회.
+    
+    Args:
+        engine: DB 엔진
+        stock_code: 종목코드
+    
+    Returns:
+        마지막 날짜 또는 None
+    """
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        stmt = (
+            select(func.max(schema.price_daily.c.date))
+            .where(schema.price_daily.c.code == stock_code)
+        )
+        result = conn.execute(stmt).scalar()
+    return result
+
+
+# ========================================
+# Job Checkpoint Functions
+# ========================================
+
+def load_job_checkpoint(engine: Engine, job_key: str) -> Optional[Dict[str, Any]]:
+    """
+    체크포인트 로드.
+    
+    Args:
+        engine: DB 엔진
+        job_key: 작업 키
+    
+    Returns:
+        payload dict 또는 None
+    """
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        stmt = select(schema.job_checkpoints).where(
+            schema.job_checkpoints.c.job_key == job_key
+        )
+        row = conn.execute(stmt).fetchone()
+        if row:
+            return dict(row.payload) if row.payload else {}
+    return None
+
+
+def save_job_checkpoint(engine: Engine, job_key: str, payload: Dict[str, Any]) -> None:
+    """
+    체크포인트 저장 (upsert).
+    
+    Args:
+        engine: DB 엔진
+        job_key: 작업 키
+        payload: 저장할 상태 정보
+    """
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        values = {
+            "job_key": job_key,
+            "updated_ts": datetime.utcnow(),
+            "payload": payload,
+        }
+        if conn.dialect.name == "postgresql":
+            stmt = pg_insert(schema.job_checkpoints).values(**values).on_conflict_do_update(
+                index_elements=["job_key"],
+                set_={"updated_ts": values["updated_ts"], "payload": values["payload"]}
+            )
+            conn.execute(stmt)
+        else:
+            # Fallback for non-PostgreSQL
+            try:
+                conn.execute(sa.insert(schema.job_checkpoints).values(**values))
+            except IntegrityError:
+                conn.execute(
+                    sa.update(schema.job_checkpoints)
+                    .where(schema.job_checkpoints.c.job_key == job_key)
+                    .values(updated_ts=values["updated_ts"], payload=values["payload"])
+                )
+
