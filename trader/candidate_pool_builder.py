@@ -279,6 +279,40 @@ class CandidatePoolBuilder:
                 logger.debug("[CANDIDATE_POOL][OHLCV_FAIL] code=%s err=%s", code, exc)
                 continue
         
+        # ✅ scored=0 즉시 실패 처리 (진단 로그 강화)
+        if len(scored) == 0:
+            # 샘플링하여 왜 실패했는지 진단
+            sample_codes = codes[:5]
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL][ZERO_SCORED] scored=0 from universe_size=%s. "
+                "Diagnosing first %s codes: %s",
+                len(codes), len(sample_codes), sample_codes
+            )
+            
+            for code in sample_codes:
+                try:
+                    df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
+                    if df is None:
+                        logger.error("[CANDIDATE_POOL][DIAG] code=%s: OHLCV provider returned None", code)
+                    elif len(df) < self.min_rows:
+                        logger.error("[CANDIDATE_POOL][DIAG] code=%s: rows=%s < min_rows=%s", code, len(df), self.min_rows)
+                    else:
+                        last_close = df["close"].iloc[-1]
+                        logger.error("[CANDIDATE_POOL][DIAG] code=%s: rows=%s last_close=%s (min_price=%s)", 
+                                     code, len(df), last_close, self.min_price)
+                except Exception as exc:
+                    logger.error("[CANDIDATE_POOL][DIAG] code=%s: exception=%s", code, str(exc)[:200])
+            
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL] Possible causes: "
+                "(1) OHLCV data missing for all symbols (check DB price_daily table), "
+                "(2) env/strategy mismatch between universe and candidate pool, "
+                "(3) network/API failure during prefetch, "
+                "(4) filter criteria too strict (min_price=%s, min_rows=%s).",
+                self.min_price, self.min_rows
+            )
+            raise RuntimeError(f"candidate pool scored=0 from {len(codes)} universe members")
+        
         # 점수 내림차순 정렬 후 상위 target_size개 선택
         scored.sort(key=lambda x: x["score"], reverse=True)
         selected = scored[:self.target_size]
@@ -290,27 +324,16 @@ class CandidatePoolBuilder:
             as_of, len(codes), len(scored), len(result_codes)
         )
         
-        # ✅ scored=0 즉시 실패 처리
-        if len(scored) == 0:
-            logger.error(
-                "[CANDIDATE_POOL][BUILD][FAIL] scored=0 from universe_size=%s. "
-                "Possible causes: (1) OHLCV data missing for all symbols, "
-                "(2) env/strategy mismatch between universe and candidate pool, "
-                "(3) network/API failure. "
-                "Check: universe env/strategy, OHLCV provider availability, DB connection.",
-                len(codes)
-            )
-            sys.exit(2)
-        
         # ✅ selected < min_size 즉시 실패 처리
         min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
         if len(result_codes) < min_size:
             logger.error(
                 "[CANDIDATE_POOL][BUILD][FAIL] selected=%s < min_size=%s (from %s scored). "
-                "Filter criteria too strict or data quality issue.",
-                len(result_codes), min_size, len(scored)
+                "Filter criteria too strict or data quality issue. "
+                "Consider: (1) lowering min_price=%s, (2) lowering min_rows=%s, (3) increasing target_size=%s",
+                len(result_codes), min_size, len(scored), self.min_price, self.min_rows, self.target_size
             )
-            sys.exit(3)
+            raise RuntimeError(f"candidate pool size {len(result_codes)} < min_size {min_size}")
         
         return result_codes
 
@@ -377,10 +400,15 @@ def build_and_save_candidate_pool(
     # DB에 저장 (WATCHLIST 테이블에 저장)
     pool_members = [{"code": code} for code in pool_codes]
     
-    # ✅ 빈 리스트 체크 (이중 안전장치)
+    # ✅ 빈 리스트 체크 (이중 안전장치) - 실패로 처리
     if not pool_members:
-        logger.warning("[WATCHLIST][SAVE] empty members -> skip (but this should have failed earlier)")
-        return pool_codes
+        logger.error("[WATCHLIST][SAVE] empty members - this should have failed in build_light_scan")
+        raise RuntimeError("candidate pool is empty after build - cannot save")
+    
+    min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+    if len(pool_members) < min_size:
+        logger.error("[WATCHLIST][SAVE] members=%s < min_size=%s - failing", len(pool_members), min_size)
+        raise RuntimeError(f"candidate pool size {len(pool_members)} < min_size {min_size}")
     
     repo.save_watchlist(
         env=env,

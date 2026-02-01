@@ -643,22 +643,14 @@ class UniverseRepo:
         as_of_date: str,
         provider: str,
     ) -> str:
+        # IMPORTANT: Do NOT delete from universe_runs - it's a historical table.
+        # universe_current points to the latest run_id via UPSERT in store_universe_snapshot.
         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
         try:
             with self.engine.begin() as conn:
-                existing = conn.execute(
-                    select(self._schema.universe_runs.c.run_id).where(
-                        and_(
-                            self._schema.universe_runs.c.strategy == strategy_key,
-                            self._schema.universe_runs.c.provider == provider,
-                            self._schema.universe_runs.c.as_of == as_of_d,
-                        )
-                    )
-                ).scalar()
-                if existing:
-                    conn.execute(sa.delete(self._schema.universe_runs).where(self._schema.universe_runs.c.run_id == existing))
+                # Simply insert a new run (no DELETE - keep history)
                 conn.execute(
                     sa.insert(self._schema.universe_runs).values(
                         run_id=run_id,
@@ -670,6 +662,7 @@ class UniverseRepo:
                         members_count=0,
                     )
                 )
+            logger.info("[UNIVERSE][RUN][START] run_id=%s env=%s strategy=%s as_of=%s", run_id, env, strategy, as_of_date)
             return str(run_id)
         except Exception:
             logger.exception("[UNIVERSE][RUN][START_FAIL] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
@@ -737,35 +730,15 @@ class UniverseRepo:
         members_list = list(members)
         as_of_d = _as_date(as_of_date)
         db_url = str(self.engine.url)
+        # IMPORTANT: Do NOT delete from universe_runs - it's a historical table.
+        # We insert a new run and update universe_current to point to it.
         run_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
         strategy_key = self._strategy_key(env, strategy)
         members_count = len(members_list)
         
         try:
             with self.engine.begin() as conn:
-                # Delete existing run with same (strategy, provider, as_of) to avoid duplicates
-                existing = conn.execute(
-                    select(self._schema.universe_runs.c.run_id).where(
-                        and_(
-                            self._schema.universe_runs.c.strategy == strategy_key,
-                            self._schema.universe_runs.c.provider == provider,
-                            self._schema.universe_runs.c.as_of == as_of_d,
-                        )
-                    )
-                ).scalar()
-                if existing:
-                    conn.execute(
-                        sa.delete(self._schema.universe_members).where(
-                            self._schema.universe_members.c.run_id == existing
-                        )
-                    )
-                    conn.execute(
-                        sa.delete(self._schema.universe_runs).where(
-                            self._schema.universe_runs.c.run_id == existing
-                        )
-                    )
-                
-                # Insert new run
+                # Insert new run (no DELETE - keep history)
                 conn.execute(
                     sa.insert(self._schema.universe_runs).values(
                         run_id=run_id,
@@ -793,7 +766,7 @@ class UniverseRepo:
                         )
                     )
                 
-                # Update UNIVERSE_CURRENT pointer (UPSERT)
+                # Update UNIVERSE_CURRENT pointer (UPSERT) - this is FK-safe
                 if members_count > 0:
                     if self.engine.dialect.name == "postgresql":
                         insert_stmt = pg_insert(self._schema.universe_current).values(
@@ -848,6 +821,8 @@ class UniverseRepo:
         Record universe build failure in UNIVERSE_RUNS.
         This method MUST NOT raise exceptions to prevent double-failure.
         """
+        # IMPORTANT: Do NOT delete from universe_runs - it's a historical table.
+        # Simply insert a new failure record.
         try:
             as_of_d = _as_date(as_of_date)
             db_url = str(self.engine.url)
@@ -855,24 +830,7 @@ class UniverseRepo:
             strategy_key = self._strategy_key(env, strategy)
             
             with self.engine.begin() as conn:
-                # Delete existing run with same (strategy, provider, as_of)
-                existing = conn.execute(
-                    select(self._schema.universe_runs.c.run_id).where(
-                        and_(
-                            self._schema.universe_runs.c.strategy == strategy_key,
-                            self._schema.universe_runs.c.provider == provider,
-                            self._schema.universe_runs.c.as_of == as_of_d,
-                        )
-                    )
-                ).scalar()
-                if existing:
-                    conn.execute(
-                        sa.delete(self._schema.universe_runs).where(
-                            self._schema.universe_runs.c.run_id == existing
-                        )
-                    )
-                
-                # Insert failure record
+                # Insert failure record (no DELETE - keep history)
                 conn.execute(
                     sa.insert(self._schema.universe_runs).values(
                         run_id=run_id,
