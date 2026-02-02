@@ -1864,10 +1864,14 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             loop_deadline.isoformat() if loop_deadline else "none",
             max_seconds,
         )
-        ensure_universe_built_once(
-            engine=engine,
-            as_of=now_kst_value.date().isoformat(),
-        )
+        # ✅ PB1_CANDIDATE_ONLY=1이면 universe ensure skip (후보군만 사용)
+        if os.getenv("PB1_CANDIDATE_ONLY", "0") == "1":
+            logger.info("[UNIVERSE][SKIP] PB1_CANDIDATE_ONLY=1 -> skip ensure/build, will use candidate pool only")
+        else:
+            ensure_universe_built_once(
+                engine=engine,
+                as_of=now_kst_value.date().isoformat(),
+            )
         strategy_mode = (
             getattr(args, "strategy_mode", None)
             or os.getenv("EFFECTIVE_STRATEGY_MODE")
@@ -2135,21 +2139,29 @@ def main() -> int:
     kis_env = os.getenv("KIS_ENV", "").lower()
     strategy_env = os.getenv("STRATEGY_ENV", "").lower()
     
-    # ✅ DIAG+Minervini-only 모드에서는 mismatch 허용 (주문 없으므로)
+    # ✅ NEW: allow mismatch in DIAG/DRY_RUN (candidate-only/minervini test)
+    # LIVE real trading must remain strict.
+    live_trading_enabled = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
+    sim_mode = os.getenv("SIM_MODE", "0") == "1"
+    pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
     diag_minervini_only = os.getenv("PB1_DIAG_MINERVINI_ONLY", "0") == "1"
     strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-    allow_mismatch = diag_minervini_only and strategy_mode == "DIAG"
+    
+    # 허용 조건: DIAG, DRY_RUN, SIM_MODE, candidate-only 중 하나라도 활성화
+    allow_mismatch = (
+        (strategy_mode == "DIAG") or
+        dry_run or
+        sim_mode or
+        pb1_candidate_only or
+        diag_minervini_only
+    )
     
     if kis_env and strategy_env and kis_env != strategy_env:
-        if allow_mismatch:
-            logger.warning(
-                "[PB1][ENV][MISMATCH_ALLOWED] KIS_ENV=%s != STRATEGY_ENV=%s (allowed in DIAG+Minervini-only mode)",
-                kis_env,
-                strategy_env,
-            )
-        else:
+        # Strict only when LIVE real trading (실거래만 엄격)
+        if live_trading_enabled and (not allow_mismatch):
             logger.error(
-                "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (environment mismatch will cause wrong universe/candidate pool)",
+                "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (real trading)",
                 kis_env,
                 strategy_env,
             )
@@ -2157,6 +2169,12 @@ def main() -> int:
                 "[PB1][ENV][FIX] Set both to the same value (e.g., KIS_ENV=live STRATEGY_ENV=live) or unset one to inherit from the other"
             )
             raise ValueError(f"KIS_ENV ({kis_env}) != STRATEGY_ENV ({strategy_env})")
+        else:
+            logger.warning(
+                "[PB1][ENV][WARN] KIS_ENV=%s != STRATEGY_ENV=%s -> continue (DIAG/DRY_RUN/PAPER/candidate-only)",
+                kis_env,
+                strategy_env,
+            )
     
     # ✅ KIS_ENV가 없으면 STRATEGY_ENV로 설정
     if not kis_env and strategy_env:

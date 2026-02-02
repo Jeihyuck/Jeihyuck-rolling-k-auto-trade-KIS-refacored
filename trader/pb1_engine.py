@@ -1482,15 +1482,30 @@ class PB1Engine:
         members_list = list(members)  # Iterable → list 변환
         scan_count = len(members_list)
         
-        # ✅ 가드: 후보군 사용 시 195 universe 재검사 방지 (자동 교정은 상위 레이어에서 처리됨)
+        # ✅ candidate-only philosophy: guard must check scan universe, not base universe.
         from trader.config import CANDIDATE_POOL_ENABLED
-        if CANDIDATE_POOL_ENABLED and scan_count > 150:
-            logger.warning(
-                "[CANDIDATE_POOL][GUARD] scan_count=%s exceeds 150, "
-                "this should have been reduced by candidate pool. "
-                "Proceeding with large universe (performance may be slow).",
-                scan_count
-            )
+        pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
+        
+        if scan_count > 150:
+            if pb1_candidate_only:
+                logger.error(
+                    "[CANDIDATE_POOL][GUARD] CRITICAL: scan_count=%s exceeds 150 in candidate-only mode (pool too large)",
+                    scan_count
+                )
+                # candidate-only에서는 150 초과 시 치명적 (빌드 문제)
+            elif CANDIDATE_POOL_ENABLED:
+                logger.warning(
+                    "[CANDIDATE_POOL][GUARD] scan_count=%s exceeds 150, "
+                    "this should have been reduced by candidate pool. "
+                    "Proceeding with large universe (performance may be slow).",
+                    scan_count
+                )
+            else:
+                # watchlist disabled인 경우 universe 사용 (정상)
+                logger.info(
+                    "[UNIVERSE][SCAN] scan_count=%s (watchlist disabled, using full universe)",
+                    scan_count
+                )
         
         # ✅ 프리필터 적용 (Top N으로 제한)
         if os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
@@ -4538,20 +4553,57 @@ class PB1Engine:
         if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry"} and not self.dry_run:
             self._run_price_probe()
 
-        # ✅ Watchlist 적용 여부 결정
+        # ✅ NEW: decide scan universe
+        # Philosophy: if candidate pool exists, it IS the universe for DIAG candidate scan.
+        pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
         watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        
+        # 유니버스 로드 (호환성 유지, 하지만 스캔에는 안 씀)
+        universe_members = self._load_universe()
+        universe_count = len(universe_members)
+        
+        scan_codes = []
+        scan_source = "universe"
+        watchlist_count = 0
+        
         if watchlist_enabled and self.phase in {"prep", "entry"}:
             logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
             # Watchlist로 members 대체
-            members, watchlist_source = self._load_today_watchlist_members()
+            watchlist_members, watchlist_source = self._load_today_watchlist_members()
+            watchlist_count = len(watchlist_members)
             logger.info(
                 "[PB1][WATCHLIST] loaded=%s source=%s",
-                len(members), watchlist_source
+                watchlist_count, watchlist_source
             )
+            
+            # candidate pool이 있으면 항상 우선 사용
+            if watchlist_members:
+                if pb1_candidate_only:
+                    scan_codes = watchlist_members
+                    scan_source = "candidate_pool"
+                else:
+                    # 일반 모드에서도 watchlist 우선
+                    scan_codes = watchlist_members
+                    scan_source = "candidate_pool"
+            else:
+                # watchlist 없으면 universe 사용
+                scan_codes = universe_members
+                scan_source = "universe"
         else:
-            # 기존 로직: 전체 유니버스 사용
-            members = self._load_universe()
-            logger.info("[PB1][UNIVERSE] loaded=%s (watchlist disabled)", len(members))
+            # watchlist disabled: 전체 유니버스 사용
+            scan_codes = universe_members
+            scan_source = "universe"
+        
+        # members를 scan_codes로 설정 (하위 로직 호환)
+        members = scan_codes
+        
+        logger.info(
+            "[ENTRY][SCAN_UNIVERSE] source=%s scan_count=%s (universe_count=%s watchlist_count=%s)",
+            scan_source,
+            len(scan_codes),
+            universe_count,
+            watchlist_count,
+        )
         
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             skip_entry_scan = True
