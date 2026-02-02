@@ -2406,39 +2406,6 @@ class KisAPI:
         elif isinstance(out2, dict):
             row = out2
         else:
-            return 0, {}
-
-        raw_fields = {
-            "ord_psbl_cash": row.get("ord_psbl_cash"),
-            "ord_psbl_amt": row.get("ord_psbl_amt"),
-            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
-            "dnca_tot_amt": row.get("dnca_tot_amt"),
-        }
-        selected_key = None
-        cash = 0
-        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
-            if key in row:
-                selected_key = key
-                cash = self._cash_to_int(row.get(key))
-                break
-        clamp_applied = False
-        if cash < 0:
-            cash = 0
-            clamp_applied = True
-        return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
-
-    def _parse_cash_from_psbl_order(self, resp: Any) -> tuple[int, dict]:
-        row = None
-        if isinstance(resp, dict):
-            if isinstance(resp.get("output"), dict):
-                row = resp.get("output")
-            elif isinstance(resp.get("output1"), list) and resp.get("output1"):
-                row = resp.get("output1")[0]
-            else:
-                row = resp
-        elif isinstance(resp, list) and resp:
-            row = resp[0]
-        else:
             return 0, {"raw_fields": {}, "selected_key": None, "clamp_applied": False}
 
         raw_fields = {
@@ -2451,13 +2418,106 @@ class KisAPI:
         cash = 0
         for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
             if key in row:
-                selected_key = key
-                cash = self._cash_to_int(row.get(key))
-                break
+                val = self._cash_to_int(row.get(key))
+                if val > 0:
+                    selected_key = key
+                    cash = val
+                    break
+        
+        # ✅ 파싱 실패 시 dnca_tot_amt로 fallback
+        if cash <= 0 and "dnca_tot_amt" in row:
+            dnca_val = self._cash_to_int(row.get("dnca_tot_amt"))
+            if dnca_val > 0:
+                logger.warning(
+                    "[BALANCE][FALLBACK] ord_psbl_cash parsing failed -> using dnca_tot_amt=%s",
+                    dnca_val
+                )
+                cash = dnca_val
+                selected_key = "dnca_tot_amt_fallback"
+        
         clamp_applied = False
         if cash < 0:
             cash = 0
             clamp_applied = True
+        
+        if cash == 0:
+            logger.warning(
+                "[BALANCE][PARSE_ZERO] all cash fields are zero or missing. raw_fields=%s",
+                raw_fields
+            )
+        
+        return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
+
+    def _parse_cash_from_psbl_order(self, resp: Any) -> tuple[int, dict]:
+        # ✅ 디버깅: 응늵 구조 로깅
+        if isinstance(resp, dict):
+            logger.info("[PSBL][RAW_KEYS] top_level_keys=%s", list(resp.keys()))
+            if "output" in resp:
+                logger.info("[PSBL][RAW_SAMPLE][output] %s", str(resp.get("output"))[:300])
+            if "output1" in resp:
+                logger.info("[PSBL][RAW_SAMPLE][output1] %s", str(resp.get("output1"))[:300])
+            if "output2" in resp:
+                logger.info("[PSBL][RAW_SAMPLE][output2] %s", str(resp.get("output2"))[:300])
+        
+        row = None
+        if isinstance(resp, dict):
+            if isinstance(resp.get("output"), dict):
+                row = resp.get("output")
+            elif isinstance(resp.get("output1"), list) and resp.get("output1"):
+                row = resp.get("output1")[0]
+            elif isinstance(resp.get("output1"), dict):
+                row = resp.get("output1")
+            elif isinstance(resp.get("output2"), dict):
+                row = resp.get("output2")
+            elif isinstance(resp.get("output2"), list) and resp.get("output2"):
+                row = resp.get("output2")[0]
+            else:
+                row = resp
+        elif isinstance(resp, list) and resp:
+            row = resp[0]
+        else:
+            logger.warning("[PSBL][PARSE_FAIL] unexpected resp type=%s", type(resp))
+            return 0, {"raw_fields": {}, "selected_key": None, "clamp_applied": False}
+
+        raw_fields = {
+            "ord_psbl_cash": row.get("ord_psbl_cash"),
+            "ord_psbl_amt": row.get("ord_psbl_amt"),
+            "nrcvb_buy_amt": row.get("nrcvb_buy_amt"),
+            "dnca_tot_amt": row.get("dnca_tot_amt"),
+        }
+        
+        selected_key = None
+        cash = 0
+        for key in ("ord_psbl_cash", "ord_psbl_amt", "nrcvb_buy_amt", "dnca_tot_amt"):
+            if key in row:
+                val = self._cash_to_int(row.get(key))
+                if val > 0:
+                    selected_key = key
+                    cash = val
+                    break
+        
+        # ✅ 파싱 실패 시 dnca_tot_amt로 fallback
+        if cash <= 0 and "dnca_tot_amt" in row:
+            dnca_val = self._cash_to_int(row.get("dnca_tot_amt"))
+            if dnca_val > 0:
+                logger.warning(
+                    "[PSBL][FALLBACK] ord_psbl_cash/ord_psbl_amt parsing failed -> using dnca_tot_amt=%s",
+                    dnca_val
+                )
+                cash = dnca_val
+                selected_key = "dnca_tot_amt_fallback"
+        
+        clamp_applied = False
+        if cash < 0:
+            cash = 0
+            clamp_applied = True
+        
+        if cash == 0:
+            logger.warning(
+                "[PSBL][PARSE_ZERO] all cash fields are zero or missing. raw_fields=%s",
+                raw_fields
+            )
+        
         return cash, {"raw_fields": raw_fields, "selected_key": selected_key, "clamp_applied": clamp_applied}
 
     def _write_orderable_cash_status(self, *, cache_stale: bool, source: str, value: int) -> None:

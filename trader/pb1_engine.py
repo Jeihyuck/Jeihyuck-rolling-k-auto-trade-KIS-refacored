@@ -4133,9 +4133,10 @@ class PB1Engine:
         
         # ✅ STEP 2: 후보군이 유효하면 사용
         if pool_reason == "hit" and pool_codes:
+            age_info = f" (latest={pool_as_of})" if pool_as_of != today else " (today)"
             logger.info(
-                "[CANDIDATE_POOL][USAGE] candidates_universe_size=%s as_of=%s (NOT 195)",
-                len(pool_codes), pool_as_of
+                "[CANDIDATE_POOL][USAGE] candidates_universe_size=%s as_of=%s%s (NOT 195 universe)",
+                len(pool_codes), pool_as_of, age_info
             )
             members = [
                 {
