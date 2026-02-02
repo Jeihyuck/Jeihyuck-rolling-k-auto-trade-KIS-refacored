@@ -519,6 +519,9 @@ jobs:
       SIMULATION_MODE: "1"
       STRATEGY_MODE: "PAPER"
 
+      # ✅ DIAG 모드에서 entry_cutoff 무시 (스캔은 진행, 주문만 차단)
+      PB1_DIAG_IGNORE_ENTRY_CUTOFF: "1"
+
       # ✅ KIS HTTP 호출 최소화 (DIAG에서 토큰/호가 에러 방지)
       KIS_HTTP_ENABLED: "0"
 

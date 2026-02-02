@@ -4618,6 +4618,14 @@ class PB1Engine:
         diag_ignore_cutoff = str(os.getenv("PB1_DIAG_IGNORE_ENTRY_CUTOFF", "0")) == "1"
         is_diag_mode = str(os.getenv("STRATEGY_MODE", "")).upper() in ("DIAG", "PAPER") or str(os.getenv("EFFECTIVE_STRATEGY_MODE","")).upper() == "DIAG"
         
+        logger.info(
+            "[PB1][ENTRY_CUTOFF][CONFIG] PB1_DIAG_IGNORE_ENTRY_CUTOFF=%s is_diag_mode=%s entry_cutoff_dt=%s now_kst=%s",
+            diag_ignore_cutoff,
+            is_diag_mode,
+            entry_cutoff_dt.isoformat(),
+            self._now_kst.isoformat(),
+        )
+        
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             # DIAG 모드 + ignore 옵션 활성화 시: 스캔은 진행, 주문만 차단
             if is_diag_mode and diag_ignore_cutoff:
