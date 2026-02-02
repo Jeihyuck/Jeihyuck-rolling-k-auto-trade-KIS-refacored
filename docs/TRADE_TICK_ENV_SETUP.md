@@ -2,12 +2,39 @@
 
 이 문서는 **trade-tick** 워크플로우에서 후보군(Candidate Pool)을 DB에서 로드하여 실거래를 수행하기 위한 환경 변수 설정 가이드입니다.
 
+## � 중요: ENV 네임스페이스 (2026-02-02 업데이트)
+
+### 환경 변수 역할 분리
+
+| 변수 | 역할 | 값 | 사용처 |
+|------|------|-----|---------|
+| `STRATEGY_ENV` | 전략 환경 | live/paper | **후보군, 유니버스, DB 네임스페이스** |
+| `KIS_ENV` | KIS 계정 | practice/real | KIS API 인증, 주문 실행 |
+
+**핵심**: 후보군은 항상 `STRATEGY_ENV`로 저장/로드됩니다. `KIS_ENV`와 혼동하지 마세요!
+
+### 올바른 설정 예시
+
+```bash
+# 모의투자 (practice 계좌 + live 전략)
+STRATEGY_ENV=live        # ✅ 후보군 로드용
+KIS_ENV=practice         # ✅ KIS API 계정
+
+# 실거래 (real 계좌 + live 전략)
+STRATEGY_ENV=live        # ✅ 후보군 로드용
+KIS_ENV=real             # ✅ KIS API 계정
+```
+
+자세한 내용: [ENV_NAMESPACE_FIX.md](../ENV_NAMESPACE_FIX.md)
+
+---
+
 ## 📋 필수 환경 변수 체크리스트
 
 ### A. 라이브 매매 필수 (Precheck 통과)
 
 ```bash
-STRATEGY_ENV=live
+STRATEGY_ENV=live              # ✅ 후보군/유니버스 네임스페이스
 STRATEGY_MODE=LIVE
 LIVE_TRADING_ENABLED=1
 DRY_RUN=0
@@ -17,6 +44,7 @@ NONTRADING_SMOKE=0
 ```
 
 **중요**: `LIVE` 모드에서는 반드시 다음 조건을 만족해야 합니다:
+- `STRATEGY_ENV=live` (**후보군 로드를 위한 필수 설정**)
 - `DRY_RUN=0` (DRY_RUN이 1이면 LIVE 위반 에러 발생)
 - `LIVE_TRADING_ENABLED=1` (이 값이 1이 아니면 LIVE 위반 에러 발생)
 - `DISABLE_LIVE_TRADING=0` (안전 스위치)

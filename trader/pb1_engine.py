@@ -4131,10 +4131,14 @@ class PB1Engine:
         # 전체 유니버스 로드 (후보군 생성에 필요)
         full_members = self._load_universe()
         
+        # ✅ FIX: 후보군은 STRATEGY_ENV로 저장되므로 STRATEGY_ENV로 로드
+        import os
+        pool_env = os.getenv("STRATEGY_ENV", self.env)
+        
         # ✅ STEP 1: 후보군 로드 (TTL 검사 포함)
         pool_codes, pool_as_of, pool_reason = load_candidate_pool(
             engine=self.engine,
-            env=self.env,
+            env=pool_env,
             today=today,
         )
         
@@ -4169,9 +4173,10 @@ class PB1Engine:
                 df, meta = self._fetch_daily(code, count=days)
                 return df
             
+            # ✅ FIX: 후보군 빌드 시에도 pool_env 사용
             pool_codes = build_and_save_candidate_pool(
                 engine=self.engine,
-                env=self.env,
+                env=pool_env,
                 as_of=today,
                 members=full_members,
                 ohlcv_provider=_ohlcv_wrapper,

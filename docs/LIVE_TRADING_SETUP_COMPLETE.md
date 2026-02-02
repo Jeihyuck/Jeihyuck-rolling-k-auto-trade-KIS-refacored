@@ -1,6 +1,32 @@
 # 실거래 완벽 설정 완료 보고서
 
-## ✅ 완료된 작업 (2026-02-02)
+## ✅ 완료된 작업
+
+### 🔥 최신 (2026-02-02 오후): ENV 네임스페이스 버그 수정 ✅
+
+**문제**: 후보군이 DB에 있는데도 trade-tick에서 0개로 로드되는 버그
+- 후보군 빌드: `STRATEGY_ENV=live`로 저장
+- trade-tick: `KIS_ENV`로 검색 → 불일치로 0개
+
+**해결**:
+1. ✅ [pb1_engine.py](trader/pb1_engine.py#L4130-L4180): 후보군 로드/저장 시 `STRATEGY_ENV` 우선 사용
+2. ✅ [verify_candidate_pool.py](scripts/verify_candidate_pool.py): `KIS_ENV` vs `STRATEGY_ENV` 불일치 경고 추가
+3. ✅ [ENV_NAMESPACE_FIX.md](../ENV_NAMESPACE_FIX.md): 상세 설명 문서 작성
+
+**핵심 개념**:
+- `STRATEGY_ENV`: 후보군/유니버스 DB 네임스페이스 (live/paper)
+- `KIS_ENV`: KIS API 계정 종류 (practice/real)
+- 둘은 **독립적**으로 설정 가능
+
+**올바른 설정**:
+```bash
+STRATEGY_ENV=live      # 후보군 로드용
+KIS_ENV=practice       # 또는 real (KIS 계좌 종류)
+```
+
+자세한 내용: [ENV_NAMESPACE_FIX.md](../ENV_NAMESPACE_FIX.md)
+
+---
 
 ### 1. 🔧 _fetch_daily 버그 수정 (근본 해결)
 

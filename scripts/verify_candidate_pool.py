@@ -22,6 +22,14 @@ def verify_candidate_pool():
     env = os.getenv("STRATEGY_ENV", "live")
     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
     
+    # ✅ KIS_ENV 경고 추가
+    kis_env = os.getenv("KIS_ENV")
+    if kis_env and kis_env != env:
+        print(f"[VERIFY][WARN] ⚠️  KIS_ENV={kis_env} != STRATEGY_ENV={env}")
+        print(f"[VERIFY][WARN] Candidate pool uses STRATEGY_ENV (not KIS_ENV)")
+        print(f"[VERIFY][WARN] Ensure STRATEGY_ENV={env} is set correctly for trade-tick")
+        print()
+    
     # as_of 날짜 결정 (우선순위: AS_OF > PB1_AS_OF > UNIVERSE_AS_OF > today)
     as_of_str = (
         os.getenv("AS_OF") or 
@@ -36,7 +44,9 @@ def verify_candidate_pool():
         as_of = as_of_str
     
     print(f"[VERIFY] Checking candidate pool...")
-    print(f"[VERIFY] env={env}")
+    print(f"[VERIFY] env={env} (STRATEGY_ENV)")
+    if kis_env:
+        print(f"[VERIFY] kis_env={kis_env} (KIS_ENV - not used for candidate pool)")
     print(f"[VERIFY] strategy={strategy}")
     print(f"[VERIFY] as_of={as_of}")
     print()
