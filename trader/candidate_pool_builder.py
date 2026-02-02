@@ -362,8 +362,8 @@ def load_candidate_pool(
         return None, None, "too_small"
     
     logger.info(
-        "[CANDIDATE_POOL][LOAD] using latest=%s age_days=%s size=%s (TTL=%s days)",
-        latest_date, age_days, len(pool_codes), CANDIDATE_POOL_TTL_DAYS
+        "[CANDIDATE_POOL][LOAD] hit=True as_of=%s size=%s age=%s",
+        latest_date, len(pool_codes), age_days
     )
     
     return pool_codes, latest_date, "hit"

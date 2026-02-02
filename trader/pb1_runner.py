@@ -248,6 +248,8 @@ def _log_db_only_universe_precheck(
     strategy: str,
     namespace: str = "default",
 ) -> None:
+    # ✅ env 정규화: 대소문자 불일치 방지
+    env = _norm_env(env)
     snapshot = repo.get_current_universe_snapshot(env, strategy)
     if not snapshot:
         logger.warning(
@@ -1507,10 +1509,12 @@ def run_once(
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
+                # ✅ env 정규화 적용
+                normalized_env = _norm_env(kis_env or "practice")
                 universe_ctx = _load_universe_context(
                     engine=engine,
                     as_of=as_of,
-                    env=kis_env or "practice",
+                    env=normalized_env,
                     strategy=universe_strategy,
                 )
             except RuntimeError as exc:

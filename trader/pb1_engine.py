@@ -4614,18 +4614,34 @@ class PB1Engine:
             watchlist_count,
         )
         
+        # ✅ DIAG 모드에서 entry_cutoff 무시 옵션
+        diag_ignore_cutoff = str(os.getenv("PB1_DIAG_IGNORE_ENTRY_CUTOFF", "0")) == "1"
+        is_diag_mode = str(os.getenv("STRATEGY_MODE", "")).upper() in ("DIAG", "PAPER") or str(os.getenv("EFFECTIVE_STRATEGY_MODE","")).upper() == "DIAG"
+        
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
-            skip_entry_scan = True
-            entry_allowed = False
-            entry_reason = "entry_cutoff"
-            logger.info(
-                "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
-                self._now_kst.isoformat(),
-                entry_cutoff_dt.isoformat(),
-            )
-            if self.phase in {"prep", "entry"}:
-                final_status = "SKIPPED"
-                final_notes = "entry_cutoff"
+            # DIAG 모드 + ignore 옵션 활성화 시: 스캔은 진행, 주문만 차단
+            if is_diag_mode and diag_ignore_cutoff:
+                entry_allowed = False  # 주문 제출은 차단
+                entry_reason = "entry_cutoff"
+                logger.warning(
+                    "[PB1][DIAG][CUTOFF_IGNORE] entry_cutoff passed but scanning forced (no orders will be submitted) now=%s cutoff=%s",
+                    self._now_kst.isoformat(),
+                    entry_cutoff_dt.isoformat(),
+                )
+                # skip_entry_scan은 False로 유지 -> 스캔 진행
+            else:
+                # 일반 모드: 스캔도 스킵
+                skip_entry_scan = True
+                entry_allowed = False
+                entry_reason = "entry_cutoff"
+                logger.info(
+                    "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
+                    self._now_kst.isoformat(),
+                    entry_cutoff_dt.isoformat(),
+                )
+                if self.phase in {"prep", "entry"}:
+                    final_status = "SKIPPED"
+                    final_notes = "entry_cutoff"
 
         if not entry_allowed:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
@@ -5573,21 +5589,48 @@ class PB1Engine:
                 t_order_submit = time.monotonic()
                 submitted_count = 0
                 failed_count = 0
-                for cf in orderable_candidates:
-                    try:
-                        if self.window_internal == "close":
-                            self._place_entry_close(cf)
-                        else:
-                            self._place_entry(cf)
-                        submitted_count += 1
-                    except Exception as e:
-                        failed_count += 1
-                        logger.exception(
-                            "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
-                            trace_id,
+                
+                # ✅ 안전장치: DIAG/PAPER 모드 또는 안전 플래그 활성화 시 주문 제출 차단
+                is_safe_mode = (
+                    self.dry_run or
+                    str(os.getenv("DISABLE_LIVE_TRADING", "0")) == "1" or
+                    str(os.getenv("LIVE_TRADING_ENABLED", "0")) != "1" or
+                    is_diag_mode
+                )
+                
+                if is_safe_mode:
+                    logger.warning(
+                        "[ORDER][SUBMIT][SKIP] safe_mode active (dry_run=%s DIAG=%s) -> intents only, no real orders trace=%s count=%s",
+                        self.dry_run,
+                        is_diag_mode,
+                        trace_id,
+                        len(orderable_candidates),
+                    )
+                    # 주문 의도만 기록하고 실제 제출은 하지 않음
+                    for cf in orderable_candidates:
+                        logger.info(
+                            "[ORDER][INTENT] code=%s qty=%s value=%.0f setup_ok=%s",
                             cf.code,
-                            str(e),
+                            cf.planned_qty,
+                            float(cf.features.get("close", 0)) * float(cf.planned_qty or 0),
+                            cf.setup_ok,
                         )
+                else:
+                    for cf in orderable_candidates:
+                        try:
+                            if self.window_internal == "close":
+                                self._place_entry_close(cf)
+                            else:
+                                self._place_entry(cf)
+                            submitted_count += 1
+                        except Exception as e:
+                            failed_count += 1
+                            logger.exception(
+                                "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
+                                trace_id,
+                                cf.code,
+                                str(e),
+                            )
                 dt_order_submit = time.monotonic() - t_order_submit
                 
                 logger.info(
