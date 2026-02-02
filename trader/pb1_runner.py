@@ -2087,20 +2087,76 @@ def main() -> int:
     # else: TRADE_INTRADAY (기존 로직)
     logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
     
+    # ✅ DIAG Minervini-only 모드 체크 (최우선 처리)
+    diag_minervini_only = os.getenv("PB1_DIAG_MINERVINI_ONLY", "0") == "1"
+    force_candidate_pool = os.getenv("PB1_FORCE_CANDIDATE_POOL", "0") == "1"
+    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+    
+    if diag_minervini_only and strategy_mode == "DIAG":
+        logger.info(
+            "[PB1][DIAG_MINERVINI_ONLY] mode=DIAG diag_minervini_only=1 -> run minervini filter only and exit"
+        )
+        
+        # DB 준비
+        assert_db_ready()
+        engine = make_engine()
+        run_migrations(engine)
+        
+        # 환경변수
+        env = os.getenv("STRATEGY_ENV", "live").lower()
+        strategy = os.getenv("STRATEGY", "best_k_meta")
+        today = now_kst().date()
+        
+        logger.info(
+            "[PB1][DIAG_MINERVINI_ONLY] env=%s strategy=%s as_of=%s force_pool=%s",
+            env, strategy, today, force_candidate_pool
+        )
+        
+        # Minervini 실행
+        from trader.minervini_runner import run_diag_minervini_only
+        
+        try:
+            exit_code = run_diag_minervini_only(
+                engine=engine,
+                env=env,
+                strategy=strategy,
+                as_of=today,
+            )
+            logger.info(
+                "[PB1][DIAG_MINERVINI_ONLY][EXIT] code=%s reason=minervini_only_complete",
+                exit_code
+            )
+            return exit_code
+        except Exception as exc:
+            logger.exception("[PB1][DIAG_MINERVINI_ONLY][FAIL] %s", exc)
+            return 1
+    
     # ✅ 환경변수 검증: KIS_ENV vs STRATEGY_ENV 일치 확인
     kis_env = os.getenv("KIS_ENV", "").lower()
     strategy_env = os.getenv("STRATEGY_ENV", "").lower()
     
+    # ✅ DIAG+Minervini-only 모드에서는 mismatch 허용 (주문 없으므로)
+    diag_minervini_only = os.getenv("PB1_DIAG_MINERVINI_ONLY", "0") == "1"
+    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+    allow_mismatch = diag_minervini_only and strategy_mode == "DIAG"
+    
     if kis_env and strategy_env and kis_env != strategy_env:
-        logger.error(
-            "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (environment mismatch will cause wrong universe/candidate pool)",
-            kis_env,
-            strategy_env,
-        )
-        logger.error(
-            "[PB1][ENV][FIX] Set both to the same value (e.g., KIS_ENV=live STRATEGY_ENV=live) or unset one to inherit from the other"
-        )
-        raise ValueError(f"KIS_ENV ({kis_env}) != STRATEGY_ENV ({strategy_env})")
+        if allow_mismatch:
+            logger.warning(
+                "[PB1][ENV][MISMATCH_ALLOWED] KIS_ENV=%s != STRATEGY_ENV=%s (allowed in DIAG+Minervini-only mode)",
+                kis_env,
+                strategy_env,
+            )
+        else:
+            logger.error(
+                "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (environment mismatch will cause wrong universe/candidate pool)",
+                kis_env,
+                strategy_env,
+            )
+            logger.error(
+                "[PB1][ENV][FIX] Set both to the same value (e.g., KIS_ENV=live STRATEGY_ENV=live) or unset one to inherit from the other"
+            )
+            raise ValueError(f"KIS_ENV ({kis_env}) != STRATEGY_ENV ({strategy_env})")
     
     # ✅ KIS_ENV가 없으면 STRATEGY_ENV로 설정
     if not kis_env and strategy_env:
