@@ -490,7 +490,6 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
