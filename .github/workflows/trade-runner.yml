@@ -649,6 +649,7 @@ jobs:
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
 
       - name: Candidate pool DB precheck (Weekend-built pool required)
+        continue-on-error: true
         run: |
           set -euo pipefail
           

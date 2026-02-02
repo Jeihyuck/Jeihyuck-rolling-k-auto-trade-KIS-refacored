@@ -13,7 +13,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from trader.db.repos import WatchlistRepo
-from trader.db.engine import get_session
+from trader.db.engine import get_engine
 
 
 def verify_candidate_pool():
@@ -41,55 +41,55 @@ def verify_candidate_pool():
     print(f"[VERIFY] as_of={as_of}")
     print()
     
-    # DB에서 후보군 로드
-    with get_session() as session:
-        repo = WatchlistRepo(session)
+    # DB에서 후보군 로드 (Engine 기반)
+    engine = get_engine()
+    repo = WatchlistRepo(engine)
+    
+    try:
+        # 후보군 로드
+        rows = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
         
-        try:
-            # 후보군 로드
-            rows = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
-            
-            if not rows:
-                print("[VERIFY][FAIL] ❌ Candidate pool is EMPTY!")
-                print()
-                print("Possible causes:")
-                print("  1. Candidate pool was not built yet")
-                print("  2. env/strategy/as_of mismatch between build and verify")
-                print("  3. Wrong database connection")
-                print()
-                print("Expected values:")
-                print(f"  STRATEGY_ENV={env}")
-                print(f"  CANDIDATE_POOL_STRATEGY_KEY={strategy}")
-                print(f"  AS_OF={as_of}")
-                print()
-                sys.exit(1)
-            
-            codes = [row["code"] for row in rows]
-            sample = codes[:5]
-            
-            print(f"[VERIFY][OK] ✅ Candidate pool found!")
-            print(f"[VERIFY][OK] size={len(codes)}")
-            print(f"[VERIFY][OK] sample={sample}")
+        if not rows:
+            print("[VERIFY][FAIL] ❌ Candidate pool is EMPTY!")
             print()
-            
-            # 최소 크기 검증
-            min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
-            if len(codes) < min_size:
-                print(f"[VERIFY][WARN] ⚠️  Pool size {len(codes)} is below minimum {min_size}")
-                print("[VERIFY][WARN] This may cause issues during trading")
-                sys.exit(1)
-            
-            print(f"[VERIFY][OK] Pool size {len(codes)} >= minimum {min_size}")
-            print("[VERIFY][OK] ✅ All checks passed!")
+            print("Possible causes:")
+            print("  1. Candidate pool was not built yet")
+            print("  2. env/strategy/as_of mismatch between build and verify")
+            print("  3. Wrong database connection")
             print()
-            
-            return 0
-            
-        except Exception as exc:
-            print(f"[VERIFY][ERROR] ❌ Exception: {exc}")
-            import traceback
-            traceback.print_exc()
+            print("Expected values:")
+            print(f"  STRATEGY_ENV={env}")
+            print(f"  CANDIDATE_POOL_STRATEGY_KEY={strategy}")
+            print(f"  AS_OF={as_of}")
+            print()
             sys.exit(1)
+        
+        codes = [row["code"] for row in rows]
+        sample = codes[:5]
+        
+        print(f"[VERIFY][OK] ✅ Candidate pool found!")
+        print(f"[VERIFY][OK] size={len(codes)}")
+        print(f"[VERIFY][OK] sample={sample}")
+        print()
+        
+        # 최소 크기 검증
+        min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+        if len(codes) < min_size:
+            print(f"[VERIFY][WARN] ⚠️  Pool size {len(codes)} is below minimum {min_size}")
+            print("[VERIFY][WARN] This may cause issues during trading")
+            sys.exit(1)
+        
+        print(f"[VERIFY][OK] Pool size {len(codes)} >= minimum {min_size}")
+        print("[VERIFY][OK] ✅ All checks passed!")
+        print()
+        
+        return 0
+        
+    except Exception as exc:
+        print(f"[VERIFY][ERROR] ❌ Exception: {exc}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -98,3 +98,49 @@ def get_engine() -> sa.Engine:
     if _engine_instance is None:
         _engine_instance = make_engine()
     return _engine_instance
+
+
+# ✅ 호환성 레이어: 일부 스크립트에서 SessionLocal/get_db를 기대할 수 있음
+from sqlalchemy.orm import sessionmaker, Session
+from typing import Generator
+from contextlib import contextmanager
+
+_SessionLocal = None
+
+
+def _get_session_local():
+    """SessionLocal 지연 초기화."""
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(bind=get_engine(), autocommit=False, autoflush=False)
+    return _SessionLocal
+
+
+def SessionLocal():
+    """SessionLocal factory (호환성용)."""
+    return _get_session_local()()
+
+
+def get_db() -> Generator[Session, None, None]:
+    """FastAPI 스타일 DB 세션 generator (호환성용)."""
+    session_factory = _get_session_local()
+    db = session_factory()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def session_scope() -> Generator[Session, None, None]:
+    """Context manager 스타일 DB 세션 (호환성용)."""
+    session_factory = _get_session_local()
+    session = session_factory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
