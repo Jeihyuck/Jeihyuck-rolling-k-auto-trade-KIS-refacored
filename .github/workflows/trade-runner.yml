@@ -478,13 +478,12 @@ jobs:
 
     needs: [candidate_pool]
 
-    # ✅ 주중(schedule trade cron)에서는 upstream 스킵이어도 반드시 실행
+    # ✅ trade-tick 무조건 실행: MODE가 trade 또는 both일 때
     if: >
       always() && (
         (github.event_name == 'schedule' && github.event.schedule == '55 23 * * 0-4') ||
         (github.event_name == 'workflow_dispatch' &&
-          (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both') &&
-          (needs.candidate_pool.result == 'success' || needs.candidate_pool.result == 'skipped'))
+          (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both'))
       )
 
     env:
@@ -506,7 +505,9 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+      # ✅ E-2: DIAG/PAPER 환경 강제 고정 (ENV mismatch 방지)
+      KIS_ENV: PAPER
+      STRATEGY_ENV: PAPER
 
       # ✅ 후보군 사용 활성화 (DB 로드 전용, 재빌드 금지)
       CANDIDATE_POOL_ENABLED: "1"
@@ -517,16 +518,20 @@ jobs:
 
       DB_ONLY: "0"
       NONTRADING_SMOKE: "0"
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DRY_RUN || '0' }}
-      LIVE_TRADING_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.LIVE_TRADING_ENABLED || '1' }}
-      DISABLE_LIVE_TRADING: "0"
-      STRATEGY_MODE: "LIVE"
+      # ✅ E-2: 주문 절대 금지 (모든 키 강제 설정)
+      DRY_RUN: "1"
+      LIVE_TRADING_ENABLED: "0"
+      DISABLE_LIVE_TRADING: "1"
+      SIMULATION_MODE: "1"
+      STRATEGY_MODE: "PAPER"
 
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
       PB1_MAX_SECONDS: "900"
       PB1_PRICE_PROBE: "1"
 
+      # ✅ E-2: Universe/Candidate rebuild 금지
+      UNIVERSE_FORCE_REBUILD: "0"
       UNIVERSE_SOURCE: "DB_ONLY"
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"

@@ -4576,6 +4576,15 @@ class PB1Engine:
                 watchlist_count, watchlist_source
             )
             
+            # ✅ E-3: candidate_pool_hit이면 universe_count를 watchlist로 교체
+            if "candidate_pool_hit" in watchlist_source:
+                universe_members = watchlist_members
+                universe_count = len(watchlist_members)
+                logger.info(
+                    "[E-3][CANDIDATE_POOL_HIT] universe_count fixed: %s -> %s",
+                    len(self._load_universe()), universe_count
+                )
+            
             # candidate pool이 있으면 항상 우선 사용
             if watchlist_members:
                 if pb1_candidate_only:
