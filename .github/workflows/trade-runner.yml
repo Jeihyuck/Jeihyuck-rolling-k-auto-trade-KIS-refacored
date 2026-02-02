@@ -521,6 +521,14 @@ jobs:
 
       # ✅ DIAG 모드에서 entry_cutoff 무시 (스캔은 진행, 주문만 차단)
       PB1_DIAG_IGNORE_ENTRY_CUTOFF: "1"
+      
+      # --- PB1 perfect scan config ---
+      PB1_PREFILTER_LIMIT: "50"            # 50/80/120 가능
+      PB1_PREFILTER_LOOKBACK_DAYS: "30"
+      PB1_EARLY_STOP_ENABLED: "1"
+      PB1_EARLY_STOP_MODE: "raw"           # raw|minervini_pass|setup_ok|buyable
+      PB1_EARLY_STOP_N: "50"               # 프리필터 50이면 50 추천(사실상 끝까지 봄)
+      PB1_EARLY_STOP_MIN_EVAL: "50"        # 최소 50개는 무조건 평가
 
       # ✅ KIS HTTP 호출 최소화 (DIAG에서 토큰/호가 에러 방지)
       KIS_HTTP_ENABLED: "0"

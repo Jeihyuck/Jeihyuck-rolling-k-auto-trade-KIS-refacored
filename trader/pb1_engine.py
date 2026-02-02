@@ -1403,9 +1403,10 @@ class PB1Engine:
         - OHLCV가 없으면 즉시 스킵(프리필터 점수 0)
         - 30일만 가져오므로 200일 풀 계산보다 훨씬 빠름
         """
-        import os
-        limit = int(os.getenv("PB1_UNIVERSE_SCAN_LIMIT", "50"))
-        lb = int(os.getenv("PB1_PREFILTER_LOOKBACK_DAYS", "30"))
+        from trader import config as cfg
+        
+        limit = int(getattr(cfg, "PB1_PREFILTER_LIMIT", 50))
+        lb = int(getattr(cfg, "PB1_PREFILTER_LOOKBACK_DAYS", 30))
         
         scored: List[tuple[float, dict]] = []
         for member in members:
@@ -1563,16 +1564,22 @@ class PB1Engine:
             rs_prices: dict[str, pd.Series] = {}
             checked_count = 0
             
-            # ✅ 조기 종료 설정
-            early_stop = os.getenv("PB1_CANDIDATE_EARLY_STOP", "1") == "1"
-            early_n = int(os.getenv("PB1_EARLY_STOP_CANDIDATES", "12"))
+            # ✅ NEW: 조기 종료 설정 (config 기반)
+            from trader import config as cfg
+            early_enabled = getattr(cfg, "PB1_EARLY_STOP_ENABLED", True)
+            early_mode = str(getattr(cfg, "PB1_EARLY_STOP_MODE", "buyable")).strip().lower()
+            early_n = int(getattr(cfg, "PB1_EARLY_STOP_N", 50))
+            early_min_eval = int(getattr(cfg, "PB1_EARLY_STOP_MIN_EVAL", len(members_list)))
+            
+            # Counters for early stop decision
+            eval_cnt = 0
+            raw_cnt = 0
+            minervini_pass_cnt = 0
+            setup_ok_cnt = 0
+            buyable_cnt = 0
             
             for m in members_list:
-                # ✅ 조기 종료 체크 (충분한 후보 확보 시)
-                if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
-                    reason = "EARLY_STOP_CANDIDATES_SUFFICIENT"
-                    logger.info("[PB1][CANDIDATES][EARLY_STOP] candidates=%s early_n=%s", len(candidates), early_n)
-                    break
+                eval_cnt += 1
                 
                 # ✅ 시간 예산 체크 (10개마다)
                 checked_count += 1
@@ -1703,10 +1710,35 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     rs_prices[code] = df["close"].reset_index(drop=True)
+                    
+                    # ✅ NEW: Track raw candidate count
+                    raw_cnt += 1
+                    
                 except Exception as exc:
                     # ✅ 개별 종목 예외로 전체 런이 죽지 않게
                     logger.exception("[PB1][CANDIDATES][COMPUTE_FAILED] code=%s error=%s -> skip", code, exc)
                     continue
+                
+                # ✅ NEW: Early stop decision (only after min eval)
+                # Note: At this stage we only have raw candidates, Minervini filtering happens later
+                # So we use "raw" mode for early stopping in the loop
+                if early_enabled and eval_cnt >= early_min_eval:
+                    if early_mode == "raw":
+                        metric = raw_cnt
+                    else:
+                        # For other modes, we'd need to wait until after Minervini filtering
+                        # So we only support raw mode in this loop
+                        metric = raw_cnt
+                    
+                    if metric >= early_n:
+                        logger.info(
+                            "[PB1][CANDIDATES][EARLY_STOP] "
+                            f"mode={early_mode} metric={metric} early_n={early_n} "
+                            f"eval_cnt={eval_cnt} min_eval={early_min_eval} "
+                            f"raw={raw_cnt}"
+                        )
+                        reason = "EARLY_STOP_BY_CONFIG"
+                        break
             
             if not candidates:
                 reason = "NO_CANDIDATES_AFTER_OHLCV"
@@ -1747,6 +1779,10 @@ class PB1Engine:
                         rs_fail_count += 1
                     if not cf.features.get("vcp_ok"):
                         vcp_fail_count += 1
+                    
+                    # ✅ NEW: Track Minervini pass count for early stop metrics
+                    if rs_p >= self.minervini_config.rs_min_percentile and cf.features.get("vcp_ok"):
+                        minervini_pass_cnt += 1
                 
                 cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
                 cf.features["score"] = cf.score
@@ -1790,6 +1826,13 @@ class PB1Engine:
                 both_pass,
                 before_minervini - both_pass,
                 dt_minervini_total,
+            )
+            
+            # ✅ NEW: Early stop summary with all metrics
+            logger.info(
+                "[PB1][CANDIDATES][EARLY_STOP_SUMMARY] "
+                f"enabled={int(early_enabled)} mode={early_mode} early_n={early_n} min_eval={early_min_eval} "
+                f"eval_cnt={eval_cnt} raw={raw_cnt} minervini_pass={minervini_pass_cnt} both_pass={both_pass}"
             )
             
             if debug_mode:
