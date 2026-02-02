@@ -431,6 +431,64 @@ def ensure_universe_built_once(
     return []
 
 
+
+def _norm_env(x: str | None) -> str:
+    """Normalize env keys to avoid 'paper' vs 'PAPER' DB misses."""
+    if not x:
+        return ""
+    return str(x).strip().upper()
+
+
+def _safe_load_universe_snapshot(repo, *, env: str, strategy: str, as_of):
+    """
+    Backward/forward compatible universe loader.
+    - Newer code may have UniverseRepo.get_latest_successful_universe_snapshot
+    - Older repos may only have get_current_universe_members / get_latest_watchlist_date style APIs
+    This function prevents AttributeError and normalizes env casing.
+    """
+    env = _norm_env(env)
+    strategy = str(strategy).strip()
+
+    # 1) Preferred API (if exists)
+    if hasattr(repo, "get_latest_successful_universe_snapshot"):
+        return repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
+
+    # 2) Common older API: get_current_universe_members
+    if hasattr(repo, "get_current_universe_members"):
+        try:
+            # some versions accept as_of / as_of_date
+            return {
+                "as_of": as_of,
+                "env": env,
+                "strategy": strategy,
+                "members": repo.get_current_universe_members(env=env, strategy=strategy, as_of=as_of) or [],
+            }
+        except TypeError:
+            # older signature: (env, strategy) only
+            return {
+                "as_of": as_of,
+                "env": env,
+                "strategy": strategy,
+                "members": repo.get_current_universe_members(env=env, strategy=strategy) or [],
+            }
+
+    # 3) Last resort: try load methods (names vary)
+    for name in ("load_universe", "load_universe_members", "get_universe_members"):
+        if hasattr(repo, name):
+            fn = getattr(repo, name)
+            try:
+                members = fn(env=env, strategy=strategy, as_of=as_of) or []
+            except TypeError:
+                try:
+                    members = fn(env=env, strategy=strategy) or []
+                except TypeError:
+                    members = fn(as_of=as_of) or []
+            return {"as_of": as_of, "env": env, "strategy": strategy, "members": members}
+
+    # If we reach here, repo API is unknown
+    return {"as_of": as_of, "env": env, "strategy": strategy, "members": []}
+
+
 def _load_universe_context(
     *,
     engine,
@@ -458,6 +516,7 @@ def _load_universe_context(
         )
     
     repo = UniverseRepo(engine)
+    env = _norm_env(env)
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
     if not members and is_db_only_mode():
         fallback = repo.get_current_universe_snapshot(env, strategy)
@@ -475,7 +534,9 @@ def _load_universe_context(
                 meta={"source": "db_only", "as_of": fallback.get("as_of")},
                 is_empty=False,
             )
-        latest = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of)
+        env = _norm_env(env)
+        latest = _safe_load_universe_snapshot(repo, env=env, strategy=strategy, as_of=as_of)
+        members = (latest or {}).get("members") or []
         if latest and latest.get("members"):
             logger.warning(
                 "[PB1][UNIVERSE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
