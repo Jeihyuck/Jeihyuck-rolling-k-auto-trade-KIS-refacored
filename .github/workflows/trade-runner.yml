@@ -478,14 +478,14 @@ jobs:
 
     needs: [candidate_pool]
 
-    # 실행 조건:
-    # - workflow_dispatch: MODE=trade|both (candidate가 실패했으면 both는 차단)
-    # - schedule: trade tick cron(55 23 * * 0-4)에서만 실행
+    # ✅ 주중(schedule trade cron)에서는 upstream 스킵이어도 반드시 실행
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '55 23 * * 0-4') ||
-      (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both') &&
-        (needs.candidate_pool.result == 'success' || needs.candidate_pool.result == 'skipped'))
+      always() && (
+        (github.event_name == 'schedule' && github.event.schedule == '55 23 * * 0-4') ||
+        (github.event_name == 'workflow_dispatch' &&
+          (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both') &&
+          (needs.candidate_pool.result == 'success' || needs.candidate_pool.result == 'skipped'))
+      )
 
     env:
       TZ: Asia/Seoul
@@ -531,7 +531,7 @@ jobs:
       SQLITE_DISABLED: "1"
 
       PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_AUTOBUILD: "1"
+      PB1_WATCHLIST_AUTOBUILD: "0"
       PB1_WATCHLIST_TOPK: "20"
       PB1_WATCHLIST_FINALN: "10"
       PB1_WATCHLIST_MIN_PRICE: "2000"
@@ -645,6 +645,35 @@ jobs:
         run: |
           set -euo pipefail
           python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
+
+      - name: Candidate pool DB precheck (Weekend-built pool required)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import WatchlistRepo
+
+          env = os.getenv("STRATEGY_ENV", "PAPER")
+          strategy_key = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+
+          repo = WatchlistRepo(get_engine())
+          latest = repo.get_latest_watchlist_date(env=env, strategy=strategy_key)
+
+          if not latest:
+              print(f"[POOL][FAIL] No candidate pool in DB. env={env} strategy={strategy_key}")
+              print("[POOL][HINT] Run weekend schedule (Sat 00:30 KST) or manually dispatch MODE=candidate.")
+              sys.exit(1)
+
+          pool = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest) or []
+          print(f"[POOL][OK] latest={latest} size={len(pool)} min_size={min_size} env={env} strategy={strategy_key}")
+
+          if len(pool) < min_size:
+              print(f"[POOL][FAIL] pool too small: {len(pool)} < {min_size}")
+              sys.exit(1)
+
+          PY
 
       - name: Run PB1 (AUTO -> LIVE in-market, DIAG after-hours)
         env:

@@ -81,3 +81,26 @@ python -m trader.pb1_runner --env live --strategy best_k_meta --once --window mo
 PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.db.migrate
 PBCORE_DB_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require python -m trader.universe.build --env practice --strategy best_k_meta --date 2026-01-05
 ```
+
+## 수동 실행 가이드 (GitHub Actions)
+
+### 주말 후보군 강제 재생성
+주말에 생성된 후보군을 수동으로 다시 생성하려면:
+
+```
+Actions → Trade Runner → Run workflow
+MODE = candidate (또는 both)
+FORCE_REBUILD = 1
+```
+
+### 주중 즉시 거래 테스트
+주중에 거래를 테스트하려면 (후보군은 DB에 반드시 있어야 함):
+
+```
+Actions → Trade Runner → Run workflow
+MODE = trade
+DRY_RUN = 1 (테스트)
+LIVE_TRADING_ENABLED = 0
+```
+
+**참고**: 주중 거래는 주말(토요일 00:30 KST)에 생성된 DB 후보군을 필수로 사용합니다. 후보군이 없으면 거래가 자동으로 차단됩니다.
