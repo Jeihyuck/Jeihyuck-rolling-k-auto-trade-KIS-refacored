@@ -1443,10 +1443,17 @@ class PB1Engine:
         )
         return top
 
-    def _fetch_daily(self, code: str, count: int | None = None) -> tuple[pd.DataFrame, Dict]:
-        """OHLCV 로딩 (기본 PB1_OHLCV_DAYS_BASE일 윈도우로 안정화)"""
+    def _fetch_daily(self, code: str, count: int | None = None, days: int | None = None) -> tuple[pd.DataFrame, Dict]:
+        """OHLCV 로딩 (기본 PB1_OHLCV_DAYS_BASE일 윈도우로 안정화)
+        
+        Args:
+            code: 종목코드
+            count: 요청할 캔들 수 (days와 상호 호환)
+            days: count의 별칭 (candidate_pool_builder 호환용)
+        """
+        # days와 count는 같은 의미 (하위 호환성)
         if count is None:
-            count = int(PB1_OHLCV_DAYS_BASE)
+            count = days if days is not None else int(PB1_OHLCV_DAYS_BASE)
         self.daily_fetch_count += 1
         try:
             result = self.ohlcv_provider.get_ohlcv(code, count)
@@ -4156,12 +4163,18 @@ class PB1Engine:
         try:
             # 후보군 생성 (가벼운 스캔)
             force_rebuild = CANDIDATE_POOL_FORCE_REBUILD
+            
+            # ✅ 호환 래퍼: days 파라미터를 count로 변환
+            def _ohlcv_wrapper(code: str, days: int = 100):
+                df, meta = self._fetch_daily(code, count=days)
+                return df
+            
             pool_codes = build_and_save_candidate_pool(
                 engine=self.engine,
                 env=self.env,
                 as_of=today,
                 members=full_members,
-                ohlcv_provider=self._fetch_daily,
+                ohlcv_provider=_ohlcv_wrapper,
                 force_rebuild=force_rebuild,
             )
             
@@ -4197,8 +4210,13 @@ class PB1Engine:
         
         # timeout-safe: 195 전체가 아니라 상위 80~100개만 사용 (최소 프리필터)
         try:
+            # ✅ 호환 래퍼: days 파라미터를 count로 변환
+            def _ohlcv_wrapper(code: str, days: int = 100):
+                df, meta = self._fetch_daily(code, count=days)
+                return df
+            
             builder = CandidatePoolBuilder(
-                ohlcv_provider=self._fetch_daily,
+                ohlcv_provider=_ohlcv_wrapper,
                 target_size=min(CANDIDATE_POOL_SIZE, 100),  # 최대 100개로 제한
                 min_price=CANDIDATE_POOL_MIN_PRICE,
                 liq_days=30,  # 30일로 단축 (timeout 방지)

@@ -508,11 +508,12 @@ jobs:
 
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
 
-      # candidate pool 사용 활성화
+      # ✅ 후보군 사용 활성화 (DB 로드 전용, 재빌드 금지)
       CANDIDATE_POOL_ENABLED: "1"
       CANDIDATE_POOL_TTL_DAYS: "7"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
 
       DB_ONLY: "0"
       NONTRADING_SMOKE: "0"
@@ -530,14 +531,15 @@ jobs:
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
 
+      # ✅ Watchlist 설정 (재빌드 금지)
       PB1_WATCHLIST_ENABLED: "1"
       PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
       PB1_WATCHLIST_TOPK: "20"
       PB1_WATCHLIST_FINALN: "10"
       PB1_WATCHLIST_MIN_PRICE: "2000"
       PB1_WATCHLIST_LIQ_DAYS: "20"
       PB1_WATCHLIST_MIN_ROWS: "30"
-      PB1_WATCHLIST_FORCE_REBUILD: "0"
       PB1_WATCHLIST_STRICT: "0"
       PB1_MIN_CANDIDATES: "1"
       PB1_TARGET_NEW_POSITIONS: "2"
@@ -616,7 +618,7 @@ jobs:
           PY
 
       - name: "Guard: LIVE env precheck"
-        if: env.EFFECTIVE_STRATEGY_MODE == 'LIVE'
+        if: steps.market_mode.outputs.live_ok == 'true'
         run: |
           set -euo pipefail
           violations=()
@@ -649,37 +651,18 @@ jobs:
       - name: Candidate pool DB precheck (Weekend-built pool required)
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os, sys
-          from trader.db.engine import get_engine
-          from trader.db.repos import WatchlistRepo
-
-          env = os.getenv("STRATEGY_ENV", "PAPER")
-          strategy_key = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
-          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
-
-          repo = WatchlistRepo(get_engine())
-          latest = repo.get_latest_watchlist_date(env=env, strategy=strategy_key)
-
-          if not latest:
-              print(f"[POOL][FAIL] No candidate pool in DB. env={env} strategy={strategy_key}")
-              print("[POOL][HINT] Run weekend schedule (Sat 00:30 KST) or manually dispatch MODE=candidate.")
-              sys.exit(1)
-
-          pool = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest) or []
-          print(f"[POOL][OK] latest={latest} size={len(pool)} min_size={min_size} env={env} strategy={strategy_key}")
-
-          if len(pool) < min_size:
-              print(f"[POOL][FAIL] pool too small: {len(pool)} < {min_size}")
-              sys.exit(1)
-
-          PY
+          
+          # ✅ 전용 검증 스크립트 사용 (더 자세한 에러 메시지 제공)
+          python scripts/verify_candidate_pool.py
+          
+          echo ""
+          echo "[POOL][PRECHECK] ✅ Candidate pool verification passed"
+          echo "[POOL][PRECHECK] trade-tick will load from DB (no rebuild)"
 
       - name: Run PB1 (AUTO -> LIVE in-market, DIAG after-hours)
         env:
-          STRATEGY_MODE: ${{ env.EFFECTIVE_STRATEGY_MODE }}
-          PB1_PHASE_DEFAULT: ${{ env.PB1_PHASE_DEFAULT }}
-          KIS_HTTP_ENABLED: ${{ env.KIS_HTTP_ENABLED }}
+          # EFFECTIVE_STRATEGY_MODE, PB1_PHASE_DEFAULT, KIS_HTTP_ENABLED는
+          # market_mode 스텝에서 GITHUB_ENV로 설정되므로 자동으로 사용됨
           PB1_DIAG_FULL_EXEC: "1"
           PB1_WINDOW_OVERRIDE: "day"
           PB1_ALLOW_OUTSIDE_WINDOWS: "1"
