@@ -645,10 +645,22 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
+      - name: Normalize ENV (force uppercase)
+        run: |
+          set -euo pipefail
+          echo "KIS_ENV=${KIS_ENV^^}" >> "$GITHUB_ENV"
+          echo "STRATEGY_ENV=${STRATEGY_ENV^^}" >> "$GITHUB_ENV"
+          echo "[ENV][NORMALIZE] KIS_ENV=${KIS_ENV^^} STRATEGY_ENV=${STRATEGY_ENV^^}"
+
       - name: DB universe precheck
         run: |
           set -euo pipefail
-          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
+          if [ "${EFFECTIVE_STRATEGY_MODE}" = "DIAG" ]; then
+            echo "[UNIVERSE][PRECHECK] DIAG mode -> do not fail hard if missing"
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}" || true
+          else
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
+          fi
 
       - name: Candidate pool DB precheck (Weekend-built pool required)
         continue-on-error: true
