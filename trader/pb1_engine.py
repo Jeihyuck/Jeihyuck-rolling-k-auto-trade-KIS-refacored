@@ -1480,22 +1480,22 @@ class PB1Engine:
         reason = "OK"
         candidates: List[CandidateFeature] = []
         members_list = list(members)  # Iterable → list 변환
-        universe_count = len(members_list)
+        scan_count = len(members_list)
         
-        # ✅ 가드: 후보군 사용 시 195 universe 재검사 방지
+        # ✅ 가드: 후보군 사용 시 195 universe 재검사 방지 (자동 교정은 상위 레이어에서 처리됨)
         from trader.config import CANDIDATE_POOL_ENABLED
-        if CANDIDATE_POOL_ENABLED and universe_count > 150:
-            logger.error(
-                "[CANDIDATE_POOL][GUARD] CRITICAL: universe_count=%s exceeds 150, "
-                "candidate pool system should have reduced this! "
-                "Check _load_today_watchlist_members logic.",
-                universe_count
+        if CANDIDATE_POOL_ENABLED and scan_count > 150:
+            logger.warning(
+                "[CANDIDATE_POOL][GUARD] scan_count=%s exceeds 150, "
+                "this should have been reduced by candidate pool. "
+                "Proceeding with large universe (performance may be slow).",
+                scan_count
             )
         
         # ✅ 프리필터 적용 (Top N으로 제한)
         if os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
             members_list = self._prefilter_members_fast(members_list)
-            logger.info("[PB1][CANDIDATES][PREFILTER] universe=%s -> filtered=%s", universe_count, len(members_list))
+            logger.info("[PB1][CANDIDATES][PREFILTER] scan_count=%s -> filtered=%s", scan_count, len(members_list))
         
         try:
             # Limit OHLCV queries to holdings + top candidates from previous run
@@ -1565,7 +1565,7 @@ class PB1Engine:
                     reason = "TIME_BUDGET_EXCEEDED"
                     logger.warning(
                         "[ENTRY][CANDIDATES][TIMEOUT] checked=%s/%s elapsed=%.1fs deadline_exceeded=True",
-                        checked_count, universe_count, time.monotonic() - t0
+                        checked_count, scan_count, time.monotonic() - t0
                     )
                     break
                 
@@ -1812,9 +1812,9 @@ class PB1Engine:
                 final_count = len([cf for cf in candidates if cf.setup_ok])
                 
                 logger.warning(
-                    "[PB1][CANDIDATES=0][BREAKDOWN] universe=%s checked=%s ohlcv_missing=%s ohlcv_ok=%s "
+                    "[PB1][CANDIDATES=0][BREAKDOWN] scan_count=%s checked=%s ohlcv_missing=%s ohlcv_ok=%s "
                     "regime_pass=%s vcp_pass=%s rs_pass=%s final=%s reason=%s",
-                    universe_count,
+                    scan_count,
                     checked_count,
                     ohlcv_missing_count,
                     ohlcv_ok_count,
@@ -1831,10 +1831,10 @@ class PB1Engine:
                     logger.warning("[PB1][CANDIDATES=0][OHLCV_SKIP_SAMPLE] codes=%s", skip_samples)
             
             logger.info(
-                "[ENTRY][PIPE][END] trace=compute_candidates total_dt=%.2fs reason=%s universe=%s candidates=%s",
+                "[ENTRY][PIPE][END] trace=compute_candidates total_dt=%.2fs reason=%s scan_count=%s candidates=%s",
                 total_dt,
                 reason,
-                universe_count,
+                scan_count,
                 candidates_count,
             )
 
@@ -4803,13 +4803,31 @@ class PB1Engine:
         dt_order_build = 0.0
         dt_order_submit = 0.0
         
-        # ✅ members를 먼저 로드하여 정확한 universe 카운트
-        members = self._load_universe()
+        # ✅ universe_members는 보유/리포트/정산용으로만 로드
+        universe_members = self._load_universe()
+        
+        # ✅ scan_members: 후보군 hit시 watchlist, 아니면 universe
+        scan_members = universe_members
+        scan_source = "universe"
+        
+        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        if watchlist_enabled and self.phase in {"prep", "entry"}:
+            watchlist_members, watchlist_reason = self._load_today_watchlist_members()
+            if "candidate_pool_hit" in watchlist_reason or "candidate_pool_autobuilt" in watchlist_reason:
+                scan_members = watchlist_members
+                scan_source = watchlist_reason
+                logger.info(
+                    "[ENTRY][SCAN_INPUT] source=%s scan_count=%s (NOT universe=%s)",
+                    scan_source,
+                    len(scan_members),
+                    len(universe_members),
+                )
         
         logger.info(
-            "[ENTRY][PIPE][START] trace=%s universe=%s slots=%s tick_budget=%.0f entry_allowed=%s",
+            "[ENTRY][PIPE][START] trace=%s scan_count=%s source=%s slots=%s tick_budget=%.0f entry_allowed=%s",
             trace_id,
-            len(members),
+            len(scan_members),
+            scan_source,
             slots_remaining,
             tick_budget_krw,
             entry_allowed,
@@ -4819,28 +4837,30 @@ class PB1Engine:
         emit_event(
             as_of=self._today,
             event="PB1_UNIVERSE_STATUS",
-            ok=bool(members),
-            universe_members=len(members),
+            ok=bool(scan_members),
+            universe_members=len(universe_members),
+            scan_members=len(scan_members),
+            scan_source=scan_source,
             universe_as_of=self._universe_as_of,
         )
-        if not members:
-            note = "universe_empty"
+        if not scan_members:
+            note = "scan_members_empty"
             logger.error(
-                "[PB1][UNIVERSE][EMPTY] env=%s strategy=%s path=%s members_count=%s action_required=universe_build",
+                "[PB1][SCAN][EMPTY] env=%s strategy=%s scan_source=%s scan_count=%s action_required=universe_or_candidate_pool_build",
                 self.env,
                 self.UNIVERSE_STRATEGY,
-                self._universe_path,
-                len(members),
+                scan_source,
+                len(scan_members),
             )
-            self._log_reason_summary("universe_empty")
-            entry_reason = "universe_empty"
+            self._log_reason_summary("scan_members_empty")
+            entry_reason = "scan_members_empty"
             entry_allowed = False
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
             if self.phase in {"prep", "entry"}:
                 _emit_entry_summary([], [], Counter())
                 _emit_entry_decision(
                     "SKIP",
-                    reason="UNIVERSE_EMPTY",
+                    reason="SCAN_MEMBERS_EMPTY",
                     ok_setups=0,
                     blocked_by=_normalize_entry_block_reasons([entry_reason]),
                 )
@@ -4853,7 +4873,7 @@ class PB1Engine:
                 )
             skip_entry_scan = True
 
-        code_market = {m.get("code"): m.get("market") for m in members}
+        code_market = {m.get("code"): m.get("market") for m in scan_members}
         candidates: List[CandidateFeature] = []
         selected_tier = "tier1"
         selected_thresholds = self.filter_thresholds
@@ -4874,7 +4894,7 @@ class PB1Engine:
             # Minervini 적용 전 시간 기록
             t_minervini_start = time.monotonic()
             
-            candidates = self._compute_candidates(members)
+            candidates = self._compute_candidates(scan_members)
             
             # Minervini 적용 시간 기록 (_compute_candidates 내부에서 Minervini 수행)
             dt_minervini = time.monotonic() - t_minervini_start
@@ -4882,9 +4902,10 @@ class PB1Engine:
             # [ENTRY][CANDIDATES] 초기 카운트
             data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
             logger.info(
-                "[ENTRY][CANDIDATES] trace=%s start universe=%s data_ok=%s dt_minervini=%.2f",
+                "[ENTRY][CANDIDATES] trace=%s start scan_count=%s source=%s data_ok=%s dt_minervini=%.2f",
                 trace_id,
-                len(members),
+                len(scan_members),
+                scan_source,
                 data_ok_count,
                 dt_minervini,
             )

@@ -2087,6 +2087,31 @@ def main() -> int:
     # else: TRADE_INTRADAY (기존 로직)
     logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
     
+    # ✅ 환경변수 검증: KIS_ENV vs STRATEGY_ENV 일치 확인
+    kis_env = os.getenv("KIS_ENV", "").lower()
+    strategy_env = os.getenv("STRATEGY_ENV", "").lower()
+    
+    if kis_env and strategy_env and kis_env != strategy_env:
+        logger.error(
+            "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (environment mismatch will cause wrong universe/candidate pool)",
+            kis_env,
+            strategy_env,
+        )
+        logger.error(
+            "[PB1][ENV][FIX] Set both to the same value (e.g., KIS_ENV=live STRATEGY_ENV=live) or unset one to inherit from the other"
+        )
+        raise ValueError(f"KIS_ENV ({kis_env}) != STRATEGY_ENV ({strategy_env})")
+    
+    # ✅ KIS_ENV가 없으면 STRATEGY_ENV로 설정
+    if not kis_env and strategy_env:
+        os.environ["KIS_ENV"] = strategy_env
+        logger.info("[PB1][ENV][AUTO] KIS_ENV not set -> using STRATEGY_ENV=%s", strategy_env)
+    
+    # ✅ STRATEGY_ENV가 없으면 KIS_ENV로 설정
+    if not strategy_env and kis_env:
+        os.environ["STRATEGY_ENV"] = kis_env
+        logger.info("[PB1][ENV][AUTO] STRATEGY_ENV not set -> using KIS_ENV=%s", kis_env)
+    
     # ✅ AUTO 모드 결정 및 환경변수 고정
     mode_env = os.getenv("STRATEGY_MODE", "AUTO")
     resolved_mode = resolve_auto_strategy_mode(mode_env)
