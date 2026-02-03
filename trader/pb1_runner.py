@@ -1552,35 +1552,56 @@ def run_once(
         if balance_state == BALANCE_STATE_STALE_OK:
             logger.warning("[PB1][BALANCE][STALE_OK] using recent snapshot for exits")
 
+        # ✅ [GATE SEPARATION] calc_allowed, price_allowed, order_allowed
+        minervini_only = os.getenv("MINERVINI_ONLY", "0") == "1"
+        
+        # calc_allowed: 분석/스코어 계산 가능 여부
+        if minervini_only:
+            calc_allowed = True  # MINERVINI_ONLY는 시간 무관하게 계산만 수행
+            logger.info("[PB1][MINERVINI_ONLY] calc_allowed=1 (cutoff/window ignored)")
+        else:
+            calc_allowed = True  # 기본적으로 계산은 항상 허용
+        
+        # price_allowed: 가격 조회 가능 여부 (MINERVINI_ONLY에서는 DB만 사용)
+        price_allowed = True  # Minervini는 OHLCV 종가 기반이므로 HTTP 필요 없음
+        
+        # order_allowed: 주문 생성/제출 가능 여부
         user_entry_enabled = bool(entry_flag.value)
-        entry_allowed_this_tick = user_entry_enabled
+        order_allowed = user_entry_enabled and not minervini_only
         entry_block_reason = None
         
+        # MINERVINI_ONLY 강제 설정
+        if minervini_only:
+            order_allowed = False
+            entry_block_reason = "minervini_only_mode"
+            logger.info("[PB1][MINERVINI_ONLY] order_allowed=0 KIS_HTTP_ENABLED=%s DRY_RUN=%s",
+                       os.getenv("KIS_HTTP_ENABLED", "N/A"), os.getenv("DRY_RUN", "N/A"))
+        
         # [2] 거래시간 체크: LIVE 모드에서 장중 여부 판정
-        if mode == "LIVE":
+        if mode == "LIVE" and not minervini_only:
             is_weekday = now.weekday() < 5  # Mon-Fri
             market_open = datetime.strptime("09:00", "%H:%M").time()
             market_close = datetime.strptime("15:20", "%H:%M").time()
             in_market_hours = is_weekday and (market_open <= now.time() < market_close)
             if not in_market_hours:
                 logger.info("[PB1][LIVE][OUT_OF_MARKET] now=%s weekday=%s -> no entry/exit", now.isoformat(), is_weekday)
-                entry_allowed_this_tick = False
+                order_allowed = False
                 entry_block_reason = entry_block_reason or "out_of_market_hours"
         
-        if not user_entry_enabled:
-            entry_allowed_this_tick = False
+        if not user_entry_enabled and not minervini_only:
+            order_allowed = False
             entry_block_reason = "entry_disabled"
-        if balance_state == BALANCE_STATE_UNKNOWN:
-            entry_allowed_this_tick = False
+        if balance_state == BALANCE_STATE_UNKNOWN and not minervini_only:
+            order_allowed = False
             entry_block_reason = entry_block_reason or "balance_unknown"
-        elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK:
-            entry_allowed_this_tick = False
+        elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK and not minervini_only:
+            order_allowed = False
             entry_block_reason = entry_block_reason or "balance_stale"
-        if window_label not in {"preopen", "morning", "day"}:
-            entry_allowed_this_tick = False
+        if window_label not in {"preopen", "morning", "day"} and not minervini_only:
+            order_allowed = False
             entry_block_reason = entry_block_reason or "window_blocked"
         entry_cutoff_raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
-        if entry_cutoff_raw:
+        if entry_cutoff_raw and not minervini_only:
             try:
                 cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
                 cutoff_dt = datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
@@ -1592,23 +1613,23 @@ def run_once(
                     resolved_phase,
                 )
                 if now.time() > cutoff_time:
-                    entry_allowed_this_tick = False
+                    order_allowed = False
                     entry_block_reason = entry_block_reason or "entry_cutoff"
             except ValueError:
                 logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s", entry_cutoff_raw)
 
-        if market_window == "preopen":
+        if market_window == "preopen" and not minervini_only:
             if not PB1_ALLOW_PREOPEN_ENTRY:
-                entry_allowed_this_tick = False
+                order_allowed = False
                 entry_block_reason = entry_block_reason or "preopen_block"
             elif PB1_PREOPEN_REQUIRE_BALANCE and balance_state != BALANCE_STATE_OK:
-                entry_allowed_this_tick = False
+                order_allowed = False
                 entry_block_reason = entry_block_reason or "balance_unknown"
 
-        if deadline_ts:
+        if deadline_ts and not minervini_only:
             remaining_budget = deadline_ts - time_mod.monotonic()
             if remaining_budget <= persist_budget_sec:
-                entry_allowed_this_tick = False
+                order_allowed = False
                 entry_block_reason = entry_block_reason or "timeout_budget"
                 logger.warning(
                     "[PB1][TIMEOUT][ENTRY_BLOCKED] remaining=%.1fs persist_budget=%s trade_budget=%s",
@@ -1617,10 +1638,10 @@ def run_once(
                     trade_budget_sec,
                 )
 
-        if kis and getattr(kis, "safe_mode", False):
-            entry_allowed_this_tick = False
+        if kis and getattr(kis, "safe_mode", False) and not minervini_only:
+            order_allowed = False
             entry_block_reason = entry_block_reason or "safe_mode"
-            logger.warning("[PB1][SAFE_MODE] entry_allowed=0")
+            logger.warning("[PB1][SAFE_MODE] order_allowed=0")
             try:
                 ReconcileLogRepo(engine).append_log(
                     env=kis_env or "practice",
@@ -1632,9 +1653,24 @@ def run_once(
             except Exception:
                 logger.warning("[PB1][SAFE_MODE][RECONCILE_LOG][FAIL]", exc_info=True)
 
-        if not entry_allowed_this_tick:
+        # ✅ 게이트 요약 로그
+        logger.info(
+            "[PB1][GATE] calc_allowed=%s price_allowed=%s order_allowed=%s minervini_only=%s reason=%s",
+            int(calc_allowed), int(price_allowed), int(order_allowed), int(minervini_only),
+            entry_block_reason or "none"
+        )
+        
+        if not calc_allowed:
             logger.info(
-                "[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0",
+                "[PB1][CALC_BLOCKED] reason=%s -> skip analytics",
+                entry_block_reason or "unknown",
+            )
+            # 계산도 못하면 조기 종료
+            return [], False, {}, phase_for_log, "SKIP_ANALYTICS"
+        
+        if not order_allowed:
+            logger.info(
+                "[PB1][ORDER_BLOCKED] reason=%s order_allowed=0",
                 entry_block_reason or "unknown",
             )
 
@@ -1709,8 +1745,11 @@ def run_once(
             now_kst_value=now,
             balance_snapshot=balance_snapshot_raw,
             balance_source=balance_source,
-            entry_allowed_this_tick=entry_allowed_this_tick,
+            calc_allowed=calc_allowed,  # ✅ 계산 허용 여부
+            price_allowed=price_allowed,  # ✅ 가격 조회 허용 여부
+            order_allowed=order_allowed,  # ✅ 주문 허용 여부
             entry_block_reason=entry_block_reason,
+            minervini_only=minervini_only,  # ✅ MINERVINI_ONLY 모드
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
             universe_context=universe_ctx,
             diag_full_exec=diag_full_exec,  # ✅ DIAG 풀패스 플래그 전달

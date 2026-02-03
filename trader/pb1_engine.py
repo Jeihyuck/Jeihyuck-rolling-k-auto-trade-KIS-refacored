@@ -492,8 +492,11 @@ class PB1Engine:
         now_kst_value: datetime | None = None,
         balance_snapshot: dict | None = None,
         balance_source: str | None = None,
-        entry_allowed_this_tick: bool = True,
+        calc_allowed: bool = True,  # ✅ 계산 허용
+        price_allowed: bool = True,  # ✅ 가격조회 허용
+        order_allowed: bool = True,  # ✅ 주문 허용
         entry_block_reason: str | None = None,
+        minervini_only: bool = False,  # ✅ MINERVINI_ONLY 모드
         preopen_max_new_positions: int = 0,
         universe_context: UniverseContext | None = None,
         diag_full_exec: bool = False,
@@ -573,7 +576,11 @@ class PB1Engine:
         self._code_name_map: Dict[str, str] = {}
         self.current_code: str | None = None
         self.top_candidates: list[dict[str, Any]] = []
-        self.entry_enabled = bool(entry_allowed_this_tick)
+        self.calc_allowed = bool(calc_allowed)  # ✅ 계산 게이트
+        self.price_allowed = bool(price_allowed)  # ✅ 가격 게이트
+        self.order_allowed = bool(order_allowed)  # ✅ 주문 게이트
+        self.minervini_only = bool(minervini_only)  # ✅ MINERVINI_ONLY 모드
+        self.entry_enabled = bool(order_allowed)  # 하위호환용
         self.entry_block_reason = entry_block_reason
         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
         self.window_internal = self._resolve_window_internal()
@@ -4491,32 +4498,30 @@ class PB1Engine:
         self.askbid_fail_count = 0  # [PATCH] 회로차단기용 실패 카운트
         final_status = "OK"
         final_notes: str | None = None
-        entry_allowed = self.entry_enabled
+        
+        # ✅ [GATE] calc_allowed, order_allowed 분리
+        calc_allowed = self.calc_allowed  # 계산 허용
+        order_allowed = self.order_allowed  # 주문 허용
+        minervini_only = self.minervini_only  # MINERVINI_ONLY 모드
+        entry_allowed = self.entry_enabled  # 하위호환용
         entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
+        
+        # ✅ MINERVINI_ONLY 모드에서는 계산만 허용, 주문은 금지
+        if minervini_only:
+            calc_allowed = True
+            order_allowed = False
+            logger.info(
+                "[MINERVINI_ONLY] calc_allowed=1 order_allowed=0 (bypass cutoff/window for analytics only)"
+            )
         
         # ✅ DIAG_FULL_EXEC: entry gate 우회
         diag_full_exec = bool(getattr(self, "diag_full_exec", False))
-        
-        # ✅ [NEW] MINERVINI_ONLY: 미너비니 계산만 수행, 주문은 금지
-        from trader.config import MINERVINI_ONLY
-        
-        # ✅ MINERVINI_ONLY=1이면 entry_allowed와 무관하게 계산은 허용, 주문은 금지
-        # calc_allowed: 미너비니/랭킹 계산 허용 여부
-        # order_allowed: 주문(intent/submit) 허용 여부
-        calc_allowed = entry_allowed or MINERVINI_ONLY
-        order_allowed = entry_allowed and (not MINERVINI_ONLY)
-        
-        if MINERVINI_ONLY:
-            logger.warning(
-                "[MINERVINI_ONLY] calc_allowed=1 order_allowed=0 (bypass cutoff/window for analytics only)"
-            )
         
         # ✅ 서킷 브레이커 체크: EGW002 발생 시 신규진입 중단
         if self.kis and hasattr(self.kis, '_price_cache'):
             from trader.kis_wrapper import _price_cache
             if _price_cache.is_circuit_open():
                 logger.warning("[PB1][DEGRADED] price circuit open -> skip new entries this tick")
-                entry_allowed = False
                 order_allowed = False
                 entry_reason = "price_circuit_open"
         
@@ -4531,7 +4536,7 @@ class PB1Engine:
         skip_entry_scan = False
         if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
             target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
-        if not entry_allowed:
+        if not order_allowed and not minervini_only:
             # ✅ DIAG_FULL_EXEC: entry gate 우회
             if diag_full_exec and entry_reason in ("entry_cutoff", "window_blocked", "phase_manage", "entry_disabled"):
                 logger.warning(
@@ -4539,37 +4544,66 @@ class PB1Engine:
                     entry_reason,
                     self.dry_run
                 )
-                entry_allowed = True
+                order_allowed = True
                 calc_allowed = True
                 entry_reason = "diag_full_exec_override"
             else:
                 logger.warning(
-                    "[PB1][ENTRY_DISABLED][REASON] entry_allowed=0 reason=%s -> skip new entries",
+                    "[PB1][ORDER_DISABLED][REASON] order_allowed=0 reason=%s -> skip new orders",
                     entry_reason
                 )
-                logger.info("[PB1][BUY][SKIP] reason=%s details={'entry_allowed': False}", entry_reason)
+                logger.info("[PB1][BUY][SKIP] reason=%s details={'order_allowed': False}", entry_reason)
                 # MINERVINI_ONLY면 계산은 허용
-                if not MINERVINI_ONLY:
+                if not minervini_only:
                     calc_allowed = False
         if self.phase == "verify":
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=verify -> allow entry")
             else:
-                entry_allowed = False
                 order_allowed = False
                 entry_reason = "phase_verify"
                 # MINERVINI_ONLY면 계산은 허용
-                if not MINERVINI_ONLY:
+                if not minervini_only:
                     calc_allowed = False
         if self.phase in {"manage", "exit", "idle"}:
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=%s -> allow entry", self.phase)
             else:
-                entry_allowed = False
                 order_allowed = False
                 entry_reason = f"phase_{self.phase}"
                 # MINERVINI_ONLY면 계산은 허용
-                if not MINERVINI_ONLY:
+                if not minervini_only:
+                    calc_allowed = False
+                )
+                order_allowed = True
+                calc_allowed = True
+                entry_reason = "diag_full_exec_override"
+            else:
+                logger.warning(
+                    "[PB1][ENTRY_DISABLED][REASON] order_allowed=0 reason=%s -> skip new orders",
+                    entry_reason
+                )
+                logger.info("[PB1][BUY][SKIP] reason=%s details={'order_allowed': False}", entry_reason)
+                # MINERVINI_ONLY면 계산은 허용
+                if not minervini_only:
+                    calc_allowed = False
+        if self.phase == "verify":
+            if diag_full_exec:
+                logger.warning("[PB1][DIAG_FULL_EXEC] override phase=verify -> allow entry")
+            else:
+                order_allowed = False
+                entry_reason = "phase_verify"
+                # MINERVINI_ONLY면 계산은 허용
+                if not minervini_only:
+                    calc_allowed = False
+        if self.phase in {"manage", "exit", "idle"}:
+            if diag_full_exec:
+                logger.warning("[PB1][DIAG_FULL_EXEC] override phase=%s -> allow entry", self.phase)
+            else:
+                order_allowed = False
+                entry_reason = f"phase_{self.phase}"
+                # MINERVINI_ONLY면 계산은 허용
+                if not minervini_only:
                     calc_allowed = False
         # ✅ FATAL 가드: intended_live=True인데 dry_run=True면 즉시 종료
         if self.intended_live and self.dry_run:
@@ -5092,6 +5126,47 @@ class PB1Engine:
                 len(candidate_codes),
                 dt_minervini,
             )
+            
+            # ✅ MINERVINI_ONLY 모드: 계산 완료 후 결과 저장하고 조기 종료
+            if minervini_only:
+                minervini_pass_count = len([c for c in candidates if c.setup_ok])
+                minervini_top_10 = candidate_codes[:10] if len(candidate_codes) >= 10 else candidate_codes
+                
+                logger.info(
+                    "[MINERVINI_ONLY][RESULT] minervini_dt=%.2f candidates_ok=%s minervini_top_summary=%s",
+                    dt_minervini,
+                    minervini_pass_count,
+                    ",".join(minervini_top_10) if minervini_top_10 else "(none)",
+                )
+                
+                # top candidates 저장
+                top_candidates_path = runtime_path("top_candidates.json")
+                try:
+                    import json
+                    with open(top_candidates_path, 'w') as f:
+                        json.dump(self.top_candidates, f)
+                    logger.info(
+                        "[MINERVINI_ONLY][TOP_CANDIDATES] saved=%s path=%s",
+                        len(self.top_candidates),
+                        top_candidates_path
+                    )
+                except Exception as exc:
+                    logger.warning("[MINERVINI_ONLY][TOP_SAVE_FAIL] %s", exc)
+                
+                # 조기 종료
+                logger.info(
+                    "[MINERVINI_ONLY][EXIT] order_allowed=0 minervini_dt=%.2f candidates=%s -> DONE_ANALYTICS",
+                    dt_minervini,
+                    minervini_pass_count,
+                )
+                return RunResult(
+                    status="DONE_ANALYTICS",
+                    notes=f"minervini_only_complete_{minervini_pass_count}_candidates",
+                    balance_api_calls=self.balance_api_calls,
+                    balance_cache_hits=self.balance_cache_hits,
+                    balance_tick_cache_hits=self.balance_tick_cache_hits,
+                )
+            
             minervini_report_path = run_minervini_report(
                 members,
                 self.minervini_config,
