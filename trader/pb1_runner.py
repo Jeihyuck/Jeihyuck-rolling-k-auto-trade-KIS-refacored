@@ -248,6 +248,8 @@ def _log_db_only_universe_precheck(
     strategy: str,
     namespace: str = "default",
 ) -> None:
+    # ✅ env 정규화: 대소문자 불일치 방지
+    env = _norm_env(env)
     snapshot = repo.get_current_universe_snapshot(env, strategy)
     if not snapshot:
         logger.warning(
@@ -1204,49 +1206,48 @@ def run_once(
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag
-    diag_enabled = force_diag  # ✅ 호환성을 위해 추가
 
-    # ✅ SINGLE SOURCE OF TRUTH: resolve_trade_flags로 통일
-    from trader.config import resolve_trade_flags
-    
-    requested_dry_run_env = os.getenv("DRY_RUN")
-    requested_dry_run = None if requested_dry_run_env is None else (requested_dry_run_env == "1")
-    
-    flags = resolve_trade_flags(
-        strategy_mode=os.getenv("STRATEGY_MODE", ""),
-        live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True"),
-        disable_live_trading=os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True"),
-        kis_http_enabled=os.getenv("KIS_HTTP_ENABLED", "1") in ("1", "true", "True"),
-        requested_dry_run=requested_dry_run,
-    )
-    
-    dry_run = flags["dry_run"]
-    intended_live = flags["intended_live"]
-    dry_run_reasons = flags["reasons"]
-    dry_run_reason = ",".join(dry_run_reasons)
-    
+    dry_run_flag = parse_env_flag("DRY_RUN", default=False)
+    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
+    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
+    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+    mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+    dry_run_reasons: list[str] = []
+    diag_enabled = force_diag
+    if diag_enabled:
+        dry_run_reasons.append("diagnostic_mode")
+    if mode_resolved == "INTENT_ONLY":
+        dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
+    if mode_resolved != "LIVE":
+        dry_run_reasons.append("STRATEGY_MODE!=LIVE")
+    if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
+        dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
+    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
+    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
+    dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
+    if not live_trading_flag.value and mode_resolved == "LIVE":
+        dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
+    if dry_run_flag.value:
+        dry_run_reasons.append("DRY_RUN=1")
+    for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
+        if not flag.valid:
+            dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
+
+    dry_run = bool(dry_run_reasons)
+    dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+
     logger.info(
-        "[TRADE_FLAGS] intended_live=%s dry_run=%s reasons=%s",
-        intended_live,
+        "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
+        event_name_lower or "unknown",
         dry_run,
-        dry_run_reasons,
+        dry_run_reasons or ["live"],
     )
-    
-    # ✅ intended_live를 환경변수로 저장 (주문 함수에서 접근 가능하도록)
-    os.environ["INTENDED_LIVE"] = "1" if intended_live else "0"
-    
     if smoke_enabled:
         logger.info(
             "[PB1][SMOKE] enabled=True simulated_now_kst=%s force_dry_run=True",
             now.isoformat(),
         )
 
-    # ✅ 호환성을 위해 기존 변수 재구성 (기존 코드가 사용)
-    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-    mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-    disable_live_flag_value = os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True")
-    live_trading_flag_value = os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True")
-    
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
     kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
     kis_env = kis_env_raw.lower()
@@ -1256,9 +1257,9 @@ def run_once(
         guard_failures: list[str] = []
         if dry_run:
             guard_failures.append("dry_run")
-        if not live_trading_flag_value:
+        if not live_trading_flag.value or not live_trading_flag.valid:
             guard_failures.append("LIVE_TRADING_ENABLED!=1")
-        if disable_live_flag_value:
+        if disable_live_flag.value or not disable_live_flag.valid:
             guard_failures.append("DISABLE_LIVE_TRADING!=0")
         if mode_resolved != "LIVE":
             guard_failures.append("STRATEGY_MODE!=LIVE")
@@ -1273,8 +1274,8 @@ def run_once(
 
     def _apply_env_flags(dry: bool) -> None:
         os.environ["DRY_RUN"] = "1" if dry else "0"
-        os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag_value else "0"
-        os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag_value else "0"
+        os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
+        os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
         os.environ["STRATEGY_MODE"] = effective_mode
 
     _apply_env_flags(dry_run)
@@ -1508,10 +1509,12 @@ def run_once(
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
+                # ✅ env 정규화 적용
+                normalized_env = _norm_env(kis_env or "practice")
                 universe_ctx = _load_universe_context(
                     engine=engine,
                     as_of=as_of,
-                    env=kis_env or "practice",
+                    env=normalized_env,
                     strategy=universe_strategy,
                 )
             except RuntimeError as exc:
@@ -1552,56 +1555,35 @@ def run_once(
         if balance_state == BALANCE_STATE_STALE_OK:
             logger.warning("[PB1][BALANCE][STALE_OK] using recent snapshot for exits")
 
-        # ✅ [GATE SEPARATION] calc_allowed, price_allowed, order_allowed
-        minervini_only = os.getenv("MINERVINI_ONLY", "0") == "1"
-        
-        # calc_allowed: 분석/스코어 계산 가능 여부
-        if minervini_only:
-            calc_allowed = True  # MINERVINI_ONLY는 시간 무관하게 계산만 수행
-            logger.info("[PB1][MINERVINI_ONLY] calc_allowed=1 (cutoff/window ignored)")
-        else:
-            calc_allowed = True  # 기본적으로 계산은 항상 허용
-        
-        # price_allowed: 가격 조회 가능 여부 (MINERVINI_ONLY에서는 DB만 사용)
-        price_allowed = True  # Minervini는 OHLCV 종가 기반이므로 HTTP 필요 없음
-        
-        # order_allowed: 주문 생성/제출 가능 여부
         user_entry_enabled = bool(entry_flag.value)
-        order_allowed = user_entry_enabled and not minervini_only
+        entry_allowed_this_tick = user_entry_enabled
         entry_block_reason = None
         
-        # MINERVINI_ONLY 강제 설정
-        if minervini_only:
-            order_allowed = False
-            entry_block_reason = "minervini_only_mode"
-            logger.info("[PB1][MINERVINI_ONLY] order_allowed=0 KIS_HTTP_ENABLED=%s DRY_RUN=%s",
-                       os.getenv("KIS_HTTP_ENABLED", "N/A"), os.getenv("DRY_RUN", "N/A"))
-        
         # [2] 거래시간 체크: LIVE 모드에서 장중 여부 판정
-        if mode == "LIVE" and not minervini_only:
+        if mode == "LIVE":
             is_weekday = now.weekday() < 5  # Mon-Fri
             market_open = datetime.strptime("09:00", "%H:%M").time()
             market_close = datetime.strptime("15:20", "%H:%M").time()
             in_market_hours = is_weekday and (market_open <= now.time() < market_close)
             if not in_market_hours:
                 logger.info("[PB1][LIVE][OUT_OF_MARKET] now=%s weekday=%s -> no entry/exit", now.isoformat(), is_weekday)
-                order_allowed = False
+                entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "out_of_market_hours"
         
-        if not user_entry_enabled and not minervini_only:
-            order_allowed = False
+        if not user_entry_enabled:
+            entry_allowed_this_tick = False
             entry_block_reason = "entry_disabled"
-        if balance_state == BALANCE_STATE_UNKNOWN and not minervini_only:
-            order_allowed = False
+        if balance_state == BALANCE_STATE_UNKNOWN:
+            entry_allowed_this_tick = False
             entry_block_reason = entry_block_reason or "balance_unknown"
-        elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK and not minervini_only:
-            order_allowed = False
+        elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK:
+            entry_allowed_this_tick = False
             entry_block_reason = entry_block_reason or "balance_stale"
-        if window_label not in {"preopen", "morning", "day"} and not minervini_only:
-            order_allowed = False
+        if window_label not in {"preopen", "morning", "day"}:
+            entry_allowed_this_tick = False
             entry_block_reason = entry_block_reason or "window_blocked"
         entry_cutoff_raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
-        if entry_cutoff_raw and not minervini_only:
+        if entry_cutoff_raw:
             try:
                 cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
                 cutoff_dt = datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
@@ -1613,23 +1595,23 @@ def run_once(
                     resolved_phase,
                 )
                 if now.time() > cutoff_time:
-                    order_allowed = False
+                    entry_allowed_this_tick = False
                     entry_block_reason = entry_block_reason or "entry_cutoff"
             except ValueError:
                 logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s", entry_cutoff_raw)
 
-        if market_window == "preopen" and not minervini_only:
+        if market_window == "preopen":
             if not PB1_ALLOW_PREOPEN_ENTRY:
-                order_allowed = False
+                entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "preopen_block"
             elif PB1_PREOPEN_REQUIRE_BALANCE and balance_state != BALANCE_STATE_OK:
-                order_allowed = False
+                entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "balance_unknown"
 
-        if deadline_ts and not minervini_only:
+        if deadline_ts:
             remaining_budget = deadline_ts - time_mod.monotonic()
             if remaining_budget <= persist_budget_sec:
-                order_allowed = False
+                entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "timeout_budget"
                 logger.warning(
                     "[PB1][TIMEOUT][ENTRY_BLOCKED] remaining=%.1fs persist_budget=%s trade_budget=%s",
@@ -1638,10 +1620,10 @@ def run_once(
                     trade_budget_sec,
                 )
 
-        if kis and getattr(kis, "safe_mode", False) and not minervini_only:
-            order_allowed = False
+        if kis and getattr(kis, "safe_mode", False):
+            entry_allowed_this_tick = False
             entry_block_reason = entry_block_reason or "safe_mode"
-            logger.warning("[PB1][SAFE_MODE] order_allowed=0")
+            logger.warning("[PB1][SAFE_MODE] entry_allowed=0")
             try:
                 ReconcileLogRepo(engine).append_log(
                     env=kis_env or "practice",
@@ -1653,24 +1635,9 @@ def run_once(
             except Exception:
                 logger.warning("[PB1][SAFE_MODE][RECONCILE_LOG][FAIL]", exc_info=True)
 
-        # ✅ 게이트 요약 로그
-        logger.info(
-            "[PB1][GATE] calc_allowed=%s price_allowed=%s order_allowed=%s minervini_only=%s reason=%s",
-            int(calc_allowed), int(price_allowed), int(order_allowed), int(minervini_only),
-            entry_block_reason or "none"
-        )
-        
-        if not calc_allowed:
+        if not entry_allowed_this_tick:
             logger.info(
-                "[PB1][CALC_BLOCKED] reason=%s -> skip analytics",
-                entry_block_reason or "unknown",
-            )
-            # 계산도 못하면 조기 종료
-            return [], False, {}, phase_for_log, "SKIP_ANALYTICS"
-        
-        if not order_allowed:
-            logger.info(
-                "[PB1][ORDER_BLOCKED] reason=%s order_allowed=0",
+                "[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0",
                 entry_block_reason or "unknown",
             )
 
@@ -1740,16 +1707,12 @@ def run_once(
             dry_run=dry_run,
             env=kis_env or "practice",
             run_id=run_record_id,
-            intended_live=intended_live,  # ✅ 메인에서 확정한 LIVE 의도 전달
             strategy=universe_strategy,  # [FIX] watchlist 버그 수정 - strategy 전달
             now_kst_value=now,
             balance_snapshot=balance_snapshot_raw,
             balance_source=balance_source,
-            calc_allowed=calc_allowed,  # ✅ 계산 허용 여부
-            price_allowed=price_allowed,  # ✅ 가격 조회 허용 여부
-            order_allowed=order_allowed,  # ✅ 주문 허용 여부
+            entry_allowed_this_tick=entry_allowed_this_tick,
             entry_block_reason=entry_block_reason,
-            minervini_only=minervini_only,  # ✅ MINERVINI_ONLY 모드
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
             universe_context=universe_ctx,
             diag_full_exec=diag_full_exec,  # ✅ DIAG 풀패스 플래그 전달
@@ -2288,27 +2251,14 @@ def main() -> int:
         os.environ["STRATEGY_ENV"] = kis_env
         logger.info("[PB1][ENV][AUTO] STRATEGY_ENV not set -> using KIS_ENV=%s", kis_env)
     
-    # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
-    from trader.config import MINERVINI_ONLY
-    if MINERVINI_ONLY:
-        os.environ["KIS_HTTP_ENABLED"] = "0"
-        os.environ["DISABLE_LIVE_TRADING"] = "1"
-        os.environ["LIVE_TRADING_ENABLED"] = "0"
-        os.environ["STRATEGY_MODE"] = "DIAG"
-        os.environ["PB1_PHASE_DEFAULT"] = "entry"
-        logger.warning(
-            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=0 + PB1_PHASE_DEFAULT=entry"
-        )
-    
     # ✅ AUTO 모드 결정 및 환경변수 고정
     mode_env = os.getenv("STRATEGY_MODE", "AUTO")
     resolved_mode = resolve_auto_strategy_mode(mode_env)
     os.environ["STRATEGY_MODE"] = resolved_mode
     logger.info(
-        "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True MINERVINI_ONLY=%s",
+        "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True",
         mode_env,
         resolved_mode,
-        int(MINERVINI_ONLY),
     )
     
     args = parse_args()

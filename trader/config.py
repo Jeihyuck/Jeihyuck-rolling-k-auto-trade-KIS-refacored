@@ -277,8 +277,6 @@ CONFIG = {
     "TRAIL_STEP_AFTER_R": "1.5",
     "FAILED_BREAKOUT_EXIT_DAYS": "2",
     "REENTRY_COOLDOWN_DAYS": "10",
-    # Minervini-only mode (analytics mode without trading)
-    "MINERVINI_ONLY": "0",
 }
 
 
@@ -833,9 +831,6 @@ CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
 CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")
 CANDIDATE_POOL_MIN_ROWS = int(_cfg("CANDIDATE_POOL_MIN_ROWS") or "30")
 
-# Minervini-only mode (analytics without trading)
-MINERVINI_ONLY = _cfg_bool("MINERVINI_ONLY", fallback=False)
-
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
@@ -895,7 +890,6 @@ logger.info(
     ENTRY_MODE,
     RISK_PER_TRADE_PCT,
 )
-logger.info("[ENV] MINERVINI_ONLY=%s", int(MINERVINI_ONLY))
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 
@@ -921,38 +915,6 @@ def resolve_market_window(now: datetime, trading_day: bool) -> str:
     if not trading_day:
         return "after"
     return calc_market_window_kst(now)
-
-
-def resolve_trade_flags(
-    *,
-    strategy_mode: str,
-    live_trading_enabled: bool,
-    disable_live_trading: bool,
-    kis_http_enabled: bool,
-    requested_dry_run: bool | None,
-) -> dict:
-    """
-    Single source of truth for trade flags.
-    Rule: If LIVE is intended (strategy_mode == 'LIVE' and live_trading_enabled and not disable_live_trading and kis_http_enabled),
-    then dry_run MUST be False regardless of any other heuristics.
-    """
-    intended_live = (
-        (strategy_mode or "").upper() == "LIVE"
-        and bool(live_trading_enabled)
-        and not bool(disable_live_trading)
-        and bool(kis_http_enabled)
-    )
-
-    if intended_live:
-        # absolute lock: never allow dry_run in live intent
-        dry_run = False
-        reasons = ["intended_live_lock"]
-    else:
-        # follow requested dry_run if explicitly given, else default True
-        dry_run = True if requested_dry_run is None else bool(requested_dry_run)
-        reasons = ["requested_or_default"]
-
-    return {"intended_live": intended_live, "dry_run": dry_run, "reasons": reasons}
 
 
 def resolve_strategy_mode(
