@@ -512,26 +512,9 @@ jobs:
 
       DB_ONLY: "0"
       NONTRADING_SMOKE: "0"
-      # ✅ 주문 절대 금지 (DIAG/PAPER 전용)
-      DRY_RUN: "1"
-      LIVE_TRADING_ENABLED: "0"
-      DISABLE_LIVE_TRADING: "1"
-      SIMULATION_MODE: "1"
-      STRATEGY_MODE: "PAPER"
 
-      # ✅ DIAG 모드에서 entry_cutoff 무시 (스캔은 진행, 주문만 차단)
-      PB1_DIAG_IGNORE_ENTRY_CUTOFF: "1"
-      
-      # --- PB1 perfect scan config ---
-      PB1_PREFILTER_LIMIT: "50"            # 50/80/120 가능
-      PB1_PREFILTER_LOOKBACK_DAYS: "30"
-      PB1_EARLY_STOP_ENABLED: "1"
-      PB1_EARLY_STOP_MODE: "raw"           # raw|minervini_pass|setup_ok|buyable
-      PB1_EARLY_STOP_N: "50"               # 프리필터 50이면 50 추천(사실상 끝까지 봄)
-      PB1_EARLY_STOP_MIN_EVAL: "50"        # 최소 50개는 무조건 평가
-
-      # ✅ KIS HTTP 호출 최소화 (DIAG에서 토큰/호가 에러 방지)
-      KIS_HTTP_ENABLED: "0"
+      # ✅ LIVE 허용 플래그는 AUTO 스텝에서 시장 상태에 따라 동적 설정됨
+      # job-level에서는 고정값을 설정하지 않음 (AUTO가 덮어씀)
 
       PB1_RUN_LOOP_MINUTES: "15"
       PB1_MAX_MINUTES: "15"
@@ -544,18 +527,21 @@ jobs:
       BOTSTATE_DISABLED: "1"
       SQLITE_DISABLED: "1"
 
-      # ✅ Watchlist 설정 (재빌드 금지)
+      # ✅ Watchlist 설정 (재빌드 금지, 120→50→30 후보 축소)
       PB1_WATCHLIST_ENABLED: "1"
       PB1_WATCHLIST_AUTOBUILD: "0"
       PB1_WATCHLIST_FORCE_REBUILD: "0"
-      PB1_WATCHLIST_TOPK: "20"
-      PB1_WATCHLIST_FINALN: "10"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FINALN: "30"
       PB1_WATCHLIST_MIN_PRICE: "2000"
       PB1_WATCHLIST_LIQ_DAYS: "20"
       PB1_WATCHLIST_MIN_ROWS: "30"
       PB1_WATCHLIST_STRICT: "0"
       PB1_MIN_CANDIDATES: "1"
       PB1_TARGET_NEW_POSITIONS: "2"
+
+      # ✅ Early stop 절대 금지 (전체 스캔 강제)
+      PB1_EARLY_STOP_ENABLED: "0"
 
       DB_DISABLE_PREPARED_STATEMENTS: "1"
 
@@ -618,17 +604,58 @@ jobs:
           live_ok = "true" if in_market else "false"
           kis_http = "1" if in_market else "0"
 
-          print(f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}")
+          print(
+              f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
+              f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} "
+              f"KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}"
+          )
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              # --- effective runtime ---
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
               f.write(f"KIS_HTTP_ENABLED={kis_http}\n")
 
+              # =========================================================
+              # ✅ (핵심) 장중에는 모의계좌라도 "실제 주문 전송" 허용값으로 강제 세팅
+              # =========================================================
+              if in_market:
+                  # 가드/엔진이 STRATEGY_MODE를 보는 경우도 있어서 같이 맞춤
+                  f.write("STRATEGY_MODE=LIVE\n")
+
+                  # LIVE env violations 방지 3종 세트 (반드시 이 값이어야 함)
+                  f.write("DRY_RUN=0\n")
+                  f.write("LIVE_TRADING_ENABLED=1\n")
+                  f.write("DISABLE_LIVE_TRADING=0\n")
+
+                  # 시뮬 모드 OFF (주문을 진짜로 모의서버에 전송)
+                  f.write("SIMULATION_MODE=0\n")
+              else:
+                  # 장외 안전장치
+                  f.write("STRATEGY_MODE=DIAG\n")
+                  f.write("DRY_RUN=1\n")
+                  f.write("LIVE_TRADING_ENABLED=0\n")
+                  f.write("DISABLE_LIVE_TRADING=1\n")
+                  f.write("SIMULATION_MODE=1\n")
+
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"live_ok={live_ok}\n")
           PY
+
+      - name: "ENV dump (검증용)"
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Environment Variables Dump (for debugging)"
+          echo "======================================"
+          echo "[ENV] KIS_ENV=$KIS_ENV STRATEGY_ENV=$STRATEGY_ENV API_BASE_URL=$API_BASE_URL"
+          echo "[ENV] EFFECTIVE_STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE STRATEGY_MODE=${STRATEGY_MODE:-}"
+          echo "[ENV] DRY_RUN=${DRY_RUN:-} LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-} DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING:-}"
+          echo "[ENV] SIMULATION_MODE=${SIMULATION_MODE:-} KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+          echo "[ENV] PB1_WATCHLIST_TOPK=${PB1_WATCHLIST_TOPK:-} PB1_WATCHLIST_FINALN=${PB1_WATCHLIST_FINALN:-}"
+          echo "[ENV] PB1_EARLY_STOP_ENABLED=${PB1_EARLY_STOP_ENABLED:-}"
+          echo "======================================"
 
       - name: "Guard: LIVE env precheck"
         if: steps.market_mode.outputs.live_ok == 'true'
@@ -640,6 +667,7 @@ jobs:
           [ "${DRY_RUN:-}" = "1" ] && violations+=("DRY_RUN=1")
           [ "${LIVE_TRADING_ENABLED:-}" != "1" ] && violations+=("LIVE_TRADING_ENABLED != '1'")
           [ "${DISABLE_LIVE_TRADING:-}" = "1" ] && violations+=("DISABLE_LIVE_TRADING=1")
+          [ "${SIMULATION_MODE:-}" = "1" ] && violations+=("SIMULATION_MODE=1")
           if [ ${#violations[@]} -gt 0 ]; then
             echo "::error::LIVE env violations: ${violations[*]}"
             exit 1

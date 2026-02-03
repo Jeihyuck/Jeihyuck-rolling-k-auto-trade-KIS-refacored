@@ -61,6 +61,7 @@ from trader.config import (
     PB1_OHLCV_DAYS_BASE,
     PB1_MAX_DAILY_FETCH_PER_TICK,
     PB1_MAX_PRICE_FETCH_PER_TICK,
+    PB1_EARLY_STOP_ENABLED,
     MIN_ORDER_KRW,
     MINERVINI_ADD_ON_R,
     MINERVINI_BREAKOUT_VOL_MULT,
@@ -1403,10 +1404,9 @@ class PB1Engine:
         - OHLCV가 없으면 즉시 스킵(프리필터 점수 0)
         - 30일만 가져오므로 200일 풀 계산보다 훨씬 빠름
         """
-        from trader import config as cfg
-        
-        limit = int(getattr(cfg, "PB1_PREFILTER_LIMIT", 50))
-        lb = int(getattr(cfg, "PB1_PREFILTER_LOOKBACK_DAYS", 30))
+        import os
+        limit = int(os.getenv("PB1_UNIVERSE_SCAN_LIMIT", "50"))
+        lb = int(os.getenv("PB1_PREFILTER_LOOKBACK_DAYS", "30"))
         
         scored: List[tuple[float, dict]] = []
         for member in members:
@@ -1564,22 +1564,16 @@ class PB1Engine:
             rs_prices: dict[str, pd.Series] = {}
             checked_count = 0
             
-            # ✅ NEW: 조기 종료 설정 (config 기반)
-            from trader import config as cfg
-            early_enabled = getattr(cfg, "PB1_EARLY_STOP_ENABLED", True)
-            early_mode = str(getattr(cfg, "PB1_EARLY_STOP_MODE", "buyable")).strip().lower()
-            early_n = int(getattr(cfg, "PB1_EARLY_STOP_N", 50))
-            early_min_eval = int(getattr(cfg, "PB1_EARLY_STOP_MIN_EVAL", len(members_list)))
-            
-            # Counters for early stop decision
-            eval_cnt = 0
-            raw_cnt = 0
-            minervini_pass_cnt = 0
-            setup_ok_cnt = 0
-            buyable_cnt = 0
+            # ✅ 조기 종료 설정 (config 기반, 기본값 0=비활성화)
+            early_stop = PB1_EARLY_STOP_ENABLED
+            early_n = int(os.getenv("PB1_EARLY_STOP_CANDIDATES", "12"))
             
             for m in members_list:
-                eval_cnt += 1
+                # ✅ 조기 종료 체크 (충분한 후보 확보 시) - PB1_EARLY_STOP_ENABLED=0이면 절대 실행 안 됨
+                if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
+                    reason = "EARLY_STOP_CANDIDATES_SUFFICIENT"
+                    logger.info("[PB1][CANDIDATES][EARLY_STOP] candidates=%s early_n=%s", len(candidates), early_n)
+                    break
                 
                 # ✅ 시간 예산 체크 (10개마다)
                 checked_count += 1
@@ -1710,35 +1704,10 @@ class PB1Engine:
                     )
                     candidates.append(cf)
                     rs_prices[code] = df["close"].reset_index(drop=True)
-                    
-                    # ✅ NEW: Track raw candidate count
-                    raw_cnt += 1
-                    
                 except Exception as exc:
                     # ✅ 개별 종목 예외로 전체 런이 죽지 않게
                     logger.exception("[PB1][CANDIDATES][COMPUTE_FAILED] code=%s error=%s -> skip", code, exc)
                     continue
-                
-                # ✅ NEW: Early stop decision (only after min eval)
-                # Note: At this stage we only have raw candidates, Minervini filtering happens later
-                # So we use "raw" mode for early stopping in the loop
-                if early_enabled and eval_cnt >= early_min_eval:
-                    if early_mode == "raw":
-                        metric = raw_cnt
-                    else:
-                        # For other modes, we'd need to wait until after Minervini filtering
-                        # So we only support raw mode in this loop
-                        metric = raw_cnt
-                    
-                    if metric >= early_n:
-                        logger.info(
-                            "[PB1][CANDIDATES][EARLY_STOP] "
-                            f"mode={early_mode} metric={metric} early_n={early_n} "
-                            f"eval_cnt={eval_cnt} min_eval={early_min_eval} "
-                            f"raw={raw_cnt}"
-                        )
-                        reason = "EARLY_STOP_BY_CONFIG"
-                        break
             
             if not candidates:
                 reason = "NO_CANDIDATES_AFTER_OHLCV"
@@ -1779,10 +1748,6 @@ class PB1Engine:
                         rs_fail_count += 1
                     if not cf.features.get("vcp_ok"):
                         vcp_fail_count += 1
-                    
-                    # ✅ NEW: Track Minervini pass count for early stop metrics
-                    if rs_p >= self.minervini_config.rs_min_percentile and cf.features.get("vcp_ok"):
-                        minervini_pass_cnt += 1
                 
                 cf.score = score_setup(cf.features, rs_percentile=rs_p, vcp_info=vcp_info, cfg=self.minervini_config)
                 cf.features["score"] = cf.score
@@ -1826,13 +1791,6 @@ class PB1Engine:
                 both_pass,
                 before_minervini - both_pass,
                 dt_minervini_total,
-            )
-            
-            # ✅ NEW: Early stop summary with all metrics
-            logger.info(
-                "[PB1][CANDIDATES][EARLY_STOP_SUMMARY] "
-                f"enabled={int(early_enabled)} mode={early_mode} early_n={early_n} min_eval={early_min_eval} "
-                f"eval_cnt={eval_cnt} raw={raw_cnt} minervini_pass={minervini_pass_cnt} both_pass={both_pass}"
             )
             
             if debug_mode:
@@ -4657,42 +4615,18 @@ class PB1Engine:
             watchlist_count,
         )
         
-        # ✅ DIAG 모드에서 entry_cutoff 무시 옵션
-        diag_ignore_cutoff = str(os.getenv("PB1_DIAG_IGNORE_ENTRY_CUTOFF", "0")) == "1"
-        is_diag_mode = str(os.getenv("STRATEGY_MODE", "")).upper() in ("DIAG", "PAPER") or str(os.getenv("EFFECTIVE_STRATEGY_MODE","")).upper() == "DIAG"
-        
-        logger.info(
-            "[PB1][ENTRY_CUTOFF][CONFIG] PB1_DIAG_IGNORE_ENTRY_CUTOFF=%s is_diag_mode=%s entry_cutoff_dt=%s now_kst=%s",
-            diag_ignore_cutoff,
-            is_diag_mode,
-            entry_cutoff_dt.isoformat(),
-            self._now_kst.isoformat(),
-        )
-        
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
-            # DIAG 모드 + ignore 옵션 활성화 시: 스캔은 진행, 주문만 차단
-            if is_diag_mode and diag_ignore_cutoff:
-                entry_allowed = False  # 주문 제출은 차단
-                entry_reason = "entry_cutoff"
-                logger.warning(
-                    "[PB1][DIAG][CUTOFF_IGNORE] entry_cutoff passed but scanning forced (no orders will be submitted) now=%s cutoff=%s",
-                    self._now_kst.isoformat(),
-                    entry_cutoff_dt.isoformat(),
-                )
-                # skip_entry_scan은 False로 유지 -> 스캔 진행
-            else:
-                # 일반 모드: 스캔도 스킵
-                skip_entry_scan = True
-                entry_allowed = False
-                entry_reason = "entry_cutoff"
-                logger.info(
-                    "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
-                    self._now_kst.isoformat(),
-                    entry_cutoff_dt.isoformat(),
-                )
-                if self.phase in {"prep", "entry"}:
-                    final_status = "SKIPPED"
-                    final_notes = "entry_cutoff"
+            skip_entry_scan = True
+            entry_allowed = False
+            entry_reason = "entry_cutoff"
+            logger.info(
+                "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
+                self._now_kst.isoformat(),
+                entry_cutoff_dt.isoformat(),
+            )
+            if self.phase in {"prep", "entry"}:
+                final_status = "SKIPPED"
+                final_notes = "entry_cutoff"
 
         if not entry_allowed:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
@@ -5640,48 +5574,21 @@ class PB1Engine:
                 t_order_submit = time.monotonic()
                 submitted_count = 0
                 failed_count = 0
-                
-                # ✅ 안전장치: DIAG/PAPER 모드 또는 안전 플래그 활성화 시 주문 제출 차단
-                is_safe_mode = (
-                    self.dry_run or
-                    str(os.getenv("DISABLE_LIVE_TRADING", "0")) == "1" or
-                    str(os.getenv("LIVE_TRADING_ENABLED", "0")) != "1" or
-                    is_diag_mode
-                )
-                
-                if is_safe_mode:
-                    logger.warning(
-                        "[ORDER][SUBMIT][SKIP] safe_mode active (dry_run=%s DIAG=%s) -> intents only, no real orders trace=%s count=%s",
-                        self.dry_run,
-                        is_diag_mode,
-                        trace_id,
-                        len(orderable_candidates),
-                    )
-                    # 주문 의도만 기록하고 실제 제출은 하지 않음
-                    for cf in orderable_candidates:
-                        logger.info(
-                            "[ORDER][INTENT] code=%s qty=%s value=%.0f setup_ok=%s",
+                for cf in orderable_candidates:
+                    try:
+                        if self.window_internal == "close":
+                            self._place_entry_close(cf)
+                        else:
+                            self._place_entry(cf)
+                        submitted_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        logger.exception(
+                            "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
+                            trace_id,
                             cf.code,
-                            cf.planned_qty,
-                            float(cf.features.get("close", 0)) * float(cf.planned_qty or 0),
-                            cf.setup_ok,
+                            str(e),
                         )
-                else:
-                    for cf in orderable_candidates:
-                        try:
-                            if self.window_internal == "close":
-                                self._place_entry_close(cf)
-                            else:
-                                self._place_entry(cf)
-                            submitted_count += 1
-                        except Exception as e:
-                            failed_count += 1
-                            logger.exception(
-                                "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
-                                trace_id,
-                                cf.code,
-                                str(e),
-                            )
                 dt_order_submit = time.monotonic() - t_order_submit
                 
                 logger.info(
