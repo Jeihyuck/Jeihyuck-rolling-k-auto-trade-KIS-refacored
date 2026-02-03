@@ -394,7 +394,7 @@ def run_diag_minervini_only(
                 meta=topn_meta,
             )
             logger.info(
-                "[MINERVINI][TOPN][SAVED] key=%s as_of=%s size=%s sample=%s",
+                "[MINERVINI][TOPN][SAVED] strategy=%s as_of=%s size=%d sample=%s",
                 MINERVINI_TOPN_STRATEGY_KEY, as_of, len(topn_codes), topn_codes[:5]
             )
         except Exception as exc:
@@ -413,7 +413,7 @@ def run_diag_minervini_only(
                     meta=pool_meta,
                 )
                 logger.info(
-                    "[CANDIDATE_POOL][SAVED] key=%s as_of=%s size=%s",
+                    "[CANDIDATE_POOL][SAVED] strategy=%s as_of=%s size=%d",
                     PB1_CANDIDATE_POOL_KEY, as_of, len(topn_codes)
                 )
             except Exception as exc:

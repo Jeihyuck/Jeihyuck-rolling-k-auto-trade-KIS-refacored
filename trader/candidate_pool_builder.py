@@ -305,6 +305,41 @@ def build_and_save_candidate_pool(
     return pool_codes
 
 
+def _normalize_pool_members_to_codes(pool_members):
+    """
+    pool_members can be:
+      - list[str]  e.g. ["005930", "000660", ...]
+      - list[dict] e.g. [{"code":"005930"}, ...]
+    returns:
+      - list[str] codes
+    """
+    if not pool_members:
+        return []
+
+    first = pool_members[0]
+
+    # Case A: list[str]
+    if isinstance(first, str):
+        return [x for x in pool_members if isinstance(x, str) and x.strip()]
+
+    # Case B: list[dict]
+    if isinstance(first, dict):
+        codes = []
+        for item in pool_members:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code") or item.get("ticker") or item.get("symbol")
+            if isinstance(code, str) and code.strip():
+                codes.append(code)
+        return codes
+
+    # Unknown shape -> try best effort
+    try:
+        return [str(x).strip() for x in pool_members if str(x).strip()]
+    except Exception:
+        return []
+
+
 def load_candidate_pool(
     *,
     engine: Engine,
@@ -352,7 +387,16 @@ def load_candidate_pool(
         logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing as_of=%s", latest_date)
         return None, None, "missing"
     
-    pool_codes = [item["code"] for item in pool_members]
+    pool_codes = _normalize_pool_members_to_codes(pool_members)
+    
+    if not pool_codes:
+        # 로드 자체는 됐지만 포맷이 이상하거나 비어있을 때
+        logger.warning(
+            "[CANDIDATE_POOL][WARN] empty pool_codes after normalization "
+            "members_type=%s sample=%s",
+            type(pool_members[0]).__name__ if pool_members else None,
+            pool_members[:3] if pool_members else None,
+        )
     
     # 최소 크기 검사
     if len(pool_codes) < CANDIDATE_POOL_MIN_SIZE:
