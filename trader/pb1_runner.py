@@ -1233,6 +1233,34 @@ def run_once(
 
     dry_run = bool(dry_run_reasons)
     dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+    
+    # ✅ LIVE 모드 이중 잠금: STRATEGY_MODE=LIVE + LIVE_TRADING_ENABLED=1 + DISABLE_LIVE_TRADING=0 이면 무조건 dry_run=False
+    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+    live_trading_enabled = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
+    disable_live_trading = os.getenv("DISABLE_LIVE_TRADING", "0") == "1"
+    kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "1") == "1"
+    
+    if (
+        strategy_mode == "LIVE"
+        and live_trading_enabled
+        and not disable_live_trading
+        and kis_http_enabled
+    ):
+        if dry_run:
+            logger.warning(
+                "[DRY_RUN_LOCK] LIVE mode detected: forcing dry_run=False (was True, reasons=%s)",
+                dry_run_reason,
+            )
+        dry_run = False
+        dry_run_reason = "live_forced"
+        dry_run_reasons = ["live_forced"]
+        logger.info(
+            "[DRY_RUN_LOCK] LIVE mode locked: dry_run=False STRATEGY_MODE=%s LIVE_TRADING_ENABLED=%s DISABLE_LIVE_TRADING=%s KIS_HTTP_ENABLED=%s",
+            strategy_mode,
+            live_trading_enabled,
+            disable_live_trading,
+            kis_http_enabled,
+        )
 
     logger.info(
         "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",

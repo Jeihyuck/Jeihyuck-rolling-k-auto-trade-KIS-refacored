@@ -235,7 +235,12 @@ def build_and_save_candidate_pool(
     
     # 이미 당일 후보군이 있으면 재사용
     if not force_rebuild:
-        existing = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+        existing, _ = repo.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            allow_latest_fallback=False,  # 빌드 시에는 정확한 날짜만 허용
+        )
         if existing:
             codes = [item["code"] for item in existing]
             logger.info(
@@ -346,7 +351,12 @@ def load_candidate_pool(
         return None, None, "expired"
     
     # 후보군 로드
-    pool_members = repo.load_watchlist(env=env, strategy=strategy, as_of=latest_date)
+    pool_members, _ = repo.load_watchlist(
+        env=env,
+        strategy=strategy,
+        as_of=latest_date,
+        allow_latest_fallback=False,  # 이미 latest_date를 사용하므로 fallback 불필요
+    )
     if not pool_members:
         logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing as_of=%s", latest_date)
         return None, None, "missing"

@@ -404,16 +404,31 @@ def load_today_watchlist_with_fallback(
     """
     today = to_date(today)  # Ensure DATE type
     repo = WatchlistRepo(engine)
+    ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
     
     def _load():
-        rows = repo.load_watchlist(env=env, strategy=strategy, as_of=today)
-        return rows
+        rows, used_as_of = repo.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=today,
+            allow_latest_fallback=True,
+            ttl_days=ttl_days,
+        )
+        return rows, used_as_of
     
-    # 1) Try load today's watchlist
-    rows = _load()
+    # 1) Try load today's watchlist (with fallback to latest within TTL)
+    rows, used_as_of = _load()
     if rows:
-        logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
-        return rows, "watchlist_db"
+        if used_as_of and used_as_of != today:
+            age_days = (today - used_as_of).days
+            logger.info(
+                "[WATCHLIST][CACHE] hit=True source=watchlist_db_fallback as_of=%s (requested=%s, age=%s days) count=%s",
+                used_as_of, today, age_days, len(rows)
+            )
+            return rows, "watchlist_db"
+        else:
+            logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
+            return rows, "watchlist_db"
     
     # 2) If empty and auto_build enabled -> build & save
     if auto_build_if_empty:
@@ -436,7 +451,7 @@ def load_today_watchlist_with_fallback(
                 repo.save_watchlist(env=env, strategy=strategy, as_of=today, members=built)
                 logger.info("[WATCHLIST][AUTO_BUILD] saved count=%s -> reloading", len(built))
                 # Reload from DB
-                rows2 = _load()
+                rows2, used_as_of2 = _load()
                 if rows2:
                     logger.info("[WATCHLIST][AUTO_BUILD] success count=%s", len(rows2))
                     return rows2, "watchlist_autobuilt"

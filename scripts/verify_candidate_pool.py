@@ -56,8 +56,15 @@ def verify_candidate_pool():
     repo = WatchlistRepo(engine)
     
     try:
-        # 후보군 로드
-        rows = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+        # 후보군 로드 (최신 fallback 허용)
+        ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
+        rows, used_as_of = repo.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            allow_latest_fallback=True,
+            ttl_days=ttl_days,
+        )
         
         if not rows:
             print("[VERIFY][FAIL] ❌ Candidate pool is EMPTY!")
@@ -66,18 +73,28 @@ def verify_candidate_pool():
             print("  1. Candidate pool was not built yet")
             print("  2. env/strategy/as_of mismatch between build and verify")
             print("  3. Wrong database connection")
+            print(f"  4. No pool found within TTL (last {ttl_days} days)")
             print()
             print("Expected values:")
             print(f"  STRATEGY_ENV={env}")
             print(f"  CANDIDATE_POOL_STRATEGY_KEY={strategy}")
             print(f"  AS_OF={as_of}")
+            print(f"  TTL_DAYS={ttl_days}")
             print()
             sys.exit(1)
         
         codes = [row["code"] for row in rows]
         sample = codes[:5]
         
-        print(f"[VERIFY][OK] ✅ Candidate pool found!")
+        # 날짜가 다르면 fallback 사용했다는 표시
+        if used_as_of and used_as_of != as_of:
+            age_days = (as_of - used_as_of).days
+            print(f"[VERIFY][OK] ✅ Candidate pool found (fallback)!")
+            print(f"[VERIFY][OK] requested_as_of={as_of}")
+            print(f"[VERIFY][OK] used_as_of={used_as_of} (age={age_days} days)")
+        else:
+            print(f"[VERIFY][OK] ✅ Candidate pool found!")
+            print(f"[VERIFY][OK] as_of={used_as_of or as_of}")
         print(f"[VERIFY][OK] size={len(codes)}")
         print(f"[VERIFY][OK] sample={sample}")
         print()

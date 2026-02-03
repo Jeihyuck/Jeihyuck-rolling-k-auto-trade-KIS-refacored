@@ -2073,18 +2073,22 @@ class WatchlistRepo:
         env: str,
         strategy: str,
         as_of: date | str,
-    ) -> List[Dict[str, Any]]:
+        allow_latest_fallback: bool = True,
+        ttl_days: int = 7,
+    ) -> tuple[List[Dict[str, Any]], date | None]:
         """
         특정 날짜의 watchlist 조회.
-        반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        반환: ([{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...], used_as_of)
         
         ✅ as_of는 DATE 타입으로 강제 변환 (VARCHAR 캐스팅 방지)
+        ✅ allow_latest_fallback=True: as_of에 없으면 TTL 이내 최신 as_of 사용
         """
         # ✅ as_of 타입 강화: date 객체로 변환
         as_of_date = to_date(as_of)
         
         schema = self._schema
         
+        # 먼저 요청한 as_of로 조회
         with self.engine.connect() as conn:
             stmt = (
                 select(schema.pb1_watchlist)
@@ -2099,6 +2103,68 @@ class WatchlistRepo:
             )
             rows = conn.execute(stmt).fetchall()
         
+        if rows:
+            result = [
+                {
+                    "code": row.code,
+                    "rank": row.rank,
+                    "score": float(row.score) if row.score else None,
+                    "meta": row.meta,
+                }
+                for row in rows
+            ]
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (exact)",
+                env, strategy, as_of_date, len(result)
+            )
+            return result, as_of_date
+        
+        # as_of에 없으면 최신 fallback 시도
+        if not allow_latest_fallback:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback)",
+                env, strategy, as_of_date
+            )
+            return [], None
+        
+        # TTL 이내 최신 as_of 조회
+        min_date = as_of_date - timedelta(days=ttl_days)
+        with self.engine.connect() as conn:
+            latest_stmt = (
+                select(func.max(schema.pb1_watchlist.c.as_of))
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.as_of <= as_of_date,
+                        schema.pb1_watchlist.c.as_of >= min_date,
+                    )
+                )
+            )
+            latest_as_of = conn.execute(latest_stmt).scalar()
+        
+        if not latest_as_of:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback within TTL=%s days)",
+                env, strategy, as_of_date, ttl_days
+            )
+            return [], None
+        
+        # 최신 as_of로 다시 조회
+        with self.engine.connect() as conn:
+            stmt = (
+                select(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.as_of == latest_as_of,
+                    )
+                )
+                .order_by(schema.pb1_watchlist.c.rank)
+            )
+            rows2 = conn.execute(stmt).fetchall()
+        
         result = [
             {
                 "code": row.code,
@@ -2106,13 +2172,13 @@ class WatchlistRepo:
                 "score": float(row.score) if row.score else None,
                 "meta": row.meta,
             }
-            for row in rows
+            for row in rows2
         ]
         logger.info(
-            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
-            env, strategy, as_of_date, len(result)
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (fallback from %s, age=%s days)",
+            env, strategy, as_of_date, len(result), latest_as_of, (as_of_date - latest_as_of).days
         )
-        return result
+        return result, latest_as_of
     
     def get_latest_watchlist_date(
         self,
@@ -2156,11 +2222,19 @@ def load_watchlist(
     env: str,
     strategy: str,
     as_of: date,
-) -> List[Dict[str, Any]]:
+    allow_latest_fallback: bool = True,
+    ttl_days: int = 7,
+) -> tuple[List[Dict[str, Any]], date | None]:
     """Standalone load_watchlist function."""
     as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
-    return repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+    return repo.load_watchlist(
+        env=env,
+        strategy=strategy,
+        as_of=as_of,
+        allow_latest_fallback=allow_latest_fallback,
+        ttl_days=ttl_days,
+    )
 
 
 # ========================================
