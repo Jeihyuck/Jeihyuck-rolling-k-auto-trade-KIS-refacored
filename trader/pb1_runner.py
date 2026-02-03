@@ -1204,76 +1204,49 @@ def run_once(
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag
+    diag_enabled = force_diag  # ✅ 호환성을 위해 추가
 
-    dry_run_flag = parse_env_flag("DRY_RUN", default=False)
-    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=False)
-    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=False)
-    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
-    mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-    dry_run_reasons: list[str] = []
-    diag_enabled = force_diag
-    if diag_enabled:
-        dry_run_reasons.append("diagnostic_mode")
-    if mode_resolved == "INTENT_ONLY":
-        dry_run_reasons.append("STRATEGY_MODE=INTENT_ONLY")
-    if mode_resolved != "LIVE":
-        dry_run_reasons.append("STRATEGY_MODE!=LIVE")
-    if parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value).value:
-        dry_run_reasons.append("DISABLE_LIVE_TRADING=1")
-    live_trading_flag = parse_env_flag("LIVE_TRADING_ENABLED", default=live_trading_flag.value)
-    disable_live_flag = parse_env_flag("DISABLE_LIVE_TRADING", default=disable_live_flag.value)
-    dry_run_flag = parse_env_flag("DRY_RUN", default=dry_run_flag.value)
-    if not live_trading_flag.value and mode_resolved == "LIVE":
-        dry_run_reasons.append("LIVE_TRADING_ENABLED=0")
-    if dry_run_flag.value:
-        dry_run_reasons.append("DRY_RUN=1")
-    for flag in (dry_run_flag, disable_live_flag, live_trading_flag):
-        if not flag.valid:
-            dry_run_reasons.append(f"{flag.name}=invalid({flag.raw})")
-
-    dry_run = bool(dry_run_reasons)
-    dry_run_reason = ",".join(dry_run_reasons) if dry_run_reasons else "live"
+    # ✅ SINGLE SOURCE OF TRUTH: resolve_trade_flags로 통일
+    from trader.config import resolve_trade_flags
     
-    # ✅ LIVE 모드 이중 잠금: STRATEGY_MODE=LIVE + LIVE_TRADING_ENABLED=1 + DISABLE_LIVE_TRADING=0 이면 무조건 dry_run=False
-    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-    live_trading_enabled = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
-    disable_live_trading = os.getenv("DISABLE_LIVE_TRADING", "0") == "1"
-    kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "1") == "1"
+    requested_dry_run_env = os.getenv("DRY_RUN")
+    requested_dry_run = None if requested_dry_run_env is None else (requested_dry_run_env == "1")
     
-    if (
-        strategy_mode == "LIVE"
-        and live_trading_enabled
-        and not disable_live_trading
-        and kis_http_enabled
-    ):
-        if dry_run:
-            logger.warning(
-                "[DRY_RUN_LOCK] LIVE mode detected: forcing dry_run=False (was True, reasons=%s)",
-                dry_run_reason,
-            )
-        dry_run = False
-        dry_run_reason = "live_forced"
-        dry_run_reasons = ["live_forced"]
-        logger.info(
-            "[DRY_RUN_LOCK] LIVE mode locked: dry_run=False STRATEGY_MODE=%s LIVE_TRADING_ENABLED=%s DISABLE_LIVE_TRADING=%s KIS_HTTP_ENABLED=%s",
-            strategy_mode,
-            live_trading_enabled,
-            disable_live_trading,
-            kis_http_enabled,
-        )
-
-    logger.info(
-        "[PB1][DRY_RUN_RESOLVE] event=%s dry_run=%s reasons=%s",
-        event_name_lower or "unknown",
-        dry_run,
-        dry_run_reasons or ["live"],
+    flags = resolve_trade_flags(
+        strategy_mode=os.getenv("STRATEGY_MODE", ""),
+        live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True"),
+        disable_live_trading=os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True"),
+        kis_http_enabled=os.getenv("KIS_HTTP_ENABLED", "1") in ("1", "true", "True"),
+        requested_dry_run=requested_dry_run,
     )
+    
+    dry_run = flags["dry_run"]
+    intended_live = flags["intended_live"]
+    dry_run_reasons = flags["reasons"]
+    dry_run_reason = ",".join(dry_run_reasons)
+    
+    logger.info(
+        "[TRADE_FLAGS] intended_live=%s dry_run=%s reasons=%s",
+        intended_live,
+        dry_run,
+        dry_run_reasons,
+    )
+    
+    # ✅ intended_live를 환경변수로 저장 (주문 함수에서 접근 가능하도록)
+    os.environ["INTENDED_LIVE"] = "1" if intended_live else "0"
+    
     if smoke_enabled:
         logger.info(
             "[PB1][SMOKE] enabled=True simulated_now_kst=%s force_dry_run=True",
             now.isoformat(),
         )
 
+    # ✅ 호환성을 위해 기존 변수 재구성 (기존 코드가 사용)
+    expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
+    mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
+    disable_live_flag_value = os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True")
+    live_trading_flag_value = os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True")
+    
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
     kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
     kis_env = kis_env_raw.lower()
@@ -1283,9 +1256,9 @@ def run_once(
         guard_failures: list[str] = []
         if dry_run:
             guard_failures.append("dry_run")
-        if not live_trading_flag.value or not live_trading_flag.valid:
+        if not live_trading_flag_value:
             guard_failures.append("LIVE_TRADING_ENABLED!=1")
-        if disable_live_flag.value or not disable_live_flag.valid:
+        if disable_live_flag_value:
             guard_failures.append("DISABLE_LIVE_TRADING!=0")
         if mode_resolved != "LIVE":
             guard_failures.append("STRATEGY_MODE!=LIVE")
@@ -1300,8 +1273,8 @@ def run_once(
 
     def _apply_env_flags(dry: bool) -> None:
         os.environ["DRY_RUN"] = "1" if dry else "0"
-        os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag.value else "0"
-        os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag.value else "0"
+        os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag_value else "0"
+        os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag_value else "0"
         os.environ["STRATEGY_MODE"] = effective_mode
 
     _apply_env_flags(dry_run)

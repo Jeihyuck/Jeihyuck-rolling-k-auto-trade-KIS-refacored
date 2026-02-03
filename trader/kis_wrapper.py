@@ -40,6 +40,7 @@ from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
+from trader.eventlog import emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -3000,9 +3001,17 @@ class KisAPI:
                 dry_run = os.getenv("DRY_RUN", "0") == "1"
                 live_trading = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
                 force_run = os.getenv("FORCE_RUN", "0") == "1"
+                intended_live = os.getenv("INTENDED_LIVE", "0") == "1"
+                
+                # ✅ CRITICAL ASSERTION: LIVE 의도인데 dry_run이면 즉시 실패
+                if intended_live and dry_run:
+                    raise RuntimeError(
+                        "FATAL: intended_live=True but dry_run=True. This must never happen. "
+                        f"INTENDED_LIVE={intended_live} DRY_RUN={dry_run} LIVE_TRADING_ENABLED={live_trading}"
+                    )
                 
                 logger.info(
-                    "[ORDER_READY] code=%s side=%s qty=%s price=%s tr_id=%s ord_dvsn=%s DRY_RUN=%s LIVE=%s FORCE_RUN=%s body=%s",
+                    "[ORDER_READY] code=%s side=%s qty=%s price=%s tr_id=%s ord_dvsn=%s DRY_RUN=%s LIVE=%s FORCE_RUN=%s INTENDED_LIVE=%s body=%s",
                     body.get("PDNO"),
                     "SELL" if is_sell else "BUY",
                     body.get("ORD_QTY"),
@@ -3012,8 +3021,42 @@ class KisAPI:
                     dry_run,
                     live_trading,
                     force_run,
+                    intended_live,
                     log_body_masked,
                 )
+                
+                # ✅ ORDER_SENT 로그: 실제 주문 발생 증거
+                logger.warning(
+                    "[ORDER_SENT] LIVE=%s dry_run=%s code=%s side=%s qty=%s price=%s tr_id=%s ord_dvsn=%s",
+                    intended_live,
+                    dry_run,
+                    body.get("PDNO"),
+                    "SELL" if is_sell else "BUY",
+                    body.get("ORD_QTY"),
+                    body.get("ORD_UNPR"),
+                    tr_id,
+                    ord_dvsn,
+                )
+                
+                # ✅ ORDER_SENT DB 이벤트 저장
+                try:
+                    run_id = os.getenv("TRADER_RUN_ID", "unknown")
+                    emit_event(
+                        as_of=datetime.now(pytz.timezone("Asia/Seoul")).date().isoformat(),
+                        event="ORDER_SENT",
+                        code=body.get("PDNO"),
+                        side="SELL" if is_sell else "BUY",
+                        qty=body.get("ORD_QTY"),
+                        price=body.get("ORD_UNPR"),
+                        tr_id=tr_id,
+                        ord_dvsn=ord_dvsn,
+                        kis_env=self.env,
+                        run_id=run_id,
+                        intended_live=intended_live,
+                        dry_run=dry_run,
+                    )
+                except Exception as exc:
+                    logger.warning("[ORDER_SENT][EVENT_FAIL] %s", exc)
 
                 # 네트워크/게이트웨이 재시도
                 for attempt in range(1, 4):

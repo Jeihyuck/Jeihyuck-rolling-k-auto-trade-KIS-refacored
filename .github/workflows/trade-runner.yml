@@ -619,6 +619,7 @@ jobs:
 
               # =========================================================
               # ✅ (핵심) 장중에는 모의계좌라도 "실제 주문 전송" 허용값으로 강제 세팅
+              # ✅ CRITICAL: 아래 4개 값이 모두 설정되어야 dry_run=False가 보장됨
               # =========================================================
               if in_market:
                   # 가드/엔진이 STRATEGY_MODE를 보는 경우도 있어서 같이 맞춤
@@ -628,6 +629,8 @@ jobs:
                   f.write("DRY_RUN=0\n")
                   f.write("LIVE_TRADING_ENABLED=1\n")
                   f.write("DISABLE_LIVE_TRADING=0\n")
+                  # ✅ NEW: KIS HTTP 활성화 (주문 API 호출 허용)
+                  f.write("KIS_HTTP_ENABLED=1\n")
 
                   # 시뮬 모드 OFF (주문을 진짜로 모의서버에 전송)
                   f.write("SIMULATION_MODE=0\n")

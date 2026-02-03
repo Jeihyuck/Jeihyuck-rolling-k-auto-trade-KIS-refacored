@@ -917,6 +917,38 @@ def resolve_market_window(now: datetime, trading_day: bool) -> str:
     return calc_market_window_kst(now)
 
 
+def resolve_trade_flags(
+    *,
+    strategy_mode: str,
+    live_trading_enabled: bool,
+    disable_live_trading: bool,
+    kis_http_enabled: bool,
+    requested_dry_run: bool | None,
+) -> dict:
+    """
+    Single source of truth for trade flags.
+    Rule: If LIVE is intended (strategy_mode == 'LIVE' and live_trading_enabled and not disable_live_trading and kis_http_enabled),
+    then dry_run MUST be False regardless of any other heuristics.
+    """
+    intended_live = (
+        (strategy_mode or "").upper() == "LIVE"
+        and bool(live_trading_enabled)
+        and not bool(disable_live_trading)
+        and bool(kis_http_enabled)
+    )
+
+    if intended_live:
+        # absolute lock: never allow dry_run in live intent
+        dry_run = False
+        reasons = ["intended_live_lock"]
+    else:
+        # follow requested dry_run if explicitly given, else default True
+        dry_run = True if requested_dry_run is None else bool(requested_dry_run)
+        reasons = ["requested_or_default"]
+
+    return {"intended_live": intended_live, "dry_run": dry_run, "reasons": reasons}
+
+
 def resolve_strategy_mode(
     now_kst: datetime | None = None,
     force_mode_env: str | None = None,
