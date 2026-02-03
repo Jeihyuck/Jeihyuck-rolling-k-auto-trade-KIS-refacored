@@ -1704,6 +1704,7 @@ def run_once(
             dry_run=dry_run,
             env=kis_env or "practice",
             run_id=run_record_id,
+            intended_live=intended_live,  # ✅ 메인에서 확정한 LIVE 의도 전달
             strategy=universe_strategy,  # [FIX] watchlist 버그 수정 - strategy 전달
             now_kst_value=now,
             balance_snapshot=balance_snapshot_raw,

@@ -487,6 +487,7 @@ class PB1Engine:
         dry_run: bool,
         env: str,
         run_id: str,
+        intended_live: bool,
         strategy: str | None = None,
         now_kst_value: datetime | None = None,
         balance_snapshot: dict | None = None,
@@ -509,6 +510,7 @@ class PB1Engine:
         self.dry_run = dry_run
         self.env = env
         self.run_id = run_id
+        self.intended_live = intended_live
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
@@ -2818,6 +2820,13 @@ class PB1Engine:
             logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
     def _place_entry(self, cf: CandidateFeature) -> None:
+        # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: order path reached with dry_run=True while intended_live=True. "
+                f"code={cf.code} intended_live={self.intended_live} dry_run={self.dry_run}"
+            )
+        
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
@@ -3005,6 +3014,14 @@ class PB1Engine:
                 float(limit_price or entry_price or 0.0),
             )
             return
+        
+        # ✅ 라이브 주문 직전 최종 확인
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: About to send live order but dry_run=True. "
+                f"code={display_code} intended_live={self.intended_live} dry_run={self.dry_run}"
+            )
+        
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
             return
@@ -3150,6 +3167,13 @@ class PB1Engine:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
 
     def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
+        # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: add_on order path reached with dry_run=True while intended_live=True. "
+                f"intended_live={self.intended_live} dry_run={self.dry_run}"
+            )
+        
         code = pos.get("code")
         if not code or qty <= 0:
             return
@@ -3203,6 +3227,14 @@ class PB1Engine:
                 float(limit_price or price or 0.0),
             )
             return
+        
+        # ✅ 라이브 주문 직전 최종 확인 (ADD_ON)
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: About to send live ADD_ON order but dry_run=True. "
+                f"code={display_code} intended_live={self.intended_live} dry_run={self.dry_run}"
+            )
+        
         if not self.kis:
             logger.warning("[PB1][ADD][SKIP] KIS missing code=%s", display_code)
             return
@@ -3866,6 +3898,14 @@ class PB1Engine:
                 float(mark or 0.0),
             )
             return
+        
+        # ✅ 라이브 주문 직전 최종 확인 (SELL)
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: About to send live SELL order but dry_run=True. "
+                f"code={display_code} intended_live={self.intended_live} dry_run={self.dry_run}"
+            )
+        
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
             return
@@ -4504,12 +4544,20 @@ class PB1Engine:
             else:
                 entry_allowed = False
                 entry_reason = f"phase_{self.phase}"
+        # ✅ FATAL 가드: intended_live=True인데 dry_run=True면 즉시 종료
+        if self.intended_live and self.dry_run:
+            raise RuntimeError(
+                "FATAL: intended_live=True but pb1_engine received dry_run=True. "
+                "This would block live orders. Fix dry_run propagation."
+            )
+        
         logger.info(
-            "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s env=%s",
+            "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s intended_live=%s env=%s",
             self.window_label,
             self.window_internal,
             self.phase,
             self.dry_run,
+            self.intended_live,
             self.env,
         )
         # 타입 검증: orders 테이블의 시간 컬럼 타입 확인
