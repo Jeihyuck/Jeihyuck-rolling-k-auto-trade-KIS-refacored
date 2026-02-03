@@ -2073,10 +2073,21 @@ class WatchlistRepo:
         env: str,
         strategy: str,
         as_of: date | str,
-    ) -> List[Dict[str, Any]]:
+        allow_latest_fallback: bool = False,
+        ttl_days: int = 7,
+    ) -> tuple[List[Dict[str, Any]], date | None]:
         """
         특정 날짜의 watchlist 조회.
-        반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        
+        Args:
+            env: 환경 (live/paper)
+            strategy: 전략 키
+            as_of: 기준 날짜
+            allow_latest_fallback: True이면 as_of에 데이터가 없을 때 최근 TTL 이내 데이터 fallback
+            ttl_days: fallback 시 최대 허용 일수
+        
+        Returns:
+            (watchlist, used_as_of): watchlist 리스트와 실제 사용된 날짜
         
         ✅ as_of는 DATE 타입으로 강제 변환 (VARCHAR 캐스팅 방지)
         """
@@ -2108,11 +2119,57 @@ class WatchlistRepo:
             }
             for row in rows
         ]
+        
+        # Fallback 로직: as_of에 데이터가 없으면 최근 데이터 찾기
+        if not result and allow_latest_fallback:
+            latest_date = self.get_latest_watchlist_date(env=env, strategy=strategy)
+            if latest_date:
+                from datetime import timedelta
+                age = (as_of_date - latest_date).days
+                if 0 <= age <= ttl_days:
+                    logger.info(
+                        "[WATCHLIST][LOAD][FALLBACK] as_of=%s not found, using latest=%s (age=%d days)",
+                        as_of_date, latest_date, age
+                    )
+                    # 최근 날짜로 재조회
+                    with self.engine.connect() as conn:
+                        stmt = (
+                            select(schema.pb1_watchlist)
+                            .where(
+                                and_(
+                                    schema.pb1_watchlist.c.env == env,
+                                    schema.pb1_watchlist.c.strategy == strategy,
+                                    schema.pb1_watchlist.c.as_of == latest_date,
+                                )
+                            )
+                            .order_by(schema.pb1_watchlist.c.rank)
+                        )
+                        rows = conn.execute(stmt).fetchall()
+                    result = [
+                        {
+                            "code": row.code,
+                            "rank": row.rank,
+                            "score": float(row.score) if row.score else None,
+                            "meta": row.meta,
+                        }
+                        for row in rows
+                    ]
+                    logger.info(
+                        "[WATCHLIST][LOAD][FALLBACK] env=%s strategy=%s fallback_as_of=%s members=%s",
+                        env, strategy, latest_date, len(result)
+                    )
+                    return result, latest_date
+                else:
+                    logger.warning(
+                        "[WATCHLIST][LOAD][FALLBACK] latest=%s too old (age=%d > ttl=%d)",
+                        latest_date, age, ttl_days
+                    )
+        
         logger.info(
             "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
             env, strategy, as_of_date, len(result)
         )
-        return result
+        return result, as_of_date
     
     def get_latest_watchlist_date(
         self,

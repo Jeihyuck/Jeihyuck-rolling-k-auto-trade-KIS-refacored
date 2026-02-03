@@ -34,6 +34,10 @@ on:
         description: "시뮬레이션 모드 (1=시뮬, 0=실거래)"
         required: false
         default: "1"
+      MINERVINI_ONLY:
+        description: "미너비니 분석만 실행 (1=분석만, 0=정상)"
+        required: false
+        default: "0"
 
   schedule:
     # 토요일 00:30 KST = 금요일 15:30 UTC : 후보군 생성
@@ -518,6 +522,9 @@ jobs:
       DISABLE_LIVE_TRADING: "1"
       SIMULATION_MODE: "1"
       STRATEGY_MODE: "PAPER"
+      
+      # ✅ MINERVINI_ONLY 모드 (workflow input에서 제어)
+      MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY || '0' }}
 
       # ✅ DIAG 모드에서 entry_cutoff 무시 (스캔은 진행, 주문만 차단)
       PB1_DIAG_IGNORE_ENTRY_CUTOFF: "1"

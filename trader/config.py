@@ -16,6 +16,19 @@ from zoneinfo import ZoneInfo
 from trader.runtime_paths import ensure_not_repo_tracked_path, get_cache_root, runtime_path
 from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
 
+
+# =========================
+# [ENV FLAGS] 전역 ENV 상수 (CONFIG 이전에 선언)
+# =========================
+def _env_flag(name: str, default: str = "0") -> bool:
+    """환경변수를 bool로 변환 (1/true/yes/y/on -> True)"""
+    v = os.getenv(name, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+# MINERVINI analytics-only mode (no orders)
+MINERVINI_ONLY = _env_flag("MINERVINI_ONLY", "0")
+
+
 # =========================
 # [CONFIG] .env 없이도 동작
 # - 아래 값을 기본으로 사용
@@ -890,6 +903,9 @@ logger.info(
     ENTRY_MODE,
     RISK_PER_TRADE_PCT,
 )
+# ✅ MINERVINI_ONLY 모드 로깅
+if MINERVINI_ONLY:
+    logger.info("[ENV] MINERVINI_ONLY=1 (analytics-only, no orders)")
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 

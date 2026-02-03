@@ -188,11 +188,22 @@ def _run_build_watchlist_job() -> int:
         members = universe_snapshot["members"]
         logger.info("[WATCHLIST][BUILD_JOB] universe loaded members=%s", len(members))
         
+        # ✅ MINERVINI_ONLY 모드 확인
+        minervini_only = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        
         # OHLCV provider 생성
-        kis = KisAPI()
+        kis = None
+        if not minervini_only:
+            kis = KisAPI()
+        else:
+            logger.warning("[MINERVINI_ONLY] skip KisAPI init (analytics only)")
+        
         krx_provider = KRXOHLCVProvider()
-        kis_provider = KISOHLCVProvider(kis)
-        ohlcv_provider = ChainOHLCVProvider([krx_provider, kis_provider])
+        if kis:
+            kis_provider = KISOHLCVProvider(kis)
+            ohlcv_provider = ChainOHLCVProvider([krx_provider, kis_provider])
+        else:
+            ohlcv_provider = krx_provider
         
         def _fetch_daily(code: str, count: int = 100):
             """pb1_engine._fetch_daily 호환 래퍼"""
@@ -728,11 +739,18 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
     token_ok = balance_ok = universe_ok = pretrade_ok = False
     kis: KisAPI | None = None
     members: list[dict] = []
-    try:
-        kis = KisAPI()
-        token_ok = True
-    except Exception as exc:
-        logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
+    
+    # ✅ MINERVINI_ONLY 모드 확인
+    minervini_only = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+    
+    if not minervini_only:
+        try:
+            kis = KisAPI()
+            token_ok = True
+        except Exception as exc:
+            logger.warning("[SMOKE][FAIL] token_init err=%s", exc)
+    else:
+        logger.warning("[MINERVINI_ONLY] skip KisAPI init (analytics only)")
 
     if kis:
         try:
@@ -1347,13 +1365,20 @@ def run_once(
 
     remaining_s = _remaining_seconds()
     exit_short_circuit = phase_for_log == "exit" or window_label == "close"
+    
+    # ✅ MINERVINI_ONLY 모드 확인
+    minervini_only = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+    
     if exit_short_circuit:
         logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
         kis = None
-        try:
-            kis = KisAPI()
-        except Exception:
-            logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
+        if not minervini_only:
+            try:
+                kis = KisAPI()
+            except Exception:
+                logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
+        else:
+            logger.warning("[MINERVINI_ONLY] skip KisAPI init (analytics only)")
         run_id = os.getenv("TRADER_RUN_ID", "local")
         reconcile_ok = False
         close_stale_ok = False
@@ -1401,10 +1426,13 @@ def run_once(
     if should_degrade(remaining_s):
         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
         kis = None
-        try:
-            kis = KisAPI()
-        except Exception:
-            logger.exception("[PB1][DEGRADED] KIS init failed")
+        if not minervini_only:
+            try:
+                kis = KisAPI()
+            except Exception:
+                logger.exception("[PB1][DEGRADED] KIS init failed")
+        else:
+            logger.warning("[MINERVINI_ONLY] skip KisAPI init (analytics only)")
         run_id = os.getenv("TRADER_RUN_ID", "local")
         reconcile_ok = False
         close_stale_ok = False
@@ -1527,16 +1555,23 @@ def run_once(
                     window_label,
                 )
                 return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
+        
+        # ✅ MINERVINI_ONLY 모드 확인 (run_once 메인 흐름)
+        minervini_only = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        
         kis: KisAPI | None = None
-        try:
-            kis = KisAPI()
-            if kis.env != kis_env:
-                dry_run_reasons.append("kis_env_mismatch")
-                dry_run = True
-                _apply_env_flags(dry_run)
-        except Exception:
-            logger.exception("[PB1] KIS init failed -> skip tick")
-            return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
+        if not minervini_only:
+            try:
+                kis = KisAPI()
+                if kis.env != kis_env:
+                    dry_run_reasons.append("kis_env_mismatch")
+                    dry_run = True
+                    _apply_env_flags(dry_run)
+            except Exception:
+                logger.exception("[PB1] KIS init failed -> skip tick")
+                return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
+        else:
+            logger.warning("[MINERVINI_ONLY] skip KisAPI init (analytics only)")
 
         balance_snapshot_raw: dict | None = None
         balance_source: str | None = None
@@ -1944,7 +1979,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             or ""
         )
         strategy_mode = str(strategy_mode).upper()
-        kis_factory = lambda: KisAPI()
+        
+        # ✅ MINERVINI_ONLY 모드 확인
+        minervini_only = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        
+        if minervini_only:
+            logger.warning("[MINERVINI_ONLY] kis_factory will return None (analytics only)")
+            kis_factory = lambda: None
+        else:
+            kis_factory = lambda: KisAPI()
+        
         if strategy_mode == "DIAG":
             logger.info("[DIAG][BALANCE] probe_once start")
             _diag_balance_probe_once_safe(

@@ -24,6 +24,7 @@ from trader.config import (
     CANDIDATE_POOL_LIQ_DAYS,
     CANDIDATE_POOL_MIN_ROWS,
     MARKET_MAP,
+
 )
 from trader.db.repos import WatchlistRepo
 from trader.ohlcv_prefetch import prefetch_ohlcv_to_db

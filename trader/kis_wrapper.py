@@ -55,8 +55,9 @@ def kis_http_enabled() -> bool:
     - 그 외 → True
     """
     # [CRITICAL] MINERVINI_ONLY가 1이면 무조건 HTTP 차단
-    from trader.config import MINERVINI_ONLY
-    if MINERVINI_ONLY:
+    # config import로 순환 문제가 나기 쉬우므로 env로 직접 판단
+    mo = os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    if mo:
         return False
     
     v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
