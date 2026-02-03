@@ -277,6 +277,8 @@ CONFIG = {
     "TRAIL_STEP_AFTER_R": "1.5",
     "FAILED_BREAKOUT_EXIT_DAYS": "2",
     "REENTRY_COOLDOWN_DAYS": "10",
+    # Minervini-only mode (analytics mode without trading)
+    "MINERVINI_ONLY": "0",
 }
 
 
@@ -831,6 +833,9 @@ CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
 CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")
 CANDIDATE_POOL_MIN_ROWS = int(_cfg("CANDIDATE_POOL_MIN_ROWS") or "30")
 
+# Minervini-only mode (analytics without trading)
+MINERVINI_ONLY = _cfg_bool("MINERVINI_ONLY", fallback=False)
+
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
@@ -890,6 +895,7 @@ logger.info(
     ENTRY_MODE,
     RISK_PER_TRADE_PCT,
 )
+logger.info("[ENV] MINERVINI_ONLY=%s", int(MINERVINI_ONLY))
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 

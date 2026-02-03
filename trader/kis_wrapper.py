@@ -49,10 +49,16 @@ logger = logging.getLogger(__name__)
 def kis_http_enabled() -> bool:
     """
     KIS API HTTP 호출 허용 여부 판단.
+    - MINERVINI_ONLY=1 → False (최우선 차단)
     - KIS_HTTP_ENABLED=0/FALSE/NO/OFF → False (차단)
     - KIS_HTTP_ENABLED=AUTO → STRATEGY_MODE=LIVE일 때만 True
     - 그 외 → True
     """
+    # [CRITICAL] MINERVINI_ONLY가 1이면 무조건 HTTP 차단
+    from trader.config import MINERVINI_ONLY
+    if MINERVINI_ONLY:
+        return False
+    
     v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
     if v in ("0", "FALSE", "NO", "OFF"):
         return False

@@ -2249,14 +2249,27 @@ def main() -> int:
         os.environ["STRATEGY_ENV"] = kis_env
         logger.info("[PB1][ENV][AUTO] STRATEGY_ENV not set -> using KIS_ENV=%s", kis_env)
     
+    # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
+    from trader.config import MINERVINI_ONLY
+    if MINERVINI_ONLY:
+        os.environ["KIS_HTTP_ENABLED"] = "0"
+        os.environ["DISABLE_LIVE_TRADING"] = "1"
+        os.environ["LIVE_TRADING_ENABLED"] = "0"
+        os.environ["STRATEGY_MODE"] = "DIAG"
+        os.environ["PB1_PHASE_DEFAULT"] = "entry"
+        logger.warning(
+            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=0 + PB1_PHASE_DEFAULT=entry"
+        )
+    
     # ✅ AUTO 모드 결정 및 환경변수 고정
     mode_env = os.getenv("STRATEGY_MODE", "AUTO")
     resolved_mode = resolve_auto_strategy_mode(mode_env)
     os.environ["STRATEGY_MODE"] = resolved_mode
     logger.info(
-        "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True",
+        "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True MINERVINI_ONLY=%s",
         mode_env,
         resolved_mode,
+        int(MINERVINI_ONLY),
     )
     
     args = parse_args()

@@ -24,6 +24,7 @@ from trader.config import (
     CANDIDATE_POOL_LIQ_DAYS,
     CANDIDATE_POOL_MIN_ROWS,
     MARKET_MAP,
+    MINERVINI_ONLY,
 )
 from trader.db.repos import WatchlistRepo
 from trader.ohlcv_prefetch import prefetch_ohlcv_to_db
@@ -315,6 +316,7 @@ def load_candidate_pool(
     env: str,
     today: date,
     base_strategy: str = "best_k_meta",
+    force_rebuild: bool = False,
 ) -> tuple[Optional[List[str]], Optional[date], str]:
     """
     후보군 로드 (TTL 검사 포함).
@@ -324,6 +326,7 @@ def load_candidate_pool(
         env: 환경
         today: 오늘 날짜
         base_strategy: 기본 전략 (미사용, 하위 호환용)
+        force_rebuild: 강제 재생성 플래그 (MINERVINI_ONLY=1일 때는 무시됨)
     
     Returns:
         (pool_codes, pool_as_of, reason)
@@ -331,6 +334,11 @@ def load_candidate_pool(
         - pool_as_of: 후보군 생성 기준일 또는 None
         - reason: "hit" | "expired" | "missing" | "too_small"
     """
+    # [CRITICAL] MINERVINI_ONLY=1이면 강제 재생성 금지
+    if MINERVINI_ONLY:
+        force_rebuild = False
+        logger.info("[CANDIDATE_POOL][MINERVINI_ONLY] force_rebuild disabled")
+    
     repo = WatchlistRepo(engine)
     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
     
@@ -338,17 +346,28 @@ def load_candidate_pool(
     latest_date = repo.get_latest_watchlist_date(env=env, strategy=strategy)
     
     if not latest_date:
+        if MINERVINI_ONLY:
+            raise RuntimeError(
+                "[CANDIDATE_POOL][MINERVINI_ONLY] No existing candidate pool in DB. "
+                "MINERVINI_ONLY requires existing pool. Run pool build first."
+            )
         logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing")
         return None, None, "missing"
     
     # TTL 검사
     age_days = (today - latest_date).days
     if age_days > CANDIDATE_POOL_TTL_DAYS:
-        logger.warning(
-            "[CANDIDATE_POOL][LOAD] miss reason=expired as_of=%s age=%s ttl=%s",
-            latest_date, age_days, CANDIDATE_POOL_TTL_DAYS
-        )
-        return None, None, "expired"
+        if MINERVINI_ONLY:
+            logger.warning(
+                "[CANDIDATE_POOL][MINERVINI_ONLY] Pool expired (age=%s > ttl=%s) but continuing anyway",
+                age_days, CANDIDATE_POOL_TTL_DAYS
+            )
+        else:
+            logger.warning(
+                "[CANDIDATE_POOL][LOAD] miss reason=expired as_of=%s age=%s ttl=%s",
+                latest_date, age_days, CANDIDATE_POOL_TTL_DAYS
+            )
+            return None, None, "expired"
     
     # 후보군 로드
     pool_members, _ = repo.load_watchlist(
@@ -358,6 +377,10 @@ def load_candidate_pool(
         allow_latest_fallback=False,  # 이미 latest_date를 사용하므로 fallback 불필요
     )
     if not pool_members:
+        if MINERVINI_ONLY:
+            raise RuntimeError(
+                f"[CANDIDATE_POOL][MINERVINI_ONLY] Pool loaded but empty for date={latest_date}"
+            )
         logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing as_of=%s", latest_date)
         return None, None, "missing"
     
@@ -365,11 +388,17 @@ def load_candidate_pool(
     
     # 최소 크기 검사
     if len(pool_codes) < CANDIDATE_POOL_MIN_SIZE:
-        logger.warning(
-            "[CANDIDATE_POOL][LOAD] miss reason=too_small as_of=%s size=%s min=%s",
-            latest_date, len(pool_codes), CANDIDATE_POOL_MIN_SIZE
-        )
-        return None, None, "too_small"
+        if MINERVINI_ONLY:
+            logger.warning(
+                "[CANDIDATE_POOL][MINERVINI_ONLY] Pool too small (size=%s < min=%s) but continuing anyway",
+                len(pool_codes), CANDIDATE_POOL_MIN_SIZE
+            )
+        else:
+            logger.warning(
+                "[CANDIDATE_POOL][LOAD] miss reason=too_small as_of=%s size=%s min=%s",
+                latest_date, len(pool_codes), CANDIDATE_POOL_MIN_SIZE
+            )
+            return None, None, "too_small"
     
     logger.info(
         "[CANDIDATE_POOL][LOAD] hit=True as_of=%s size=%s age=%s",

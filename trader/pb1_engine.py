@@ -4497,12 +4497,27 @@ class PB1Engine:
         # ✅ DIAG_FULL_EXEC: entry gate 우회
         diag_full_exec = bool(getattr(self, "diag_full_exec", False))
         
+        # ✅ [NEW] MINERVINI_ONLY: 미너비니 계산만 수행, 주문은 금지
+        from trader.config import MINERVINI_ONLY
+        
+        # ✅ MINERVINI_ONLY=1이면 entry_allowed와 무관하게 계산은 허용, 주문은 금지
+        # calc_allowed: 미너비니/랭킹 계산 허용 여부
+        # order_allowed: 주문(intent/submit) 허용 여부
+        calc_allowed = entry_allowed or MINERVINI_ONLY
+        order_allowed = entry_allowed and (not MINERVINI_ONLY)
+        
+        if MINERVINI_ONLY:
+            logger.warning(
+                "[MINERVINI_ONLY] calc_allowed=1 order_allowed=0 (bypass cutoff/window for analytics only)"
+            )
+        
         # ✅ 서킷 브레이커 체크: EGW002 발생 시 신규진입 중단
         if self.kis and hasattr(self.kis, '_price_cache'):
             from trader.kis_wrapper import _price_cache
             if _price_cache.is_circuit_open():
                 logger.warning("[PB1][DEGRADED] price circuit open -> skip new entries this tick")
                 entry_allowed = False
+                order_allowed = False
                 entry_reason = "price_circuit_open"
         
         entry_summary_emitted = False
@@ -4525,6 +4540,7 @@ class PB1Engine:
                     self.dry_run
                 )
                 entry_allowed = True
+                calc_allowed = True
                 entry_reason = "diag_full_exec_override"
             else:
                 logger.warning(
@@ -4532,18 +4548,29 @@ class PB1Engine:
                     entry_reason
                 )
                 logger.info("[PB1][BUY][SKIP] reason=%s details={'entry_allowed': False}", entry_reason)
+                # MINERVINI_ONLY면 계산은 허용
+                if not MINERVINI_ONLY:
+                    calc_allowed = False
         if self.phase == "verify":
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=verify -> allow entry")
             else:
                 entry_allowed = False
+                order_allowed = False
                 entry_reason = "phase_verify"
+                # MINERVINI_ONLY면 계산은 허용
+                if not MINERVINI_ONLY:
+                    calc_allowed = False
         if self.phase in {"manage", "exit", "idle"}:
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=%s -> allow entry", self.phase)
             else:
                 entry_allowed = False
+                order_allowed = False
                 entry_reason = f"phase_{self.phase}"
+                # MINERVINI_ONLY면 계산은 허용
+                if not MINERVINI_ONLY:
+                    calc_allowed = False
         # ✅ FATAL 가드: intended_live=True인데 dry_run=True면 즉시 종료
         if self.intended_live and self.dry_run:
             raise RuntimeError(
@@ -5058,6 +5085,12 @@ class PB1Engine:
                 "[MINERVINI][CANDIDATES] n=%s codes=%s",
                 len(candidate_codes),
                 ", ".join(candidate_codes) if candidate_codes else "(no candidates)",
+            )
+            # ✅ [NEW] MINERVINI_ONLY 검증용 로그
+            logger.info(
+                "[MINERVINI][DONE] ranked=%d dt=%.2f",
+                len(candidate_codes),
+                dt_minervini,
             )
             minervini_report_path = run_minervini_report(
                 members,
