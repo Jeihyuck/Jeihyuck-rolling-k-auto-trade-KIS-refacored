@@ -2207,6 +2207,40 @@ def save_watchlist(
     repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
 
 
+def save_watchlist_simple(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    codes: List[str],
+    meta: Dict[str, Any] | None = None,
+) -> None:
+    """
+    간단한 코드 리스트로 watchlist 저장.
+    
+    Args:
+        engine: DB 엔진
+        env: 환경 (live/paper)
+        strategy: 전략 키
+        as_of: 기준 날짜
+        codes: 종목 코드 리스트
+        meta: 메타 정보 (전체 watchlist에 공통으로 저장)
+    """
+    as_of = to_date(as_of)
+    repo = WatchlistRepo(engine)
+    members = [
+        {
+            "code": str(code).zfill(6),
+            "rank": i + 1,
+            "score": None,
+            "meta": meta or {},
+        }
+        for i, code in enumerate(codes)
+    ]
+    repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
+
+
 def load_watchlist(
     engine: Engine,
     *,

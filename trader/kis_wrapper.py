@@ -3152,6 +3152,11 @@ class KisAPI:
     # 매수/매도 (기본)
     # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        # ✅ MINERVINI_ONLY 안전장치: analytics-only일 때는 주문 금지
+        if os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            logger.warning("[MINERVINI_ONLY] orders are disabled -> skip buy_stock_market")
+            return None
+        
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -3163,6 +3168,11 @@ class KisAPI:
         return self._order_cash(body, is_sell=False)
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        # ✅ MINERVINI_ONLY 안전장치: analytics-only일 때는 주문 금지
+        if os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            logger.warning("[MINERVINI_ONLY] orders are disabled -> skip sell_stock_market")
+            return None
+        
         # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
@@ -3216,6 +3226,11 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        # ✅ MINERVINI_ONLY 안전장치: analytics-only일 때는 주문 금지
+        if os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            logger.warning("[MINERVINI_ONLY] orders are disabled -> skip buy_stock_limit")
+            return None
+        
         _assert_orders_allowed("buy_stock_limit")
         now = now_kst()
         block_reason = _order_block_reason(now)
@@ -3271,6 +3286,11 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        # ✅ MINERVINI_ONLY 안전장치: analytics-only일 때는 주문 금지
+        if os.getenv("MINERVINI_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            logger.warning("[MINERVINI_ONLY] orders are disabled -> skip sell_stock_limit")
+            return None
+        
         _assert_orders_allowed("sell_stock_limit")
         now = now_kst()
         block_reason = _order_block_reason(now)

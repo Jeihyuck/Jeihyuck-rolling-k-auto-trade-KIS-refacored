@@ -1608,9 +1608,15 @@ def run_once(
         if not user_entry_enabled:
             entry_allowed_this_tick = False
             entry_block_reason = "entry_disabled"
+        
+        # ✅ analytics-only 체크 미리 계산
+        from trader.config import MINERVINI_BYPASS_BALANCE
+        analytics_only = minervini_only and MINERVINI_BYPASS_BALANCE
+        
         if balance_state == BALANCE_STATE_UNKNOWN:
-            entry_allowed_this_tick = False
-            entry_block_reason = entry_block_reason or "balance_unknown"
+            if not analytics_only:
+                entry_allowed_this_tick = False
+                entry_block_reason = entry_block_reason or "balance_unknown"
         elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK:
             entry_allowed_this_tick = False
             entry_block_reason = entry_block_reason or "balance_stale"
@@ -1640,8 +1646,9 @@ def run_once(
                 entry_allowed_this_tick = False
                 entry_block_reason = entry_block_reason or "preopen_block"
             elif PB1_PREOPEN_REQUIRE_BALANCE and balance_state != BALANCE_STATE_OK:
-                entry_allowed_this_tick = False
-                entry_block_reason = entry_block_reason or "balance_unknown"
+                if not analytics_only:
+                    entry_allowed_this_tick = False
+                    entry_block_reason = entry_block_reason or "balance_unknown"
 
         if deadline_ts:
             remaining_budget = deadline_ts - time_mod.monotonic()
@@ -1722,12 +1729,19 @@ def run_once(
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
+        # ✅ analytics-only 모드에서는 잔고 게이트를 우회 (필터/저장은 실행, 주문만 차단)
+        analytics_only = minervini_only and MINERVINI_BYPASS_BALANCE
+        
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
-            logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
-            runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
-            db_write_reasons.append("balance_degraded")
-            _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
-            return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+            if analytics_only:
+                # analytics-only에서는 막지 않는다 (주문은 kis=None으로 이미 차단됨)
+                logger.warning("[PB1][ENTRY_NOT_BLOCKED] analytics_only -> continue (no orders)")
+            else:
+                logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
+                runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
+                db_write_reasons.append("balance_degraded")
+                _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
+                return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,

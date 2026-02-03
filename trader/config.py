@@ -28,6 +28,13 @@ def _env_flag(name: str, default: str = "0") -> bool:
 # MINERVINI analytics-only mode (no orders)
 MINERVINI_ONLY = _env_flag("MINERVINI_ONLY", "0")
 
+# MINERVINI analytics-only controls
+MINERVINI_BYPASS_BALANCE = _env_flag("MINERVINI_BYPASS_BALANCE", "1")  # analytics-only일 때 잔고 게이트 우회
+MINERVINI_TOPN_STRATEGY_KEY = os.getenv("MINERVINI_TOPN_STRATEGY_KEY", "pb1_minervini_topn")
+MINERVINI_WRITE_TO_CANDIDATE_POOL = _env_flag("MINERVINI_WRITE_TO_CANDIDATE_POOL", "1")
+PB1_CANDIDATE_POOL_KEY = os.getenv("PB1_CANDIDATE_POOL_KEY", "pb1_candidate_pool")
+MINERVINI_TOPN_N = int(os.getenv("MINERVINI_TOPN_N", "10"))
+
 
 # =========================
 # [CONFIG] .env 없이도 동작

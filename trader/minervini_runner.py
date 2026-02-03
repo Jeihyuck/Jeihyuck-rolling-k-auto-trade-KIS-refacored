@@ -360,6 +360,65 @@ def run_diag_minervini_only(
     # 점수 내림차순 정렬
     top_candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     
+    # ✅ TopN DB 저장 (MINERVINI_ONLY 전용)
+    from trader.config import (
+        MINERVINI_TOPN_N,
+        MINERVINI_TOPN_STRATEGY_KEY,
+        MINERVINI_WRITE_TO_CANDIDATE_POOL,
+        PB1_CANDIDATE_POOL_KEY,
+    )
+    from trader.db.repos import save_watchlist_simple
+    
+    topn_codes = [c["code"] for c in top_candidates[:MINERVINI_TOPN_N]]
+    
+    if topn_codes:
+        # TopN Watchlist 저장
+        topn_meta = {
+            "source": "minervini",
+            "topn_n": MINERVINI_TOPN_N,
+            "params": {
+                "rs_min_percentile": minervini_config.rs_min_percentile,
+                "vcp_min_score": minervini_config.vcp_min_score,
+                "min_dollar_vol_50d": minervini_config.min_dollar_vol_50d,
+            },
+            "sample": topn_codes[:5],
+        }
+        
+        try:
+            save_watchlist_simple(
+                engine,
+                env=env,
+                strategy=MINERVINI_TOPN_STRATEGY_KEY,
+                as_of=as_of,
+                codes=topn_codes,
+                meta=topn_meta,
+            )
+            logger.info(
+                "[MINERVINI][TOPN][SAVED] key=%s as_of=%s size=%s sample=%s",
+                MINERVINI_TOPN_STRATEGY_KEY, as_of, len(topn_codes), topn_codes[:5]
+            )
+        except Exception as exc:
+            logger.error("[MINERVINI][TOPN][SAVE_FAIL] %s", exc, exc_info=True)
+        
+        # LIVE 연동: candidate_pool에도 저장
+        if MINERVINI_WRITE_TO_CANDIDATE_POOL:
+            try:
+                pool_meta = {**topn_meta, "alias_of": MINERVINI_TOPN_STRATEGY_KEY}
+                save_watchlist_simple(
+                    engine,
+                    env=env,
+                    strategy=PB1_CANDIDATE_POOL_KEY,
+                    as_of=as_of,
+                    codes=topn_codes,
+                    meta=pool_meta,
+                )
+                logger.info(
+                    "[CANDIDATE_POOL][SAVED] key=%s as_of=%s size=%s",
+                    PB1_CANDIDATE_POOL_KEY, as_of, len(topn_codes)
+                )
+            except Exception as exc:
+                logger.error("[CANDIDATE_POOL][SAVE_FAIL] %s", exc, exc_info=True)
+    
     try:
         top_candidates_path.parent.mkdir(parents=True, exist_ok=True)
         top_candidates_path.write_text(
