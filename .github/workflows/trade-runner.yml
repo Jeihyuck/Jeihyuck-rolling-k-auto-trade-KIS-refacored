@@ -34,6 +34,12 @@ on:
         description: "시뮬레이션 모드 (1=시뮬, 0=실거래)"
         required: false
         default: "1"
+      MINERVINI_ONLY:
+        description: "MINERVINI_ONLY (1=미너비니 계산만, KIS HTTP/주문 금지)"
+        required: true
+        default: "0"
+        type: choice
+        options: ["0", "1"]
 
   schedule:
     # 토요일 00:30 KST = 금요일 15:30 UTC : 후보군 생성
@@ -502,6 +508,11 @@ jobs:
       # ✅ KIS_ENV/STRATEGY_ENV 동기화 (중복 정의 제거, mismatch 방지)
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+
+      # ✅ MINERVINI_ONLY 모드 (미너비니 계산만, KIS HTTP/주문 금지)
+      MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY || '0' }}
+      # ✅ MINERVINI_ONLY=1이면 KIS_HTTP_ENABLED 강제로 0 (실수 방지)
+      KIS_HTTP_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY == '1' && '0' || '1' }}
 
       # ✅ 후보군: DB 로드 전용 (재빌드 절대 금지)
       CANDIDATE_POOL_ENABLED: "1"
