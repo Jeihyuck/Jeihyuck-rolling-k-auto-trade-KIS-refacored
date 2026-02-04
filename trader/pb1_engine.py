@@ -517,6 +517,15 @@ class PB1Engine:
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
+        
+        # ✅ DRY_RUN verification log in engine (critical)
+        logger.info(
+            "[DRY_RUN][ENGINE] dry_run=%s (type=%s) intended_live=%s phase=%s",
+            self.dry_run,
+            type(self.dry_run).__name__,
+            self.intended_live,
+            self.phase,
+        )
         self.window = window
         self.window_label = window_label
         self.phase = phase

@@ -3004,10 +3004,11 @@ class KisAPI:
                     k: (v if k not in ("CANO", "ACNT_PRDT_CD") else "***")
                     for k, v in body.items()
                 }
-                dry_run = os.getenv("DRY_RUN", "0") == "1"
-                live_trading = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
-                force_run = os.getenv("FORCE_RUN", "0") == "1"
-                intended_live = os.getenv("INTENDED_LIVE", "0") == "1"
+                from trader.utils.env import env_bool
+                dry_run = env_bool("DRY_RUN", default=True)
+                live_trading = env_bool("LIVE_TRADING_ENABLED", default=False)
+                force_run = env_bool("FORCE_RUN", default=False)
+                intended_live = env_bool("INTENDED_LIVE", default=False)
                 
                 # ✅ CRITICAL ASSERTION: LIVE 의도인데 dry_run이면 즉시 실패
                 if intended_live and dry_run:

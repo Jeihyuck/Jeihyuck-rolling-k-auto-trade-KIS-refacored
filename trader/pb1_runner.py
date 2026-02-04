@@ -931,10 +931,11 @@ def run_once(
             break
     
     # [NEW] FORCE_RUN, WATCHLIST_MODE 로깅
-    force_run = os.getenv("FORCE_RUN", "0") == "1"
-    watchlist_mode = os.getenv("WATCHLIST_MODE", "0") == "1"
-    dry_run = os.getenv("DRY_RUN", "0") == "1"
-    live_trading = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
+    from trader.utils.env import env_bool
+    force_run = env_bool("FORCE_RUN", default=False)
+    watchlist_mode = env_bool("WATCHLIST_MODE", default=False)
+    dry_run = env_bool("DRY_RUN", default=True)
+    live_trading = env_bool("LIVE_TRADING_ENABLED", default=False)
     
     if force_run or watchlist_mode:
         logger.info(
@@ -953,7 +954,7 @@ def run_once(
             violations.append("LIVE_TRADING_ENABLED != '1'")
         if os.getenv("DISABLE_LIVE_TRADING") == "1":
             violations.append("DISABLE_LIVE_TRADING == '1'")
-        if os.getenv("DRY_RUN") == "1":
+        if env_bool("DRY_RUN", default=True):
             violations.append("DRY_RUN == '1'")
         if os.getenv("DB_ONLY") == "1":
             violations.append("DB_ONLY == '1'")
@@ -1208,15 +1209,16 @@ def run_once(
 
     # ✅ SINGLE SOURCE OF TRUTH: resolve_trade_flags로 통일
     from trader.config import resolve_trade_flags
+    from trader.utils.env import env_bool
     
     requested_dry_run_env = os.getenv("DRY_RUN")
-    requested_dry_run = None if requested_dry_run_env is None else (requested_dry_run_env == "1")
+    requested_dry_run = None if requested_dry_run_env is None else env_bool("DRY_RUN", default=True)
     
     flags = resolve_trade_flags(
         strategy_mode=os.getenv("STRATEGY_MODE", ""),
-        live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True"),
-        disable_live_trading=os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True"),
-        kis_http_enabled=os.getenv("KIS_HTTP_ENABLED", "1") in ("1", "true", "True"),
+        live_trading_enabled=env_bool("LIVE_TRADING_ENABLED", default=False),
+        disable_live_trading=env_bool("DISABLE_LIVE_TRADING", default=True),
+        kis_http_enabled=env_bool("KIS_HTTP_ENABLED", default=True),
         requested_dry_run=requested_dry_run,
     )
     
@@ -1726,6 +1728,15 @@ def run_once(
             db_write_reasons.append("balance_degraded")
             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
             return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+
+        # ✅ DRY_RUN verification log (critical for debugging)
+        logger.info(
+            "[DRY_RUN][RESOLVED] env=%s parsed=%s (type=%s) intended_live=%s",
+            os.getenv('DRY_RUN'),
+            dry_run,
+            type(dry_run).__name__,
+            intended_live,
+        )
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
@@ -2243,11 +2254,12 @@ def main() -> int:
     
     # ✅ NEW: allow mismatch in DIAG/DRY_RUN (candidate-only/minervini test)
     # LIVE real trading must remain strict.
-    live_trading_enabled = os.getenv("LIVE_TRADING_ENABLED", "0") == "1"
-    dry_run = os.getenv("DRY_RUN", "0") == "1"
-    sim_mode = os.getenv("SIM_MODE", "0") == "1"
-    pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
-    diag_minervini_only = os.getenv("PB1_DIAG_MINERVINI_ONLY", "0") == "1"
+    from trader.utils.env import env_bool
+    live_trading_enabled = env_bool("LIVE_TRADING_ENABLED", default=False)
+    dry_run = env_bool("DRY_RUN", default=True)
+    sim_mode = env_bool("SIM_MODE", default=False)
+    pb1_candidate_only = env_bool("PB1_CANDIDATE_ONLY", default=False)
+    diag_minervini_only = env_bool("PB1_DIAG_MINERVINI_ONLY", default=False)
     strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
     
     # 허용 조건: DIAG, DRY_RUN, SIM_MODE, candidate-only 중 하나라도 활성화
