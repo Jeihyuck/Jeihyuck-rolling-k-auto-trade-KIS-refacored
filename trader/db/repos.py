@@ -2073,29 +2073,22 @@ class WatchlistRepo:
         env: str,
         strategy: str,
         as_of: date | str,
-        allow_latest_fallback: bool = False,
+        allow_latest_fallback: bool = True,
         ttl_days: int = 7,
     ) -> tuple[List[Dict[str, Any]], date | None]:
         """
         특정 날짜의 watchlist 조회.
-        
-        Args:
-            env: 환경 (live/paper)
-            strategy: 전략 키
-            as_of: 기준 날짜
-            allow_latest_fallback: True이면 as_of에 데이터가 없을 때 최근 TTL 이내 데이터 fallback
-            ttl_days: fallback 시 최대 허용 일수
-        
-        Returns:
-            (watchlist, used_as_of): watchlist 리스트와 실제 사용된 날짜
+        반환: ([{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...], used_as_of)
         
         ✅ as_of는 DATE 타입으로 강제 변환 (VARCHAR 캐스팅 방지)
+        ✅ allow_latest_fallback=True: as_of에 없으면 TTL 이내 최신 as_of 사용
         """
         # ✅ as_of 타입 강화: date 객체로 변환
         as_of_date = to_date(as_of)
         
         schema = self._schema
         
+        # 먼저 요청한 as_of로 조회
         with self.engine.connect() as conn:
             stmt = (
                 select(schema.pb1_watchlist)
@@ -2110,6 +2103,68 @@ class WatchlistRepo:
             )
             rows = conn.execute(stmt).fetchall()
         
+        if rows:
+            result = [
+                {
+                    "code": row.code,
+                    "rank": row.rank,
+                    "score": float(row.score) if row.score else None,
+                    "meta": row.meta,
+                }
+                for row in rows
+            ]
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (exact)",
+                env, strategy, as_of_date, len(result)
+            )
+            return result, as_of_date
+        
+        # as_of에 없으면 최신 fallback 시도
+        if not allow_latest_fallback:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback)",
+                env, strategy, as_of_date
+            )
+            return [], None
+        
+        # TTL 이내 최신 as_of 조회
+        min_date = as_of_date - timedelta(days=ttl_days)
+        with self.engine.connect() as conn:
+            latest_stmt = (
+                select(func.max(schema.pb1_watchlist.c.as_of))
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.as_of <= as_of_date,
+                        schema.pb1_watchlist.c.as_of >= min_date,
+                    )
+                )
+            )
+            latest_as_of = conn.execute(latest_stmt).scalar()
+        
+        if not latest_as_of:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback within TTL=%s days)",
+                env, strategy, as_of_date, ttl_days
+            )
+            return [], None
+        
+        # 최신 as_of로 다시 조회
+        with self.engine.connect() as conn:
+            stmt = (
+                select(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env,
+                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.as_of == latest_as_of,
+                    )
+                )
+                .order_by(schema.pb1_watchlist.c.rank)
+            )
+            rows2 = conn.execute(stmt).fetchall()
+        
         result = [
             {
                 "code": row.code,
@@ -2117,59 +2172,13 @@ class WatchlistRepo:
                 "score": float(row.score) if row.score else None,
                 "meta": row.meta,
             }
-            for row in rows
+            for row in rows2
         ]
-        
-        # Fallback 로직: as_of에 데이터가 없으면 최근 데이터 찾기
-        if not result and allow_latest_fallback:
-            latest_date = self.get_latest_watchlist_date(env=env, strategy=strategy)
-            if latest_date:
-                from datetime import timedelta
-                age = (as_of_date - latest_date).days
-                if 0 <= age <= ttl_days:
-                    logger.info(
-                        "[WATCHLIST][LOAD][FALLBACK] as_of=%s not found, using latest=%s (age=%d days)",
-                        as_of_date, latest_date, age
-                    )
-                    # 최근 날짜로 재조회
-                    with self.engine.connect() as conn:
-                        stmt = (
-                            select(schema.pb1_watchlist)
-                            .where(
-                                and_(
-                                    schema.pb1_watchlist.c.env == env,
-                                    schema.pb1_watchlist.c.strategy == strategy,
-                                    schema.pb1_watchlist.c.as_of == latest_date,
-                                )
-                            )
-                            .order_by(schema.pb1_watchlist.c.rank)
-                        )
-                        rows = conn.execute(stmt).fetchall()
-                    result = [
-                        {
-                            "code": row.code,
-                            "rank": row.rank,
-                            "score": float(row.score) if row.score else None,
-                            "meta": row.meta,
-                        }
-                        for row in rows
-                    ]
-                    logger.info(
-                        "[WATCHLIST][LOAD][FALLBACK] env=%s strategy=%s fallback_as_of=%s members=%s",
-                        env, strategy, latest_date, len(result)
-                    )
-                    return result, latest_date
-                else:
-                    logger.warning(
-                        "[WATCHLIST][LOAD][FALLBACK] latest=%s too old (age=%d > ttl=%d)",
-                        latest_date, age, ttl_days
-                    )
-        
         logger.info(
-            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
-            env, strategy, as_of_date, len(result)
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (fallback from %s, age=%s days)",
+            env, strategy, as_of_date, len(result), latest_as_of, (as_of_date - latest_as_of).days
         )
-        return result, as_of_date
+        return result, latest_as_of
     
     def get_latest_watchlist_date(
         self,
@@ -2207,51 +2216,25 @@ def save_watchlist(
     repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
 
 
-def save_watchlist_simple(
-    engine: Engine,
-    *,
-    env: str,
-    strategy: str,
-    as_of: date,
-    codes: List[str],
-    meta: Dict[str, Any] | None = None,
-) -> None:
-    """
-    간단한 코드 리스트로 watchlist 저장.
-    
-    Args:
-        engine: DB 엔진
-        env: 환경 (live/paper)
-        strategy: 전략 키
-        as_of: 기준 날짜
-        codes: 종목 코드 리스트
-        meta: 메타 정보 (전체 watchlist에 공통으로 저장)
-    """
-    as_of = to_date(as_of)
-    repo = WatchlistRepo(engine)
-    members = [
-        {
-            "code": str(code).zfill(6),
-            "rank": i + 1,
-            "score": None,
-            "meta": meta or {},
-        }
-        for i, code in enumerate(codes)
-    ]
-    repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
-
-
 def load_watchlist(
     engine: Engine,
     *,
     env: str,
     strategy: str,
     as_of: date,
-) -> List[Dict[str, Any]]:
+    allow_latest_fallback: bool = True,
+    ttl_days: int = 7,
+) -> tuple[List[Dict[str, Any]], date | None]:
     """Standalone load_watchlist function."""
     as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
-    return repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+    return repo.load_watchlist(
+        env=env,
+        strategy=strategy,
+        as_of=as_of,
+        allow_latest_fallback=allow_latest_fallback,
+        ttl_days=ttl_days,
+    )
 
 
 # ========================================

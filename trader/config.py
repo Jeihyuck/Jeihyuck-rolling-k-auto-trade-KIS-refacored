@@ -16,26 +16,6 @@ from zoneinfo import ZoneInfo
 from trader.runtime_paths import ensure_not_repo_tracked_path, get_cache_root, runtime_path
 from trader.utils.env import env_bool, resolve_mode, TRUE_VALUES, FALSE_VALUES
 
-
-# =========================
-# [ENV FLAGS] 전역 ENV 상수 (CONFIG 이전에 선언)
-# =========================
-def _env_flag(name: str, default: str = "0") -> bool:
-    """환경변수를 bool로 변환 (1/true/yes/y/on -> True)"""
-    v = os.getenv(name, default)
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-# MINERVINI analytics-only mode (no orders)
-MINERVINI_ONLY = _env_flag("MINERVINI_ONLY", "0")
-
-# MINERVINI analytics-only controls
-MINERVINI_BYPASS_BALANCE = _env_flag("MINERVINI_BYPASS_BALANCE", "1")  # analytics-only일 때 잔고 게이트 우회
-MINERVINI_TOPN_STRATEGY_KEY = os.getenv("MINERVINI_TOPN_STRATEGY_KEY", "pb1_minervini_topn")
-MINERVINI_WRITE_TO_CANDIDATE_POOL = _env_flag("MINERVINI_WRITE_TO_CANDIDATE_POOL", "1")
-PB1_CANDIDATE_POOL_KEY = os.getenv("PB1_CANDIDATE_POOL_KEY", "pb1_candidate_pool")
-MINERVINI_TOPN_N = int(os.getenv("MINERVINI_TOPN_N", "10"))
-
-
 # =========================
 # [CONFIG] .env 없이도 동작
 # - 아래 값을 기본으로 사용
@@ -297,6 +277,8 @@ CONFIG = {
     "TRAIL_STEP_AFTER_R": "1.5",
     "FAILED_BREAKOUT_EXIT_DAYS": "2",
     "REENTRY_COOLDOWN_DAYS": "10",
+    # Minervini-only mode (analytics mode without trading)
+    "MINERVINI_ONLY": "0",
 }
 
 
@@ -851,6 +833,9 @@ CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
 CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")
 CANDIDATE_POOL_MIN_ROWS = int(_cfg("CANDIDATE_POOL_MIN_ROWS") or "30")
 
+# Minervini-only mode (analytics without trading)
+MINERVINI_ONLY = _cfg_bool("MINERVINI_ONLY", fallback=False)
+
 # 추가 상수
 ALLOW_KIS_DAILY_FALLBACK = _cfg_bool("ALLOW_KIS_DAILY_FALLBACK", fallback=False)
 PB1_MAX_DAILY_FETCH_PER_TICK = int(_cfg("PB1_MAX_DAILY_FETCH_PER_TICK") or "20")
@@ -910,9 +895,7 @@ logger.info(
     ENTRY_MODE,
     RISK_PER_TRADE_PCT,
 )
-# ✅ MINERVINI_ONLY 모드 로깅
-if MINERVINI_ONLY:
-    logger.info("[ENV] MINERVINI_ONLY=1 (analytics-only, no orders)")
+logger.info("[ENV] MINERVINI_ONLY=%s", int(MINERVINI_ONLY))
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 
@@ -938,6 +921,38 @@ def resolve_market_window(now: datetime, trading_day: bool) -> str:
     if not trading_day:
         return "after"
     return calc_market_window_kst(now)
+
+
+def resolve_trade_flags(
+    *,
+    strategy_mode: str,
+    live_trading_enabled: bool,
+    disable_live_trading: bool,
+    kis_http_enabled: bool,
+    requested_dry_run: bool | None,
+) -> dict:
+    """
+    Single source of truth for trade flags.
+    Rule: If LIVE is intended (strategy_mode == 'LIVE' and live_trading_enabled and not disable_live_trading and kis_http_enabled),
+    then dry_run MUST be False regardless of any other heuristics.
+    """
+    intended_live = (
+        (strategy_mode or "").upper() == "LIVE"
+        and bool(live_trading_enabled)
+        and not bool(disable_live_trading)
+        and bool(kis_http_enabled)
+    )
+
+    if intended_live:
+        # absolute lock: never allow dry_run in live intent
+        dry_run = False
+        reasons = ["intended_live_lock"]
+    else:
+        # follow requested dry_run if explicitly given, else default True
+        dry_run = True if requested_dry_run is None else bool(requested_dry_run)
+        reasons = ["requested_or_default"]
+
+    return {"intended_live": intended_live, "dry_run": dry_run, "reasons": reasons}
 
 
 def resolve_strategy_mode(
