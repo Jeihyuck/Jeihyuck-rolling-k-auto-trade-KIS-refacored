@@ -226,7 +226,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -361,7 +361,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -506,7 +506,7 @@ jobs:
       # ✅ KIS_ENV/STRATEGY_ENV 동기화 (중복 정의 제거, mismatch 방지)
       # Note: ENV input should be 'practice' or 'real' per internal standard
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'practice' }}
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
 
       # ✅ MINERVINI_ONLY 모드 (미너비니 계산만, KIS HTTP/주문 금지)
       MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY || '0' }}
@@ -605,7 +605,7 @@ jobs:
 
             # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
             echo "KIS_ENV=practice" >> $GITHUB_ENV
-            echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
@@ -635,7 +635,7 @@ jobs:
 
             # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
             echo "KIS_ENV=practice" >> $GITHUB_ENV
-            echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
