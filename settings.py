@@ -18,7 +18,17 @@ APP_KEY        = safe_strip(os.getenv("KIS_APP_KEY"))
 APP_SECRET     = safe_strip(os.getenv("KIS_APP_SECRET"))
 CANO           = safe_strip(os.getenv("CANO"))
 ACNT_PRDT_CD   = safe_strip(os.getenv("ACNT_PRDT_CD"))
-KIS_ENV        = safe_strip(os.getenv("KIS_ENV", "practice"))
+KIS_ENV        = safe_strip(os.getenv("KIS_ENV", "practice")).lower()
+
+# ✅ Normalize KIS_ENV: convert all synonyms to internal standard (practice/real)
+if KIS_ENV in {"paper", "practice", "vts", "mock", "demo"}:
+    KIS_ENV = "practice"
+elif KIS_ENV in {"real", "prod", "live", "production"}:
+    KIS_ENV = "real"
+else:
+    # Safety fallback for unknown values
+    logger.warning(f"[KIS_ENV] Unknown value '{KIS_ENV}', falling back to 'practice'")
+    KIS_ENV = "practice"
 
 if KIS_ENV == "real":
     API_BASE_URL = "https://openapi.koreainvestment.com:9443"

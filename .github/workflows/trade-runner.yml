@@ -83,10 +83,11 @@ jobs:
       STRATEGY_ENV: "PAPER"
       
       # KIS API (FDR는 필요 없지만 환경 통일을 위해 유지)
+      # ✅ Internal standard: practice (not PAPER)
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: "PAPER"
+      KIS_ENV: "practice"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -215,7 +216,7 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: "PAPER"
+      KIS_ENV: "practice"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -350,7 +351,7 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: "PAPER"
+      KIS_ENV: "practice"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -503,7 +504,8 @@ jobs:
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
       # ✅ KIS_ENV/STRATEGY_ENV 동기화 (중복 정의 제거, mismatch 방지)
-      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
+      # Note: ENV input should be 'practice' or 'real' per internal standard
+      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'practice' }}
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PAPER' }}
 
       # ✅ MINERVINI_ONLY 모드 (미너비니 계산만, KIS HTTP/주문 금지)
@@ -601,8 +603,8 @@ jobs:
             echo "STRATEGY_MODE=LIVE" >> $GITHUB_ENV
             echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
 
-            # ✅ DB 파티션/전략키는 PAPER/REAL로 통일
-            echo "KIS_ENV=PAPER" >> $GITHUB_ENV
+            # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
+            echo "KIS_ENV=practice" >> $GITHUB_ENV
             echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
@@ -631,8 +633,8 @@ jobs:
             echo "DISABLE_LIVE_TRADING=${{ github.event.inputs.DISABLE_LIVE_TRADING || '1' }}" >> $GITHUB_ENV
             echo "LIVE_TRADING_ENABLED=${{ github.event.inputs.LIVE_TRADING_ENABLED || '0' }}" >> $GITHUB_ENV
 
-            # ✅ DB 파티션/전략키는 PAPER/REAL로 통일
-            echo "KIS_ENV=PAPER" >> $GITHUB_ENV
+            # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
+            echo "KIS_ENV=practice" >> $GITHUB_ENV
             echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정

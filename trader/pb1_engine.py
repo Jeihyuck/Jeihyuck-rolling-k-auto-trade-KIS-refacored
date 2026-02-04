@@ -517,18 +517,21 @@ class PB1Engine:
         
         self.env = env
         self.run_id = run_id
-        self.intended_live = intended_live
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
         
-        # ✅ FATAL GUARD: Catch bool casting bugs immediately
+        # ✅ DEFENSIVE GUARD: Auto-correct intended_live vs dry_run mismatch instead of crashing
         if intended_live and self.dry_run:
-            raise RuntimeError(
-                f"FATAL: intended_live=True but pb1_engine received dry_run=True. "
-                f"DRY_RUN(env)={os.getenv('DRY_RUN')} dry_run(input)={dry_run} "
-                f"dry_run(parsed)={self.dry_run} type={type(dry_run).__name__}"
+            logger.error(
+                "[PB1][ENGINE] intended_live=True but dry_run=True detected; "
+                "downgrading intended_live to False to prevent fatal crash. "
+                "DRY_RUN(env)=%s dry_run(input)=%s dry_run(parsed)=%s type=%s",
+                os.getenv('DRY_RUN'), dry_run, self.dry_run, type(dry_run).__name__
             )
+            intended_live = False  # Auto-correct to prevent crash
+        
+        self.intended_live = intended_live
         
         # ✅ DRY_RUN verification log in engine (critical)
         logger.info(

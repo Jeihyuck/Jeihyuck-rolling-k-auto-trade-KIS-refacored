@@ -1581,8 +1581,9 @@ def run_once(
         try:
             kis = KisAPI()
             if kis.env != kis_env:
-                logger.warning("[PB1][KIS_ENV_MISMATCH] kis.env=%s != kis_env=%s -> force dry_run", kis.env, kis_env)
+                logger.warning("[PB1][KIS_ENV_MISMATCH] kis.env=%s != kis_env=%s -> force dry_run + downgrade intended_live", kis.env, kis_env)
                 dry_run = True
+                intended_live = False  # ✅ CRITICAL: must sync intended_live when forcing dry_run
                 _apply_env_flags_if_needed(dry_run)
         except Exception:
             logger.exception("[PB1] KIS init failed -> skip tick")
