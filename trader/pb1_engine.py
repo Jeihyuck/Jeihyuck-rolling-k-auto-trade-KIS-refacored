@@ -1504,7 +1504,7 @@ class PB1Engine:
         # ✅ 타이머 및 시간 예산 설정
         t0 = time.monotonic()
         t_minervini_enter = time.monotonic()
-        deadline = t0 + 540.0  # 900초 중 60% = 540초 예산
+        deadline = t0 + 3600.0  # 후보 스캔 타임아웃: 3600초 (1시간)
         reason = "OK"
         candidates: List[CandidateFeature] = []
         members_list = list(members)  # Iterable → list 변환
