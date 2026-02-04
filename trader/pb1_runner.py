@@ -1319,11 +1319,11 @@ def run_once(
     # ✅ _apply_env_flags는 intended_live=True일 때 스킵 (env 이미 락됨)
     # DIAG 모드나 기타 경우에만 env 업데이트 허용
     def _apply_env_flags_if_needed(dry: bool) -> None:
-        \"\"\"
+        """
         Apply environment flags ONLY if not already locked by intended_live.
         If intended_live=True, the env was locked by _force_live_env_lock_if_needed.
         DO NOT overwrite the lock.
-        \"\"\"
+        """
         if intended_live:
             # ✅ Already locked - do not touch
             logger.info("[ENV_FLAGS] Skip _apply_env_flags (intended_live=True, env locked)")
