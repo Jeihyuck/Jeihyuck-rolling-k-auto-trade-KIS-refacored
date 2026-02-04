@@ -47,3 +47,52 @@ def resolve_mode(raw: str | None) -> str:
     if normalized in {"INTENT_ONLY", "INTENT", "DIAG", "DIAGNOSTIC"}:
         return "INTENT_ONLY"
     return "INTENT_ONLY"
+
+
+def parse_bool_any(value, default: bool = False) -> bool:
+    """
+    Robust bool parser.
+    Accepts bool/int/str/None and converts safely.
+    Critical: "0" must be False (bool("0") bug prevention)
+    
+    Args:
+        value: Any type of input (bool, int, str, None)
+        default: Default value if value is None or invalid
+        
+    Returns:
+        bool: Safely parsed boolean value
+        
+    Examples:
+        >>> parse_bool_any("0")
+        False
+        >>> parse_bool_any("1")
+        True
+        >>> parse_bool_any(0)
+        False
+        >>> parse_bool_any(1)
+        True
+        >>> parse_bool_any(True)
+        True
+        >>> parse_bool_any("yes")
+        True
+        >>> parse_bool_any("")
+        False
+        >>> parse_bool_any(None, default=True)
+        True
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off", ""):
+            return False
+        # unknown string → default (fail safe)
+        return default
+    # unknown type → default (fail safe)
+    return default

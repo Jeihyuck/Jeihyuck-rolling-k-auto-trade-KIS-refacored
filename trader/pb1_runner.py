@@ -76,7 +76,7 @@ from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst
-from trader.utils.env import env_bool, parse_env_flag, resolve_mode
+from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
 from trader.db.repos import WatchlistRepo
@@ -87,16 +87,26 @@ logger = logging.getLogger(__name__)
 log = logger
 
 
-def _force_live_env_lock_if_needed(intended_live: bool) -> None:
+def _force_live_env_lock_if_needed(intended_live: bool) -> bool:
     """
     If we intend to trade live, we must guarantee env flags are consistent.
     This prevents any later re-reads from flipping DRY_RUN back to '1'.
     
     CRITICAL: Once intended_live=True, environment variables must be locked
     to prevent any code path from re-reading or re-setting them to safe defaults.
+    
+    Returns:
+        bool: parsed dry_run value after lock (must be False for intended_live=True)
     """
     if not intended_live:
-        return
+        # Safe mode: just parse and return using safe parser
+        dry_run = parse_bool_any(os.getenv("DRY_RUN"), default=True)
+        logger.info(
+            "[LIVE_ENV_LOCK][SAFE] intended_live=False -> dry_run=%s (env=%s)",
+            dry_run,
+            os.getenv("DRY_RUN"),
+        )
+        return dry_run
 
     # Hard lock: once live-intended, env must not block orders.
     os.environ["DRY_RUN"] = "0"
@@ -111,6 +121,27 @@ def _force_live_env_lock_if_needed(intended_live: bool) -> None:
         os.getenv("LIVE_TRADING_ENABLED"),
         os.getenv("SIMULATION_MODE"),
     )
+    
+    # ✅ CRITICAL: Parse dry_run AFTER lock using safe parser (must be single source of truth)
+    dry_run = parse_bool_any(os.getenv("DRY_RUN"), default=True)
+    
+    # ✅ FATAL: If env=0 but parsed=True, something is broken
+    if os.getenv("DRY_RUN") == "0" and dry_run is True:
+        raise RuntimeError(
+            f"BUG: DRY_RUN=0 parsed as True. "
+            f"parse_bool_any import/implementation is broken. "
+            f"env={os.getenv('DRY_RUN')} parsed={dry_run} type={type(dry_run).__name__}"
+        )
+    
+    logger.info(
+        "[LIVE_ENV_LOCK][DRY_RUN] env=%s parsed=%s (type=%s) intended_live=%s",
+        os.getenv("DRY_RUN"),
+        dry_run,
+        type(dry_run).__name__,
+        intended_live,
+    )
+    
+    return dry_run
 
 
 def resolve_auto_strategy_mode(mode_env: str) -> str:
@@ -960,28 +991,34 @@ def run_once(
     from trader.utils.env import env_bool
     force_run = env_bool("FORCE_RUN", default=False)
     watchlist_mode = env_bool("WATCHLIST_MODE", default=False)
-    dry_run = env_bool("DRY_RUN", default=True)
+    # ✅ dry_run은 intended_live 결정 후 LIVE_ENV_LOCK에서 단 한 번만 파싱
+    # dry_run = env_bool("DRY_RUN", default=True)  # ← 삭제 (중복 파싱 금지)
     live_trading = env_bool("LIVE_TRADING_ENABLED", default=False)
     
     if force_run or watchlist_mode:
         logger.info(
-            "[PB1][FORCE_RUN] FORCE_RUN=%s WATCHLIST_MODE=%s WATCHLIST=%s DRY_RUN=%s LIVE_TRADING=%s",
+            "[PB1][FORCE_RUN] FORCE_RUN=%s WATCHLIST_MODE=%s WATCHLIST=%s LIVE_TRADING=%s",
             force_run,
             watchlist_mode,
             os.getenv("WATCHLIST", "")[:100],
-            dry_run,
             live_trading,
         )
     
-    # [1] LIVE 강제 정책: STRATEGY_MODE=LIVE일 때 env 검증
-    if os.getenv("STRATEGY_MODE") == "LIVE":
+    # ✅ [1] intended_live 결정 (STRATEGY_MODE=LIVE 여부)
+    intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
+    
+    # ✅ [2] LIVE_ENV_LOCK 호출 → dry_run 파싱 (단 한 번만)
+    dry_run = _force_live_env_lock_if_needed(intended_live=intended_live)
+    
+    # ✅ [3] LIVE mode 검증 (dry_run은 이미 파싱 완료)
+    if intended_live:
         violations = []
         if os.getenv("LIVE_TRADING_ENABLED") != "1":
             violations.append("LIVE_TRADING_ENABLED != '1'")
         if os.getenv("DISABLE_LIVE_TRADING") == "1":
             violations.append("DISABLE_LIVE_TRADING == '1'")
-        if env_bool("DRY_RUN", default=True):
-            violations.append("DRY_RUN == '1'")
+        if dry_run:  # ✅ 이미 파싱된 값 사용 (env 재파싱 금지)
+            violations.append(f"DRY_RUN=True (env={os.getenv('DRY_RUN')})")
         if os.getenv("DB_ONLY") == "1":
             violations.append("DB_ONLY == '1'")
         if os.getenv("NONTRADING_SMOKE") == "1":
@@ -1233,51 +1270,23 @@ def run_once(
     force_diag = diag_env_flag
     diag_enabled = force_diag  # ✅ 호환성을 위해 추가
 
-    # ✅ SINGLE SOURCE OF TRUTH: resolve_trade_flags로 통일
-    from trader.config import resolve_trade_flags
+    # ✅ CRITICAL: intended_live와 dry_run은 run_once에서 이미 확정됨
+    # 여기서는 재계산하지 말고 env에서 그대로 읽기만 (이미 락됨)
     from trader.utils.env import env_bool
     
-    requested_dry_run_env = os.getenv("DRY_RUN")
-    requested_dry_run = None if requested_dry_run_env is None else env_bool("DRY_RUN", default=True)
-    
-    flags = resolve_trade_flags(
-        strategy_mode=os.getenv("STRATEGY_MODE", ""),
-        live_trading_enabled=env_bool("LIVE_TRADING_ENABLED", default=False),
-        disable_live_trading=env_bool("DISABLE_LIVE_TRADING", default=True),
-        kis_http_enabled=env_bool("KIS_HTTP_ENABLED", default=True),
-        requested_dry_run=requested_dry_run,
-    )
-    
-    dry_run = flags["dry_run"]
-    intended_live = flags["intended_live"]
-    dry_run_reasons = flags["reasons"]
-    dry_run_reason = ",".join(dry_run_reasons)
-    
-    # ✅ CRITICAL: Lock environment variables if intended_live=True
-    # This prevents any subsequent code from flipping DRY_RUN back to '1'
-    _force_live_env_lock_if_needed(intended_live)
-    
-    # ✅ Re-read dry_run after lock to ensure consistency
-    # (env_bool is safe even if env changed)
     dry_run = env_bool("DRY_RUN", default=True)
+    intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
     
     logger.info(
-        "[TRADE_FLAGS] intended_live=%s dry_run=%s reasons=%s",
+        "[TICK][INIT] intended_live=%s dry_run=%s (from locked env)",
         intended_live,
         dry_run,
-        dry_run_reasons,
     )
     
     # ✅ intended_live를 환경변수로 저장 (주문 함수에서 접근 가능하도록)
     os.environ["INTENDED_LIVE"] = "1" if intended_live else "0"
     
-    if smoke_enabled:
-        logger.info(
-            "[PB1][SMOKE] enabled=True simulated_now_kst=%s force_dry_run=True",
-            now.isoformat(),
-        )
-
-    # ✅ 호환성을 위해 기존 변수 재구성 (기존 코드가 사용)
+    
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
     mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
     disable_live_flag_value = os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True")
@@ -1307,12 +1316,14 @@ def run_once(
         if guard_failures:
             raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
 
-    def _apply_env_flags(dry: bool) -> None:
-        """
+    # ✅ _apply_env_flags는 intended_live=True일 때 스킵 (env 이미 락됨)
+    # DIAG 모드나 기타 경우에만 env 업데이트 허용
+    def _apply_env_flags_if_needed(dry: bool) -> None:
+        \"\"\"
         Apply environment flags ONLY if not already locked by intended_live.
         If intended_live=True, the env was locked by _force_live_env_lock_if_needed.
         DO NOT overwrite the lock.
-        """
+        \"\"\"
         if intended_live:
             # ✅ Already locked - do not touch
             logger.info("[ENV_FLAGS] Skip _apply_env_flags (intended_live=True, env locked)")
@@ -1323,8 +1334,6 @@ def run_once(
         os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag_value else "0"
         os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag_value else "0"
         os.environ["STRATEGY_MODE"] = effective_mode
-
-    _apply_env_flags(dry_run)
 
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_override_arg = resolved_phase
@@ -1354,13 +1363,11 @@ def run_once(
 
     if diag_enabled:
         dry_run = True
-        dry_run_reason = dry_run_reason if dry_run_reason else "diagnostic"
-        dry_run_reasons = dry_run_reasons or ["diagnostic"]
         if args.phase == "auto" and not force_phase_env:
             phase_override_arg = "verify"
             phase_reason = "diagnostic"
         window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
-        _apply_env_flags(dry_run)
+        _apply_env_flags_if_needed(dry_run)
 
     window_label = _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
@@ -1575,9 +1582,9 @@ def run_once(
         try:
             kis = KisAPI()
             if kis.env != kis_env:
-                dry_run_reasons.append("kis_env_mismatch")
+                logger.warning("[PB1][KIS_ENV_MISMATCH] kis.env=%s != kis_env=%s -> force dry_run", kis.env, kis_env)
                 dry_run = True
-                _apply_env_flags(dry_run)
+                _apply_env_flags_if_needed(dry_run)
         except Exception:
             logger.exception("[PB1] KIS init failed -> skip tick")
             return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
@@ -1774,13 +1781,18 @@ def run_once(
             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
             return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
 
-        # ✅ DRY_RUN verification log (critical for debugging)
+        # ✅ dry_run은 이미 LIVE_ENV_LOCK에서 파싱 완료 (재파싱 금지)
+        # 엔진에 전달할 값 최종 확인: bool 타입 강제
+        dry_run_for_engine = parse_bool_any(dry_run, default=True)
+        
         logger.info(
-            "[DRY_RUN][RESOLVED] env=%s parsed=%s (type=%s) intended_live=%s",
-            os.getenv('DRY_RUN'),
-            dry_run,
+            "[ENGINE][INIT] dry_run=%s (input_type=%s, parsed_type=%s) intended_live=%s phase=%s window=%s",
+            dry_run_for_engine,
             type(dry_run).__name__,
+            type(dry_run_for_engine).__name__,
             intended_live,
+            phase_override_arg,
+            window_label,
         )
 
         engine_runner = PB1Engine(
@@ -1793,7 +1805,7 @@ def run_once(
             window=window,
             window_label=window_label,
             phase=phase_override_arg,
-            dry_run=dry_run,
+            dry_run=dry_run_for_engine,  # ✅ bool 강제된 값 전달
             env=kis_env or "practice",
             run_id=run_record_id,
             intended_live=intended_live,  # ✅ 메인에서 확정한 LIVE 의도 전달

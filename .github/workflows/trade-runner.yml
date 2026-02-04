@@ -688,32 +688,12 @@ jobs:
               f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
               f.write(f"MARKET_WINDOW={window}\n")
               f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+              # ✅ KIS_HTTP_ENABLED만 시간창 기반으로 결정 (주문 API 호출 제어)
               f.write(f"KIS_HTTP_ENABLED={kis_http}\n")
-
-              # =========================================================
-              # ✅ (핵심) 장중에는 모의계좌라도 "실제 주문 전송" 허용값으로 강제 세팅
-              # ✅ CRITICAL: 아래 4개 값이 모두 설정되어야 dry_run=False가 보장됨
-              # =========================================================
-              if in_market:
-                  # 가드/엔진이 STRATEGY_MODE를 보는 경우도 있어서 같이 맞춤
-                  f.write("STRATEGY_MODE=LIVE\n")
-
-                  # LIVE env violations 방지 3종 세트 (반드시 이 값이어야 함)
-                  f.write("DRY_RUN=0\n")
-                  f.write("LIVE_TRADING_ENABLED=1\n")
-                  f.write("DISABLE_LIVE_TRADING=0\n")
-                  # ✅ NEW: KIS HTTP 활성화 (주문 API 호출 허용)
-                  f.write("KIS_HTTP_ENABLED=1\n")
-
-                  # 시뮬 모드 OFF (주문을 진짜로 모의서버에 전송)
-                  f.write("SIMULATION_MODE=0\n")
-              else:
-                  # 장외 안전장치
-                  f.write("STRATEGY_MODE=DIAG\n")
-                  f.write("DRY_RUN=1\n")
-                  f.write("LIVE_TRADING_ENABLED=0\n")
-                  f.write("DISABLE_LIVE_TRADING=1\n")
-                  f.write("SIMULATION_MODE=1\n")
+              
+              # ⚠️ IMPORTANT: LIVE 3종 세트(DRY_RUN, LIVE_TRADING_ENABLED, DISABLE_LIVE_TRADING)는
+              # FINAL ENV LOCK 스텝에서만 설정하고, 여기서는 절대 건드리지 않음!
+              # 두 곳에서 설정하면 실행 순서에 따라 값이 덮어씌워져서 의도와 다르게 동작할 수 있음.
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"live_ok={live_ok}\n")

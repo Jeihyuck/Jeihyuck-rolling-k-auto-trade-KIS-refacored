@@ -134,7 +134,7 @@ from trader.time_utils import now_kst, week_monday
 from trader.core_utils import _round_to_tick
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
-from trader.utils.env import env_bool
+from trader.utils.env import env_bool, parse_bool_any
 from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
@@ -510,13 +510,25 @@ class PB1Engine:
         self.window = window
         self.window_label = window_label
         self.phase = phase
-        self.dry_run = dry_run
+        
+        # ✅ CRITICAL: dry_run may come as bool/int/str. Never use bool("0")!
+        # parse_bool_any handles all cases: bool(True/False), int(0/1), str("0"/"1"/"yes"/"no"/etc)
+        self.dry_run = parse_bool_any(dry_run, default=True)
+        
         self.env = env
         self.run_id = run_id
         self.intended_live = intended_live
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
+        
+        # ✅ FATAL GUARD: Catch bool casting bugs immediately
+        if intended_live and self.dry_run:
+            raise RuntimeError(
+                f"FATAL: intended_live=True but pb1_engine received dry_run=True. "
+                f"DRY_RUN(env)={os.getenv('DRY_RUN')} dry_run(input)={dry_run} "
+                f"dry_run(parsed)={self.dry_run} type={type(dry_run).__name__}"
+            )
         
         # ✅ DRY_RUN verification log in engine (critical)
         logger.info(
@@ -526,12 +538,6 @@ class PB1Engine:
             self.intended_live,
             self.phase,
         )
-        self.window = window
-        self.window_label = window_label
-        self.phase = phase
-        self.dry_run = dry_run
-        self.env = env
-        self.run_id = run_id
         self.balance_api_calls = 0
         self.balance_cache_hits = 0
         self.balance_tick_cache_hits = 0
