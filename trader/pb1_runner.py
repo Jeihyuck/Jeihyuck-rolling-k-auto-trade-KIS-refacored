@@ -1515,7 +1515,7 @@ def run_once(
             return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
 
     logger.info(
-        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s reasons=%s",
+        "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s",
         event_name_lower or "unknown",
         now.isoformat(),
         trading_day,
@@ -1528,7 +1528,6 @@ def run_once(
         os.getenv("LIVE_TRADING_ENABLED"),
         os.getenv("STRATEGY_MODE"),
         os.getenv("PB1_ENTRY_ENABLED"),
-        dry_run_reasons or ["live"],
     )
 
     if non_trading_day:
@@ -1740,10 +1739,11 @@ def run_once(
             workflow_run_id=workflow_run_id,
             workflow_attempt=int(os.getenv("GITHUB_RUN_ATTEMPT", "0") or 0),
             config_json={
-                "dry_run_reasons": dry_run_reasons,
                 "run_window": window_label,
                 "phase": phase_override_arg,
                 "phase_reason": phase_reason,
+                "intended_live": intended_live,
+                "dry_run": dry_run,
             },
         )
         db_write_reasons.append("run_start")
