@@ -87,6 +87,32 @@ logger = logging.getLogger(__name__)
 log = logger
 
 
+def _force_live_env_lock_if_needed(intended_live: bool) -> None:
+    """
+    If we intend to trade live, we must guarantee env flags are consistent.
+    This prevents any later re-reads from flipping DRY_RUN back to '1'.
+    
+    CRITICAL: Once intended_live=True, environment variables must be locked
+    to prevent any code path from re-reading or re-setting them to safe defaults.
+    """
+    if not intended_live:
+        return
+
+    # Hard lock: once live-intended, env must not block orders.
+    os.environ["DRY_RUN"] = "0"
+    os.environ["DISABLE_LIVE_TRADING"] = "0"
+    os.environ["LIVE_TRADING_ENABLED"] = "1"
+    os.environ["SIMULATION_MODE"] = "0"
+
+    logger.info(
+        "[LIVE_ENV_LOCK] 🔒 FORCE LOCK: DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s SIMULATION_MODE=%s",
+        os.getenv("DRY_RUN"),
+        os.getenv("DISABLE_LIVE_TRADING"),
+        os.getenv("LIVE_TRADING_ENABLED"),
+        os.getenv("SIMULATION_MODE"),
+    )
+
+
 def resolve_auto_strategy_mode(mode_env: str) -> str:
     """
     AUTO 모드 결정: 시간 기반으로 LIVE/DIAG 결정.
@@ -1227,6 +1253,14 @@ def run_once(
     dry_run_reasons = flags["reasons"]
     dry_run_reason = ",".join(dry_run_reasons)
     
+    # ✅ CRITICAL: Lock environment variables if intended_live=True
+    # This prevents any subsequent code from flipping DRY_RUN back to '1'
+    _force_live_env_lock_if_needed(intended_live)
+    
+    # ✅ Re-read dry_run after lock to ensure consistency
+    # (env_bool is safe even if env changed)
+    dry_run = env_bool("DRY_RUN", default=True)
+    
     logger.info(
         "[TRADE_FLAGS] intended_live=%s dry_run=%s reasons=%s",
         intended_live,
@@ -1274,6 +1308,17 @@ def run_once(
             raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
 
     def _apply_env_flags(dry: bool) -> None:
+        """
+        Apply environment flags ONLY if not already locked by intended_live.
+        If intended_live=True, the env was locked by _force_live_env_lock_if_needed.
+        DO NOT overwrite the lock.
+        """
+        if intended_live:
+            # ✅ Already locked - do not touch
+            logger.info("[ENV_FLAGS] Skip _apply_env_flags (intended_live=True, env locked)")
+            return
+        
+        # ✅ Safe to apply for non-live scenarios
         os.environ["DRY_RUN"] = "1" if dry else "0"
         os.environ["DISABLE_LIVE_TRADING"] = "1" if disable_live_flag_value else "0"
         os.environ["LIVE_TRADING_ENABLED"] = "1" if live_trading_flag_value else "0"

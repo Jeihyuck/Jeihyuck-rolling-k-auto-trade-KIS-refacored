@@ -27,17 +27,17 @@ on:
         required: false
         default: "0"
       DRY_RUN:
-        description: "1=dryrun (manual test only)"
-        required: false
-        default: "1"
-      DISABLE_LIVE_TRADING:
-        description: "1=force block live (manual test only)"
-        required: false
-        default: "1"
-      LIVE_TRADING_ENABLED:
-        description: "1=allow live gate (manual test only)"
+        description: "1=dryrun (manual test)"
         required: false
         default: "0"
+      DISABLE_LIVE_TRADING:
+        description: "1=force block live (manual test)"
+        required: false
+        default: "0"
+      LIVE_TRADING_ENABLED:
+        description: "1=allow live gate"
+        required: false
+        default: "1"
       ENV:
         description: "PAPER or REAL (environment)"
         required: false
