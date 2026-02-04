@@ -49,12 +49,7 @@ on:
     # 월~금 08:55 KST = 23:55 UTC (일~목) : trade tick
     - cron: "55 23 * * 0-4"
 
-  push:
-    branches: ["nullim"]
-    paths:
-      - ".github/workflows/**"
-      - "repo/**"
-      - "trader/**"
+  # push 트리거 제거: 운영은 schedule 기본, 테스트는 workflow_dispatch로만
 
 defaults:
   run:
@@ -91,7 +86,7 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
+      KIS_ENV: "PAPER"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -220,7 +215,7 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
+      KIS_ENV: "PAPER"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -250,7 +245,7 @@ jobs:
       OHLCV_PREFETCH_VERBOSE: "0"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
+      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -355,7 +350,7 @@ jobs:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-      KIS_ENV: ${{ secrets.KIS_ENV }}
+      KIS_ENV: "PAPER"
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
@@ -377,7 +372,7 @@ jobs:
       CANDIDATE_POOL_TTL_DAYS: "7"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: ${{ secrets.KIS_ENV }}
+      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -606,7 +601,11 @@ jobs:
             echo "STRATEGY_MODE=LIVE" >> $GITHUB_ENV
             echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
 
-            echo "KIS_ENV=practice" >> $GITHUB_ENV
+            # ✅ DB 파티션/전략키는 PAPER/REAL로 통일
+            echo "KIS_ENV=PAPER" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
+            
+            # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
             echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
@@ -632,8 +631,11 @@ jobs:
             echo "DISABLE_LIVE_TRADING=${{ github.event.inputs.DISABLE_LIVE_TRADING || '1' }}" >> $GITHUB_ENV
             echo "LIVE_TRADING_ENABLED=${{ github.event.inputs.LIVE_TRADING_ENABLED || '0' }}" >> $GITHUB_ENV
 
-            # 수동에서도 PAPER로 돌리려면 원하면 여기 고정
-            echo "KIS_ENV=practice" >> $GITHUB_ENV
+            # ✅ DB 파티션/전략키는 PAPER/REAL로 통일
+            echo "KIS_ENV=PAPER" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PAPER" >> $GITHUB_ENV
+            
+            # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
             echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
