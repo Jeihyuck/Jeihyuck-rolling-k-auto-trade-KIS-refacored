@@ -464,12 +464,33 @@ jobs:
               print(f"[VERIFY][FAIL] no candidate pool in DB for {env}/{strategy_key}")
               sys.exit(1)
 
-          pool = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest) or []
-          print(f"[VERIFY] as_of={latest} size={len(pool)}")
+          # load_watchlist returns (members_list, used_as_of) tuple
+          result = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest)
+          
+          # Extract members list from return value
+          if isinstance(result, tuple) and len(result) == 2:
+              members, used_as_of = result
+          elif isinstance(result, dict):
+              members = result.get("members") or result.get("codes") or []
+              used_as_of = result.get("as_of")
+          elif hasattr(result, "members"):
+              members = result.members
+              used_as_of = getattr(result, "as_of", None)
+          else:
+              members = result or []
+              used_as_of = None
+          
+          # Debug output (optional, controlled by env var)
+          if os.getenv("DEBUG_VERIFY"):
+              print(f"[VERIFY][DEBUG] raw_result type={type(result)}")
+              if isinstance(result, tuple):
+                  print(f"[VERIFY][DEBUG] tuple length={len(result)}")
+          
+          print(f"[VERIFY] as_of={latest} size={len(members)}")
 
           min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
-          if len(pool) < min_size:
-              print(f"[VERIFY][FAIL] pool size {len(pool)} < min {min_size}")
+          if len(members) < min_size:
+              print(f"[VERIFY][FAIL] pool size {len(members)} < min {min_size}")
               sys.exit(1)
 
           print("[VERIFY][OK] candidate pool ready")
