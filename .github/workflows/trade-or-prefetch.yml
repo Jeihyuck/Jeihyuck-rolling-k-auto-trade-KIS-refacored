@@ -65,6 +65,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate required secrets
+        if: steps.mode.outputs.run_mode != 'skip'
+        shell: bash
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+        run: |
+          set -euo pipefail
+          miss=0
+          for k in API_BASE_URL APP_KEY APP_SECRET PBCORE_DB_URL; do
+            v="${!k:-}"
+            if [ -z "$v" ]; then
+              echo "::error::$k is EMPTY (check repo secrets name)"
+              miss=1
+            else
+              echo "$k=OK"
+            fi
+          done
+          if [ "$miss" -ne 0 ]; then
+            exit 2
+          fi
+
       - name: Decide run mode (trade vs prefetch)
         id: mode
         shell: bash
@@ -145,8 +169,35 @@ jobs:
           OHLCV_PREFETCH_ONLY: "1"
         run: |
           set -euo pipefail
-          echo "[TRADE_TICK] Starting trade tick (장중 매매)..."
-          python -m trader.trade_tick
+          echo "[TRADE_TICK] Starting..."
+          
+          # Try known entrypoints in order (do not assume trade_tick exists)
+          if python -c "import trader.trade_tick" >/dev/null 2>&1; then
+            echo "[TRADE_TICK] Using trader.trade_tick"
+            python -m trader.trade_tick
+          
+          elif python -c "import trader.pb1_runner" >/dev/null 2>&1; then
+            echo "[TRADE_TICK] Using trader.pb1_runner"
+            python -m trader.pb1_runner
+          
+          elif python -c "import trader.trade_runner" >/dev/null 2>&1; then
+            echo "[TRADE_TICK] Using trader.trade_runner"
+            python -m trader.trade_runner
+          
+          elif python -c "import trader.pb1_engine" >/dev/null 2>&1; then
+            echo "[TRADE_TICK] Using trader.pb1_engine"
+            python -m trader.pb1_engine
+          
+          else
+            echo "::error::No known trade entrypoint found under package 'trader'."
+            echo "[DEBUG] Listing trader modules:"
+            python - <<'PY'
+import pkgutil, trader
+mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)])
+print("\n".join(mods))
+PY
+            exit 2
+          fi
 
       - name: Run candidate-pool OHLCV prefetch
         if: steps.mode.outputs.run_mode == 'prefetch'
@@ -179,6 +230,13 @@ jobs:
           PREFETCH_TIMEOUT_SEC: "8"
         run: |
           set -euo pipefail
+          
+          # Validate module exists
+          python -c "import trader.ohlcv_prefetch" >/dev/null 2>&1 || {
+            echo "::error::trader.ohlcv_prefetch module not found. Did you add trader/ohlcv_prefetch.py?"
+            exit 2
+          }
+          
           echo "[PREFETCH] as_of=${{ steps.kst.outputs.as_of }}"
           python -m trader.ohlcv_prefetch \
             --env "${STRATEGY_ENV}" \
@@ -192,6 +250,9 @@ jobs:
         with:
           name: runtime-reports-${{ steps.kst.outputs.as_of || 'na' }}
           path: |
-            ${{ github.workspace }}/repo/runtime/reports/
-            ${{ github.workspace }}/repo/runtime/logs/
+            /home/runner/work/_temp/trader_runtime/runtime/reports/
+            /home/runner/work/_temp/trader_runtime/runtime/logs/
+            /home/runner/work/_temp/trader_runtime/runtime/diagnostics/
+            /home/runner/work/_temp/trader_runtime/runtime/reports/**/*
+            /home/runner/work/_temp/trader_runtime/runtime/logs/**/*
           if-no-files-found: ignore
