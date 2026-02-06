@@ -191,11 +191,7 @@ jobs:
           else
             echo "::error::No known trade entrypoint found under package 'trader'."
             echo "[DEBUG] Listing trader modules:"
-            python - <<'PY'
-import pkgutil, trader
-mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)])
-print("\n".join(mods))
-PY
+            python -c "import pkgutil, trader; mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)]); print('\n'.join(mods))"
             exit 2
           fi
 
