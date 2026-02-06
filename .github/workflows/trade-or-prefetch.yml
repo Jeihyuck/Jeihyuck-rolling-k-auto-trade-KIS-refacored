@@ -1,5 +1,14 @@
 name: "Unified Trading Pipeline (Universe + Candidate + Prefetch + Trade)"
 
+# ✅ 실행 방법 (Execution Guide)
+# 1. 토요일 자동: Universe+Prefetch(520일)+Candidate 저장
+#    - Schedule: Sat 00:30 KST (Fri 15:30 UTC)
+# 2. 수동 prep 실행:
+#    - MODE=prep, PREFETCH_DAYS=520, FORCE_CANDIDATE=1(옵션)
+# 3. 수동 미너비니 테스트 (주문 차단 + LIVE 경로):
+#    - MODE=minervini_test
+#    - 기대: NO_TRADE=1 로그, 주문 전송은 blocked
+
 permissions:
   contents: write
 
@@ -15,9 +24,13 @@ on:
   workflow_dispatch:
     inputs:
       MODE:
-        description: "candidate | trade | both"
+        description: "prep | trade | minervini_test | both"
         required: false
         default: "trade"
+      PREFETCH_DAYS:
+        description: "OHLCV prefetch days (e.g., 520)"
+        required: false
+        default: "520"
       FORCE_CANDIDATE:
         description: "1=regen candidate"
         required: false
@@ -39,9 +52,9 @@ on:
         required: false
         default: "1"
       ENV:
-        description: "PAPER or REAL (environment)"
+        description: "practice or real (internal standard). DO NOT use PAPER/REAL strings here."
         required: false
-        default: "PAPER"
+        default: "practice"
 
   schedule:
     # Weekend candidate pool build: Sat 00:30 KST = Fri 15:30 UTC
@@ -205,10 +218,9 @@ jobs:
     # ✅ universe_build 완료 후 실행
     needs: [universe_build]
 
-    # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
+    # 실행 조건: MODE=prep/both만 실행 (trade는 스킵)
     if: >
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
       (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
@@ -230,7 +242,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+      STRATEGY_ENV: "PRACTICE"
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -240,7 +252,7 @@ jobs:
       CANDIDATE_POOL_SIZE: "120"
       CANDIDATE_POOL_MIN_SIZE: "40"
       CANDIDATE_POOL_TTL_DAYS: "7"
-      CANDIDATE_POOL_PREFETCH_DAYS: "180"
+      CANDIDATE_POOL_PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.PREFETCH_DAYS || '520' }}
       CANDIDATE_POOL_PREFETCH_CHUNK: "25"
       
       # 병렬화/timeout/retry 설정
@@ -250,7 +262,7 @@ jobs:
       OHLCV_PREFETCH_VERBOSE: "0"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
+      CANDIDATE_POOL_UNIVERSE_ENV: "PRACTICE"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -340,10 +352,9 @@ jobs:
     # ✅ prefetch 완료 후 실행
     needs: [candidate_pool_prefetch]
 
-    # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
+    # 실행 조건: MODE=prep/both만 실행 (trade는 스킵)
     if: >
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
       (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
@@ -365,7 +376,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+      STRATEGY_ENV: "PRACTICE"
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -377,7 +388,7 @@ jobs:
       CANDIDATE_POOL_TTL_DAYS: "7"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
+      CANDIDATE_POOL_UNIVERSE_ENV: "PRACTICE"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -483,11 +494,11 @@ jobs:
 
     # ✅ needs 제거: MODE=trade일 때 즉시 실행 (DB의 기존 candidate pool 사용)
 
-    # ✅ trade-tick 실행 조건: MODE=trade/both, pre-market schedule, or intraday schedule
+    # ✅ trade-tick 실행 조건: MODE=trade/minervini_test/both, pre-market schedule, or intraday schedule
     if: >
       (github.event_name == 'schedule' && (github.event.schedule == '55 23 * * 0-4' || github.event.schedule == '*/15 0-6 * * 1-5')) ||
       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both'))
+        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'minervini_test' || github.event.inputs.MODE == 'both'))
 
     env:
       TZ: Asia/Seoul
@@ -639,6 +650,7 @@ jobs:
             echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
             # 🔥 LIVE 인터락 통과 3종 세트(이게 핵심)
+            echo "NO_TRADE=0" >> $GITHUB_ENV
             echo "DRY_RUN=0" >> $GITHUB_ENV
             echo "DISABLE_LIVE_TRADING=0" >> $GITHUB_ENV
             echo "LIVE_TRADING_ENABLED=1" >> $GITHUB_ENV
@@ -654,24 +666,40 @@ jobs:
             echo "FORCE_CANDIDATE=${{ github.event.inputs.FORCE_CANDIDATE || '0' }}" >> $GITHUB_ENV
             echo "MINERVINI_ONLY=${{ github.event.inputs.MINERVINI_ONLY || '0' }}" >> $GITHUB_ENV
 
-            # 수동 테스트는 기본적으로 막아두고(기본값 1/1/0),
-            # 필요 시 사용자가 풀어서 실행
-            echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || '1' }}" >> $GITHUB_ENV
-            echo "DISABLE_LIVE_TRADING=${{ github.event.inputs.DISABLE_LIVE_TRADING || '1' }}" >> $GITHUB_ENV
-            echo "LIVE_TRADING_ENABLED=${{ github.event.inputs.LIVE_TRADING_ENABLED || '0' }}" >> $GITHUB_ENV
-
             # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
             echo "KIS_ENV=practice" >> $GITHUB_ENV
             echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
-            echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
-            # 수동은 DIAG로도 돌리고 싶으면 여기에서 STRATEGY_MODE 선택 가능
-            # 지금은 안전하게 DIAG 기본:
-            echo "STRATEGY_MODE=DIAG" >> $GITHUB_ENV
-            echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
+            # MODE별 분기 처리
+            if [[ "${{ github.event.inputs.MODE }}" == "minervini_test" ]]; then
+              # 🔥 minervini_test: LIVE 동일 경로 + 주문만 차단
+              echo "STRATEGY_MODE=LIVE" >> $GITHUB_ENV
+              echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
+
+              echo "NO_TRADE=1" >> $GITHUB_ENV
+              echo "DRY_RUN=0" >> $GITHUB_ENV
+              echo "DISABLE_LIVE_TRADING=0" >> $GITHUB_ENV
+              echo "LIVE_TRADING_ENABLED=1" >> $GITHUB_ENV
+              echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
+
+            else
+              # 기존 수동 안전모드(기본 DIAG) 유지
+              # 수동 테스트는 기본적으로 막아두고(기본값 1/1/0),
+              # 필요 시 사용자가 풀어서 실행
+              echo "NO_TRADE=0" >> $GITHUB_ENV
+              echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || '1' }}" >> $GITHUB_ENV
+              echo "DISABLE_LIVE_TRADING=${{ github.event.inputs.DISABLE_LIVE_TRADING || '1' }}" >> $GITHUB_ENV
+              echo "LIVE_TRADING_ENABLED=${{ github.event.inputs.LIVE_TRADING_ENABLED || '0' }}" >> $GITHUB_ENV
+              echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
+
+              # 수동은 DIAG로도 돌리고 싶으면 여기에서 STRATEGY_MODE 선택 가능
+              # 지금은 안전하게 DIAG 기본:
+              echo "STRATEGY_MODE=DIAG" >> $GITHUB_ENV
+              echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
+            fi
           fi
 
           echo "[FINAL-LOCK] will apply env in next steps."
@@ -680,7 +708,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "[ENV] STRATEGY_MODE=$STRATEGY_MODE MODE=${MODE:-} KIS_ENV=${KIS_ENV:-}"
-          echo "[ENV] DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
+          echo "[ENV] NO_TRADE=${NO_TRADE:-0} DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           echo "[ENV] API_BASE_URL=${API_BASE_URL:-} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-}"
 
       - name: Resolve market-aware runtime mode
@@ -696,19 +724,23 @@ jobs:
           window = calc_market_window_kst(now)
           in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
 
-          mode = "LIVE" if in_market else "DIAG"
+          mode_input = os.getenv("MODE", "")
+          force_live_http = (mode_input == "minervini_test")
+
+          mode = "LIVE" if (in_market or force_live_http) else "DIAG"
           pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
 
           # DIAG에서도 매수/필터 검증하려고 entry로 고정
           if mode == "DIAG":
               pb1_phase = "entry"
 
-          live_ok = "true" if in_market else "false"
-          kis_http = "1" if in_market else "0"
+          kis_http = "1" if (in_market or force_live_http) else "0"
+          live_ok = "true" if (in_market or force_live_http) else "false"
 
           print(
               f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
-              f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} "
+              f"in_market={in_market} mode_input={mode_input} force_live_http={force_live_http} "
+              f"-> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} "
               f"KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}"
           )
 
@@ -746,6 +778,7 @@ jobs:
         if: steps.market_mode.outputs.live_ok == 'true'
         run: |
           set -euo pipefail
+          echo "[PRECHECK] NO_TRADE=${NO_TRADE:-0}"
           violations=()
           [ "${DB_ONLY:-}" = "1" ] && violations+=("DB_ONLY=1")
           [ "${NONTRADING_SMOKE:-}" = "1" ] && violations+=("NONTRADING_SMOKE=1")
@@ -779,11 +812,11 @@ jobs:
       - name: DB universe precheck
         run: |
           set -euo pipefail
-          if [ "${{ env.EFFECTIVE_STRATEGY_MODE }}" = "DIAG" ]; then
+          if [ "${EFFECTIVE_STRATEGY_MODE}" = "DIAG" ]; then
             echo "[UNIVERSE][PRECHECK] DIAG mode -> do not fail hard if missing"
-            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${{ env.EFFECTIVE_STRATEGY_MODE }}" || true
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}" || true
           else
-            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${{ env.EFFECTIVE_STRATEGY_MODE }}"
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${EFFECTIVE_STRATEGY_MODE}"
           fi
 
       - name: Candidate pool DB precheck (Weekend-built pool required)
@@ -815,6 +848,7 @@ jobs:
           echo "Mode: ${STRATEGY_MODE:-AUTO}"
           echo "PB1_PHASE_DEFAULT: ${PB1_PHASE_DEFAULT:-entry}"
           echo "KIS_HTTP_ENABLED: ${KIS_HTTP_ENABLED:-AUTO}"
+          echo "[RUN] MODE=${MODE:-} NO_TRADE=${NO_TRADE:-0} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-} STRATEGY_MODE=${STRATEGY_MODE:-}"
           echo "======================================"
           
           # Try known entrypoints in order (do not assume trade_tick exists)

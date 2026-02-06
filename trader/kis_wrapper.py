@@ -2965,6 +2965,17 @@ class KisAPI:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         _assert_orders_allowed("order_cash")
 
+        # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
+        import os
+        if os.getenv("NO_TRADE", "0") == "1":
+            logger.warning(
+                "[NO_TRADE] blocked order submit (test mode) - intent only. code=%s side=%s qty=%s",
+                body.get("PDNO"),
+                "SELL" if is_sell else "BUY",
+                body.get("ORD_QTY")
+            )
+            return {"blocked": True, "reason": "NO_TRADE", "rt_cd": "1", "msg_cd": "NO_TRADE", "msg1": "NO_TRADE mode - order blocked for testing"}
+
         # TR 후보 순차 시도
         tr_list = _pick_tr(self.env, "ORDER_SELL" if is_sell else "ORDER_BUY")
 
@@ -3217,6 +3228,16 @@ class KisAPI:
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         _assert_orders_allowed("buy_stock_limit")
+        
+        # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
+        import os
+        if os.getenv("NO_TRADE", "0") == "1":
+            logger.warning(
+                "[NO_TRADE] blocked order submit (test mode) - intent only. code=%s side=BUY qty=%s price=%s",
+                pdno, qty, price
+            )
+            return {"blocked": True, "reason": "NO_TRADE", "rt_cd": "1", "msg_cd": "NO_TRADE", "msg1": "NO_TRADE mode - order blocked for testing"}
+        
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:
@@ -3272,6 +3293,16 @@ class KisAPI:
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         _assert_orders_allowed("sell_stock_limit")
+        
+        # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
+        import os
+        if os.getenv("NO_TRADE", "0") == "1":
+            logger.warning(
+                "[NO_TRADE] blocked order submit (test mode) - intent only. code=%s side=SELL qty=%s price=%s",
+                pdno, qty, price
+            )
+            return {"blocked": True, "reason": "NO_TRADE", "rt_cd": "1", "msg_cd": "NO_TRADE", "msg1": "NO_TRADE mode - order blocked for testing"}
+        
         now = now_kst()
         block_reason = _order_block_reason(now)
         if block_reason:

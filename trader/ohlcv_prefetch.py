@@ -323,7 +323,7 @@ def run_prefetch_cli(
         bars: 필요한 OHLCV bar 개수 (권장 520, 최소 420)
         strategy_key: candidate pool 전략 키 (예: pb1_candidate_pool)
     """
-    from trader.db.connection import get_engine
+    from trader.db.engine import get_engine
     from trader.runtime_paths import runtime_path
     
     logging.basicConfig(
