@@ -1,50 +1,99 @@
-name: trade-or-prefetch
+name: "Unified Trading Pipeline (Universe + Candidate + Prefetch + Trade)"
 
 permissions:
   contents: write
 
-on:
-  schedule:
-    # Trade window: Weekdays, every 15 min in UTC 00-06 (KST 09-15)
-    - cron: "*/15 0-6 * * 1-5"
-    # Prefetch: Weekdays 17:00 KST == 08:00 UTC
-    - cron: "0 8 * * 1-5"
-  workflow_dispatch:
-    inputs:
-      RUN:
-        description: "trade | prefetch (manual override)"
-        required: true
-        default: "trade"
-      ENV:
-        description: "PRACTICE | LIVE"
-        required: true
-        default: "PRACTICE"
-      BARS:
-        description: "prefetch bars (recommend 520; min 420)"
-        required: false
-        default: "520"
-      STRATEGY_KEY:
-        description: "candidate pool strategy key"
-        required: false
-        default: "pb1_candidate_pool"
-      AS_OF:
-        description: "YYYY-MM-DD (empty => today KST)"
-        required: false
-        default: ""
-
 concurrency:
-  group: trade-or-prefetch-${{ github.ref }}
+  group: unified-pipeline
   cancel-in-progress: false
 
 env:
+  NO_TRADE: "0"
   DB_DISABLE_PREPARED_STATEMENTS: "1"
-  TZ: Asia/Seoul
-  PYTHONUNBUFFERED: "1"
+
+on:
+  workflow_dispatch:
+    inputs:
+      MODE:
+        description: "candidate | trade | both"
+        required: false
+        default: "trade"
+      FORCE_CANDIDATE:
+        description: "1=regen candidate"
+        required: false
+        default: "0"
+      MINERVINI_ONLY:
+        description: "1=analysis only"
+        required: false
+        default: "0"
+      DRY_RUN:
+        description: "1=dryrun (manual test)"
+        required: false
+        default: "0"
+      DISABLE_LIVE_TRADING:
+        description: "1=force block live (manual test)"
+        required: false
+        default: "0"
+      LIVE_TRADING_ENABLED:
+        description: "1=allow live gate"
+        required: false
+        default: "1"
+      ENV:
+        description: "PAPER or REAL (environment)"
+        required: false
+        default: "PAPER"
+
+  schedule:
+    # Weekend candidate pool build: Sat 00:30 KST = Fri 15:30 UTC
+    - cron: "30 15 * * 5"
+    # Daily trade tick (pre-market): Mon-Fri 08:55 KST = Sun-Thu 23:55 UTC
+    - cron: "55 23 * * 0-4"
+    # Intraday trading: Mon-Fri 09:00-15:00 KST = 00:00-06:00 UTC, every 15 min
+    - cron: "*/15 0-6 * * 1-5"
+    # Daily OHLCV prefetch: Mon-Fri 17:00 KST = 08:00 UTC
+    - cron: "0 8 * * 1-5"
+
+  # push 트리거 제거: 운영은 schedule 기본, 테스트는 workflow_dispatch로만
+
+defaults:
+  run:
+    shell: bash
+    working-directory: repo
 
 jobs:
-  run:
+  universe_build:
+    name: Universe Build (FDR → Postgres)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+
+    # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      # ✅ Postgres ONLY (sqlite 완전 제거)
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      # Universe 환경 설정
+      STRATEGY_ENV: "PAPER"
+      
+      # KIS API (FDR는 필요 없지만 환경 통일을 위해 유지)
+      # ✅ Internal standard: practice (not PAPER)
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: "practice"
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
 
     steps:
       - name: Checkout
@@ -57,21 +106,501 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
 
-      - name: Install dependencies
-        working-directory: repo
+      - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Detect FDR universe builder entrypoint
+        run: |
+          set -euo pipefail
+          echo "[DEBUG] FDR universe builder: trader.universe.build"
+          echo "[DEBUG] Entry: python -m trader.universe.build"
+
+      - name: Universe build (FDR → Postgres)
+        run: |
+          set -euo pipefail
+          
+          UENV="${KIS_ENV}"
+          USTRAT="best_k_meta"
+          
+          echo "======================================"
+          echo "Universe Build (FDR → Postgres)"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${UENV}"
+          echo "Strategy: ${USTRAT}"
+          echo "DB: PBCORE_DB_URL (Postgres)"
+          echo "======================================"
+          
+          # FDR universe build 실행
+          python -m trader.universe.build \
+            --env "${UENV}" \
+            --strategy "${USTRAT}" \
+            --provider "fdr_kospi100_kosdaq100"
+
+      - name: Verify universe saved
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import UniverseRepo
+
+          uenv = os.getenv("KIS_ENV")
+          ustrat = "best_k_meta"
+
+          engine = get_engine()
+          repo = UniverseRepo(engine)
+          members = repo.get_current_universe_members(env=uenv, strategy=ustrat) or []
+          
+          print(f"[UNIVERSE][VERIFY] env={uenv} strategy={ustrat} members={len(members)}")
+          
+          if len(members) == 0:
+              print("[UNIVERSE][FAIL] no members found after build")
+              sys.exit(1)
+          
+          if len(members) < 50:
+              print(f"[UNIVERSE][WARN] only {len(members)} members (expected ~200)")
+          
+          print("[UNIVERSE][OK] universe ready")
+          PY
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
+  candidate_pool_prefetch:
+    name: Candidate Pool OHLCV Prefetch
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    # ✅ universe_build 완료 후 실행
+    needs: [universe_build]
+
+    # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: "practice"
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      # 후보군은 무조건 DIAG로 (매매 금지)
+      STRATEGY_MODE: "DIAG"
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+
+      # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
+      KIS_HTTP_ENABLED: "0"
+
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_CANDIDATE || '0' }}
+      CANDIDATE_POOL_SIZE: "120"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_PREFETCH_DAYS: "180"
+      CANDIDATE_POOL_PREFETCH_CHUNK: "25"
+      
+      # 병렬화/timeout/retry 설정
+      OHLCV_PREFETCH_WORKERS: "6"
+      OHLCV_FETCH_TIMEOUT_SEC: "25"
+      OHLCV_FETCH_RETRIES: "1"
+      OHLCV_PREFETCH_VERBOSE: "0"
+
+      # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
+      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
+
+      # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Heartbeat (keep logs alive)
+        run: |
+          set -euo pipefail
+          ( while true; do echo "[HEARTBEAT] $(date '+%F %T %Z') still running..."; sleep 60; done ) &
+          echo "HEARTBEAT_PID=$!" >> $GITHUB_ENV
+
+      - name: OHLCV Prefetch
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "OHLCV Prefetch (Incremental + Parallel)"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Force rebuild: ${CANDIDATE_POOL_FORCE_REBUILD}"
+          echo "Workers: ${OHLCV_PREFETCH_WORKERS}"
+          echo "Timeout: ${OHLCV_FETCH_TIMEOUT_SEC}s"
+          echo "Retries: ${OHLCV_FETCH_RETRIES}"
+          echo "======================================"
+          python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
+
+      - name: Stop Heartbeat
+        if: always()
+        run: |
+          set +e
+          if [ -n "${HEARTBEAT_PID:-}" ]; then kill "${HEARTBEAT_PID}" || true; fi
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
+  candidate_pool:
+    name: Candidate Pool Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    # ✅ prefetch 완료 후 실행
+    needs: [candidate_pool_prefetch]
+
+    # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_ENV: "practice"
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      # 후보군은 무조건 DIAG로 (매매 금지)
+      STRATEGY_MODE: "DIAG"
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+
+      # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
+      KIS_HTTP_ENABLED: "0"
+
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_CANDIDATE || '0' }}
+      CANDIDATE_POOL_SIZE: "120"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+
+      # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
+      CANDIDATE_POOL_UNIVERSE_ENV: "PAPER"
+
+      # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Candidate pool build (build-only)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Candidate Pool Build (build-only mode)"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Pool size target: ${CANDIDATE_POOL_SIZE}"
+          echo "Pool min size: ${CANDIDATE_POOL_MIN_SIZE}"
+          echo "TTL(days): ${CANDIDATE_POOL_TTL_DAYS}"
+          echo "======================================"
+          python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
+
+      - name: Verify pool saved
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from trader.db.engine import get_engine
+          from trader.db.repos import WatchlistRepo
+
+          env = os.getenv("STRATEGY_ENV", "PAPER")
+          strategy_key = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+
+          engine = get_engine()
+          repo = WatchlistRepo(engine)
+
+          latest = repo.get_latest_watchlist_date(env=env, strategy=strategy_key)
+          if not latest:
+              print(f"[VERIFY][FAIL] no candidate pool in DB for {env}/{strategy_key}")
+              sys.exit(1)
+
+          pool = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest) or []
+          print(f"[VERIFY] as_of={latest} size={len(pool)}")
+
+          min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+          if len(pool) < min_size:
+              print(f"[VERIFY][FAIL] pool size {len(pool)} < min {min_size}")
+              sys.exit(1)
+
+          print("[VERIFY][OK] candidate pool ready")
+          PY
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
+  trade_tick:
+    name: Trade Tick (daily)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # ✅ needs 제거: MODE=trade일 때 즉시 실행 (DB의 기존 candidate pool 사용)
+
+    # ✅ trade-tick 실행 조건: MODE=trade/both, pre-market schedule, or intraday schedule
+    if: >
+      (github.event_name == 'schedule' && (github.event.schedule == '55 23 * * 0-4' || github.event.schedule == '*/15 0-6 * * 1-5')) ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both'))
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ACCESS_TOKEN: ${{ secrets.KIS_ACCESS_TOKEN }}
+      KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
+
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      # ✅ KIS_ENV/STRATEGY_ENV 동기화 (중복 정의 제거, mismatch 방지)
+      # Note: ENV input should be 'practice' or 'real' per internal standard
+      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'practice' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+
+      # ✅ MINERVINI_ONLY 모드 (미너비니 계산만, KIS HTTP/주문 금지)
+      MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY || '0' }}
+      # ✅ MINERVINI_ONLY=1이면 KIS_HTTP_ENABLED 강제로 0 (실수 방지)
+      KIS_HTTP_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY == '1' && '0' || '1' }}
+
+      # ✅ 후보군: DB 로드 전용 (재빌드 절대 금지)
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
+
+      DB_ONLY: "0"
+      NONTRADING_SMOKE: "0"
+
+      # ✅ LIVE 허용 플래그는 AUTO 스텝에서 시장 상태에 따라 동적 설정됨
+      # job-level에서는 고정값을 설정하지 않음 (AUTO가 덮어씀)
+
+      PB1_RUN_LOOP_MINUTES: "15"
+      PB1_MAX_MINUTES: "15"
+      PB1_MAX_SECONDS: "900"
+      PB1_PRICE_PROBE: "1"
+
+      # ✅ E-2: Universe/Candidate rebuild 금지
+      UNIVERSE_FORCE_REBUILD: "0"
+      UNIVERSE_SOURCE: "DB_ONLY"
+      BOTSTATE_DISABLED: "1"
+      SQLITE_DISABLED: "1"
+
+      # ✅ Watchlist 설정 (재빌드 금지, 120→50→30 후보 축소)
+      PB1_WATCHLIST_ENABLED: "1"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FINALN: "30"
+      PB1_WATCHLIST_MIN_PRICE: "2000"
+      PB1_WATCHLIST_LIQ_DAYS: "20"
+      PB1_WATCHLIST_MIN_ROWS: "30"
+      PB1_WATCHLIST_STRICT: "0"
+      PB1_MIN_CANDIDATES: "1"
+      PB1_TARGET_NEW_POSITIONS: "2"
+
+      # ✅ Early stop 절대 금지 (전체 스캔 강제)
+      PB1_EARLY_STOP_ENABLED: "0"
+
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "nullim"
+          path: repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Init runtime dir (logs only)
+        run: |
+          set -euo pipefail
+          echo "TRADER_RUNTIME_DIR=${RUNNER_TEMP}/trader_runtime" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/trader_runtime/runtime/diagnostics"
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
 
       - name: Validate required secrets
-        if: steps.mode.outputs.run_mode != 'skip'
         shell: bash
         env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          APP_KEY: ${{ secrets.APP_KEY }}
-          APP_SECRET: ${{ secrets.APP_SECRET }}
+          API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+          APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
         run: |
           set -euo pipefail
@@ -89,87 +618,204 @@ jobs:
             exit 2
           fi
 
-      - name: Decide run mode (trade vs prefetch)
-        id: mode
+      - name: FINAL ENV LOCK (schedule=weekday live paper, manual=inputs)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Manual override
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run_mode=${{ inputs.RUN }}" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          echo "[FINAL-LOCK] event=${GITHUB_EVENT_NAME}"
 
-          # Schedule mode: decide by UTC time
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            # ✅ 스케줄: 무조건 "주중 모의 LIVE"로 고정
+            echo "STRATEGY_MODE=LIVE" >> $GITHUB_ENV
+            echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
 
-          # Prefetch: exactly 08:00 UTC
-          if [ "$HOUR" = "08" ] && [ "$MIN" = "00" ]; then
-            echo "run_mode=prefetch" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+            # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
+            echo "KIS_ENV=practice" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
+            
+            # ✅ 접속 서버는 URL로 vts(모의) 고정
+            echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
+            echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
-          # Trade: UTC 00-06
-          if [ "$HOUR" -ge "00" ] && [ "$HOUR" -le "06" ]; then
-            echo "run_mode=trade" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+            # 🔥 LIVE 인터락 통과 3종 세트(이게 핵심)
+            echo "DRY_RUN=0" >> $GITHUB_ENV
+            echo "DISABLE_LIVE_TRADING=0" >> $GITHUB_ENV
+            echo "LIVE_TRADING_ENABLED=1" >> $GITHUB_ENV
 
-          echo "run_mode=skip" >> $GITHUB_OUTPUT
+            # 스케줄 기본 운용값(원하면 고정)
+            echo "MODE=trade" >> $GITHUB_ENV
+            echo "FORCE_CANDIDATE=0" >> $GITHUB_ENV
+            echo "MINERVINI_ONLY=0" >> $GITHUB_ENV
 
-      - name: Resolve AS_OF (KST today if empty)
-        id: kst
-        if: steps.mode.outputs.run_mode != 'skip'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.AS_OF }}" ]; then
-            echo "as_of=${{ inputs.AS_OF }}" >> $GITHUB_OUTPUT
           else
-            echo "as_of=$(TZ=Asia/Seoul date +%F)" >> $GITHUB_OUTPUT
+            # ✅ 수동: 입력값 반영 (주말/장닫힘 테스트용)
+            echo "MODE=${{ github.event.inputs.MODE || 'trade' }}" >> $GITHUB_ENV
+            echo "FORCE_CANDIDATE=${{ github.event.inputs.FORCE_CANDIDATE || '0' }}" >> $GITHUB_ENV
+            echo "MINERVINI_ONLY=${{ github.event.inputs.MINERVINI_ONLY || '0' }}" >> $GITHUB_ENV
+
+            # 수동 테스트는 기본적으로 막아두고(기본값 1/1/0),
+            # 필요 시 사용자가 풀어서 실행
+            echo "DRY_RUN=${{ github.event.inputs.DRY_RUN || '1' }}" >> $GITHUB_ENV
+            echo "DISABLE_LIVE_TRADING=${{ github.event.inputs.DISABLE_LIVE_TRADING || '1' }}" >> $GITHUB_ENV
+            echo "LIVE_TRADING_ENABLED=${{ github.event.inputs.LIVE_TRADING_ENABLED || '0' }}" >> $GITHUB_ENV
+
+            # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
+            echo "KIS_ENV=practice" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
+            
+            # ✅ 접속 서버는 URL로 vts(모의) 고정
+            echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
+            echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
+
+            # 수동은 DIAG로도 돌리고 싶으면 여기에서 STRATEGY_MODE 선택 가능
+            # 지금은 안전하게 DIAG 기본:
+            echo "STRATEGY_MODE=DIAG" >> $GITHUB_ENV
+            echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
           fi
 
-      - name: Run trade tick
-        if: steps.mode.outputs.run_mode == 'trade'
-        working-directory: repo
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
-          
-          # Strategy environment
-          STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.ENV || 'PRACTICE' }}
-          
-          # KIS API
-          KIS_ENV: practice
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          APP_KEY: ${{ secrets.APP_KEY }}
-          APP_SECRET: ${{ secrets.APP_SECRET }}
-          CANO: ${{ secrets.CANO }}
-          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-          
-          # Database
-          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          SQLITE_DISABLED: "1"
-          BOTSTATE_DISABLED: "1"
+          echo "[FINAL-LOCK] will apply env in next steps."
 
-          # Trading mode
-          LIVE_TRADING_ENABLED: "1"
-          DISABLE_LIVE_TRADING: "0"
-          DRY_RUN: "0"
-          KIS_HTTP_ENABLED: "1"
-
-          # PB1 knobs
-          PB1_ATR_MAX_PCT: "10"
-          PB1_WATCHLIST_TOPK: "50"
-          PB1_WATCHLIST_FINALN: "30"
-          PB1_EARLY_STOP_ENABLED: "0"
-
-          # CRITICAL: 반드시 장중 외부호출 차단
-          OHLCV_PREFETCH_ONLY: "1"
+      - name: ENV SNAPSHOT (must pass live gate on schedule)
         run: |
           set -euo pipefail
-          echo "[TRADE_TICK] Starting..."
+          echo "[ENV] STRATEGY_MODE=$STRATEGY_MODE MODE=${MODE:-} KIS_ENV=${KIS_ENV:-}"
+          echo "[ENV] DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
+          echo "[ENV] API_BASE_URL=${API_BASE_URL:-} KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED:-}"
+
+      - name: Resolve market-aware runtime mode
+        id: market_mode
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst
+
+          now = now_kst()
+          is_weekday = is_trading_weekday(now)
+          window = calc_market_window_kst(now)
+          in_market = is_weekday and window in {"preopen", "morning", "day", "close"}
+
+          mode = "LIVE" if in_market else "DIAG"
+          pb1_phase = "entry" if window in {"preopen", "morning", "day"} else "exit"
+
+          # DIAG에서도 매수/필터 검증하려고 entry로 고정
+          if mode == "DIAG":
+              pb1_phase = "entry"
+
+          live_ok = "true" if in_market else "false"
+          kis_http = "1" if in_market else "0"
+
+          print(
+              f"[AUTO] now={now.isoformat()} trading_day={is_weekday} window={window} "
+              f"in_market={in_market} -> STRATEGY_MODE={mode} PB1_PHASE_DEFAULT={pb1_phase} "
+              f"KIS_HTTP_ENABLED={kis_http} live_ok={live_ok}"
+          )
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              # --- effective runtime ---
+              f.write(f"EFFECTIVE_STRATEGY_MODE={mode}\n")
+              f.write(f"MARKET_WINDOW={window}\n")
+              f.write(f"PB1_PHASE_DEFAULT={pb1_phase}\n")
+              # ✅ KIS_HTTP_ENABLED만 시간창 기반으로 결정 (주문 API 호출 제어)
+              f.write(f"KIS_HTTP_ENABLED={kis_http}\n")
+              
+              # ⚠️ IMPORTANT: LIVE 3종 세트(DRY_RUN, LIVE_TRADING_ENABLED, DISABLE_LIVE_TRADING)는
+              # FINAL ENV LOCK 스텝에서만 설정하고, 여기서는 절대 건드리지 않음!
+              # 두 곳에서 설정하면 실행 순서에 따라 값이 덮어씌워져서 의도와 다르게 동작할 수 있음.
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"live_ok={live_ok}\n")
+          PY
+
+      - name: "ENV dump (검증용)"
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Environment Variables Dump (for debugging)"
+          echo "======================================"
+          echo "[ENV] KIS_ENV=$KIS_ENV STRATEGY_ENV=$STRATEGY_ENV API_BASE_URL=$API_BASE_URL"
+          echo "[ENV] EFFECTIVE_STRATEGY_MODE=$EFFECTIVE_STRATEGY_MODE STRATEGY_MODE=${STRATEGY_MODE:-}"
+          echo "[ENV] DRY_RUN=${DRY_RUN:-} LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-} DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING:-}"
+          echo "[ENV] SIMULATION_MODE=${SIMULATION_MODE:-} KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED MARKET_WINDOW=$MARKET_WINDOW PB1_PHASE_DEFAULT=$PB1_PHASE_DEFAULT"
+          echo "[ENV] PB1_WATCHLIST_TOPK=${PB1_WATCHLIST_TOPK:-} PB1_WATCHLIST_FINALN=${PB1_WATCHLIST_FINALN:-}"
+          echo "[ENV] PB1_EARLY_STOP_ENABLED=${PB1_EARLY_STOP_ENABLED:-}"
+          echo "======================================"
+
+      - name: "Guard: LIVE env precheck"
+        if: steps.market_mode.outputs.live_ok == 'true'
+        run: |
+          set -euo pipefail
+          violations=()
+          [ "${DB_ONLY:-}" = "1" ] && violations+=("DB_ONLY=1")
+          [ "${NONTRADING_SMOKE:-}" = "1" ] && violations+=("NONTRADING_SMOKE=1")
+          [ "${DRY_RUN:-}" = "1" ] && violations+=("DRY_RUN=1")
+          [ "${LIVE_TRADING_ENABLED:-}" != "1" ] && violations+=("LIVE_TRADING_ENABLED != '1'")
+          [ "${DISABLE_LIVE_TRADING:-}" = "1" ] && violations+=("DISABLE_LIVE_TRADING=1")
+          [ "${SIMULATION_MODE:-}" = "1" ] && violations+=("SIMULATION_MODE=1")
+          if [ ${#violations[@]} -gt 0 ]; then
+            echo "::error::LIVE env violations: ${violations[*]}"
+            exit 1
+          fi
+          echo "[PRECHECK] LIVE env ok"
+
+      - name: Precheck import (fail fast)
+        run: |
+          set -euo pipefail
+          python -c "import importlib; importlib.import_module('trader.pb1_runner'); print('[PRECHECK] pb1_runner import ok')"
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Normalize ENV (force uppercase)
+        run: |
+          set -euo pipefail
+          echo "KIS_ENV=${KIS_ENV^^}" >> "$GITHUB_ENV"
+          echo "STRATEGY_ENV=${STRATEGY_ENV^^}" >> "$GITHUB_ENV"
+          echo "[ENV][NORMALIZE] KIS_ENV=${KIS_ENV^^} STRATEGY_ENV=${STRATEGY_ENV^^}"
+
+      - name: DB universe precheck
+        run: |
+          set -euo pipefail
+          if [ "${{ env.EFFECTIVE_STRATEGY_MODE }}" = "DIAG" ]; then
+            echo "[UNIVERSE][PRECHECK] DIAG mode -> do not fail hard if missing"
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${{ env.EFFECTIVE_STRATEGY_MODE }}" || true
+          else
+            python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "${{ env.EFFECTIVE_STRATEGY_MODE }}"
+          fi
+
+      - name: Candidate pool DB precheck (Weekend-built pool required)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          
+          # ✅ 전용 검증 스크립트 사용 (더 자세한 에러 메시지 제공)
+          python scripts/verify_candidate_pool.py
+          
+          echo ""
+          echo "[POOL][PRECHECK] ✅ Candidate pool verification passed"
+          echo "[POOL][PRECHECK] trade-tick will load from DB (no rebuild)"
+
+      - name: Run PB1 (AUTO -> LIVE in-market, DIAG after-hours)
+        env:
+          # EFFECTIVE_STRATEGY_MODE, PB1_PHASE_DEFAULT, KIS_HTTP_ENABLED는
+          # market_mode 스텝에서 GITHUB_ENV로 설정되므로 자동으로 사용됨
+          PB1_DIAG_FULL_EXEC: "1"
+          PB1_WINDOW_OVERRIDE: "day"
+          PB1_ALLOW_OUTSIDE_WINDOWS: "1"
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Trade Tick"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Mode: ${STRATEGY_MODE:-AUTO}"
+          echo "PB1_PHASE_DEFAULT: ${PB1_PHASE_DEFAULT:-entry}"
+          echo "KIS_HTTP_ENABLED: ${KIS_HTTP_ENABLED:-AUTO}"
+          echo "======================================"
           
           # Try known entrypoints in order (do not assume trade_tick exists)
           if python -c "import trader.trade_tick" >/dev/null 2>&1; then
@@ -194,61 +840,3 @@ jobs:
             python -c "import pkgutil, trader; mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)]); print('\n'.join(mods))"
             exit 2
           fi
-
-      - name: Run candidate-pool OHLCV prefetch
-        if: steps.mode.outputs.run_mode == 'prefetch'
-        working-directory: repo
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
-          
-          # Strategy environment
-          STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.ENV || 'PRACTICE' }}
-          
-          # KIS API (for DB access)
-          KIS_ENV: practice
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          APP_KEY: ${{ secrets.APP_KEY }}
-          APP_SECRET: ${{ secrets.APP_SECRET }}
-          CANO: ${{ secrets.CANO }}
-          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-          
-          # Database
-          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          SQLITE_DISABLED: "1"
-          BOTSTATE_DISABLED: "1"
-
-          # Prefetch configuration
-          PREFETCH_BARS: ${{ github.event_name == 'workflow_dispatch' && inputs.BARS || '520' }}
-          PREFETCH_STRATEGY_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_KEY || 'pb1_candidate_pool' }}
-          PREFETCH_OHLCV_SOURCE: "FDR"
-          PREFETCH_MAX_WORKERS: "6"
-          PREFETCH_RETRY: "2"
-          PREFETCH_TIMEOUT_SEC: "8"
-        run: |
-          set -euo pipefail
-          
-          # Validate module exists
-          python -c "import trader.ohlcv_prefetch" >/dev/null 2>&1 || {
-            echo "::error::trader.ohlcv_prefetch module not found. Did you add trader/ohlcv_prefetch.py?"
-            exit 2
-          }
-          
-          echo "[PREFETCH] as_of=${{ steps.kst.outputs.as_of }}"
-          python -m trader.ohlcv_prefetch \
-            --env "${STRATEGY_ENV}" \
-            --as-of "${{ steps.kst.outputs.as_of }}" \
-            --bars "${PREFETCH_BARS}" \
-            --strategy-key "${PREFETCH_STRATEGY_KEY}"
-
-      - name: Upload runtime reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-reports-${{ steps.kst.outputs.as_of || 'na' }}
-          path: |
-            /home/runner/work/_temp/trader_runtime/runtime/reports/
-            /home/runner/work/_temp/trader_runtime/runtime/logs/
-            /home/runner/work/_temp/trader_runtime/runtime/diagnostics/
-            /home/runner/work/_temp/trader_runtime/runtime/reports/**/*
-            /home/runner/work/_temp/trader_runtime/runtime/logs/**/*
-          if-no-files-found: ignore
