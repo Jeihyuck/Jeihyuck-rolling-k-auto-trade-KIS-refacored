@@ -3,8 +3,8 @@ name: "Unified Trading Pipeline (Universe + Candidate + Prefetch + Trade)"
 # ✅ 실행 방법 (Execution Guide)
 # 1. 토요일 자동: Universe+Prefetch(520일)+Candidate 저장
 #    - Schedule: Sat 00:30 KST (Fri 15:30 UTC)
-# 2. 수동 prep 실행:
-#    - MODE=prep, PREFETCH_DAYS=520, FORCE_CANDIDATE=1(옵션)
+# 2. 수동 candidate 실행:
+#    - MODE=candidate (or prep legacy), PREFETCH_DAYS=520, FORCE_CANDIDATE=1(옵션)
 # 3. 수동 미너비니 테스트 (주문 차단 + LIVE 경로):
 #    - MODE=minervini_test
 #    - 기대: NO_TRADE=1 로그, 주문 전송은 blocked
@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       MODE:
-        description: "prep | trade | minervini_test | both"
+        description: "candidate | prep | trade | minervini_test | both (candidate jobs run only for MODE=candidate or both; prep is legacy alias)"
         required: false
         default: "trade"
       PREFETCH_DAYS:
@@ -32,7 +32,7 @@ on:
         required: false
         default: "520"
       FORCE_CANDIDATE:
-        description: "1=regen candidate"
+        description: "1=force rebuild candidate pool"
         required: false
         default: "0"
       MINERVINI_ONLY:
@@ -218,9 +218,9 @@ jobs:
     # ✅ universe_build 완료 후 실행
     needs: [universe_build]
 
-    # 실행 조건: MODE=prep/both만 실행 (trade는 스킵)
+    # 실행 조건: MODE=candidate/both만 실행 (prep legacy alias, trade는 스킵)
     if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
       (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
@@ -352,9 +352,9 @@ jobs:
     # ✅ prefetch 완료 후 실행
     needs: [candidate_pool_prefetch]
 
-    # 실행 조건: MODE=prep/both만 실행 (trade는 스킵)
+    # 실행 조건: MODE=candidate/both만 실행 (prep legacy alias, trade는 스킵)
     if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
       (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
@@ -464,12 +464,16 @@ jobs:
               print(f"[VERIFY][FAIL] no candidate pool in DB for {env}/{strategy_key}")
               sys.exit(1)
 
-          # load_watchlist returns (members_list, used_as_of) tuple
           result = repo.load_watchlist(env=env, strategy=strategy_key, as_of=latest)
-          
-          # Extract members list from return value
+
           if isinstance(result, tuple) and len(result) == 2:
-              members, used_as_of = result
+              a, b = result
+              if isinstance(a, list):
+                  members, used_as_of = a, b
+              elif isinstance(b, list):
+                  members, used_as_of = b, a
+              else:
+                  members, used_as_of = a, b
           elif isinstance(result, dict):
               members = result.get("members") or result.get("codes") or []
               used_as_of = result.get("as_of")
@@ -478,19 +482,14 @@ jobs:
               used_as_of = getattr(result, "as_of", None)
           else:
               members = result or []
-              used_as_of = None
-          
-          # Debug output (optional, controlled by env var)
-          if os.getenv("DEBUG_VERIFY"):
-              print(f"[VERIFY][DEBUG] raw_result type={type(result)}")
-              if isinstance(result, tuple):
-                  print(f"[VERIFY][DEBUG] tuple length={len(result)}")
-          
-          print(f"[VERIFY] as_of={latest} size={len(members)}")
+              used_as_of = latest
+
+          size = len(members)
+          print(f"[VERIFY] as_of={used_as_of or latest} size={size}")
 
           min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
-          if len(members) < min_size:
-              print(f"[VERIFY][FAIL] pool size {len(members)} < min {min_size}")
+          if size < min_size:
+              print(f"[VERIFY][FAIL] pool size {size} < min {min_size}")
               sys.exit(1)
 
           print("[VERIFY][OK] candidate pool ready")
