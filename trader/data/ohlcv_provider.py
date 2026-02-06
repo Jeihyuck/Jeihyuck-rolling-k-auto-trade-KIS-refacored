@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -79,6 +80,24 @@ class KISOHLCVProvider:
         except Exception as exc:
             logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
 
+        # ====================================================================
+        # [PREFETCH_ONLY] 장중 외부 OHLCV 호출 차단
+        # ====================================================================
+        if os.getenv("OHLCV_PREFETCH_ONLY", "0") == "1":
+            logger.debug(
+                "[OHLCV][PREFETCH_ONLY] symbol=%s days=%d - external fetch blocked (OHLCV_PREFETCH_ONLY=1)",
+                symbol, days
+            )
+            return OHLCVResult(
+                pd.DataFrame(),
+                {
+                    "provider": self.name,
+                    "source": "db_insufficient_prefetch_only",
+                    "error": "ohlcv_prefetch_only_enabled",
+                    "volume_missing": True,
+                }
+            )
+        
         # ====================================================================
         # [DIAG 방화벽] DIAG 모드일 때는 KIS fallback 절대 금지
         # ====================================================================

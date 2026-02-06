@@ -1,0 +1,197 @@
+name: trade-or-prefetch
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # Trade window: Weekdays, every 15 min in UTC 00-06 (KST 09-15)
+    - cron: "*/15 0-6 * * 1-5"
+    # Prefetch: Weekdays 17:00 KST == 08:00 UTC
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      RUN:
+        description: "trade | prefetch (manual override)"
+        required: true
+        default: "trade"
+      ENV:
+        description: "PRACTICE | LIVE"
+        required: true
+        default: "PRACTICE"
+      BARS:
+        description: "prefetch bars (recommend 520; min 420)"
+        required: false
+        default: "520"
+      STRATEGY_KEY:
+        description: "candidate pool strategy key"
+        required: false
+        default: "pb1_candidate_pool"
+      AS_OF:
+        description: "YYYY-MM-DD (empty => today KST)"
+        required: false
+        default: ""
+
+concurrency:
+  group: trade-or-prefetch-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DB_DISABLE_PREPARED_STATEMENTS: "1"
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Decide run mode (trade vs prefetch)
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Manual override
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_mode=${{ inputs.RUN }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Schedule mode: decide by UTC time
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+
+          # Prefetch: exactly 08:00 UTC
+          if [ "$HOUR" = "08" ] && [ "$MIN" = "00" ]; then
+            echo "run_mode=prefetch" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Trade: UTC 00-06
+          if [ "$HOUR" -ge "00" ] && [ "$HOUR" -le "06" ]; then
+            echo "run_mode=trade" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "run_mode=skip" >> $GITHUB_OUTPUT
+
+      - name: Resolve AS_OF (KST today if empty)
+        id: kst
+        if: steps.mode.outputs.run_mode != 'skip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.AS_OF }}" ]; then
+            echo "as_of=${{ inputs.AS_OF }}" >> $GITHUB_OUTPUT
+          else
+            echo "as_of=$(TZ=Asia/Seoul date +%F)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run trade tick
+        if: steps.mode.outputs.run_mode == 'trade'
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+          
+          # Strategy environment
+          STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.ENV || 'PRACTICE' }}
+          
+          # KIS API
+          KIS_ENV: practice
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          
+          # Database
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          SQLITE_DISABLED: "1"
+          BOTSTATE_DISABLED: "1"
+
+          # Trading mode
+          LIVE_TRADING_ENABLED: "1"
+          DISABLE_LIVE_TRADING: "0"
+          DRY_RUN: "0"
+          KIS_HTTP_ENABLED: "1"
+
+          # PB1 knobs
+          PB1_ATR_MAX_PCT: "10"
+          PB1_WATCHLIST_TOPK: "50"
+          PB1_WATCHLIST_FINALN: "30"
+          PB1_EARLY_STOP_ENABLED: "0"
+
+          # CRITICAL: 반드시 장중 외부호출 차단
+          OHLCV_PREFETCH_ONLY: "1"
+        run: |
+          set -euo pipefail
+          echo "[TRADE_TICK] Starting trade tick (장중 매매)..."
+          python -m trader.trade_tick
+
+      - name: Run candidate-pool OHLCV prefetch
+        if: steps.mode.outputs.run_mode == 'prefetch'
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+          
+          # Strategy environment
+          STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.ENV || 'PRACTICE' }}
+          
+          # KIS API (for DB access)
+          KIS_ENV: practice
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          
+          # Database
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          SQLITE_DISABLED: "1"
+          BOTSTATE_DISABLED: "1"
+
+          # Prefetch configuration
+          PREFETCH_BARS: ${{ github.event_name == 'workflow_dispatch' && inputs.BARS || '520' }}
+          PREFETCH_STRATEGY_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_KEY || 'pb1_candidate_pool' }}
+          PREFETCH_OHLCV_SOURCE: "FDR"
+          PREFETCH_MAX_WORKERS: "6"
+          PREFETCH_RETRY: "2"
+          PREFETCH_TIMEOUT_SEC: "8"
+        run: |
+          set -euo pipefail
+          echo "[PREFETCH] as_of=${{ steps.kst.outputs.as_of }}"
+          python -m trader.ohlcv_prefetch \
+            --env "${STRATEGY_ENV}" \
+            --as-of "${{ steps.kst.outputs.as_of }}" \
+            --bars "${PREFETCH_BARS}" \
+            --strategy-key "${PREFETCH_STRATEGY_KEY}"
+
+      - name: Upload runtime reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-reports-${{ steps.kst.outputs.as_of || 'na' }}
+          path: |
+            ${{ github.workspace }}/repo/runtime/reports/
+            ${{ github.workspace }}/repo/runtime/logs/
+          if-no-files-found: ignore

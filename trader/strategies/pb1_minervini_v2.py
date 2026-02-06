@@ -84,7 +84,28 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     vol50 = float(vol.rolling(50).mean().iloc[-1]) if len(df) >= 50 else float("nan")
     last_volume = float(vol.iloc[-1]) if len(df) >= 1 else float("nan")
 
+    # MA200 slope 계산 (NaN 대응 포함)
     ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + 20)]) if len(df) >= 221 else float("nan")
+    ma200_slope_method = "standard"  # 어떤 방법으로 계산했는지 기록
+    
+    # MA200_slope NaN degrade: 대체 slope 시도
+    if not np.isfinite(ma200_slope):
+        # 대체 slope 1: ma200[-1] > ma200[-20] 비교
+        if len(df) >= 220 and len(ma200) >= 20:
+            try:
+                ma200_last = ma200.iloc[-1]
+                ma200_20ago = ma200.iloc[-20]
+                if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
+                    # 단순 비교로 상승/하락 여부 판단
+                    ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
+                    ma200_slope_method = "simple_compare"
+            except (IndexError, KeyError):
+                pass
+        
+        # 대체 slope 2: 그것도 안 되면 unknown으로 처리 (slope=0으로 설정하여 failmode_soft 흐름으로)
+        if not np.isfinite(ma200_slope):
+            ma200_slope = 0.0
+            ma200_slope_method = "unknown"
 
     atr_value = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else float("nan")
     last_close = float(close.iloc[-1])
@@ -99,6 +120,7 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "ma200": float(ma200.iloc[-1]),
         "ma20": float(ma20.iloc[-1]),
         "ma200_slope": ma200_slope,
+        "ma200_slope_method": ma200_slope_method,  # degrade 방법 기록
         "atr14": atr_value,
         "atr_pct": atr_ratio,  # ratio (0~1) 저장
         "hi_52w": hi_52w,
@@ -201,14 +223,15 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
     c = feats.get("close")
     ma50, ma150, ma200 = feats.get("ma50"), feats.get("ma150"), feats.get("ma200")
     ma200_slope = feats.get("ma200_slope")
+    ma200_slope_method = feats.get("ma200_slope_method", "standard")
     dv50 = feats.get("dollar_vol_50")
     rs_percentile = feats.get("rs_percentile")
     vcp_ok = feats.get("vcp_ok")
 
     if debug_mode:
         logger.info(
-            "[MINERVINI][FILTER][ENTER] c=%.2f ma50=%.2f ma150=%.2f ma200=%.2f rs_pct=%.2f vcp_ok=%s rs_min=%.2f",
-            c or 0, ma50 or 0, ma150 or 0, ma200 or 0, (rs_percentile or 0) * 100, vcp_ok, cfg.rs_min_percentile * 100
+            "[MINERVINI][FILTER][ENTER] c=%.2f ma50=%.2f ma150=%.2f ma200=%.2f ma200_slope=%.2f slope_method=%s rs_pct=%.2f vcp_ok=%s rs_min=%.2f",
+            c or 0, ma50 or 0, ma150 or 0, ma200 or 0, ma200_slope or 0, ma200_slope_method, (rs_percentile or 0) * 100, vcp_ok, cfg.rs_min_percentile * 100
         )
 
     reasons: list[str] = []
@@ -217,8 +240,21 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
         reasons.append("missing_ma")
     elif not (c > ma50 > ma150 > ma200):
         reasons.append("trend_template_fail")
-    if not (ma200_slope is not None and ma200_slope > 0):
-        reasons.append("ma200_not_rising")
+    
+    # MA200_slope NaN degrade: unknown일 때는 soft fail (점수 감점만, hard fail 금지)
+    if ma200_slope_method == "unknown":
+        # slope 조건 unknown: degrade 처리 (점수 감점용 flag만 추가, hard fail 금지)
+        reasons.append("ma200_slope_unknown")
+        feats["ma200_slope_degraded"] = True  # 점수 감점용 플래그
+    elif ma200_slope_method == "simple_compare":
+        # 대체 slope 사용: 상승 여부만 체크
+        if not (ma200_slope is not None and ma200_slope > 0):
+            reasons.append("ma200_not_rising_fallback")
+    else:
+        # 정상 slope 계산: 기존 로직
+        if not (ma200_slope is not None and ma200_slope > 0):
+            reasons.append("ma200_not_rising")
+    
     if not (rs_percentile is not None and rs_percentile >= cfg.rs_min_percentile):
         reasons.append("rs_below_min")
     if not (dv50 is not None and np.isfinite(dv50) and dv50 >= cfg.min_dollar_vol_50d):
@@ -226,10 +262,13 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
     if not vcp_ok:
         reasons.append("vcp_fail")
 
-    ok = len(reasons) == 0
+    # ma200_slope_unknown은 soft fail만 (hard fail 금지)
+    # 다른 조건들이 통과하면 후보로 유지 (단, 점수 감점 적용)
+    hard_fail_reasons = [r for r in reasons if r != "ma200_slope_unknown"]
+    ok = len(hard_fail_reasons) == 0
     
     if debug_mode:
-        logger.info("[MINERVINI][FILTER][RESULT] ok=%s reasons=%s", ok, reasons)
+        logger.info("[MINERVINI][FILTER][RESULT] ok=%s reasons=%s hard_fail_reasons=%s", ok, reasons, hard_fail_reasons)
     
     return ok, reasons
 
@@ -315,6 +354,11 @@ def score_setup(feats: dict, rs_percentile: float, vcp_info: dict, cfg: Minervin
     if pivot is not None and np.isfinite(pivot) and pivot > 0 and close is not None:
         extension = max(0.0, (float(close) - pivot) / pivot)
         score -= extension * 100.0
+    
+    # MA200_slope degraded 시 점수 감점
+    if feats.get("ma200_slope_degraded"):
+        score -= 10.0  # 10점 감점
+    
     return float(max(0.0, min(120.0, score)))
 
 

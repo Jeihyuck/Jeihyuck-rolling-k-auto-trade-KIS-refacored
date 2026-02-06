@@ -78,8 +78,27 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     value20 = float((close * vol).rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")
     vol20 = float(vol.rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")
 
-    # MA200 slope
+    # MA200 slope 계산 (NaN 대응 포함)
     ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + 20)]) if len(df) >= 221 else float("nan")
+    ma200_slope_method = "standard"
+    
+    # MA200_slope NaN degrade: 대체 slope 시도
+    if not np.isfinite(ma200_slope):
+        # 대체 slope 1: ma200[-1] > ma200[-20] 비교
+        if len(df) >= 220 and len(ma200) >= 20:
+            try:
+                ma200_last = ma200.iloc[-1]
+                ma200_20ago = ma200.iloc[-20]
+                if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
+                    ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
+                    ma200_slope_method = "simple_compare"
+            except (IndexError, KeyError):
+                pass
+        
+        # 대체 slope 2: 그것도 안 되면 unknown으로 처리
+        if not np.isfinite(ma200_slope):
+            ma200_slope = 0.0
+            ma200_slope_method = "unknown"
 
     pivot, pivot_age = _pivot_high(df, 20, 60)
 
@@ -94,6 +113,7 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "ma150": float(ma150.iloc[-1]),
         "ma200": float(ma200.iloc[-1]),
         "ma200_slope": ma200_slope,
+        "ma200_slope_method": ma200_slope_method,
         "atr14": atr_value,
         "atr_pct": atr_ratio,  # ratio (0~1) 저장
         "hi_52w": hi_52w,
@@ -113,6 +133,7 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
     c = feats["close"]
     ma50, ma150, ma200 = feats["ma50"], feats["ma150"], feats["ma200"]
     ma200_slope = feats["ma200_slope"]
+    ma200_slope_method = feats.get("ma200_slope_method", "standard")
     hi_52w, lo_52w = feats["hi_52w"], feats["lo_52w"]
     dv50 = feats["dollar_vol_50"]
 
@@ -120,8 +141,18 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
 
     if not (c > ma50 > ma150 > ma200):
         reasons.append("trend_template_fail")
-    if not (ma200_slope > 0):
-        reasons.append("ma200_not_rising")
+    
+    # MA200_slope NaN degrade: unknown일 때는 soft fail
+    if ma200_slope_method == "unknown":
+        reasons.append("ma200_slope_unknown")
+        feats["ma200_slope_degraded"] = True
+    elif ma200_slope_method == "simple_compare":
+        if not (ma200_slope > 0):
+            reasons.append("ma200_not_rising_fallback")
+    else:
+        if not (ma200_slope > 0):
+            reasons.append("ma200_not_rising")
+    
     # 52주 고저: None이면 스킵 (탈락시키지 않음)
     if hi_52w is not None and not (np.isfinite(hi_52w) and c >= hi_52w * 0.75):
         reasons.append("too_far_from_52w_high")
@@ -130,7 +161,9 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
     if not (np.isfinite(dv50) and dv50 >= cfg.min_dollar_vol_50d):
         reasons.append("illiquid")
 
-    ok = len(reasons) == 0
+    # ma200_slope_unknown은 soft fail만 (hard fail 금지)
+    hard_fail_reasons = [r for r in reasons if r != "ma200_slope_unknown"]
+    ok = len(hard_fail_reasons) == 0
     return ok, reasons
 
 

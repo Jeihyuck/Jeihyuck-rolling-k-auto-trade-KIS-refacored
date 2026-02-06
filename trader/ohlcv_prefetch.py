@@ -1,23 +1,29 @@
-"""OHLCV Prefetch - 증분 업데이트 + 병렬화 + 체크포인트."""
+"""OHLCV Prefetch - 증분 업데이트 + 병렬화 + 체크포인트 + CLI."""
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select, func
 
 from trader.config import MARKET_MAP
 from trader.db.repos import (
     upsert_price_daily,
     get_ohlcv_last_date,
+    load_watchlist,
     load_job_checkpoint,
     save_job_checkpoint,
 )
 from trader.time_utils import now_kst
+from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
@@ -288,3 +294,260 @@ def prefetch_ohlcv_to_db(
         "[OHLCV][PREFETCH][DONE] elapsed_total=%.1fs success=%s skip=%s fail=%s fail_codes_sample=%s",
         overall_elapsed, cumulative_success, cumulative_skip, cumulative_fail, fail_codes[:5]
     )
+
+
+def _count_ohlcv_bars(engine: Engine, code: str) -> int:
+    """DB에서 주어진 종목의 OHLCV bar 개수를 조회."""
+    from trader.db.schema import schema_for_engine
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        stmt = select(func.count()).select_from(schema.price_daily).where(
+            schema.price_daily.c.code == code
+        )
+        return conn.execute(stmt).scalar() or 0
+
+
+def run_prefetch_cli(
+    *,
+    env: str,
+    as_of: date,
+    bars: int,
+    strategy_key: str,
+) -> None:
+    """
+    CLI로 실행되는 prefetch 메인 로직.
+    
+    Args:
+        env: PRACTICE | LIVE
+        as_of: 기준일 (YYYY-MM-DD)
+        bars: 필요한 OHLCV bar 개수 (권장 520, 최소 420)
+        strategy_key: candidate pool 전략 키 (예: pb1_candidate_pool)
+    """
+    from trader.db.connection import get_engine
+    from trader.runtime_paths import runtime_path
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    
+    logger.info(
+        "[PREFETCH][CLI][START] env=%s as_of=%s bars=%s strategy_key=%s",
+        env, as_of, bars, strategy_key
+    )
+    
+    start_time = time.time()
+    
+    # DB 연결
+    engine = get_engine()
+    
+    # Candidate pool 로드 (DB에서)
+    members, actual_as_of = load_watchlist(
+        engine,
+        env=env,
+        strategy=strategy_key,
+        as_of=as_of,
+        allow_latest_fallback=True,
+        ttl_days=30,  # 최대 30일 이내 fallback
+    )
+    
+    if not members:
+        logger.warning(
+            "[PREFETCH][CLI][WARN] No candidate pool found for env=%s strategy=%s as_of=%s. "
+            "Trying latest fallback...",
+            env, strategy_key, as_of
+        )
+        # 재시도
+        members, actual_as_of = load_watchlist(
+            engine,
+            env=env,
+            strategy=strategy_key,
+            as_of=now_kst().date(),
+            allow_latest_fallback=True,
+            ttl_days=90,
+        )
+    
+    if not members:
+        logger.error(
+            "[PREFETCH][CLI][FAIL] No candidate pool available. Run candidate_pool_builder first."
+        )
+        sys.exit(1)
+    
+    logger.info(
+        "[PREFETCH][CLI][POOL] loaded=%s symbols (as_of=%s, requested=%s)",
+        len(members), actual_as_of, as_of
+    )
+    
+    # 환경변수 설정 (CLI로부터)
+    os.environ.setdefault("PREFETCH_MAX_WORKERS", os.getenv("PREFETCH_MAX_WORKERS", "6"))
+    os.environ.setdefault("PREFETCH_TIMEOUT_SEC", os.getenv("PREFETCH_TIMEOUT_SEC", "8"))
+    os.environ.setdefault("PREFETCH_RETRY", os.getenv("PREFETCH_RETRY", "2"))
+    
+    workers = int(os.getenv("PREFETCH_MAX_WORKERS", "6"))
+    timeout_sec = int(os.getenv("PREFETCH_TIMEOUT_SEC", "8"))
+    retries = int(os.getenv("PREFETCH_RETRY", "2"))
+    
+    # 각 종목별 DB OHLCV bar 수 체크
+    codes = [m["code"] for m in members]
+    total_codes = len(codes)
+    
+    logger.info("[PREFETCH][CLI][CHECK] Checking OHLCV bar counts for %s symbols...", total_codes)
+    
+    codes_to_fetch = []
+    for code in codes:
+        bar_count = _count_ohlcv_bars(engine, code)
+        if bar_count < bars:
+            codes_to_fetch.append(code)
+            logger.debug(
+                "[PREFETCH][CLI][NEED] code=%s bars=%s < required=%s",
+                code, bar_count, bars
+            )
+        else:
+            logger.debug(
+                "[PREFETCH][CLI][OK] code=%s bars=%s >= required=%s",
+                code, bar_count, bars
+            )
+    
+    logger.info(
+        "[PREFETCH][CLI][PLAN] total=%s need_fetch=%s skip=%s",
+        total_codes, len(codes_to_fetch), total_codes - len(codes_to_fetch)
+    )
+    
+    # FDR 보강 (부족한 종목만)
+    updated_count = 0
+    skipped_count = 0
+    failed_codes = []
+    
+    if codes_to_fetch:
+        logger.info("[PREFETCH][CLI][FETCH] Starting FDR fetch for %s symbols...", len(codes_to_fetch))
+        
+        # 날짜 범위 계산 (bars * 1.5 영업일을 감안하여 충분히 확보)
+        end_date = as_of
+        start_date = end_date - timedelta(days=int(bars * 1.5 + 50))
+        
+        # 병렬 fetch
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for code in codes_to_fetch:
+                future = executor.submit(
+                    _fetch_and_upsert_single,
+                    engine=engine,
+                    code=code,
+                    from_date=start_date,
+                    to_date=end_date,
+                    timeout_sec=timeout_sec,
+                    retries=retries,
+                    force_rebuild=False,  # 증분 업데이트
+                )
+                futures[future] = code
+            
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    result = future.result()
+                    status = result["status"]
+                    rows = result["rows"]
+                    elapsed = result["elapsed"]
+                    reason = result["reason"]
+                    
+                    if status == "success":
+                        updated_count += 1
+                        logger.info(
+                            "[PREFETCH][CLI][UPDATE] code=%s rows=%s elapsed=%.1fs",
+                            code, rows, elapsed
+                        )
+                    elif status == "skip":
+                        skipped_count += 1
+                        logger.debug("[PREFETCH][CLI][SKIP] code=%s reason=%s", code, reason)
+                    else:  # fail
+                        failed_codes.append(code)
+                        logger.warning(
+                            "[PREFETCH][CLI][FAIL] code=%s reason=%s elapsed=%.1fs",
+                            code, reason, elapsed
+                        )
+                except Exception as exc:
+                    failed_codes.append(code)
+                    logger.warning("[PREFETCH][CLI][FAIL] code=%s exc=%s", code, str(exc)[:100])
+    else:
+        logger.info("[PREFETCH][CLI][SKIP] All symbols already have sufficient OHLCV bars.")
+        skipped_count = total_codes
+    
+    # 리포트 생성
+    elapsed_total = time.time() - start_time
+    
+    report = {
+        "env": env,
+        "as_of": as_of.isoformat(),
+        "actual_as_of": actual_as_of.isoformat() if actual_as_of else None,
+        "strategy_key": strategy_key,
+        "bars_required": bars,
+        "total_symbols": total_codes,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "failed": len(failed_codes),
+        "failed_codes": failed_codes[:20],  # 최대 20개만 기록
+        "dt_seconds": round(elapsed_total, 2),
+        "timestamp": now_kst().isoformat(),
+    }
+    
+    # 리포트 저장
+    report_dir = runtime_path("runtime") / "reports" / "prefetch" / as_of.strftime("%Y-%m-%d")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "prefetch_report.json"
+    
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    logger.info(
+        "[PREFETCH][CLI][DONE] elapsed=%.1fs total=%s updated=%s skipped=%s failed=%s report=%s",
+        elapsed_total, total_codes, updated_count, skipped_count, len(failed_codes), report_path
+    )
+    logger.info("[PREFETCH][CLI][REPORT] %s", json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def main():
+    """CLI entrypoint."""
+    parser = argparse.ArgumentParser(
+        description="Prefetch OHLCV for candidate pool from DB (incremental update)"
+    )
+    parser.add_argument(
+        "--env",
+        type=str,
+        required=True,
+        choices=["PRACTICE", "LIVE"],
+        help="Trading environment (PRACTICE | LIVE)",
+    )
+    parser.add_argument(
+        "--as-of",
+        type=str,
+        required=True,
+        help="As-of date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--bars",
+        type=int,
+        default=520,
+        help="Required OHLCV bars (recommend 520, min 420)",
+    )
+    parser.add_argument(
+        "--strategy-key",
+        type=str,
+        default="pb1_candidate_pool",
+        help="Candidate pool strategy key",
+    )
+    
+    args = parser.parse_args()
+    
+    # as-of 파싱
+    as_of = to_date(args.as_of)
+    
+    run_prefetch_cli(
+        env=args.env,
+        as_of=as_of,
+        bars=args.bars,
+        strategy_key=args.strategy_key,
+    )
+
+
+if __name__ == "__main__":
+    main()
