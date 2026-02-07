@@ -507,16 +507,15 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-  minervini_weekend_test:
-    name: "Minervini Weekend Test (DB universe/pool, NO ORDER)"
+  minervini_weekend_test_schedule:
+    name: "Minervini Weekend Test (Schedule, DB universe/pool, NO ORDER)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     needs: [universe_build, candidate_pool_prefetch, candidate_pool]
 
     if: >
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.MODE == 'minervini_test') ||
-      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+      github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5'
 
     env:
       TZ: Asia/Seoul
@@ -537,6 +536,145 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
 
       # ✅ 강제 고정 (입력값 무시)
+      MODE: "minervini_test"
+      NO_TRADE: "1"
+      MINERVINI_ONLY: "1"
+      DRY_RUN: "1"
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      KIS_HTTP_ENABLED: "1"
+      STRATEGY_MODE: "DIAG"
+      PB1_PHASE_DEFAULT: "entry"
+      KIS_ENV: "practice"
+      STRATEGY_ENV: "PRACTICE"
+      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
+      UNIVERSE_SOURCE: "DB_ONLY"
+      UNIVERSE_FORCE_REBUILD: "0"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FINALN: "30"
+      PB1_EARLY_STOP_ENABLED: "0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "nullim"
+          path: repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: Assert safe-mode env (hard lock)
+        run: |
+          set -euo pipefail
+          echo "[ENV] NO_TRADE=${NO_TRADE}"
+          echo "[ENV] MINERVINI_ONLY=${MINERVINI_ONLY}"
+          echo "[ENV] DRY_RUN=${DRY_RUN}"
+          echo "[ENV] DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING}"
+          echo "[ENV] LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED}"
+          echo "[ENV] KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED}"
+          [[ "${NO_TRADE}" == "1" ]] || { echo "::error::NO_TRADE must be 1"; exit 1; }
+          [[ "${MINERVINI_ONLY}" == "1" ]] || { echo "::error::MINERVINI_ONLY must be 1"; exit 1; }
+          [[ "${DRY_RUN}" == "1" ]] || { echo "::error::DRY_RUN must be 1"; exit 1; }
+          [[ "${DISABLE_LIVE_TRADING}" == "1" ]] || { echo "::error::DISABLE_LIVE_TRADING must be 1"; exit 1; }
+          [[ "${LIVE_TRADING_ENABLED}" == "0" ]] || { echo "::error::LIVE_TRADING_ENABLED must be 0"; exit 1; }
+          [[ "${KIS_HTTP_ENABLED}" == "1" ]] || { echo "::error::KIS_HTTP_ENABLED must be 1"; exit 1; }
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Verify candidate pool exists (DB load only)
+        run: |
+          set -euo pipefail
+          python scripts/verify_candidate_pool.py
+
+      - name: Verify universe exists (DB load only)
+        run: |
+          set -euo pipefail
+          python -m trader.universe.db_check --env practice --strategy best_k_meta --mode DIAG
+
+      - name: Log candidate pool stats (pre-run)
+        run: |
+          set -euo pipefail
+          echo "[MINERVINI_TEST] MINERVINI_ONLY=${MINERVINI_ONLY} STRATEGY_MODE=${STRATEGY_MODE} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT}"
+          python scripts/verify_candidate_pool.py
+
+      - name: Run PB1 runner (NO ORDER)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Minervini Weekend Test"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "[RUN] MODE=minervini_test NO_TRADE=$NO_TRADE MINERVINI_ONLY=$MINERVINI_ONLY KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
+          echo "======================================"
+          echo "[MINERVINI] Using trader.pb1_runner (MINERVINI_ONLY=1)"
+          python -m trader.pb1_runner
+
+      - name: Log candidate pool stats (post-run)
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "[MINERVINI_TEST] pb1_runner completed. MODE=minervini_test MINERVINI_ONLY=${MINERVINI_ONLY}"
+
+  minervini_weekend_test_manual:
+    name: "Minervini Weekend Test (Manual, DB universe/pool, NO ORDER)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    if: >
+      github.event_name == 'workflow_dispatch' && github.event.inputs.MODE == 'minervini_test'
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      # DB
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+      # KIS secrets (import가 필요할 수 있어 유지) + 서버는 vts 고정
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+
+      # ✅ 강제 고정 (입력값 무시)
+      MODE: "minervini_test"
       NO_TRADE: "1"
       MINERVINI_ONLY: "1"
       DRY_RUN: "1"
