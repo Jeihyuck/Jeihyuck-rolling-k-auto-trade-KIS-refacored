@@ -600,6 +600,43 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
+      - name: Assert safe-mode env (no orders, no HTTP)
+        run: |
+          set -euo pipefail
+          echo "[ENV] NO_TRADE=${NO_TRADE}"
+          echo "[ENV] MINERVINI_ONLY=${MINERVINI_ONLY}"
+          echo "[ENV] DRY_RUN=${DRY_RUN}"
+          echo "[ENV] DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING}"
+          echo "[ENV] LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED}"
+          echo "[ENV] KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED}"
+          echo "[ENV] STRATEGY_MODE=${STRATEGY_MODE}"
+          echo "[ENV] KIS_ENV=${KIS_ENV}"
+          echo "[ENV] STRATEGY_ENV=${STRATEGY_ENV}"
+          echo "[ENV] UNIVERSE_SOURCE=${UNIVERSE_SOURCE}"
+          echo "[ENV] UNIVERSE_FORCE_REBUILD=${UNIVERSE_FORCE_REBUILD}"
+          echo "[ENV] CANDIDATE_POOL_FORCE_REBUILD=${CANDIDATE_POOL_FORCE_REBUILD}"
+          echo "[ENV] PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
+          echo "[ENV] PB1_WATCHLIST_FORCE_REBUILD=${PB1_WATCHLIST_FORCE_REBUILD}"
+          echo "[ENV] SQLITE_DISABLED=${SQLITE_DISABLED}"
+          echo "[ENV] BOTSTATE_DISABLED=${BOTSTATE_DISABLED}"
+
+          [[ "${NO_TRADE}" == "1" ]] || { echo "::error::NO_TRADE must be 1"; exit 1; }
+          [[ "${MINERVINI_ONLY}" == "1" ]] || { echo "::error::MINERVINI_ONLY must be 1"; exit 1; }
+          [[ "${DRY_RUN}" == "1" ]] || { echo "::error::DRY_RUN must be 1"; exit 1; }
+          [[ "${DISABLE_LIVE_TRADING}" == "1" ]] || { echo "::error::DISABLE_LIVE_TRADING must be 1"; exit 1; }
+          [[ "${LIVE_TRADING_ENABLED}" == "0" ]] || { echo "::error::LIVE_TRADING_ENABLED must be 0"; exit 1; }
+          [[ "${KIS_HTTP_ENABLED}" == "0" ]] || { echo "::error::KIS_HTTP_ENABLED must be 0"; exit 1; }
+          [[ "${STRATEGY_MODE}" == "DIAG" ]] || { echo "::error::STRATEGY_MODE must be DIAG"; exit 1; }
+          [[ "${KIS_ENV}" == "practice" ]] || { echo "::error::KIS_ENV must be practice"; exit 1; }
+          [[ "${STRATEGY_ENV}" == "PRACTICE" ]] || { echo "::error::STRATEGY_ENV must be PRACTICE"; exit 1; }
+          [[ "${UNIVERSE_SOURCE}" == "DB_ONLY" ]] || { echo "::error::UNIVERSE_SOURCE must be DB_ONLY"; exit 1; }
+          [[ "${UNIVERSE_FORCE_REBUILD}" == "0" ]] || { echo "::error::UNIVERSE_FORCE_REBUILD must be 0"; exit 1; }
+          [[ "${CANDIDATE_POOL_FORCE_REBUILD}" == "0" ]] || { echo "::error::CANDIDATE_POOL_FORCE_REBUILD must be 0"; exit 1; }
+          [[ "${PB1_WATCHLIST_AUTOBUILD}" == "0" ]] || { echo "::error::PB1_WATCHLIST_AUTOBUILD must be 0"; exit 1; }
+          [[ "${PB1_WATCHLIST_FORCE_REBUILD}" == "0" ]] || { echo "::error::PB1_WATCHLIST_FORCE_REBUILD must be 0"; exit 1; }
+          [[ "${SQLITE_DISABLED}" == "1" ]] || { echo "::error::SQLITE_DISABLED must be 1"; exit 1; }
+          [[ "${BOTSTATE_DISABLED}" == "1" ]] || { echo "::error::BOTSTATE_DISABLED must be 1"; exit 1; }
+
       - name: Verify candidate pool exists (DB load only)
         run: |
           set -euo pipefail
@@ -617,25 +654,33 @@ jobs:
           echo "Minervini Weekend Test"
           echo "======================================"
           echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "[RUN] MODE=minervini_test NO_TRADE=$NO_TRADE MINERVINI_ONLY=$MINERVINI_ONLY KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED"
+          echo "[RUN] MODE=minervini_test NO_TRADE=$NO_TRADE MINERVINI_ONLY=$MINERVINI_ONLY KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           echo "======================================"
 
-          # NOTE:
-          # 프로젝트에서 MINERVINI_ONLY=1이면 pb1_runner가 미너비니 필터만 수행하도록 구현되어 있다고 가정.
-          # 만약 전용 엔트리포인트가 있으면 그것을 우선 사용하도록 아래 탐색 순서를 적용.
-          if python -c "import trader.minervini_runner" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini_runner"
-            python -m trader.minervini_runner
-          elif python -c "import trader.minervini" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini"
-            python -m trader.minervini
+          if python -c "import trader.minervini.runner" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini.runner"
+            python -m trader.minervini.runner
+          elif python -c "import trader.minervini.cli" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini.cli"
+            python -m trader.minervini.cli
+          elif python -c "import trader.minervini.main" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini.main"
+            python -m trader.minervini.main
+          elif python -c "import trader.minervini.run" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini.run"
+            python -m trader.minervini.run
+          elif [ -f "scripts/run_minervini.py" ]; then
+            echo "[MINERVINI] Using scripts/run_minervini.py"
+            python scripts/run_minervini.py
+          elif [ -f "scripts/minervini.py" ]; then
+            echo "[MINERVINI] Using scripts/minervini.py"
+            python scripts/minervini.py
           elif python -c "import trader.pb1_runner" >/dev/null 2>&1; then
             echo "[MINERVINI] Using trader.pb1_runner (MINERVINI_ONLY=1)"
             python -m trader.pb1_runner
           else
             echo "::error::No known minervini entrypoint found."
-            echo "[DEBUG] Listing trader modules:"
-            python -c "import pkgutil, trader; mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)]); print('\\n'.join(mods))"
+            python -c "import pkgutil, trader; print('\\n'.join(sorted([m.name for m in pkgutil.iter_modules(trader.__path__)])))"
             exit 2
           fi
 
