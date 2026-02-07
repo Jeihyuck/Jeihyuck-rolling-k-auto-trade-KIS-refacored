@@ -34,6 +34,14 @@ from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
 
+MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
+MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
+
+
+def _minervini_ohlcv_days() -> int:
+    base = 200 + MA200_SLOPE_LOOKBACK + 60
+    return max(MINERVINI_OHLCV_DAYS_MIN, base)
+
 
 def run_minervini_for_codes(
     *,
@@ -107,9 +115,17 @@ def run_minervini_for_codes(
         }
         return report_result
     
+    need_days = _minervini_ohlcv_days()
+    logger.info(
+        "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, slope_lb=%s)",
+        need_days,
+        os.getenv("MINERVINI_OHLCV_DAYS"),
+        MA200_SLOPE_LOOKBACK,
+    )
+
     for code in codes:
         try:
-            df, meta = ohlcv_provider(code, count=260)
+            df, meta = ohlcv_provider(code, count=need_days)
             
             if df is None or df.empty or len(df) < 120:
                 candidates.append({

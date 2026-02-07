@@ -678,6 +678,10 @@ jobs:
       # ✅ MINERVINI_ONLY=1이면 KIS_HTTP_ENABLED 강제로 0 (실수 방지)
       KIS_HTTP_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY == '1' && '0' || '1' }}
 
+      MINERVINI_OHLCV_DAYS: "520"
+      MA200_SLOPE_LOOKBACK: "20"
+      PB1_ATR_MAX_PCT: "10"
+
       # ✅ 후보군: DB 로드 전용 (재빌드 절대 금지)
       CANDIDATE_POOL_ENABLED: "1"
       CANDIDATE_POOL_TTL_DAYS: "7"

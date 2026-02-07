@@ -27,6 +27,7 @@ from trader.config import (
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,
     PB1_MAX_ATR_PCT,
+    PB1_MAX_ATR_PCT_RAW,
     PB1_MIN_VALUE20,
     PB1_FAILMODE_SOFT,
     PB1_MIN_CANDIDATES,
@@ -141,6 +142,15 @@ from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
 
 logger = logging.getLogger(__name__)
+
+# Minervini feature calc requires MA200 slope + VCP; force long window.
+MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
+MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
+
+
+def _minervini_ohlcv_days() -> int:
+    base = 200 + MA200_SLOPE_LOOKBACK + 60
+    return max(MINERVINI_OHLCV_DAYS_MIN, base)
 
 _OUTPUT2_LIST_NORMALIZED_LOGGED = False
 _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
@@ -1587,6 +1597,14 @@ class PB1Engine:
                         cf.setup_ok = False
                         cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
                     return candidates
+
+            need_days = _minervini_ohlcv_days()
+            logger.info(
+                "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, slope_lb=%s)",
+                need_days,
+                os.getenv("MINERVINI_OHLCV_DAYS"),
+                MA200_SLOPE_LOOKBACK,
+            )
             
             rs_prices: dict[str, pd.Series] = {}
             checked_count = 0
@@ -1616,7 +1634,7 @@ class PB1Engine:
                 market = m.get("market") or ""
                 try:
                     # ✅ OHLCV 결측 즉시 스킵 (보장 모드)
-                    df, meta = self._fetch_daily(code)
+                    df, meta = self._fetch_daily(code, days=need_days)
                     if df is None or df.empty or len(df) < 120:
                         # 120일 미만이면 VCP/Minervini 점수 계산이 의미 없음
                         if df is None or df.empty:
@@ -4891,10 +4909,11 @@ class PB1Engine:
             allow_add_to_existing,
         )
         # ATR% 상한 검증 로그 (raw=config에서 읽은 원본, used=가드 후 실제 사용값)
-        atr_pct_max_raw = PB1_MAX_ATR_PCT
-        atr_pct_max_used = atr_pct_max_raw
-        if atr_pct_max_used > 1.0:  # 단위 혼선 방지: 6, 7, 8 등 -> 0.06, 0.07, 0.08로 교정
-            atr_pct_max_used = atr_pct_max_used / 100.0
+        try:
+            atr_pct_max_raw = float(PB1_MAX_ATR_PCT_RAW)
+        except (TypeError, ValueError):
+            atr_pct_max_raw = float(PB1_MAX_ATR_PCT) * 100 if float(PB1_MAX_ATR_PCT) <= 1.0 else float(PB1_MAX_ATR_PCT)
+        atr_pct_max_used = float(PB1_MAX_ATR_PCT)
         logger.info(
             "[PB1][ATR_MAX] raw=%.2f used=%.2f pct=%.2f%%",
             atr_pct_max_raw,

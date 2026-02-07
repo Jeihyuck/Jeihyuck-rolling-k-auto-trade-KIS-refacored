@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Dict, Tuple
 
 import numpy as np
@@ -84,17 +85,20 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     vol50 = float(vol.rolling(50).mean().iloc[-1]) if len(df) >= 50 else float("nan")
     last_volume = float(vol.iloc[-1]) if len(df) >= 1 else float("nan")
 
+    slope_lb = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
+    min_rows = 200 + slope_lb + 5
     # MA200 slope 계산 (NaN 대응 포함)
-    ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + 20)]) if len(df) >= 221 else float("nan")
+    ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + slope_lb)]) if len(df) >= min_rows else float("nan")
     ma200_slope_method = "standard"  # 어떤 방법으로 계산했는지 기록
     
     # MA200_slope NaN degrade: 대체 slope 시도
     if not np.isfinite(ma200_slope):
         # 대체 slope 1: ma200[-1] > ma200[-20] 비교
-        if len(df) >= 220 and len(ma200) >= 20:
+        fallback_min = 200 + slope_lb
+        if len(df) >= fallback_min and len(ma200) >= slope_lb:
             try:
                 ma200_last = ma200.iloc[-1]
-                ma200_20ago = ma200.iloc[-20]
+                ma200_20ago = ma200.iloc[-slope_lb]
                 if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
                     # 단순 비교로 상승/하락 여부 판단
                     ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0

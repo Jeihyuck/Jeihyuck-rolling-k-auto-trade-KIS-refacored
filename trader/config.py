@@ -297,6 +297,41 @@ def _cfg_with_alias(primary: str, alias: str) -> str:
     return CONFIG.get(alias, "")
 
 
+def _cfg_first(*keys: str) -> str:
+    for key in keys:
+        if os.getenv(key) is not None:
+            return os.getenv(key, "")
+    for key in keys:
+        if key in CONFIG:
+            return CONFIG.get(key, "")
+    return ""
+
+
+def get_atr_max_pct_raw() -> str:
+    return (
+        _cfg_first(
+            "PB1_ATR_MAX_PCT",
+            "ATR_MAX_PCT",
+            "PB1_ATR_MAX",
+            "ATR_MAX",
+            "PB1_MAX_ATR_PCT",
+            "PB1_ATR_PCT_MAX",
+        )
+        or "8.0"
+    )
+
+
+def get_atr_max_pct() -> float:
+    raw = get_atr_max_pct_raw()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 8.0
+    if value > 1.0:
+        value = value / 100.0
+    return value
+
+
 def _default_bool(key: str, fallback: bool = False) -> bool:
     raw_default = str(CONFIG.get(key, "")).strip().lower()
     if raw_default in TRUE_VALUES:
@@ -778,7 +813,8 @@ PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
 PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
 PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
-PB1_MAX_ATR_PCT = float(_cfg_with_alias("PB1_MAX_ATR_PCT", "PB1_ATR_PCT_MAX") or "8.0")
+PB1_MAX_ATR_PCT_RAW = get_atr_max_pct_raw()
+PB1_MAX_ATR_PCT = get_atr_max_pct()
 PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
