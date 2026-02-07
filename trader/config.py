@@ -206,6 +206,7 @@ CONFIG = {
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
     "PB1_MAX_ATR_PCT": "8.0",           # ATR% 상한 (과변동 종목 제외)
     "PB1_ATR_PCT_MAX": "8.0",
+    "ATR_MAX_PCT": "0.10",             # ATR% 상한 공통값 (ratio 기준)
     "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
     "PB1_VOL_MAX": "1.00",
     "PB1_VOLU_MAX": "0.98",
@@ -307,29 +308,29 @@ def _cfg_first(*keys: str) -> str:
     return ""
 
 
-def get_atr_max_pct_raw() -> str:
-    return (
-        _cfg_first(
-            "PB1_ATR_MAX_PCT",
-            "ATR_MAX_PCT",
-            "PB1_ATR_MAX",
-            "ATR_MAX",
-            "PB1_MAX_ATR_PCT",
-            "PB1_ATR_PCT_MAX",
-        )
-        or "8.0"
-    )
+def _cfg_first_with_source(*keys: str) -> tuple[str | None, str | None]:
+    for key in keys:
+        if os.getenv(key) is not None:
+            return os.getenv(key, ""), key
+    for key in keys:
+        if key in CONFIG:
+            return CONFIG.get(key, ""), key
+    return None, None
 
 
-def get_atr_max_pct() -> float:
-    raw = get_atr_max_pct_raw()
+def _resolve_atr_max_pct(*keys: str, default_ratio: float = 0.10) -> tuple[float, str, str]:
+    raw, source = _cfg_first_with_source(*keys)
+    if raw is None or raw == "":
+        raw = str(default_ratio)
+        source = "default"
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        value = 8.0
+        value = float(default_ratio)
+        source = "default"
     if value > 1.0:
         value = value / 100.0
-    return value
+    return value, source or "default", str(raw)
 
 
 def _default_bool(key: str, fallback: bool = False) -> bool:
@@ -348,6 +349,27 @@ def _cfg_bool(key: str, fallback: bool | None = None) -> bool:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _normalize_env_lower(key: str, default: str | None = None) -> str | None:
+    raw = os.getenv(key)
+    if raw is None and default is not None:
+        raw = default
+        os.environ[key] = raw
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if raw != normalized:
+        os.environ[key] = normalized
+    return normalized
+
+
+STRATEGY_ENV = _normalize_env_lower("STRATEGY_ENV")
+KIS_ENV = _normalize_env_lower("KIS_ENV")
+if STRATEGY_ENV:
+    logger.info("[VERIFY] env=%s (STRATEGY_ENV)", STRATEGY_ENV)
+if KIS_ENV:
+    logger.info("[VERIFY] kis_env=%s", KIS_ENV)
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -813,8 +835,22 @@ PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
 PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
 PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
-PB1_MAX_ATR_PCT_RAW = get_atr_max_pct_raw()
-PB1_MAX_ATR_PCT = get_atr_max_pct()
+PB1_MAX_ATR_PCT, PB1_MAX_ATR_PCT_SOURCE, PB1_MAX_ATR_PCT_RAW = _resolve_atr_max_pct(
+    "PB1_ATR_MAX_PCT",
+    "ATR_MAX_PCT",
+    "PB1_MAX_ATR_PCT",
+    "PB1_ATR_PCT_MAX",
+    "PB1_ATR_MAX",
+    "ATR_MAX",
+    default_ratio=0.10,
+)
+MINERVINI_MAX_ATR_PCT, MINERVINI_MAX_ATR_PCT_SOURCE, MINERVINI_MAX_ATR_PCT_RAW = _resolve_atr_max_pct(
+    "MINERVINI_ATR_MAX_PCT",
+    "ATR_MAX_PCT",
+    "MINERVINI_ATR_MAX",
+    "ATR_MAX",
+    default_ratio=0.10,
+)
 PB1_MIN_VALUE20 = float(_cfg("PB1_MIN_VALUE20") or "3000000000")
 PB1_ALLOW_ADD_TO_EXISTING = _cfg_bool("PB1_ALLOW_ADD_TO_EXISTING")
 PB1_LOG_ENTRY_GATE = _cfg_bool("PB1_LOG_ENTRY_GATE", fallback=True)
@@ -907,6 +943,16 @@ logger.info(
     PB1_EARLY_STOP_MODE,
     PB1_EARLY_STOP_N,
     PB1_EARLY_STOP_MIN_EVAL,
+)
+logger.info(
+    "[CONFIG][RISK] ATR_MAX_PCT=%.2f source=%s",
+    PB1_MAX_ATR_PCT,
+    PB1_MAX_ATR_PCT_SOURCE,
+)
+logger.info(
+    "[CONFIG][RISK] ATR_MAX_PCT=%.2f source=%s",
+    MINERVINI_MAX_ATR_PCT,
+    MINERVINI_MAX_ATR_PCT_SOURCE,
 )
 logger.info(
     "[CONFIG][CANDIDATE_POOL] enabled=%s ttl_days=%s size=%s min_size=%s strategy_key=%s force_rebuild=%s",

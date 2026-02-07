@@ -78,27 +78,37 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     value20 = float((close * vol).rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")
     vol20 = float(vol.rolling(20).mean().iloc[-1]) if len(df) >= 20 else float("nan")
 
-    # MA200 slope 계산 (NaN 대응 포함)
-    ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + 20)]) if len(df) >= 221 else float("nan")
+    slope_lb = 20
+    slope_min_rows = max(200 + slope_lb, 260)
+    ma200_tail = ma200.tail(5)
+    ma200_tail_nan = int(ma200_tail.isna().sum())
     ma200_slope_method = "standard"
-    
-    # MA200_slope NaN degrade: 대체 slope 시도
-    if not np.isfinite(ma200_slope):
-        # 대체 slope 1: ma200[-1] > ma200[-20] 비교
-        if len(df) >= 220 and len(ma200) >= 20:
-            try:
-                ma200_last = ma200.iloc[-1]
-                ma200_20ago = ma200.iloc[-20]
-                if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
-                    ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
-                    ma200_slope_method = "simple_compare"
-            except (IndexError, KeyError):
-                pass
-        
-        # 대체 slope 2: 그것도 안 되면 unknown으로 처리
+    ma200_slope_reason = "ok"
+
+    if len(df) < slope_min_rows:
+        ma200_slope = 0.0
+        ma200_slope_method = "unknown"
+        ma200_slope_reason = "data_short"
+    elif ma200_tail_nan > 0:
+        ma200_slope = 0.0
+        ma200_slope_method = "unknown"
+        ma200_slope_reason = "ma200_nan"
+    else:
+        ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + slope_lb)])
         if not np.isfinite(ma200_slope):
-            ma200_slope = 0.0
-            ma200_slope_method = "unknown"
+            if len(df) >= 200 + slope_lb and len(ma200) >= slope_lb:
+                try:
+                    ma200_last = ma200.iloc[-1]
+                    ma200_20ago = ma200.iloc[-slope_lb]
+                    if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
+                        ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
+                        ma200_slope_method = "simple_compare"
+                except (IndexError, KeyError):
+                    pass
+            if not np.isfinite(ma200_slope):
+                ma200_slope = 0.0
+                ma200_slope_method = "unknown"
+                ma200_slope_reason = "ma200_nan"
 
     pivot, pivot_age = _pivot_high(df, 20, 60)
 
@@ -114,6 +124,9 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "ma200": float(ma200.iloc[-1]),
         "ma200_slope": ma200_slope,
         "ma200_slope_method": ma200_slope_method,
+        "ma200_slope_reason": ma200_slope_reason,
+        "ma200_slope_window": slope_lb,
+        "ma200_tail_nan": ma200_tail_nan,
         "atr14": atr_value,
         "atr_pct": atr_ratio,  # ratio (0~1) 저장
         "hi_52w": hi_52w,

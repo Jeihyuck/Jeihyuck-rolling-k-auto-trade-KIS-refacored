@@ -4543,7 +4543,7 @@ class PB1Engine:
         calc_allowed = self.calc_allowed  # 계산 허용
         order_allowed = self.order_allowed  # 주문 허용
         minervini_only = self.minervini_only  # MINERVINI_ONLY 모드
-        entry_allowed = self.entry_enabled  # 하위호환용
+        entry_allowed = bool(self.entry_enabled and order_allowed)  # 하위호환용
         entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
         
         # ✅ MINERVINI_ONLY 모드에서는 계산만 허용, 주문은 금지
@@ -4593,27 +4593,21 @@ class PB1Engine:
                     entry_reason
                 )
                 logger.info("[PB1][BUY][SKIP] reason=%s details={'order_allowed': False}", entry_reason)
-                # MINERVINI_ONLY면 계산은 허용
-                if not minervini_only:
-                    calc_allowed = False
+                # 주문만 차단, 계산은 계속 허용
         if self.phase == "verify":
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=verify -> allow entry")
             else:
                 order_allowed = False
                 entry_reason = "phase_verify"
-                # MINERVINI_ONLY면 계산은 허용
-                if not minervini_only:
-                    calc_allowed = False
+                # 주문만 차단, 계산은 계속 허용
         if self.phase in {"manage", "exit", "idle"}:
             if diag_full_exec:
                 logger.warning("[PB1][DIAG_FULL_EXEC] override phase=%s -> allow entry", self.phase)
             else:
                 order_allowed = False
                 entry_reason = f"phase_{self.phase}"
-                # MINERVINI_ONLY면 계산은 허용
-                if not minervini_only:
-                    calc_allowed = False
+                # 주문만 차단, 계산은 계속 허용
         # ✅ FATAL 가드: intended_live=True인데 dry_run=True면 즉시 종료
         if self.intended_live and self.dry_run:
             raise RuntimeError(
@@ -4734,17 +4728,25 @@ class PB1Engine:
         )
         
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
-            skip_entry_scan = True
             entry_allowed = False
+            order_allowed = False
             entry_reason = "entry_cutoff"
             logger.info(
                 "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
                 self._now_kst.isoformat(),
                 entry_cutoff_dt.isoformat(),
             )
-            if self.phase in {"prep", "entry"}:
+            if not calc_allowed and self.phase in {"prep", "entry"}:
+                skip_entry_scan = True
                 final_status = "SKIPPED"
                 final_notes = "entry_cutoff"
+
+        logger.info(
+            "[GATE] compute_allowed=%s order_allowed=%s reason=%s",
+            int(calc_allowed),
+            int(order_allowed),
+            entry_reason or "ok",
+        )
 
         if not entry_allowed:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
@@ -4912,11 +4914,12 @@ class PB1Engine:
         try:
             atr_pct_max_raw = float(PB1_MAX_ATR_PCT_RAW)
         except (TypeError, ValueError):
-            atr_pct_max_raw = float(PB1_MAX_ATR_PCT) * 100 if float(PB1_MAX_ATR_PCT) <= 1.0 else float(PB1_MAX_ATR_PCT)
+            atr_pct_max_raw = float(PB1_MAX_ATR_PCT)
         atr_pct_max_used = float(PB1_MAX_ATR_PCT)
+        atr_pct_max_raw_display = atr_pct_max_raw * 100 if atr_pct_max_raw <= 1.0 else atr_pct_max_raw
         logger.info(
             "[PB1][ATR_MAX] raw=%.2f used=%.2f pct=%.2f%%",
-            atr_pct_max_raw,
+            atr_pct_max_raw_display,
             atr_pct_max_used,
             atr_pct_max_used * 100,
         )

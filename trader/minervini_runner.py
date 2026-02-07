@@ -14,6 +14,7 @@ from sqlalchemy import Engine
 
 from trader.candidate_pool_builder import load_candidate_pool
 from trader.config import (
+    MINERVINI_MAX_ATR_PCT,
     RS_BENCHMARK,
     RS_COMPOSITE_W1,
     RS_COMPOSITE_W2,
@@ -116,18 +117,34 @@ def run_minervini_for_codes(
         return report_result
     
     need_days = _minervini_ohlcv_days()
+    prefetch_days_raw = os.getenv("OHLCV_PREFETCH_DAYS", "0")
+    try:
+        prefetch_days = int(prefetch_days_raw)
+    except ValueError:
+        prefetch_days = 0
+    need_days = max(need_days, prefetch_days, 520)
     logger.info(
-        "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, slope_lb=%s)",
+        "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, prefetch_days=%s, slope_lb=%s)",
         need_days,
         os.getenv("MINERVINI_OHLCV_DAYS"),
+        prefetch_days_raw,
         MA200_SLOPE_LOOKBACK,
     )
+
+    slope_unknown_samples: list[dict[str, Any]] = []
 
     for code in codes:
         try:
             df, meta = ohlcv_provider(code, count=need_days)
+            rows = len(df) if df is not None else 0
+            logger.info(
+                "[MINERVINI][OHLCV] code=%s days_req=%s rows=%s",
+                code,
+                need_days,
+                rows,
+            )
             
-            if df is None or df.empty or len(df) < 120:
+            if df is None or df.empty or rows < 120:
                 candidates.append({
                     "code": code,
                     "setup_ok": False,
@@ -135,9 +152,39 @@ def run_minervini_for_codes(
                     "score": 0.0,
                 })
                 continue
+            if rows < 520:
+                logger.warning(
+                    "[MINERVINI][FAIL] code=%s reason=DATA_SHORT rows=%s",
+                    code,
+                    rows,
+                )
+                candidates.append({
+                    "code": code,
+                    "setup_ok": False,
+                    "reasons": ["data_short"],
+                    "score": 0.0,
+                    "features": {"rows": rows},
+                })
+                continue
             
             # Features 계산
             features = compute_features(df)
+            slope_method = features.get("ma200_slope_method")
+            slope_reason = features.get("ma200_slope_reason")
+            if slope_method == "unknown":
+                ma200_series = df["close"].rolling(200).mean()
+                ma200_tail = ma200_series.tail(5)
+                slope_unknown_samples.append(
+                    {
+                        "code": code,
+                        "rows": rows,
+                        "ma200_tail_nan": int(ma200_tail.isna().sum()),
+                        "ma200_tail": [float(v) if pd.notna(v) else None for v in ma200_tail.tolist()],
+                        "slope_window": features.get("ma200_slope_window"),
+                        "slope_value": features.get("ma200_slope"),
+                        "slope_reason": slope_reason,
+                    }
+                )
             
             # VCP 점수 계산
             vcp_score = score_vcp(
@@ -238,6 +285,21 @@ def run_minervini_for_codes(
         elif not (close > ma50 > ma150 > ma200):
             reasons.append("trend_template_fail")
         
+        # MA200 slope unknown -> reason 남김 (데이터 품질 문제)
+        slope_method = candidate["features"].get("ma200_slope_method")
+        slope_reason = candidate["features"].get("ma200_slope_reason")
+        if slope_method == "unknown":
+            reasons.append("ma200_slope_unknown")
+            if slope_reason == "ma200_nan":
+                reasons.append("ma200_nan")
+
+        # ATR% 리스크 게이트
+        atr_ratio = candidate["features"].get("atr_pct")
+        if atr_ratio is None or (isinstance(atr_ratio, float) and atr_ratio != atr_ratio):
+            reasons.append("atr_pct_missing")
+        elif float(atr_ratio) > float(MINERVINI_MAX_ATR_PCT):
+            reasons.append("atr_pct_too_high")
+
         # 유동성 체크
         dollar_vol_50 = candidate["features"].get("dollar_vol_50")
         if not dollar_vol_50 or dollar_vol_50 < minervini_config.min_dollar_vol_50d:
@@ -258,6 +320,23 @@ def run_minervini_for_codes(
         "[MINERVINI_RUNNER][RESULT] input=%s passed=%s rejected=%s",
         len(codes), len(passed), len(rejected)
     )
+
+    if slope_unknown_samples:
+        logger.warning(
+            "[MINERVINI][SLOPE_UNKNOWN] samples=%s",
+            len(slope_unknown_samples),
+        )
+        for sample in slope_unknown_samples[:3]:
+            logger.warning(
+                "[MINERVINI][SLOPE_UNKNOWN][SAMPLE] code=%s rows=%s ma200_tail_nan=%s ma200_tail=%s slope_window=%s slope_value=%s reason=%s",
+                sample.get("code"),
+                sample.get("rows"),
+                sample.get("ma200_tail_nan"),
+                sample.get("ma200_tail"),
+                sample.get("slope_window"),
+                sample.get("slope_value"),
+                sample.get("slope_reason"),
+            )
     
     # 리포트 생성 (기존 run_minervini_report 재사용)
     universe_members = [
@@ -272,6 +351,39 @@ def run_minervini_for_codes(
         candidates=candidates,
         report_dir=report_dir,
     )
+
+    # Minervini 후보군 저장 (DB watchlist)
+    pool_key = os.getenv("MINERVINI_CANDIDATE_POOL_KEY", "minervini_candidate_pool")
+    try:
+        pool_size = int(os.getenv("MINERVINI_CANDIDATE_POOL_SIZE", "120"))
+    except ValueError:
+        pool_size = 120
+    if passed:
+        ranked = sorted(passed, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        members = []
+        for idx, row in enumerate(ranked[:pool_size], start=1):
+            members.append(
+                {
+                    "code": row.get("code"),
+                    "rank": idx,
+                    "score": row.get("score"),
+                    "meta": {
+                        "rs_pctile": (row.get("features") or {}).get("rs_pctile"),
+                    },
+                }
+            )
+        WatchlistRepo(engine).save_watchlist(
+            env=env,
+            strategy=pool_key,
+            as_of=as_of,
+            members=members,
+        )
+        logger.info(
+            "[MINERVINI][CANDIDATE_POOL] saved=%s strategy=%s as_of=%s",
+            len(members),
+            pool_key,
+            as_of,
+        )
     
     logger.info(
         "[MINERVINI_RUNNER][REPORT] path=%s passed=%s rejected=%s",

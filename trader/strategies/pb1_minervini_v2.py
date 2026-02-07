@@ -86,30 +86,37 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
     last_volume = float(vol.iloc[-1]) if len(df) >= 1 else float("nan")
 
     slope_lb = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
-    min_rows = 200 + slope_lb + 5
-    # MA200 slope 계산 (NaN 대응 포함)
-    ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + slope_lb)]) if len(df) >= min_rows else float("nan")
-    ma200_slope_method = "standard"  # 어떤 방법으로 계산했는지 기록
-    
-    # MA200_slope NaN degrade: 대체 slope 시도
-    if not np.isfinite(ma200_slope):
-        # 대체 slope 1: ma200[-1] > ma200[-20] 비교
-        fallback_min = 200 + slope_lb
-        if len(df) >= fallback_min and len(ma200) >= slope_lb:
-            try:
-                ma200_last = ma200.iloc[-1]
-                ma200_20ago = ma200.iloc[-slope_lb]
-                if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
-                    # 단순 비교로 상승/하락 여부 판단
-                    ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
-                    ma200_slope_method = "simple_compare"
-            except (IndexError, KeyError):
-                pass
-        
-        # 대체 slope 2: 그것도 안 되면 unknown으로 처리 (slope=0으로 설정하여 failmode_soft 흐름으로)
+    slope_min_rows = max(200 + slope_lb, 260)
+    ma200_tail = ma200.tail(5)
+    ma200_tail_nan = int(ma200_tail.isna().sum())
+    ma200_slope_method = "standard"
+    ma200_slope_reason = "ok"
+
+    if len(df) < slope_min_rows:
+        ma200_slope = 0.0
+        ma200_slope_method = "unknown"
+        ma200_slope_reason = "data_short"
+    elif ma200_tail_nan > 0:
+        ma200_slope = 0.0
+        ma200_slope_method = "unknown"
+        ma200_slope_reason = "ma200_nan"
+    else:
+        ma200_slope = float(ma200.iloc[-1] - ma200.iloc[-(1 + slope_lb)])
         if not np.isfinite(ma200_slope):
-            ma200_slope = 0.0
-            ma200_slope_method = "unknown"
+            fallback_min = 200 + slope_lb
+            if len(df) >= fallback_min and len(ma200) >= slope_lb:
+                try:
+                    ma200_last = ma200.iloc[-1]
+                    ma200_20ago = ma200.iloc[-slope_lb]
+                    if np.isfinite(ma200_last) and np.isfinite(ma200_20ago):
+                        ma200_slope = 1.0 if ma200_last > ma200_20ago else -1.0
+                        ma200_slope_method = "simple_compare"
+                except (IndexError, KeyError):
+                    pass
+            if not np.isfinite(ma200_slope):
+                ma200_slope = 0.0
+                ma200_slope_method = "unknown"
+                ma200_slope_reason = "ma200_nan"
 
     atr_value = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else float("nan")
     last_close = float(close.iloc[-1])
@@ -124,12 +131,15 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
         "ma200": float(ma200.iloc[-1]),
         "ma20": float(ma20.iloc[-1]),
         "ma200_slope": ma200_slope,
-        "ma200_slope_method": ma200_slope_method,  # degrade 방법 기록
+        "ma200_slope_method": ma200_slope_method,
+        "ma200_slope_reason": ma200_slope_reason,
+        "ma200_slope_window": slope_lb,
+        "ma200_tail_nan": ma200_tail_nan,
         "atr14": atr_value,
-        "atr_pct": atr_ratio,  # ratio (0~1) 저장
+        "atr_pct": atr_ratio,
         "hi_52w": hi_52w,
         "lo_52w": lo_52w,
-        "hi_52w_available": hi_52w_available,  # 252일 데이터 보유 여부
+        "hi_52w_available": hi_52w_available,
         "dollar_vol_50": dollar_vol_50,
         "value20": value20,
         "vol20": vol20,

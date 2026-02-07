@@ -30,6 +30,10 @@ _REASON_MAP = {
     "planned_qty_zero_or_min_order": "MIN_ORDER_FAIL",
     "atr_pct_too_high": "ATR_TOO_HIGH",
     "liquidity_too_low": "LIQ_TOO_LOW",
+    "data_short": "DATA_SHORT",
+    "ma200_slope_unknown": "MA200_SLOPE_UNKNOWN",
+    "ma200_nan": "MA200_NAN",
+    "atr_pct_missing": "ATR_MISSING",
 }
 
 

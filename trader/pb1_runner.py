@@ -1612,6 +1612,8 @@ def run_once(
 
         # ✅ [GATE SEPARATION] calc_allowed, price_allowed, order_allowed
         minervini_only = os.getenv("MINERVINI_ONLY", "0") == "1"
+        mode_input = (os.getenv("MODE") or "").strip().lower()
+        minervini_test = mode_input == "minervini_test"
         
         # calc_allowed: 분석/스코어 계산 가능 여부
         if minervini_only:
@@ -1634,6 +1636,12 @@ def run_once(
             entry_block_reason = "minervini_only_mode"
             logger.info("[PB1][MINERVINI_ONLY] order_allowed=0 KIS_HTTP_ENABLED=%s DRY_RUN=%s",
                        os.getenv("KIS_HTTP_ENABLED", "N/A"), os.getenv("DRY_RUN", "N/A"))
+
+        if minervini_test:
+            calc_allowed = True
+            order_allowed = False
+            entry_block_reason = entry_block_reason or "minervini_test"
+            logger.info("[PB1][MINERVINI_TEST] compute_allowed=1 order_allowed=0")
         
         # [2] 거래시간 체크: LIVE 모드에서 장중 여부 판정
         if mode == "LIVE" and not minervini_only:
@@ -2265,6 +2273,21 @@ def main() -> int:
     
     # else: TRADE_INTRADAY (기존 로직)
     logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
+
+    mode_input = (os.getenv("MODE") or "").strip().lower()
+    minervini_test = mode_input == "minervini_test"
+    minervini_with_pb1 = env_bool("MINERVINI_TEST_WITH_PB1", default=False)
+    if minervini_test:
+        selection_only = not minervini_with_pb1
+        if selection_only:
+            os.environ["MINERVINI_ONLY"] = "1"
+        else:
+            os.environ["MINERVINI_ONLY"] = "0"
+        logger.info(
+            "[RUN_PLAN] MODE=minervini_test selection_only=%s with_pb1=%s",
+            int(selection_only),
+            int(minervini_with_pb1),
+        )
     
     # ✅ DIAG Minervini-only 모드 체크 (최우선 처리)
     diag_minervini_only = os.getenv("PB1_DIAG_MINERVINI_ONLY", "0") == "1"
@@ -2363,8 +2386,8 @@ def main() -> int:
         logger.info("[PB1][ENV][AUTO] STRATEGY_ENV not set -> using KIS_ENV=%s", kis_env)
     
     # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
-    from trader.config import MINERVINI_ONLY
-    if MINERVINI_ONLY:
+    minervini_only_env = os.getenv("MINERVINI_ONLY", "0") == "1"
+    if minervini_only_env:
         os.environ["KIS_HTTP_ENABLED"] = "0"
         os.environ["DISABLE_LIVE_TRADING"] = "1"
         os.environ["LIVE_TRADING_ENABLED"] = "0"
@@ -2382,7 +2405,7 @@ def main() -> int:
         "[PB1][MODE] mode_env=%s resolved=%s fixed_in_env=True MINERVINI_ONLY=%s",
         mode_env,
         resolved_mode,
-        int(MINERVINI_ONLY),
+        int(minervini_only_env),
     )
     
     args = parse_args()

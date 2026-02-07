@@ -55,6 +55,22 @@ on:
         description: "practice or real (internal standard). DO NOT use PAPER/REAL strings here."
         required: false
         default: "practice"
+      ATR_MAX_PCT:
+        description: "ATR max percent (ratio like 0.10)"
+        required: false
+        default: "0.10"
+      MINERVINI_TEST_WITH_PB1:
+        description: "1=run PB1 decision pipeline during minervini_test"
+        required: false
+        default: "0"
+      MINERVINI_FORCE_COMPUTE:
+        description: "1=force compute even when entry cutoff blocks orders"
+        required: false
+        default: "1"
+      ENTRY_CUTOFF_BYPASS_FOR_COMPUTE:
+        description: "1=bypass entry cutoff for compute only"
+        required: false
+        default: "1"
 
   schedule:
     # Weekend candidate pool build: Sat 00:30 KST = Fri 15:30 UTC
@@ -97,7 +113,7 @@ jobs:
       BOTSTATE_DISABLED: "1"
 
       # Universe 환경 설정
-      STRATEGY_ENV: "PAPER"
+      STRATEGY_ENV: "practice"
       
       # KIS API (FDR는 필요 없지만 환경 통일을 위해 유지)
       # ✅ Internal standard: practice (not PAPER)
@@ -242,7 +258,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: "PRACTICE"
+      STRATEGY_ENV: "practice"
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -262,7 +278,7 @@ jobs:
       OHLCV_PREFETCH_VERBOSE: "0"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: "PRACTICE"
+      CANDIDATE_POOL_UNIVERSE_ENV: "practice"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -376,7 +392,7 @@ jobs:
 
       # 후보군은 무조건 DIAG로 (매매 금지)
       STRATEGY_MODE: "DIAG"
-      STRATEGY_ENV: "PRACTICE"
+      STRATEGY_ENV: "practice"
 
       # 후보군 계산은 HTTP 막고(시장시간/토큰 의존 최소화) pykrx/DB fallback 사용
       KIS_HTTP_ENABLED: "0"
@@ -388,7 +404,7 @@ jobs:
       CANDIDATE_POOL_TTL_DAYS: "7"
 
       # 유니버스는 KIS_ENV(practice/real) 기준으로 저장/조회
-      CANDIDATE_POOL_UNIVERSE_ENV: "PRACTICE"
+      CANDIDATE_POOL_UNIVERSE_ENV: "practice"
 
       # Candidate가 참조할 Universe 전략키 (DB에 저장된 universe 사용)
       CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
@@ -453,7 +469,7 @@ jobs:
           from trader.db.engine import get_engine
           from trader.db.repos import WatchlistRepo
 
-          env = os.getenv("STRATEGY_ENV", "PAPER")
+          env = os.getenv("STRATEGY_ENV", "practice")
           strategy_key = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
 
           engine = get_engine()
@@ -533,7 +549,7 @@ jobs:
 
       # env standard
       KIS_ENV: practice
-      STRATEGY_ENV: PRACTICE
+      STRATEGY_ENV: practice
       MODE: minervini_test
 
       # ✅ 정규장 selection을 주말에 그대로 재현
@@ -570,6 +586,10 @@ jobs:
 
       # minervini_only는 0 (이거 1이면 selection 안 돎)
       MINERVINI_ONLY: "0"
+      MINERVINI_TEST_WITH_PB1: ${{ github.event.inputs.MINERVINI_TEST_WITH_PB1 || '0' }}
+      MINERVINI_FORCE_COMPUTE: ${{ github.event.inputs.MINERVINI_FORCE_COMPUTE || '1' }}
+      ENTRY_CUTOFF_BYPASS_FOR_COMPUTE: ${{ github.event.inputs.ENTRY_CUTOFF_BYPASS_FOR_COMPUTE || '1' }}
+      ATR_MAX_PCT: ${{ github.event.inputs.ATR_MAX_PCT || '0.10' }}
 
       DB_DISABLE_PREPARED_STATEMENTS: "1"
 
@@ -671,7 +691,7 @@ jobs:
       # ✅ KIS_ENV/STRATEGY_ENV 동기화 (중복 정의 제거, mismatch 방지)
       # Note: ENV input should be 'practice' or 'real' per internal standard
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'practice' }}
-      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'PRACTICE' }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ENV || 'practice' }}
 
       # ✅ MINERVINI_ONLY 모드 (미너비니 계산만, KIS HTTP/주문 금지)
       MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MINERVINI_ONLY || '0' }}
@@ -680,7 +700,7 @@ jobs:
 
       MINERVINI_OHLCV_DAYS: "520"
       MA200_SLOPE_LOOKBACK: "20"
-      PB1_ATR_MAX_PCT: "10"
+      ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ATR_MAX_PCT || '0.10' }}
 
       # ✅ 후보군: DB 로드 전용 (재빌드 절대 금지)
       CANDIDATE_POOL_ENABLED: "1"
@@ -797,7 +817,7 @@ jobs:
 
             # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
             echo "KIS_ENV=practice" >> $GITHUB_ENV
-            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=practice" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
@@ -822,21 +842,21 @@ jobs:
 
             # ✅ DB 파티션/전략키는 practice/real로 통일 (내부 표준)
             echo "KIS_ENV=practice" >> $GITHUB_ENV
-            echo "STRATEGY_ENV=PRACTICE" >> $GITHUB_ENV
+            echo "STRATEGY_ENV=practice" >> $GITHUB_ENV
             
             # ✅ 접속 서버는 URL로 vts(모의) 고정
             echo "API_BASE_URL=https://openapivts.koreainvestment.com:29443" >> $GITHUB_ENV
 
             # MODE별 분기 처리
             if [[ "${{ github.event.inputs.MODE }}" == "minervini_test" ]]; then
-              # 🔥 minervini_test: LIVE 동일 경로 + 주문만 차단
-              echo "STRATEGY_MODE=LIVE" >> $GITHUB_ENV
+              # 🔥 minervini_test: compute only, 주문은 차단
+              echo "STRATEGY_MODE=DIAG" >> $GITHUB_ENV
               echo "PB1_PHASE_DEFAULT=entry" >> $GITHUB_ENV
 
               echo "NO_TRADE=1" >> $GITHUB_ENV
-              echo "DRY_RUN=0" >> $GITHUB_ENV
-              echo "DISABLE_LIVE_TRADING=0" >> $GITHUB_ENV
-              echo "LIVE_TRADING_ENABLED=1" >> $GITHUB_ENV
+              echo "DRY_RUN=1" >> $GITHUB_ENV
+              echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
+              echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
               echo "KIS_HTTP_ENABLED=1" >> $GITHUB_ENV
 
             else
@@ -956,12 +976,12 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
-      - name: Normalize ENV (force uppercase)
+      - name: Normalize ENV (force lowercase)
         run: |
           set -euo pipefail
-          echo "KIS_ENV=${KIS_ENV^^}" >> "$GITHUB_ENV"
-          echo "STRATEGY_ENV=${STRATEGY_ENV^^}" >> "$GITHUB_ENV"
-          echo "[ENV][NORMALIZE] KIS_ENV=${KIS_ENV^^} STRATEGY_ENV=${STRATEGY_ENV^^}"
+          echo "KIS_ENV=${KIS_ENV,,}" >> "$GITHUB_ENV"
+          echo "STRATEGY_ENV=${STRATEGY_ENV,,}" >> "$GITHUB_ENV"
+          echo "[ENV][NORMALIZE] KIS_ENV=${KIS_ENV,,} STRATEGY_ENV=${STRATEGY_ENV,,}"
 
       - name: DB universe precheck
         run: |
