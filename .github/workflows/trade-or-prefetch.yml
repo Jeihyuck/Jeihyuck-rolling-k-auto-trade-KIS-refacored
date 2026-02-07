@@ -507,17 +507,149 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
+  minervini_weekend_test:
+    name: "Minervini Weekend Test (DB universe/pool, NO ORDER)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.MODE == 'minervini_test'
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      # DB
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+      # KIS secrets (import가 필요할 수 있어 유지) + 서버는 vts 고정
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: https://openapivts.koreainvestment.com:29443
+
+      # 내부 표준 파티션
+      KIS_ENV: "practice"
+      STRATEGY_ENV: "PRACTICE"
+
+      # ✅ 절대 안전잠금(주문/HTTP 차단)
+      NO_TRADE: "1"
+      MINERVINI_ONLY: "1"
+      DRY_RUN: "1"
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      KIS_HTTP_ENABLED: "0"
+      STRATEGY_MODE: "DIAG"
+
+      # ✅ Universe/Candidate는 DB 로드만 (리빌드 금지)
+      UNIVERSE_SOURCE: "DB_ONLY"
+      UNIVERSE_FORCE_REBUILD: "0"
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      CANDIDATE_POOL_TTL_DAYS: "7"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
+
+      # watchlist 재생성 금지(후보 120 그대로 활용)
+      PB1_WATCHLIST_ENABLED: "1"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+
+      BOTSTATE_DISABLED: "1"
+      SQLITE_DISABLED: "1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: "nullim"
+          path: repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Verify candidate pool exists (DB load only)
+        run: |
+          set -euo pipefail
+          python scripts/verify_candidate_pool.py
+
+      - name: Verify universe exists (DB load only)
+        run: |
+          set -euo pipefail
+          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "DIAG"
+
+      - name: Run Minervini filter (NO ORDER)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Minervini Weekend Test"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "[RUN] MODE=minervini_test NO_TRADE=$NO_TRADE MINERVINI_ONLY=$MINERVINI_ONLY KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED"
+          echo "======================================"
+
+          # NOTE:
+          # 프로젝트에서 MINERVINI_ONLY=1이면 pb1_runner가 미너비니 필터만 수행하도록 구현되어 있다고 가정.
+          # 만약 전용 엔트리포인트가 있으면 그것을 우선 사용하도록 아래 탐색 순서를 적용.
+          if python -c "import trader.minervini_runner" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini_runner"
+            python -m trader.minervini_runner
+          elif python -c "import trader.minervini" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.minervini"
+            python -m trader.minervini
+          elif python -c "import trader.pb1_runner" >/dev/null 2>&1; then
+            echo "[MINERVINI] Using trader.pb1_runner (MINERVINI_ONLY=1)"
+            python -m trader.pb1_runner
+          else
+            echo "::error::No known minervini entrypoint found."
+            echo "[DEBUG] Listing trader modules:"
+            python -c "import pkgutil, trader; mods = sorted([m.name for m in pkgutil.iter_modules(trader.__path__)]); print('\\n'.join(mods))"
+            exit 2
+          fi
+
   trade_tick:
     needs: [universe_build, candidate_pool_prefetch, candidate_pool]
     name: Trade Tick (daily)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # ✅ trade-tick 실행 조건: MODE=trade/minervini_test/both, pre-market schedule, or intraday schedule
+    # ✅ trade-tick 실행 조건: MODE=trade/both, pre-market schedule, or intraday schedule
     if: >
       (github.event_name == 'schedule' && (github.event.schedule == '55 23 * * 0-4' || github.event.schedule == '*/15 0-6 * * 1-5')) ||
       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'minervini_test' || github.event.inputs.MODE == 'both'))
+        (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both'))
 
     env:
       TZ: Asia/Seoul
