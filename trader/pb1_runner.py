@@ -1530,10 +1530,11 @@ def run_once(
         os.getenv("PB1_ENTRY_ENABLED"),
     )
 
-    # Ensure dry_run_reason is always defined (avoid NameError on non-trading-day paths)
-    dry_run_reason = locals().get("dry_run_reason") or os.getenv("DRY_RUN_REASON") or "nontrading_day"
+    # Ensure defined for all branches (prevents NameError in non-trading-day path)
+    dry_run_reason = "unknown"
 
     if non_trading_day:
+        dry_run_reason = "nontrading_day"
         logger.info("[PB1][SKIP] non-trading-day(%s) → diagnostics/dry-run reason=%s", now.date(), dry_run_reason)
         if diag_enabled:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())

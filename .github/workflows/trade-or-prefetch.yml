@@ -508,7 +508,7 @@ jobs:
           echo "OK: no sqlite artifacts."
 
   minervini_weekend_test:
-    name: Minervini Weekend Test (no-order, full selection)
+    name: Minervini Weekend Test (FULL selection, NO ORDER)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -531,48 +531,47 @@ jobs:
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       API_BASE_URL: https://openapivts.koreainvestment.com:29443
 
-      # --- env standard ---
+      # env standard
       KIS_ENV: practice
       STRATEGY_ENV: PRACTICE
       MODE: minervini_test
+
+      # ✅ 정규장 selection을 주말에 그대로 재현
       STRATEGY_MODE: DIAG
-
+      PB1_PHASE_DEFAULT: entry
       PB1_DIAG_FULL_EXEC: "1"
-      PB1_WINDOW_OVERRIDE: "day"
-      PB1_ALLOW_OUTSIDE_WINDOWS: "1"
+      PB1_EARLY_STOP_ENABLED: "0"
 
-      # --- absolutely no orders ---
+      # ✅ watchlist 120 → 50 → 30
+      CANDIDATE_POOL_ENABLED: "1"
+      CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
+      CANDIDATE_POOL_MIN_SIZE: "40"
+      PB1_WATCHLIST_ENABLED: "1"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FINALN: "30"
+
+      # ✅ 리빌드 금지(기존 DB 사용)
+      UNIVERSE_SOURCE: DB_ONLY
+      UNIVERSE_FORCE_REBUILD: "0"
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      # ✅ 주문 4중 차단(절대 주문 X)
       NO_TRADE: "1"
       DRY_RUN: "1"
       DISABLE_LIVE_TRADING: "1"
       LIVE_TRADING_ENABLED: "0"
 
-      # --- allow HTTP for quotes if your selection path needs it ---
-      # (orders still blocked above)
+      # ✅ 조회는 허용(단, kis_wrapper 정책이 env로 제어되도록)
       KIS_HTTP_ENABLED: "1"
 
-      # --- DB reuse only ---
-      UNIVERSE_SOURCE: DB_ONLY
-      UNIVERSE_FORCE_REBUILD: "0"
-      CANDIDATE_POOL_FORCE_REBUILD: "0"
-      PB1_WATCHLIST_AUTOBUILD: "0"
-      PB1_WATCHLIST_FORCE_REBUILD: "0"
-      SQLITE_DISABLED: "1"
-      BOTSTATE_DISABLED: "1"
-
-      # --- selection params (120 -> 50 -> 30) ---
-      CANDIDATE_POOL_ENABLED: "1"
-      CANDIDATE_POOL_STRATEGY_KEY: pb1_candidate_pool
-      CANDIDATE_POOL_MIN_SIZE: "40"
-      PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_TOPK: "50"
-      PB1_WATCHLIST_FINALN: "30"
-      PB1_EARLY_STOP_ENABLED: "0"
-
-      # --- IMPORTANT: do NOT use MINERVINI_ONLY=1 (it forces smoke path + forces HTTP=0 in your logs) ---
+      # minervini_only는 0 (이거 1이면 selection 안 돎)
       MINERVINI_ONLY: "0"
 
-      PB1_PHASE_DEFAULT: "entry"
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
 
     steps:
       - name: Checkout

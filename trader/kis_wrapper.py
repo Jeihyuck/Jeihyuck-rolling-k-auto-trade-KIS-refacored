@@ -695,8 +695,22 @@ class KisAPI:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
+        # Safe helper: always defined, avoids name collisions with variables
+        def kis_http_on() -> bool:
+            from trader.config import MINERVINI_ONLY
+
+            if MINERVINI_ONLY:
+                return False
+
+            v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
+            if v in ("0", "FALSE", "NO", "OFF"):
+                return False
+            if v == "AUTO":
+                return os.getenv("STRATEGY_MODE", "").strip().upper() == "LIVE"
+            return True
+
         # ✅ KIS_HTTP_ENABLED 차단
-        if not kis_http_enabled():
+        if not kis_http_on():
             logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=%s", os.getenv("STRATEGY_MODE"), url)
             
             # Stub response 반환
@@ -712,9 +726,9 @@ class KisAPI:
         
         # ✅ DIAG 모드 KIS API 차단 (KIS_HTTP_ENABLED=1이면 읽기 허용)
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-        kis_http_enabled = str(os.getenv("KIS_HTTP_ENABLED", "0"))
+        kis_http_env = str(os.getenv("KIS_HTTP_ENABLED", "0")).strip()
 
-        if strategy_mode == "DIAG" and kis_http_enabled != "1":
+        if strategy_mode == "DIAG" and kis_http_env != "1":
             raise KISBlockedError(f"KIS API blocked in DIAG mode (KIS_HTTP_ENABLED=0): {method} {url}")
         
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
