@@ -594,10 +594,14 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Force NO_TRADE=1 (belt & suspenders)
+        run: |
+          echo "NO_TRADE=1" >> "$GITHUB_ENV"
+
       - name: Assert safe no-order env (fail fast)
         run: |
           set -euo pipefail
-          echo "[ASSERT] NO_TRADE=$NO_TRADE DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
+          echo "[ASSERT] NO_TRADE=${NO_TRADE:-} DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           [ "$NO_TRADE" = "1" ] || (echo "::error::NO_TRADE must be 1" && exit 2)
           [ "$DRY_RUN" = "1" ] || (echo "::error::DRY_RUN must be 1" && exit 2)
           [ "$DISABLE_LIVE_TRADING" = "1" ] || (echo "::error::DISABLE_LIVE_TRADING must be 1" && exit 2)
