@@ -512,9 +512,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    needs: [universe_build, candidate_pool_prefetch, candidate_pool]
+
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.MODE == 'minervini_test'
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.MODE == 'minervini_test') ||
+      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
 
     env:
       TZ: Asia/Seoul
@@ -540,7 +542,7 @@ jobs:
       DRY_RUN: "1"
       DISABLE_LIVE_TRADING: "1"
       LIVE_TRADING_ENABLED: "0"
-      KIS_HTTP_ENABLED: "0"
+      KIS_HTTP_ENABLED: "1"
       STRATEGY_MODE: "DIAG"
       PB1_PHASE_DEFAULT: "entry"
       KIS_ENV: "practice"
@@ -556,6 +558,9 @@ jobs:
       CANDIDATE_POOL_ENABLED: "1"
       CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
       CANDIDATE_POOL_MIN_SIZE: "40"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FINALN: "30"
+      PB1_EARLY_STOP_ENABLED: "0"
 
     steps:
       - name: Checkout code
@@ -587,11 +592,6 @@ jobs:
             exit 1
           fi
 
-      - name: DB migrate
-        run: |
-          set -euo pipefail
-          python -m trader.db.migrate
-
       - name: Assert safe-mode env (hard lock)
         run: |
           set -euo pipefail
@@ -606,7 +606,12 @@ jobs:
           [[ "${DRY_RUN}" == "1" ]] || { echo "::error::DRY_RUN must be 1"; exit 1; }
           [[ "${DISABLE_LIVE_TRADING}" == "1" ]] || { echo "::error::DISABLE_LIVE_TRADING must be 1"; exit 1; }
           [[ "${LIVE_TRADING_ENABLED}" == "0" ]] || { echo "::error::LIVE_TRADING_ENABLED must be 0"; exit 1; }
-          [[ "${KIS_HTTP_ENABLED}" == "0" ]] || { echo "::error::KIS_HTTP_ENABLED must be 0"; exit 1; }
+          [[ "${KIS_HTTP_ENABLED}" == "1" ]] || { echo "::error::KIS_HTTP_ENABLED must be 1"; exit 1; }
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
 
       - name: Verify candidate pool exists (DB load only)
         run: |

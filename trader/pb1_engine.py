@@ -5121,6 +5121,34 @@ class PB1Engine:
             # ✅ MINERVINI_ONLY 모드: 계산 완료 후 결과 저장하고 조기 종료
             if minervini_only:
                 minervini_pass_count = len([c for c in candidates if c.setup_ok])
+                minervini_fail_count = len(candidates) - minervini_pass_count
+                topk_target = int(os.getenv("PB1_WATCHLIST_TOPK", "50"))
+                finaln_target = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
+                scan_codes = [m.get("code") for m in (scan_members or []) if m.get("code")]
+                topk_selected = scan_codes[:topk_target]
+                finaln_selected = candidate_codes[:finaln_target]
+                logger.info(
+                    "[MINERVINI_ONLY][SUMMARY] candidate_loaded=%s",
+                    len(scan_members),
+                )
+                logger.info(
+                    "[MINERVINI_ONLY][SUMMARY] watchlist_topk=%s selected=%s sample=%s",
+                    topk_target,
+                    len(topk_selected),
+                    ",".join(topk_selected[:5]) if topk_selected else "(none)",
+                )
+                logger.info(
+                    "[MINERVINI_ONLY][SUMMARY] watchlist_finaln=%s selected=%s sample=%s",
+                    finaln_target,
+                    len(finaln_selected),
+                    ",".join(finaln_selected[:5]) if finaln_selected else "(none)",
+                )
+                logger.info(
+                    "[MINERVINI_ONLY][SUMMARY] minervini_pass_count=%s fail_count=%s",
+                    minervini_pass_count,
+                    minervini_fail_count,
+                )
+                self._log_reason_summary("minervini_only")
                 minervini_top_10 = candidate_codes[:10] if len(candidate_codes) >= 10 else candidate_codes
                 
                 print(
