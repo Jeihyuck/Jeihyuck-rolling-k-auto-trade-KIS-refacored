@@ -4230,6 +4230,10 @@ class PB1Engine:
                 "[CANDIDATE_POOL][USAGE] candidates_universe_size=%s as_of=%s%s (NOT 195 universe)",
                 len(pool_codes), pool_as_of, age_info
             )
+            if os.getenv("MINERVINI_ONLY") == "1":
+                print(
+                    f"[MINERVINI_ONLY][POOL] loaded={len(pool_codes)} as_of={pool_as_of}{age_info}"
+                )
             members = [
                 {
                     "code": code,
@@ -5119,6 +5123,10 @@ class PB1Engine:
                 minervini_pass_count = len([c for c in candidates if c.setup_ok])
                 minervini_top_10 = candidate_codes[:10] if len(candidate_codes) >= 10 else candidate_codes
                 
+                print(
+                    "[MINERVINI_ONLY][RESULT] passed=%s top10=%s"
+                    % (minervini_pass_count, ",".join(minervini_top_10) if minervini_top_10 else "(none)")
+                )
                 logger.info(
                     "[MINERVINI_ONLY][RESULT] minervini_dt=%.2f candidates_ok=%s minervini_top_summary=%s",
                     dt_minervini,

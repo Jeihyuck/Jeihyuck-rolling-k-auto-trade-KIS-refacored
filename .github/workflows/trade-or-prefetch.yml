@@ -533,13 +533,8 @@ jobs:
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
       APP_KEY: ${{ secrets.KIS_APP_KEY }}
       APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      API_BASE_URL: https://openapivts.koreainvestment.com:29443
 
-      # 내부 표준 파티션
-      KIS_ENV: "practice"
-      STRATEGY_ENV: "PRACTICE"
-
-      # ✅ 절대 안전잠금(주문/HTTP 차단)
+      # ✅ 강제 고정 (입력값 무시)
       NO_TRADE: "1"
       MINERVINI_ONLY: "1"
       DRY_RUN: "1"
@@ -547,23 +542,20 @@ jobs:
       LIVE_TRADING_ENABLED: "0"
       KIS_HTTP_ENABLED: "0"
       STRATEGY_MODE: "DIAG"
-
-      # ✅ Universe/Candidate는 DB 로드만 (리빌드 금지)
+      PB1_PHASE_DEFAULT: "entry"
+      KIS_ENV: "practice"
+      STRATEGY_ENV: "PRACTICE"
+      API_BASE_URL: "https://openapivts.koreainvestment.com:29443"
       UNIVERSE_SOURCE: "DB_ONLY"
       UNIVERSE_FORCE_REBUILD: "0"
+      CANDIDATE_POOL_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
       CANDIDATE_POOL_ENABLED: "1"
       CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
       CANDIDATE_POOL_MIN_SIZE: "40"
-      CANDIDATE_POOL_TTL_DAYS: "7"
-      CANDIDATE_POOL_FORCE_REBUILD: "0"
-
-      # watchlist 재생성 금지(후보 120 그대로 활용)
-      PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_AUTOBUILD: "0"
-      PB1_WATCHLIST_FORCE_REBUILD: "0"
-
-      BOTSTATE_DISABLED: "1"
-      SQLITE_DISABLED: "1"
 
     steps:
       - name: Checkout code
@@ -600,7 +592,7 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
-      - name: Assert safe-mode env (no orders, no HTTP)
+      - name: Assert safe-mode env (hard lock)
         run: |
           set -euo pipefail
           echo "[ENV] NO_TRADE=${NO_TRADE}"
@@ -609,33 +601,12 @@ jobs:
           echo "[ENV] DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING}"
           echo "[ENV] LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED}"
           echo "[ENV] KIS_HTTP_ENABLED=${KIS_HTTP_ENABLED}"
-          echo "[ENV] STRATEGY_MODE=${STRATEGY_MODE}"
-          echo "[ENV] KIS_ENV=${KIS_ENV}"
-          echo "[ENV] STRATEGY_ENV=${STRATEGY_ENV}"
-          echo "[ENV] UNIVERSE_SOURCE=${UNIVERSE_SOURCE}"
-          echo "[ENV] UNIVERSE_FORCE_REBUILD=${UNIVERSE_FORCE_REBUILD}"
-          echo "[ENV] CANDIDATE_POOL_FORCE_REBUILD=${CANDIDATE_POOL_FORCE_REBUILD}"
-          echo "[ENV] PB1_WATCHLIST_AUTOBUILD=${PB1_WATCHLIST_AUTOBUILD}"
-          echo "[ENV] PB1_WATCHLIST_FORCE_REBUILD=${PB1_WATCHLIST_FORCE_REBUILD}"
-          echo "[ENV] SQLITE_DISABLED=${SQLITE_DISABLED}"
-          echo "[ENV] BOTSTATE_DISABLED=${BOTSTATE_DISABLED}"
-
           [[ "${NO_TRADE}" == "1" ]] || { echo "::error::NO_TRADE must be 1"; exit 1; }
           [[ "${MINERVINI_ONLY}" == "1" ]] || { echo "::error::MINERVINI_ONLY must be 1"; exit 1; }
           [[ "${DRY_RUN}" == "1" ]] || { echo "::error::DRY_RUN must be 1"; exit 1; }
           [[ "${DISABLE_LIVE_TRADING}" == "1" ]] || { echo "::error::DISABLE_LIVE_TRADING must be 1"; exit 1; }
           [[ "${LIVE_TRADING_ENABLED}" == "0" ]] || { echo "::error::LIVE_TRADING_ENABLED must be 0"; exit 1; }
           [[ "${KIS_HTTP_ENABLED}" == "0" ]] || { echo "::error::KIS_HTTP_ENABLED must be 0"; exit 1; }
-          [[ "${STRATEGY_MODE}" == "DIAG" ]] || { echo "::error::STRATEGY_MODE must be DIAG"; exit 1; }
-          [[ "${KIS_ENV}" == "practice" ]] || { echo "::error::KIS_ENV must be practice"; exit 1; }
-          [[ "${STRATEGY_ENV}" == "PRACTICE" ]] || { echo "::error::STRATEGY_ENV must be PRACTICE"; exit 1; }
-          [[ "${UNIVERSE_SOURCE}" == "DB_ONLY" ]] || { echo "::error::UNIVERSE_SOURCE must be DB_ONLY"; exit 1; }
-          [[ "${UNIVERSE_FORCE_REBUILD}" == "0" ]] || { echo "::error::UNIVERSE_FORCE_REBUILD must be 0"; exit 1; }
-          [[ "${CANDIDATE_POOL_FORCE_REBUILD}" == "0" ]] || { echo "::error::CANDIDATE_POOL_FORCE_REBUILD must be 0"; exit 1; }
-          [[ "${PB1_WATCHLIST_AUTOBUILD}" == "0" ]] || { echo "::error::PB1_WATCHLIST_AUTOBUILD must be 0"; exit 1; }
-          [[ "${PB1_WATCHLIST_FORCE_REBUILD}" == "0" ]] || { echo "::error::PB1_WATCHLIST_FORCE_REBUILD must be 0"; exit 1; }
-          [[ "${SQLITE_DISABLED}" == "1" ]] || { echo "::error::SQLITE_DISABLED must be 1"; exit 1; }
-          [[ "${BOTSTATE_DISABLED}" == "1" ]] || { echo "::error::BOTSTATE_DISABLED must be 1"; exit 1; }
 
       - name: Verify candidate pool exists (DB load only)
         run: |
@@ -645,9 +616,15 @@ jobs:
       - name: Verify universe exists (DB load only)
         run: |
           set -euo pipefail
-          python -m trader.universe.db_check --env "${KIS_ENV}" --strategy best_k_meta --mode "DIAG"
+          python -m trader.universe.db_check --env practice --strategy best_k_meta --mode DIAG
 
-      - name: Run Minervini filter (NO ORDER)
+      - name: Log candidate pool stats (pre-run)
+        run: |
+          set -euo pipefail
+          echo "[MINERVINI_TEST] MINERVINI_ONLY=${MINERVINI_ONLY} STRATEGY_MODE=${STRATEGY_MODE} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT}"
+          python scripts/verify_candidate_pool.py
+
+      - name: Run PB1 runner (NO ORDER)
         run: |
           set -euo pipefail
           echo "======================================"
@@ -656,33 +633,14 @@ jobs:
           echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "[RUN] MODE=minervini_test NO_TRADE=$NO_TRADE MINERVINI_ONLY=$MINERVINI_ONLY KIS_HTTP_ENABLED=$KIS_HTTP_ENABLED DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
           echo "======================================"
+          echo "[MINERVINI] Using trader.pb1_runner (MINERVINI_ONLY=1)"
+          python -m trader.pb1_runner
 
-          if python -c "import trader.minervini.runner" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini.runner"
-            python -m trader.minervini.runner
-          elif python -c "import trader.minervini.cli" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini.cli"
-            python -m trader.minervini.cli
-          elif python -c "import trader.minervini.main" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini.main"
-            python -m trader.minervini.main
-          elif python -c "import trader.minervini.run" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.minervini.run"
-            python -m trader.minervini.run
-          elif [ -f "scripts/run_minervini.py" ]; then
-            echo "[MINERVINI] Using scripts/run_minervini.py"
-            python scripts/run_minervini.py
-          elif [ -f "scripts/minervini.py" ]; then
-            echo "[MINERVINI] Using scripts/minervini.py"
-            python scripts/minervini.py
-          elif python -c "import trader.pb1_runner" >/dev/null 2>&1; then
-            echo "[MINERVINI] Using trader.pb1_runner (MINERVINI_ONLY=1)"
-            python -m trader.pb1_runner
-          else
-            echo "::error::No known minervini entrypoint found."
-            python -c "import pkgutil, trader; print('\\n'.join(sorted([m.name for m in pkgutil.iter_modules(trader.__path__)])))"
-            exit 2
-          fi
+      - name: Log candidate pool stats (post-run)
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "[MINERVINI_TEST] pb1_runner completed. MODE=minervini_test MINERVINI_ONLY=${MINERVINI_ONLY}"
 
   trade_tick:
     needs: [universe_build, candidate_pool_prefetch, candidate_pool]
