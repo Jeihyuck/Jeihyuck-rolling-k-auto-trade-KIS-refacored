@@ -535,6 +535,11 @@ jobs:
       KIS_ENV: practice
       STRATEGY_ENV: PRACTICE
       MODE: minervini_test
+      STRATEGY_MODE: DIAG
+
+      PB1_DIAG_FULL_EXEC: "1"
+      PB1_WINDOW_OVERRIDE: "day"
+      PB1_ALLOW_OUTSIDE_WINDOWS: "1"
 
       # --- absolutely no orders ---
       NO_TRADE: "1"
@@ -546,13 +551,12 @@ jobs:
       # (orders still blocked above)
       KIS_HTTP_ENABLED: "1"
 
-      # --- IMPORTANT: do NOT use MINERVINI_ONLY=1 (it forces smoke path + forces HTTP=0 in your logs) ---
-      MINERVINI_ONLY: "0"
-
       # --- DB reuse only ---
       UNIVERSE_SOURCE: DB_ONLY
       UNIVERSE_FORCE_REBUILD: "0"
       CANDIDATE_POOL_FORCE_REBUILD: "0"
+      PB1_WATCHLIST_AUTOBUILD: "0"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
       SQLITE_DISABLED: "1"
       BOTSTATE_DISABLED: "1"
 
@@ -561,16 +565,13 @@ jobs:
       CANDIDATE_POOL_STRATEGY_KEY: pb1_candidate_pool
       CANDIDATE_POOL_MIN_SIZE: "40"
       PB1_WATCHLIST_ENABLED: "1"
-      PB1_WATCHLIST_AUTOBUILD: "0"
-      PB1_WATCHLIST_FORCE_REBUILD: "0"
       PB1_WATCHLIST_TOPK: "50"
       PB1_WATCHLIST_FINALN: "30"
       PB1_EARLY_STOP_ENABLED: "0"
 
-      # --- force full selection even on weekend/off-hours (prevents smoke-only exit) ---
-      PB1_DIAG_FULL_EXEC: "1"
-      PB1_ALLOW_OUTSIDE_WINDOWS: "1"
-      PB1_WINDOW_OVERRIDE: "day"
+      # --- IMPORTANT: do NOT use MINERVINI_ONLY=1 (it forces smoke path + forces HTTP=0 in your logs) ---
+      MINERVINI_ONLY: "0"
+
       PB1_PHASE_DEFAULT: "entry"
 
     steps:
@@ -594,19 +595,22 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Force NO_TRADE=1 (belt & suspenders)
-        run: |
-          echo "NO_TRADE=1" >> "$GITHUB_ENV"
-
-      - name: Assert safe no-order env (fail fast)
+      - name: Force safety env (NO_TRADE hard lock)
         run: |
           set -euo pipefail
-          echo "[ASSERT] NO_TRADE=${NO_TRADE:-} DRY_RUN=$DRY_RUN DISABLE_LIVE_TRADING=$DISABLE_LIVE_TRADING LIVE_TRADING_ENABLED=$LIVE_TRADING_ENABLED"
-          [ "$NO_TRADE" = "1" ] || (echo "::error::NO_TRADE must be 1" && exit 2)
-          [ "$DRY_RUN" = "1" ] || (echo "::error::DRY_RUN must be 1" && exit 2)
-          [ "$DISABLE_LIVE_TRADING" = "1" ] || (echo "::error::DISABLE_LIVE_TRADING must be 1" && exit 2)
-          [ "$LIVE_TRADING_ENABLED" = "0" ] || (echo "::error::LIVE_TRADING_ENABLED must be 0" && exit 2)
-          [ "${MINERVINI_ONLY:-0}" = "0" ] || (echo "::error::MINERVINI_ONLY must be 0 for full selection test" && exit 2)
+          echo "NO_TRADE=1" >> $GITHUB_ENV
+          echo "DRY_RUN=1" >> $GITHUB_ENV
+          echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
+          echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
+
+      - name: Assert safe mode
+        run: |
+          set -euo pipefail
+          echo "[ASSERT] NO_TRADE=${NO_TRADE:-} DRY_RUN=${DRY_RUN:-} DISABLE_LIVE_TRADING=${DISABLE_LIVE_TRADING:-} LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-}"
+          [ "${NO_TRADE:-0}" = "1" ] || (echo "::error::NO_TRADE must be 1" && exit 2)
+          [ "${DRY_RUN:-0}" = "1" ] || (echo "::error::DRY_RUN must be 1" && exit 2)
+          [ "${DISABLE_LIVE_TRADING:-0}" = "1" ] || (echo "::error::DISABLE_LIVE_TRADING must be 1" && exit 2)
+          [ "${LIVE_TRADING_ENABLED:-1}" = "0" ] || (echo "::error::LIVE_TRADING_ENABLED must be 0" && exit 2)
 
       - name: DB migrate
         run: |

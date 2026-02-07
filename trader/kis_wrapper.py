@@ -710,15 +710,12 @@ class KisAPI:
 
             return _DiagDummyResponse()
         
-        # ✅ DIAG 모드 KIS API 차단
+        # ✅ DIAG 모드 KIS API 차단 (KIS_HTTP_ENABLED=1이면 읽기 허용)
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-        block_on_diag = os.getenv("KIS_BLOCK_ALL_ON_DIAG", "1") == "1"
-        allow_marketdata = os.getenv("DIAG_ALLOW_KIS_MARKETDATA", "0") == "1"
-        
-        if strategy_mode == "DIAG" and block_on_diag:
-            # 시세 조회 허용 옵션 체크
-            if not allow_marketdata:
-                raise KISBlockedError(f"KIS API blocked in DIAG mode: {method} {url}")
+        kis_http_enabled = str(os.getenv("KIS_HTTP_ENABLED", "0"))
+
+        if strategy_mode == "DIAG" and kis_http_enabled != "1":
+            raise KISBlockedError(f"KIS API blocked in DIAG mode (KIS_HTTP_ENABLED=0): {method} {url}")
         
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
             logger.warning("[NET][DIAG] KIS calls disabled; skipping request method=%s url=%s", method, url)
