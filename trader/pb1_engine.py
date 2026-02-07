@@ -1672,6 +1672,29 @@ class PB1Engine:
                         )
                         candidates.append(cf)
                         continue
+                    ma200_slope = features.get("ma200_slope")
+                    if debug_mode and (ma200_slope is None or (isinstance(ma200_slope, float) and not np.isfinite(ma200_slope))):
+                        close_series = df["close"] if "close" in df.columns else pd.Series(dtype=float)
+                        close_nan = int(close_series.isna().sum()) if not close_series.empty else 0
+                        if "date" in df.columns:
+                            first_date = str(df["date"].iloc[0])
+                            last_date = str(df["date"].iloc[-1])
+                        else:
+                            first_date = str(df.index[0]) if len(df.index) else "n/a"
+                            last_date = str(df.index[-1]) if len(df.index) else "n/a"
+                        ma200_series = close_series.rolling(200).mean() if not close_series.empty else pd.Series(dtype=float)
+                        ma200_valid = int(ma200_series.notna().sum()) if not ma200_series.empty else 0
+                        logger.info(
+                            "[MINERVINI][MA200_SLOPE_DEBUG] code=%s rows=%s first=%s last=%s close_nan=%s ma200_valid=%s ma200=%s slope=%s",
+                            code,
+                            len(df),
+                            first_date,
+                            last_date,
+                            close_nan,
+                            ma200_valid,
+                            features.get("ma200"),
+                            ma200_slope,
+                        )
                     close_val = features.get("close")
                     ma200_val = features.get("ma200")
                     scale_ratio = None
@@ -4728,6 +4751,10 @@ class PB1Engine:
         )
         
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
+            force_compute_when_cutoff = (
+                env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
+                or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
+            )
             entry_allowed = False
             order_allowed = False
             entry_reason = "entry_cutoff"
@@ -4736,6 +4763,9 @@ class PB1Engine:
                 self._now_kst.isoformat(),
                 entry_cutoff_dt.isoformat(),
             )
+            if force_compute_when_cutoff:
+                calc_allowed = True
+                logger.info("[PB1][CUTOFF_OVERRIDE] compute_only=1 order_allowed=0")
             if not calc_allowed and self.phase in {"prep", "entry"}:
                 skip_entry_scan = True
                 final_status = "SKIPPED"

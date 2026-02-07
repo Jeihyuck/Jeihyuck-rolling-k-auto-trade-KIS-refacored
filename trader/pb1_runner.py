@@ -41,6 +41,7 @@ from trader.config import (
     PB1_EXIT_WINDOW_END,
     PB1_MORNING_WINDOW_END,
     PB1_REQUIRE_BALANCE_FOR_ENTRY,
+    PB1_DIAG_IGNORE_ENTRY_CUTOFF,
     PB1_FORCE_ENTRY_ON_PUSH,
     PB1_MAX_WAIT_FOR_WINDOW_MIN,
     PB1_WAIT_FOR_WINDOW,
@@ -988,7 +989,6 @@ def run_once(
             break
     
     # [NEW] FORCE_RUN, WATCHLIST_MODE 로깅
-    from trader.utils.env import env_bool
     force_run = env_bool("FORCE_RUN", default=False)
     watchlist_mode = env_bool("WATCHLIST_MODE", default=False)
     # ✅ dry_run은 intended_live 결정 후 LIVE_ENV_LOCK에서 단 한 번만 파싱
@@ -1272,7 +1272,6 @@ def run_once(
 
     # ✅ CRITICAL: intended_live와 dry_run은 run_once에서 이미 확정됨
     # 여기서는 재계산하지 말고 env에서 그대로 읽기만 (이미 락됨)
-    from trader.utils.env import env_bool
     
     dry_run = env_bool("DRY_RUN", default=True)
     intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
@@ -1679,8 +1678,19 @@ def run_once(
                     resolved_phase,
                 )
                 if now.time() > cutoff_time:
+                    force_compute_when_cutoff = (
+                        env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
+                        or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
+                        or PB1_DIAG_IGNORE_ENTRY_CUTOFF
+                    )
                     order_allowed = False
                     entry_block_reason = entry_block_reason or "entry_cutoff"
+                    if force_compute_when_cutoff:
+                        calc_allowed = True
+                        logger.info(
+                            "[PB1][CUTOFF_OVERRIDE] compute_only=1 order_allowed=0 (reason=%s)",
+                            entry_block_reason,
+                        )
             except ValueError:
                 logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s", entry_cutoff_raw)
 
@@ -2339,7 +2349,6 @@ def main() -> int:
     
     # ✅ NEW: allow mismatch in DIAG/DRY_RUN (candidate-only/minervini test)
     # LIVE real trading must remain strict.
-    from trader.utils.env import env_bool
     live_trading_enabled = env_bool("LIVE_TRADING_ENABLED", default=False)
     dry_run = env_bool("DRY_RUN", default=True)
     sim_mode = env_bool("SIM_MODE", default=False)
