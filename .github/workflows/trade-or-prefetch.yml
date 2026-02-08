@@ -659,7 +659,7 @@ jobs:
           python -m trader.pb1_runner
 
   trade_tick:
-    needs: [universe_build, candidate_pool_prefetch, candidate_pool]
+    # needs: [universe_build, candidate_pool_prefetch, candidate_pool]
     name: Trade Tick (daily)
     runs-on: ubuntu-latest
     timeout-minutes: 60
