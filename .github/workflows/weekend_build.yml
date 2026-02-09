@@ -1,0 +1,176 @@
+name: Weekend Build (Universe + Prefetch + Candidate + Features)
+
+on:
+  schedule:
+    - cron: "30 15 * * 5" # Fri 15:30 UTC = Sat 00:30 KST
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekend-build
+  cancel-in-progress: false
+
+env:
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
+  KIS_HTTP_ENABLED: "1"
+  NO_TRADE: "1"
+  FORCE_CANDIDATE: "1"
+  PREFETCH_DAYS: "300"
+  CANDIDATE_POOL_TTL_DAYS: "7"
+  CANDIDATE_POOL_SIZE: "120"
+  CANDIDATE_POOL_MIN_SIZE: "40"
+  CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+  CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+  CANDIDATE_POOL_UNIVERSE_ENV: "practice"
+  MINERVINI_USE_FEATURE_CACHE: "1"
+  FEATURE_CACHE_ENABLED: "1"
+  FEATURE_CACHE_LOOKBACK_DAYS: "300"
+  DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: "Guard: postgres-only"
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Universe build (DB)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Weekend Build - Universe"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Strategy: best_k_meta"
+          echo "======================================"
+          python -m trader.universe.build
+
+      - name: Prefetch OHLCV to DB
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Weekend Build - OHLCV Prefetch"
+          echo "======================================"
+          echo "Days: ${PREFETCH_DAYS}"
+          echo "======================================"
+          python -m trader.data.prefetch --days "${PREFETCH_DAYS}"
+
+      - name: Build and Save Candidate Pool
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Weekend Build - Candidate Pool"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Env: ${STRATEGY_ENV}"
+          echo "Strategy: ${CANDIDATE_POOL_STRATEGY_KEY}"
+          echo "Force: ${FORCE_CANDIDATE}"
+          echo "Size: ${CANDIDATE_POOL_SIZE}"
+          echo "======================================"
+          python -m trader.candidate_pool_builder
+
+      - name: Build and Save Candidate Features Cache
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Weekend Build - Feature Cache"
+          echo "======================================"
+          echo "Enabled: ${FEATURE_CACHE_ENABLED}"
+          echo "Lookback: ${FEATURE_CACHE_LOOKBACK_DAYS}"
+          echo "======================================"
+          python -m trader.features.build_candidate_features || echo "::warning::Feature cache build failed (non-critical)"
+
+      - name: Verify Weekend Build Success
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from trader.db.engine import get_engine
+          from trader.db.repos import UniverseRepo
+
+          env = os.getenv("STRATEGY_ENV")
+          strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+          kst = ZoneInfo("Asia/Seoul")
+          today = datetime.now(kst).date()
+
+          engine = get_engine()
+          repo = UniverseRepo(engine)
+
+          # Verify candidate pool was saved
+          from trader.db.repos import load_watchlist
+          pool = load_watchlist(env=env, strategy=strategy, as_of=today, allow_fallback=False)
+          
+          if not pool or not pool.get("members"):
+              print(f"[WEEKEND_BUILD][FAIL] No candidate pool saved for as_of={today}")
+              sys.exit(1)
+          
+          print(f"[WEEKEND_BUILD][OK] ✅ Candidate pool saved: as_of={today} members={len(pool['members'])}")
+          PY
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."

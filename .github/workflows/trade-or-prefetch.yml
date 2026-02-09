@@ -72,17 +72,8 @@ on:
         required: false
         default: "1"
 
-  schedule:
-    # Weekend candidate pool build: Sat 00:30 KST = Fri 15:30 UTC
-    - cron: "30 15 * * 5"
-    # Daily trade tick (pre-market): Mon-Fri 08:55 KST = Sun-Thu 23:55 UTC
-    - cron: "55 23 * * 0-4"
-    # Intraday trading: Mon-Fri 09:00-15:00 KST = 00:00-06:00 UTC, every 15 min
-    - cron: "*/15 0-6 * * 1-5"
-    # Daily OHLCV prefetch: Mon-Fri 17:00 KST = 08:00 UTC
-    - cron: "0 8 * * 1-5"
-
-  # push 트리거 제거: 운영은 schedule 기본, 테스트는 workflow_dispatch로만
+  # ✅ schedule 제거: 운영은 weekend_build.yml(토요일) + weekday_trade_tick.yml(주중)만 사용
+  # ✅ 이 워크플로우는 수동 테스트/디버깅 전용 (workflow_dispatch만)
 
 defaults:
   run:
@@ -98,8 +89,7 @@ jobs:
     # 실행 조건: MODE=candidate/both만 실행 (trade는 스킵)
     if: >
       github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both')) ||
-      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'both'))
 
     env:
       TZ: Asia/Seoul
@@ -236,8 +226,7 @@ jobs:
 
     # 실행 조건: MODE=candidate/both만 실행 (prep legacy alias, trade는 스킵)
     if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
-      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both'))
 
     env:
       TZ: Asia/Seoul
@@ -370,8 +359,7 @@ jobs:
 
     # 실행 조건: MODE=candidate/both만 실행 (prep legacy alias, trade는 스킵)
     if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both')) ||
-      (github.event_name == 'schedule' && github.event.schedule == '30 15 * * 5')
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.MODE == 'candidate' || github.event.inputs.MODE == 'prep' || github.event.inputs.MODE == 'both'))
 
     env:
       TZ: Asia/Seoul
@@ -664,9 +652,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # ✅ trade-tick 실행 조건: MODE=trade/both, pre-market schedule, or intraday schedule
+    # ✅ trade-tick 실행 조건: workflow_dispatch with MODE=trade/both only
     if: >
-      (github.event_name == 'schedule' && (github.event.schedule == '55 23 * * 0-4' || github.event.schedule == '*/15 0-6 * * 1-5')) ||
       (github.event_name == 'workflow_dispatch' &&
         (github.event.inputs.MODE == 'trade' || github.event.inputs.MODE == 'both'))
 
