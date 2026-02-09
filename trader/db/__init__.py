@@ -5,6 +5,7 @@ Database utilities for the PB-Core v2 backend.
 from .engine import get_db_url, make_engine
 from .schema import (
     FILLS,
+    DERIVED_MINERVINI,
     LEDGER_EVENTS,
     ORDERS,
     POSITIONS,
@@ -28,6 +29,7 @@ __all__ = [
     "make_engine",
     "run_migrations",
     "FILLS",
+    "DERIVED_MINERVINI",
     "LEDGER_EVENTS",
     "ORDERS",
     "POSITIONS",

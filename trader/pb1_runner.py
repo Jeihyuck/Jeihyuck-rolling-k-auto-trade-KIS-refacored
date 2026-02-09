@@ -57,6 +57,7 @@ from trader.db.locks import acquire_advisory_lock, release_advisory_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
     FillsRepo,
+    DerivedMinerviniRepo,
     LedgerEventsRepo,
     OrdersRepo,
     PositionsRepo,
@@ -2416,6 +2417,40 @@ def main() -> int:
         resolved_mode,
         int(minervini_only_env),
     )
+
+    # ✅ Trade guard: PREP_DONE + derived_minervini + today watchlist required
+    if mode_input == "trade":
+        prep_as_of = now_kst().date()
+        engine = make_engine()
+        ledger_repo = LedgerEventsRepo(engine)
+        if not ledger_repo.has_event_type_on_date(env=os.getenv("STRATEGY_ENV", "practice").lower(), event_type="PREP_DONE", as_of=prep_as_of):
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE as_of=%s",
+                prep_as_of.isoformat(),
+            )
+            return 0
+        derived_repo = DerivedMinerviniRepo(engine)
+        if derived_repo.count_as_of(as_of=prep_as_of) <= 0:
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=DERIVED_MISSING as_of=%s",
+                prep_as_of.isoformat(),
+            )
+            return 0
+        pool_repo = WatchlistRepo(engine)
+        pool_env = os.getenv("STRATEGY_ENV", "practice").lower()
+        pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+        pool_rows, _ = pool_repo.load_watchlist(
+            env=pool_env,
+            strategy=pool_strategy,
+            as_of=prep_as_of,
+            allow_latest_fallback=False,
+        )
+        if not pool_rows:
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=CANDIDATE_POOL_MISSING as_of=%s",
+                prep_as_of.isoformat(),
+            )
+            return 0
     
     args = parse_args()
     assert_db_ready()

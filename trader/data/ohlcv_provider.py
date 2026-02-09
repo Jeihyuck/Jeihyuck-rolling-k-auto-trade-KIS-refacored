@@ -3,14 +3,14 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, List, Protocol
 
 import pandas as pd
 
 from trader.runtime_paths import get_ohlcv_cache_dir
-from trader.time_utils import now_kst
+from trader.time_utils import now_kst, prev_business_day
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv
 from trader.db.engine import make_engine
@@ -285,6 +285,8 @@ class ChainOHLCVProvider:
         return result
 
     def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
+        if os.getenv("MODE") == "trade" and days >= 260:
+            raise RuntimeError("TRADE_TICK_FORBIDS_LONG_OHLCV_FETCH")
         errors: list[str] = []
         best: OHLCVResult | None = None
         memory_key = (symbol, days)
@@ -351,3 +353,112 @@ class ChainOHLCVProvider:
         result = self._annotate_result(result, days=days)
         self._memory_cache[memory_key] = result
         return result
+
+
+def _recent_trading_dates(as_of: date, days: int) -> list[date]:
+    dates: list[date] = []
+    cursor = as_of
+    while len(dates) < days:
+        if cursor.weekday() >= 5:
+            cursor = prev_business_day(cursor)
+            continue
+        dates.append(cursor)
+        cursor = prev_business_day(cursor)
+    return sorted(dates)
+
+
+def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dict:
+    """Fetch recent trading days only and upsert to DB."""
+    if os.getenv("MODE") == "trade" and days >= 260:
+        raise RuntimeError("TRADE_TICK_FORBIDS_LONG_OHLCV_FETCH")
+    if days < 1:
+        return {"symbols": 0, "inserted": 0, "updated": 0, "dates": []}
+
+    try:
+        import FinanceDataReader as fdr
+    except Exception as exc:
+        raise RuntimeError(f"FinanceDataReader not available: {exc}")
+
+    engine = make_engine()
+    clean_symbols = [str(s).zfill(6) for s in symbols if s]
+    dates = _recent_trading_dates(as_of, days)
+    if not dates:
+        return {"symbols": len(clean_symbols), "inserted": 0, "updated": 0, "dates": []}
+
+    date_min = min(dates)
+    date_max = max(dates)
+    inserted = 0
+    updated = 0
+
+    for symbol in clean_symbols:
+        df = fdr.DataReader(symbol, start=date_min, end=date_max)
+        if df is None or df.empty:
+            continue
+        df = df.reset_index()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df[df["Date"].dt.date.isin(dates)]
+        if df.empty:
+            continue
+
+        existing = load_price_daily(engine, symbol, date_min, date_max)
+        existing_dates = {str(row.get("date"))[:10] for row in existing}
+
+        candles = []
+        for _, row in df.iterrows():
+            dt_val = row.get("Date")
+            if hasattr(dt_val, "date"):
+                date_str = dt_val.date().isoformat()
+            else:
+                date_str = str(dt_val)[:10]
+            candles.append(
+                {
+                    "date": date_str,
+                    "open": float(row.get("Open", 0)),
+                    "high": float(row.get("High", 0)),
+                    "low": float(row.get("Low", 0)),
+                    "close": float(row.get("Close", 0)),
+                    "volume": float(row.get("Volume", 0)),
+                }
+            )
+
+        if not candles:
+            continue
+
+        new_dates = {c["date"] for c in candles}
+        inserted += len(new_dates - existing_dates)
+        updated += len(new_dates & existing_dates)
+
+        market = MARKET_MAP.get(symbol, "KOSPI")
+        upsert_price_daily(engine, candles, market, symbol)
+
+    logger.info(
+        "[OHLCV][DELTA_UPSERT] symbols=%s days=%s dates=%s inserted=%s updated=%s",
+        len(clean_symbols),
+        days,
+        [d.isoformat() for d in dates],
+        inserted,
+        updated,
+    )
+    return {"symbols": len(clean_symbols), "inserted": inserted, "updated": updated, "dates": dates}
+
+
+def ensure_ohlcv_history(*, symbols: list[str], lookback_days: int = 520) -> None:
+    """Ensure long OHLCV history exists. Weekend/base builds only."""
+    mode = (os.getenv("MODE") or "").strip().lower()
+    if mode in {"trade", "prep"}:
+        raise RuntimeError("PREP_FORBIDS_OHLCV_HISTORY")
+    from trader.ohlcv_prefetch import prefetch_ohlcv_to_db
+
+    engine = make_engine()
+    members = [{"code": str(s).zfill(6)} for s in symbols if s]
+    if not members:
+        return
+    prefetch_ohlcv_to_db(
+        engine=engine,
+        members=members,
+        days=lookback_days,
+        force_rebuild=False,
+        env=os.getenv("STRATEGY_ENV", "practice"),
+        strategy=os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool"),
+        as_of=now_kst().date(),
+    )

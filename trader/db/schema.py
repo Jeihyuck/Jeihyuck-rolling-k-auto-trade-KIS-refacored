@@ -43,6 +43,7 @@ class SchemaTables:
     price_daily: sa.Table
     pb1_watchlist: sa.Table
     job_checkpoints: sa.Table
+    derived_minervini: sa.Table
     uses_native_uuid: bool
 
 
@@ -285,6 +286,33 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Index("ix_pb1_watchlist_lookup", "env", "strategy", "as_of"),
     )
 
+    derived_minervini = sa.Table(
+        "derived_minervini",
+        metadata,
+        sa.Column("symbol", sa.String, nullable=False),
+        sa.Column("as_of", sa.Date, nullable=False),
+        sa.Column("close", sa.Float),
+        sa.Column("ma50", sa.Float),
+        sa.Column("ma150", sa.Float),
+        sa.Column("ma200", sa.Float),
+        sa.Column("ma200_slope", sa.Float),
+        sa.Column("dollar_vol_50", sa.Float),
+        sa.Column("atr", sa.Float),
+        sa.Column("atr_pct", sa.Float),
+        sa.Column("rs_percentile", sa.Float),
+        sa.Column("vcp_score", sa.Float),
+        sa.Column("vcp_ok", sa.Boolean),
+        sa.Column("pivot", sa.Float),
+        sa.Column("minervini_score", sa.Float),
+        sa.Column("minervini_pass", sa.Boolean),
+        sa.Column("features_json", sa.JSON, nullable=False, default=dict),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
+        sa.PrimaryKeyConstraint("symbol", "as_of"),
+        sa.Index("ix_derived_minervini_as_of", "as_of"),
+        sa.Index("ix_derived_minervini_symbol", "symbol"),
+    )
+
     job_checkpoints = sa.Table(
         "job_checkpoints",
         metadata,
@@ -309,6 +337,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         price_daily=price_daily,
         pb1_watchlist=pb1_watchlist,
         job_checkpoints=job_checkpoints,
+        derived_minervini=derived_minervini,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -347,4 +376,5 @@ LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
 RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 PRICE_DAILY = DEFAULT_SCHEMA.price_daily
 PB1_WATCHLIST = DEFAULT_SCHEMA.pb1_watchlist
+DERIVED_MINERVINI = DEFAULT_SCHEMA.derived_minervini
 JOB_CHECKPOINTS = DEFAULT_SCHEMA.job_checkpoints

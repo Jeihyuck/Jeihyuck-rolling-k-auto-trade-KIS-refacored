@@ -108,7 +108,7 @@ from trader.config import (
     VCP_MIN_SCORE,
     resolve_market_window,
 )
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI, KISBlockedError
 from trader.ledger.store import LedgerStore
@@ -150,7 +150,10 @@ MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
 
 def _minervini_ohlcv_days() -> int:
     base = 200 + MA200_SLOPE_LOOKBACK + 60
-    return max(MINERVINI_OHLCV_DAYS_MIN, base)
+    need_days = max(MINERVINI_OHLCV_DAYS_MIN, base)
+    if os.getenv("MODE") == "trade" and need_days >= 200:
+        raise RuntimeError("TRADE_TICK_FORBIDS_LONG_MINERVINI_FETCH")
+    return need_days
 
 _OUTPUT2_LIST_NORMALIZED_LOGGED = False
 _OUTPUT2_UNEXPECTED_TYPE_LOGGED = False
@@ -1571,40 +1574,63 @@ class PB1Engine:
             
             # 최소 캔들 수 조건 완화: 120일 또는 200일 데이터만으로도 후보 선정 가능
             required_candles = self.min_candles
-            bench_df, _ = self._fetch_daily(RS_BENCHMARK)
-            bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
-            
-            # [MINERVINI] 벤치마크 데이터 부족 감지
+            if trade_mode:
+                required_candles = min(required_candles, 30)
+            trade_mode = os.getenv("MODE") == "trade"
+            derived_map: dict[str, dict] = {}
+            if trade_mode:
+                derived_repo = DerivedMinerviniRepo(self.engine)
+                today_val = self._today
+                if isinstance(today_val, datetime):
+                    today_val = today_val.date()
+                elif isinstance(today_val, str):
+                    today_val = date.fromisoformat(today_val.split("T")[0])
+                symbol_list = [str(m.get("code") or "").zfill(6) for m in members_list]
+                derived_rows = derived_repo.load_for_as_of(as_of=today_val, symbols=symbol_list)
+                if not derived_rows:
+                    logger.warning("[MINERVINI][TRADE_SKIP] derived_minervini missing as_of=%s", today_val)
+                    return []
+                derived_map = {str(row.get("symbol") or "").zfill(6): row for row in derived_rows}
+            bench_df = pd.DataFrame()
+            bench_close = pd.Series(dtype=float)
             debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
             degraded_ok = os.getenv("MINERVINI_DEGRADED_OK", "0") == "1"
+            bench_insufficient = False
             min_bench_required = max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS)
-        
-            bench_insufficient = len(bench_df) < min_bench_required
-            if bench_insufficient:
-                logger.warning(
-                    "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s pass_through=%s",
-                    len(bench_df),
-                    min_bench_required,
-                    degraded_ok,
-                )
-                if not degraded_ok:
-                    # STRICT 모드: 벤치마크 데이터 부족 시 후보 비우기
-                    logger.error(
-                        "[MINERVINI][STRICT] benchmark data insufficient -> clear candidates (set MINERVINI_DEGRADED_OK=1 to allow)"
-                    )
-                    # 빈 후보 리스트 반환
-                    for cf in candidates:
-                        cf.setup_ok = False
-                        cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
-                    return candidates
 
-            need_days = _minervini_ohlcv_days()
-            logger.info(
-                "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, slope_lb=%s)",
-                need_days,
-                os.getenv("MINERVINI_OHLCV_DAYS"),
-                MA200_SLOPE_LOOKBACK,
-            )
+            if not trade_mode:
+                bench_df, _ = self._fetch_daily(RS_BENCHMARK)
+                bench_close = bench_df["close"] if not bench_df.empty else pd.Series(dtype=float)
+
+                # [MINERVINI] 벤치마크 데이터 부족 감지
+                bench_insufficient = len(bench_df) < min_bench_required
+                if bench_insufficient:
+                    logger.warning(
+                        "[MINERVINI][SKIP] reason=insufficient_benchmark benchmark_rows=%s min_required=%s pass_through=%s",
+                        len(bench_df),
+                        min_bench_required,
+                        degraded_ok,
+                    )
+                    if not degraded_ok:
+                        # STRICT 모드: 벤치마크 데이터 부족 시 후보 비우기
+                        logger.error(
+                            "[MINERVINI][STRICT] benchmark data insufficient -> clear candidates (set MINERVINI_DEGRADED_OK=1 to allow)"
+                        )
+                        # 빈 후보 리스트 반환
+                        for cf in candidates:
+                            cf.setup_ok = False
+                            cf.reasons = (cf.reasons or []) + ["minervini_benchmark_insufficient"]
+                        return candidates
+
+                need_days = _minervini_ohlcv_days()
+                logger.info(
+                    "[MINERVINI][OHLCV_DAYS] need_days=%s (env MINERVINI_OHLCV_DAYS=%s, slope_lb=%s)",
+                    need_days,
+                    os.getenv("MINERVINI_OHLCV_DAYS"),
+                    MA200_SLOPE_LOOKBACK,
+                )
+            else:
+                need_days = 30
             
             rs_prices: dict[str, pd.Series] = {}
             checked_count = 0
@@ -1634,44 +1660,59 @@ class PB1Engine:
                 market = m.get("market") or ""
                 try:
                     # ✅ OHLCV 결측 즉시 스킵 (보장 모드)
+                    derived_row = derived_map.get(code) if trade_mode else None
+                    if trade_mode and not derived_row:
+                        continue
+
                     df, meta = self._fetch_daily(code, days=need_days)
-                    if df is None or df.empty or len(df) < 120:
-                        # 120일 미만이면 VCP/Minervini 점수 계산이 의미 없음
+                    if df is None or df.empty or len(df) < required_candles:
                         if df is None or df.empty:
                             skip_reason = "data_empty"
                         else:
                             skip_reason = "insufficient_data"
-                        logger.debug("[PB1][CANDIDATES][SKIP] code=%s reason=%s rows=%s", code, skip_reason, len(df) if df is not None else 0)
-                        continue
-                    
-                    if len(df) < required_candles:
-                        reasons = ["insufficient_candles"]
-                        cf = CandidateFeature(
-                            code=code,
-                            market=market,
-                            features={"reasons": reasons, "count": len(df), "data_ok": False},
-                            setup_ok=False,
-                            reasons=reasons,
-                            mode=1,
-                            mode_reasons=["default_day_mode"],
+                        logger.debug(
+                            "[PB1][CANDIDATES][SKIP] code=%s reason=%s rows=%s",
+                            code,
+                            skip_reason,
+                            len(df) if df is not None else 0,
                         )
-                        candidates.append(cf)
                         continue
-                    try:
-                        features = compute_features(df)
-                    except ValueError:
-                        reasons = ["insufficient_candles"]
-                        cf = CandidateFeature(
-                            code=code,
-                            market=market,
-                            features={"reasons": reasons, "count": len(df), "data_ok": False},
-                            setup_ok=False,
-                            reasons=reasons,
-                            mode=1,
-                            mode_reasons=["default_day_mode"],
-                        )
-                        candidates.append(cf)
-                        continue
+
+                    if trade_mode:
+                        features = {
+                            "close": derived_row.get("close") or float(df["close"].iloc[-1]),
+                            "ma50": derived_row.get("ma50"),
+                            "ma150": derived_row.get("ma150"),
+                            "ma200": derived_row.get("ma200"),
+                            "ma200_slope": derived_row.get("ma200_slope"),
+                            "dollar_vol_50": derived_row.get("dollar_vol_50"),
+                            "atr14": derived_row.get("atr"),
+                            "atr_pct": derived_row.get("atr_pct"),
+                            "rs_percentile": derived_row.get("rs_percentile"),
+                            "vcp_score": derived_row.get("vcp_score"),
+                            "vcp_ok": derived_row.get("vcp_ok"),
+                            "pivot": derived_row.get("pivot"),
+                            "score": derived_row.get("minervini_score"),
+                        }
+                        extra = derived_row.get("features_json") or {}
+                        if isinstance(extra, dict):
+                            features.update(extra)
+                    else:
+                        try:
+                            features = compute_features(df)
+                        except ValueError:
+                            reasons = ["insufficient_candles"]
+                            cf = CandidateFeature(
+                                code=code,
+                                market=market,
+                                features={"reasons": reasons, "count": len(df), "data_ok": False},
+                                setup_ok=False,
+                                reasons=reasons,
+                                mode=1,
+                                mode_reasons=["default_day_mode"],
+                            )
+                            candidates.append(cf)
+                            continue
                     ma200_slope = features.get("ma200_slope")
                     if debug_mode and (ma200_slope is None or (isinstance(ma200_slope, float) and not np.isfinite(ma200_slope))):
                         close_series = df["close"] if "close" in df.columns else pd.Series(dtype=float)
@@ -1732,28 +1773,39 @@ class PB1Engine:
                         spread_pct = float(spread_proxy.tail(20).mean()) if len(spread_proxy) else None
                         range_proxy = (df["high"] - df["low"]) / df["close"] * 100.0
                         range_pct = float(range_proxy.tail(20).mean()) if len(range_proxy) else None
-                    vcp_score = score_vcp(
-                        df,
-                        VCP_LOOKBACK,
-                        VolContractRules(),
-                        PriceTightRules(),
-                    )
-                    pivot_info = find_pivot(df)
-                    pivot = pivot_info.get("pivot_price")
-                    vcp_info = detect_vcp(df, self.minervini_config)
-                    features["market"] = market
-                    features["volume_missing"] = bool(meta.get("volume_missing"))
-                    features["data_ok"] = True
-                    features["vcp_ok"] = bool(vcp_info.get("vcp_ok") or is_vcp_ready(vcp_score, VCP_MIN_SCORE))
-                    features["vcp_score"] = float(vcp_score)
-                    features["vcp_contractions"] = vcp_info.get("contractions")
-                    pivot_val = float(pivot) if pivot and np.isfinite(pivot) else float("nan")
-                    features["pivot"] = pivot_val
-                    features["pivot_scan"] = pivot_val
-                    features["pivot_age"] = pivot_info.get("pivot_date")
-                    features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
-                    features["tight_low"] = pivot_info.get("tight_low")
-                    features["base_high"] = pivot_info.get("base_high")
+                    if trade_mode:
+                        pivot_val = features.get("pivot")
+                        features["market"] = market
+                        features["volume_missing"] = bool(meta.get("volume_missing"))
+                        features["data_ok"] = True
+                        features["vcp_ok"] = bool(features.get("vcp_ok"))
+                        features["vcp_score"] = float(features.get("vcp_score") or 0.0)
+                        features["pivot"] = float(pivot_val) if pivot_val and np.isfinite(pivot_val) else float("nan")
+                        features["pivot_scan"] = features["pivot"]
+                        features.setdefault("pivot_valid", bool(pivot_val))
+                    else:
+                        vcp_score = score_vcp(
+                            df,
+                            VCP_LOOKBACK,
+                            VolContractRules(),
+                            PriceTightRules(),
+                        )
+                        pivot_info = find_pivot(df)
+                        pivot = pivot_info.get("pivot_price")
+                        vcp_info = detect_vcp(df, self.minervini_config)
+                        features["market"] = market
+                        features["volume_missing"] = bool(meta.get("volume_missing"))
+                        features["data_ok"] = True
+                        features["vcp_ok"] = bool(vcp_info.get("vcp_ok") or is_vcp_ready(vcp_score, VCP_MIN_SCORE))
+                        features["vcp_score"] = float(vcp_score)
+                        features["vcp_contractions"] = vcp_info.get("contractions")
+                        pivot_val = float(pivot) if pivot and np.isfinite(pivot) else float("nan")
+                        features["pivot"] = pivot_val
+                        features["pivot_scan"] = pivot_val
+                        features["pivot_age"] = pivot_info.get("pivot_date")
+                        features["pivot_valid"] = bool(pivot and np.isfinite(pivot))
+                        features["tight_low"] = pivot_info.get("tight_low")
+                        features["base_high"] = pivot_info.get("base_high")
                     features["gap_pct"] = gap_pct
                     features["spread_pct"] = spread_pct
                     features["range_pct"] = range_pct
@@ -1771,7 +1823,8 @@ class PB1Engine:
                         mode_reasons=["minervini_default"],
                     )
                     candidates.append(cf)
-                    rs_prices[code] = df["close"].reset_index(drop=True)
+                    if not trade_mode:
+                        rs_prices[code] = df["close"].reset_index(drop=True)
                 except Exception as exc:
                     # ✅ 개별 종목 예외로 전체 런이 죽지 않게
                     logger.exception("[PB1][CANDIDATES][COMPUTE_FAILED] code=%s error=%s -> skip", code, exc)
@@ -1781,15 +1834,19 @@ class PB1Engine:
                 reason = "NO_CANDIDATES_AFTER_OHLCV"
                 return candidates
             
-            rs_rank = rank_rs(
-                rs_prices,
-                bench_close,
-                lookback_days=RS_LOOKBACK_DAYS,
-                lookback2_days=RS_LOOKBACK2_DAYS,
-                w1=RS_COMPOSITE_W1,
-                w2=RS_COMPOSITE_W2,
-            )
-            rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
+            if trade_mode:
+                rs_rank = pd.DataFrame()
+                rs_map = {}
+            else:
+                rs_rank = rank_rs(
+                    rs_prices,
+                    bench_close,
+                    lookback_days=RS_LOOKBACK_DAYS,
+                    lookback2_days=RS_LOOKBACK2_DAYS,
+                    w1=RS_COMPOSITE_W1,
+                    w2=RS_COMPOSITE_W2,
+                )
+                rs_map = {row["ticker"]: row for row in rs_rank.to_dict(orient="records")}
             
             # [MINERVINI] RS/VCP 필터 적용 전 카운트
             before_minervini = len([cf for cf in candidates if cf.features.get("data_ok")])
@@ -1799,8 +1856,12 @@ class PB1Engine:
             vcp_fail_count = 0
             
             for i, cf in enumerate(candidates):
-                rs_row = rs_map.get(cf.code, {})
-                rs_p = float(rs_row.get("pctile") or 0.0)
+                if trade_mode:
+                    rs_p = float(cf.features.get("rs_percentile") or 0.0)
+                    rs_row = {}
+                else:
+                    rs_row = rs_map.get(cf.code, {})
+                    rs_p = float(rs_row.get("pctile") or 0.0)
                 cf.features["rs_percentile"] = rs_p
                 cf.features["rs_pctile"] = rs_p * 100.0
                 cf.features["rs_comp"] = rs_row.get("composite")
@@ -4256,6 +4317,30 @@ class PB1Engine:
         # ✅ FIX: 후보군은 STRATEGY_ENV로 저장되므로 STRATEGY_ENV로 로드
         import os
         pool_env = os.getenv("STRATEGY_ENV", self.env)
+
+        # ✅ trade 모드: 오늘 as_of 없으면 즉시 스킵 (auto-build 금지)
+        trade_mode = os.getenv("MODE") == "trade"
+        if trade_mode:
+            repo = WatchlistRepo(self.engine)
+            pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+            rows, _ = repo.load_watchlist(
+                env=pool_env,
+                strategy=pool_strategy,
+                as_of=today,
+                allow_latest_fallback=False,
+            )
+            if not rows:
+                logger.warning(
+                    "[CANDIDATE_POOL][TRADE_SKIP] no today pool as_of=%s",
+                    today,
+                )
+                return [], "candidate_pool_missing_today"
+            pool_codes = [item["code"] for item in rows]
+            members = [
+                {"code": code, "name": self._code_name_map.get(code, "")}
+                for code in pool_codes
+            ]
+            return members, "candidate_pool_today"
         
         # ✅ STEP 1: 후보군 로드 (TTL 검사 포함)
         pool_codes, pool_as_of, pool_reason = load_candidate_pool(

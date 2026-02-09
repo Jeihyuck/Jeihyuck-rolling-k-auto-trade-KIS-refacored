@@ -233,6 +233,9 @@ def build_and_save_candidate_pool(
     """
     repo = WatchlistRepo(engine)
     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+
+    if os.getenv("MODE") == "trade" and force_rebuild:
+        raise RuntimeError("TRADE_MODE_FORBIDS_CANDIDATE_POOL_REBUILD")
     
     # 이미 당일 후보군이 있으면 재사용
     if not force_rebuild:

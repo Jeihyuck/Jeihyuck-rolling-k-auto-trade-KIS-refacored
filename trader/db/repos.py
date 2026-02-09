@@ -44,6 +44,7 @@ __all__ = [
     "ReconcileLogRepo",
     "PositionRepo",  # Backward compatibility
     "WatchlistRepo",
+    "DerivedMinerviniRepo",
     "save_watchlist",
     "load_watchlist",
 ]
@@ -1567,6 +1568,20 @@ class LedgerEventsRepo:
         )
         return None
 
+    def has_event_type_on_date(self, *, env: str, event_type: str, as_of: date | str) -> bool:
+        schema = self._schema
+        as_of_date = to_date(as_of)
+        stmt = select(func.count()).select_from(schema.ledger_events).where(
+            and_(
+                schema.ledger_events.c.env == env,
+                schema.ledger_events.c.event_type == event_type,
+                func.date(schema.ledger_events.c.ts) == as_of_date,
+            )
+        )
+        with self.engine.connect() as conn:
+            count = conn.execute(stmt).scalar() or 0
+        return int(count) > 0
+
 
 class PositionsRepo:
     def __init__(self, engine: Engine):
@@ -2200,6 +2215,65 @@ class WatchlistRepo:
             )
             result = conn.execute(stmt).scalar()
         return result
+
+
+# ========================================
+# Derived Minervini Repository
+# ========================================
+
+class DerivedMinerviniRepo:
+    """Daily Minervini/PB1 derived feature snapshots."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+
+    def upsert_rows(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        schema = self._schema
+        with self.engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                stmt = pg_insert(schema.derived_minervini).values(rows)
+                update_cols = {
+                    col.name: getattr(stmt.excluded, col.name)
+                    for col in schema.derived_minervini.c
+                    if col.name not in {"symbol", "as_of", "created_at"}
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[schema.derived_minervini.c.symbol, schema.derived_minervini.c.as_of],
+                    set_=update_cols,
+                )
+                conn.execute(stmt)
+            else:
+                for payload in rows:
+                    try:
+                        conn.execute(sa.insert(schema.derived_minervini).values(**payload))
+                    except IntegrityError:
+                        where_clause = and_(
+                            schema.derived_minervini.c.symbol == payload["symbol"],
+                            schema.derived_minervini.c.as_of == payload["as_of"],
+                        )
+                        update_cols = {k: v for k, v in payload.items() if k not in {"symbol", "as_of"}}
+                        conn.execute(sa.update(schema.derived_minervini).where(where_clause).values(**update_cols))
+        return len(rows)
+
+    def load_for_as_of(self, *, as_of: date, symbols: list[str] | None = None) -> list[dict]:
+        schema = self._schema
+        stmt = select(schema.derived_minervini).where(schema.derived_minervini.c.as_of == to_date(as_of))
+        if symbols:
+            stmt = stmt.where(schema.derived_minervini.c.symbol.in_(symbols))
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(row) for row in rows]
+
+    def count_as_of(self, *, as_of: date) -> int:
+        schema = self._schema
+        stmt = select(func.count()).select_from(schema.derived_minervini).where(
+            schema.derived_minervini.c.as_of == to_date(as_of)
+        )
+        with self.engine.connect() as conn:
+            return int(conn.execute(stmt).scalar() or 0)
 
 
 def save_watchlist(

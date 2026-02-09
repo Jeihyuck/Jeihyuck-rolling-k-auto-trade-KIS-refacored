@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, DBAPIError
 
@@ -8,7 +10,19 @@ LOCK_KEY = 912345678
 
 
 def acquire_advisory_lock(conn, key: int = LOCK_KEY) -> bool:
-    return bool(conn.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
+    retries = int(os.getenv("LOCK_ACQUIRE_RETRIES", "3"))
+    sleep_sec = float(os.getenv("LOCK_ACQUIRE_SLEEP_SEC", "0.5"))
+    for attempt in range(1, retries + 1):
+        try:
+            ok = bool(conn.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
+        except Exception as exc:
+            logger.warning("[LOCK][ACQUIRE][FAIL] attempt=%s err=%s", attempt, exc)
+            ok = False
+        if ok:
+            return True
+        if attempt < retries:
+            time.sleep(sleep_sec)
+    return False
 
 
 def release_advisory_lock(conn, key: int = LOCK_KEY) -> None:
