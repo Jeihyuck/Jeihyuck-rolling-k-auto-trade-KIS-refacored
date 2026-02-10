@@ -110,11 +110,6 @@ env:
   CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
   CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
 
-defaults:
-  run:
-    shell: bash
-    working-directory: repo
-
 jobs:
   resolve:
     runs-on: ubuntu-latest
@@ -180,6 +175,10 @@ jobs:
     needs: [resolve]
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: repo
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
