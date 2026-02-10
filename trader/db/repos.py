@@ -1248,6 +1248,12 @@ class LedgerEventsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def _payload_as_of_expr(self):
+        col = self._schema.ledger_events.c.payload_json
+        if self.engine.dialect.name == "postgresql":
+            return col["as_of"].astext
+        return func.json_extract(col, "$.as_of")
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -1571,16 +1577,79 @@ class LedgerEventsRepo:
     def has_event_type_on_date(self, *, env: str, event_type: str, as_of: date | str) -> bool:
         schema = self._schema
         as_of_date = to_date(as_of)
+        as_of_str = as_of_date.isoformat()
+        payload_as_of = self._payload_as_of_expr()
         stmt = select(func.count()).select_from(schema.ledger_events).where(
             and_(
                 schema.ledger_events.c.env == env,
                 schema.ledger_events.c.event_type == event_type,
-                func.date(schema.ledger_events.c.ts) == as_of_date,
+                or_(
+                    payload_as_of == as_of_str,
+                    func.date(schema.ledger_events.c.ts) == as_of_date,
+                ),
             )
         )
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0
+
+    def get_event_type_on_date_summary(
+        self, *, env: str, event_type: str, as_of: date | str
+    ) -> dict:
+        schema = self._schema
+        as_of_date = to_date(as_of)
+        as_of_str = as_of_date.isoformat()
+        payload_as_of = self._payload_as_of_expr()
+        filters = and_(
+            schema.ledger_events.c.env == env,
+            schema.ledger_events.c.event_type == event_type,
+            or_(
+                payload_as_of == as_of_str,
+                func.date(schema.ledger_events.c.ts) == as_of_date,
+            ),
+        )
+        stmt = select(func.count()).select_from(schema.ledger_events).where(filters)
+        latest_stmt = (
+            select(
+                schema.ledger_events.c.ts,
+                schema.ledger_events.c.run_id,
+                schema.ledger_events.c.payload_json,
+            )
+            .where(filters)
+            .order_by(schema.ledger_events.c.ts.desc())
+            .limit(1)
+        )
+        with self.engine.connect() as conn:
+            count = int(conn.execute(stmt).scalar() or 0)
+            latest_row = conn.execute(latest_stmt).mappings().first()
+        latest_ts = latest_row.get("ts") if latest_row else None
+        latest_run_id = latest_row.get("run_id") if latest_row else None
+        latest_payload_as_of = None
+        if latest_row and latest_row.get("payload_json"):
+            latest_payload_as_of = latest_row["payload_json"].get("as_of")
+        return {
+            "count": count,
+            "latest_ts": latest_ts,
+            "latest_run_id": latest_run_id,
+            "latest_payload_as_of": latest_payload_as_of,
+        }
+
+    def get_latest_payload_as_of(self, *, env: str, event_type: str) -> str | None:
+        schema = self._schema
+        payload_as_of = self._payload_as_of_expr()
+        stmt = (
+            select(func.max(payload_as_of))
+            .select_from(schema.ledger_events)
+            .where(
+                and_(
+                    schema.ledger_events.c.env == env,
+                    schema.ledger_events.c.event_type == event_type,
+                )
+            )
+        )
+        with self.engine.connect() as conn:
+            value = conn.execute(stmt).scalar()
+        return str(value) if value else None
 
 
 class PositionsRepo:

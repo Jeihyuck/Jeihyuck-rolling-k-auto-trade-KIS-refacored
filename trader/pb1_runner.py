@@ -49,6 +49,7 @@ from trader.config import (
     PAPER_RESET_AUTO_PURGE,
     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
+    RS_BENCHMARK,
 )
 from trader.runtime_paths import runtime_root, runtime_path
 from trader.db.engine import make_engine
@@ -64,6 +65,7 @@ from trader.db.repos import (
     ReconcileLogRepo,
     RunsRepo,
     UniverseRepo,
+    load_price_daily,
 )
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
@@ -2486,12 +2488,27 @@ def main() -> int:
         engine = make_engine()
         ledger_repo = LedgerEventsRepo(engine)
         
-        # PREP_DONE 체크는 derived_as_of 기준으로
-        if not ledger_repo.has_event_type_on_date(
+        prep_summary = ledger_repo.get_event_type_on_date_summary(
             env=os.getenv("STRATEGY_ENV", "practice").lower(),
             event_type="PREP_DONE",
             as_of=derived_as_of,
-        ):
+        )
+        latest_prep_as_of = ledger_repo.get_latest_payload_as_of(
+            env=os.getenv("STRATEGY_ENV", "practice").lower(),
+            event_type="PREP_DONE",
+        )
+        logger.info(
+            "[TRADE_TICK][PREP_DONE][QUERY] env=%s as_of=%s count=%d latest_ts=%s latest_payload_as_of=%s latest_global_as_of=%s keys=env+as_of+event_type",
+            os.getenv("STRATEGY_ENV", "practice").lower(),
+            derived_as_of.isoformat(),
+            prep_summary.get("count", 0),
+            prep_summary.get("latest_ts") or "N/A",
+            prep_summary.get("latest_payload_as_of") or "N/A",
+            latest_prep_as_of or "N/A",
+        )
+
+        # PREP_DONE 체크는 derived_as_of 기준으로
+        if prep_summary.get("count", 0) <= 0:
             logger.warning(
                 "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
                 derived_as_of.isoformat(),
@@ -2517,6 +2534,48 @@ def main() -> int:
             derived_count,
         )
         
+        # WATCHLIST 체크도 derived_as_of 기준으로
+        watchlist_repo = WatchlistRepo(engine)
+        watchlist_env = os.getenv("STRATEGY_ENV", "practice").lower()
+        watchlist_strategy = os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist")
+        watchlist_rows, watchlist_actual_as_of = watchlist_repo.load_watchlist(
+            env=watchlist_env,
+            strategy=watchlist_strategy,
+            as_of=derived_as_of,
+            allow_latest_fallback=False,
+        )
+        if not watchlist_rows:
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=WATCHLIST_MISSING derived_as_of=%s trade_date=%s",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
+            )
+            return 0
+
+        logger.info(
+            "[TRADE_TICK][WATCHLIST][OK] derived_as_of=%s actual_as_of=%s count=%d",
+            derived_as_of.isoformat(),
+            watchlist_actual_as_of.isoformat() if watchlist_actual_as_of else "N/A",
+            len(watchlist_rows),
+        )
+
+        benchmark_code = str(RS_BENCHMARK or "229200").zfill(6)
+        benchmark_rows = load_price_daily(engine, benchmark_code, derived_as_of, derived_as_of)
+        if not benchmark_rows:
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=BENCHMARK_MISSING derived_as_of=%s trade_date=%s benchmark=%s",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
+                benchmark_code,
+            )
+            return 0
+        logger.info(
+            "[TRADE_TICK][BENCHMARK][OK] derived_as_of=%s benchmark=%s rows=%d",
+            derived_as_of.isoformat(),
+            benchmark_code,
+            len(benchmark_rows),
+        )
+
         # CANDIDATE_POOL 체크도 derived_as_of 기준으로
         pool_repo = WatchlistRepo(engine)
         pool_env = os.getenv("STRATEGY_ENV", "practice").lower()
@@ -2534,7 +2593,7 @@ def main() -> int:
                 trade_date.isoformat(),
             )
             return 0
-        
+
         logger.info(
             "[TRADE_TICK][CANDIDATE_POOL][OK] derived_as_of=%s actual_as_of=%s count=%d",
             derived_as_of.isoformat(),
