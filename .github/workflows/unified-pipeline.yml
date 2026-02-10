@@ -1,18 +1,24 @@
-name: "Unified Pipeline (Delta Prep + Candidate + Trade Tick) - SINGLE YML"
+name: "Unified (Prep Delta + Trade Tick)"
 
 on:
   # ✅ 1) Prep Delta: Mon-Fri 08:40 KST = Sun-Thu 23:40 UTC
-  # ✅ 2) Trade Tick: Mon-Fri 09:05~15:20 KST 동안 5분마다 (KST 09:05~15:20 = UTC 00:05~06:20)
+  # ✅ 2) Trade Tick: Mon-Fri 09:00~15:30 KST every 5 min (UTC 00:00~06:30)
   schedule:
     - cron: "40 23 * * 0-4"
-    - cron: "*/5 0-6 * * 1-5"
+    - cron: "0-30/5 0-6 * * 1-5"
 
   workflow_dispatch:
     inputs:
       MODE:
-        description: "prep | candidate | trade | minervini_test | both"
+        description: "prep | candidate | trade | minervini_test"
         required: true
         default: "prep"
+        type: choice
+        options:
+          - prep
+          - candidate
+          - trade
+          - minervini_test
       STRATEGY_ENV:
         description: "practice | real"
         required: true
@@ -137,27 +143,61 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             RUN_MODE="${{ inputs.MODE }}"
             STRATEGY_ENV="${{ inputs.STRATEGY_ENV }}"
-            ALLOW_LIVE_GATE="${{ inputs.ALLOW_LIVE_GATE }}"
-            FORCE_BLOCK_LIVE="${{ inputs.FORCE_BLOCK_LIVE }}"
             DRYRUN="${{ inputs.DRYRUN }}"
             ANALYSIS_ONLY="${{ inputs.ANALYSIS_ONLY }}"
-          fi
-
-          # ----- schedule일 때: 어떤 크론인지에 따라 모드 결정 -----
-          # 23:40 UTC 스케줄 = Prep Delta
-          # */5 0-6 UTC 스케줄 = Trade Tick
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            SCHED="${{ github.event.schedule }}"
-            if [[ "${SCHED}" == "40 23 * * 0-4" ]]; then
-              RUN_MODE="prep"
-              # prep는 주문 차단 고정
+            
+            # workflow_dispatch에서는 prep 모드일 때 강제 차단
+            if [[ "${RUN_MODE}" == "prep" ]]; then
               ALLOW_LIVE_GATE="0"
               FORCE_BLOCK_LIVE="1"
+              echo "[RESOLVE] prep mode detected - forcing ALLOW_LIVE_GATE=0, FORCE_BLOCK_LIVE=1"
             else
+              ALLOW_LIVE_GATE="${{ inputs.ALLOW_LIVE_GATE }}"
+              FORCE_BLOCK_LIVE="${{ inputs.FORCE_BLOCK_LIVE }}"
+            fi
+          fi
+
+          # ----- schedule일 때: KST 시간 기반 모드 결정 -----
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            # KST 시간 계산 (UTC+9)
+            KST_HOUR=$(TZ=Asia/Seoul date '+%H')
+            KST_MIN=$(TZ=Asia/Seoul date '+%M')
+            KST_TIME="${KST_HOUR}:${KST_MIN}"
+            KST_DOW=$(TZ=Asia/Seoul date '+%u')  # 1=Mon, 5=Fri
+            
+            echo "[RESOLVE] KST time: ${KST_TIME}, day of week: ${KST_DOW}"
+            
+            # KST 08:40 = prep delta
+            if [[ "${KST_HOUR}" == "08" && "${KST_MIN}" == "40" ]]; then
+              RUN_MODE="prep"
+              ALLOW_LIVE_GATE="0"
+              FORCE_BLOCK_LIVE="1"
+              echo "[RESOLVE] Detected prep delta window (08:40 KST)"
+            # KST 09:00~15:30 on weekdays (Mon-Fri) = trade tick  
+            elif [[ "${KST_DOW}" -ge 1 && "${KST_DOW}" -le 5 ]]; then
+              # Convert to minutes for easier comparison
+              KST_MINUTES=$((10#${KST_HOUR} * 60 + 10#${KST_MIN}))
+              START_MIN=$((9 * 60))      # 09:00 = 540
+              END_MIN=$((15 * 60 + 30))  # 15:30 = 930
+              
+              if [[ "${KST_MINUTES}" -ge "${START_MIN}" && "${KST_MINUTES}" -le "${END_MIN}" ]]; then
+                RUN_MODE="trade"
+                ALLOW_LIVE_GATE="1"
+                FORCE_BLOCK_LIVE="0"
+                echo "[RESOLVE] Detected trade tick window (${KST_TIME} KST)"
+              else
+                # Outside market hours - run trade but with safety
+                RUN_MODE="trade"
+                ALLOW_LIVE_GATE="0"
+                FORCE_BLOCK_LIVE="1"
+                echo "[RESOLVE] Outside market hours (${KST_TIME} KST) - running trade with gates blocked"
+              fi
+            else
+              # Weekend - run trade but blocked
               RUN_MODE="trade"
-              # trade-tick 스케줄은 게이트 허용 + 주문차단 해제(실전은 여기서만)
-              ALLOW_LIVE_GATE="1"
-              FORCE_BLOCK_LIVE="0"
+              ALLOW_LIVE_GATE="0"
+              FORCE_BLOCK_LIVE="1"
+              echo "[RESOLVE] Weekend detected - running trade with gates blocked"
             fi
           fi
 
@@ -168,8 +208,17 @@ jobs:
           echo "dryrun=${DRYRUN}" >> "$GITHUB_OUTPUT"
           echo "analysis_only=${ANALYSIS_ONLY}" >> "$GITHUB_OUTPUT"
 
-          echo "[RESOLVE] event=${GITHUB_EVENT_NAME}"
-          echo "[RESOLVE] mode=${RUN_MODE} env=${STRATEGY_ENV} allow_live_gate=${ALLOW_LIVE_GATE} force_block_live=${FORCE_BLOCK_LIVE}"
+          echo "======================================"
+          echo "[RESOLVE] Effective Configuration"
+          echo "======================================"
+          echo "event: ${GITHUB_EVENT_NAME}"
+          echo "mode: ${RUN_MODE}"
+          echo "env: ${STRATEGY_ENV}"
+          echo "allow_live_gate: ${ALLOW_LIVE_GATE}"
+          echo "force_block_live: ${FORCE_BLOCK_LIVE}"
+          echo "dryrun: ${DRYRUN}"
+          echo "analysis_only: ${ANALYSIS_ONLY}"
+          echo "======================================"
 
   run:
     needs: [resolve]
@@ -241,6 +290,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Import check (preflight)
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "[IMPORT CHECK] Verifying modules exist"
+          echo "======================================"
+          
+          EXIT_CODE=0
+          
+          # Check each critical module
+          for module in "trader.prep_runner" "trader.candidate_pool_builder" "trader.pb1_runner" "trader.minervini_runner" "trader.trade_tick" "trader.db.migrate"; do
+            if python -c "import ${module}" 2>/dev/null; then
+              echo "✅ ${module} - OK"
+            else
+              echo "❌ ${module} - MISSING"
+              EXIT_CODE=1
+            fi
+          done
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::error::One or more required modules are missing!"
+            exit 1
+          fi
+          
+          echo "All required modules are available."
+          echo "======================================" 
+
       - name: Guard postgres-only
         run: |
           set -euo pipefail
@@ -269,24 +345,70 @@ jobs:
           echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
           echo "======================================"
 
-      - name: Safety guards (delta only prevents full rebuild)
+      - name: Live status check
         run: |
           set -euo pipefail
-          # ✅ prep(델타)에서는 절대 대공사/주문 불가
+          echo "======================================"
+          echo "[LIVE] Live Trading Status"
+          echo "======================================"
+          echo "allow_live_gate: ${ALLOW_LIVE_GATE}"
+          echo "force_block_live: ${FORCE_BLOCK_LIVE}"
+          echo "dryrun: ${DRYRUN}"
+          echo "analysis_only: ${ANALYSIS_ONLY}"
+          
+          if [[ "${FORCE_BLOCK_LIVE}" == "1" ]]; then
+            echo ""
+            echo "🔒 ORDERS ARE BLOCKED (force_block_live=1)"
+            echo "   - No real orders will be sent"
+            echo "   - Safe for prep/testing/analysis"
+          elif [[ "${ALLOW_LIVE_GATE}" == "0" ]]; then
+            echo ""
+            echo "🔒 LIVE GATE CLOSED (allow_live_gate=0)"  
+            echo "   - Orders may be blocked by internal logic"
+          else
+            echo ""
+            echo "⚠️  LIVE GATE OPEN (allow_live_gate=1, force_block_live=0)"
+            echo "   - Real orders MAY be sent if env=real"
+            echo "   - Ensure strategy_env is set correctly"
+          fi
+          
+          echo "======================================"
+
+      - name: Safety guards
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "[SAFETY] Applying mode-specific guards"
+          echo "======================================"
+          
+          # ✅ prep mode MUST NEVER send orders
           if [[ "${MODE}" == "prep" ]]; then
-            export FORCE_BLOCK_LIVE="1"
-            export DISABLE_LIVE_TRADING="1"
-            export LIVE_TRADING_ENABLED="0"
-            export NO_TRADE="1"
+            echo "Mode: prep - Forcing all order blocks ON"
+            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
+            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
+            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
+            echo "NO_TRADE=1" >> $GITHUB_ENV
           fi
 
-          # ✅ minervini_test도 주문 차단
+          # ✅ minervini_test also blocks orders
           if [[ "${MODE}" == "minervini_test" ]]; then
-            export FORCE_BLOCK_LIVE="1"
-            export DISABLE_LIVE_TRADING="1"
-            export LIVE_TRADING_ENABLED="0"
-            export NO_TRADE="1"
+            echo "Mode: minervini_test - Forcing all order blocks ON"
+            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
+            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
+            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
+            echo "NO_TRADE=1" >> $GITHUB_ENV
           fi
+          
+          # ✅ candidate mode blocks orders
+          if [[ "${MODE}" == "candidate" ]]; then
+            echo "Mode: candidate - Forcing all order blocks ON"
+            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
+            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
+            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
+            echo "NO_TRADE=1" >> $GITHUB_ENV
+          fi
+          
+          echo "======================================"
 
       - name: DB migrate
         run: |
@@ -296,25 +418,27 @@ jobs:
       - name: Run (mode switch)
         run: |
           set -euo pipefail
+          
+          echo "======================================"
+          echo "[RUN] Executing MODE=${MODE}"
+          echo "======================================"
 
-          # ✅ 스킵 방지: MODE에 따라 명확히 실행
           case "${MODE}" in
             prep)
-              # ✅ Delta only: OHLCV_DELTA_DAYS=1, PREFETCH_DAYS=1 기본
+              echo "Running prep_runner (delta OHLCV + watchlist/candidate cache)..."
               python -m trader.prep_runner
               ;;
             candidate)
+              echo "Running candidate_pool_builder..."
               python -m trader.candidate_pool_builder
               ;;
             trade)
-              python -m trader.trade_tick
-              ;;
-            both)
-              python -m trader.prep_runner
-              python -m trader.candidate_pool_builder
-              python -m trader.trade_tick
+              echo "Running pb1_runner (trade tick pipeline)..."
+              # ✅ Use pb1_runner directly (trade_tick.py is now an alias that delegates to this)
+              python -m trader.pb1_runner
               ;;
             minervini_test)
+              echo "Running minervini_runner (test mode)..."
               python -m trader.minervini_runner
               ;;
             *)
@@ -322,6 +446,10 @@ jobs:
               exit 1
               ;;
           esac
+          
+          echo "======================================"
+          echo "[RUN] Execution completed successfully"
+          echo "======================================"
 
       - name: Scan for SQLite artifacts
         if: always()
