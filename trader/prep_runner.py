@@ -17,13 +17,20 @@ from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import build_and_save_watchlist
 from trader.data.ohlcv_provider import upsert_ohlcv_delta
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
-from trader.time_utils import now_kst
+from trader.time_utils import now_kst, prev_business_day
 from trader.utils.json_sanitize import to_jsonable
 
 logger = logging.getLogger(__name__)
 
 
+def _pick_as_of_date_always_prev() -> date:
+    """PREP는 항상 전 거래일 기준으로 실행 (장전/장중/장후 무관)"""
+    now = now_kst()
+    return prev_business_day(now.date())
+
+
 def _as_of_today() -> date:
+    """Deprecated: 전일 고정을 위해 _pick_as_of_date_always_prev() 사용"""
     return now_kst().date()
 
 
@@ -63,9 +70,9 @@ def main() -> int:
 
     env = os.getenv("STRATEGY_ENV", "practice").lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
-    as_of = _as_of_today()
+    as_of = _pick_as_of_date_always_prev()
 
-    logger.info("[PREP][START] env=%s as_of=%s", env, as_of)
+    logger.info("[PREP][START] env=%s as_of=%s (PREV_TRADING_DAY)", env, as_of)
     t0 = time.monotonic()
 
     members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=as_of)

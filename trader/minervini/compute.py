@@ -12,6 +12,7 @@ from trader.db.repos import DerivedMinerviniRepo, load_price_daily
 from trader.factors.rs_rank import rank_rs
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig, compute_features, compute_pivot, detect_vcp, evaluate_filters, score_setup
 from trader.time_utils import now_kst
+from trader.utils.json_sanitize import to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,9 @@ def compute_minervini_features_for_asof(
 
     for symbol in symbols_list:
         df = _load_df_from_db(engine=engine, symbol=symbol, as_of=as_of_date, days=need_days)
-        if df.empty or "close" not in df.columns:
+        # 데이터 부족 시 스킵 (NaN 생성 방지)
+        if df.empty or "close" not in df.columns or len(df) < 127:
+            logger.debug("[DERIVED][MINERVINI][SKIP] symbol=%s len=%d (required>=127)", symbol, len(df))
             continue
         price_series[symbol] = df["close"]
         try:
@@ -136,6 +139,13 @@ def compute_and_store_derived_minervini(
         as_of=as_of_date,
         lookback_days=lookback_days,
     )
+    
+    # NaN/Inf 완전 차단 (DB upsert 직전 sanitize)
+    for r in rows:
+        fj = r.get("features_json")
+        if fj is not None:
+            r["features_json"] = to_jsonable(fj)
+    
     repo = DerivedMinerviniRepo(engine)
     upserted = repo.upsert_rows(rows)
     dt = time.monotonic() - start
