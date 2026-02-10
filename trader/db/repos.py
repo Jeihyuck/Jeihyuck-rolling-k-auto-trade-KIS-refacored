@@ -2274,6 +2274,126 @@ class DerivedMinerviniRepo:
         )
         with self.engine.connect() as conn:
             return int(conn.execute(stmt).scalar() or 0)
+    
+    def get_latest_as_of(self, *, requested_as_of: date, ttl_days: int = 7) -> date | None:
+        """
+        주어진 as_of 이하의 최신 derived as_of를 찾는다.
+        
+        Args:
+            requested_as_of: 요청된 as_of (이 날짜 이하)
+            ttl_days: 최대 허용 일수 (기본 7일)
+        
+        Returns:
+            최신 as_of 또는 None (ttl 초과 시)
+        
+        Examples:
+            >>> # 2026-02-10 요청했는데 없으면, 2026-02-09 찾기
+            >>> repo.get_latest_as_of(requested_as_of=date(2026, 2, 10))
+            date(2026, 2, 9)
+        """
+        schema = self._schema
+        requested_date = to_date(requested_as_of)
+        
+        # 최신 as_of 찾기 (requested_as_of 이하)
+        stmt = (
+            select(func.max(schema.derived_minervini.c.as_of))
+            .where(schema.derived_minervini.c.as_of <= requested_date)
+        )
+        
+        with self.engine.connect() as conn:
+            latest_as_of = conn.execute(stmt).scalar()
+        
+        if not latest_as_of:
+            logger.warning(
+                "[DERIVED][FALLBACK][NOT_FOUND] requested=%s no_data",
+                requested_date.isoformat(),
+            )
+            return None
+        
+        # TTL 체크
+        age_days = (requested_date - latest_as_of).days
+        
+        if age_days > ttl_days:
+            logger.warning(
+                "[DERIVED][FALLBACK][TTL_EXCEEDED] requested=%s latest=%s age=%d ttl=%d",
+                requested_date.isoformat(),
+                latest_as_of.isoformat(),
+                age_days,
+                ttl_days,
+            )
+            return None
+        
+        logger.info(
+            "[DERIVED][FALLBACK][OK] requested=%s latest=%s age=%d",
+            requested_date.isoformat(),
+            latest_as_of.isoformat(),
+            age_days,
+        )
+        
+        return latest_as_of
+    
+    def load_for_as_of_with_fallback(
+        self,
+        *,
+        as_of: date,
+        symbols: list[str] | None = None,
+        ttl_days: int = 7,
+    ) -> tuple[list[dict], date | None]:
+        """
+        as_of로 derived를 로드하되, 없으면 fallback to 최신 available.
+        
+        Args:
+            as_of: 요청 날짜
+            symbols: 종목 필터 (옵션)
+            ttl_days: fallback TTL (기본 7일)
+        
+        Returns:
+            (rows, actual_as_of): 로드된 데이터와 실제 사용된 as_of
+        
+        Examples:
+            >>> # 2026-02-10 요청 -> 없으면 2026-02-09로 fallback
+            >>> rows, actual = repo.load_for_as_of_with_fallback(
+            ...     as_of=date(2026, 2, 10)
+            ... )
+            >>> actual  # date(2026, 2, 9)
+        """
+        # 먼저 요청된 as_of로 시도
+        rows = self.load_for_as_of(as_of=as_of, symbols=symbols)
+        
+        if rows:
+            logger.debug(
+                "[DERIVED][LOAD][DIRECT] as_of=%s count=%d",
+                as_of.isoformat(),
+                len(rows),
+            )
+            return rows, as_of
+        
+        # 없으면 fallback 시도
+        logger.info(
+            "[DERIVED][LOAD][FALLBACK_START] requested=%s reason=empty",
+            as_of.isoformat(),
+        )
+        
+        fallback_as_of = self.get_latest_as_of(requested_as_of=as_of, ttl_days=ttl_days)
+        
+        if not fallback_as_of:
+            logger.warning(
+                "[DERIVED][LOAD][FALLBACK_FAIL] requested=%s reason=no_valid_fallback",
+                as_of.isoformat(),
+            )
+            return [], None
+        
+        # fallback으로 재로드
+        rows = self.load_for_as_of(as_of=fallback_as_of, symbols=symbols)
+        
+        logger.info(
+            "[DERIVED][LOAD][FALLBACK_SUCCESS] requested=%s fallback=%s count=%d",
+            as_of.isoformat(),
+            fallback_as_of.isoformat(),
+            len(rows),
+        )
+        
+        return rows, fallback_as_of
 
 
 def save_watchlist(

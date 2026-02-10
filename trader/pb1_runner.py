@@ -77,7 +77,7 @@ from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
-from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -806,7 +806,17 @@ def _run_smoke(engine, kis_env: str, now: datetime) -> None:
             if os.getenv("ALLOW_UNIVERSE_BUILD_IN_TRADE", "0") == "1" and not is_db_only_mode():
                 from trader.universe import build as universe_build
 
-                universe_build.build_universe(as_of_date=now.date().isoformat(), env=kis_env, strategy="best_k_meta")
+                # ✅ CRITICAL: smoke test도 derived_as_of 사용
+                smoke_derived_as_of_date = resolve_derived_as_of(now)
+                smoke_as_of = smoke_derived_as_of_date.isoformat()
+                
+                logger.info(
+                    "[ASOF][SMOKE][UNIVERSE] trade_date=%s derived_as_of=%s",
+                    now.date().isoformat(),
+                    smoke_as_of,
+                )
+                
+                universe_build.build_universe(as_of_date=smoke_as_of, env=kis_env, strategy="best_k_meta")
                 members = repo.get_current_universe_members(kis_env, "best_k_meta")
             else:
                 logger.info("[UNIVERSE][SKIP] forbidden during trade path")
@@ -1039,7 +1049,18 @@ def run_once(
         persist_budget_sec = max(5, persist_budget_sec)
     trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
     run_start_ts = time_mod.time()
-    as_of = now.date().isoformat()
+    
+    # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
+    trade_date = now.date()
+    derived_as_of_date = resolve_derived_as_of(now)
+    as_of = derived_as_of_date.isoformat()
+    
+    logger.info(
+        "[ASOF][RUN_ONCE] trade_date=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",
+        trade_date.isoformat(),
+        as_of,
+    )
+    
     runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     close_cancel_only = env_bool("PB1_CLOSE_CANCEL_ONLY", False)
@@ -1207,7 +1228,17 @@ def run_once(
             )
             # nontrading_smoke는 실행하되, 엔진도 계속 진행
             exit_status = "DIAG_NONTRADING_CONTINUE"
-            as_of = now.date().isoformat()
+            
+            # ✅ CRITICAL: DIAG 모드에서도 derived_as_of 사용
+            diag_derived_as_of_date = resolve_derived_as_of(now)
+            as_of = diag_derived_as_of_date.isoformat()
+            
+            logger.info(
+                "[ASOF][DIAG][NONTRADING] trade_date=%s derived_as_of=%s",
+                now.date().isoformat(),
+                as_of,
+            )
+            
             smoke_flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of)
             if not smoke_flag.exists() or NONTRADING_SMOKE_FORCE:
                 try:
@@ -1939,7 +1970,17 @@ def _run_nontrading_smoke_if_needed(
     )
     if trading_day:
         return False
-    as_of = now.date().isoformat()
+    
+    # ✅ CRITICAL: nontrading smoke도 derived_as_of 사용
+    smoke_derived_as_of_date = resolve_derived_as_of(now)
+    as_of = smoke_derived_as_of_date.isoformat()
+    
+    logger.info(
+        "[ASOF][NONTRADING_SMOKE] trade_date=%s derived_as_of=%s",
+        now.date().isoformat(),
+        as_of,
+    )
+    
     smoke_flag = nontrading_smoke_flag_path(runtime_root_dir, as_of=as_of)
     if smoke_flag.exists() and not NONTRADING_SMOKE_FORCE:
         logger.info("[NONTRADING_SMOKE][SKIP] reason=already_done flag=%s", smoke_flag)
@@ -2062,9 +2103,19 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         if os.getenv("PB1_CANDIDATE_ONLY", "0") == "1":
             logger.info("[UNIVERSE][SKIP] PB1_CANDIDATE_ONLY=1 -> skip ensure/build, will use candidate pool only")
         else:
+            # ✅ CRITICAL: ensure_universe_built_once도 derived_as_of 사용
+            loop_derived_as_of_date = resolve_derived_as_of(now_kst_value)
+            loop_as_of = loop_derived_as_of_date.isoformat()
+            
+            logger.info(
+                "[ASOF][LOOP][UNIVERSE] trade_date=%s derived_as_of=%s",
+                now_kst_value.date().isoformat(),
+                loop_as_of,
+            )
+            
             ensure_universe_built_once(
                 engine=engine,
-                as_of=now_kst_value.date().isoformat(),
+                as_of=loop_as_of,
             )
         strategy_mode = (
             getattr(args, "strategy_mode", None)
@@ -2420,37 +2471,76 @@ def main() -> int:
 
     # ✅ Trade guard: PREP_DONE + derived_minervini + today watchlist required
     if mode_input == "trade":
-        prep_as_of = now_kst().date()
+        # ✅ CRITICAL: 장중 매매는 "전일 영업일 derived"를 사용해야 함
+        # prep_runner가 전일 종가로 derived를 생성하므로, trade는 전일을 참조
+        now = now_kst()
+        trade_date = now.date()
+        derived_as_of = resolve_derived_as_of(now)
+        
+        logger.info(
+            "[ASOF][TRADE] trade_date=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",
+            trade_date.isoformat(),
+            derived_as_of.isoformat(),
+        )
+        
         engine = make_engine()
         ledger_repo = LedgerEventsRepo(engine)
-        if not ledger_repo.has_event_type_on_date(env=os.getenv("STRATEGY_ENV", "practice").lower(), event_type="PREP_DONE", as_of=prep_as_of):
+        
+        # PREP_DONE 체크는 derived_as_of 기준으로
+        if not ledger_repo.has_event_type_on_date(
+            env=os.getenv("STRATEGY_ENV", "practice").lower(),
+            event_type="PREP_DONE",
+            as_of=derived_as_of,
+        ):
             logger.warning(
-                "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE as_of=%s",
-                prep_as_of.isoformat(),
+                "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
             )
             return 0
+        
+        # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
-        if derived_repo.count_as_of(as_of=prep_as_of) <= 0:
+        derived_count = derived_repo.count_as_of(as_of=derived_as_of)
+        if derived_count <= 0:
             logger.warning(
-                "[TRADE_TICK][SKIP] reason=DERIVED_MISSING as_of=%s",
-                prep_as_of.isoformat(),
+                "[TRADE_TICK][SKIP] reason=DERIVED_MISSING derived_as_of=%s trade_date=%s count=%d",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
+                derived_count,
             )
             return 0
+        
+        logger.info(
+            "[TRADE_TICK][DERIVED][OK] derived_as_of=%s count=%d",
+            derived_as_of.isoformat(),
+            derived_count,
+        )
+        
+        # CANDIDATE_POOL 체크도 derived_as_of 기준으로
         pool_repo = WatchlistRepo(engine)
         pool_env = os.getenv("STRATEGY_ENV", "practice").lower()
         pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
-        pool_rows, _ = pool_repo.load_watchlist(
+        pool_rows, pool_actual_as_of = pool_repo.load_watchlist(
             env=pool_env,
             strategy=pool_strategy,
-            as_of=prep_as_of,
+            as_of=derived_as_of,
             allow_latest_fallback=False,
         )
         if not pool_rows:
             logger.warning(
-                "[TRADE_TICK][SKIP] reason=CANDIDATE_POOL_MISSING as_of=%s",
-                prep_as_of.isoformat(),
+                "[TRADE_TICK][SKIP] reason=CANDIDATE_POOL_MISSING derived_as_of=%s trade_date=%s",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
             )
             return 0
+        
+        logger.info(
+            "[TRADE_TICK][CANDIDATE_POOL][OK] derived_as_of=%s actual_as_of=%s count=%d",
+            derived_as_of.isoformat(),
+            pool_actual_as_of.isoformat() if pool_actual_as_of else "N/A",
+            len(pool_rows),
+        )
     
     args = parse_args()
     assert_db_ready()

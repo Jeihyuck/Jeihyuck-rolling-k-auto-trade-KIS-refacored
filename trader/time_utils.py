@@ -173,3 +173,46 @@ def prev_business_day(d: date) -> date:
     
     return prev
 
+
+def resolve_derived_as_of(now: datetime | None = None) -> date:
+    """
+    Trade에서 사용할 derived 데이터의 as_of 날짜를 결정.
+    
+    장중 매매는 항상 "전일 종가 기반 derived"를 사용해야 하므로,
+    현재 시각과 무관하게 전일 영업일을 반환한다.
+    
+    Args:
+        now: 현재 시각 (없으면 now_kst() 사용)
+    
+    Returns:
+        전일 영업일 (date 객체)
+    
+    Examples:
+        >>> # 2026-02-10 (화) 장중 -> 2026-02-09 (월) derived 사용
+        >>> resolve_derived_as_of(datetime(2026, 2, 10, 10, 0, tzinfo=KST))
+        date(2026, 2, 9)
+        
+        >>> # 2026-02-10 (화) 새벽 -> 2026-02-09 (월) derived 사용
+        >>> resolve_derived_as_of(datetime(2026, 2, 10, 3, 0, tzinfo=KST))
+        date(2026, 2, 9)
+    
+    Rationale:
+        - prep_runner는 전일 종가 기반으로 derived를 생성 (PREV_TRADING_DAY)
+        - trade는 장중에 "오늘 종가"가 없으므로 전일 derived를 사용해야 함
+        - 일관성: 장중/장외 무관하게 전일 영업일 사용
+    """
+    now = now or now_kst()
+    today = now.date()
+    
+    # 전일 영업일 계산
+    derived_as_of = prev_business_day(today)
+    
+    logger.debug(
+        "[ASOF][RESOLVE] now=%s today=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",
+        now.isoformat(),
+        today.isoformat(),
+        derived_as_of.isoformat(),
+    )
+    
+    return derived_as_of
+

@@ -1586,10 +1586,31 @@ class PB1Engine:
                 elif isinstance(today_val, str):
                     today_val = date.fromisoformat(today_val.split("T")[0])
                 symbol_list = [str(m.get("code") or "").zfill(6) for m in members_list]
-                derived_rows = derived_repo.load_for_as_of(as_of=today_val, symbols=symbol_list)
+                
+                # ✅ CRITICAL: fallback 지원 버전 사용 (최대 7일 이내)
+                derived_rows, actual_as_of = derived_repo.load_for_as_of_with_fallback(
+                    as_of=today_val,
+                    symbols=symbol_list,
+                    ttl_days=7,
+                )
+                
                 if not derived_rows:
-                    logger.warning("[MINERVINI][TRADE_SKIP] derived_minervini missing as_of=%s", today_val)
+                    logger.warning(
+                        "[MINERVINI][TRADE_SKIP] derived_minervini missing requested=%s actual=%s",
+                        today_val.isoformat(),
+                        actual_as_of.isoformat() if actual_as_of else "N/A",
+                    )
                     return []
+                
+                if actual_as_of and actual_as_of != today_val:
+                    logger.info(
+                        "[MINERVINI][DERIVED][FALLBACK] requested=%s actual=%s age=%d rows=%d",
+                        today_val.isoformat(),
+                        actual_as_of.isoformat(),
+                        (today_val - actual_as_of).days,
+                        len(derived_rows),
+                    )
+                
                 derived_map = {str(row.get("symbol") or "").zfill(6): row for row in derived_rows}
             bench_df = pd.DataFrame()
             bench_close = pd.Series(dtype=float)
