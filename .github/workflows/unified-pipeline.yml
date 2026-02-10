@@ -1,0 +1,339 @@
+name: "Unified Pipeline (Delta Prep + Candidate + Trade Tick) - SINGLE YML"
+
+on:
+  # ✅ 1) Prep Delta: Mon-Fri 08:40 KST = Sun-Thu 23:40 UTC
+  schedule:
+    - cron: "40 23 * * 0-4"
+
+    # ✅ 2) Trade Tick: Mon-Fri 09:05~15:20 KST 동안 5분마다
+    # KST 09:05~15:20 = UTC 00:05~06:20
+    - cron: "*/5 0-6 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      MODE:
+        description: "prep | candidate | trade | minervini_test | both"
+        required: true
+        default: "prep"
+      STRATEGY_ENV:
+        description: "practice | real"
+        required: true
+        default: "practice"
+      PREFETCH_DAYS:
+        description: "OHLCV full prefetch days (e.g., 520). For delta prep keep 1"
+        required: true
+        default: "1"
+      OHLCV_DELTA_DAYS:
+        description: "Delta days for OHLCV (default 1)"
+        required: true
+        default: "1"
+      FORCE_CANDIDATE:
+        description: "1=force rebuild candidate pool"
+        required: true
+        default: "0"
+      DRYRUN:
+        description: "1=dryrun (manual test)"
+        required: true
+        default: "0"
+      ANALYSIS_ONLY:
+        description: "1=analysis only"
+        required: true
+        default: "0"
+      FORCE_BLOCK_LIVE:
+        description: "1=force block live (manual test)"
+        required: true
+        default: "1"
+      ALLOW_LIVE_GATE:
+        description: "1=allow live gate (for real trading windows)"
+        required: true
+        default: "0"
+      ATR_MAX_PCT:
+        description: "ATR max percent (ratio like 0.10)"
+        required: true
+        default: "0.10"
+      PB1_RUN_IN_MINERVINI_TEST:
+        description: "1=run PB1 decision pipeline during minervini_test"
+        required: true
+        default: "0"
+      FORCE_COMPUTE_ON_CUTOFF:
+        description: "1=force compute even when entry cutoff blocks orders"
+        required: true
+        default: "1"
+      BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY:
+        description: "1=bypass entry cutoff for compute only"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-single-yml
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: "1"
+  DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+  # ✅ 기본값(스케줄 실행에서 inputs가 없으니 여기서 안전 기본값을 보장)
+  MODE: "prep"
+  STRATEGY_ENV: "practice"
+  KIS_ENV: "practice"
+
+  # ✅ Delta 기본: 전일/1일 델타
+  PREFETCH_DAYS: "1"
+  OHLCV_DELTA_DAYS: "1"
+
+  FORCE_CANDIDATE: "0"
+  DRYRUN: "0"
+  ANALYSIS_ONLY: "0"
+
+  # ✅ 안전 기본: 스케줄은 주문 차단(원하면 trade-tick에서만 해제)
+  FORCE_BLOCK_LIVE: "1"
+  ALLOW_LIVE_GATE: "0"
+
+  ATR_MAX_PCT: "0.10"
+  PB1_RUN_IN_MINERVINI_TEST: "0"
+  FORCE_COMPUTE_ON_CUTOFF: "1"
+  BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
+
+  # Backward-compatible aliases
+  DRY_RUN: "0"
+  DISABLE_LIVE_TRADING: "1"
+  LIVE_TRADING_ENABLED: "0"
+  MINERVINI_ONLY: "0"
+  MINERVINI_TEST_WITH_PB1: "0"
+  FORCE_COMPUTE_WHEN_CUTOFF: "1"
+  BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: "1"
+
+  CANDIDATE_POOL_FORCE_REBUILD: "0"
+  CANDIDATE_POOL_PREFETCH_DAYS: "1"
+  CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+  CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: repo
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      run_mode: ${{ steps.set.outputs.run_mode }}
+      strategy_env: ${{ steps.set.outputs.strategy_env }}
+      allow_live_gate: ${{ steps.set.outputs.allow_live_gate }}
+      force_block_live: ${{ steps.set.outputs.force_block_live }}
+      dryrun: ${{ steps.set.outputs.dryrun }}
+      analysis_only: ${{ steps.set.outputs.analysis_only }}
+    steps:
+      - id: set
+        run: |
+          set -euo pipefail
+
+          # ----- 기본값(스케줄) -----
+          RUN_MODE="prep"
+          STRATEGY_ENV="practice"
+          ALLOW_LIVE_GATE="0"
+          FORCE_BLOCK_LIVE="1"
+          DRYRUN="0"
+          ANALYSIS_ONLY="0"
+
+          # ----- workflow_dispatch면 inputs로 덮어쓰기 -----
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            RUN_MODE="${{ inputs.MODE }}"
+            STRATEGY_ENV="${{ inputs.STRATEGY_ENV }}"
+            ALLOW_LIVE_GATE="${{ inputs.ALLOW_LIVE_GATE }}"
+            FORCE_BLOCK_LIVE="${{ inputs.FORCE_BLOCK_LIVE }}"
+            DRYRUN="${{ inputs.DRYRUN }}"
+            ANALYSIS_ONLY="${{ inputs.ANALYSIS_ONLY }}"
+          fi
+
+          # ----- schedule일 때: 어떤 크론인지에 따라 모드 결정 -----
+          # 23:40 UTC 스케줄 = Prep Delta
+          # */5 0-6 UTC 스케줄 = Trade Tick
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            SCHED="${{ github.event.schedule }}"
+            if [[ "${SCHED}" == "40 23 * * 0-4" ]]; then
+              RUN_MODE="prep"
+              # prep는 주문 차단 고정
+              ALLOW_LIVE_GATE="0"
+              FORCE_BLOCK_LIVE="1"
+            else
+              RUN_MODE="trade"
+              # trade-tick 스케줄은 게이트 허용 + 주문차단 해제(실전은 여기서만)
+              ALLOW_LIVE_GATE="1"
+              FORCE_BLOCK_LIVE="0"
+            fi
+          fi
+
+          echo "run_mode=${RUN_MODE}" >> "$GITHUB_OUTPUT"
+          echo "strategy_env=${STRATEGY_ENV}" >> "$GITHUB_OUTPUT"
+          echo "allow_live_gate=${ALLOW_LIVE_GATE}" >> "$GITHUB_OUTPUT"
+          echo "force_block_live=${FORCE_BLOCK_LIVE}" >> "$GITHUB_OUTPUT"
+          echo "dryrun=${DRYRUN}" >> "$GITHUB_OUTPUT"
+          echo "analysis_only=${ANALYSIS_ONLY}" >> "$GITHUB_OUTPUT"
+
+          echo "[RESOLVE] event=${GITHUB_EVENT_NAME}"
+          echo "[RESOLVE] mode=${RUN_MODE} env=${STRATEGY_ENV} allow_live_gate=${ALLOW_LIVE_GATE} force_block_live=${FORCE_BLOCK_LIVE}"
+
+  run:
+    needs: [resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      # ✅ secrets
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+      # ✅ resolve outputs 반영
+      MODE: ${{ needs.resolve.outputs.run_mode }}
+      STRATEGY_ENV: ${{ needs.resolve.outputs.strategy_env }}
+      KIS_ENV: ${{ needs.resolve.outputs.strategy_env }}
+      ALLOW_LIVE_GATE: ${{ needs.resolve.outputs.allow_live_gate }}
+      FORCE_BLOCK_LIVE: ${{ needs.resolve.outputs.force_block_live }}
+      DRYRUN: ${{ needs.resolve.outputs.dryrun }}
+      ANALYSIS_ONLY: ${{ needs.resolve.outputs.analysis_only }}
+
+      # ✅ delta 기본(수동입력 있으면 override)
+      PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.PREFETCH_DAYS || '1' }}
+      OHLCV_DELTA_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_DELTA_DAYS || '1' }}
+      FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
+      ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
+      PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
+      FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
+      BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
+
+      # aliases
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}
+      DISABLE_LIVE_TRADING: ${{ needs.resolve.outputs.force_block_live == '1' && '1' || '0' }}
+      LIVE_TRADING_ENABLED: ${{ needs.resolve.outputs.force_block_live == '1' && '0' || '1' }}
+      FORCE_COMPUTE_WHEN_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
+      BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+          ref: "nullim"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Guard postgres-only
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: Print effective config
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Unified Single YML - Effective Config"
+          echo "======================================"
+          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "event: ${GITHUB_EVENT_NAME}"
+          echo "MODE: ${MODE}"
+          echo "ENV: ${STRATEGY_ENV}"
+          echo "PREFETCH_DAYS: ${PREFETCH_DAYS}"
+          echo "OHLCV_DELTA_DAYS: ${OHLCV_DELTA_DAYS}"
+          echo "FORCE_CANDIDATE: ${FORCE_CANDIDATE}"
+          echo "ALLOW_LIVE_GATE: ${ALLOW_LIVE_GATE}"
+          echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
+          echo "DRYRUN: ${DRYRUN}"
+          echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
+          echo "======================================"
+
+      - name: Safety guards (delta only prevents full rebuild)
+        run: |
+          set -euo pipefail
+          # ✅ prep(델타)에서는 절대 대공사/주문 불가
+          if [[ "${MODE}" == "prep" ]]; then
+            export FORCE_BLOCK_LIVE="1"
+            export DISABLE_LIVE_TRADING="1"
+            export LIVE_TRADING_ENABLED="0"
+            export NO_TRADE="1"
+          fi
+
+          # ✅ minervini_test도 주문 차단
+          if [[ "${MODE}" == "minervini_test" ]]; then
+            export FORCE_BLOCK_LIVE="1"
+            export DISABLE_LIVE_TRADING="1"
+            export LIVE_TRADING_ENABLED="0"
+            export NO_TRADE="1"
+          fi
+
+      - name: DB migrate
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+
+      - name: Run (mode switch)
+        run: |
+          set -euo pipefail
+
+          # ✅ 스킵 방지: MODE에 따라 명확히 실행
+          case "${MODE}" in
+            prep)
+              # ✅ Delta only: OHLCV_DELTA_DAYS=1, PREFETCH_DAYS=1 기본
+              python -m trader.prep_runner
+              ;;
+            candidate)
+              python -m trader.candidate_pool_builder
+              ;;
+            trade)
+              python -m trader.trade_tick
+              ;;
+            both)
+              python -m trader.prep_runner
+              python -m trader.candidate_pool_builder
+              python -m trader.trade_tick
+              ;;
+            minervini_test)
+              python -m trader.minervini_runner
+              ;;
+            *)
+              echo "::error::Unknown MODE=${MODE}"
+              exit 1
+              ;;
+          esac
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
