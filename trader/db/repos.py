@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
-from sqlalchemy import Engine, and_, func, or_, select, bindparam
+from sqlalchemy import Engine, String, and_, cast, func, or_, select, bindparam
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
@@ -1251,7 +1251,11 @@ class LedgerEventsRepo:
     def _payload_as_of_expr(self):
         col = self._schema.ledger_events.c.payload_json
         if self.engine.dialect.name == "postgresql":
-            return col["as_of"].astext
+            expr = col["as_of"]
+            try:
+                return expr.as_string()
+            except Exception:
+                return cast(expr, String)
         return func.json_extract(col, "$.as_of")
 
     def ensure_run_exists(self, run_id: str) -> None:
