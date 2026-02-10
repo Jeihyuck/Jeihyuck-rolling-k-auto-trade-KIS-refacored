@@ -1,4 +1,7 @@
 ALTER TABLE ledger_events
+  ALTER COLUMN payload_json DROP DEFAULT;
+
+ALTER TABLE ledger_events
   ALTER COLUMN payload_json TYPE jsonb
   USING
     CASE
