@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import Engine
 
 
@@ -51,6 +52,7 @@ def _build_schema(database_url: str) -> SchemaTables:
     metadata = sa.MetaData()
     uuid_type = _uuid_type_for_url(database_url)
     uses_native_uuid = False
+    jsonb_type = JSONB if database_url.startswith("postgres") else sa.JSON
 
     def uuid_col(name: str, **kwargs: Any) -> sa.Column:
         return sa.Column(name, uuid_type, default=lambda: str(uuid4()), **kwargs)
@@ -240,7 +242,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("ok", sa.Boolean, nullable=False, server_default=sa.text("true")),
         sa.Column("reasons", sa.JSON, nullable=False, default=list),
         sa.Column("stage", sa.String),
-        sa.Column("payload_json", sa.JSON, nullable=False, default=dict),
+        sa.Column("payload_json", jsonb_type, nullable=False, default=dict),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
