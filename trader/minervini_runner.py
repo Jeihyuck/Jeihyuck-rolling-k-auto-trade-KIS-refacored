@@ -1,53 +1,25 @@
-"""Minervini 필터 독립 실행 모듈 - DIAG 모드 전용."""
-from __future__ import annotations
-
-import json
-import logging
+# trader/minervini_runner.py
 import os
-from collections import Counter
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Dict, List
 
-import pandas as pd
-from sqlalchemy import Engine
+def main():
+    """
+    Thin wrapper to ensure `python -m trader.minervini_runner` works.
+    We delegate to prep_runner in MINERVINI_ONLY mode to reuse existing pipeline safely.
+    """
+    os.environ.setdefault("MINERVINI_ONLY", "1")
+    # optional: allow running PB1 decision pipeline during minervini_test
+    # keep as-is: controlled by PB1_RUN_IN_MINERVINI_TEST env used elsewhere
+    from trader import prep_runner
 
-from trader.candidate_pool_builder import load_candidate_pool
-from trader.config import (
-    MINERVINI_MAX_ATR_PCT,
-    RS_BENCHMARK,
-    RS_COMPOSITE_W1,
-    RS_COMPOSITE_W2,
-    RS_LOOKBACK_DAYS,
-    RS_LOOKBACK2_DAYS,
-    VCP_LOOKBACK,
-    VCP_MIN_SCORE,
-)
-from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-from trader.db.repos import UniverseRepo, WatchlistRepo
-from trader.factors.rs_rank import rank_rs
-from trader.kis_wrapper import KisAPI
-from trader.minervini.report import run_minervini_report
-from trader.runtime_paths import runtime_path
-from trader.setups.vcp_pro import VolContractRules, PriceTightRules, score_vcp, is_vcp_ready, detect_vcp
-from trader.strategies.pb1_minervini_v2 import MinerviniConfig, compute_features, score_setup
-from trader.time_utils import now_kst
+    # prep_runner가 main()을 제공하면 호출, 아니면 모듈 실행 루틴을 호출
+    if hasattr(prep_runner, "main"):
+        prep_runner.main()
+    else:
+        # fallback: run module as script style
+        import runpy
+        runpy.run_module("trader.prep_runner", run_name="__main__")
 
-logger = logging.getLogger(__name__)
-
-MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
-MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
-
-
-def _minervini_ohlcv_days() -> int:
-    base = 200 + MA200_SLOPE_LOOKBACK + 60
-    return max(MINERVINI_OHLCV_DAYS_MIN, base)
-
-
-def run_minervini_for_codes(
-    *,
-    codes: List[str],
-    as_of: date,
+if __name__ == "__main__":
     env: str,
     strategy: str,
     engine: Engine,

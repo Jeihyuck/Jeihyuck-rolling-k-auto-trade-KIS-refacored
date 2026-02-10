@@ -294,13 +294,22 @@ jobs:
         run: |
           set -euo pipefail
           echo "======================================"
-          echo "[IMPORT CHECK] Verifying modules exist"
+          echo "[IMPORT CHECK] MODE=${MODE}"
           echo "======================================"
           
-          EXIT_CODE=0
+          mods=("trader.db.migrate")
           
-          # Check each critical module
-          for module in "trader.prep_runner" "trader.candidate_pool_builder" "trader.pb1_runner" "trader.minervini_runner" "trader.trade_tick" "trader.db.migrate"; do
+          case "${MODE}" in
+            prep) mods+=("trader.prep_runner") ;;
+            candidate) mods+=("trader.candidate_pool_builder") ;;
+            trade) mods+=("trader.trade_tick") ;;
+            both) mods+=("trader.prep_runner" "trader.candidate_pool_builder" "trader.trade_tick") ;;
+            minervini_test) mods+=("trader.minervini_runner") ;;
+            *) echo "::error::Unknown MODE=${MODE}"; exit 1 ;;
+          esac
+          
+          EXIT_CODE=0
+          for module in "${mods[@]}"; do
             if python -c "import ${module}" 2>/dev/null; then
               echo "✅ ${module} - OK"
             else
@@ -310,11 +319,11 @@ jobs:
           done
           
           if [ $EXIT_CODE -ne 0 ]; then
-            echo "::error::One or more required modules are missing!"
+            echo "::error::Missing required modules for MODE=${MODE}"
             exit 1
           fi
           
-          echo "All required modules are available."
+          echo "All required modules available."
           echo "======================================" 
 
       - name: Guard postgres-only
@@ -425,20 +434,20 @@ jobs:
 
           case "${MODE}" in
             prep)
-              echo "Running prep_runner (delta OHLCV + watchlist/candidate cache)..."
               python -m trader.prep_runner
               ;;
             candidate)
-              echo "Running candidate_pool_builder..."
               python -m trader.candidate_pool_builder
               ;;
             trade)
-              echo "Running pb1_runner (trade tick pipeline)..."
-              # ✅ Use pb1_runner directly (trade_tick.py is now an alias that delegates to this)
-              python -m trader.pb1_runner
+              python -m trader.trade_tick
+              ;;
+            both)
+              python -m trader.prep_runner
+              python -m trader.candidate_pool_builder
+              python -m trader.trade_tick
               ;;
             minervini_test)
-              echo "Running minervini_runner (test mode)..."
               python -m trader.minervini_runner
               ;;
             *)
