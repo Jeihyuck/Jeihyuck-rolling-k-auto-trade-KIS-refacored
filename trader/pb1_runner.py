@@ -1169,6 +1169,18 @@ def run_once(
             allow_wait,
         )
 
+        run_action = (os.getenv("RUN_ACTION") or "smoke").strip().lower()
+        if run_action in {"decision", "live"} and action in {"smoke", "wait"}:
+            logger.info(
+                "[PB1][RUN_ACTION] override action=%s -> run (run_action=%s)",
+                action,
+                run_action,
+            )
+            action = "run"
+            target_start = None
+        elif run_action not in {"smoke", "decision", "live"}:
+            logger.warning("[PB1][RUN_ACTION] invalid RUN_ACTION=%s (expected smoke|decision|live)", run_action)
+
         if action == "wait" and target_start:
             while True:
                 now = _get_now_kst()

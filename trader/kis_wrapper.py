@@ -2965,6 +2965,20 @@ class KisAPI:
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+            logger.warning(
+                "[ORDER][BLOCKED] reason=force_block_live code=%s side=%s qty=%s",
+                body.get("PDNO"),
+                "SELL" if is_sell else "BUY",
+                body.get("ORD_QTY"),
+            )
+            return {
+                "blocked": True,
+                "reason": "force_block_live",
+                "rt_cd": "1",
+                "msg_cd": "FORCE_BLOCK_LIVE",
+                "msg1": "force_block_live",
+            }
         _assert_orders_allowed("order_cash")
 
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
@@ -3229,6 +3243,19 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+            logger.warning(
+                "[ORDER][BLOCKED] reason=force_block_live code=%s side=BUY qty=%s",
+                pdno,
+                qty,
+            )
+            return {
+                "blocked": True,
+                "reason": "force_block_live",
+                "rt_cd": "1",
+                "msg_cd": "FORCE_BLOCK_LIVE",
+                "msg1": "force_block_live",
+            }
         _assert_orders_allowed("buy_stock_limit")
         
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
@@ -3294,6 +3321,19 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+            logger.warning(
+                "[ORDER][BLOCKED] reason=force_block_live code=%s side=SELL qty=%s",
+                pdno,
+                qty,
+            )
+            return {
+                "blocked": True,
+                "reason": "force_block_live",
+                "rt_cd": "1",
+                "msg_cd": "FORCE_BLOCK_LIVE",
+                "msg1": "force_block_live",
+            }
         _assert_orders_allowed("sell_stock_limit")
         
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)

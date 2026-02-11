@@ -4557,6 +4557,52 @@ class PB1Engine:
         )
         return members, source
 
+    def _apply_minervini_prefilter(self, members: list[dict]) -> tuple[list[dict], str]:
+        if not members:
+            return members, "empty"
+        if not self.minervini_only:
+            return members, "disabled"
+
+        today_val = self._today
+        if isinstance(today_val, str):
+            today_val = today_val.split("T")[0]
+            today_val = date.fromisoformat(today_val)
+        elif isinstance(today_val, datetime):
+            today_val = today_val.date()
+
+        symbols = [str(m.get("code") or "").zfill(6) for m in members if m.get("code")]
+        if not symbols:
+            return members, "no_symbols"
+
+        ttl_days = int(os.getenv("MINERVINI_PREFILTER_TTL_DAYS", "7"))
+        derived_repo = DerivedMinerviniRepo(self.engine)
+        rows, actual_as_of = derived_repo.load_for_as_of_with_fallback(
+            as_of=today_val,
+            symbols=symbols,
+            ttl_days=ttl_days,
+        )
+        if not rows:
+            logger.warning(
+                "[MINERVINI][PREFILTER] skip reason=missing_derived as_of=%s",
+                today_val,
+            )
+            return members, "missing_derived"
+
+        pass_set = {
+            str(row.get("symbol") or "").zfill(6)
+            for row in rows
+            if row.get("minervini_pass")
+        }
+        before = len(members)
+        filtered = [m for m in members if str(m.get("code") or "").zfill(6) in pass_set]
+        logger.info(
+            "[MINERVINI][PREFILTER] before=%s after=%s as_of=%s",
+            before,
+            len(filtered),
+            actual_as_of.isoformat() if actual_as_of else "none",
+        )
+        return filtered, "applied"
+
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
         marks = self._fetch_marks([p["code"] for p in positions], fallback)
@@ -5142,6 +5188,11 @@ class PB1Engine:
                     len(scan_members),
                     len(universe_members),
                 )
+
+        if self.minervini_only and scan_members:
+            scan_members, prefilter_reason = self._apply_minervini_prefilter(scan_members)
+            if prefilter_reason == "applied":
+                scan_source = f"{scan_source}+minervini_prefilter"
         
         logger.info(
             "[ENTRY][PIPE][START] trace=%s scan_count=%s source=%s slots=%s tick_budget=%.0f entry_allowed=%s",
@@ -5285,6 +5336,13 @@ class PB1Engine:
                 scan_codes = [m.get("code") for m in (scan_members or []) if m.get("code")]
                 topk_selected = scan_codes[:topk_target]
                 finaln_selected = candidate_codes[:finaln_target]
+                logger.info(
+                    "[PB1][SELECT] topk=%s finaln=%s selected_topk=%s selected_finaln=%s",
+                    topk_target,
+                    finaln_target,
+                    len(topk_selected),
+                    len(finaln_selected),
+                )
                 logger.info(
                     "[MINERVINI_ONLY][SUMMARY] candidate_loaded=%s",
                     len(scan_members),

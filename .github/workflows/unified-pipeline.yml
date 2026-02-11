@@ -60,6 +60,23 @@ on:
         description: "1=run PB1 decision pipeline during minervini_test"
         required: true
         default: "0"
+      FORCE_LIVE_MODE:
+        description: "1=force intraday mode even when market is closed"
+        required: true
+        default: "0"
+      RUN_ACTION:
+        description: "smoke | decision | live"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - decision
+          - live
+      MINERVINI_ONLY:
+        description: "1=apply minervini prefilter for final selection"
+        required: true
+        default: "0"
       FORCE_COMPUTE_ON_CUTOFF:
         description: "1=force compute even when entry cutoff blocks orders"
         required: true
@@ -112,6 +129,8 @@ env:
 
   ATR_MAX_PCT: "0.10"
   PB1_RUN_IN_MINERVINI_TEST: "0"
+  FORCE_LIVE_MODE: "0"
+  RUN_ACTION: "smoke"
   FORCE_COMPUTE_ON_CUTOFF: "1"
   BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
   FORCE_HTTP: "0"
@@ -275,6 +294,9 @@ jobs:
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
+      FORCE_LIVE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_LIVE_MODE || '0' }}
+      RUN_ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.RUN_ACTION || 'smoke' }}
+      MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.MINERVINI_ONLY || '0' }}
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
       FORCE_HTTP: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_HTTP || '0' }}
@@ -371,6 +393,9 @@ jobs:
           echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
           echo "DRYRUN: ${DRYRUN}"
           echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
+          echo "FORCE_LIVE_MODE: ${FORCE_LIVE_MODE}"
+          echo "RUN_ACTION: ${RUN_ACTION}"
+          echo "MINERVINI_ONLY: ${MINERVINI_ONLY}"
           echo "FORCE_HTTP: ${FORCE_HTTP}"
           echo "ORDER_TEST: ${ORDER_TEST}"
           echo "ORDER_TEST_SYMBOLS: ${ORDER_TEST_SYMBOLS}"
