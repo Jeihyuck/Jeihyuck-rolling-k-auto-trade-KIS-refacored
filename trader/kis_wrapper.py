@@ -49,21 +49,25 @@ logger = logging.getLogger(__name__)
 def kis_http_enabled() -> bool:
     """
     KIS API HTTP 호출 허용 여부 판단.
-    - MINERVINI_ONLY=1 → False (최우선 차단)
+    - FORCE_HTTP=1 → True (DIAG 포함, 최우선 허용)
+    - MINERVINI_ONLY=1 → False (FORCE_HTTP=1이면 예외)
     - KIS_HTTP_ENABLED=0/FALSE/NO/OFF → False (차단)
     - KIS_HTTP_ENABLED=AUTO → STRATEGY_MODE=LIVE일 때만 True
     - 그 외 → True
     """
+    force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
+
     # [CRITICAL] MINERVINI_ONLY가 1이면 무조건 HTTP 차단
     from trader.config import MINERVINI_ONLY
-    if MINERVINI_ONLY:
+    if MINERVINI_ONLY and not force_http:
         return False
     
     v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
     if v in ("0", "FALSE", "NO", "OFF"):
-        return False
+        return force_http
     if v == "AUTO":
-        return os.getenv("STRATEGY_MODE", "").strip().upper() == "LIVE"
+        http_enabled = os.getenv("STRATEGY_MODE", "").strip().upper() == "LIVE"
+        return http_enabled or force_http
     return True
 
 
@@ -695,22 +699,8 @@ class KisAPI:
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
-        # Safe helper: always defined, avoids name collisions with variables
-        def kis_http_on() -> bool:
-            from trader.config import MINERVINI_ONLY
-
-            if MINERVINI_ONLY:
-                return False
-
-            v = os.getenv("KIS_HTTP_ENABLED", "AUTO").strip().upper()
-            if v in ("0", "FALSE", "NO", "OFF"):
-                return False
-            if v == "AUTO":
-                return os.getenv("STRATEGY_MODE", "").strip().upper() == "LIVE"
-            return True
-
         # ✅ KIS_HTTP_ENABLED 차단
-        if not kis_http_on():
+        if not kis_http_enabled():
             logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=%s", os.getenv("STRATEGY_MODE"), url)
             
             # Stub response 반환
@@ -727,8 +717,9 @@ class KisAPI:
         # ✅ DIAG 모드 KIS API 차단 (KIS_HTTP_ENABLED=1이면 읽기 허용)
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         kis_http_env = str(os.getenv("KIS_HTTP_ENABLED", "0")).strip()
+        force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
 
-        if strategy_mode == "DIAG" and kis_http_env != "1":
+        if strategy_mode == "DIAG" and kis_http_env != "1" and not force_http:
             raise KISBlockedError(f"KIS API blocked in DIAG mode (KIS_HTTP_ENABLED=0): {method} {url}")
         
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":

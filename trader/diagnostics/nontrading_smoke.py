@@ -125,15 +125,22 @@ def run_nontrading_smoke_once(
         _check_timeout("probe_prepare")
         # DIAG 모드에서는 KIS HTTP 경로 진입 최소화
         is_diag = os.getenv("EFFECTIVE_STRATEGY_MODE", "").upper() == "DIAG"
+        force_http = os.getenv("FORCE_HTTP", "0") == "1"
         kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "0") != "0"
+        effective_http = kis_http_enabled or force_http
         kis = None
-        if not is_diag and kis_http_enabled:
+        if effective_http:
             try:
                 kis = KisAPI(env=env)
             except Exception as exc:
                 logger.warning("[NONTRADING_SMOKE][PROBE] kis_init_fail env=%s err=%s", env, exc)
         else:
-            logger.info("[NONTRADING_SMOKE][PROBE] KIS skipped (DIAG=%s, HTTP=%s)", is_diag, kis_http_enabled)
+            logger.info(
+                "[NONTRADING_SMOKE][PROBE] KIS skipped (DIAG=%s, HTTP=%s, FORCE_HTTP=%s)",
+                is_diag,
+                kis_http_enabled,
+                int(force_http),
+            )
         providers = [KISOHLCVProvider(kis)] if kis else []
         providers.append(KRXOHLCVProvider())
         chain = ChainOHLCVProvider(providers, env=env)

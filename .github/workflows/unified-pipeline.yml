@@ -68,6 +68,18 @@ on:
         description: "1=bypass entry cutoff for compute only"
         required: true
         default: "1"
+      FORCE_HTTP:
+        description: "1=enable KIS HTTP even in DIAG"
+        required: true
+        default: "0"
+      ORDER_TEST:
+        description: "1=call order endpoint for test"
+        required: true
+        default: "0"
+      ORDER_TEST_SYMBOLS:
+        description: "comma-separated whitelist for order tests"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -102,6 +114,9 @@ env:
   PB1_RUN_IN_MINERVINI_TEST: "0"
   FORCE_COMPUTE_ON_CUTOFF: "1"
   BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
+  FORCE_HTTP: "0"
+  ORDER_TEST: "0"
+  ORDER_TEST_SYMBOLS: ""
 
   # Backward-compatible aliases
   DRY_RUN: "0"
@@ -262,6 +277,9 @@ jobs:
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
+      FORCE_HTTP: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_HTTP || '0' }}
+      ORDER_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
+      ORDER_TEST_SYMBOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST_SYMBOLS || '' }}
 
       # aliases
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}
@@ -353,6 +371,9 @@ jobs:
           echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
           echo "DRYRUN: ${DRYRUN}"
           echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
+          echo "FORCE_HTTP: ${FORCE_HTTP}"
+          echo "ORDER_TEST: ${ORDER_TEST}"
+          echo "ORDER_TEST_SYMBOLS: ${ORDER_TEST_SYMBOLS}"
           echo "======================================"
 
       - name: Live status check

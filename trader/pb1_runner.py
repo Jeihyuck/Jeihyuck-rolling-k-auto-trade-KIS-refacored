@@ -2453,13 +2453,16 @@ def main() -> int:
     # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
     minervini_only_env = os.getenv("MINERVINI_ONLY", "0") == "1"
     if minervini_only_env:
-        os.environ["KIS_HTTP_ENABLED"] = "0"
+        force_http = os.getenv("FORCE_HTTP", "0") == "1"
+        if not force_http:
+            os.environ["KIS_HTTP_ENABLED"] = "0"
         os.environ["DISABLE_LIVE_TRADING"] = "1"
         os.environ["LIVE_TRADING_ENABLED"] = "0"
         os.environ["STRATEGY_MODE"] = "DIAG"
         os.environ["PB1_PHASE_DEFAULT"] = "entry"
         logger.warning(
-            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=0 + PB1_PHASE_DEFAULT=entry"
+            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=%s + PB1_PHASE_DEFAULT=entry",
+            "0" if not force_http else os.getenv("KIS_HTTP_ENABLED", "AUTO"),
         )
     
     # ✅ AUTO 모드 결정 및 환경변수 고정
