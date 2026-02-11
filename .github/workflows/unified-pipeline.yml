@@ -89,6 +89,10 @@ on:
         description: "1=enable KIS HTTP even in DIAG"
         required: true
         default: "0"
+      BYPASS_ACTIVE_WINDOW:
+        description: "1=bypass active window gate (run decision even outside market windows)"
+        required: false
+        default: "0"
       ORDER_TEST:
         description: "1=call order endpoint for test"
         required: true
@@ -134,6 +138,7 @@ env:
   FORCE_COMPUTE_ON_CUTOFF: "1"
   BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
   FORCE_HTTP: "0"
+  BYPASS_ACTIVE_WINDOW: "0"
   ORDER_TEST: "0"
   ORDER_TEST_SYMBOLS: ""
 
@@ -300,6 +305,7 @@ jobs:
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
       FORCE_HTTP: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_HTTP || '0' }}
+      BYPASS_ACTIVE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ACTIVE_WINDOW || '0' }}
       ORDER_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
       ORDER_TEST_SYMBOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST_SYMBOLS || '' }}
 
@@ -397,6 +403,7 @@ jobs:
           echo "RUN_ACTION: ${RUN_ACTION}"
           echo "MINERVINI_ONLY: ${MINERVINI_ONLY}"
           echo "FORCE_HTTP: ${FORCE_HTTP}"
+          echo "BYPASS_ACTIVE_WINDOW: ${BYPASS_ACTIVE_WINDOW}"
           echo "ORDER_TEST: ${ORDER_TEST}"
           echo "ORDER_TEST_SYMBOLS: ${ORDER_TEST_SYMBOLS}"
           echo "======================================"

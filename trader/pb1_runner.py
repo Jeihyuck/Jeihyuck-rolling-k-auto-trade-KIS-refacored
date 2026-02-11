@@ -1170,6 +1170,15 @@ def run_once(
         )
 
         run_action = (os.getenv("RUN_ACTION") or "smoke").strip().lower()
+        bypass_active_window = str(os.getenv("BYPASS_ACTIVE_WINDOW", "0")).strip() in {
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+            "y",
+            "Y",
+        }
         if run_action in {"decision", "live"} and action in {"smoke", "wait"}:
             logger.info(
                 "[PB1][RUN_ACTION] override action=%s -> run (run_action=%s)",
@@ -1311,8 +1320,16 @@ def run_once(
             phase_for_log = phase_default
             logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
         else:
-            logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-            return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
+            if bypass_active_window and run_action in {"decision", "live"}:
+                logger.warning(
+                    "[PB1][WINDOW] bypassed outside active windows "
+                    "(BYPASS_ACTIVE_WINDOW=1, run_action=%s) now=%s",
+                    run_action,
+                    now,
+                )
+            else:
+                logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+                return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag
