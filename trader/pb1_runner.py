@@ -211,6 +211,11 @@ BALANCE_STATE_UNKNOWN = "UNKNOWN"
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
 
 
+def _env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return v if (v is not None and str(v).strip() != "") else default
+
+
 def _run_build_watchlist_job() -> int:
     """
     ✅ 설계 1: 주 1회 워치리스트 빌드 JOB.
@@ -1021,6 +1026,13 @@ def run_once(
     
     # ✅ [1] intended_live 결정 (STRATEGY_MODE=LIVE 여부)
     intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
+
+    universe_strategy = (
+        _env("CANDIDATE_POOL_UNIVERSE_STRATEGY")
+        or _env("UNIVERSE_STRATEGY")
+        or _env("STRATEGY")
+        or DEFAULT_UNIVERSE_STRATEGY
+    )
     
     # ✅ [2] LIVE_ENV_LOCK 호출 → dry_run 파싱 (단 한 번만)
     dry_run = _force_live_env_lock_if_needed(intended_live=intended_live)
@@ -1567,7 +1579,8 @@ def run_once(
 
     if not loop_mode:
         if is_db_only_mode():
-            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            if not universe_strategy:
+                universe_strategy = DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
                 repo=UniverseRepo(engine),
                 env=kis_env or "practice",
@@ -1627,7 +1640,8 @@ def run_once(
     universe_ctx: UniverseContext | None = None
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            if not universe_strategy:
+                universe_strategy = DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
                     engine=engine,
@@ -1882,6 +1896,9 @@ def run_once(
             phase_override_arg,
             window_label,
         )
+
+        if not universe_strategy:
+            universe_strategy = DEFAULT_UNIVERSE_STRATEGY
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
