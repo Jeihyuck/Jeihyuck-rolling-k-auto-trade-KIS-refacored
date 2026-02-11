@@ -15,8 +15,12 @@ from zoneinfo import ZoneInfo
 from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
+    CANDIDATE_POOL_TTL_DAYS,
     CLOSE_AUCTION_END,
     CLOSE_AUCTION_START,
+    DERIVED_FALLBACK_ENABLED,
+    DERIVED_FALLBACK_MAX_DAYS,
+    DERIVED_FALLBACK_WARN_AGE_DAYS,
     DIAGNOSTIC_MODE,
     DIAGNOSTIC_ONLY,
     LEDGER_BASE_DIR,
@@ -49,7 +53,6 @@ from trader.config import (
     PAPER_RESET_AUTO_PURGE,
     PAPER_RESET_EVENT_ONLY_IN_PRACTICE,
     resolve_strategy_mode,
-    RS_BENCHMARK,
 )
 from trader.runtime_paths import runtime_root, runtime_path
 from trader.db.engine import make_engine
@@ -65,7 +68,6 @@ from trader.db.repos import (
     ReconcileLogRepo,
     RunsRepo,
     UniverseRepo,
-    load_price_daily,
 )
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
@@ -2488,27 +2490,12 @@ def main() -> int:
         engine = make_engine()
         ledger_repo = LedgerEventsRepo(engine)
         
-        prep_summary = ledger_repo.get_event_type_on_date_summary(
+        # PREP_DONE 체크는 derived_as_of 기준으로
+        if not ledger_repo.has_event_type_on_date(
             env=os.getenv("STRATEGY_ENV", "practice").lower(),
             event_type="PREP_DONE",
             as_of=derived_as_of,
-        )
-        latest_prep_as_of = ledger_repo.get_latest_payload_as_of(
-            env=os.getenv("STRATEGY_ENV", "practice").lower(),
-            event_type="PREP_DONE",
-        )
-        logger.info(
-            "[TRADE_TICK][PREP_DONE][QUERY] env=%s as_of=%s count=%d latest_ts=%s latest_payload_as_of=%s latest_global_as_of=%s keys=env+as_of+event_type",
-            os.getenv("STRATEGY_ENV", "practice").lower(),
-            derived_as_of.isoformat(),
-            prep_summary.get("count", 0),
-            prep_summary.get("latest_ts") or "N/A",
-            prep_summary.get("latest_payload_as_of") or "N/A",
-            latest_prep_as_of or "N/A",
-        )
-
-        # PREP_DONE 체크는 derived_as_of 기준으로
-        if prep_summary.get("count", 0) <= 0:
+        ):
             logger.warning(
                 "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
                 derived_as_of.isoformat(),
@@ -2519,64 +2506,86 @@ def main() -> int:
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
         derived_count = derived_repo.count_as_of(as_of=derived_as_of)
+        
+        # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
         if derived_count <= 0:
-            logger.warning(
-                "[TRADE_TICK][SKIP] reason=DERIVED_MISSING derived_as_of=%s trade_date=%s count=%d",
+            if DERIVED_FALLBACK_ENABLED:
+                logger.info(
+                    "[TRADE_TICK][FALLBACK][START] derived_as_of=%s missing -> trying fallback (max_back=%d ttl=%d)",
+                    derived_as_of.isoformat(),
+                    DERIVED_FALLBACK_MAX_DAYS,
+                    CANDIDATE_POOL_TTL_DAYS,
+                )
+                
+                fallback_as_of = derived_repo.find_latest_available_asof(
+                    target_as_of=derived_as_of,
+                    max_back_days=DERIVED_FALLBACK_MAX_DAYS,
+                    ttl_days=CANDIDATE_POOL_TTL_DAYS,
+                )
+                
+                if fallback_as_of:
+                    age_days = (derived_as_of - fallback_as_of).days
+                    
+                    # ✅ 안전장치: fallback age가 크면 강력한 경고
+                    if age_days >= DERIVED_FALLBACK_WARN_AGE_DAYS:
+                        logger.error(
+                            "[TRADE_TICK][FALLBACK][RISK_WARNING] ⚠️  STALE DATA RISK ⚠️  "
+                            "derived_as_of=%s -> fallback=%s age=%d >= warn_threshold=%d | "
+                            "데이터가 %d영업일 이상 오래되었습니다. 매매 리스크가 높습니다. "
+                            "ANALYSIS_ONLY 권장 또는 수량 축소 고려",
+                            derived_as_of.isoformat(),
+                            fallback_as_of.isoformat(),
+                            age_days,
+                            DERIVED_FALLBACK_WARN_AGE_DAYS,
+                            age_days,
+                        )
+                    else:
+                        logger.warning(
+                            "[TRADE_TICK][FALLBACK][SUCCESS] derived_as_of=%s -> fallback=%s age=%d (max_back=%d ttl=%d)",
+                            derived_as_of.isoformat(),
+                            fallback_as_of.isoformat(),
+                            age_days,
+                            DERIVED_FALLBACK_MAX_DAYS,
+                            CANDIDATE_POOL_TTL_DAYS,
+                        )
+                    
+                    # ✅ derived_as_of를 fallback으로 교체하여 이후 로직에서 사용
+                    derived_as_of = fallback_as_of
+                    derived_count = derived_repo.count_as_of(as_of=derived_as_of)
+                    
+                    logger.info(
+                        "[TRADE_TICK][FALLBACK][DERIVED][OK] fallback_as_of=%s count=%d age=%d",
+                        derived_as_of.isoformat(),
+                        derived_count,
+                        age_days,
+                    )
+                else:
+                    logger.warning(
+                        "[TRADE_TICK][SKIP] reason=DERIVED_MISSING_FALLBACK_FAILED derived_as_of=%s trade_date=%s (max_back=%d ttl=%d)",
+                        derived_as_of.isoformat(),
+                        trade_date.isoformat(),
+                        DERIVED_FALLBACK_MAX_DAYS,
+                        CANDIDATE_POOL_TTL_DAYS,
+                    )
+                    return 0
+            else:
+                logger.warning(
+                    "[TRADE_TICK][SKIP] reason=DERIVED_MISSING derived_as_of=%s trade_date=%s count=%d (fallback_disabled)",
+                    derived_as_of.isoformat(),
+                    trade_date.isoformat(),
+                    derived_count,
+                )
+                return 0
+        else:
+            # 전일 derived 존재
+            logger.info(
+                "[TRADE_TICK][DERIVED][OK] derived_as_of=%s count=%d",
                 derived_as_of.isoformat(),
-                trade_date.isoformat(),
                 derived_count,
             )
-            return 0
         
-        logger.info(
-            "[TRADE_TICK][DERIVED][OK] derived_as_of=%s count=%d",
-            derived_as_of.isoformat(),
-            derived_count,
-        )
-        
-        # WATCHLIST 체크도 derived_as_of 기준으로
-        watchlist_repo = WatchlistRepo(engine)
-        watchlist_env = os.getenv("STRATEGY_ENV", "practice").lower()
-        watchlist_strategy = os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist")
-        watchlist_rows, watchlist_actual_as_of = watchlist_repo.load_watchlist(
-            env=watchlist_env,
-            strategy=watchlist_strategy,
-            as_of=derived_as_of,
-            allow_latest_fallback=False,
-        )
-        if not watchlist_rows:
-            logger.warning(
-                "[TRADE_TICK][SKIP] reason=WATCHLIST_MISSING derived_as_of=%s trade_date=%s",
-                derived_as_of.isoformat(),
-                trade_date.isoformat(),
-            )
-            return 0
-
-        logger.info(
-            "[TRADE_TICK][WATCHLIST][OK] derived_as_of=%s actual_as_of=%s count=%d",
-            derived_as_of.isoformat(),
-            watchlist_actual_as_of.isoformat() if watchlist_actual_as_of else "N/A",
-            len(watchlist_rows),
-        )
-
-        benchmark_code = str(RS_BENCHMARK or "229200").zfill(6)
-        benchmark_rows = load_price_daily(engine, benchmark_code, derived_as_of, derived_as_of)
-        if not benchmark_rows:
-            logger.warning(
-                "[TRADE_TICK][SKIP] reason=BENCHMARK_MISSING derived_as_of=%s trade_date=%s benchmark=%s",
-                derived_as_of.isoformat(),
-                trade_date.isoformat(),
-                benchmark_code,
-            )
-            return 0
-        logger.info(
-            "[TRADE_TICK][BENCHMARK][OK] derived_as_of=%s benchmark=%s rows=%d",
-            derived_as_of.isoformat(),
-            benchmark_code,
-            len(benchmark_rows),
-        )
-
         # CANDIDATE_POOL 체크도 derived_as_of 기준으로
+        # ✅ derived_as_of는 이미 fallback되었을 수 있으므로, pool도 fallback 허용
         pool_repo = WatchlistRepo(engine)
         pool_env = os.getenv("STRATEGY_ENV", "practice").lower()
         pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
@@ -2584,7 +2593,7 @@ def main() -> int:
             env=pool_env,
             strategy=pool_strategy,
             as_of=derived_as_of,
-            allow_latest_fallback=False,
+            allow_latest_fallback=True,  # ✅ fallback 허용 (ttl_days 범위 내)
         )
         if not pool_rows:
             logger.warning(
@@ -2593,7 +2602,7 @@ def main() -> int:
                 trade_date.isoformat(),
             )
             return 0
-
+        
         logger.info(
             "[TRADE_TICK][CANDIDATE_POOL][OK] derived_as_of=%s actual_as_of=%s count=%d",
             derived_as_of.isoformat(),

@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
-from sqlalchemy import Engine, String, and_, cast, func, or_, select, bindparam
+from sqlalchemy import Engine, and_, func, or_, select, bindparam
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .schema import (
@@ -1248,16 +1248,6 @@ class LedgerEventsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
-    def _payload_as_of_expr(self):
-        col = self._schema.ledger_events.c.payload_json
-        if self.engine.dialect.name == "postgresql":
-            expr = col["as_of"]
-            try:
-                return expr.as_string()
-            except Exception:
-                return cast(expr, String)
-        return func.json_extract(col, "$.as_of")
-
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -1581,79 +1571,16 @@ class LedgerEventsRepo:
     def has_event_type_on_date(self, *, env: str, event_type: str, as_of: date | str) -> bool:
         schema = self._schema
         as_of_date = to_date(as_of)
-        as_of_str = as_of_date.isoformat()
-        payload_as_of = self._payload_as_of_expr()
         stmt = select(func.count()).select_from(schema.ledger_events).where(
             and_(
                 schema.ledger_events.c.env == env,
                 schema.ledger_events.c.event_type == event_type,
-                or_(
-                    payload_as_of == as_of_str,
-                    func.date(schema.ledger_events.c.ts) == as_of_date,
-                ),
+                func.date(schema.ledger_events.c.ts) == as_of_date,
             )
         )
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0
-
-    def get_event_type_on_date_summary(
-        self, *, env: str, event_type: str, as_of: date | str
-    ) -> dict:
-        schema = self._schema
-        as_of_date = to_date(as_of)
-        as_of_str = as_of_date.isoformat()
-        payload_as_of = self._payload_as_of_expr()
-        filters = and_(
-            schema.ledger_events.c.env == env,
-            schema.ledger_events.c.event_type == event_type,
-            or_(
-                payload_as_of == as_of_str,
-                func.date(schema.ledger_events.c.ts) == as_of_date,
-            ),
-        )
-        stmt = select(func.count()).select_from(schema.ledger_events).where(filters)
-        latest_stmt = (
-            select(
-                schema.ledger_events.c.ts,
-                schema.ledger_events.c.run_id,
-                schema.ledger_events.c.payload_json,
-            )
-            .where(filters)
-            .order_by(schema.ledger_events.c.ts.desc())
-            .limit(1)
-        )
-        with self.engine.connect() as conn:
-            count = int(conn.execute(stmt).scalar() or 0)
-            latest_row = conn.execute(latest_stmt).mappings().first()
-        latest_ts = latest_row.get("ts") if latest_row else None
-        latest_run_id = latest_row.get("run_id") if latest_row else None
-        latest_payload_as_of = None
-        if latest_row and latest_row.get("payload_json"):
-            latest_payload_as_of = latest_row["payload_json"].get("as_of")
-        return {
-            "count": count,
-            "latest_ts": latest_ts,
-            "latest_run_id": latest_run_id,
-            "latest_payload_as_of": latest_payload_as_of,
-        }
-
-    def get_latest_payload_as_of(self, *, env: str, event_type: str) -> str | None:
-        schema = self._schema
-        payload_as_of = self._payload_as_of_expr()
-        stmt = (
-            select(func.max(payload_as_of))
-            .select_from(schema.ledger_events)
-            .where(
-                and_(
-                    schema.ledger_events.c.env == env,
-                    schema.ledger_events.c.event_type == event_type,
-                )
-            )
-        )
-        with self.engine.connect() as conn:
-            value = conn.execute(stmt).scalar()
-        return str(value) if value else None
 
 
 class PositionsRepo:
@@ -2467,6 +2394,107 @@ class DerivedMinerviniRepo:
         )
         
         return rows, fallback_as_of
+    
+    def find_latest_available_asof(
+        self,
+        *,
+        target_as_of: date,
+        max_back_days: int = 3,
+        ttl_days: int = 7,
+    ) -> date | None:
+        """
+        전일 derived 없을 때 fallback as_of 찾기 (우선순위 탐색).
+        
+        로직:
+        1. target_as_of부터 역순으로 max_back_days까지 순차 조회
+           (target, target-1, target-2, ..., target-max_back_days)
+        2. 없으면 ttl_days 범위 내에서 가장 최신 as_of 반환
+        3. 그것도 없으면 None
+        
+        Args:
+            target_as_of: 목표 as_of (전일)
+            max_back_days: 우선 탐색 범위 (기본 3일)
+            ttl_days: 최대 허용 일수 (기본 7일)
+        
+        Returns:
+            fallback_as_of | None
+        
+        Examples:
+            >>> # 2026-02-10 요청 -> 없으면 2026-02-09, 2026-02-08, 2026-02-07 순으로 확인
+            >>> # 그것도 없으면 ttl_days(7일) 범위 내 최신 반환
+            >>> repo.find_latest_available_asof(
+            ...     target_as_of=date(2026, 2, 10),
+            ...     max_back_days=3,
+            ...     ttl_days=7,
+            ... )
+            date(2026, 2, 9)  # 또는 2026-02-08, 2026-02-07, ...
+        """
+        schema = self._schema
+        target_date = to_date(target_as_of)
+        
+        # Step 1: 우선순위 탐색 (target, target-1, target-2, ..., target-max_back_days)
+        for i in range(max_back_days + 1):
+            candidate_date = target_date - timedelta(days=i)
+            
+            stmt = select(func.count()).select_from(schema.derived_minervini).where(
+                schema.derived_minervini.c.as_of == candidate_date
+            )
+            
+            with self.engine.connect() as conn:
+                count = int(conn.execute(stmt).scalar() or 0)
+            
+            if count > 0:
+                logger.info(
+                    "[DERIVED][FALLBACK][PRIORITY_FOUND] target=%s found=%s offset=%d count=%d",
+                    target_date.isoformat(),
+                    candidate_date.isoformat(),
+                    i,
+                    count,
+                )
+                return candidate_date
+        
+        # Step 2: 우선순위 탐색 실패 -> ttl 범위 내 최신 검색
+        logger.info(
+            "[DERIVED][FALLBACK][PRIORITY_MISS] target=%s max_back_days=%d -> trying ttl=%d",
+            target_date.isoformat(),
+            max_back_days,
+            ttl_days,
+        )
+        
+        min_date = target_date - timedelta(days=ttl_days)
+        stmt = (
+            select(func.max(schema.derived_minervini.c.as_of))
+            .where(
+                and_(
+                    schema.derived_minervini.c.as_of >= min_date,
+                    schema.derived_minervini.c.as_of <= target_date,
+                )
+            )
+        )
+        
+        with self.engine.connect() as conn:
+            latest_as_of = conn.execute(stmt).scalar()
+        
+        if not latest_as_of:
+            logger.warning(
+                "[DERIVED][FALLBACK][NOT_FOUND] target=%s max_back_days=%d ttl_days=%d",
+                target_date.isoformat(),
+                max_back_days,
+                ttl_days,
+            )
+            return None
+        
+        age_days = (target_date - latest_as_of).days
+        
+        logger.info(
+            "[DERIVED][FALLBACK][TTL_FOUND] target=%s fallback=%s age=%d ttl=%d",
+            target_date.isoformat(),
+            latest_as_of.isoformat(),
+            age_days,
+            ttl_days,
+        )
+        
+        return latest_as_of
 
 
 def save_watchlist(

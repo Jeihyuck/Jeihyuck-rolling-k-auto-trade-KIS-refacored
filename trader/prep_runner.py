@@ -19,7 +19,6 @@ from trader.data.ohlcv_provider import upsert_ohlcv_delta
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 from trader.time_utils import now_kst, prev_business_day
 from trader.utils.json_sanitize import to_jsonable
-from trader.config import RS_BENCHMARK
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +81,10 @@ def main() -> int:
         return 1
 
     symbols = [m.get("code") for m in members if m.get("code")]
-    benchmark_symbols = [RS_BENCHMARK or "229200", "229200"]
-    symbols_for_ohlcv = sorted({str(s).zfill(6) for s in (symbols + benchmark_symbols) if s})
 
     t_ohlcv = time.monotonic()
     delta_days = int(os.getenv("OHLCV_DELTA_DAYS", "1"))
-    delta_result = upsert_ohlcv_delta(symbols=symbols_for_ohlcv, as_of=as_of, days=delta_days)
+    delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
     dt_ohlcv = time.monotonic() - t_ohlcv
 
     t_derived = time.monotonic()

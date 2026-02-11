@@ -25,13 +25,13 @@ on:
         required: true
         default: "practice"
       PREFETCH_DAYS:
-        description: "OHLCV full prefetch days (e.g., 520). For delta prep keep 1"
+        description: "OHLCV full prefetch days (e.g., 520). For delta prep keep 5"
         required: true
-        default: "1"
+        default: "5"
       OHLCV_DELTA_DAYS:
-        description: "Delta days for OHLCV (default 1)"
+        description: "Delta days for OHLCV (default 5)"
         required: true
-        default: "1"
+        default: "5"
       FORCE_CANDIDATE:
         description: "1=force rebuild candidate pool"
         required: true
@@ -86,9 +86,9 @@ env:
   STRATEGY_ENV: "practice"
   KIS_ENV: "practice"
 
-  # ✅ Delta 기본: 전일/1일 델타
-  PREFETCH_DAYS: "1"
-  OHLCV_DELTA_DAYS: "1"
+  # ✅ Delta 기본: 최근 5일 델타 (전일 누락 흡수용)
+  PREFETCH_DAYS: "5"
+  OHLCV_DELTA_DAYS: "5"
 
   FORCE_CANDIDATE: "0"
   DRYRUN: "0"

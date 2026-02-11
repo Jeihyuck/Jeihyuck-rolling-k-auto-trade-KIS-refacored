@@ -228,6 +228,10 @@ CONFIG = {
     "CANDIDATE_POOL_MIN_PRICE": "2000.0",             # 후보군 최소 주가
     "CANDIDATE_POOL_LIQ_DAYS": "20",                  # 유동성 계산 일수
     "CANDIDATE_POOL_MIN_ROWS": "30",                  # OHLCV 최소 행수
+    # Derived Fallback (전일 데이터 없을 때 최근 영업일 최신 as_of로 fallback)
+    "DERIVED_FALLBACK_MAX_DAYS": "3",                 # 최근 N 영업일 우선 탐색 (기본 3)
+    "DERIVED_FALLBACK_ENABLED": "1",                  # fallback 활성화 (0=비활성화)
+    "DERIVED_FALLBACK_WARN_AGE_DAYS": "2",            # fallback age가 이 값 이상이면 경고 (기본 2)
     # Minervini v2 tuning
     "MINERVINI_RS_MIN": "0.80",
     "MINERVINI_MAX_PYRAMID": "3",
@@ -900,6 +904,12 @@ CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
 CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")
 CANDIDATE_POOL_MIN_ROWS = int(_cfg("CANDIDATE_POOL_MIN_ROWS") or "30")
 
+# === [NEW] Derived Fallback 환경변수 ===
+DERIVED_FALLBACK_ENABLED = _cfg_bool("DERIVED_FALLBACK_ENABLED", fallback=True)
+DERIVED_FALLBACK_MAX_DAYS = int(_cfg("DERIVED_FALLBACK_MAX_DAYS") or "3")
+DERIVED_FALLBACK_WARN_AGE_DAYS = int(_cfg("DERIVED_FALLBACK_WARN_AGE_DAYS") or "2")
+# ttl_days는 CANDIDATE_POOL_TTL_DAYS를 재사용
+
 # Minervini-only mode (analytics without trading)
 MINERVINI_ONLY = _cfg_bool("MINERVINI_ONLY", fallback=False)
 
@@ -957,6 +967,13 @@ logger.info(
     CANDIDATE_POOL_MIN_SIZE,
     CANDIDATE_POOL_STRATEGY_KEY,
     int(CANDIDATE_POOL_FORCE_REBUILD),
+)
+logger.info(
+    "[CONFIG][DERIVED_FALLBACK] enabled=%s max_back_days=%s warn_age_days=%s ttl_days=%s",
+    int(DERIVED_FALLBACK_ENABLED),
+    DERIVED_FALLBACK_MAX_DAYS,
+    DERIVED_FALLBACK_WARN_AGE_DAYS,
+    CANDIDATE_POOL_TTL_DAYS,
 )
 logger.info(
     "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
