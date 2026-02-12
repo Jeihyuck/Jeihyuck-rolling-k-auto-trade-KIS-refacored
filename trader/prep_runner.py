@@ -19,6 +19,8 @@ from trader.data.ohlcv_provider import upsert_ohlcv_delta
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 from trader.time_utils import now_kst, prev_business_day
 from trader.utils.json_sanitize import to_jsonable
+from trader.universe.build import build_universe
+from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +50,40 @@ def _load_db_ohlcv_df(*, engine, code: str, as_of: date, count: int) -> pd.DataF
 
 
 def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[dict]:
+    """
+    Ensure universe exists in DB for (env, strategy, as_of).
+    If missing and emergency_build/force_rebuild enabled -> build + save + reload.
+    If still missing -> fail hard (no silent fallback).
+    """
     repo = UniverseRepo(engine)
-    members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of.isoformat())
-    if members:
-        return members
+    as_of_s = as_of.isoformat()
 
-    from trader.universe import build as universe_build
+    # 1) load
+    members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
 
-    built = universe_build.build_universe(as_of_date=as_of.isoformat(), env=env, strategy=strategy)
-    if built:
-        repo.save_universe_run_and_members(env=env, strategy=strategy, as_of=as_of.isoformat(), members=built)
-        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of.isoformat())
-    return members or []
+    # 2) decide build
+    if FORCE_UNIVERSE_REBUILD or (EMERGENCY_UNIVERSE_BUILD and len(members) == 0):
+        logger.warning(
+            "[UNIVERSE][AUTO_BUILD] trigger build: env=%s strategy=%s as_of=%s (members=%d) emergency=%s force=%s",
+            env, strategy, as_of_s, len(members), EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
+        )
+
+        built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
+
+        # 3) save
+        repo.save_universe_run_and_members(env=env, strategy=strategy, as_of=as_of_s, members=built)
+
+        # 4) reload verify
+        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
+
+    # 5) hard fail if still empty
+    if len(members) == 0:
+        raise RuntimeError(
+            f"Universe empty after ensure/build: env={env} strategy={strategy} as_of={as_of_s} "
+            f"(emergency={EMERGENCY_UNIVERSE_BUILD}, force={FORCE_UNIVERSE_REBUILD})"
+        )
+
+    return members
 
 
 def main() -> int:

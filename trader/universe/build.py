@@ -156,6 +156,11 @@ def _load_fallback_universe_from_db(
     strategy: str,
     as_of_date: str,
 ) -> list[dict]:
+    # Check if fallback is disabled
+    if os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
+        logger.error("[UNIVERSE][NO_FALLBACK] fallback disabled by env")
+        return []
+    
     snapshot = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of_date)
     if not snapshot:
         logger.error(
