@@ -123,11 +123,30 @@ def main() -> int:
         logger.error("[PREP][FAIL] universe empty")
         return 1
 
+    # ---- RS benchmark handling (229200 etc.) ----
+    bench = os.getenv("RS_BENCHMARK", "229200").strip()
+
+    # Universe symbols
     symbols = [m.get("code") for m in members if m.get("code")]
+
+    # Ensure benchmark included for downstream RS/Stage_B computations
+    if bench and bench not in symbols:
+        symbols.append(bench)
+
+    # Use a longer backfill window for benchmark so RS lookbacks never fail.
+    # RS rank requires ~127 trading days; use 260/520 to be safe.
+    bench_days = int(os.getenv("BENCH_OHLCV_DAYS", "520"))
 
     t_ohlcv = time.monotonic()
     delta_days = int(os.getenv("OHLCV_DELTA_DAYS", "1"))
+
+    # 1) universe + bench: recent delta
     delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
+
+    # 2) benchmark: long backfill (only for bench) to satisfy RS required window
+    if bench and bench_days > delta_days:
+        upsert_ohlcv_delta(symbols=[bench], as_of=as_of, days=bench_days)
+
     dt_ohlcv = time.monotonic() - t_ohlcv
 
     t_derived = time.monotonic()
