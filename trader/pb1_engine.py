@@ -1536,54 +1536,59 @@ class PB1Engine:
         checked_count = 0
         ohlcv_missing_count = 0
         
-        # ✅ candidate-only philosophy: guard must check scan universe, not base universe.
+        # ✅ GUARD: 스캔 대상이 150 초과 시 경고 (성능 저하 우려)
+        # Note: 이 로그는 _compute_candidates 호출 후가 아닌, 입력 members_list 기준
         from trader.config import CANDIDATE_POOL_ENABLED
         pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
         
         if scan_count > 150:
             if pb1_candidate_only:
                 logger.error(
-                    "[CANDIDATE_POOL][GUARD] CRITICAL: scan_count=%s exceeds 150 in candidate-only mode (pool too large)",
+                    "[SCAN][GUARD] CRITICAL: scan_count=%d exceeds 150 in candidate-only mode (pool too large)",
                     scan_count
                 )
-                # candidate-only에서는 150 초과 시 치명적 (빌드 문제)
             elif CANDIDATE_POOL_ENABLED:
                 logger.warning(
-                    "[CANDIDATE_POOL][GUARD] scan_count=%s exceeds 150, "
-                    "this should have been reduced by candidate pool. "
-                    "Proceeding with large universe (performance may be slow).",
+                    "[SCAN][GUARD] scan_count=%d exceeds 150 (should have been reduced by candidate pool, check pool build)",
                     scan_count
                 )
             else:
-                # watchlist disabled인 경우 universe 사용 (정상)
                 logger.info(
-                    "[UNIVERSE][SCAN] scan_count=%s (watchlist disabled, using full universe)",
+                    "[SCAN][GUARD] scan_count=%d exceeds 150 (using full universe, watchlist disabled)",
                     scan_count
                 )
         
-        # ✅ 프리필터 적용 (Top N으로 제한)
-        if os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
+        # ✅ 프리필터 적용: watchlist인 경우 프리필터 스킵 (후보군 무력화 방지)
+        from trader.config import CANDIDATE_POOL_ENABLED
+        is_watchlist = CANDIDATE_POOL_ENABLED and scan_count <= 150
+        
+        if not is_watchlist and os.getenv("PB1_UNIVERSE_PREFILTER", "1") == "1":
             members_list = self._prefilter_members_fast(members_list)
             logger.info("[PB1][CANDIDATES][PREFILTER] scan_count=%s -> filtered=%s", scan_count, len(members_list))
+        elif is_watchlist:
+            logger.info("[PB1][CANDIDATES][PREFILTER] SKIP (using watchlist, scan_count=%s)", scan_count)
         
         try:
-            # Limit OHLCV queries to holdings + top candidates from previous run
-            holdings_codes = set(str(row.get("pdno") or "").zfill(6) for row in self._holdings_summary.get("output1", []))
-            top_candidates_path = runtime_path("top_candidates.json")
-            prev_top_codes = set()
-            if top_candidates_path.exists():
-                try:
-                    with open(top_candidates_path) as f:
-                        prev_top_candidates = json.load(f)
-                    prev_top_codes = set(c.get("code") for c in prev_top_candidates if c.get("code"))
-                except Exception:
-                    logger.warning("[PB1][TOP_CANDIDATES][LOAD_FAIL] %s", top_candidates_path)
-            relevant_codes = holdings_codes | prev_top_codes
-            if relevant_codes:
-                members_list = [m for m in members_list if str(m.get("code") or "").zfill(6) in relevant_codes]
-                logger.info("[PB1][CANDIDATES][LIMITED] holdings=%s prev_top=%s total_members=%s", len(holdings_codes), len(prev_top_codes), len(members_list))
+            # ✅ holdings/prev_top 필터: watchlist인 경우 스킵 (후보군 무력화 방지)
+            if not is_watchlist:
+                holdings_codes = set(str(row.get("pdno") or "").zfill(6) for row in self._holdings_summary.get("output1", []))
+                top_candidates_path = runtime_path("top_candidates.json")
+                prev_top_codes = set()
+                if top_candidates_path.exists():
+                    try:
+                        with open(top_candidates_path) as f:
+                            prev_top_candidates = json.load(f)
+                        prev_top_codes = set(c.get("code") for c in prev_top_candidates if c.get("code"))
+                    except Exception:
+                        logger.warning("[PB1][TOP_CANDIDATES][LOAD_FAIL] %s", top_candidates_path)
+                relevant_codes = holdings_codes | prev_top_codes
+                if relevant_codes:
+                    members_list = [m for m in members_list if str(m.get("code") or "").zfill(6) in relevant_codes]
+                    logger.info("[PB1][CANDIDATES][LIMITED] holdings=%s prev_top=%s total_members=%s", len(holdings_codes), len(prev_top_codes), len(members_list))
+                else:
+                    logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
             else:
-                logger.info("[PB1][CANDIDATES][FULL] no holdings/top_candidates -> full universe")
+                logger.info("[PB1][CANDIDATES][WATCHLIST] SKIP holdings/prev_top filter (scan_count=%s)", len(members_list))
             
             # 최소 캔들 수 조건 완화: 120일 또는 200일 데이터만으로도 후보 선정 가능
             required_candles = self.min_candles
@@ -4321,6 +4326,25 @@ class PB1Engine:
         }
         return members
 
+    def _resolve_scan_members_for_entry(self, universe_members: list[dict], watchlist_members: list[dict], watchlist_reason: str) -> tuple[list[dict], str]:
+        """
+        Entry scan target must be deterministic:
+        - if watchlist(candidate_pool) has members -> scan ONLY watchlist
+        - else -> scan universe
+        Returns: (scan_members, scan_source)
+        """
+        wl = list(watchlist_members or [])
+        uni = list(universe_members or [])
+
+        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        
+        if watchlist_enabled and len(wl) > 0:
+            # watchlist가 존재하면 무조건 watchlist만 스캔
+            return wl, watchlist_reason or "candidate_pool"
+        
+        # watchlist가 없거나 비활성화된 경우에만 universe 사용
+        return uni, "universe"
+
     def _load_today_watchlist_members(self) -> tuple[list[dict], str]:
         """
         ✅ NEW: 후보군(Candidate Pool) 우선 사용 로직.
@@ -5174,25 +5198,28 @@ class PB1Engine:
         # ✅ universe_members는 보유/리포트/정산용으로만 로드
         universe_members = self._load_universe()
         
-        # ✅ scan_members: 후보군 hit시 watchlist, 아니면 universe
-        scan_members = universe_members
-        scan_source = "universe"
+        # ✅ scan_members: 후보군 우선, 단일 함수로 결정 (이후 절대 덮어쓰지 않음)
+        watchlist_members = []
+        watchlist_reason = ""
         
-        watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
-        if watchlist_enabled and self.phase in {"prep", "entry"}:
+        if self.phase in {"prep", "entry"}:
             watchlist_members, watchlist_reason = self._load_today_watchlist_members()
-            if "candidate_pool_hit" in watchlist_reason or "candidate_pool_autobuilt" in watchlist_reason:
-                scan_members = watchlist_members
-                scan_source = watchlist_reason
-                logger.info(
-                    "[ENTRY][SCAN_INPUT] source=%s scan_count=%s (NOT universe=%s)",
-                    scan_source,
-                    len(scan_members),
-                    len(universe_members),
-                )
+        
+        # ✅ CRITICAL: scan_members는 이 함수 호출로만 결정 (이후 절대 변경 금지)
+        scan_members, scan_source = self._resolve_scan_members_for_entry(
+            universe_members=universe_members,
+            watchlist_members=watchlist_members,
+            watchlist_reason=watchlist_reason,
+        )
+        
+        # ✅ 디버그 로그: 원인 추적용 (재발 방지)
+        logger.info(
+            "[DEBUG][SCAN_MEMBERS] source=%s scan_len=%d watchlist_len=%d universe_len=%d",
+            scan_source, len(scan_members), len(watchlist_members or []), len(universe_members or [])
+        )
         
         logger.info(
-            "[ENTRY][PIPE][START] trace=%s scan_count=%s source=%s slots=%s tick_budget=%.0f entry_allowed=%s",
+            "[ENTRY][PIPE][START] trace=%s scan_count=%d source=%s slots=%d tick_budget=%.0f entry_allowed=%s",
             trace_id,
             len(scan_members),
             scan_source,
