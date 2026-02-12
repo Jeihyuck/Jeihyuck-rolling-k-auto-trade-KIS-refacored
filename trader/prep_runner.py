@@ -69,11 +69,10 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         )
 
         built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
+        logger.info("[UNIVERSE][AUTO_BUILD] built_members=%d (saved by builder)", len(built))
 
-        # 3) save
-        repo.save_universe_run_and_members(env=env, strategy=strategy, as_of=as_of_s, members=built)
-
-        # 4) reload verify
+        # NOTE: build_universe() already persists run+members to DB.
+        # So in prep_runner, only reload to verify.
         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
 
     # 5) hard fail if still empty
