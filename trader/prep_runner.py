@@ -11,7 +11,7 @@ import pandas as pd
 from trader.db.engine import get_engine
 from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
-from trader.db.repos import LedgerEventsRepo, UniverseRepo
+from trader.db.repos import LedgerEventsRepo, UniverseRepo, WatchlistRepo
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import build_and_save_watchlist
@@ -196,6 +196,31 @@ def main() -> int:
         force_rebuild=bool(force_candidate),
     )
     dt_watchlist = time.monotonic() - t_watchlist
+
+    # 보험: watchlist 최종 검증 (30 미만이면 DB에서 재확정)
+    finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
+    if len(watchlist) < finaln:
+        logger.warning(
+            "[PREP][WATCHLIST][TOO_SMALL] got=%s expected=%s -> reload exact from DB",
+            len(watchlist), finaln
+        )
+        watchlist_repo = WatchlistRepo(engine)
+        rows = watchlist_repo.load_watchlist(
+            env=env,
+            strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
+            as_of=as_of
+        )
+        if rows and len(rows) >= finaln:
+            watchlist = rows
+            logger.info("[PREP][WATCHLIST][FIXED_FROM_DB] count=%s", len(watchlist))
+        elif rows:
+            logger.error(
+                "[PREP][WATCHLIST][DB_TOO_SMALL] db_count=%s < expected=%s",
+                len(rows), finaln
+            )
+            raise RuntimeError(f"watchlist too small even in DB: {len(rows)} < {finaln}")
+        else:
+            raise RuntimeError(f"watchlist missing in DB: env={env} as_of={as_of}")
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id

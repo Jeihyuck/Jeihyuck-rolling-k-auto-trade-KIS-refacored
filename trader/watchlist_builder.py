@@ -350,11 +350,19 @@ def build_and_save_watchlist(
     if not force_rebuild:
         existing = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
         if existing:
-            logger.info(
-                "[WATCHLIST][CACHE] hit=True as_of=%s members=%s",
-                as_of, len(existing)
-            )
-            return existing
+            finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
+            if len(existing) < finaln:
+                logger.warning(
+                    "[WATCHLIST][CACHE][IGNORE] cached too small: %s < %s -> treat as miss",
+                    len(existing), finaln
+                )
+                existing = []
+            else:
+                logger.info(
+                    "[WATCHLIST][CACHE] hit=True as_of=%s members=%s",
+                    as_of, len(existing)
+                )
+                return existing
     
     # Watchlist 생성
     builder = WatchlistBuilder(
@@ -419,16 +427,24 @@ def load_today_watchlist_with_fallback(
     # 1) Try load today's watchlist (with fallback to latest within TTL)
     rows, used_as_of = _load()
     if rows:
-        if used_as_of and used_as_of != today:
-            age_days = (today - used_as_of).days
-            logger.info(
-                "[WATCHLIST][CACHE] hit=True source=watchlist_db_fallback as_of=%s (requested=%s, age=%s days) count=%s",
-                used_as_of, today, age_days, len(rows)
+        finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
+        if len(rows) < finaln:
+            logger.warning(
+                "[WATCHLIST][CACHE][IGNORE] cached too small: %s < %s -> treat as miss",
+                len(rows), finaln
             )
-            return rows, "watchlist_db"
+            rows = []
         else:
-            logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
-            return rows, "watchlist_db"
+            if used_as_of and used_as_of != today:
+                age_days = (today - used_as_of).days
+                logger.info(
+                    "[WATCHLIST][CACHE] hit=True source=watchlist_db_fallback as_of=%s (requested=%s, age=%s days) count=%s",
+                    used_as_of, today, age_days, len(rows)
+                )
+                return rows, "watchlist_db"
+            else:
+                logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
+                return rows, "watchlist_db"
     
     # 2) If empty and auto_build enabled -> build & save
     if auto_build_if_empty:
@@ -463,11 +479,18 @@ def load_today_watchlist_with_fallback(
     if latest_date:
         watchlist = repo.load_watchlist(env=env, strategy=strategy, as_of=latest_date)
         if watchlist:
-            logger.warning(
-                "[WATCHLIST][CACHE] hit=True source=prevday as_of=%s (today=%s)",
-                latest_date, today
-            )
-            return watchlist, "prevday"
+            finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
+            if len(watchlist) < finaln:
+                logger.warning(
+                    "[WATCHLIST][CACHE][IGNORE] prevday too small: %s < %s -> fallback to liquidity",
+                    len(watchlist), finaln
+                )
+            else:
+                logger.warning(
+                    "[WATCHLIST][CACHE] hit=True source=prevday as_of=%s (today=%s)",
+                    latest_date, today
+                )
+                return watchlist, "prevday"
     
     # 4) Fallback: liquidity topK
     logger.warning("[WATCHLIST][CACHE] miss -> fallback to liquidity topK")
