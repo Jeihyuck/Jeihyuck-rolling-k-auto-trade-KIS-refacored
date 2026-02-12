@@ -31,7 +31,7 @@ class OHLCVResult:
 class OHLCVProvider(Protocol):
     name: str
 
-    def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult: ...
+    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult: ...
 
 
 class KISOHLCVProvider:
@@ -47,7 +47,7 @@ class KISOHLCVProvider:
         self._warned_keys.add(key)
         logger.warning(message, *args)
 
-    def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
+    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
         cache_key = ("daily", symbol, days)
         cached = daily_cache.get(cache_key)
         if cached:
@@ -182,7 +182,7 @@ class KRXOHLCVProvider:
         start = end - timedelta(days=back)
         return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
-    def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
+    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
         try:
             from pykrx.stock import get_market_ohlcv_by_date
         except Exception as exc:  # pragma: no cover - import guard
@@ -284,21 +284,59 @@ class ChainOHLCVProvider:
         result.meta["insufficient_candles"] = len(result.df) < days if days else False
         return result
 
-    def get_ohlcv(self, symbol: str, days: int) -> OHLCVResult:
-        if os.getenv("MODE") == "trade" and days >= 260:
-            raise RuntimeError("TRADE_TICK_FORBIDS_LONG_OHLCV_FETCH")
+    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
+        """
+        OHLCV 데이터 조회 (DB-first + guarded remote fetch).
+        
+        Args:
+            symbol: 종목코드
+            days: 요청 일수
+            purpose: 조회 목적 ("regime", "benchmark", "universe", None)
+                     - regime/benchmark는 trade-tick에서도 긴 조회 허용 (DB 우선)
+        """
         errors: list[str] = []
         best: OHLCVResult | None = None
         memory_key = (symbol, days)
+        
+        # 메모리 캐시 확인
         cached = self._memory_cache.get(memory_key)
         if cached:
             return self._annotate_result(cached, days=days)
+        
+        # 파일 캐시 확인 (DB-first)
         cache_result = self._load_cache(symbol, days)
         if cache_result:
             best = self._annotate_result(cache_result, days=days)
             if not cache_result.meta.get("volume_missing") and cache_result.meta.get("rows", 0) >= days:
                 self._memory_cache[memory_key] = cache_result
+                logger.info(
+                    "[OHLCV][DB][HIT] symbol=%s days=%d rows=%d purpose=%s",
+                    symbol, days, cache_result.meta.get("rows", 0), purpose or "universe"
+                )
                 return cache_result
+        
+        # ====================================================================
+        # [TRADE-TICK GUARD] 긴 조회는 remote fetch 금지 (DB hit는 허용됨)
+        # ====================================================================
+        if os.getenv("MODE") == "trade" and days >= 260:
+            # DB에 충분한 데이터가 있으면 이미 위에서 반환됨
+            # 여기까지 왔다는 것은 DB 부족 → remote fetch 필요
+            is_benchmark = purpose in {"regime", "benchmark"}
+            
+            # 레짐/벤치마크는 제한적 허용 (경고 로그)
+            if is_benchmark:
+                logger.warning(
+                    "[OHLCV][TRADE][LONG_FETCH_ALLOWED] symbol=%s days=%d purpose=%s (regime/benchmark exception)",
+                    symbol, days, purpose
+                )
+                # remote fetch 허용하지만 아래 provider 루프에서 시도
+            else:
+                # 일반 종목은 금지
+                logger.error(
+                    "[OHLCV][TRADE][LONG_FETCH_BLOCKED] symbol=%s days=%d purpose=%s",
+                    symbol, days, purpose or "universe"
+                )
+                raise RuntimeError("TRADE_TICK_FORBIDS_LONG_OHLCV_FETCH")
 
         for provider in self.providers:
             try:

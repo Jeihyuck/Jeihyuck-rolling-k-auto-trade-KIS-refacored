@@ -60,23 +60,6 @@ on:
         description: "1=run PB1 decision pipeline during minervini_test"
         required: true
         default: "0"
-      FORCE_LIVE_MODE:
-        description: "1=force intraday mode even when market is closed"
-        required: true
-        default: "0"
-      RUN_ACTION:
-        description: "smoke | decision | live"
-        required: true
-        default: "smoke"
-        type: choice
-        options:
-          - smoke
-          - decision
-          - live
-      MINERVINI_ONLY:
-        description: "1=apply minervini prefilter for final selection"
-        required: true
-        default: "0"
       FORCE_COMPUTE_ON_CUTOFF:
         description: "1=force compute even when entry cutoff blocks orders"
         required: true
@@ -86,21 +69,21 @@ on:
         required: true
         default: "1"
       FORCE_HTTP:
-        description: "1=enable KIS HTTP even in DIAG"
+        description: "1=force KIS HTTP calls even in DIAG mode (for quote/balance/token)"
         required: true
         default: "0"
-      BYPASS_ACTIVE_WINDOW:
-        description: "1=bypass active window gate (run decision even outside market windows)"
-        required: false
-        default: "0"
       ORDER_TEST:
-        description: "1=call order endpoint for test"
+        description: "1=enable order endpoint testing (with safety guards)"
         required: true
         default: "0"
       ORDER_TEST_SYMBOLS:
-        description: "comma-separated whitelist for order tests"
+        description: "Comma-separated whitelist of symbols allowed for order testing (e.g., 005930,035720)"
         required: false
         default: ""
+      MAX_ORDER_KRW_TEST:
+        description: "Maximum order amount in KRW for order testing (default 50000)"
+        required: false
+        default: "50000"
 
 permissions:
   contents: read
@@ -133,14 +116,8 @@ env:
 
   ATR_MAX_PCT: "0.10"
   PB1_RUN_IN_MINERVINI_TEST: "0"
-  FORCE_LIVE_MODE: "0"
-  RUN_ACTION: "smoke"
   FORCE_COMPUTE_ON_CUTOFF: "1"
   BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
-  FORCE_HTTP: "0"
-  BYPASS_ACTIVE_WINDOW: "0"
-  ORDER_TEST: "0"
-  ORDER_TEST_SYMBOLS: ""
 
   # Backward-compatible aliases
   DRY_RUN: "0"
@@ -299,15 +276,8 @@ jobs:
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
-      FORCE_LIVE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_LIVE_MODE || '0' }}
-      RUN_ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.RUN_ACTION || 'smoke' }}
-      MINERVINI_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.MINERVINI_ONLY || '0' }}
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
-      FORCE_HTTP: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_HTTP || '0' }}
-      BYPASS_ACTIVE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ACTIVE_WINDOW || '0' }}
-      ORDER_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
-      ORDER_TEST_SYMBOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST_SYMBOLS || '' }}
 
       # aliases
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}
@@ -399,13 +369,6 @@ jobs:
           echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
           echo "DRYRUN: ${DRYRUN}"
           echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
-          echo "FORCE_LIVE_MODE: ${FORCE_LIVE_MODE}"
-          echo "RUN_ACTION: ${RUN_ACTION}"
-          echo "MINERVINI_ONLY: ${MINERVINI_ONLY}"
-          echo "FORCE_HTTP: ${FORCE_HTTP}"
-          echo "BYPASS_ACTIVE_WINDOW: ${BYPASS_ACTIVE_WINDOW}"
-          echo "ORDER_TEST: ${ORDER_TEST}"
-          echo "ORDER_TEST_SYMBOLS: ${ORDER_TEST_SYMBOLS}"
           echo "======================================"
 
       - name: Live status check

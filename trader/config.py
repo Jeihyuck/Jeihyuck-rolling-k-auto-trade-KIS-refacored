@@ -1056,11 +1056,6 @@ def resolve_strategy_mode(
     now_kst = now_kst or datetime.now(KST)
     if now_kst.tzinfo is None:
         now_kst = now_kst.replace(tzinfo=KST)
-
-    # FORCE_LIVE_MODE=1 -> treat as intraday regardless of clock
-    force_live_mode = os.getenv("FORCE_LIVE_MODE", "0") == "1"
-    if force_live_mode:
-        return "LIVE", True, "day", "force_live_mode"
     
     # [NEW] FORCE_RUN=1이면 무조건 장중으로 간주
     force_run = os.getenv("FORCE_RUN", "0") == "1"

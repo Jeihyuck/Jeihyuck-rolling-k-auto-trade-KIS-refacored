@@ -1495,9 +1495,17 @@ class PB1Engine:
         # days와 count는 같은 의미 (하위 호환성)
         if count is None:
             count = days if days is not None else int(PB1_OHLCV_DAYS_BASE)
+        
+        # ✅ 레짐/벤치마크 심볼 판단 (trade-tick 긴 조회 예외 허용)
+        purpose = None
+        if code == str(REGIME_INDEX).zfill(6) or code == REGIME_INDEX:
+            purpose = "regime"
+        elif code == str(RS_BENCHMARK).zfill(6) or code == RS_BENCHMARK:
+            purpose = "benchmark"
+        
         self.daily_fetch_count += 1
         try:
-            result = self.ohlcv_provider.get_ohlcv(code, count)
+            result = self.ohlcv_provider.get_ohlcv(code, count, purpose=purpose)
         except Exception:
             logger.exception("[PB1][DATA][FAIL] code=%s", code)
             return pd.DataFrame(), {"volume_missing": True, "source": "error", "mapped": {}}
@@ -1509,8 +1517,8 @@ class PB1Engine:
         # 데이터 품질 로그: 252일(정확한 52주) 또는 120일(fallback) 여부 표시
         has_full_52w = 1 if len(df_norm) >= 252 else 0
         has_fallback = 1 if len(df_norm) >= 120 else 0
-        logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d",
-                    code, count, len(df_norm), has_full_52w, has_fallback)
+        logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d purpose=%s",
+                    code, count, len(df_norm), has_full_52w, has_fallback, purpose or "universe")
         return df_norm, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
@@ -1522,6 +1530,11 @@ class PB1Engine:
         candidates: List[CandidateFeature] = []
         members_list = list(members)  # Iterable → list 변환
         scan_count = len(members_list)
+        
+        # ✅ CRITICAL: UnboundLocalError 방지 - 모든 변수 초기화
+        trade_mode = os.getenv("MODE") == "trade"
+        checked_count = 0
+        ohlcv_missing_count = 0
         
         # ✅ candidate-only philosophy: guard must check scan universe, not base universe.
         from trader.config import CANDIDATE_POOL_ENABLED
@@ -1576,7 +1589,7 @@ class PB1Engine:
             required_candles = self.min_candles
             if trade_mode:
                 required_candles = min(required_candles, 30)
-            trade_mode = os.getenv("MODE") == "trade"
+            
             derived_map: dict[str, dict] = {}
             if trade_mode:
                 derived_repo = DerivedMinerviniRepo(self.engine)
@@ -1654,7 +1667,8 @@ class PB1Engine:
                 need_days = 30
             
             rs_prices: dict[str, pd.Series] = {}
-            checked_count = 0
+            # checked_count는 함수 시작 시 이미 초기화됨
+
             
             # ✅ 조기 종료 설정 (config 기반, 기본값 0=비활성화)
             early_stop = PB1_EARLY_STOP_ENABLED
@@ -1961,7 +1975,17 @@ class PB1Engine:
         except Exception as exc:
             reason = f"EXCEPTION:{type(exc).__name__}"
             logger.exception("[ENTRY][PIPE][ERROR] exception in _compute_candidates: %s", exc)
-            return candidates
+            
+            # ✅ failmode_soft 처리
+            failmode_soft = int(os.getenv("PB1_FAILMODE_SOFT", str(PB1_FAILMODE_SOFT)))
+            if failmode_soft:
+                logger.warning(
+                    "[ENTRY][PIPE][SOFT_FAIL] failmode_soft=1 -> return empty candidates (no crash)"
+                )
+                return []
+            else:
+                # hard 모드: 예외 전파
+                raise
         
         finally:
             # ✅ 무조건 요약 로그 출력 (성공/실패 모두)
@@ -4332,6 +4356,11 @@ class PB1Engine:
         elif isinstance(today, datetime):
             today = today.date()
         
+        # ✅ CRITICAL: derived_as_of 사용 (전일 종가 기준)
+        # trade-tick에서 watchlist는 전일 빌드된 것을 사용해야 함
+        from trader.time_utils import resolve_derived_as_of
+        derived_as_of = resolve_derived_as_of(self._now_kst)
+        
         # 전체 유니버스 로드 (후보군 생성에 필요)
         full_members = self._load_universe()
         
@@ -4339,23 +4368,42 @@ class PB1Engine:
         import os
         pool_env = os.getenv("STRATEGY_ENV", self.env)
 
-        # ✅ trade 모드: 오늘 as_of 없으면 즉시 스킵 (auto-build 금지)
+        # ✅ trade 모드: derived_as_of 사용 + TTL fallback 허용
         trade_mode = os.getenv("MODE") == "trade"
         if trade_mode:
             repo = WatchlistRepo(self.engine)
             pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
-            rows, _ = repo.load_watchlist(
+            ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
+            
+            # ✅ derived_as_of 우선, 없으면 ttl_days 이내 최신 fallback
+            rows, used_as_of = repo.load_watchlist(
                 env=pool_env,
                 strategy=pool_strategy,
-                as_of=today,
-                allow_latest_fallback=False,
+                as_of=derived_as_of,
+                allow_latest_fallback=True,
+                ttl_days=ttl_days,
             )
+            
             if not rows:
                 logger.warning(
-                    "[CANDIDATE_POOL][TRADE_SKIP] no today pool as_of=%s",
-                    today,
+                    "[CANDIDATE_POOL][TRADE_SKIP] no pool within TTL as_of=%s ttl_days=%d",
+                    derived_as_of, ttl_days
                 )
-                return [], "candidate_pool_missing_today"
+                return [], "candidate_pool_missing_within_ttl"
+            
+            # ✅ fallback 사용 시 로그 명확화
+            if used_as_of and used_as_of != derived_as_of:
+                age = (derived_as_of - used_as_of).days if isinstance(used_as_of, date) else 0
+                logger.info(
+                    "[CANDIDATE_POOL][TRADE][FALLBACK] requested=%s actual=%s age=%d members=%d",
+                    derived_as_of, used_as_of, age, len(rows)
+                )
+            else:
+                logger.info(
+                    "[CANDIDATE_POOL][TRADE][EXACT] as_of=%s members=%d",
+                    derived_as_of, len(rows)
+                )
+            
             pool_codes = [item["code"] for item in rows]
             members = [
                 {"code": code, "name": self._code_name_map.get(code, "")}
@@ -4556,52 +4604,6 @@ class PB1Engine:
             len(members), source, as_of, today, watchlist_strict
         )
         return members, source
-
-    def _apply_minervini_prefilter(self, members: list[dict]) -> tuple[list[dict], str]:
-        if not members:
-            return members, "empty"
-        if not self.minervini_only:
-            return members, "disabled"
-
-        today_val = self._today
-        if isinstance(today_val, str):
-            today_val = today_val.split("T")[0]
-            today_val = date.fromisoformat(today_val)
-        elif isinstance(today_val, datetime):
-            today_val = today_val.date()
-
-        symbols = [str(m.get("code") or "").zfill(6) for m in members if m.get("code")]
-        if not symbols:
-            return members, "no_symbols"
-
-        ttl_days = int(os.getenv("MINERVINI_PREFILTER_TTL_DAYS", "7"))
-        derived_repo = DerivedMinerviniRepo(self.engine)
-        rows, actual_as_of = derived_repo.load_for_as_of_with_fallback(
-            as_of=today_val,
-            symbols=symbols,
-            ttl_days=ttl_days,
-        )
-        if not rows:
-            logger.warning(
-                "[MINERVINI][PREFILTER] skip reason=missing_derived as_of=%s",
-                today_val,
-            )
-            return members, "missing_derived"
-
-        pass_set = {
-            str(row.get("symbol") or "").zfill(6)
-            for row in rows
-            if row.get("minervini_pass")
-        }
-        before = len(members)
-        filtered = [m for m in members if str(m.get("code") or "").zfill(6) in pass_set]
-        logger.info(
-            "[MINERVINI][PREFILTER] before=%s after=%s as_of=%s",
-            before,
-            len(filtered),
-            actual_as_of.isoformat() if actual_as_of else "none",
-        )
-        return filtered, "applied"
 
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
@@ -5188,11 +5190,6 @@ class PB1Engine:
                     len(scan_members),
                     len(universe_members),
                 )
-
-        if self.minervini_only and scan_members:
-            scan_members, prefilter_reason = self._apply_minervini_prefilter(scan_members)
-            if prefilter_reason == "applied":
-                scan_source = f"{scan_source}+minervini_prefilter"
         
         logger.info(
             "[ENTRY][PIPE][START] trace=%s scan_count=%s source=%s slots=%s tick_budget=%.0f entry_allowed=%s",
@@ -5336,13 +5333,6 @@ class PB1Engine:
                 scan_codes = [m.get("code") for m in (scan_members or []) if m.get("code")]
                 topk_selected = scan_codes[:topk_target]
                 finaln_selected = candidate_codes[:finaln_target]
-                logger.info(
-                    "[PB1][SELECT] topk=%s finaln=%s selected_topk=%s selected_finaln=%s",
-                    topk_target,
-                    finaln_target,
-                    len(topk_selected),
-                    len(finaln_selected),
-                )
                 logger.info(
                     "[MINERVINI_ONLY][SUMMARY] candidate_loaded=%s",
                     len(scan_members),

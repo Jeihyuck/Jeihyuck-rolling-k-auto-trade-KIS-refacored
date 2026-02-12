@@ -211,11 +211,6 @@ BALANCE_STATE_UNKNOWN = "UNKNOWN"
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
 
 
-def _env(name: str, default: str | None = None) -> str | None:
-    v = os.getenv(name)
-    return v if (v is not None and str(v).strip() != "") else default
-
-
 def _run_build_watchlist_job() -> int:
     """
     ✅ 설계 1: 주 1회 워치리스트 빌드 JOB.
@@ -1026,13 +1021,6 @@ def run_once(
     
     # ✅ [1] intended_live 결정 (STRATEGY_MODE=LIVE 여부)
     intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
-
-    universe_strategy = (
-        _env("CANDIDATE_POOL_UNIVERSE_STRATEGY")
-        or _env("UNIVERSE_STRATEGY")
-        or _env("STRATEGY")
-        or DEFAULT_UNIVERSE_STRATEGY
-    )
     
     # ✅ [2] LIVE_ENV_LOCK 호출 → dry_run 파싱 (단 한 번만)
     dry_run = _force_live_env_lock_if_needed(intended_live=intended_live)
@@ -1181,27 +1169,6 @@ def run_once(
             allow_wait,
         )
 
-        run_action = (os.getenv("RUN_ACTION") or "smoke").strip().lower()
-        bypass_active_window = str(os.getenv("BYPASS_ACTIVE_WINDOW", "0")).strip() in {
-            "1",
-            "true",
-            "True",
-            "YES",
-            "yes",
-            "y",
-            "Y",
-        }
-        if run_action in {"decision", "live"} and action in {"smoke", "wait"}:
-            logger.info(
-                "[PB1][RUN_ACTION] override action=%s -> run (run_action=%s)",
-                action,
-                run_action,
-            )
-            action = "run"
-            target_start = None
-        elif run_action not in {"smoke", "decision", "live"}:
-            logger.warning("[PB1][RUN_ACTION] invalid RUN_ACTION=%s (expected smoke|decision|live)", run_action)
-
         if action == "wait" and target_start:
             while True:
                 now = _get_now_kst()
@@ -1332,16 +1299,8 @@ def run_once(
             phase_for_log = phase_default
             logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
         else:
-            if bypass_active_window and run_action in {"decision", "live"}:
-                logger.warning(
-                    "[PB1][WINDOW] bypassed outside active windows "
-                    "(BYPASS_ACTIVE_WINDOW=1, run_action=%s) now=%s",
-                    run_action,
-                    now,
-                )
-            else:
-                logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
-                return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
+            logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
+            return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
 
     non_trading_day = not trading_day
     force_diag = diag_env_flag
@@ -1579,8 +1538,7 @@ def run_once(
 
     if not loop_mode:
         if is_db_only_mode():
-            if not universe_strategy:
-                universe_strategy = DEFAULT_UNIVERSE_STRATEGY
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
                 repo=UniverseRepo(engine),
                 env=kis_env or "practice",
@@ -1640,8 +1598,7 @@ def run_once(
     universe_ctx: UniverseContext | None = None
     try:
         if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
-            if not universe_strategy:
-                universe_strategy = DEFAULT_UNIVERSE_STRATEGY
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
                     engine=engine,
@@ -1896,9 +1853,6 @@ def run_once(
             phase_override_arg,
             window_label,
         )
-
-        if not universe_strategy:
-            universe_strategy = DEFAULT_UNIVERSE_STRATEGY
 
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
@@ -2499,16 +2453,13 @@ def main() -> int:
     # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
     minervini_only_env = os.getenv("MINERVINI_ONLY", "0") == "1"
     if minervini_only_env:
-        force_http = os.getenv("FORCE_HTTP", "0") == "1"
-        if not force_http:
-            os.environ["KIS_HTTP_ENABLED"] = "0"
+        os.environ["KIS_HTTP_ENABLED"] = "0"
         os.environ["DISABLE_LIVE_TRADING"] = "1"
         os.environ["LIVE_TRADING_ENABLED"] = "0"
         os.environ["STRATEGY_MODE"] = "DIAG"
         os.environ["PB1_PHASE_DEFAULT"] = "entry"
         logger.warning(
-            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=%s + PB1_PHASE_DEFAULT=entry",
-            "0" if not force_http else os.getenv("KIS_HTTP_ENABLED", "AUTO"),
+            "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=0 + PB1_PHASE_DEFAULT=entry"
         )
     
     # ✅ AUTO 모드 결정 및 환경변수 고정
