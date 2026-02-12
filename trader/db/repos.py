@@ -46,6 +46,10 @@ __all__ = [
     "PositionRepo",  # Backward compatibility
     "WatchlistRepo",
     "DerivedMinerviniRepo",
+    "WatchlistSnapshotRepo",
+    "MinerviniSnapshotRepo",
+    "EntryDecisionRepo",
+    "ExitAnalysisRepo",
     "save_watchlist",
     "load_watchlist",
 ]
@@ -2671,4 +2675,366 @@ def save_job_checkpoint(engine: Engine, job_key: str, payload: Dict[str, Any]) -
                     .where(schema.job_checkpoints.c.job_key == job_key)
                     .values(updated_ts=values["updated_ts"], payload=values["payload"])
                 )
+
+
+# ========================================
+# Institutional Decision Tracking Repos
+# ========================================
+
+class WatchlistSnapshotRepo:
+    """Final 30 선정 이유 스냅샷 저장/조회."""
+    
+    def __init__(self, engine: Engine):
+        self.engine = engine
+    
+    def save_snapshot(
+        self,
+        *,
+        as_of: date,
+        final30: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Final 30 스냅샷 저장.
+        
+        Args:
+            as_of: 기준일
+            final30: Final 30 종목 리스트 (각 항목에 code, name, rank, tech_score, flow_score, final_score, reasons 포함)
+        """
+        as_of = to_date(as_of)
+        
+        logger.info("[WATCHLIST_SNAPSHOT][SAVE] as_of=%s count=%s", as_of, len(final30))
+        
+        with self.engine.begin() as conn:
+            # 기존 데이터 삭제 (같은 날짜)
+            conn.execute(
+                sa.text("DELETE FROM watchlist_snapshot WHERE as_of = :as_of"),
+                {"as_of": as_of}
+            )
+            
+            # 새 데이터 삽입
+            for item in final30:
+                conn.execute(
+                    sa.text("""
+                        INSERT INTO watchlist_snapshot (as_of, code, name, rank, tech_score, flow_score, final_score, reasons)
+                        VALUES (:as_of, :code, :name, :rank, :tech_score, :flow_score, :final_score, :reasons::jsonb)
+                    """),
+                    {
+                        "as_of": as_of,
+                        "code": item.get("code"),
+                        "name": item.get("name"),
+                        "rank": item.get("rank"),
+                        "tech_score": item.get("tech_score"),
+                        "flow_score": item.get("flow_score"),
+                        "final_score": item.get("final_score"),
+                        "reasons": json_sanitize(item.get("reasons", {})),
+                    }
+                )
+    
+    def load_snapshot(self, as_of: date) -> List[Dict[str, Any]]:
+        """
+        스냅샷 로드.
+        
+        Args:
+            as_of: 기준일
+        
+        Returns:
+            종목 리스트
+        """
+        as_of = to_date(as_of)
+        
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                sa.text("""
+                    SELECT code, name, rank, tech_score, flow_score, final_score, reasons
+                    FROM watchlist_snapshot
+                    WHERE as_of = :as_of
+                    ORDER BY rank
+                """),
+                {"as_of": as_of}
+            )
+            
+            items = []
+            for row in result:
+                items.append({
+                    "code": row[0],
+                    "name": row[1],
+                    "rank": row[2],
+                    "tech_score": row[3],
+                    "flow_score": row[4],
+                    "final_score": row[5],
+                    "reasons": dict(row[6]) if row[6] else {},
+                })
+            
+            return items
+
+
+class MinerviniSnapshotRepo:
+    """미너비니 통과 종목 스냅샷 저장/조회."""
+    
+    def __init__(self, engine: Engine):
+        self.engine = engine
+    
+    def save_snapshot(
+        self,
+        *,
+        as_of: date,
+        passed_list: List[Dict[str, Any]],
+    ) -> None:
+        """
+        미너비니 통과 종목 스냅샷 저장.
+        
+        Args:
+            as_of: 기준일
+            passed_list: 통과 종목 리스트
+        """
+        as_of = to_date(as_of)
+        
+        logger.info("[MINERVINI_SNAPSHOT][SAVE] as_of=%s count=%s", as_of, len(passed_list))
+        
+        with self.engine.begin() as conn:
+            # 기존 데이터 삭제
+            conn.execute(
+                sa.text("DELETE FROM minervini_snapshot WHERE as_of = :as_of"),
+                {"as_of": as_of}
+            )
+            
+            # 새 데이터 삽입
+            for item in passed_list:
+                conn.execute(
+                    sa.text("""
+                        INSERT INTO minervini_snapshot (as_of, code, name, rs_percentile, vcp_score, trend_ok, score, reasons)
+                        VALUES (:as_of, :code, :name, :rs_percentile, :vcp_score, :trend_ok, :score, :reasons::jsonb)
+                    """),
+                    {
+                        "as_of": as_of,
+                        "code": item.get("code"),
+                        "name": item.get("name"),
+                        "rs_percentile": item.get("rs_percentile"),
+                        "vcp_score": item.get("vcp_score"),
+                        "trend_ok": item.get("trend_ok"),
+                        "score": item.get("score"),
+                        "reasons": json_sanitize(item.get("reasons", {})),
+                    }
+                )
+    
+    def load_snapshot(self, as_of: date) -> List[Dict[str, Any]]:
+        """스냅샷 로드."""
+        as_of = to_date(as_of)
+        
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                sa.text("""
+                    SELECT code, name, rs_percentile, vcp_score, trend_ok, score, reasons
+                    FROM minervini_snapshot
+                    WHERE as_of = :as_of
+                    ORDER BY score DESC
+                """),
+                {"as_of": as_of}
+            )
+            
+            items = []
+            for row in result:
+                items.append({
+                    "code": row[0],
+                    "name": row[1],
+                    "rs_percentile": row[2],
+                    "vcp_score": row[3],
+                    "trend_ok": row[4],
+                    "score": row[5],
+                    "reasons": dict(row[6]) if row[6] else {},
+                })
+            
+            return items
+
+
+class EntryDecisionRepo:
+    """매수 당시 의사결정 스냅샷 저장/조회."""
+    
+    def __init__(self, engine: Engine):
+        self.engine = engine
+    
+    def save_snapshot(
+        self,
+        *,
+        run_id: str,
+        as_of: date,
+        code: str,
+        entry_price: float,
+        stop_price: float,
+        qty: int,
+        features: Dict[str, Any],
+        reasons: Dict[str, Any],
+    ) -> int:
+        """
+        매수 스냅샷 저장.
+        
+        Args:
+            run_id: 실행 ID
+            as_of: 매수일
+            code: 종목코드
+            entry_price: 매수가
+            stop_price: 손절가
+            qty: 수량
+            features: 기술적 특징 스냅샷
+            reasons: 매수 이유
+        
+        Returns:
+            생성된 스냅샷 ID
+        """
+        as_of = to_date(as_of)
+        
+        logger.info("[ENTRY_SNAPSHOT][SAVE] code=%s run_id=%s", code, run_id)
+        
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                sa.text("""
+                    INSERT INTO entry_decision_snapshot 
+                    (run_id, as_of, code, entry_price, stop_price, qty, features, reasons)
+                    VALUES (:run_id, :as_of, :code, :entry_price, :stop_price, :qty, :features::jsonb, :reasons::jsonb)
+                    RETURNING id
+                """),
+                {
+                    "run_id": run_id,
+                    "as_of": as_of,
+                    "code": code,
+                    "entry_price": entry_price,
+                    "stop_price": stop_price,
+                    "qty": qty,
+                    "features": json_sanitize(features),
+                    "reasons": json_sanitize(reasons),
+                }
+            )
+            
+            snapshot_id = result.scalar()
+            logger.info("[ENTRY_SNAPSHOT][SAVED] id=%s code=%s", snapshot_id, code)
+            return snapshot_id
+    
+    def load_latest_snapshot(self, code: str) -> Optional[Dict[str, Any]]:
+        """
+        최근 매수 스냅샷 로드.
+        
+        Args:
+            code: 종목코드
+        
+        Returns:
+            스냅샷 또는 None
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                sa.text("""
+                    SELECT id, run_id, as_of, entry_price, stop_price, qty, features, reasons
+                    FROM entry_decision_snapshot
+                    WHERE code = :code
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {"code": code}
+            )
+            
+            row = result.fetchone()
+            if row:
+                return {
+                    "id": row[0],
+                    "run_id": row[1],
+                    "as_of": row[2],
+                    "entry_price": row[3],
+                    "stop_price": row[4],
+                    "qty": row[5],
+                    "features": dict(row[6]) if row[6] else {},
+                    "reasons": dict(row[7]) if row[7] else {},
+                }
+            
+            return None
+
+
+class ExitAnalysisRepo:
+    """매도 시점 비교 분석 저장/조회."""
+    
+    def __init__(self, engine: Engine):
+        self.engine = engine
+    
+    def save_analysis(
+        self,
+        *,
+        code: str,
+        entry_snapshot_id: int,
+        exit_date: date,
+        exit_price: float,
+        pnl: float,
+        pnl_pct: float,
+        hold_days: int,
+        comparison: Dict[str, Any],
+    ) -> int:
+        """
+        Exit 분석 저장.
+        
+        Args:
+            code: 종목코드
+            entry_snapshot_id: 매수 스냅샷 ID
+            exit_date: 매도일
+            exit_price: 매도가
+            pnl: 손익 (원)
+            pnl_pct: 손익률
+            hold_days: 보유 기간
+            comparison: 비교 분석 결과
+        
+        Returns:
+            생성된 분석 ID
+        """
+        exit_date = to_date(exit_date)
+        
+        logger.info("[EXIT_ANALYSIS][SAVE] code=%s entry_snapshot_id=%s", code, entry_snapshot_id)
+        
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                sa.text("""
+                    INSERT INTO exit_analysis_snapshot 
+                    (code, entry_snapshot_id, exit_date, exit_price, pnl, pnl_pct, hold_days, comparison)
+                    VALUES (:code, :entry_snapshot_id, :exit_date, :exit_price, :pnl, :pnl_pct, :hold_days, :comparison::jsonb)
+                    RETURNING id
+                """),
+                {
+                    "code": code,
+                    "entry_snapshot_id": entry_snapshot_id,
+                    "exit_date": exit_date,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "hold_days": hold_days,
+                    "comparison": json_sanitize(comparison),
+                }
+            )
+            
+            analysis_id = result.scalar()
+            logger.info("[EXIT_ANALYSIS][SAVED] id=%s code=%s", analysis_id, code)
+            return analysis_id
+    
+    def load_analysis_by_code(self, code: str) -> List[Dict[str, Any]]:
+        """종목별 exit 분석 로드."""
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                sa.text("""
+                    SELECT id, entry_snapshot_id, exit_date, exit_price, pnl, pnl_pct, hold_days, comparison
+                    FROM exit_analysis_snapshot
+                    WHERE code = :code
+                    ORDER BY exit_date DESC
+                """),
+                {"code": code}
+            )
+            
+            items = []
+            for row in result:
+                items.append({
+                    "id": row[0],
+                    "entry_snapshot_id": row[1],
+                    "exit_date": row[2],
+                    "exit_price": row[3],
+                    "pnl": row[4],
+                    "pnl_pct": row[5],
+                    "hold_days": row[6],
+                    "comparison": dict(row[7]) if row[7] else {},
+                })
+            
+            return items
+
 

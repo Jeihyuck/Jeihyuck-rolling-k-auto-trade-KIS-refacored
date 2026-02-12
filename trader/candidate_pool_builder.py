@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -26,8 +27,10 @@ from trader.config import (
     MARKET_MAP,
     MINERVINI_ONLY,
 )
-from trader.db.repos import WatchlistRepo
+from trader.db.repos import WatchlistRepo, WatchlistSnapshotRepo
+from trader.flow_score import calculate_flow_score, rank_by_dollar_volume, calculate_final_score
 from trader.ohlcv_prefetch import prefetch_ohlcv_to_db
+from trader.report.pdf_report import generate_watchlist_pdf
 from trader.time_utils import now_kst, prev_business_day
 from trader.time_coerce import to_date
 
@@ -204,6 +207,220 @@ class CandidatePoolBuilder:
             raise RuntimeError(f"candidate pool size {len(result_codes)} < min_size {min_size}")
         
         return result_codes
+    
+    def build_final30_pipeline(
+        self,
+        *,
+        members: List[Dict[str, Any]],
+        as_of: date,
+        engine: Engine,
+        env: str,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Universe → 120 → 50 → Final 30 파이프라인.
+        
+        Args:
+            members: 유니버스 멤버 (195개)
+            as_of: 기준일
+            engine: DB 엔진 (스냅샷 저장용)
+            env: 환경
+        
+        Returns:
+            (pool120, top50, final30)
+        """
+        logger.info("[FINAL30_PIPELINE][START] as_of=%s universe=%s", as_of, len(members))
+        
+        # Step 1: Universe → 120 (기존 로직)
+        codes = [m["code"] for m in members]
+        scored = []
+        
+        for code in codes:
+            try:
+                df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
+                if df is None or len(df) < self.min_rows:
+                    continue
+                
+                last_close = df["close"].iloc[-1]
+                if last_close < self.min_price:
+                    continue
+                
+                # 유동성 점수
+                recent = df.tail(self.liq_days)
+                avg_value = (recent["close"] * recent["volume"]).mean()
+                
+                # 추세 점수
+                trend_score = 0
+                if len(df) >= 200:
+                    ma20 = df["close"].rolling(20).mean().iloc[-1]
+                    ma50 = df["close"].rolling(50).mean().iloc[-1]
+                    ma200 = df["close"].rolling(200).mean().iloc[-1]
+                    if ma20 > ma50:
+                        trend_score += 1
+                    if ma50 > ma200:
+                        trend_score += 1
+                elif len(df) >= 50:
+                    ma20 = df["close"].rolling(20).mean().iloc[-1]
+                    ma50 = df["close"].rolling(50).mean().iloc[-1]
+                    if ma20 > ma50:
+                        trend_score += 1
+                
+                # 변동성 필터
+                volatility = recent["close"].pct_change().std()
+                if volatility > 0.08:
+                    continue
+                
+                # 복합 점수
+                composite_score = avg_value * 0.7 + trend_score * 1e9 * 0.3
+                
+                scored.append({
+                    "code": code,
+                    "name": next((m["name"] for m in members if m["code"] == code), ""),
+                    "score": composite_score,
+                    "avg_value": avg_value,
+                    "trend_score": trend_score,
+                })
+                
+            except Exception as exc:
+                logger.debug("[FINAL30][120] code=%s err=%s", code, exc)
+                continue
+        
+        if len(scored) == 0:
+            raise RuntimeError("scored=0 in 120 step")
+        
+        # 상위 120개 선택
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        pool120 = scored[:min(120, len(scored))]
+        
+        logger.info("[FINAL30_PIPELINE][120] selected=%s", len(pool120))
+        
+        # Step 2: 120 → 50 (기술적 점수 강화)
+        top50_scored = []
+        for item in pool120:
+            code = item["code"]
+            try:
+                df = self.ohlcv_provider(code, days=200)
+                if df is None or len(df) < 50:
+                    continue
+                
+                # RS 계산 (간단 버전)
+                ret_90d = ((df["close"].iloc[-1] / df["close"].iloc[-90]) - 1) if len(df) >= 90 else 0
+                ret_180d = ((df["close"].iloc[-1] / df["close"].iloc[-180]) - 1) if len(df) >= 180 else 0
+                rs_score = ret_90d * 0.6 + ret_180d * 0.4
+                
+                # Pullback 계산
+                high_52w = df["high"].tail(252).max() if len(df) >= 252 else df["high"].max()
+                pullback_pct = (high_52w - df["close"].iloc[-1]) / high_52w if high_52w > 0 else 0
+                
+                # VCP 점수 (간단 버전: 최근 변동성 감소)
+                vol_recent = df["volume"].tail(10).mean()
+                vol_prior = df["volume"].tail(30).head(20).mean()
+                vcp_score = 1.0 if vol_prior > 0 and vol_recent < vol_prior * 0.7 else 0.0
+                
+                # 기술적 점수
+                tech_score = rs_score * 50 + (1 - pullback_pct) * 30 + vcp_score * 20
+                
+                item["tech_score"] = tech_score
+                item["rs_score"] = rs_score
+                item["pullback_pct"] = pullback_pct
+                item["vcp_score"] = vcp_score
+                
+                top50_scored.append(item)
+                
+            except Exception as exc:
+                logger.debug("[FINAL30][50] code=%s err=%s", code, exc)
+                continue
+        
+        top50_scored.sort(key=lambda x: x["tech_score"], reverse=True)
+        top50 = top50_scored[:min(50, len(top50_scored))]
+        
+        logger.info("[FINAL30_PIPELINE][50] selected=%s", len(top50))
+        
+        # Step 3: 50 → 30 (Flow 점수 추가)
+        final30_scored = []
+        for item in top50:
+            code = item["code"]
+            try:
+                df = self.ohlcv_provider(code, days=30)
+                if df is None:
+                    continue
+                
+                # Flow 점수 계산 (외국인/기관 데이터가 없으면 0)
+                # 실제 구현에서는 외국인/기관 데이터를 별도로 가져와야 함
+                # 여기서는 간단히 0으로 설정
+                flow_result = calculate_flow_score(
+                    code=code,
+                    ohlcv_df=df,
+                    foreign_df=None,  # TODO: 외국인 데이터 연결
+                    inst_df=None,  # TODO: 기관 데이터 연결
+                    window=20,
+                )
+                
+                item["flow_score"] = flow_result["flow_score"]
+                item["foreign_20_ratio"] = flow_result["foreign_20_ratio"]
+                item["inst_20_ratio"] = flow_result["inst_20_ratio"]
+                
+                # 최종 점수 (Tech 70% + Flow 30%)
+                final_score = calculate_final_score(
+                    tech_score=item["tech_score"],
+                    flow_score=item["flow_score"],
+                    tech_weight=0.7,
+                    flow_weight=0.3,
+                )
+                
+                item["final_score"] = final_score
+                
+                # 선정 사유
+                item["reasons"] = {
+                    "trend_template": item.get("trend_score", 0) >= 1,
+                    "rs_percentile": item.get("rs_score", 0) * 100,
+                    "vcp": item.get("vcp_score", 0) > 0,
+                    "pullback_pct": item.get("pullback_pct", 0),
+                    "foreign_20_ratio": item.get("foreign_20_ratio", 0),
+                    "inst_20_ratio": item.get("inst_20_ratio", 0),
+                    "dollar_vol_rank": 0,  # 아래에서 계산
+                }
+                
+                final30_scored.append(item)
+                
+            except Exception as exc:
+                logger.debug("[FINAL30][30] code=%s err=%s", code, exc)
+                continue
+        
+        # 거래대금 순위 추가
+        final30_scored = rank_by_dollar_volume(final30_scored, self.ohlcv_provider, window=20)
+        
+        # 최종 점수로 정렬하여 상위 30개 선택
+        final30_scored.sort(key=lambda x: x["final_score"], reverse=True)
+        final30 = final30_scored[:min(30, len(final30_scored))]
+        
+        # 랭킹 추가
+        for i, item in enumerate(final30, 1):
+            item["rank"] = i
+            item["reasons"]["dollar_vol_rank"] = item.get("dollar_vol_rank", 0)
+        
+        logger.info("[FINAL30_PIPELINE][30] selected=%s", len(final30))
+        
+        # DB에 스냅샷 저장
+        snapshot_repo = WatchlistSnapshotRepo(engine)
+        snapshot_repo.save_snapshot(as_of=as_of, final30=final30)
+        
+        # JSON 저장
+        output_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_dir / "final30.json", "w") as f:
+            json.dump(final30, f, indent=2, default=str)
+        
+        logger.info("[FINAL30_PIPELINE][JSON] saved to %s", output_dir / "final30.json")
+        
+        # PDF 생성
+        try:
+            pdf_path = generate_watchlist_pdf(final30=final30, as_of=as_of)
+            logger.info("[FINAL30_PIPELINE][PDF] generated %s", pdf_path)
+        except Exception as exc:
+            logger.warning("[FINAL30_PIPELINE][PDF] failed: %s", exc)
+        
+        return pool120, top50, final30
 
 
 def build_and_save_candidate_pool(
