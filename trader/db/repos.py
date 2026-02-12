@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
+import pytz
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
 from sqlalchemy import Engine, and_, func, or_, select, bindparam
@@ -977,6 +978,61 @@ class OrdersRepo:
         )
         with self.engine.begin() as conn:
             return conn.execute(stmt).scalar() is not None
+
+    def has_blocking_order_today(
+        self,
+        env: str,
+        code: str,
+        side: str,
+        stage: str | None = None,
+        trade_date: str | None = None,
+    ) -> tuple[bool, dict | None]:
+        """
+        오늘 같은 종목/사이드/스테이지에 대해 '블록 상태'의 주문이 이미 존재하는지 확인.
+        블록 상태: SUBMITTED, ACCEPTED, FILLED, PARTIAL_FILLED
+        재시도 허용 상태: REJECTED, FAILED, ERROR, SKIP, INTENT
+        
+        Returns:
+            (is_blocked: bool, prior_order: dict | None)
+            prior_order에는 status, created_at, client_order_key, run_id 등 포함
+        """
+        if not trade_date:
+            now = now_kst()
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+        else:
+            from datetime import datetime
+            day = datetime.fromisoformat(trade_date)
+            start = day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.timezone('Asia/Seoul'))
+            end = start + timedelta(days=1)
+        
+        # 블록 상태만 필터링
+        blocking_statuses = ['SUBMITTED', 'ACCEPTED', 'FILLED', 'PARTIAL_FILLED']
+        
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.code == code,
+            self._schema.orders.c.side == side,
+            self._schema.orders.c.created_at >= start,
+            self._schema.orders.c.created_at < end,
+            self._schema.orders.c.status.in_(blocking_statuses),
+        ]
+        
+        if stage:
+            conditions.append(self._schema.orders.c.stage == stage)
+        
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+            .limit(1)
+        )
+        
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+            if row:
+                return True, dict(row)
+            return False, None
 
     def list_today_orders(
         self,

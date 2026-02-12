@@ -2104,8 +2104,29 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             max_seconds,
         )
         # ✅ PB1_CANDIDATE_ONLY=1이면 universe ensure skip (후보군만 사용)
+        # ✅ 또는 PB1_JOB=TRADE_INTRADAY이고 watchlist 사용 중이면 skip
+        skip_universe = False
+        skip_reason = ""
+        
         if os.getenv("PB1_CANDIDATE_ONLY", "0") == "1":
-            logger.info("[UNIVERSE][SKIP] PB1_CANDIDATE_ONLY=1 -> skip ensure/build, will use candidate pool only")
+            skip_universe = True
+            skip_reason = "PB1_CANDIDATE_ONLY=1"
+        elif os.getenv("PB1_JOB", "TRADE_INTRADAY").upper() == "TRADE_INTRADAY":
+            # trade 모드에서 watchlist 사용 시 universe 로드 차단
+            from trader.db.repos import WatchlistRepo
+            try:
+                watchlist_repo = WatchlistRepo(engine)
+                watchlist_count = watchlist_repo.count_as_of(
+                    as_of=now_kst_value.date().isoformat()
+                )
+                if watchlist_count > 0:
+                    skip_universe = True
+                    skip_reason = f"watchlist_only mode=trade watchlist={watchlist_count}"
+            except Exception as e:
+                logger.warning("[UNIVERSE][CHECK][FAIL] watchlist check failed: %s", e)
+        
+        if skip_universe:
+            logger.info("[UNIVERSE][SKIP] reason=%s -> skip ensure/build, will use candidate pool/watchlist only", skip_reason)
         else:
             # ✅ CRITICAL: ensure_universe_built_once도 derived_as_of 사용
             loop_derived_as_of_date = resolve_derived_as_of(now_kst_value)

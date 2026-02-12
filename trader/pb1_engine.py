@@ -203,7 +203,8 @@ _ENTRY_BLOCK_REASON_MAP = {
     "target_new_positions_zero": "TARGET_NEW_POSITIONS_ZERO",
     "open_order": "RATE_LIMIT",
     "today_buy_exists": "RATE_LIMIT",
-    "duplicate_order": "RATE_LIMIT",
+    "duplicate_order": "DUPLICATE",
+    "rate_limit": "RATE_LIMIT",
     "holding_position": "EXISTING_POSITION",
     "order_value_zero": "ORDER_VALUE_ZERO",
     "qty_zero": "QTY_ZERO",
@@ -224,7 +225,8 @@ _ORDER_SKIP_REASON_MAP = {
     "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
     "open_order": "ORDER_SKIP_RATE_LIMIT",
     "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
-    "duplicate_order": "ORDER_SKIP_RATE_LIMIT",
+    "duplicate_order": "ORDER_SKIP_DUPLICATE",
+    "rate_limit": "ORDER_SKIP_RATE_LIMIT",
     "entry_cutoff": "ORDER_SKIP_CUTOFF",
     "entry_disabled": "ORDER_SKIP_DISABLED",
 }
@@ -2918,10 +2920,34 @@ class PB1Engine:
                 marks[code] = px
         return marks
 
-    def _should_block_order(self, client_order_key: str) -> bool:
-        if not client_order_key:
-            return True
-        return self.orders_repo.has_client_order_key(self.env, client_order_key)
+    def _should_block_order(
+        self,
+        client_order_key: str,
+        code: str | None = None,
+        side: str = "BUY",
+        stage: str | None = None,
+    ) -> tuple[bool, dict | None]:
+        """
+        중복 주문 차단 여부 판정.
+        - 성공/접수된 주문만 차단 (SUBMITTED, ACCEPTED, FILLED, PARTIAL_FILLED)
+        - 실패/거절/스킵된 주문은 재시도 허용
+        
+        Returns:
+            (should_block: bool, prior_order_info: dict | None)
+        """
+        if not client_order_key or not code:
+            return False, None
+        
+        # 오늘 같은 종목/사이드/스테이지에 블록 상태의 주문이 있는지 확인
+        is_blocked, prior = self.orders_repo.has_blocking_order_today(
+            env=self.env,
+            code=code,
+            side=side,
+            stage=stage,
+            trade_date=self._today,
+        )
+        
+        return is_blocked, prior
 
     def _pretrade_check(
         self,
@@ -3970,7 +3996,7 @@ class PB1Engine:
                 fields={"cooldown_until": cooldown_until},
             )
 
-        if self._should_block_order(client_key):
+        if self._should_block_order(client_key, code=code, side="SELL", stage="PB1-EXIT")[0]:
             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
             try:
                 self._append_ledger_event(
@@ -5582,18 +5608,35 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
-                if not allow_add_to_existing and self._should_block_order(cf.client_order_key or ""):
-                    self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["duplicate_order"])
-                    self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["duplicate_order"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
+                if not allow_add_to_existing:
+                    is_blocked, prior = self._should_block_order(
+                        cf.client_order_key or "",
+                        code=cf.code,
+                        side="BUY",
+                        stage="PB1-CLOSE",
                     )
-                    continue
+                    if is_blocked:
+                        # 중복 차단 상세 로그
+                        if prior:
+                            logger.info(
+                                "[BUYABLE_GATE][DUP] code=%s key=%s|BUY|PB1-CLOSE prior_status=%s prior_created=%s prior_run=%s",
+                                cf.code,
+                                self._today,
+                                prior.get("status"),
+                                prior.get("created_at"),
+                                prior.get("run_id"),
+                            )
+                        self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
+                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["duplicate_order"])
+                        self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=["duplicate_order"],
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        continue
                 if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
                     self._record_drop(drop_reason_counter, drop_examples, "entry_mode_close_only", cf.code)
                     self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_close_only"])
