@@ -84,6 +84,14 @@ on:
         description: "Maximum order amount in KRW for order testing (default 50000)"
         required: false
         default: "50000"
+      UNIVERSE_EMERGENCY_BUILD:
+        description: "1=if universe missing, build and save to DB"
+        required: true
+        default: "1"
+      UNIVERSE_FORCE_REBUILD:
+        description: "1=force rebuild universe for as_of"
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -278,6 +286,10 @@ jobs:
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
+
+      # ✅ 유니버스 자동 생성 옵션 (수동 실행 시에만 활성화, 스케줄은 0)
+      UNIVERSE_EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
+      UNIVERSE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
 
       # aliases
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}
@@ -476,7 +488,31 @@ jobs:
           echo "======================================"
           echo "[RUN] Execution completed successfully"
           echo "======================================"
-
+      - name: Verify universe (prep mode only)
+        if: needs.resolve.outputs.run_mode == 'prep' || needs.resolve.outputs.run_mode == 'both'
+        run: |
+          set -euo pipefail
+          echo "====================================="
+          echo "[VERIFY] Checking universe creation"
+          echo "====================================="
+          
+          # 로그에서 universe fallback 패턴 검사
+          if grep -q "members=0 (no run)" <<< "$(tail -n 200 *.log 2>/dev/null || echo '')"; then
+            echo "::warning::Universe appears empty (members=0 detected)"
+            echo "This may indicate universe was not built successfully."
+            echo "Check UNIVERSE_EMERGENCY_BUILD and UNIVERSE_FORCE_REBUILD settings."
+            # 필요시 exit 1로 변경하여 실패 처리 가능
+          fi
+          
+          if grep -q "LOAD][FALLBACK" <<< "$(tail -n 200 *.log 2>/dev/null || echo '')"; then
+            echo "::warning::Universe fallback detected"
+            echo "This indicates universe for current as_of was not found."
+            echo "Consider enabling UNIVERSE_EMERGENCY_BUILD=1 for manual runs."
+            # 필요시 exit 1로 변경하여 실패 처리 가능
+          fi
+          
+          echo "Universe verification completed."
+          echo "====================================="
       - name: Scan for SQLite artifacts
         if: always()
         run: |
