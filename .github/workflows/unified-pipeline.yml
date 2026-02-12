@@ -288,8 +288,14 @@ jobs:
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
 
       # ✅ 유니버스 자동 생성 옵션 (수동 실행 시에만 활성화, 스케줄은 0)
+      # universe flags (new)
       UNIVERSE_EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
       UNIVERSE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
+
+      # universe flags (legacy aliases)
+      EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
+      FORCE_REBUILD_UNIVERSE: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
+      FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
 
       # aliases
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}

@@ -351,6 +351,26 @@ def _cfg_bool(key: str, fallback: bool | None = None) -> bool:
     return env_bool(key, default=default_value)
 
 
+def _env_bool(keys: list[str], default: bool = False) -> tuple[bool, str]:
+    """
+    Read boolean env var from a list of keys.
+    Accepts: 1/0, true/false, yes/no, on/off (case-insensitive).
+    Returns: (value: bool, source_key: str)
+    """
+    for k in keys:
+        v = os.getenv(k)
+        if v is None:
+            continue
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True, k
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False, k
+        # Unknown value -> treat non-empty as True
+        return True, k
+    return default, "default"
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -577,16 +597,23 @@ logger.info(
     NONTRADING_SMOKE_TIMEOUT_SEC,
 )
 
-_emergency_universe_default = True if DIAG_ENABLED else _default_bool("EMERGENCY_UNIVERSE_BUILD", False)
-EMERGENCY_UNIVERSE_BUILD = env_bool("EMERGENCY_UNIVERSE_BUILD", default=_emergency_universe_default)
-FORCE_UNIVERSE_REBUILD = _cfg_bool("FORCE_UNIVERSE_REBUILD")
+# Universe build flags (support new + legacy env keys)
+emergency_build, emergency_src = _env_bool(
+    ["UNIVERSE_EMERGENCY_BUILD", "EMERGENCY_BUILD"],
+    default=False,
+)
+force_rebuild, rebuild_src = _env_bool(
+    ["UNIVERSE_FORCE_REBUILD", "FORCE_REBUILD_UNIVERSE", "FORCE_REBUILD"],
+    default=False,
+)
 UNIVERSE_NAMESPACE_MODE = (_cfg("UNIVERSE_NAMESPACE_MODE") or "ACCOUNT_ENV").strip().upper()
 
+EMERGENCY_UNIVERSE_BUILD = emergency_build
+FORCE_UNIVERSE_REBUILD = force_rebuild
+
 logger.info(
-    "[CONFIG][UNIVERSE] emergency_build=%s force_rebuild=%s namespace_mode=%s",
-    EMERGENCY_UNIVERSE_BUILD,
-    FORCE_UNIVERSE_REBUILD,
-    UNIVERSE_NAMESPACE_MODE,
+    "[CONFIG][UNIVERSE] emergency_build=%s(src=%s) force_rebuild=%s(src=%s) namespace_mode=%s",
+    emergency_build, emergency_src, force_rebuild, rebuild_src, UNIVERSE_NAMESPACE_MODE
 )
 
 # 전략별 레짐 축소 우선순위
