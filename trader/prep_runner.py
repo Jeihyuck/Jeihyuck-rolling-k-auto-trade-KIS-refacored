@@ -62,17 +62,37 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
 
     # 2) decide build
-    if FORCE_UNIVERSE_REBUILD or (EMERGENCY_UNIVERSE_BUILD and len(members) == 0):
-        logger.warning(
-            "[UNIVERSE][AUTO_BUILD] trigger build: env=%s strategy=%s as_of=%s (members=%d) emergency=%s force=%s",
-            env, strategy, as_of_s, len(members), EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
-        )
+    force_always = os.getenv("UNIVERSE_FORCE_REBUILD_ALWAYS", "0") == "1"
 
+    should_build = False
+    reason = ""
+
+    if len(members) == 0 and EMERGENCY_UNIVERSE_BUILD:
+        should_build = True
+        reason = "emergency_missing"
+    elif FORCE_UNIVERSE_REBUILD:
+        if force_always:
+            should_build = True
+            reason = "force_always"
+        elif len(members) == 0:
+            should_build = True
+            reason = "force_missing"
+        else:
+            # 안전장치: 이미 있으면 강제 재빌드 스킵
+            logger.info(
+                "[UNIVERSE][AUTO_BUILD][SKIP] universe already exists (members=%d). "
+                "Set UNIVERSE_FORCE_REBUILD_ALWAYS=1 to rebuild anyway.",
+                len(members),
+            )
+            should_build = False
+
+    if should_build:
+        logger.warning(
+            "[UNIVERSE][AUTO_BUILD] trigger build: env=%s strategy=%s as_of=%s (members=%d) reason=%s emergency=%s force=%s",
+            env, strategy, as_of_s, len(members), reason, EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
+        )
         built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
         logger.info("[UNIVERSE][AUTO_BUILD] built_members=%d (saved by builder)", len(built))
-
-        # NOTE: build_universe() already persists run+members to DB.
-        # So in prep_runner, only reload to verify.
         members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
 
     # 5) hard fail if still empty
