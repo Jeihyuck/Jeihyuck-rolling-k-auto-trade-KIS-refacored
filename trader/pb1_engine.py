@@ -1526,7 +1526,7 @@ class PB1Engine:
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
         # ✅ 타이머 및 시간 예산 설정
         t0 = time.monotonic()
-        t_minervini_enter = time.monotonic()
+        t_minervini_start = time.monotonic()  # ✅ Minervini 전용 타이머
         deadline = t0 + 3600.0  # 후보 스캔 타임아웃: 3600초 (1시간)
         reason = "OK"
         candidates: List[CandidateFeature] = []

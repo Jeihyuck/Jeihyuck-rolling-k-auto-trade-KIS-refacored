@@ -479,6 +479,12 @@ class UniverseRepo:
         return None
 
     def get_universe_members(self, *, env: str, strategy: str, as_of_date: str) -> list[dict]:
+        """
+        Get universe members for given (env, strategy, as_of_date).
+        
+        CRITICAL: env is account_env (practice/paper/real), NOT exec_mode.
+        Uses (strategy_key, as_of) tuple only - NO run_id filtering.
+        """
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
         stmt = (
@@ -494,7 +500,10 @@ class UniverseRepo:
         with self.engine.begin() as conn:
             run_id = conn.execute(stmt).scalar()
         if not run_id:
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no run)", as_of_date)
+            logger.info(
+                "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (trying fallback)",
+                env, strategy, as_of_date
+            )
             # [PATCH] Fallback to latest non-empty as_of
             fallback_stmt = (
                 select(self._schema.universe_runs.c.as_of, self._schema.universe_runs.c.run_id)
@@ -508,13 +517,22 @@ class UniverseRepo:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
                 if fallback_members:
-                    logger.info("[UNIVERSE][DB][LOAD][FALLBACK] as_of=%s -> %s members=%s", as_of_date, row["as_of"], len(fallback_members))
+                    logger.info(
+                        "[UNIVERSE][DB][LOAD][FALLBACK] env=%s strategy=%s as_of=%s -> %s members=%s",
+                        env, strategy, as_of_date, row["as_of"], len(fallback_members)
+                    )
                     return fallback_members
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no fallback)", as_of_date)
+            logger.info(
+                "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback)",
+                env, strategy, as_of_date
+            )
             return []
         members = self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
         if not members:
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0", as_of_date)
+            logger.info(
+                "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (trying fallback)",
+                env, strategy, as_of_date
+            )
             # [PATCH] Fallback to latest non-empty as_of
             fallback_stmt = (
                 select(self._schema.universe_runs.c.as_of, self._schema.universe_runs.c.run_id)
@@ -533,11 +551,20 @@ class UniverseRepo:
                 fallback_run_id = str(row["run_id"])
                 fallback_members = self._fetch_members_for_run(fallback_run_id, env=env, strategy=strategy)
                 if fallback_members:
-                    logger.info("[UNIVERSE][DB][LOAD][FALLBACK] as_of=%s -> %s members=%s", as_of_date, row["as_of"], len(fallback_members))
+                    logger.info(
+                        "[UNIVERSE][DB][LOAD][FALLBACK] env=%s strategy=%s as_of=%s -> %s members=%s",
+                        env, strategy, as_of_date, row["as_of"], len(fallback_members)
+                    )
                     return fallback_members
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=0 (no fallback)", as_of_date)
+            logger.info(
+                "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback)",
+                env, strategy, as_of_date
+            )
         else:
-            logger.info("[UNIVERSE][DB][LOAD] as_of=%s members=%s", as_of_date, len(members))
+            logger.info(
+                "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=%s",
+                env, strategy, as_of_date, len(members)
+            )
         return members
 
     def save_universe_run_and_members(
