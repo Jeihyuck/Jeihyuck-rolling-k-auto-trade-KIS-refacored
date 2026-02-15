@@ -141,7 +141,7 @@ env:
   BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: "1"
 
   CANDIDATE_POOL_FORCE_REBUILD: "0"
-  CANDIDATE_POOL_PREFETCH_DAYS: "1"
+  CANDIDATE_POOL_PREFETCH_DAYS: "520"
   CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
   CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
 
@@ -284,7 +284,7 @@ jobs:
 
       # ✅ delta 기본(수동입력 있으면 override)
       PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.PREFETCH_DAYS || '1' }}
-      OHLCV_DELTA_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_DELTA_DAYS || '1' }}
+      OHLCV_DELTA_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_DELTA_DAYS || '5' }}
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}

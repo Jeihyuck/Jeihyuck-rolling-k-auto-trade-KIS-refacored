@@ -2019,6 +2019,17 @@ class KisAPI:
             logger.warning(f"[ATR] 계산 실패 code={code}: {e}")
             return None
 
+    def fetch_daily_ohlcv(self, symbol: str, days: int = 30, **kwargs):
+        """Backward-compatible alias for legacy callers expecting DataFrame OHLCV."""
+        candles = self.get_daily_candles(symbol, count=days)
+        try:
+            import pandas as pd
+            if not candles:
+                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(candles)
+        except Exception:
+            return candles
+
     def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000") -> List[Dict[str, Any]]:
         """KIS 주식당일분봉조회 (FHKST03010200 / inquire-time-itemchartprice)
         - FID_COND_MRKT_DIV_CODE: 'J'

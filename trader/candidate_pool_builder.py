@@ -90,16 +90,22 @@ class CandidatePoolBuilder:
         
         codes = [m["code"] for m in members]
         scored = []
+        excluded_data_insufficient = 0
+        excluded_low_price = 0
+        excluded_high_volatility = 0
+        excluded_provider_error = 0
         
         for code in codes:
             try:
                 df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
                 if df is None or len(df) < self.min_rows:
+                    excluded_data_insufficient += 1
                     continue
                 
                 # 최소 주가 필터
                 last_close = df["close"].iloc[-1]
                 if last_close < self.min_price:
+                    excluded_low_price += 1
                     continue
                 
                 # 유동성 점수 계산 (평균 거래대금)
@@ -125,6 +131,7 @@ class CandidatePoolBuilder:
                 # 변동성 필터 (과도한 변동성 제외)
                 volatility = recent["close"].pct_change().std()
                 if volatility > 0.08:  # 일일 8% 이상 변동은 제외
+                    excluded_high_volatility += 1
                     continue
                 
                 # 복합 점수 (유동성 70% + 추세 30%)
@@ -138,8 +145,14 @@ class CandidatePoolBuilder:
                 })
                 
             except Exception as exc:
+                excluded_provider_error += 1
                 logger.debug("[CANDIDATE_POOL][OHLCV_FAIL] code=%s err=%s", code, exc)
                 continue
+
+        logger.info(
+            "[CANDIDATE_POOL][BUILD][EXCLUDE] total=%s data_insufficient=%s low_price=%s high_volatility=%s provider_error=%s",
+            len(codes), excluded_data_insufficient, excluded_low_price, excluded_high_volatility, excluded_provider_error,
+        )
         
         # ✅ scored=0 즉시 실패 처리 (진단 로그 강화)
         if len(scored) == 0:
@@ -182,6 +195,13 @@ class CandidatePoolBuilder:
                 "(4) filter criteria too strict (min_price=%s, min_rows=%s).",
                 self.min_price, self.min_rows
             )
+            if excluded_data_insufficient >= len(codes):
+                prefetch_days = os.getenv("CANDIDATE_POOL_PREFETCH_DAYS", "unknown")
+                raise RuntimeError(
+                    f"candidate pool excluded: data_insufficient for all {len(codes)} symbols "
+                    f"(min_rows={self.min_rows}, CANDIDATE_POOL_PREFETCH_DAYS={prefetch_days}). "
+                    "Increase prefetch window (recommend >=260, preferred 520) and rebuild."
+                )
             raise RuntimeError(f"candidate pool scored=0 from {len(codes)} universe members")
         
         # 점수 내림차순 정렬 후 상위 target_size개 선택
@@ -667,8 +687,7 @@ def main():
     # DB 연결
     from trader.db.engine import get_engine
     from trader.db.repos import UniverseRepo
-    from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-    from trader.kis_wrapper import KisAPI
+    from trader.data.ohlcv_provider import KISOHLCVProvider
     
     engine = get_engine()
     
@@ -713,16 +732,27 @@ def main():
         print("OHLCV prefetch completed")
         return
     
-    # OHLCV 프로바이더 설정
-    kis_http_enabled = os.getenv("KIS_HTTP_ENABLED", "1") == "1"
-    
-    if kis_http_enabled:
-        kis = KisAPI()
-        ohlcv_provider_func = lambda code, days: kis.fetch_daily_ohlcv(code, days=days)
-    else:
-        # DIAG 모드: KRX fallback만 사용
-        krx_provider = KRXOHLCVProvider()
-        ohlcv_provider_func = lambda code, days: krx_provider.fetch(code, days=days)
+    # OHLCV 프로바이더 설정 (빌드 단계는 DB-only 강제)
+    if args.build or args.build_only:
+        os.environ["OHLCV_PREFETCH_ONLY"] = "1"
+        logger.info(
+            "[CANDIDATE_POOL][OHLCV] build phase enforces DB-only provider (OHLCV_PREFETCH_ONLY=1)"
+        )
+
+    db_first_provider = KISOHLCVProvider(kis=None)
+
+    def ohlcv_provider_func(code: str, days: int):
+        result = db_first_provider.get_ohlcv(code, days)
+        if result.df is None or len(result.df) < CANDIDATE_POOL_MIN_ROWS:
+            logger.debug(
+                "[CANDIDATE_POOL][OHLCV][DATA_INSUFFICIENT] code=%s days=%s rows=%s source=%s error=%s",
+                code,
+                days,
+                0 if result.df is None else len(result.df),
+                result.meta.get("source"),
+                result.meta.get("error"),
+            )
+        return result.df
     
     # 후보군 생성 및 저장
     force_rebuild = CANDIDATE_POOL_FORCE_REBUILD or os.getenv("CANDIDATE_POOL_FORCE_REBUILD", "0") == "1"
