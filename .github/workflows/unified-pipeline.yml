@@ -486,9 +486,8 @@ jobs:
               ;;
             candidate)
               # candidate_pool_builder는 인자 없으면 help만 출력하고 종료함
-              if [ "${STRATEGY_ENV}" = "practice" ]; then CP_ENV="PAPER"; else CP_ENV="LIVE"; fi
-              python -m trader.candidate_pool_builder --prefetch-only --env "${CP_ENV}"
-              python -m trader.candidate_pool_builder --build-only --build pool --env "${CP_ENV}"
+              python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
+              python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
               ;;
             trade)
               python -m trader.trade_tick
@@ -496,9 +495,8 @@ jobs:
             both)
               python -m trader.prep_runner
               # candidate_pool_builder는 인자 없으면 help만 출력하고 종료함
-              if [ "${STRATEGY_ENV}" = "practice" ]; then CP_ENV="PAPER"; else CP_ENV="LIVE"; fi
-              python -m trader.candidate_pool_builder --prefetch-only --env "${CP_ENV}"
-              python -m trader.candidate_pool_builder --build-only --build pool --env "${CP_ENV}"
+              python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
+              python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
               python -m trader.trade_tick
               ;;
             minervini_test)

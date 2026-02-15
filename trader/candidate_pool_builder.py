@@ -39,10 +39,16 @@ logger = logging.getLogger(__name__)
 
 def resolve_env(cli_env: str | None) -> str:
     if cli_env:
-        return str(cli_env).strip().lower()
+        v = str(cli_env).strip().lower()
+        if v not in ("paper", "live", "practice"):
+            raise RuntimeError(f"INVALID_ENV={cli_env}")
+        return v
     strategy_env = os.getenv("STRATEGY_ENV")
     if strategy_env:
-        return str(strategy_env).strip().lower()
+        v = str(strategy_env).strip().lower()
+        if v not in ("paper", "live", "practice"):
+            raise RuntimeError(f"INVALID_STRATEGY_ENV={strategy_env}")
+        return v
     raise RuntimeError("ENV_NOT_DEFINED")
 
 
@@ -705,10 +711,13 @@ def main():
     logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, resolved_env)
     
     # 환경 변수 출력 (디버깅용)
-    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", resolved_env)
+    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV")
+    if not universe_env:
+        universe_env = resolve_env(None)
+    universe_env = universe_env.strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
-    if universe_env.strip().lower() != resolved_env:
-        raise RuntimeError("ENV_NAMESPACE_MISMATCH")
+    if resolved_env != universe_env:
+        raise RuntimeError(f"ENV_NAMESPACE_MISMATCH env={resolved_env} universe_env={universe_env}")
     logger.info(
         "[CANDIDATE_POOL][CONFIG] CANDIDATE_POOL_UNIVERSE_ENV=%s CANDIDATE_POOL_UNIVERSE_STRATEGY=%s",
         universe_env, universe_strategy

@@ -32,6 +32,21 @@ from trader.time_coerce import to_date
 logger = logging.getLogger(__name__)
 
 
+def resolve_env(cli_env: str | None) -> str:
+    if cli_env:
+        v = str(cli_env).strip().lower()
+        if v not in ("paper", "live", "practice"):
+            raise RuntimeError(f"INVALID_ENV={cli_env}")
+        return v
+    strategy_env = os.getenv("STRATEGY_ENV")
+    if strategy_env:
+        v = str(strategy_env).strip().lower()
+        if v not in ("paper", "live", "practice"):
+            raise RuntimeError(f"INVALID_STRATEGY_ENV={strategy_env}")
+        return v
+    raise RuntimeError("ENV_NOT_DEFINED")
+
+
 def prefetch_ohlcv_to_db(
     *,
     engine: Engine,
@@ -495,7 +510,7 @@ def main():
     parser = argparse.ArgumentParser(description="Candidate Pool Builder")
     parser.add_argument("--build", choices=["pool"], help="Build candidate pool")
     parser.add_argument("--as_of", type=str, help="As-of date (YYYY-MM-DD), default: prev business day")
-    parser.add_argument("--env", type=str, default=os.getenv("STRATEGY_ENV", "PAPER"), help="Environment (LIVE/PAPER)")
+    parser.add_argument("--env", type=str, default=None, help="Environment (practice/live)")
     
     args = parser.parse_args()
     
@@ -514,11 +529,17 @@ def main():
         else:
             as_of = now.date()
     
-    logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, args.env)
+    resolved_env = resolve_env(args.env)
+    logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, resolved_env)
     
     # 환경 변수 출력 (디버깅용)
-    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", os.getenv("KIS_ENV", args.env))
+    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV")
+    if not universe_env:
+        universe_env = resolve_env(None)
+    universe_env = universe_env.strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
+    if resolved_env != universe_env:
+        raise RuntimeError(f"ENV_NAMESPACE_MISMATCH env={resolved_env} universe_env={universe_env}")
     logger.info(
         "[CANDIDATE_POOL][CONFIG] CANDIDATE_POOL_UNIVERSE_ENV=%s CANDIDATE_POOL_UNIVERSE_STRATEGY=%s",
         universe_env, universe_strategy
@@ -569,7 +590,7 @@ def main():
     
     pool_codes = build_and_save_candidate_pool(
         engine=engine,
-        env=args.env,
+        env=resolved_env,
         as_of=as_of,
         members=members,
         ohlcv_provider=ohlcv_provider_func,
