@@ -37,6 +37,15 @@ from trader.time_coerce import to_date
 logger = logging.getLogger(__name__)
 
 
+def resolve_env(cli_env: str | None) -> str:
+    if cli_env:
+        return str(cli_env).strip().lower()
+    strategy_env = os.getenv("STRATEGY_ENV")
+    if strategy_env:
+        return str(strategy_env).strip().lower()
+    raise RuntimeError("ENV_NOT_DEFINED")
+
+
 class CandidatePoolBuilder:
     """
     후보군 생성기 - 가벼운 스캔으로 195 유니버스를 80~150개로 압축.
@@ -541,6 +550,24 @@ def build_and_save_candidate_pool(
         as_of=as_of,
         members=pool_members,
     )
+
+    final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+    final_members = [{"code": code, "rank": idx + 1} for idx, code in enumerate(pool_codes[:30])]
+    if len(final_members) < 30:
+        raise RuntimeError(f"watchlist final size {len(final_members)} < 30")
+    repo.save_watchlist(
+        env=env,
+        strategy=final_strategy,
+        as_of=as_of,
+        members=final_members,
+    )
+    logger.info(
+        "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
+        env,
+        final_strategy,
+        as_of,
+        len(final_members),
+    )
     
     logger.info(
         "[CANDIDATE_POOL][SAVE] env=%s strategy=%s size=%s as_of=%s",
@@ -655,7 +682,7 @@ def main():
     parser.add_argument("--prefetch-only", action="store_true", help="Run OHLCV prefetch only")
     parser.add_argument("--build-only", action="store_true", help="Run pool build only (skip prefetch)")
     parser.add_argument("--as_of", type=str, help="As-of date (YYYY-MM-DD), default: prev business day")
-    parser.add_argument("--env", type=str, default=os.getenv("STRATEGY_ENV", "PAPER"), help="Environment (LIVE/PAPER)")
+    parser.add_argument("--env", type=str, default=None, help="Environment (practice/live)")
     
     args = parser.parse_args()
     
@@ -674,11 +701,14 @@ def main():
         else:
             as_of = now.date()
     
-    logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, args.env)
+    resolved_env = resolve_env(args.env)
+    logger.info("[CANDIDATE_POOL][CLI] build=%s as_of=%s env=%s", args.build, as_of, resolved_env)
     
     # 환경 변수 출력 (디버깅용)
-    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", os.getenv("KIS_ENV", args.env))
+    universe_env = os.getenv("CANDIDATE_POOL_UNIVERSE_ENV", resolved_env)
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
+    if universe_env.strip().lower() != resolved_env:
+        raise RuntimeError("ENV_NAMESPACE_MISMATCH")
     logger.info(
         "[CANDIDATE_POOL][CONFIG] CANDIDATE_POOL_UNIVERSE_ENV=%s CANDIDATE_POOL_UNIVERSE_STRATEGY=%s",
         universe_env, universe_strategy
@@ -724,7 +754,7 @@ def main():
             engine=engine,
             members=members,
             force_rebuild=force_rebuild,
-            env=args.env,
+            env=resolved_env,
             strategy=strategy_key,
             as_of=as_of,
         )
@@ -760,7 +790,7 @@ def main():
     
     pool_codes = build_and_save_candidate_pool(
         engine=engine,
-        env=args.env,
+        env=resolved_env,
         as_of=as_of,
         members=members,
         ohlcv_provider=ohlcv_provider_func,

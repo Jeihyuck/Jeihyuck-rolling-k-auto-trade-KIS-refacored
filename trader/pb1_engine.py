@@ -131,7 +131,7 @@ from trader.strategies.pb1_minervini_v2 import (
     score_setup,
     update_trailing_stop,
 )
-from trader.time_utils import now_kst, week_monday
+from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.core_utils import _round_to_tick
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -4411,55 +4411,73 @@ class PB1Engine:
         from trader.time_utils import resolve_derived_as_of
         derived_as_of = resolve_derived_as_of(self._now_kst)
         
-        # 전체 유니버스 로드 (후보군 생성에 필요)
-        full_members = self._load_universe()
-        
-        # ✅ FIX: 후보군은 STRATEGY_ENV로 저장되므로 STRATEGY_ENV로 로드
+        # ✅ FIX: watchlist/candidate는 STRATEGY_ENV namespace를 사용
         import os
         pool_env = os.getenv("STRATEGY_ENV", self.env)
 
-        # ✅ trade 모드: derived_as_of 사용 + TTL fallback 허용
+        # ✅ trade 모드: watchlist_final only (no universe/candidate fallback)
         trade_mode = os.getenv("MODE") == "trade"
         if trade_mode:
             repo = WatchlistRepo(self.engine)
-            pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
-            ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
-            
-            # ✅ derived_as_of 우선, 없으면 ttl_days 이내 최신 fallback
-            rows, used_as_of = repo.load_watchlist(
-                env=pool_env,
-                strategy=pool_strategy,
-                as_of=derived_as_of,
-                allow_latest_fallback=True,
-                ttl_days=ttl_days,
-            )
-            
+            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+            ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
+            max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
+
+            request_as_of = derived_as_of
+            current_as_of = request_as_of
+            rows: list[dict] = []
+            used_as_of = request_as_of
+            for step in range(max_back_days + 1):
+                rows, _ = repo.load_watchlist(
+                    env=pool_env,
+                    strategy=pool_strategy,
+                    as_of=current_as_of,
+                    allow_latest_fallback=False,
+                )
+                if rows:
+                    used_as_of = current_as_of
+                    break
+                if step < max_back_days:
+                    current_as_of = prev_business_day(current_as_of)
+
             if not rows:
-                logger.warning(
-                    "[CANDIDATE_POOL][TRADE_SKIP] no pool within TTL as_of=%s ttl_days=%d",
-                    derived_as_of, ttl_days
+                logger.error(
+                    "[WATCHLIST][TRADE][MISS] requested=%s env=%s strategy=%s max_back_days=%d",
+                    request_as_of,
+                    pool_env,
+                    pool_strategy,
+                    max_back_days,
                 )
-                return [], "candidate_pool_missing_within_ttl"
-            
-            # ✅ fallback 사용 시 로그 명확화
-            if used_as_of and used_as_of != derived_as_of:
-                age = (derived_as_of - used_as_of).days if isinstance(used_as_of, date) else 0
-                logger.info(
-                    "[CANDIDATE_POOL][TRADE][FALLBACK] requested=%s actual=%s age=%d members=%d",
-                    derived_as_of, used_as_of, age, len(rows)
+                return [], "watchlist_final_missing"
+
+            age = (request_as_of - used_as_of).days
+            if age > ttl_days:
+                logger.error(
+                    "[WATCHLIST][TRADE][TTL_EXCEEDED] requested=%s actual=%s age=%d ttl_days=%d",
+                    request_as_of,
+                    used_as_of,
+                    age,
+                    ttl_days,
                 )
-            else:
-                logger.info(
-                    "[CANDIDATE_POOL][TRADE][EXACT] as_of=%s members=%d",
-                    derived_as_of, len(rows)
-                )
-            
+                return [], "watchlist_final_ttl_exceeded"
+
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%d",
+                pool_env,
+                pool_strategy,
+                used_as_of,
+                len(rows),
+            )
+
             pool_codes = [item["code"] for item in rows]
             members = [
                 {"code": code, "name": self._code_name_map.get(code, "")}
                 for code in pool_codes
             ]
-            return members, "candidate_pool_today"
+            return members, "watchlist_final"
+
+        # 전체 유니버스 로드 (비-trade 모드 후보군 생성에 필요)
+        full_members = self._load_universe()
         
         # ✅ STEP 1: 후보군 로드 (TTL 검사 포함)
         pool_codes, pool_as_of, pool_reason = load_candidate_pool(

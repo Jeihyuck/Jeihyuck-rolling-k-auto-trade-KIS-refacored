@@ -81,7 +81,7 @@ from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
-from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of, prev_business_day
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -91,6 +91,15 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 
 logger = logging.getLogger(__name__)
 log = logger
+
+
+def resolve_env(cli_env: str | None) -> str:
+    if cli_env:
+        return str(cli_env).strip().lower()
+    strategy_env = os.getenv("STRATEGY_ENV")
+    if strategy_env:
+        return str(strategy_env).strip().lower()
+    raise RuntimeError("ENV_NOT_DEFINED")
 
 
 def _force_live_env_lock_if_needed(intended_live: bool) -> bool:
@@ -559,6 +568,53 @@ def _load_universe_context(
     env: str,
     strategy: str,
 ) -> UniverseContext:
+    mode_input = (os.getenv("MODE") or "").strip().lower()
+    if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
+        watchlist_repo = WatchlistRepo(engine)
+        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+        ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
+        max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
+        requested_as_of = datetime.strptime(as_of, "%Y-%m-%d").date()
+        current_as_of = requested_as_of
+        rows: list[dict] = []
+        used_as_of = requested_as_of
+
+        for step in range(max_back_days + 1):
+            rows, _ = watchlist_repo.load_watchlist(
+                env=env,
+                strategy=watchlist_strategy,
+                as_of=current_as_of,
+                allow_latest_fallback=False,
+            )
+            if rows:
+                used_as_of = current_as_of
+                break
+            if step < max_back_days:
+                current_as_of = prev_business_day(current_as_of)
+
+        if not rows:
+            raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
+
+        age_days = (requested_as_of - used_as_of).days
+        if age_days > ttl_days:
+            raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
+
+        members = [{"code": str(r.get("code") or "").zfill(6)} for r in rows if r.get("code")]
+        logger.info(
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+            env,
+            watchlist_strategy,
+            used_as_of.isoformat(),
+            len(members),
+        )
+        return UniverseContext(
+            as_of_date=used_as_of.isoformat(),
+            members=members,
+            selected_path=None,
+            meta={"source": "watchlist_final", "as_of": used_as_of.isoformat()},
+            is_empty=len(members) == 0,
+        )
+
     # [NEW] WATCHLIST_MODE=1이면 WATCHLIST env에서 직접 로딩
     watchlist_mode = os.getenv("WATCHLIST_MODE", "0") == "1"
     if watchlist_mode:
@@ -864,6 +920,7 @@ def parse_args() -> argparse.Namespace:
         help="Execution window override",
     )
     parser.add_argument("--phase", default="auto", choices=["auto", "entry", "exit", "verify"], help="Phase override")
+    parser.add_argument("--env", type=str, default=None, help="DB/KIS environment namespace")
     return parser.parse_args()
 
 
@@ -2351,6 +2408,12 @@ def _exit_code_for_status(status: str) -> int:
 
 
 def main() -> int:
+    args = parse_args()
+    resolved_env = resolve_env(args.env)
+    os.environ["STRATEGY_ENV"] = resolved_env
+    if not os.getenv("KIS_ENV"):
+        os.environ["KIS_ENV"] = resolved_env
+
     # ✅ 설계 1: JOB 모드 분리 (BUILD_WATCHLIST vs TRADE_INTRADAY)
     job_mode = os.getenv("PB1_JOB", "TRADE_INTRADAY").upper()
     
@@ -2392,7 +2455,7 @@ def main() -> int:
         run_migrations(engine)
         
         # 환경변수
-        env = os.getenv("STRATEGY_ENV", "live").lower()
+        env = resolved_env
         strategy = os.getenv("STRATEGY", "best_k_meta")
         today = now_kst().date()
         
@@ -2443,23 +2506,7 @@ def main() -> int:
     )
     
     if kis_env and strategy_env and kis_env != strategy_env:
-        # Strict only when LIVE real trading (실거래만 엄격)
-        if live_trading_enabled and (not allow_mismatch):
-            logger.error(
-                "[PB1][ENV][CRITICAL] KIS_ENV=%s != STRATEGY_ENV=%s -> FAIL (real trading)",
-                kis_env,
-                strategy_env,
-            )
-            logger.error(
-                "[PB1][ENV][FIX] Set both to the same value (e.g., KIS_ENV=live STRATEGY_ENV=live) or unset one to inherit from the other"
-            )
-            raise ValueError(f"KIS_ENV ({kis_env}) != STRATEGY_ENV ({strategy_env})")
-        else:
-            logger.warning(
-                "[PB1][ENV][WARN] KIS_ENV=%s != STRATEGY_ENV=%s -> continue (DIAG/DRY_RUN/PAPER/candidate-only)",
-                kis_env,
-                strategy_env,
-            )
+        raise RuntimeError("ENV_MISMATCH_IN_TRADE")
     
     # ✅ KIS_ENV가 없으면 STRATEGY_ENV로 설정
     if not kis_env and strategy_env:
@@ -2496,6 +2543,7 @@ def main() -> int:
 
     # ✅ Trade guard: PREP_DONE + derived_minervini + today watchlist required
     if mode_input == "trade":
+        os.environ["PB1_TRADE_WATCHLIST_ONLY"] = "1"
         # ✅ CRITICAL: 장중 매매는 "전일 영업일 derived"를 사용해야 함
         # prep_runner가 전일 종가로 derived를 생성하므로, trade는 전일을 참조
         now = now_kst()
@@ -2605,33 +2653,43 @@ def main() -> int:
                 derived_count,
             )
         
-        # CANDIDATE_POOL 체크도 derived_as_of 기준으로
-        # ✅ derived_as_of는 이미 fallback되었을 수 있으므로, pool도 fallback 허용
-        pool_repo = WatchlistRepo(engine)
-        pool_env = os.getenv("STRATEGY_ENV", "practice").lower()
-        pool_strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
-        pool_rows, pool_actual_as_of = pool_repo.load_watchlist(
-            env=pool_env,
-            strategy=pool_strategy,
-            as_of=derived_as_of,
-            allow_latest_fallback=True,  # ✅ fallback 허용 (ttl_days 범위 내)
-        )
-        if not pool_rows:
-            logger.warning(
-                "[TRADE_TICK][SKIP] reason=CANDIDATE_POOL_MISSING derived_as_of=%s trade_date=%s",
-                derived_as_of.isoformat(),
-                trade_date.isoformat(),
+        watchlist_repo = WatchlistRepo(engine)
+        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+        ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
+        max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
+        watchlist_env = resolve_env(args.env)
+
+        current_as_of = derived_as_of
+        watchlist_rows: list[dict] = []
+        used_as_of = derived_as_of
+        for step in range(max_back_days + 1):
+            watchlist_rows, _ = watchlist_repo.load_watchlist(
+                env=watchlist_env,
+                strategy=watchlist_strategy,
+                as_of=current_as_of,
+                allow_latest_fallback=False,
             )
-            return 0
-        
+            if watchlist_rows:
+                used_as_of = current_as_of
+                break
+            if step < max_back_days:
+                current_as_of = prev_business_day(current_as_of)
+
+        if not watchlist_rows:
+            raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
+
+        age_days = (derived_as_of - used_as_of).days
+        if age_days > ttl_days:
+            raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
+
         logger.info(
-            "[TRADE_TICK][CANDIDATE_POOL][OK] derived_as_of=%s actual_as_of=%s count=%d",
-            derived_as_of.isoformat(),
-            pool_actual_as_of.isoformat() if pool_actual_as_of else "N/A",
-            len(pool_rows),
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+            watchlist_env,
+            watchlist_strategy,
+            used_as_of.isoformat(),
+            len(watchlist_rows),
         )
-    
-    args = parse_args()
+
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
     run_loop_minutes, _max_minutes, max_seconds, loop_configured = _resolve_loop_limits()
@@ -2668,7 +2726,7 @@ def main() -> int:
         os.environ["TRADER_RUN_ID"] = run_id
     
     # Create RunContext
-    env = os.getenv("ENV", "live")
+    env = resolve_env(args.env)
     strategy = os.getenv("STRATEGY", "best_k_meta")
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     git_sha = os.getenv("GITHUB_SHA")

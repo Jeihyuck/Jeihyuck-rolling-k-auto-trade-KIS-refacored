@@ -14,6 +14,7 @@ from typing import Any
 from trader.db.repos import WatchlistRepo
 from trader.time_coerce import to_date
 from trader.pb1_engine import UniverseContext
+from trader.time_utils import prev_business_day
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +25,19 @@ def load_watchlist_for_trade(
     env: str,
     strategy: str,
     as_of: str | date,
-    fallback_to_universe: bool = True,
+    fallback_to_universe: bool = False,
 ) -> UniverseContext:
     """
     Load watchlist for trade tick (optimized for latency).
     
     CRITICAL: Trade should scan ONLY watchlist (final 30), not full universe.
-    Universe is used only for fallback when watchlist is missing.
     
     Args:
         engine: SQLAlchemy engine
         env: Account environment (practice/paper/real)
         strategy: Strategy name
         as_of: Date to load watchlist for
-        fallback_to_universe: If True, fall back to universe if watchlist is empty
+        fallback_to_universe: Deprecated. Universe fallback is forbidden.
     
     Returns:
         UniverseContext with watchlist members
@@ -92,47 +92,23 @@ def load_watchlist_for_trade(
             is_empty=len(members) == 0,
         )
     
-    # Watchlist empty - try fallback
+    # Watchlist empty
     logger.warning(
-        "[WATCHLIST][LOAD][EMPTY] env=%s strategy=%s as_of=%s -> fallback=%s",
-        env, strategy, as_of_date.isoformat(), fallback_to_universe
+        "[WATCHLIST][LOAD][EMPTY] env=%s strategy=%s as_of=%s",
+        env, strategy, as_of_date.isoformat()
     )
-    
-    if not fallback_to_universe:
-        return UniverseContext(
-            as_of_date=as_of_date.isoformat(),
-            members=[],
-            selected_path=None,
-            meta={"source": "watchlist", "as_of": as_of_date.isoformat(), "count": 0},
-            is_empty=True,
-        )
-    
-    # Fallback to universe (NOT RECOMMENDED for latency)
-    from trader.db.repos import UniverseRepo
-    
-    universe_repo = UniverseRepo(engine)
-    universe_members = universe_repo.get_universe_members(
-        env=env,
-        strategy=strategy,
-        as_of_date=as_of_date.isoformat(),
-    )
-    
-    logger.warning(
-        "[WATCHLIST][LOAD][FALLBACK_UNIVERSE] env=%s strategy=%s as_of=%s members=%s (SLOW)",
-        env, strategy, as_of_date.isoformat(), len(universe_members)
-    )
-    
+
     return UniverseContext(
         as_of_date=as_of_date.isoformat(),
-        members=universe_members,
+        members=[],
         selected_path=None,
         meta={
-            "source": "universe_fallback",
+            "source": "watchlist",
             "as_of": as_of_date.isoformat(),
-            "count": len(universe_members),
-            "warning": "watchlist_missing"
+            "count": 0,
+            "warning": "watchlist_missing",
         },
-        is_empty=len(universe_members) == 0,
+        is_empty=True,
     )
 
 
@@ -143,14 +119,15 @@ def load_today_watchlist_with_fallback(
     strategy: str,
     as_of: str | date,
     ttl_days: int = 7,
+    max_back_days: int = 3,
 ) -> UniverseContext:
     """
     Load today's watchlist with intelligent fallback.
     
     Strategy:
     1. Try as_of date
-    2. If empty, try most recent within TTL days
-    3. If still empty, fall back to universe (with warning)
+    2. If empty, try previous business day up to max_back_days
+    3. Reject if no result within ttl_days
     
     Args:
         engine: SQLAlchemy engine
@@ -177,11 +154,13 @@ def load_today_watchlist_with_fallback(
     if not ctx.is_empty:
         return ctx
     
-    # Find most recent watchlist within TTL
-    from datetime import timedelta
-    
-    for days_back in range(1, ttl_days + 1):
-        fallback_date = as_of_date - timedelta(days=days_back)
+    # Find watchlist by previous business-day backtracking
+    fallback_date = as_of_date
+    for _ in range(max_back_days):
+        fallback_date = prev_business_day(fallback_date)
+        days_back = (as_of_date - fallback_date).days
+        if days_back > ttl_days:
+            break
         
         ctx_fallback = load_watchlist_for_trade(
             engine=engine,
@@ -193,7 +172,7 @@ def load_today_watchlist_with_fallback(
         
         if not ctx_fallback.is_empty:
             logger.warning(
-                "[WATCHLIST][FALLBACK][TTL_OK] requested=%s actual=%s age=%d members=%s",
+                "[WATCHLIST][FALLBACK][BIZDAY_OK] requested=%s actual=%s age=%d members=%s",
                 as_of_date.isoformat(),
                 fallback_date.isoformat(),
                 days_back,
@@ -205,17 +184,23 @@ def load_today_watchlist_with_fallback(
             ctx_fallback.meta["age_days"] = days_back
             return ctx_fallback
     
-    # No watchlist found within TTL - fallback to universe
+    # No watchlist found within allowed backtracking/TTL window
     logger.error(
-        "[WATCHLIST][FALLBACK][TTL_EXCEEDED] requested=%s ttl=%d -> using universe (SLOW)",
+        "[WATCHLIST][FALLBACK][FAIL] requested=%s ttl=%d max_back_days=%d",
         as_of_date.isoformat(),
         ttl_days,
+        max_back_days,
     )
-    
-    return load_watchlist_for_trade(
-        engine=engine,
-        env=env,
-        strategy=strategy,
-        as_of=as_of_date,
-        fallback_to_universe=True,  # Last resort
+
+    return UniverseContext(
+        as_of_date=as_of_date.isoformat(),
+        members=[],
+        selected_path=None,
+        meta={
+            "source": "watchlist",
+            "as_of": as_of_date.isoformat(),
+            "count": 0,
+            "warning": "fallback_not_found",
+        },
+        is_empty=True,
     )
