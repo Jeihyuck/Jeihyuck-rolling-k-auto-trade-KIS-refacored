@@ -329,54 +329,53 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Import check (preflight)
+      - name: Debug tree (repo sanity)
+        shell: bash
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "[IMPORT CHECK] MODE=${MODE}"
-          echo "======================================"
-          
-          mods=("trader.db.migrate")
-          
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          pwd
+          ls -la
+          echo "---- repo ----"
+          ls -la repo || true
+          echo "---- repo/trader ----"
+          ls -la repo/trader | head -n 80 || true
+          test -f repo/trader/minervini_runner.py && echo "OK: minervini_runner.py exists" || (echo "::error::missing repo/trader/minervini_runner.py" && exit 1)
+
+      - name: Import check (preflight)
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          echo "PWD=$(pwd)"
+          python -c "import sys; print('sys.path[0:5]=', sys.path[0:5])"
+          python -c "import trader; print('✅ trader - OK')"
+          python -c "import trader.db.migrate; print('✅ trader.db.migrate - OK')"
+
           case "${MODE}" in
-            prep) mods+=("trader.prep_runner") ;;
-            candidate) mods+=("trader.candidate_pool_builder") ;;
-            trade) mods+=("trader.trade_tick") ;;
-            both) mods+=("trader.prep_runner" "trader.candidate_pool_builder" "trader.trade_tick") ;;
-            minervini_test) mods+=("trader.minervini_runner") ;;
+            prep) python -c "import trader.prep_runner; print('✅ trader.prep_runner - OK')" ;;
+            candidate) python -c "import trader.candidate_pool_builder; print('✅ trader.candidate_pool_builder - OK')" ;;
+            trade) python -c "import trader.trade_tick; print('✅ trader.trade_tick - OK')" ;;
+            both)
+              python -c "import trader.prep_runner; print('✅ trader.prep_runner - OK')"
+              python -c "import trader.candidate_pool_builder; print('✅ trader.candidate_pool_builder - OK')"
+              python -c "import trader.trade_tick; print('✅ trader.trade_tick - OK')"
+              ;;
+            minervini_test) python -c "import trader.minervini_runner; print('✅ trader.minervini_runner - OK')" ;;
             *) echo "::error::Unknown MODE=${MODE}"; exit 1 ;;
           esac
-          
-          EXIT_CODE=0
-          for module in "${mods[@]}"; do
-            if python -c "import ${module}" 2>/dev/null; then
-              echo "✅ ${module} - OK"
-            else
-              echo "❌ ${module} - MISSING"
-              EXIT_CODE=1
-            fi
-          done
-          
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "::error::Missing required modules for MODE=${MODE}"
-            exit 1
-          fi
-          
-          echo "All required modules available."
-          echo "======================================" 
 
-      - name: Install DB driver (psycopg3)
+      - name: Install DB drivers
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "SQLAlchemy>=2.0" "psycopg[binary]>=3.1"
-
-      - name: Verify DB driver import
-        run: |
-          set -euo pipefail
           python - <<'PY'
-          import sqlalchemy
-          import psycopg
+          import sqlalchemy, psycopg
           print("SQLAlchemy:", sqlalchemy.__version__)
           print("psycopg:", psycopg.__version__)
           PY
@@ -516,7 +515,7 @@ jobs:
               python -m trader.trade_tick
               ;;
             minervini_test)
-              python -m trader.minervini_runner
+              echo "minervini_test is executed in dedicated step"
               ;;
             *)
               echo "::error::Unknown MODE=${MODE}"
@@ -527,6 +526,17 @@ jobs:
           echo "======================================"
           echo "[RUN] Execution completed successfully"
           echo "======================================"
+
+      - name: Run minervini_test
+        if: ${{ needs.resolve.outputs.run_mode == 'minervini_test' }}
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate
+          python -m trader.minervini_runner
 
       - name: Fail if universe fallback occurred (prep)
         if: ${{ always() && needs.resolve.outputs.run_mode == 'prep' }}
