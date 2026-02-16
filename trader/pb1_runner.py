@@ -102,6 +102,16 @@ def resolve_env(cli_env: str | None) -> str:
     raise RuntimeError("ENV_NOT_DEFINED")
 
 
+def _parse_as_of_override(value: str) -> datetime.date:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("empty AS_OF value")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"invalid AS_OF format: {raw}") from exc
+
+
 def _force_live_env_lock_if_needed(intended_live: bool) -> bool:
     """
     If we intend to trade live, we must guarantee env flags are consistent.
@@ -1112,11 +1122,13 @@ def run_once(
     trade_date = now.date()
     derived_as_of_date = resolve_derived_as_of(now)
     as_of = derived_as_of_date.isoformat()
+    asof_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "INTRADAY_USE_PREV_CLOSE"
     
     logger.info(
-        "[ASOF][RUN_ONCE] trade_date=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",
+        "[ASOF][RUN_ONCE] trade_date=%s derived_as_of=%s reason=%s",
         trade_date.isoformat(),
         as_of,
+        asof_reason,
     )
     
     runtime_root_dir = runtime_dir or runtime_root()
@@ -1210,6 +1222,13 @@ def run_once(
     target_start = None
     if not loop_mode:
         action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
+        trade_run_minervini = env_bool("TRADE_RUN_MINERVINI", default=False)
+        if trade_run_minervini and mode == "DIAG" and action == "wait":
+            logger.info(
+                "[PB1][TRADE_MINERVINI] mode=DIAG TRADE_RUN_MINERVINI=1 -> bypass wait and run now",
+            )
+            action = "run"
+            target_start = None
         logger.info(
             "[PB1][RUN-PLAN] event=%s now_kst=%s trading_day=%s action=%s target_start=%s max_wait_s=%s window=%s phase=%s allow_wait=%s",
             event_name_lower or "unknown",
@@ -1629,9 +1648,10 @@ def run_once(
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
 
     runs_repo = RunsRepo(engine)
+    run_id = os.getenv("TRADER_RUN_ID", "local")
     # Ensure run row exists early to prevent FK errors
     runs_repo.upsert_run(
-        run_id=ctx.run_id,
+        run_id=run_id,
         env=ctx.env,
         strategy=ctx.strategy,
         workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
@@ -2124,12 +2144,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     strategy = os.getenv("STRATEGY", "best_k_meta")
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     git_sha = os.getenv("GITHUB_SHA")
-    ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
-    # ✅ RunContext의 run_id를 TRADER_RUN_ID로 강제 교체
-    ctx.run_id = run_id
+    exec_mode = resolve_mode(os.getenv("STRATEGY_MODE", "DIAG"))
+    ctx = RunContext.new(
+        account_env=env,
+        exec_mode=exec_mode,
+        strategy=strategy,
+        gh_run_number=gh_run_number,
+        git_sha=git_sha,
+    )
     logger.info(
         "[PB1][LOOP][CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s",
-        ctx.run_id,
+        run_id,
         ctx.env,
         ctx.strategy,
         ctx.gh_run_number,
@@ -2541,33 +2566,107 @@ def main() -> int:
     # ✅ Trade guard: PREP_DONE + derived_minervini + today watchlist required
     if mode_input == "trade":
         os.environ["PB1_TRADE_WATCHLIST_ONLY"] = "1"
-        # ✅ CRITICAL: 장중 매매는 "전일 영업일 derived"를 사용해야 함
-        # prep_runner가 전일 종가로 derived를 생성하므로, trade는 전일을 참조
+
+        trade_asof_source = (os.getenv("TRADE_ASOF_SOURCE") or "").strip().lower()
+        as_of_override_raw = (os.getenv("AS_OF_OVERRIDE") or "").strip()
+        allow_wl_only = os.getenv("ALLOW_TRADE_WITH_WATCHLIST_ONLY", "0") == "1"
+        trade_run_minervini = os.getenv("TRADE_RUN_MINERVINI", "0") == "1"
+
+        if trade_run_minervini:
+            os.environ["PB1_DIAG_FULL_EXEC"] = "1"
+            os.environ["FORCE_PB1_PHASE"] = "entry"
+            logger.info(
+                "[TRADE][MINERVINI] TRADE_RUN_MINERVINI=1 -> force PB1_DIAG_FULL_EXEC=%s FORCE_PB1_PHASE=%s",
+                os.getenv("PB1_DIAG_FULL_EXEC"),
+                os.getenv("FORCE_PB1_PHASE"),
+            )
+
         now = now_kst()
         trade_date = now.date()
-        derived_as_of = resolve_derived_as_of(now)
+        watchlist_loaded_for_guard = False
+
+        def _ensure_watchlist_for_guard(requested_as_of):
+            nonlocal watchlist_loaded_for_guard
+            watchlist_engine = make_engine()
+            watchlist_repo = WatchlistRepo(watchlist_engine)
+            watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+            ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
+            max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
+            watchlist_env = resolve_env(args.env)
+            watchlist_rows, watchlist_as_of = watchlist_repo.load_watchlist(
+                env=watchlist_env,
+                strategy=watchlist_strategy,
+                as_of=requested_as_of,
+                allow_latest_fallback=True,
+                ttl_days=ttl_days,
+                max_back_days=max_back_days,
+            )
+            if not watchlist_rows or watchlist_as_of is None or len(watchlist_rows) != 30:
+                raise RuntimeError(
+                    f"[TRADE][WATCHLIST_FINAL] missing_or_bad n={len(watchlist_rows) if watchlist_rows else 0} as_of_try={requested_as_of.isoformat()}"
+                )
+            watchlist_loaded_for_guard = True
+            top10_codes = [str(item.get("code") or "").zfill(6) for item in watchlist_rows[:10] if item.get("code")]
+            logger.info(
+                "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
+                watchlist_env,
+                watchlist_strategy,
+                requested_as_of.isoformat(),
+                watchlist_as_of.isoformat(),
+                len(watchlist_rows),
+            )
+            logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
+            return watchlist_as_of
+
+        if as_of_override_raw:
+            derived_as_of = _parse_as_of_override(as_of_override_raw)
+            asof_reason = "AS_OF_OVERRIDE"
+            if allow_wl_only:
+                _ensure_watchlist_for_guard(derived_as_of)
+        elif trade_asof_source == "watchlist":
+            watchlist_as_of = _ensure_watchlist_for_guard(trade_date)
+            derived_as_of = watchlist_as_of
+            watchlist_reason = "exact" if watchlist_as_of == trade_date else "ttl_fallback"
+            asof_reason = f"WATCHLIST_ASOF({watchlist_reason})"
+        else:
+            # ✅ CRITICAL: 장중 매매는 "전일 영업일 derived"를 사용해야 함
+            # prep_runner가 전일 종가로 derived를 생성하므로, trade는 전일을 참조
+            derived_as_of = resolve_derived_as_of(now)
+            asof_reason = "INTRADAY_USE_PREV_CLOSE"
+
+        # trade 실행 전 구간(run_once/engine 포함) 전체에서 동일 as_of를 강제
+        os.environ["AS_OF_OVERRIDE"] = derived_as_of.isoformat()
         
         logger.info(
-            "[ASOF][TRADE] trade_date=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",
+            "[ASOF][TRADE] trade_date=%s derived_as_of=%s reason=%s",
             trade_date.isoformat(),
             derived_as_of.isoformat(),
+            asof_reason,
         )
         
         engine = make_engine()
         ledger_repo = LedgerEventsRepo(engine)
         
         # PREP_DONE 체크는 derived_as_of 기준으로
-        if not ledger_repo.has_event_type_on_date(
+        prep_done = ledger_repo.has_event_type_on_date(
             env=os.getenv("STRATEGY_ENV", "practice").lower(),
             event_type="PREP_DONE",
             as_of=derived_as_of,
-        ):
-            logger.warning(
-                "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
-                derived_as_of.isoformat(),
-                trade_date.isoformat(),
-            )
-            return 0
+        )
+        if not prep_done:
+            if allow_wl_only and watchlist_loaded_for_guard:
+                logger.warning(
+                    "[TRADE_TICK][PREP_BYPASS] prep_not_done but watchlist_final present -> continue derived_as_of=%s trade_date=%s",
+                    derived_as_of.isoformat(),
+                    trade_date.isoformat(),
+                )
+            else:
+                logger.warning(
+                    "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
+                    derived_as_of.isoformat(),
+                    trade_date.isoformat(),
+                )
+                return 0
         
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
@@ -2575,7 +2674,13 @@ def main() -> int:
         
         # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
         if derived_count <= 0:
-            if DERIVED_FALLBACK_ENABLED:
+            if allow_wl_only and watchlist_loaded_for_guard:
+                logger.warning(
+                    "[TRADE_TICK][DERIVED][BYPASS] derived_missing but watchlist_final locked -> continue derived_as_of=%s trade_date=%s",
+                    derived_as_of.isoformat(),
+                    trade_date.isoformat(),
+                )
+            elif DERIVED_FALLBACK_ENABLED:
                 logger.info(
                     "[TRADE_TICK][FALLBACK][START] derived_as_of=%s missing -> trying fallback (max_back=%d ttl=%d)",
                     derived_as_of.isoformat(),
@@ -2725,10 +2830,14 @@ def main() -> int:
     strategy = os.getenv("STRATEGY", "best_k_meta")
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     git_sha = os.getenv("GITHUB_SHA")
-    ctx = RunContext.new(env=env, strategy=strategy, gh_run_number=gh_run_number, git_sha=git_sha)
-    # ✅ RunContext의 run_id를 TRADER_RUN_ID로 강제 교체
-    ctx.run_id = run_id
-    logger.info("[RUN_CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s", ctx.run_id, ctx.env, ctx.strategy, ctx.gh_run_number, ctx.git_sha)
+    ctx = RunContext.new(
+        account_env=env,
+        exec_mode=resolved_mode,
+        strategy=strategy,
+        gh_run_number=gh_run_number,
+        git_sha=git_sha,
+    )
+    logger.info("[RUN_CONTEXT] run_id=%s env=%s strategy=%s gh_run_number=%s git_sha=%s", run_id, ctx.env, ctx.strategy, ctx.gh_run_number, ctx.git_sha)
     metrics: dict[str, int] = {}
     phase_for_log = "none"
     result_status = "UNKNOWN"

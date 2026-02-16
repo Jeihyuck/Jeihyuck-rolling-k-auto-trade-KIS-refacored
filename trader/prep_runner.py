@@ -17,7 +17,7 @@ from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import build_and_save_watchlist
 from trader.data.ohlcv_provider import upsert_ohlcv_delta
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
-from trader.time_utils import now_kst, prev_business_day
+from trader.time_utils import now_kst, resolve_derived_as_of
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 def _pick_as_of_date_always_prev() -> date:
-    """PREP는 항상 전 거래일 기준으로 실행 (장전/장중/장후 무관)"""
-    now = now_kst()
-    return prev_business_day(now.date())
+    """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 전 거래일."""
+    return resolve_derived_as_of(now_kst())
 
 
 def _as_of_today() -> date:
@@ -115,7 +114,8 @@ def main() -> int:
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     as_of = _pick_as_of_date_always_prev()
 
-    logger.info("[PREP][START] env=%s as_of=%s (PREV_TRADING_DAY)", env, as_of)
+    as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
+    logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
     t0 = time.monotonic()
 
     members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=as_of)

@@ -174,7 +174,7 @@ def prev_business_day(d: date) -> date:
     return prev
 
 
-def resolve_derived_as_of(now: datetime | None = None) -> date:
+def resolve_derived_as_of(now: datetime | None = None, cli_as_of: date | str | None = None) -> date:
     """
     Trade에서 사용할 derived 데이터의 as_of 날짜를 결정.
     
@@ -202,6 +202,38 @@ def resolve_derived_as_of(now: datetime | None = None) -> date:
         - 일관성: 장중/장외 무관하게 전일 영업일 사용
     """
     now = now or now_kst()
+
+    if cli_as_of is not None:
+        if isinstance(cli_as_of, date):
+            derived_as_of = cli_as_of
+        else:
+            raw = str(cli_as_of).strip()
+            if not raw:
+                raise ValueError("cli_as_of is empty")
+            try:
+                derived_as_of = date.fromisoformat(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid cli_as_of format: {raw}") from exc
+        logger.info(
+            "[ASOF][RESOLVE] now=%s derived_as_of=%s reason=CLI_AS_OF",
+            now.isoformat(),
+            derived_as_of.isoformat(),
+        )
+        return derived_as_of
+
+    as_of_override = (os.getenv("AS_OF_OVERRIDE") or "").strip()
+    if as_of_override:
+        try:
+            derived_as_of = date.fromisoformat(as_of_override)
+        except ValueError as exc:
+            raise ValueError(f"invalid AS_OF_OVERRIDE format: {as_of_override}") from exc
+        logger.info(
+            "[ASOF][RESOLVE] now=%s derived_as_of=%s reason=AS_OF_OVERRIDE",
+            now.isoformat(),
+            derived_as_of.isoformat(),
+        )
+        return derived_as_of
+
     today = now.date()
     
     # 전일 영업일 계산
