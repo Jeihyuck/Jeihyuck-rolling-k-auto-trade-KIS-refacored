@@ -19,3 +19,10 @@ install: requirements.txt ## 의존성 설치 (.venv 생성 및 패키지 설치
 run: ## 개발 서버 실행 (FastAPI + Uvicorn)
 	. .venv/bin/activate && \
 	uvicorn $(PKG).main:app --reload --host 0.0.0.0 --port 8000
+
+verify-candidate-trade: ## candidate→trade 원클릭 검증 (AS_OF/STRATEGY_ENV/EXPECTED_POOL/EXPECTED_FINAL override 가능)
+	AS_OF="$(AS_OF)" \
+	STRATEGY_ENV="$(STRATEGY_ENV)" \
+	EXPECTED_POOL="$(EXPECTED_POOL)" \
+	EXPECTED_FINAL="$(EXPECTED_FINAL)" \
+	./scripts/pbcore_candidate_trade_verify.sh
