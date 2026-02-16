@@ -39,8 +39,27 @@ def _describe_db_url(url: str) -> Tuple[str, str]:
     return drivername, base
 
 
+def _normalize_db_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return url
+
+    # SQLAlchemy 기본 드라이버(psycopg2) 경로를 피하고 psycopg3로 강제
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+
+    # Supabase pooler/pgBouncer 대비: sslmode=require 기본 보장
+    if url.startswith("postgresql+psycopg://") and "sslmode=" not in url.lower():
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+
+    return url
+
+
 def get_db_url() -> str:
-    url = (os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
+    raw = (os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
+    url = _normalize_db_url(raw)
     if not url:
         raise RuntimeError(
             "Postgres DB URL missing. "

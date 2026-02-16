@@ -27,7 +27,7 @@ from trader.config import (
     MARKET_MAP,
     MINERVINI_ONLY,
 )
-from trader.db.repos import WatchlistRepo, WatchlistSnapshotRepo
+from trader.db.repos import WatchlistRepo
 from trader.flow_score import calculate_flow_score, rank_by_dollar_volume, calculate_final_score
 from trader.ohlcv_prefetch import prefetch_ohlcv_to_db
 from trader.report.pdf_report import generate_watchlist_pdf
@@ -435,10 +435,6 @@ class CandidatePoolBuilder:
         
         logger.info("[FINAL30_PIPELINE][30] selected=%s", len(final30))
         
-        # DB에 스냅샷 저장
-        snapshot_repo = WatchlistSnapshotRepo(engine)
-        snapshot_repo.save_snapshot(as_of=as_of, final30=final30)
-        
         # JSON 저장
         output_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +480,7 @@ def build_and_save_candidate_pool(
         후보군 종목코드 리스트
     """
     repo = WatchlistRepo(engine)
-    strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+    strategy = CANDIDATE_POOL_STRATEGY_KEY
 
     if os.getenv("MODE") == "trade" and force_rebuild:
         raise RuntimeError("TRADE_MODE_FORBIDS_CANDIDATE_POOL_REBUILD")
@@ -537,8 +533,16 @@ def build_and_save_candidate_pool(
         logger.error("[CANDIDATE_POOL][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
     
-    # DB에 저장 (WATCHLIST 테이블에 저장)
-    pool_members = [{"code": code} for code in pool_codes]
+    # DB에 저장 (pb1_watchlist)
+    pool_members = [
+        {
+            "code": code,
+            "rank": idx + 1,
+            "score": None,
+            "meta": {"kind": "pool"},
+        }
+        for idx, code in enumerate(pool_codes)
+    ]
     
     # ✅ 빈 리스트 체크 (이중 안전장치) - 실패로 처리
     if not pool_members:
@@ -558,7 +562,15 @@ def build_and_save_candidate_pool(
     )
 
     final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
-    final_members = [{"code": code, "rank": idx + 1} for idx, code in enumerate(pool_codes[:30])]
+    final_members = [
+        {
+            "code": code,
+            "rank": idx + 1,
+            "score": None,
+            "meta": {"kind": "final30"},
+        }
+        for idx, code in enumerate(pool_codes[:30])
+    ]
     if len(final_members) < 30:
         raise RuntimeError(f"watchlist final size {len(final_members)} < 30")
     repo.save_watchlist(

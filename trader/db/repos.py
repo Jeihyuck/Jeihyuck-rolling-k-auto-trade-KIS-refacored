@@ -52,6 +52,8 @@ __all__ = [
     "ExitAnalysisRepo",
     "save_watchlist",
     "load_watchlist",
+    "save_pb1_watchlist_rows",
+    "load_pb1_watchlist_codes",
 ]
 
 
@@ -65,6 +67,160 @@ def _as_date(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _norm_env(env: str | None) -> str:
+    return (env or "").strip().lower()
+
+
+def _norm_strategy(strategy: str | None) -> str:
+    return (strategy or "").strip().lower()
+
+
+def save_pb1_watchlist_rows(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    rows: List[Dict[str, Any]],
+) -> None:
+    env_n = _norm_env(env)
+    strategy_n = _norm_strategy(strategy)
+    as_of_date = to_date(as_of)
+
+    if not rows:
+        logger.warning("[WATCHLIST][SAVE] empty rows -> skip env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
+        return
+
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.delete(schema.pb1_watchlist).where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == as_of_date,
+                )
+            )
+        )
+
+        payload = [
+            {
+                "env": env_n,
+                "strategy": strategy_n,
+                "as_of": as_of_date,
+                "code": str(r.get("code") or "").zfill(6),
+                "rank": int(r.get("rank", 0)),
+                "score": float(r["score"]) if r.get("score") is not None else None,
+                "meta": json_sanitize(r.get("meta") or {}),
+            }
+            for r in rows
+            if r.get("code")
+        ]
+        if payload:
+            conn.execute(sa.insert(schema.pb1_watchlist), payload)
+
+    logger.info(
+        "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
+        env_n,
+        strategy_n,
+        as_of_date,
+        len(payload),
+    )
+
+
+def load_pb1_watchlist_codes(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    ttl_days: int = 7,
+    max_back_days: int = 3,
+) -> List[str]:
+    env_n = _norm_env(env)
+    strategy_n = _norm_strategy(strategy)
+    as_of_date = to_date(as_of)
+
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        exact_stmt = (
+            select(schema.pb1_watchlist.c.code)
+            .where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == as_of_date,
+                )
+            )
+            .order_by(schema.pb1_watchlist.c.rank.asc())
+        )
+        exact_codes = conn.execute(exact_stmt).scalars().all()
+        if exact_codes:
+            normalized = [str(code).zfill(6) for code in exact_codes]
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+                env_n,
+                strategy_n,
+                as_of_date,
+                len(normalized),
+            )
+            return normalized
+
+        effective_back_days = max(0, min(int(ttl_days), int(max_back_days)))
+        if effective_back_days == 0:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0",
+                env_n,
+                strategy_n,
+                as_of_date,
+            )
+            return []
+
+        min_date = as_of_date - timedelta(days=effective_back_days)
+        latest_stmt = (
+            select(func.max(schema.pb1_watchlist.c.as_of))
+            .where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of <= as_of_date,
+                    schema.pb1_watchlist.c.as_of >= min_date,
+                )
+            )
+        )
+        latest_as_of = conn.execute(latest_stmt).scalar()
+        if latest_as_of is None:
+            logger.info(
+                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0",
+                env_n,
+                strategy_n,
+                as_of_date,
+            )
+            return []
+
+        latest_codes_stmt = (
+            select(schema.pb1_watchlist.c.code)
+            .where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == latest_as_of,
+                )
+            )
+            .order_by(schema.pb1_watchlist.c.rank.asc())
+        )
+        latest_codes = conn.execute(latest_codes_stmt).scalars().all()
+        normalized = [str(code).zfill(6) for code in latest_codes]
+        logger.info(
+            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+            env_n,
+            strategy_n,
+            latest_as_of,
+            len(normalized),
+        )
+        return normalized
 
 
 def ensure_run(
@@ -2130,43 +2286,12 @@ class WatchlistRepo:
         Watchlist를 DB에 upsert.
         members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
         """
-        as_of = to_date(as_of)  # Ensure DATE type
-        
-        if not members:
-            logger.warning("[WATCHLIST][SAVE] empty members -> skip")
-            return
-        
-        schema = self._schema
-        with self.engine.begin() as conn:
-            # 기존 당일 watchlist 삭제
-            delete_stmt = sa.delete(schema.pb1_watchlist).where(
-                and_(
-                    schema.pb1_watchlist.c.env == env,
-                    schema.pb1_watchlist.c.strategy == strategy,
-                    schema.pb1_watchlist.c.as_of == as_of,
-                )
-            )
-            conn.execute(delete_stmt)
-            
-            # 새 watchlist 삽입
-            rows = [
-                {
-                    "env": env,
-                    "strategy": strategy,
-                    "as_of": as_of,
-                    "code": str(m["code"]).zfill(6),
-                    "rank": m.get("rank", 0),
-                    "score": m.get("score"),
-                    "meta": json_sanitize(m.get("meta")),
-                }
-                for m in members
-            ]
-            if rows:
-                conn.execute(sa.insert(schema.pb1_watchlist), rows)
-        
-        logger.info(
-            "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
-            env, strategy, as_of, len(members)
+        save_pb1_watchlist_rows(
+            self.engine,
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            rows=members,
         )
     
     def load_watchlist(
@@ -2177,6 +2302,7 @@ class WatchlistRepo:
         as_of: date | str,
         allow_latest_fallback: bool = True,
         ttl_days: int = 7,
+        max_back_days: int = 3,
     ) -> tuple[List[Dict[str, Any]], date | None]:
         """
         특정 날짜의 watchlist 조회.
@@ -2185,102 +2311,80 @@ class WatchlistRepo:
         ✅ as_of는 DATE 타입으로 강제 변환 (VARCHAR 캐스팅 방지)
         ✅ allow_latest_fallback=True: as_of에 없으면 TTL 이내 최신 as_of 사용
         """
-        # ✅ as_of 타입 강화: date 객체로 변환
         as_of_date = to_date(as_of)
-        
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
+        effective_max_back_days = int(max_back_days) if allow_latest_fallback else 0
+
+        codes = load_pb1_watchlist_codes(
+            self.engine,
+            env=env_n,
+            strategy=strategy_n,
+            as_of=as_of_date,
+            ttl_days=ttl_days,
+            max_back_days=effective_max_back_days,
+        )
+        if not codes:
+            return [], None
+
         schema = self._schema
-        
-        # 먼저 요청한 as_of로 조회
         with self.engine.connect() as conn:
+            exact_count_stmt = (
+                select(func.count())
+                .select_from(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
+                        schema.pb1_watchlist.c.as_of == as_of_date,
+                    )
+                )
+            )
+            exact_count = int(conn.execute(exact_count_stmt).scalar() or 0)
+
+            used_as_of = as_of_date if exact_count > 0 else None
+            if used_as_of is None and allow_latest_fallback:
+                effective_back_days = max(0, min(int(ttl_days), int(max_back_days)))
+                min_date = as_of_date - timedelta(days=effective_back_days)
+                latest_stmt = (
+                    select(func.max(schema.pb1_watchlist.c.as_of))
+                    .where(
+                        and_(
+                            schema.pb1_watchlist.c.env == env_n,
+                            schema.pb1_watchlist.c.strategy == strategy_n,
+                            schema.pb1_watchlist.c.as_of <= as_of_date,
+                            schema.pb1_watchlist.c.as_of >= min_date,
+                        )
+                    )
+                )
+                used_as_of = conn.execute(latest_stmt).scalar()
+
+            if used_as_of is None:
+                return [], None
+
             stmt = (
                 select(schema.pb1_watchlist)
                 .where(
                     and_(
-                        schema.pb1_watchlist.c.env == env,
-                        schema.pb1_watchlist.c.strategy == strategy,
-                        schema.pb1_watchlist.c.as_of == as_of_date,  # ✅ DATE 타입
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
+                        schema.pb1_watchlist.c.as_of == used_as_of,
                     )
                 )
                 .order_by(schema.pb1_watchlist.c.rank)
             )
             rows = conn.execute(stmt).fetchall()
-        
-        if rows:
-            result = [
-                {
-                    "code": row.code,
-                    "rank": row.rank,
-                    "score": float(row.score) if row.score else None,
-                    "meta": row.meta,
-                }
-                for row in rows
-            ]
-            logger.info(
-                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (exact)",
-                env, strategy, as_of_date, len(result)
-            )
-            return result, as_of_date
-        
-        # as_of에 없으면 최신 fallback 시도
-        if not allow_latest_fallback:
-            logger.info(
-                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback)",
-                env, strategy, as_of_date
-            )
-            return [], None
-        
-        # TTL 이내 최신 as_of 조회
-        min_date = as_of_date - timedelta(days=ttl_days)
-        with self.engine.connect() as conn:
-            latest_stmt = (
-                select(func.max(schema.pb1_watchlist.c.as_of))
-                .where(
-                    and_(
-                        schema.pb1_watchlist.c.env == env,
-                        schema.pb1_watchlist.c.strategy == strategy,
-                        schema.pb1_watchlist.c.as_of <= as_of_date,
-                        schema.pb1_watchlist.c.as_of >= min_date,
-                    )
-                )
-            )
-            latest_as_of = conn.execute(latest_stmt).scalar()
-        
-        if not latest_as_of:
-            logger.info(
-                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=0 (no fallback within TTL=%s days)",
-                env, strategy, as_of_date, ttl_days
-            )
-            return [], None
-        
-        # 최신 as_of로 다시 조회
-        with self.engine.connect() as conn:
-            stmt = (
-                select(schema.pb1_watchlist)
-                .where(
-                    and_(
-                        schema.pb1_watchlist.c.env == env,
-                        schema.pb1_watchlist.c.strategy == strategy,
-                        schema.pb1_watchlist.c.as_of == latest_as_of,
-                    )
-                )
-                .order_by(schema.pb1_watchlist.c.rank)
-            )
-            rows2 = conn.execute(stmt).fetchall()
-        
+
         result = [
             {
                 "code": row.code,
                 "rank": row.rank,
-                "score": float(row.score) if row.score else None,
+                "score": float(row.score) if row.score is not None else None,
                 "meta": row.meta,
             }
-            for row in rows2
+            for row in rows
         ]
-        logger.info(
-            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s (fallback from %s, age=%s days)",
-            env, strategy, as_of_date, len(result), latest_as_of, (as_of_date - latest_as_of).days
-        )
-        return result, latest_as_of
+        return result, used_as_of
     
     def get_latest_watchlist_date(
         self,
@@ -2290,13 +2394,15 @@ class WatchlistRepo:
     ) -> Optional[date]:
         """가장 최근 watchlist의 as_of 날짜 반환."""
         schema = self._schema
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
         with self.engine.connect() as conn:
             stmt = (
                 select(func.max(schema.pb1_watchlist.c.as_of))
                 .where(
                     and_(
-                        schema.pb1_watchlist.c.env == env,
-                        schema.pb1_watchlist.c.strategy == strategy,
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
                     )
                 )
             )
@@ -2593,9 +2699,13 @@ def save_watchlist(
     members: List[Dict[str, Any]],
 ) -> None:
     """Standalone save_watchlist function."""
-    as_of = to_date(as_of)  # Ensure DATE type
-    repo = WatchlistRepo(engine)
-    repo.save_watchlist(env=env, strategy=strategy, as_of=as_of, members=members)
+    save_pb1_watchlist_rows(
+        engine,
+        env=env,
+        strategy=strategy,
+        as_of=as_of,
+        rows=members,
+    )
 
 
 def load_watchlist(
@@ -2606,9 +2716,9 @@ def load_watchlist(
     as_of: date,
     allow_latest_fallback: bool = True,
     ttl_days: int = 7,
+    max_back_days: int = 3,
 ) -> tuple[List[Dict[str, Any]], date | None]:
     """Standalone load_watchlist function."""
-    as_of = to_date(as_of)  # Ensure DATE type
     repo = WatchlistRepo(engine)
     return repo.load_watchlist(
         env=env,
@@ -2616,6 +2726,7 @@ def load_watchlist(
         as_of=as_of,
         allow_latest_fallback=allow_latest_fallback,
         ttl_days=ttl_days,
+        max_back_days=max_back_days,
     )
 
 

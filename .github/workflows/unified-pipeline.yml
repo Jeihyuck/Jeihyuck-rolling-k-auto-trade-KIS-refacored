@@ -365,6 +365,22 @@ jobs:
           echo "All required modules available."
           echo "======================================" 
 
+      - name: Install DB driver (psycopg3)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "SQLAlchemy>=2.0" "psycopg[binary]>=3.1"
+
+      - name: Verify DB driver import
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlalchemy
+          import psycopg
+          print("SQLAlchemy:", sqlalchemy.__version__)
+          print("psycopg:", psycopg.__version__)
+          PY
+
       - name: Guard postgres-only
         run: |
           set -euo pipefail

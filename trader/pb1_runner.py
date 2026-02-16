@@ -508,7 +508,7 @@ def _norm_env(x: str | None) -> str:
     """Normalize env keys to avoid 'paper' vs 'PAPER' DB misses."""
     if not x:
         return ""
-    return str(x).strip().upper()
+    return str(x).strip().lower()
 
 
 def _safe_load_universe_snapshot(repo, *, env: str, strategy: str, as_of):
@@ -571,42 +571,39 @@ def _load_universe_context(
     mode_input = (os.getenv("MODE") or "").strip().lower()
     if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
         watchlist_repo = WatchlistRepo(engine)
-        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
         ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
         max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
         requested_as_of = datetime.strptime(as_of, "%Y-%m-%d").date()
-        current_as_of = requested_as_of
-        rows: list[dict] = []
-        used_as_of = requested_as_of
+        rows, used_as_of = watchlist_repo.load_watchlist(
+            env=env,
+            strategy=watchlist_strategy,
+            as_of=requested_as_of,
+            allow_latest_fallback=True,
+            ttl_days=ttl_days,
+            max_back_days=max_back_days,
+        )
 
-        for step in range(max_back_days + 1):
-            rows, _ = watchlist_repo.load_watchlist(
-                env=env,
-                strategy=watchlist_strategy,
-                as_of=current_as_of,
-                allow_latest_fallback=False,
-            )
-            if rows:
-                used_as_of = current_as_of
-                break
-            if step < max_back_days:
-                current_as_of = prev_business_day(current_as_of)
-
-        if not rows:
+        if not rows or used_as_of is None:
             raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
 
         age_days = (requested_as_of - used_as_of).days
         if age_days > ttl_days:
             raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
+        if len(rows) != 30:
+            raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(rows)}")
 
         members = [{"code": str(r.get("code") or "").zfill(6)} for r in rows if r.get("code")]
+        top10_codes = [m.get("code") for m in members[:10] if m.get("code")]
         logger.info(
-            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
-            env,
+            "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
+            (env or "").strip().lower(),
             watchlist_strategy,
+            requested_as_of.isoformat(),
             used_as_of.isoformat(),
             len(members),
         )
+        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
         return UniverseContext(
             as_of_date=used_as_of.isoformat(),
             members=members,
@@ -2654,41 +2651,39 @@ def main() -> int:
             )
         
         watchlist_repo = WatchlistRepo(engine)
-        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
         ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
         max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
         watchlist_env = resolve_env(args.env)
 
-        current_as_of = derived_as_of
-        watchlist_rows: list[dict] = []
-        used_as_of = derived_as_of
-        for step in range(max_back_days + 1):
-            watchlist_rows, _ = watchlist_repo.load_watchlist(
-                env=watchlist_env,
-                strategy=watchlist_strategy,
-                as_of=current_as_of,
-                allow_latest_fallback=False,
-            )
-            if watchlist_rows:
-                used_as_of = current_as_of
-                break
-            if step < max_back_days:
-                current_as_of = prev_business_day(current_as_of)
+        watchlist_rows, used_as_of = watchlist_repo.load_watchlist(
+            env=watchlist_env,
+            strategy=watchlist_strategy,
+            as_of=derived_as_of,
+            allow_latest_fallback=True,
+            ttl_days=ttl_days,
+            max_back_days=max_back_days,
+        )
 
-        if not watchlist_rows:
+        if not watchlist_rows or used_as_of is None:
             raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
 
         age_days = (derived_as_of - used_as_of).days
         if age_days > ttl_days:
             raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
+        if len(watchlist_rows) != 30:
+            raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(watchlist_rows)}")
 
+        top10_codes = [str(item.get("code") or "").zfill(6) for item in watchlist_rows[:10] if item.get("code")]
         logger.info(
-            "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%s",
+            "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
             watchlist_env,
             watchlist_strategy,
+            derived_as_of.isoformat(),
             used_as_of.isoformat(),
             len(watchlist_rows),
         )
+        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
 
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"

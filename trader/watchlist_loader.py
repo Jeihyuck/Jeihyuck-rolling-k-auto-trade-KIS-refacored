@@ -9,12 +9,10 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date
-from typing import Any
 
 from trader.db.repos import WatchlistRepo
 from trader.time_coerce import to_date
 from trader.pb1_engine import UniverseContext
-from trader.time_utils import prev_business_day
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +52,27 @@ def load_watchlist_for_trade(
     """
     as_of_date = to_date(as_of)
     repo = WatchlistRepo(engine)
+    env_n = (env or "").strip().lower()
+    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+    if strategy.strip().lower() != forced_strategy:
+        logger.warning(
+            "[WATCHLIST][TRADE][FORCE_STRATEGY] requested=%s forced=%s",
+            strategy,
+            forced_strategy,
+        )
     
     # Load watchlist (final 30)
     watchlist_rows = repo.load_watchlist(
-        env=env,
-        strategy=strategy,
+        env=env_n,
+        strategy=forced_strategy,
         as_of=as_of_date,
+        allow_latest_fallback=True,
+        ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
+        max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
     )
+    rows, used_as_of = watchlist_rows
     
-    if watchlist_rows:
+    if rows:
         # Convert watchlist rows to members format
         members = [
             {
@@ -71,14 +81,23 @@ def load_watchlist_for_trade(
                 "score": row.get("score"),
                 "market": row.get("meta", {}).get("market") if isinstance(row.get("meta"), dict) else None,
             }
-            for row in watchlist_rows
+            for row in rows
             if row.get("code")
         ]
         
+        if len(members) != 30:
+            raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(members)}")
+        used_as_of_date = used_as_of or as_of_date
+        top10_codes = [m.get("code") for m in members[:10] if m.get("code")]
         logger.info(
-            "[WATCHLIST][LOAD][SUCCESS] env=%s strategy=%s as_of=%s members=%s source=watchlist",
-            env, strategy, as_of_date.isoformat(), len(members)
+            "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
+            env_n,
+            forced_strategy,
+            as_of_date.isoformat(),
+            used_as_of_date.isoformat(),
+            len(members),
         )
+        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
         
         return UniverseContext(
             as_of_date=as_of_date.isoformat(),
@@ -95,7 +114,7 @@ def load_watchlist_for_trade(
     # Watchlist empty
     logger.warning(
         "[WATCHLIST][LOAD][EMPTY] env=%s strategy=%s as_of=%s",
-        env, strategy, as_of_date.isoformat()
+        env_n, forced_strategy, as_of_date.isoformat()
     )
 
     return UniverseContext(
@@ -141,48 +160,51 @@ def load_today_watchlist_with_fallback(
     """
     as_of_date = to_date(as_of)
     repo = WatchlistRepo(engine)
+    env_n = (env or "").strip().lower()
+    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip()
     
-    # Try exact as_of
-    ctx = load_watchlist_for_trade(
-        engine=engine,
-        env=env,
-        strategy=strategy,
+    rows, used_as_of = repo.load_watchlist(
+        env=env_n,
+        strategy=forced_strategy,
         as_of=as_of_date,
-        fallback_to_universe=False,
+        allow_latest_fallback=True,
+        ttl_days=ttl_days,
+        max_back_days=max_back_days,
     )
-    
-    if not ctx.is_empty:
-        return ctx
-    
-    # Find watchlist by previous business-day backtracking
-    fallback_date = as_of_date
-    for _ in range(max_back_days):
-        fallback_date = prev_business_day(fallback_date)
-        days_back = (as_of_date - fallback_date).days
-        if days_back > ttl_days:
-            break
-        
-        ctx_fallback = load_watchlist_for_trade(
-            engine=engine,
-            env=env,
-            strategy=strategy,
-            as_of=fallback_date,
-            fallback_to_universe=False,
-        )
-        
-        if not ctx_fallback.is_empty:
+
+    if rows and used_as_of is not None:
+        members = [
+            {
+                "code": str(row.get("code") or "").zfill(6),
+                "rank": row.get("rank"),
+                "score": row.get("score"),
+                "market": row.get("meta", {}).get("market") if isinstance(row.get("meta"), dict) else None,
+            }
+            for row in rows
+            if row.get("code")
+        ]
+        days_back = (as_of_date - used_as_of).days
+        if days_back > 0:
             logger.warning(
-                "[WATCHLIST][FALLBACK][BIZDAY_OK] requested=%s actual=%s age=%d members=%s",
+                "[WATCHLIST][FALLBACK][OK] requested=%s actual=%s age=%d members=%s",
                 as_of_date.isoformat(),
-                fallback_date.isoformat(),
+                used_as_of.isoformat(),
                 days_back,
-                len(ctx_fallback.members),
+                len(members),
             )
-            # Update as_of_date in meta but keep actual date in log
-            ctx_fallback.meta["requested_as_of"] = as_of_date.isoformat()
-            ctx_fallback.meta["actual_as_of"] = fallback_date.isoformat()
-            ctx_fallback.meta["age_days"] = days_back
-            return ctx_fallback
+        return UniverseContext(
+            as_of_date=used_as_of.isoformat(),
+            members=members,
+            selected_path=None,
+            meta={
+                "source": "watchlist",
+                "requested_as_of": as_of_date.isoformat(),
+                "actual_as_of": used_as_of.isoformat(),
+                "age_days": days_back,
+                "count": len(members),
+            },
+            is_empty=len(members) == 0,
+        )
     
     # No watchlist found within allowed backtracking/TTL window
     logger.error(

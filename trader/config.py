@@ -223,7 +223,7 @@ CONFIG = {
     "CANDIDATE_POOL_TTL_DAYS": "7",                   # 후보군 유효기간(일)
     "CANDIDATE_POOL_SIZE": "120",                     # 후보군 목표 수
     "CANDIDATE_POOL_MIN_SIZE": "40",                  # 최소 후보군 수 (이보다 작으면 fallback)
-    "CANDIDATE_POOL_STRATEGY_KEY": "best_k_meta__pool",  # DB 저장 전략키
+    "CANDIDATE_POOL_STRATEGY_KEY": "pb1_candidate_pool",  # DB 저장 전략키
     "CANDIDATE_POOL_FORCE_REBUILD": "0",              # 강제 재생성 (DIAG/수동)
     "CANDIDATE_POOL_MIN_PRICE": "2000.0",             # 후보군 최소 주가
     "CANDIDATE_POOL_LIQ_DAYS": "20",                  # 유동성 계산 일수
@@ -925,7 +925,7 @@ CANDIDATE_POOL_ENABLED = _cfg_bool("CANDIDATE_POOL_ENABLED", fallback=True)
 CANDIDATE_POOL_TTL_DAYS = int(_cfg("CANDIDATE_POOL_TTL_DAYS") or "7")
 CANDIDATE_POOL_SIZE = int(_cfg("CANDIDATE_POOL_SIZE") or "120")
 CANDIDATE_POOL_MIN_SIZE = int(_cfg("CANDIDATE_POOL_MIN_SIZE") or "40")
-CANDIDATE_POOL_STRATEGY_KEY = _cfg("CANDIDATE_POOL_STRATEGY_KEY") or "best_k_meta__pool"
+CANDIDATE_POOL_STRATEGY_KEY = _cfg("CANDIDATE_POOL_STRATEGY_KEY") or "pb1_candidate_pool"
 CANDIDATE_POOL_FORCE_REBUILD = _cfg_bool("CANDIDATE_POOL_FORCE_REBUILD", fallback=False)
 CANDIDATE_POOL_MIN_PRICE = float(_cfg("CANDIDATE_POOL_MIN_PRICE") or "2000.0")
 CANDIDATE_POOL_LIQ_DAYS = int(_cfg("CANDIDATE_POOL_LIQ_DAYS") or "20")

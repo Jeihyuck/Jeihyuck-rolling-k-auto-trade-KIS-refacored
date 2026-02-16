@@ -4416,31 +4416,24 @@ class PB1Engine:
         pool_env = os.getenv("STRATEGY_ENV", self.env)
 
         # ✅ trade 모드: watchlist_final only (no universe/candidate fallback)
-        trade_mode = os.getenv("MODE") == "trade"
+        trade_mode = (os.getenv("MODE") or "").strip().lower() == "trade"
         if trade_mode:
             repo = WatchlistRepo(self.engine)
-            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
+            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
             ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
             max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
 
             request_as_of = derived_as_of
-            current_as_of = request_as_of
-            rows: list[dict] = []
-            used_as_of = request_as_of
-            for step in range(max_back_days + 1):
-                rows, _ = repo.load_watchlist(
-                    env=pool_env,
-                    strategy=pool_strategy,
-                    as_of=current_as_of,
-                    allow_latest_fallback=False,
-                )
-                if rows:
-                    used_as_of = current_as_of
-                    break
-                if step < max_back_days:
-                    current_as_of = prev_business_day(current_as_of)
+            rows, used_as_of = repo.load_watchlist(
+                env=pool_env,
+                strategy=pool_strategy,
+                as_of=request_as_of,
+                allow_latest_fallback=True,
+                ttl_days=ttl_days,
+                max_back_days=max_back_days,
+            )
 
-            if not rows:
+            if not rows or used_as_of is None:
                 logger.error(
                     "[WATCHLIST][TRADE][MISS] requested=%s env=%s strategy=%s max_back_days=%d",
                     request_as_of,
@@ -4460,14 +4453,25 @@ class PB1Engine:
                     ttl_days,
                 )
                 return [], "watchlist_final_ttl_exceeded"
+            if len(rows) != 30:
+                logger.error(
+                    "[TRADE][WATCHLIST_FINAL][SIZE_INVALID] requested=%s actual=%s n=%d expected=30",
+                    request_as_of,
+                    used_as_of,
+                    len(rows),
+                )
+                raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(rows)}")
 
+            top10_codes = [str(item.get("code") or "").zfill(6) for item in rows[:10] if item.get("code")]
             logger.info(
-                "[WATCHLIST][LOAD] env=%s strategy=%s as_of=%s members=%d",
+                "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%d",
                 pool_env,
                 pool_strategy,
+                request_as_of,
                 used_as_of,
                 len(rows),
             )
+            logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
 
             pool_codes = [item["code"] for item in rows]
             members = [
