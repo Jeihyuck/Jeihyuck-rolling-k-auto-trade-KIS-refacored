@@ -318,6 +318,9 @@ def main() -> int:
             "env": env,
             "weights": watchlist_bundle.get("weights", {}),
             "reject_summary": watchlist_bundle.get("reject_summary", {}),
+            "requested_finaln": int(os.getenv("PB1_WATCHLIST_FINALN", "30")),
+            "final_count": int(watchlist_bundle.get("final_count", len(watchlist or []))),
+            "degrade": watchlist_bundle.get("degrade", {}),
         },
     )
     pdf_path = generate_watchlist_pdf(

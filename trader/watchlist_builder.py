@@ -86,6 +86,26 @@ class WatchlistBuilder:
         top50 = self._stage_b_strategy_scoring(pool120, as_of)
         final30 = self._stage_c_flow_final(top50, as_of)
 
+        degrade_meta = {
+            "used": False,
+            "requested_finaln": int(self.finaln),
+            "final_count": len(final30),
+            "fill_sources": {"top50": 0, "pool120": 0},
+            "missing_after_fill": max(0, int(self.finaln) - len(final30)),
+        }
+        if len(final30) < self.finaln:
+            logger.warning(
+                "[WATCHLIST][PIPELINE][C_FINAL30][DEGRADE] too small: %s < %s -> fill from B_TOP50 then A_POOL120",
+                len(final30),
+                self.finaln,
+            )
+            final30, degrade_meta = self._degrade_fill_final_rows(
+                final_rows=final30,
+                top50_rows=top50,
+                pool120_rows=pool120,
+                target_n=self.finaln,
+            )
+
         reject_counter = Counter()
         for item in universe_scored:
             for reason in item.get("reject_reasons", []):
@@ -102,6 +122,9 @@ class WatchlistBuilder:
             "top50": top50,
             "final30": final30,
             "reject_summary": dict(reject_counter),
+            "final_count": len(final30),
+            "requested_finaln": int(self.finaln),
+            "degrade": degrade_meta,
         }
 
         logger.info(
@@ -112,6 +135,72 @@ class WatchlistBuilder:
             len(final30),
         )
         return final30
+
+    def _degrade_fill_final_rows(
+        self,
+        *,
+        final_rows: List[Dict[str, Any]],
+        top50_rows: List[Dict[str, Any]],
+        pool120_rows: List[Dict[str, Any]],
+        target_n: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        filled: List[Dict[str, Any]] = [dict(row) for row in final_rows]
+        seen_codes = {str(row.get("code") or "").zfill(6) for row in filled}
+        fill_sources = {"top50": 0, "pool120": 0}
+
+        def _as_final_row(src: Dict[str, Any], source_name: str) -> Dict[str, Any]:
+            row = dict(src)
+            reasons = list(row.get("reject_reasons", []) or [])
+            reasons.append(f"degrade_fill_from_{source_name}")
+            row["reject_reasons"] = reasons
+            row["flow_score"] = float(row.get("flow_score", 0.0) or 0.0)
+            row["foreign_20_ratio"] = float(row.get("foreign_20_ratio", 0.0) or 0.0)
+            row["inst_20_ratio"] = float(row.get("inst_20_ratio", 0.0) or 0.0)
+            tech_score = float(row.get("tech_score", 0.0) or 0.0)
+            fallback_score = float(row.get("score", 0.0) or 0.0)
+            row["final_score"] = float(row.get("final_score", tech_score if tech_score > 0 else fallback_score) or 0.0)
+            return self._normalize_item(row, score_key="final_score", rank_key="final_rank")
+
+        for src in top50_rows:
+            if len(filled) >= target_n:
+                break
+            code = str(src.get("code") or "").zfill(6)
+            if not code or code in seen_codes:
+                continue
+            filled.append(_as_final_row(src, "top50"))
+            seen_codes.add(code)
+            fill_sources["top50"] += 1
+
+        for src in pool120_rows:
+            if len(filled) >= target_n:
+                break
+            code = str(src.get("code") or "").zfill(6)
+            if not code or code in seen_codes:
+                continue
+            filled.append(_as_final_row(src, "pool120"))
+            seen_codes.add(code)
+            fill_sources["pool120"] += 1
+
+        for idx, item in enumerate(filled, start=1):
+            item["final_rank"] = idx
+            item["rank"] = idx
+            item["rank_final30"] = idx
+
+        degrade_meta = {
+            "used": True,
+            "requested_finaln": int(target_n),
+            "final_count": len(filled),
+            "fill_sources": fill_sources,
+            "missing_after_fill": max(0, int(target_n) - len(filled)),
+        }
+        logger.warning(
+            "[WATCHLIST][PIPELINE][C_FINAL30][DEGRADE] filled final=%s requested=%s fill_top50=%s fill_pool120=%s",
+            len(filled),
+            target_n,
+            fill_sources["top50"],
+            fill_sources["pool120"],
+        )
+        return filled[:target_n], degrade_meta
 
     def _base_item(self, code: str) -> Dict[str, Any]:
         return {
@@ -137,8 +226,24 @@ class WatchlistBuilder:
 
     def _normalize_item(self, item: Dict[str, Any], *, score_key: str, rank_key: str) -> Dict[str, Any]:
         score_val = float(item.get(score_key, 0.0) or 0.0)
-        rank_val = item.get(rank_key)
+        rank_val = item.get(rank_key) or item.get("rank")
         reject_reasons = list(item.get("reject_reasons", []) or [])
+        filters_passed = list(item.get("filters_passed", []) or [])
+        filters_failed = list(item.get("filters_failed", []) or reject_reasons)
+        if not filters_passed:
+            if float(item.get("liq_avg", 0.0) or 0.0) > 0.0:
+                filters_passed.append("A_POOL120")
+            if float(item.get("tech_score", 0.0) or 0.0) > 0.0:
+                filters_passed.append("B_TOP50")
+            if float(item.get("final_score", 0.0) or 0.0) > 0.0:
+                filters_passed.append("C_FINAL30")
+        score_liq = float(item.get("liq_avg", 0.0) or 0.0)
+        score_tech = float(item.get("tech_score", 0.0) or 0.0)
+        score_flow = float(item.get("flow_score", 0.0) or 0.0)
+        score_final = float(item.get("final_score", score_val) or 0.0)
+        rank_pool120 = int(item.get("pool_rank", 0) or 0)
+        rank_top50 = int(item.get("top50_rank", 0) or 0)
+        rank_final30 = int(item.get("final_rank", 0) or 0)
         meta = {
             "liq_avg": float(item.get("liq_avg", 0.0) or 0.0),
             "last_close": float(item.get("last_close", 0.0) or 0.0),
@@ -158,6 +263,16 @@ class WatchlistBuilder:
                 "flow_weight": self.flow_weight,
             },
             "reject_reasons": reject_reasons,
+            "reasons": reject_reasons,
+            "filters_passed": filters_passed,
+            "filters_failed": filters_failed,
+            "rank_pool120": rank_pool120,
+            "rank_top50": rank_top50,
+            "rank_final30": rank_final30,
+            "score_liq": score_liq,
+            "score_tech": score_tech,
+            "score_flow": score_flow,
+            "score_final": score_final,
             **(item.get("meta") or {}),
         }
         return {
@@ -179,6 +294,16 @@ class WatchlistBuilder:
             "tech_score": meta["tech_score"],
             "final_score": meta["final_score"],
             "reject_reasons": reject_reasons,
+            "reasons": reject_reasons,
+            "filters_passed": filters_passed,
+            "filters_failed": filters_failed,
+            "rank_pool120": rank_pool120,
+            "rank_top50": rank_top50,
+            "rank_final30": rank_final30,
+            "score_liq": score_liq,
+            "score_tech": score_tech,
+            "score_flow": score_flow,
+            "score_final": score_final,
         }
 
     def _stage_a_liquidity_filter(self, members: List[Dict[str, Any]], as_of: date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -363,6 +488,9 @@ class WatchlistBuilder:
             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30] kept=0 from=0")
             return []
 
+        if self.flow_provider is None:
+            logger.warning("[WATCHLIST][PIPELINE][C_FINAL30][FLOW] provider missing -> flow weight disabled by item")
+
         scored: List[Dict[str, Any]] = []
         for cand in top50:
             code = cand["code"]
@@ -383,8 +511,12 @@ class WatchlistBuilder:
                     reject_reasons.append("flow_provider_error")
                     logger.debug("[WATCHLIST][PIPELINE][C_FINAL30][FLOW_PROVIDER_FAIL] code=%s err=%s", code, exc)
 
-            if foreign_df is None and inst_df is None:
-                reject_reasons.append("flow_data_missing")
+            flow_weight_effective = self.flow_weight
+            tech_weight_effective = self.tech_weight
+            if foreign_df is None or inst_df is None:
+                reject_reasons.append("flow_data_missing -> flow_weight_disabled")
+                flow_weight_effective = 0.0
+                tech_weight_effective = 1.0
 
             flow_result = calculate_flow_score(
                 code=code,
@@ -400,8 +532,8 @@ class WatchlistBuilder:
             final_score = calculate_final_score(
                 tech_score=tech_score,
                 flow_score=flow_score_100,
-                tech_weight=self.tech_weight,
-                flow_weight=self.flow_weight,
+                tech_weight=tech_weight_effective,
+                flow_weight=flow_weight_effective,
             )
 
             item.update(
@@ -411,8 +543,16 @@ class WatchlistBuilder:
                     "inst_20_ratio": float(flow_result.get("inst_20_ratio", 0.0) or 0.0),
                     "final_score": float(final_score),
                     "reject_reasons": reject_reasons,
+                    "flow_weight_effective": float(flow_weight_effective),
+                    "tech_weight_effective": float(tech_weight_effective),
                 }
             )
+            meta = dict(item.get("meta") or {})
+            meta["weights_effective"] = {
+                "tech_weight": float(tech_weight_effective),
+                "flow_weight": float(flow_weight_effective),
+            }
+            item["meta"] = meta
             scored.append(item)
 
         scored.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
