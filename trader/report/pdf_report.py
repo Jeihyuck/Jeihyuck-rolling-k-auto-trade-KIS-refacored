@@ -88,6 +88,30 @@ def _create_styles():
     return styles
 
 
+def _normalize_reasons_for_pdf(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        if all(isinstance(x, str) for x in value):
+            return {"bullets": list(value)}
+        if all(isinstance(x, dict) for x in value):
+            merged: Dict[str, Any] = {}
+            can_merge = True
+            for entry in value:
+                for key, item_value in entry.items():
+                    if key in merged:
+                        can_merge = False
+                        break
+                    merged[key] = item_value
+                if not can_merge:
+                    break
+            return merged if can_merge else {"items": list(value)}
+        return {"raw": str(value)}
+    return {"raw": str(value)}
+
+
 def generate_watchlist_pdf(
     *,
     final30: Optional[List[Dict[str, Any]]] = None,
@@ -165,7 +189,16 @@ def generate_watchlist_pdf(
         else:
             for item in rows[:max_rows]:
                 reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
-                reject_txt = ", ".join(reject_reasons[:3]) if reject_reasons else "-"
+                reasons_dict = _normalize_reasons_for_pdf(item.get("reasons"))
+                failed_reasons = reasons_dict.get("failed")
+                if isinstance(failed_reasons, list) and failed_reasons:
+                    reject_txt = ", ".join([str(x) for x in failed_reasons[:3]])
+                elif reject_reasons:
+                    reject_txt = ", ".join([str(x) for x in reject_reasons[:3]])
+                elif isinstance(reasons_dict.get("bullets"), list) and reasons_dict.get("bullets"):
+                    reject_txt = ", ".join([str(x) for x in reasons_dict.get("bullets", [])[:3]])
+                else:
+                    reject_txt = "-"
                 table_data.append(
                     [
                         str(item.get("rank", "-")),
@@ -210,7 +243,9 @@ def generate_watchlist_pdf(
     story.append(Paragraph("Top 5 Detailed Analysis", styles['KoreanHeading2']))
     
     for i, item in enumerate(final30[:5], 1):
-        reasons = item.get("reasons", {})
+        reasons = _normalize_reasons_for_pdf(item.get("reasons"))
+        notes = reasons.get("notes") if isinstance(reasons.get("notes"), dict) else {}
+        scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
         reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
         
         detail_text = f"""
@@ -218,13 +253,13 @@ def generate_watchlist_pdf(
         Final Score: {item.get('final_score', 0):.2f} (Tech: {item.get('tech_score', 0):.1f}, Flow: {item.get('flow_score', 0):.2f})<br/>
         <br/>
         <b>Selection Reasons:</b><br/>
-        - Trend Template: {'Yes' if reasons.get('trend_template') else 'No'}<br/>
-        - RS Percentile: {item.get('rs_pctile', reasons.get('rs_percentile', 0)): .1f}<br/>
-        - VCP Score: {item.get('vcp_score', 0):.1f}<br/>
-        - Pullback: {item.get('pullback_pct', reasons.get('pullback_pct', 0)): .2%}<br/>
-        - Foreign 20D Flow: {item.get('foreign_20_ratio', reasons.get('foreign_20_ratio', 0)): .3f}<br/>
-        - Institutional 20D Flow: {item.get('inst_20_ratio', reasons.get('inst_20_ratio', 0)): .3f}<br/>
-        - Dollar Volume Rank: {reasons.get('dollar_vol_rank', 'N/A')}<br/>
+        - Trend Template: {'Yes' if scores.get('trend_template', 0) else 'No'}<br/>
+        - RS Percentile: {item.get('rs_pctile', scores.get('rs_pctile', notes.get('rs_pctile', 0))): .1f}<br/>
+        - VCP Score: {item.get('vcp_score', scores.get('vcp_score', notes.get('vcp_score', 0))):.1f}<br/>
+        - Pullback: {item.get('pullback_pct', notes.get('pullback_pct', 0)): .2%}<br/>
+        - Foreign 20D Flow: {item.get('foreign_20_ratio', notes.get('foreign_net_20d', 0)): .3f}<br/>
+        - Institutional 20D Flow: {item.get('inst_20_ratio', notes.get('inst_net_20d', 0)): .3f}<br/>
+        - Dollar Volume Rank: {scores.get('liquidity_rank', reasons.get('dollar_vol_rank', 'N/A'))}<br/>
         - Reject Reasons: {', '.join(reject_reasons) if reject_reasons else '-'}<br/>
         """
         

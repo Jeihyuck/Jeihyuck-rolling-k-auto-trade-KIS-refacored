@@ -39,6 +39,28 @@ def _env_bool(key: str, default: bool) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    normalized = df.copy()
+    normalized.columns = [str(col).strip().lower().replace(" ", "_") for col in normalized.columns]
+
+    def _map_if_missing(target: str, candidates: List[str]) -> None:
+        if target in normalized.columns:
+            return
+        for candidate in candidates:
+            if candidate in normalized.columns:
+                normalized.rename(columns={candidate: target}, inplace=True)
+                return
+
+    _map_if_missing("close", ["adj_close", "adjusted_close", "close_price", "stck_clpr"])
+    _map_if_missing("high", ["high_price", "stck_hgpr"])
+    _map_if_missing("low", ["low_price", "stck_lwpr"])
+    _map_if_missing("volume", ["vol", "trade_volume", "acml_vol", "acml_volm"])
+    return normalized
+
+
 class WatchlistBuilder:
     """단일 파이프라인으로 universe -> pool120 -> top50 -> final30 생성."""
 
@@ -202,9 +224,11 @@ class WatchlistBuilder:
         )
         return filled[:target_n], degrade_meta
 
-    def _base_item(self, code: str) -> Dict[str, Any]:
+    def _base_item(self, code: str, *, name: str = "", as_of: Optional[date] = None) -> Dict[str, Any]:
         return {
+            "as_of": as_of.isoformat() if isinstance(as_of, date) else "",
             "code": code,
+            "name": name,
             "rank": None,
             "score": None,
             "liq_avg": 0.0,
@@ -229,7 +253,77 @@ class WatchlistBuilder:
         rank_val = item.get(rank_key) or item.get("rank")
         reject_reasons = list(item.get("reject_reasons", []) or [])
         filters_passed = list(item.get("filters_passed", []) or [])
-        filters_failed = list(item.get("filters_failed", []) or reject_reasons)
+        rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
+        if rs_min_pctile <= 1.0:
+            rs_min_pctile = rs_min_pctile * 100.0
+        vcp_min_score = float(self.minervini_config.get("vcp_min_score", 70.0) or 70.0)
+
+        scores = {
+            "rs_pctile": float(item.get("rs_pctile", 0.0) or 0.0),
+            "vcp_score": float(item.get("vcp_score", 0.0) or 0.0),
+            "trend_template": 1 if float(item.get("trend_score", 0.0) or 0.0) >= 100.0 else 0,
+            "liquidity_rank": int(item.get("pool_rank", 0) or item.get("rank_pool120", 0) or 0),
+            "pullback_score": max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0) or 0.0) * 400.0)),
+            "foreign_score": max(0.0, min(100.0, float(item.get("foreign_20_ratio", 0.0) or 0.0) * 100.0)),
+            "inst_score": max(0.0, min(100.0, float(item.get("inst_20_ratio", 0.0) or 0.0) * 100.0)),
+        }
+
+        reasons_raw = item.get("reasons")
+        reasons: Dict[str, Any]
+        if reasons_raw is None:
+            reasons = {}
+        elif isinstance(reasons_raw, dict):
+            reasons = dict(reasons_raw)
+        elif isinstance(reasons_raw, list):
+            if all(isinstance(x, str) for x in reasons_raw):
+                reasons = {"bullets": list(reasons_raw)}
+            elif all(isinstance(x, dict) for x in reasons_raw):
+                merged: Dict[str, Any] = {}
+                can_merge = True
+                for entry in reasons_raw:
+                    for key, value in entry.items():
+                        if key in merged:
+                            can_merge = False
+                            break
+                        merged[key] = value
+                    if not can_merge:
+                        break
+                reasons = merged if can_merge else {"items": list(reasons_raw)}
+            else:
+                reasons = {"raw": str(reasons_raw)}
+        else:
+            reasons = {"raw": str(reasons_raw)}
+
+        passed = list(reasons.get("passed", []) or [])
+        failed = list(reasons.get("failed", []) or [])
+        notes = dict(reasons.get("notes", {}) or {})
+
+        if scores["rs_pctile"] >= rs_min_pctile:
+            passed.append(f"RS>={rs_min_pctile:.0f}")
+        if scores["vcp_score"] >= vcp_min_score:
+            passed.append(f"VCP>={vcp_min_score:.0f}")
+        if scores["trend_template"] == 1:
+            passed.append("Trend=Yes")
+        if float(item.get("flow_score", 0.0) or 0.0) > 0.0:
+            passed.append("Flow=Positive")
+
+        failed.extend(reject_reasons)
+        passed = list(dict.fromkeys(passed))
+        failed = list(dict.fromkeys(failed))
+
+        notes.setdefault("rs_pctile", scores["rs_pctile"])
+        notes.setdefault("vcp_score", scores["vcp_score"])
+        notes.setdefault("foreign_net_20d", float(item.get("foreign_net_20d", item.get("foreign_20_ratio", 0.0)) or 0.0))
+        notes.setdefault("inst_net_20d", float(item.get("inst_net_20d", item.get("inst_20_ratio", 0.0)) or 0.0))
+
+        reasons = {
+            **reasons,
+            "passed": passed,
+            "failed": failed,
+            "notes": notes,
+        }
+
+        filters_failed = list(item.get("filters_failed", []) or reasons.get("failed", []) or reject_reasons)
         if not filters_passed:
             if float(item.get("liq_avg", 0.0) or 0.0) > 0.0:
                 filters_passed.append("A_POOL120")
@@ -245,6 +339,8 @@ class WatchlistBuilder:
         rank_top50 = int(item.get("top50_rank", 0) or 0)
         rank_final30 = int(item.get("final_rank", 0) or 0)
         meta = {
+            "as_of": str(item.get("as_of") or ""),
+            "name": str(item.get("name") or ""),
             "liq_avg": float(item.get("liq_avg", 0.0) or 0.0),
             "last_close": float(item.get("last_close", 0.0) or 0.0),
             "rows": int(item.get("rows", 0) or 0),
@@ -263,7 +359,7 @@ class WatchlistBuilder:
                 "flow_weight": self.flow_weight,
             },
             "reject_reasons": reject_reasons,
-            "reasons": reject_reasons,
+            "reasons": reasons,
             "filters_passed": filters_passed,
             "filters_failed": filters_failed,
             "rank_pool120": rank_pool120,
@@ -273,10 +369,13 @@ class WatchlistBuilder:
             "score_tech": score_tech,
             "score_flow": score_flow,
             "score_final": score_final,
+            "scores": scores,
             **(item.get("meta") or {}),
         }
         return {
+            "as_of": str(item.get("as_of") or ""),
             "code": str(item.get("code") or "").zfill(6),
+            "name": str(item.get("name") or ""),
             "rank": int(rank_val) if rank_val else 0,
             "score": score_val,
             "meta": meta,
@@ -294,7 +393,8 @@ class WatchlistBuilder:
             "tech_score": meta["tech_score"],
             "final_score": meta["final_score"],
             "reject_reasons": reject_reasons,
-            "reasons": reject_reasons,
+            "reasons": reasons,
+            "scores": scores,
             "filters_passed": filters_passed,
             "filters_failed": filters_failed,
             "rank_pool120": rank_pool120,
@@ -319,7 +419,7 @@ class WatchlistBuilder:
             if not code:
                 continue
 
-            item = self._base_item(code)
+            item = self._base_item(code, name=str(m.get("name") or ""), as_of=as_of)
 
             try:
                 df, _meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 30, 260))
@@ -335,6 +435,8 @@ class WatchlistBuilder:
                 excluded_rows += 1
                 universe_items.append(item)
                 continue
+
+            df = _normalize_ohlcv_columns(df)
 
             rows = len(df)
             item["rows"] = rows
@@ -408,6 +510,7 @@ class WatchlistBuilder:
 
         try:
             bench_df, _ = self.ohlcv_provider(RS_BENCHMARK, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
+            bench_df = _normalize_ohlcv_columns(bench_df if bench_df is not None else pd.DataFrame())
             if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
                 raise ValueError(f"benchmark {RS_BENCHMARK} empty")
             bench_close = bench_df["close"]
@@ -418,6 +521,7 @@ class WatchlistBuilder:
         rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
         if rs_min_pctile <= 1.0:
             rs_min_pctile = rs_min_pctile * 100.0
+        vcp_min_score = float(self.minervini_config.get("vcp_min_score", 70.0) or 70.0)
 
         scored: List[Dict[str, Any]] = []
         for cand in pool120:
@@ -427,6 +531,7 @@ class WatchlistBuilder:
 
             try:
                 df, _ = self.ohlcv_provider(code, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
+                df = _normalize_ohlcv_columns(df if df is not None else pd.DataFrame())
             except Exception:
                 reject_reasons.append("ohlcv_fetch_error_stage_b")
                 item["reject_reasons"] = reject_reasons
@@ -455,6 +560,10 @@ class WatchlistBuilder:
 
             if rs_pctile < rs_min_pctile:
                 reject_reasons.append("rs_below_min")
+            if vcp_score < vcp_min_score:
+                reject_reasons.append("vcp_below_min")
+            if trend_score < 100.0:
+                reject_reasons.append("trend_template_fail")
 
             item.update(
                 {
@@ -499,6 +608,7 @@ class WatchlistBuilder:
 
             try:
                 ohlcv_df, _ = self.ohlcv_provider(code, count=max(self.flow_window + 10, 80))
+                ohlcv_df = _normalize_ohlcv_columns(ohlcv_df if ohlcv_df is not None else pd.DataFrame())
             except Exception:
                 ohlcv_df = pd.DataFrame()
 
@@ -563,9 +673,28 @@ class WatchlistBuilder:
 
         normalized_final = [self._normalize_item(item, score_key="final_score", rank_key="final_rank") for item in final30]
 
+        rs_fail = 0
+        vcp_fail = 0
+        trend_fail = 0
+        flow_fail = 0
+        for item in scored:
+            reasons = list(item.get("reject_reasons", []) or [])
+            if "rs_below_min" in reasons:
+                rs_fail += 1
+            if "vcp_below_min" in reasons:
+                vcp_fail += 1
+            if "trend_template_fail" in reasons:
+                trend_fail += 1
+            if any(str(reason).startswith("flow_") for reason in reasons):
+                flow_fail += 1
+
         logger.info(
-            "[WATCHLIST][PIPELINE][C_FINAL30] kept=%s from=%s requested=%s",
+            "[WATCHLIST][PIPELINE][C_FINAL30] kept=%s rs_fail=%s vcp_fail=%s trend_fail=%s flow_fail=%s from=%s requested=%s",
             len(normalized_final),
+            rs_fail,
+            vcp_fail,
+            trend_fail,
+            flow_fail,
             len(top50),
             self.finaln,
         )

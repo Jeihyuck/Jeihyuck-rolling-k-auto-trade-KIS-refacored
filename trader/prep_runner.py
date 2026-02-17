@@ -303,6 +303,40 @@ def main() -> int:
         }
     dt_watchlist = time.monotonic() - t_watchlist
 
+    # watchlist 최종 검증 (30 미만이어도 계속 진행, 가능한 만큼 산출)
+    finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
+    shortage_reason = ""
+    if len(watchlist) < finaln:
+        logger.warning(
+            "[PREP][WATCHLIST][TOO_SMALL] got=%s expected=%s -> reload from DB (soft)",
+            len(watchlist), finaln
+        )
+        watchlist_repo = WatchlistRepo(engine)
+        rows, _used_as_of = watchlist_repo.load_watchlist(
+            env=env,
+            strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
+            as_of=as_of
+        )
+        if rows:
+            watchlist = rows
+            watchlist_bundle["final30"] = rows
+            watchlist_bundle["final_count"] = len(rows)
+            if len(rows) >= finaln:
+                logger.info("[PREP][WATCHLIST][FIXED_FROM_DB] count=%s", len(watchlist))
+            else:
+                shortage_reason = f"db_too_small:{len(rows)}<{finaln}"
+                logger.warning(
+                    "[PREP][WATCHLIST][DB_TOO_SMALL][SOFT] db_count=%s expected=%s -> continue",
+                    len(rows),
+                    finaln,
+                )
+        else:
+            shortage_reason = f"db_missing:{as_of.isoformat()}"
+            logger.warning("[PREP][WATCHLIST][MISSING][SOFT] env=%s as_of=%s -> continue", env, as_of)
+
+    if not shortage_reason and len(watchlist) < finaln:
+        shortage_reason = f"pipeline_shortage:{len(watchlist)}<{finaln}"
+
     export_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
@@ -318,56 +352,25 @@ def main() -> int:
             "env": env,
             "weights": watchlist_bundle.get("weights", {}),
             "reject_summary": watchlist_bundle.get("reject_summary", {}),
-            "requested_finaln": int(os.getenv("PB1_WATCHLIST_FINALN", "30")),
+            "expected_finaln": finaln,
             "final_count": int(watchlist_bundle.get("final_count", len(watchlist or []))),
+            "shortage_reason": shortage_reason,
             "degrade": watchlist_bundle.get("degrade", {}),
         },
     )
-    pdf_path = generate_watchlist_pdf(
-        as_of=as_of,
-        output_dir=export_dir,
-        pool120=watchlist_bundle.get("pool120", []),
-        top50=watchlist_bundle.get("top50", []),
-        final30=watchlist_bundle.get("final30", watchlist or []),
-        reject_summary=watchlist_bundle.get("reject_summary", {}),
-        weights=watchlist_bundle.get("weights", {}),
-    )
-    logger.info("[PDF] wrote %s", pdf_path)
-
-    # 보험: watchlist 최종 검증 (30 미만이면 DB에서 재확정)
-    finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
-    mode = str(os.getenv("MODE", "")).strip().lower()
-    dryrun = _env_true("DRYRUN") or _env_true("DRY_RUN")
-    analysis_only = _env_true("ANALYSIS_ONLY")
-    strict_watchlist_min = _env_true("STRICT_WATCHLIST_MIN") and mode == "trade" and not dryrun and not analysis_only
-    soft_mode = mode == "minervini_test" or dryrun or analysis_only
-    if len(watchlist) < finaln:
-        logger.warning(
-            "[PREP][WATCHLIST][TOO_SMALL] got=%s expected=%s -> reload exact from DB",
-            len(watchlist), finaln
+    try:
+        pdf_path = generate_watchlist_pdf(
+            as_of=as_of,
+            output_dir=export_dir,
+            pool120=watchlist_bundle.get("pool120", []),
+            top50=watchlist_bundle.get("top50", []),
+            final30=watchlist_bundle.get("final30", watchlist or []),
+            reject_summary=watchlist_bundle.get("reject_summary", {}),
+            weights=watchlist_bundle.get("weights", {}),
         )
-        watchlist_repo = WatchlistRepo(engine)
-        rows, _used_as_of = watchlist_repo.load_watchlist(
-            env=env,
-            strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
-            as_of=as_of
-        )
-        if rows and len(rows) >= finaln:
-            watchlist = rows
-            logger.info("[PREP][WATCHLIST][FIXED_FROM_DB] count=%s", len(watchlist))
-        elif rows:
-            logger.warning(
-                "[PREP][WATCHLIST][DB_TOO_SMALL] db_count=%s < expected=%s mode=%s dryrun=%s analysis_only=%s strict=%s",
-                len(rows), finaln, mode, dryrun, analysis_only, strict_watchlist_min
-            )
-            watchlist = rows
-            if strict_watchlist_min and not soft_mode:
-                raise RuntimeError(f"watchlist too small even in DB: {len(rows)} < {finaln}")
-        else:
-            msg = f"watchlist missing in DB: env={env} as_of={as_of}"
-            if strict_watchlist_min and not soft_mode:
-                raise RuntimeError(msg)
-            logger.warning("[PREP][WATCHLIST][MISSING][SOFT] %s", msg)
+        logger.info("[PDF] wrote %s", pdf_path)
+    except Exception:
+        logger.exception("[REPORT][WATCHLIST][PDF][FAIL] as_of=%s output_dir=%s", as_of, export_dir)
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id
