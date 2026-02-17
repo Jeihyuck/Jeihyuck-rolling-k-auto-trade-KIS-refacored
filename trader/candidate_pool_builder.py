@@ -560,32 +560,6 @@ def build_and_save_candidate_pool(
         as_of=as_of,
         members=pool_members,
     )
-
-    final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final")
-    final_members = [
-        {
-            "code": code,
-            "rank": idx + 1,
-            "score": None,
-            "meta": {"kind": "final30"},
-        }
-        for idx, code in enumerate(pool_codes[:30])
-    ]
-    if len(final_members) < 30:
-        raise RuntimeError(f"watchlist final size {len(final_members)} < 30")
-    repo.save_watchlist(
-        env=env,
-        strategy=final_strategy,
-        as_of=as_of,
-        members=final_members,
-    )
-    logger.info(
-        "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
-        env,
-        final_strategy,
-        as_of,
-        len(final_members),
-    )
     
     logger.info(
         "[CANDIDATE_POOL][SAVE] env=%s strategy=%s size=%s as_of=%s",

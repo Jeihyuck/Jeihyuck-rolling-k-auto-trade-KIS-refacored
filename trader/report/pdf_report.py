@@ -90,7 +90,11 @@ def _create_styles():
 
 def generate_watchlist_pdf(
     *,
-    final30: List[Dict[str, Any]],
+    final30: Optional[List[Dict[str, Any]]] = None,
+    pool120: Optional[List[Dict[str, Any]]] = None,
+    top50: Optional[List[Dict[str, Any]]] = None,
+    reject_summary: Optional[Dict[str, Any]] = None,
+    weights: Optional[Dict[str, Any]] = None,
     as_of: date,
     output_dir: Optional[Path] = None,
 ) -> Path:
@@ -98,18 +102,28 @@ def generate_watchlist_pdf(
     Final 30 선정 이유 PDF 생성.
     
     Args:
-        final30: Final 30 종목 리스트 (각 항목에 code, name, rank, tech_score, flow_score, final_score, reasons 포함)
+        final30: Final 30 종목 리스트
+        pool120: Pool 120 종목 리스트
+        top50: Top 50 종목 리스트
+        reject_summary: 탈락 사유 집계
+        weights: 가중치 정보
         as_of: 기준일
-        output_dir: 출력 디렉토리 (기본값: runtime/reports/watchlist/YYYY-MM-DD/)
+        output_dir: 출력 디렉토리 (기본값: runtime/watchlist/YYYY-MM-DD/)
     
     Returns:
         생성된 PDF 파일 경로
     """
     if output_dir is None:
-        output_dir = Path("runtime/reports/watchlist") / as_of.strftime("%Y-%m-%d")
+        output_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
     
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "watchlist_report.pdf"
+    output_path = output_dir / "report.pdf"
+
+    final30 = final30 or []
+    top50 = top50 or []
+    pool120 = pool120 or []
+    reject_summary = reject_summary or {}
+    weights = weights or {"tech_weight": 0.7, "flow_weight": 0.3}
     
     logger.info("[REPORT][WATCHLIST][PDF] generating as_of=%s output=%s", as_of, output_path)
     
@@ -127,68 +141,68 @@ def generate_watchlist_pdf(
     styles = _create_styles()
     
     # 제목
-    story.append(Paragraph(f"Final 30 Watchlist Report", styles['KoreanTitle']))
+    story.append(Paragraph("Unified Watchlist Pipeline Report", styles['KoreanTitle']))
     story.append(Paragraph(f"Date: {as_of.strftime('%Y-%m-%d')}", styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
     
     # 요약
     story.append(Paragraph("Selection Summary", styles['KoreanHeading2']))
-    summary_text = f"""
-    Total candidates analyzed: 120<br/>
-    Top 50 filtered: 50<br/>
-    Final selection: {len(final30)}<br/>
-    Selection criteria: Technical Score + Flow Score (Foreign/Institutional)
-    """
+    summary_text = (
+        f"Total candidates analyzed: {len(pool120)}<br/>"
+        f"Top 50 filtered: {len(top50)}<br/>"
+        f"Final selection: {len(final30)}<br/>"
+        f"Selection criteria: FinalScore = TechScore({weights.get('tech_weight', 0.7):.2f}) "
+        f"+ FlowScore({weights.get('flow_weight', 0.3):.2f})"
+    )
     story.append(Paragraph(summary_text, styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
     
-    # 상위 30 테이블
-    story.append(Paragraph("Top 30 Selected Stocks", styles['KoreanHeading2']))
+    def _append_table(title: str, rows: List[Dict[str, Any]], max_rows: int):
+        story.append(Paragraph(title, styles['KoreanHeading2']))
+        table_data = [["Rank", "Code", "Tech", "Flow", "Final", "Reject Reasons"]]
+        if not rows:
+            table_data.append(["-", "-", "-", "-", "-", "No rows"])
+        else:
+            for item in rows[:max_rows]:
+                reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
+                reject_txt = ", ".join(reject_reasons[:3]) if reject_reasons else "-"
+                table_data.append(
+                    [
+                        str(item.get("rank", "-")),
+                        str(item.get("code", "-")),
+                        f"{float(item.get('tech_score', 0) or 0):.1f}",
+                        f"{float(item.get('flow_score', 0) or 0):.3f}",
+                        f"{float(item.get('final_score', item.get('score', 0)) or 0):.1f}",
+                        reject_txt,
+                    ]
+                )
+
+        table = Table(table_data, colWidths=[0.6 * inch, 0.9 * inch, 0.8 * inch, 0.8 * inch, 0.8 * inch, 2.6 * inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 0.25 * inch))
     
-    # 테이블 헤더
-    table_data = [
-        ["Rank", "Code", "Name", "Tech", "Flow", "Final", "Key Reasons"]
-    ]
-    
-    for item in final30:
-        reasons = item.get("reasons", {})
-        # 주요 이유 요약 (최대 3개)
-        key_reasons_list = []
-        if reasons.get("trend_template"):
-            key_reasons_list.append("Trend✓")
-        if reasons.get("vcp"):
-            key_reasons_list.append("VCP✓")
-        if reasons.get("rs_percentile", 0) > 80:
-            key_reasons_list.append(f"RS{int(reasons.get('rs_percentile', 0))}")
-        
-        key_reasons_str = ", ".join(key_reasons_list[:3]) if key_reasons_list else "-"
-        
-        table_data.append([
-            str(item.get("rank", "-")),
-            item.get("code", "-"),
-            item.get("name", "-")[:10],  # 이름 10자 제한
-            f"{item.get('tech_score', 0):.1f}",
-            f"{item.get('flow_score', 0):.2f}",
-            f"{item.get('final_score', 0):.1f}",
-            key_reasons_str,
-        ])
-    
-    # 테이블 스타일
-    table = Table(table_data, colWidths=[0.6*inch, 0.8*inch, 1.2*inch, 0.7*inch, 0.7*inch, 0.8*inch, 2*inch])
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('FONTSIZE', (0, 1), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]))
-    
-    story.append(table)
+    _append_table("Pool 120", pool120, 20)
+    _append_table("Top 50", top50, 20)
+    _append_table("Final 30", final30, 30)
+
+    story.append(Paragraph("Reject Summary", styles['KoreanHeading2']))
+    if reject_summary:
+        reject_lines = "<br/>".join([f"- {k}: {v}" for k, v in sorted(reject_summary.items(), key=lambda x: x[1], reverse=True)])
+    else:
+        reject_lines = "- no reject reasons"
+    story.append(Paragraph(reject_lines, styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
     
     # Top 5 상세 분석
@@ -197,6 +211,7 @@ def generate_watchlist_pdf(
     
     for i, item in enumerate(final30[:5], 1):
         reasons = item.get("reasons", {})
+        reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
         
         detail_text = f"""
         <b>#{i}: {item.get('code')} - {item.get('name', 'N/A')}</b><br/>
@@ -204,12 +219,13 @@ def generate_watchlist_pdf(
         <br/>
         <b>Selection Reasons:</b><br/>
         - Trend Template: {'Yes' if reasons.get('trend_template') else 'No'}<br/>
-        - RS Percentile: {reasons.get('rs_percentile', 0):.1f}<br/>
-        - VCP Pattern: {'Yes' if reasons.get('vcp') else 'No'}<br/>
-        - Pullback: {reasons.get('pullback_pct', 0):.2%}<br/>
-        - Foreign 20D Flow: {reasons.get('foreign_20_ratio', 0):.3f}<br/>
-        - Institutional 20D Flow: {reasons.get('inst_20_ratio', 0):.3f}<br/>
+        - RS Percentile: {item.get('rs_pctile', reasons.get('rs_percentile', 0)): .1f}<br/>
+        - VCP Score: {item.get('vcp_score', 0):.1f}<br/>
+        - Pullback: {item.get('pullback_pct', reasons.get('pullback_pct', 0)): .2%}<br/>
+        - Foreign 20D Flow: {item.get('foreign_20_ratio', reasons.get('foreign_20_ratio', 0)): .3f}<br/>
+        - Institutional 20D Flow: {item.get('inst_20_ratio', reasons.get('inst_20_ratio', 0)): .3f}<br/>
         - Dollar Volume Rank: {reasons.get('dollar_vol_rank', 'N/A')}<br/>
+        - Reject Reasons: {', '.join(reject_reasons) if reject_reasons else '-'}<br/>
         """
         
         story.append(Paragraph(detail_text, styles['KoreanBody']))
@@ -218,7 +234,7 @@ def generate_watchlist_pdf(
     # PDF 빌드
     doc.build(story)
     
-    logger.info("[REPORT][WATCHLIST][PDF] generated path=%s", output_path)
+    logger.info("[PDF] wrote %s", output_path)
     return output_path
 
 

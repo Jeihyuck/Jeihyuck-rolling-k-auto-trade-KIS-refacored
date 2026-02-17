@@ -1,31 +1,26 @@
-"""PB1 Watchlist Builder - 하루 1회 스캔으로 유니버스 필터링."""
+"""PB1 Watchlist Builder - 120 -> 50 -> 30 unified pipeline."""
 from __future__ import annotations
 
 import logging
 import os
-import time
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from datetime import date
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import Engine
 
-from trader.config import (
-    RS_BENCHMARK,
-    RS_LOOKBACK_DAYS,
-    RS_LOOKBACK2_DAYS,
-    RS_MIN_PCTILE,
-)
+from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.db.repos import WatchlistRepo
-from trader.time_utils import now_kst, week_monday
+from trader.flow_score import calculate_final_score, calculate_flow_score
 from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
+FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]
+
 
 def _env_int(key: str, default: int) -> int:
-    """환경변수를 int로 파싱, 실패 시 default 반환."""
     try:
         return int(os.getenv(key, str(default)))
     except Exception:
@@ -33,7 +28,6 @@ def _env_int(key: str, default: int) -> int:
 
 
 def _env_float(key: str, default: float) -> float:
-    """환경변수를 float로 파싱, 실패 시 default 반환."""
     try:
         return float(os.getenv(key, str(default)))
     except Exception:
@@ -41,291 +35,493 @@ def _env_float(key: str, default: float) -> float:
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    """환경변수를 bool로 파싱, 실패 시 default 반환."""
     val = os.getenv(key, str(default)).lower()
     return val in ("1", "true", "yes", "on")
 
 
 class WatchlistBuilder:
-    """
-    PB1 Watchlist 빌더.
-    
-    Stage A: 유니버스 -> topK (유동성 필터)
-    Stage B: topK -> finalN (전략 스코어링)
-    """
-    
+    """단일 파이프라인으로 universe -> pool120 -> top50 -> final30 생성."""
+
     def __init__(
         self,
         *,
-        ohlcv_provider: Any,  # OHLCV 데이터 제공자 (pb1_engine._fetch_daily 같은 함수)
+        ohlcv_provider: Any,
         minervini_config: Dict[str, Any],
+        pooln: int = 120,
         topk: int = 50,
         finaln: int = 30,
         min_price: float = 2000.0,
         liq_days: int = 20,
         min_rows: int = 30,
+        flow_provider: Optional[FlowProvider] = None,
+        flow_window: int = 20,
+        tech_weight: float = 0.7,
+        flow_weight: float = 0.3,
     ):
         self.ohlcv_provider = ohlcv_provider
         self.minervini_config = minervini_config
+        self.pooln = pooln
         self.topk = topk
         self.finaln = finaln
         self.min_price = min_price
         self.liq_days = liq_days
         self.min_rows = min_rows
-    
-    def build(
-        self,
-        *,
-        members: List[Dict[str, Any]],
-        as_of: date,
-    ) -> List[Dict[str, Any]]:
-        """
-        Watchlist 생성.
-        
-        반환: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
-        """
+        self.flow_provider = flow_provider
+        self.flow_window = flow_window
+        self.tech_weight = tech_weight
+        self.flow_weight = flow_weight
+        self.last_bundle: Dict[str, Any] = {}
+
+    def build(self, *, members: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
         logger.info(
-            "[WATCHLIST][BUILD][START] as_of=%s members=%s topk=%s finaln=%s",
-            as_of, len(members), self.topk, self.finaln
+            "[WATCHLIST][BUILD][START] as_of=%s members=%s pooln=%s topk=%s finaln=%s",
+            as_of,
+            len(members),
+            self.pooln,
+            self.topk,
+            self.finaln,
         )
-        
-        # Stage A: 유동성 필터
-        stage_a_result = self._stage_a_liquidity_filter(members, as_of)
-        if not stage_a_result:
-            logger.warning("[WATCHLIST][STAGE_A] no members passed -> empty watchlist")
-            return []
-        
-        # Stage B: 전략 스코어링
-        try:
-            stage_b_result = self._stage_b_strategy_scoring(stage_a_result, as_of)
-        except Exception as exc:
-            logger.warning(
-                "[WATCHLIST][STAGE_B][FAIL] reason=%s -> fallback to stage_a",
-                exc
-            )
-            stage_b_result = stage_a_result[:self.finaln]
-        
-        # Rank 부여
-        for i, item in enumerate(stage_b_result, start=1):
-            item["rank"] = i
-        
+
+        pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
+        top50 = self._stage_b_strategy_scoring(pool120, as_of)
+        final30 = self._stage_c_flow_final(top50, as_of)
+
+        reject_counter = Counter()
+        for item in universe_scored:
+            for reason in item.get("reject_reasons", []):
+                reject_counter[reason] += 1
+
+        self.last_bundle = {
+            "as_of": as_of,
+            "weights": {
+                "tech_weight": self.tech_weight,
+                "flow_weight": self.flow_weight,
+            },
+            "universe_scored": universe_scored,
+            "pool120": pool120,
+            "top50": top50,
+            "final30": final30,
+            "reject_summary": dict(reject_counter),
+        }
+
         logger.info(
-            "[WATCHLIST][BUILD][DONE] as_of=%s final_members=%s",
-            as_of, len(stage_b_result)
+            "[WATCHLIST][BUILD][DONE] as_of=%s pool120=%s top50=%s final30=%s",
+            as_of,
+            len(pool120),
+            len(top50),
+            len(final30),
         )
-        return stage_b_result
-    
-    def _stage_a_liquidity_filter(
-        self,
-        members: List[Dict[str, Any]],
-        as_of: date,
-    ) -> List[Dict[str, Any]]:
-        """
-        Stage A: 유동성 필터.
-        
-        1. OHLCV rows 부족 제외 (최근 min_rows일 미만)
-        2. 가격 필터 (최근 종가 min_price원 미만 제외)
-        3. 거래대금 상위 topK 선정 (최근 liq_days일 평균)
-        """
-        candidates = []
+        return final30
+
+    def _base_item(self, code: str) -> Dict[str, Any]:
+        return {
+            "code": code,
+            "rank": None,
+            "score": None,
+            "liq_avg": 0.0,
+            "last_close": 0.0,
+            "rows": 0,
+            "rs_pctile": 0.0,
+            "vcp_score": 0.0,
+            "pullback_pct": 0.0,
+            "trend_score": 0.0,
+            "atr_pct": 0.0,
+            "foreign_20_ratio": 0.0,
+            "inst_20_ratio": 0.0,
+            "flow_score": 0.0,
+            "tech_score": 0.0,
+            "final_score": 0.0,
+            "reject_reasons": [],
+            "meta": {},
+        }
+
+    def _normalize_item(self, item: Dict[str, Any], *, score_key: str, rank_key: str) -> Dict[str, Any]:
+        score_val = float(item.get(score_key, 0.0) or 0.0)
+        rank_val = item.get(rank_key)
+        reject_reasons = list(item.get("reject_reasons", []) or [])
+        meta = {
+            "liq_avg": float(item.get("liq_avg", 0.0) or 0.0),
+            "last_close": float(item.get("last_close", 0.0) or 0.0),
+            "rows": int(item.get("rows", 0) or 0),
+            "rs_pctile": float(item.get("rs_pctile", 0.0) or 0.0),
+            "vcp_score": float(item.get("vcp_score", 0.0) or 0.0),
+            "pullback_pct": float(item.get("pullback_pct", 0.0) or 0.0),
+            "trend_score": float(item.get("trend_score", 0.0) or 0.0),
+            "atr_pct": float(item.get("atr_pct", 0.0) or 0.0),
+            "foreign_20_ratio": float(item.get("foreign_20_ratio", 0.0) or 0.0),
+            "inst_20_ratio": float(item.get("inst_20_ratio", 0.0) or 0.0),
+            "flow_score": float(item.get("flow_score", 0.0) or 0.0),
+            "tech_score": float(item.get("tech_score", 0.0) or 0.0),
+            "final_score": float(item.get("final_score", 0.0) or 0.0),
+            "weights": {
+                "tech_weight": self.tech_weight,
+                "flow_weight": self.flow_weight,
+            },
+            "reject_reasons": reject_reasons,
+            **(item.get("meta") or {}),
+        }
+        return {
+            "code": str(item.get("code") or "").zfill(6),
+            "rank": int(rank_val) if rank_val else 0,
+            "score": score_val,
+            "meta": meta,
+            "liq_avg": meta["liq_avg"],
+            "last_close": meta["last_close"],
+            "rows": meta["rows"],
+            "rs_pctile": meta["rs_pctile"],
+            "vcp_score": meta["vcp_score"],
+            "pullback_pct": meta["pullback_pct"],
+            "trend_score": meta["trend_score"],
+            "atr_pct": meta["atr_pct"],
+            "foreign_20_ratio": meta["foreign_20_ratio"],
+            "inst_20_ratio": meta["inst_20_ratio"],
+            "flow_score": meta["flow_score"],
+            "tech_score": meta["tech_score"],
+            "final_score": meta["final_score"],
+            "reject_reasons": reject_reasons,
+        }
+
+    def _stage_a_liquidity_filter(self, members: List[Dict[str, Any]], as_of: date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         excluded_rows = 0
         excluded_price = 0
         excluded_nan = 0
-        
+
+        candidates: List[Dict[str, Any]] = []
+        universe_items: List[Dict[str, Any]] = []
+
         for m in members:
             code = str(m.get("code") or "").zfill(6)
             if not code:
                 continue
-            
-            # OHLCV 조회
+
+            item = self._base_item(code)
+
             try:
-                df, meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 10))
+                df, _meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 30, 260))
             except Exception as exc:
-                logger.debug("[WATCHLIST][STAGE_A][OHLCV_FAIL] code=%s err=%s", code, exc)
+                item["reject_reasons"].append("ohlcv_fetch_error")
                 excluded_rows += 1
+                logger.debug("[WATCHLIST][PIPELINE][A_POOL120][OHLCV_FAIL] code=%s err=%s", code, exc)
+                universe_items.append(item)
                 continue
-            
-            if df is None or df.empty or len(df) < self.min_rows:
+
+            if df is None or df.empty:
+                item["reject_reasons"].append("ohlcv_empty")
                 excluded_rows += 1
+                universe_items.append(item)
                 continue
-            
-            # 가격 필터
-            last_close = df["close"].iloc[-1] if "close" in df.columns and len(df) > 0 else None
-            if last_close is None or pd.isna(last_close):
-                excluded_nan += 1
+
+            rows = len(df)
+            item["rows"] = rows
+            if rows < self.min_rows:
+                item["reject_reasons"].append("rows_below_min")
+                excluded_rows += 1
+                universe_items.append(item)
                 continue
-            if last_close < self.min_price:
-                excluded_price += 1
-                continue
-            
-            # 거래대금 계산 (최근 liq_days일 평균)
+
             if "close" not in df.columns or "volume" not in df.columns:
+                item["reject_reasons"].append("missing_close_or_volume")
                 excluded_nan += 1
+                universe_items.append(item)
                 continue
-            
-            recent_df = df.tail(self.liq_days)
-            liq_avg = (recent_df["close"] * recent_df["volume"]).mean()
+
+            last_close = df["close"].iloc[-1]
+            if pd.isna(last_close):
+                item["reject_reasons"].append("last_close_nan")
+                excluded_nan += 1
+                universe_items.append(item)
+                continue
+            if float(last_close) < self.min_price:
+                item["reject_reasons"].append("price_below_min")
+                excluded_price += 1
+                item["last_close"] = float(last_close)
+                universe_items.append(item)
+                continue
+
+            recent = df.tail(self.liq_days)
+            liq_avg = (recent["close"] * recent["volume"]).mean()
             if pd.isna(liq_avg):
+                item["reject_reasons"].append("liq_nan")
                 excluded_nan += 1
+                universe_items.append(item)
                 continue
-            
-            candidates.append({
-                "code": code,
-                "liq_avg": float(liq_avg),
-                "last_close": float(last_close),
-                "meta": {
-                    "liq_avg": float(liq_avg),
-                    "last_close": float(last_close),
-                    "rows": len(df),
-                },
-            })
-        
-        # 거래대금 내림차순 정렬
-        candidates.sort(key=lambda x: x["liq_avg"], reverse=True)
-        
-        # topK 선정
-        topk_candidates = candidates[:self.topk]
-        
+
+            item["liq_avg"] = float(liq_avg)
+            item["last_close"] = float(last_close)
+            item["meta"] = {"as_of": as_of.isoformat()}
+            candidates.append(item)
+            universe_items.append(item)
+
+        candidates.sort(key=lambda x: x.get("liq_avg", 0.0), reverse=True)
+        pool120 = candidates[: self.pooln]
+
+        keep_codes = {x["code"] for x in pool120}
+        for idx, item in enumerate(pool120, start=1):
+            item["pool_rank"] = idx
+
+        for item in universe_items:
+            if item["code"] not in keep_codes and not item.get("reject_reasons"):
+                item.setdefault("reject_reasons", []).append("not_in_pool120")
+
+        normalized_pool = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in pool120]
+        normalized_universe = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in universe_items]
+
         logger.info(
-            "[WATCHLIST][STAGE_A] kept=%s excluded_rows=%s excluded_price=%s excluded_nan=%s",
-            len(topk_candidates), excluded_rows, excluded_price, excluded_nan
+            "[WATCHLIST][PIPELINE][A_POOL120] kept=%s universe=%s excluded_rows=%s excluded_price=%s excluded_nan=%s",
+            len(normalized_pool),
+            len(normalized_universe),
+            excluded_rows,
+            excluded_price,
+            excluded_nan,
         )
-        
-        return topk_candidates
-    
-    def _stage_b_strategy_scoring(
-        self,
-        candidates: List[Dict[str, Any]],
-        as_of: date,
-    ) -> List[Dict[str, Any]]:
-        """
-        Stage B: 전략 스코어링.
-        
-        Minervini RS percentile, VCP score 통과한 것 중 상위 finalN 선정.
-        """
-        scored = []
-        
-        # 벤치마크 데이터 로드
+        return normalized_pool, normalized_universe
+
+    def _stage_b_strategy_scoring(self, pool120: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
+        if not pool120:
+            logger.warning("[WATCHLIST][PIPELINE][B_TOP50] kept=0 from=0")
+            return []
+
         try:
-            bench_df, _ = self.ohlcv_provider(RS_BENCHMARK, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS) + 10)
-            if bench_df is None or bench_df.empty:
-                raise ValueError(f"benchmark {RS_BENCHMARK} data empty")
+            bench_df, _ = self.ohlcv_provider(RS_BENCHMARK, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
+            if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
+                raise ValueError(f"benchmark {RS_BENCHMARK} empty")
             bench_close = bench_df["close"]
         except Exception as exc:
-            logger.error("[WATCHLIST][STAGE_B][BENCHMARK_FAIL] err=%s", exc)
-            raise
-        
-        rs_min_pctile = self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE)
-        vcp_min_score = self.minervini_config.get("vcp_min_score", 70.0)
-        
-        for cand in candidates:
+            logger.error("[WATCHLIST][PIPELINE][B_TOP50][BENCH_FAIL] err=%s", exc)
+            bench_close = None
+
+        rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
+        if rs_min_pctile <= 1.0:
+            rs_min_pctile = rs_min_pctile * 100.0
+
+        scored: List[Dict[str, Any]] = []
+        for cand in pool120:
             code = cand["code"]
-            
-            # OHLCV 조회 (충분한 데이터 필요)
+            item = dict(cand)
+            reject_reasons = list(item.get("reject_reasons", []))
+
             try:
-                df, meta = self.ohlcv_provider(code, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 120) + 10)
+                df, _ = self.ohlcv_provider(code, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
             except Exception:
+                reject_reasons.append("ohlcv_fetch_error_stage_b")
+                item["reject_reasons"] = reject_reasons
                 continue
-            
+
             if df is None or df.empty or len(df) < 120:
+                reject_reasons.append("insufficient_rows_stage_b")
+                item["reject_reasons"] = reject_reasons
                 continue
-            
-            # RS percentile 계산
-            try:
-                rs_pctile = self._compute_rs_percentile(df["close"], bench_close)
-            except Exception:
-                rs_pctile = 0.0
-            
-            # VCP score 계산
-            try:
-                vcp_score = self._compute_vcp_score(df)
-            except Exception:
-                vcp_score = 0.0
-            
-            # 필터링
+
+            rs_pctile = self._compute_rs_percentile(df["close"], bench_close)
+            vcp_score = self._compute_vcp_score(df)
+            pullback_pct = self._compute_pullback_pct(df)
+            trend_score = self._compute_trend_score(df)
+            atr_pct = self._compute_atr_pct(df)
+
+            pullback_score = max(0.0, min(100.0, 100.0 - (pullback_pct * 400.0)))
+            atr_score = max(0.0, min(100.0, 100.0 - abs(atr_pct - 0.04) * 1000.0))
+            tech_score = (
+                rs_pctile * 0.40
+                + vcp_score * 0.25
+                + trend_score * 0.20
+                + pullback_score * 0.10
+                + atr_score * 0.05
+            )
+
             if rs_pctile < rs_min_pctile:
-                continue
-            if vcp_score < vcp_min_score:
-                continue
-            
-            # 종합 점수 (RS + VCP 가중 평균)
-            score = rs_pctile * 0.5 + vcp_score * 0.5
-            
-            scored.append({
-                "code": code,
-                "score": float(score),
-                "meta": {
-                    **cand.get("meta", {}),
+                reject_reasons.append("rs_below_min")
+
+            item.update(
+                {
                     "rs_pctile": float(rs_pctile),
                     "vcp_score": float(vcp_score),
-                },
-            })
-        
-        # 점수 내림차순 정렬
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        
-        # finalN 선정
-        final = scored[:self.finaln]
-        
+                    "pullback_pct": float(pullback_pct),
+                    "trend_score": float(trend_score),
+                    "atr_pct": float(atr_pct),
+                    "tech_score": float(tech_score),
+                    "reject_reasons": reject_reasons,
+                }
+            )
+            scored.append(item)
+
+        scored.sort(key=lambda x: x.get("tech_score", 0.0), reverse=True)
+        top50 = scored[: self.topk]
+        keep_codes = {item["code"] for item in top50}
+
+        for idx, item in enumerate(top50, start=1):
+            item["top50_rank"] = idx
+        for item in scored[self.topk :]:
+            item.setdefault("reject_reasons", []).append("not_in_top50")
+
+        normalized = [self._normalize_item(item, score_key="tech_score", rank_key="top50_rank") for item in top50]
+
+        logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(normalized), len(pool120))
+        return normalized
+
+    def _stage_c_flow_final(self, top50: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
+        if not top50:
+            logger.warning("[WATCHLIST][PIPELINE][C_FINAL30] kept=0 from=0")
+            return []
+
+        scored: List[Dict[str, Any]] = []
+        for cand in top50:
+            code = cand["code"]
+            item = dict(cand)
+            reject_reasons = list(item.get("reject_reasons", []))
+
+            try:
+                ohlcv_df, _ = self.ohlcv_provider(code, count=max(self.flow_window + 10, 80))
+            except Exception:
+                ohlcv_df = pd.DataFrame()
+
+            foreign_df: Optional[pd.DataFrame] = None
+            inst_df: Optional[pd.DataFrame] = None
+            if self.flow_provider is not None:
+                try:
+                    foreign_df, inst_df = self.flow_provider(code, as_of, self.flow_window)
+                except Exception as exc:
+                    reject_reasons.append("flow_provider_error")
+                    logger.debug("[WATCHLIST][PIPELINE][C_FINAL30][FLOW_PROVIDER_FAIL] code=%s err=%s", code, exc)
+
+            if foreign_df is None and inst_df is None:
+                reject_reasons.append("flow_data_missing")
+
+            flow_result = calculate_flow_score(
+                code=code,
+                ohlcv_df=ohlcv_df if ohlcv_df is not None else pd.DataFrame(),
+                foreign_df=foreign_df,
+                inst_df=inst_df,
+                window=self.flow_window,
+            )
+
+            flow_score_norm = float(flow_result.get("flow_score", 0.0) or 0.0)
+            flow_score_100 = flow_score_norm * 100.0
+            tech_score = float(item.get("tech_score", 0.0) or 0.0)
+            final_score = calculate_final_score(
+                tech_score=tech_score,
+                flow_score=flow_score_100,
+                tech_weight=self.tech_weight,
+                flow_weight=self.flow_weight,
+            )
+
+            item.update(
+                {
+                    "flow_score": flow_score_norm,
+                    "foreign_20_ratio": float(flow_result.get("foreign_20_ratio", 0.0) or 0.0),
+                    "inst_20_ratio": float(flow_result.get("inst_20_ratio", 0.0) or 0.0),
+                    "final_score": float(final_score),
+                    "reject_reasons": reject_reasons,
+                }
+            )
+            scored.append(item)
+
+        scored.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+        final30 = scored[: self.finaln]
+
+        for idx, item in enumerate(final30, start=1):
+            item["final_rank"] = idx
+
+        normalized_final = [self._normalize_item(item, score_key="final_score", rank_key="final_rank") for item in final30]
+
         logger.info(
-            "[WATCHLIST][STAGE_B] kept=%s (from %s candidates)",
-            len(final), len(candidates)
+            "[WATCHLIST][PIPELINE][C_FINAL30] kept=%s from=%s requested=%s",
+            len(normalized_final),
+            len(top50),
+            self.finaln,
         )
-        
-        return final
-    
-    def _compute_rs_percentile(self, stock_close: pd.Series, bench_close: pd.Series) -> float:
-        """RS percentile 계산 (간단한 구현)."""
-        if len(stock_close) < RS_LOOKBACK_DAYS or len(bench_close) < RS_LOOKBACK_DAYS:
+        return normalized_final
+
+    def _compute_rs_percentile(self, stock_close: pd.Series, bench_close: Optional[pd.Series]) -> float:
+        if bench_close is None or len(stock_close) < RS_LOOKBACK_DAYS or len(bench_close) < RS_LOOKBACK_DAYS:
             return 0.0
-        
-        # 최근 RS_LOOKBACK_DAYS일 수익률
+
         stock_ret = (stock_close.iloc[-1] / stock_close.iloc[-RS_LOOKBACK_DAYS] - 1) * 100
         bench_ret = (bench_close.iloc[-1] / bench_close.iloc[-RS_LOOKBACK_DAYS] - 1) * 100
-        
-        # RS = stock_ret - bench_ret
         rs = stock_ret - bench_ret
-        
-        # Percentile 근사 (간단히 0~100 스케일로 변환)
-        # 실제로는 전체 유니버스 대비 percentile을 계산해야 하지만,
-        # 여기서는 단순히 RS > 0이면 높은 점수를 주는 방식으로 근사
+
         if rs > 20:
             return 90.0
-        elif rs > 10:
+        if rs > 10:
             return 80.0
-        elif rs > 0:
+        if rs > 0:
             return 70.0
-        else:
-            return max(0.0, 50.0 + rs)  # RS < 0이면 50 미만
-    
-    def _compute_vcp_score(self, df: pd.Series) -> float:
-        """VCP score 계산 (간단한 구현)."""
-        if len(df) < 120:
+        return max(0.0, 50.0 + rs)
+
+    def _compute_vcp_score(self, df: pd.DataFrame) -> float:
+        if df is None or df.empty or len(df) < 120:
             return 0.0
-        
-        # 변동성 수축 패턴 감지 (간단한 휴리스틱)
-        # 최근 30일 변동성 vs 이전 90일 변동성
+        if "high" not in df.columns or "low" not in df.columns:
+            return 0.0
+
         recent_30 = df["high"].tail(30) / df["low"].tail(30) - 1
         prev_90 = df["high"].iloc[-120:-30] / df["low"].iloc[-120:-30] - 1
-        
-        recent_vol = recent_30.mean()
-        prev_vol = prev_90.mean()
-        
+
+        recent_vol = float(recent_30.mean())
+        prev_vol = float(prev_90.mean())
         if prev_vol == 0:
             return 0.0
-        
-        # 변동성 수축 비율
+
         contraction_ratio = recent_vol / prev_vol
-        
-        # 수축 비율이 낮을수록 높은 점수
         if contraction_ratio < 0.5:
             return 90.0
-        elif contraction_ratio < 0.7:
+        if contraction_ratio < 0.7:
             return 80.0
-        elif contraction_ratio < 0.9:
+        if contraction_ratio < 0.9:
             return 70.0
-        else:
-            return max(0.0, 100.0 - contraction_ratio * 100)
+        return max(0.0, 100.0 - contraction_ratio * 100.0)
+
+    def _compute_pullback_pct(self, df: pd.DataFrame) -> float:
+        if "close" not in df.columns or df.empty:
+            return 0.0
+        lookback = min(252, len(df))
+        high_52w = float(df["close"].tail(lookback).max())
+        last_close = float(df["close"].iloc[-1])
+        if high_52w <= 0:
+            return 0.0
+        return max(0.0, (high_52w - last_close) / high_52w)
+
+    def _compute_trend_score(self, df: pd.DataFrame) -> float:
+        if "close" not in df.columns or len(df) < 200:
+            return 0.0
+        close = df["close"]
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        ma200 = float(close.rolling(200).mean().iloc[-1])
+        last_close = float(close.iloc[-1])
+
+        checks = [
+            last_close > ma20,
+            ma20 > ma50,
+            ma50 > ma200,
+            last_close > ma200,
+        ]
+        return float(sum(1 for x in checks if x) * 25.0)
+
+    def _compute_atr_pct(self, df: pd.DataFrame, period: int = 14) -> float:
+        if df is None or len(df) < period + 1:
+            return 0.0
+        required = {"high", "low", "close"}
+        if not required.issubset(df.columns):
+            return 0.0
+
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+
+        tr = pd.concat(
+            [
+                (high - low).abs(),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(period).mean().iloc[-1]
+        last_close = close.iloc[-1]
+        if pd.isna(atr) or pd.isna(last_close) or float(last_close) == 0.0:
+            return 0.0
+        return float(atr) / float(last_close)
 
 
 def build_and_save_watchlist(
@@ -338,57 +534,71 @@ def build_and_save_watchlist(
     ohlcv_provider: Any,
     minervini_config: Dict[str, Any],
     force_rebuild: bool = False,
-) -> List[Dict[str, Any]]:
-    """
-    Watchlist를 생성하고 DB에 저장.
-    
-    force_rebuild=False이면 이미 당일 watchlist가 있으면 재사용.
-    """
+    flow_provider: Optional[FlowProvider] = None,
+    return_bundle: bool = False,
+) -> Any:
+    """Watchlist를 생성하고 DB에 저장한다."""
     repo = WatchlistRepo(engine)
-    
-    # 이미 당일 watchlist가 있으면 재사용
+
     if not force_rebuild:
-        existing = repo.load_watchlist(env=env, strategy=strategy, as_of=as_of)
+        existing, _used_as_of = repo.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            allow_latest_fallback=False,
+        )
         if existing:
             finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
             if len(existing) < finaln:
                 logger.warning(
                     "[WATCHLIST][CACHE][IGNORE] cached too small: %s < %s -> treat as miss",
-                    len(existing), finaln
+                    len(existing),
+                    finaln,
                 )
-                existing = []
             else:
-                logger.info(
-                    "[WATCHLIST][CACHE] hit=True as_of=%s members=%s",
-                    as_of, len(existing)
-                )
+                logger.info("[WATCHLIST][CACHE] hit=True as_of=%s members=%s", as_of, len(existing))
+                if return_bundle:
+                    return existing, {
+                        "as_of": as_of,
+                        "weights": {"tech_weight": 0.7, "flow_weight": 0.3},
+                        "universe_scored": [],
+                        "pool120": [],
+                        "top50": [],
+                        "final30": existing,
+                        "reject_summary": {},
+                    }
                 return existing
-    
-    # Watchlist 생성
+
     builder = WatchlistBuilder(
         ohlcv_provider=ohlcv_provider,
         minervini_config=minervini_config,
+        pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
         topk=_env_int("PB1_WATCHLIST_TOPK", 50),
         finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
         min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
         liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
         min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
+        flow_provider=flow_provider,
+        flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
+        tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
+        flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
     )
-    
+
     try:
         watchlist = builder.build(members=members, as_of=as_of)
     except Exception as exc:
         logger.error("[WATCHLIST][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
-    
-    # DB에 저장
+
     repo.save_watchlist(
         env=env,
         strategy=strategy,
         as_of=as_of,
         members=watchlist,
     )
-    
+
+    if return_bundle:
+        return watchlist, builder.last_bundle
     return watchlist
 
 
@@ -404,17 +614,12 @@ def load_today_watchlist_with_fallback(
     auto_build_if_empty: bool = True,
     strict_fail_on_empty: bool = False,
 ) -> tuple[List[Dict[str, Any]], str]:
-    """
-    오늘 watchlist를 로드, 없으면 자동 생성 또는 fallback 전략 적용.
-    
-    반환: (watchlist, source)
-    - source: "watchlist_db" | "watchlist_autobuilt" | "prevday" | "fallback" | "watchlist_empty"
-    """
-    today = to_date(today)  # Ensure DATE type
+    """오늘 watchlist를 로드, 없으면 자동 생성 또는 fallback 전략 적용."""
+    today = to_date(today)
     repo = WatchlistRepo(engine)
     ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
-    
-    def _load():
+
+    def _load() -> tuple[List[Dict[str, Any]], date | None]:
         rows, used_as_of = repo.load_watchlist(
             env=env,
             strategy=strategy,
@@ -423,98 +628,75 @@ def load_today_watchlist_with_fallback(
             ttl_days=ttl_days,
         )
         return rows, used_as_of
-    
-    # 1) Try load today's watchlist (with fallback to latest within TTL)
+
     rows, used_as_of = _load()
     if rows:
         finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
         if len(rows) < finaln:
-            logger.warning(
-                "[WATCHLIST][CACHE][IGNORE] cached too small: %s < %s -> treat as miss",
-                len(rows), finaln
-            )
-            rows = []
+            logger.warning("[WATCHLIST][CACHE][IGNORE] cached too small: %s < %s", len(rows), finaln)
         else:
             if used_as_of and used_as_of != today:
-                age_days = (today - used_as_of).days
                 logger.info(
-                    "[WATCHLIST][CACHE] hit=True source=watchlist_db_fallback as_of=%s (requested=%s, age=%s days) count=%s",
-                    used_as_of, today, age_days, len(rows)
+                    "[WATCHLIST][CACHE] hit=True source=watchlist_db_fallback as_of=%s requested=%s count=%s",
+                    used_as_of,
+                    today,
+                    len(rows),
                 )
-                return rows, "watchlist_db"
             else:
                 logger.info("[WATCHLIST][CACHE] hit=True source=watchlist_db as_of=%s count=%s", today, len(rows))
-                return rows, "watchlist_db"
-    
-    # 2) If empty and auto_build enabled -> build & save
+            return rows, "watchlist_db"
+
     if auto_build_if_empty:
         logger.warning("[WATCHLIST][AUTO_BUILD] today=%s missing -> building now", today)
         try:
-            topk = _env_int("PB1_WATCHLIST_TOPK", 50)
-            finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
-            builder = WatchlistBuilder(
+            built = build_and_save_watchlist(
+                engine=engine,
+                env=env,
+                strategy=strategy,
+                as_of=today,
+                members=members,
                 ohlcv_provider=ohlcv_provider,
                 minervini_config=minervini_config,
-                topk=topk,
-                finaln=finaln,
-                min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
-                liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
-                min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
+                force_rebuild=True,
             )
-            built = builder.build(members=members, as_of=today)
             if built:
-                # Save to DB
-                repo.save_watchlist(env=env, strategy=strategy, as_of=today, members=built)
-                logger.info("[WATCHLIST][AUTO_BUILD] saved count=%s -> reloading", len(built))
-                # Reload from DB
-                rows2, used_as_of2 = _load()
+                rows2, _ = _load()
                 if rows2:
                     logger.info("[WATCHLIST][AUTO_BUILD] success count=%s", len(rows2))
                     return rows2, "watchlist_autobuilt"
         except Exception as exc:
             logger.error("[WATCHLIST][AUTO_BUILD][FAIL] err=%s", exc, exc_info=True)
-    
-    # 3) Try previous day watchlist
+
     latest_date = repo.get_latest_watchlist_date(env=env, strategy=strategy)
     if latest_date:
-        watchlist = repo.load_watchlist(env=env, strategy=strategy, as_of=latest_date)
-        if watchlist:
-            finaln = _env_int("PB1_WATCHLIST_FINALN", 30)
-            if len(watchlist) < finaln:
-                logger.warning(
-                    "[WATCHLIST][CACHE][IGNORE] prevday too small: %s < %s -> fallback to liquidity",
-                    len(watchlist), finaln
-                )
-            else:
-                logger.warning(
-                    "[WATCHLIST][CACHE] hit=True source=prevday as_of=%s (today=%s)",
-                    latest_date, today
-                )
-                return watchlist, "prevday"
-    
-    # 4) Fallback: liquidity topK
-    logger.warning("[WATCHLIST][CACHE] miss -> fallback to liquidity topK")
+        prev_rows, _ = repo.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=latest_date,
+            allow_latest_fallback=False,
+        )
+        if prev_rows:
+            logger.warning("[WATCHLIST][CACHE] hit=True source=prevday as_of=%s", latest_date)
+            return prev_rows, "prevday"
+
+    logger.warning("[WATCHLIST][CACHE] miss -> fallback to liquidity pool")
     try:
-        topk = _env_int("PB1_WATCHLIST_TOPK", 50)
         builder = WatchlistBuilder(
             ohlcv_provider=ohlcv_provider,
             minervini_config=minervini_config,
-            topk=topk,
-            finaln=topk,  # Stage B 스킵, Stage A만 사용
+            pooln=_env_int("PB1_WATCHLIST_TOPK", 50),
+            topk=_env_int("PB1_WATCHLIST_TOPK", 50),
+            finaln=_env_int("PB1_WATCHLIST_TOPK", 50),
             min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
             liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
             min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
         )
-        fallback = builder._stage_a_liquidity_filter(members, today)
-        for i, item in enumerate(fallback, start=1):
-            item["rank"] = i
-        logger.warning(
-            "[WATCHLIST][FALLBACK] source=fallback members=%s",
-            len(fallback)
-        )
+        fallback, _ = builder._stage_a_liquidity_filter(members, today)
+        for idx, item in enumerate(fallback, start=1):
+            item["rank"] = idx
         return fallback, "fallback"
     except Exception as exc:
-        logger.error("[WATCHLIST][FALLBACK][FAIL] err=%s -> return empty", exc)
+        logger.error("[WATCHLIST][FALLBACK][FAIL] err=%s", exc)
         if strict_fail_on_empty:
             raise RuntimeError(f"Watchlist empty after auto-build: env={env} strategy={strategy} as_of={today}") from exc
         return [], "watchlist_empty"

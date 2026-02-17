@@ -567,3 +567,15 @@ jobs:
             exit 1
           fi
           echo "OK: no sqlite artifacts."
+
+      - name: Upload watchlist reports (pdf/json/csv)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchlist-${{ github.run_id }}
+          path: |
+            repo/runtime/watchlist/**
+            repo/runtime/reports/**
+            repo/**/*.pdf
+            repo/**/*.json
+            repo/**/*.csv
