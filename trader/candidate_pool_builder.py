@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -109,8 +110,11 @@ class CandidatePoolBuilder:
         excluded_low_price = 0
         excluded_high_volatility = 0
         excluded_provider_error = 0
+        total = len(codes)
+        progress_every = max(1, total // 10)
+        ts0 = time.monotonic()
         
-        for code in codes:
+        for idx, code in enumerate(codes, start=1):
             try:
                 df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
                 if df is None or len(df) < self.min_rows:
@@ -163,6 +167,19 @@ class CandidatePoolBuilder:
                 excluded_provider_error += 1
                 logger.debug("[CANDIDATE_POOL][OHLCV_FAIL] code=%s err=%s", code, exc)
                 continue
+            finally:
+                if idx == 1 or idx % progress_every == 0 or idx == total:
+                    logger.info(
+                        "[CANDIDATE_POOL][BUILD][PROGRESS] processed=%s/%s scored=%s excluded(data=%s,price=%s,vol=%s,err=%s) elapsed=%.1fs",
+                        idx,
+                        total,
+                        len(scored),
+                        excluded_data_insufficient,
+                        excluded_low_price,
+                        excluded_high_volatility,
+                        excluded_provider_error,
+                        time.monotonic() - ts0,
+                    )
 
         logger.info(
             "[CANDIDATE_POOL][BUILD][EXCLUDE] total=%s data_insufficient=%s low_price=%s high_volatility=%s provider_error=%s",
@@ -268,8 +285,11 @@ class CandidatePoolBuilder:
         # Step 1: Universe → 120 (기존 로직)
         codes = [m["code"] for m in members]
         scored = []
+        total_step1 = len(codes)
+        progress_step1 = max(1, total_step1 // 10)
+        ts_step1 = time.monotonic()
         
-        for code in codes:
+        for idx, code in enumerate(codes, start=1):
             try:
                 df = self.ohlcv_provider(code, days=max(self.liq_days + 10, 80))
                 if df is None or len(df) < self.min_rows:
@@ -318,6 +338,15 @@ class CandidatePoolBuilder:
             except Exception as exc:
                 logger.debug("[FINAL30][120] code=%s err=%s", code, exc)
                 continue
+            finally:
+                if idx == 1 or idx % progress_step1 == 0 or idx == total_step1:
+                    logger.info(
+                        "[FINAL30_PIPELINE][120][PROGRESS] processed=%s/%s passed=%s elapsed=%.1fs",
+                        idx,
+                        total_step1,
+                        len(scored),
+                        time.monotonic() - ts_step1,
+                    )
         
         if len(scored) == 0:
             raise RuntimeError("scored=0 in 120 step")
@@ -330,7 +359,10 @@ class CandidatePoolBuilder:
         
         # Step 2: 120 → 50 (기술적 점수 강화)
         top50_scored = []
-        for item in pool120:
+        total_step2 = len(pool120)
+        progress_step2 = max(1, total_step2 // 10)
+        ts_step2 = time.monotonic()
+        for idx, item in enumerate(pool120, start=1):
             code = item["code"]
             try:
                 df = self.ohlcv_provider(code, days=200)
@@ -364,6 +396,15 @@ class CandidatePoolBuilder:
             except Exception as exc:
                 logger.debug("[FINAL30][50] code=%s err=%s", code, exc)
                 continue
+            finally:
+                if idx == 1 or idx % progress_step2 == 0 or idx == total_step2:
+                    logger.info(
+                        "[FINAL30_PIPELINE][50][PROGRESS] processed=%s/%s passed=%s elapsed=%.1fs",
+                        idx,
+                        total_step2,
+                        len(top50_scored),
+                        time.monotonic() - ts_step2,
+                    )
         
         top50_scored.sort(key=lambda x: x["tech_score"], reverse=True)
         top50 = top50_scored[:min(50, len(top50_scored))]

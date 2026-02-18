@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -139,13 +140,25 @@ def _filter_tradeable_members(
         return members, []
     kept: list[dict] = []
     dropped: list[dict] = []
-    for member in members:
+    total = len(members)
+    progress_every = max(1, total // 10)
+    ts0 = time.monotonic()
+    for idx, member in enumerate(members, start=1):
         code = str(member.get("code") or "").zfill(6)
         ok, reason = validate_listed_and_tradeable(kis, code)
         if ok:
             kept.append(member)
-            continue
-        dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
+        else:
+            dropped.append({"code": code, "reason": f"not_tradeable:{reason}"})
+        if idx == 1 or idx % progress_every == 0 or idx == total:
+            logger.info(
+                "[UNIVERSE][TRADEABLE][PROGRESS] processed=%s/%s kept=%s dropped=%s elapsed=%.1fs",
+                idx,
+                total,
+                len(kept),
+                len(dropped),
+                time.monotonic() - ts0,
+            )
     return kept, dropped
 
 
@@ -227,7 +240,10 @@ def _sanitize_members(
     invalid_format_codes: list[str] = []
     insufficient_history_codes: list[str] = []
     dropped: list[dict] = []
-    for member in members:
+    total = len(members)
+    progress_every = max(1, total // 10)
+    ts0 = time.monotonic()
+    for idx, member in enumerate(members, start=1):
         raw_code = str(member.get("code") or member.get("pdno") or "").strip()
         code = raw_code.zfill(6) if raw_code.isdigit() else raw_code
         if not TICKER_PATTERN.match(code):
@@ -252,6 +268,16 @@ def _sanitize_members(
                 dropped.append({"code": code, "reason": "insufficient_history"})
                 continue
         sanitized.append(member)
+        if idx == 1 or idx % progress_every == 0 or idx == total:
+            logger.info(
+                "[UNIVERSE][SANITIZE][PROGRESS] processed=%s/%s kept=%s invalid_format=%s insufficient_history=%s elapsed=%.1fs",
+                idx,
+                total,
+                len(sanitized),
+                stats["invalid_format"],
+                stats["insufficient_history"],
+                time.monotonic() - ts0,
+            )
     stats["final"] = len(sanitized)
     return (
         sanitized,
@@ -528,9 +554,16 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     today = now_kst().date()
     as_of_day = _parse_as_of_date(as_of_date) or today
-    for provider_name in preferred_chain:
+    provider_total = len(preferred_chain)
+    for provider_idx, provider_name in enumerate(preferred_chain, start=1):
         result: dict | None = None
         reason: str | None = None
+        logger.info(
+            "[UNIVERSE][PROVIDER][PROGRESS] step=%s/%s provider=%s",
+            provider_idx,
+            provider_total,
+            provider_name,
+        )
 
         if provider_name == "fdr_kospi100_kosdaq100":
             result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
@@ -563,6 +596,12 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
     ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
+    logger.info(
+        "[UNIVERSE][SANITIZE][START] members=%s validate_history=%s min_candles=%s",
+        len(members),
+        int(validate_history),
+        min_candles,
+    )
     members, stats, sanitize_detail = _sanitize_members(members, ohlcv_provider=ohlcv_provider, min_candles=min_candles)
     logger.info(
         "[UNIVERSE][SANITIZE] total_raw=%s invalid_format=%s insufficient_history=%s final=%s",
@@ -595,6 +634,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             logger.warning("[UNIVERSE][TRADEABLE][INIT_FAIL] env=%s err=%s", env, exc)
             kis_validator = None
     if validate_kis:
+        logger.info("[UNIVERSE][TRADEABLE][START] members=%s", len(members))
         members, dropped_tradeable = _filter_tradeable_members(members, kis=kis_validator)
         if dropped_tradeable:
             stats["not_tradeable"] = len(dropped_tradeable)

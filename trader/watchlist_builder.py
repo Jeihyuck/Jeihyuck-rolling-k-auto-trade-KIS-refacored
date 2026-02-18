@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import Counter
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -643,9 +644,23 @@ class WatchlistBuilder:
 
         candidates: List[Dict[str, Any]] = []
         universe_items: List[Dict[str, Any]] = []
+        total = len(members)
+        progress_every = max(1, total // 10)
+        ts0 = time.monotonic()
 
-        for m in members:
+        for idx, m in enumerate(members, start=1):
             code = str(m.get("code") or "").zfill(6)
+            if idx == 1 or idx % progress_every == 0 or idx == total:
+                logger.info(
+                    "[WATCHLIST][PIPELINE][A_POOL120][PROGRESS] processed=%s/%s candidates=%s excluded(rows=%s,price=%s,nan=%s) elapsed=%.1fs",
+                    idx,
+                    total,
+                    len(candidates),
+                    excluded_rows,
+                    excluded_price,
+                    excluded_nan,
+                    time.monotonic() - ts0,
+                )
             if not code:
                 continue
 
@@ -754,7 +769,18 @@ class WatchlistBuilder:
         vcp_min_score = float(self.minervini_config.get("vcp_min_score", 70.0) or 70.0)
 
         scored: List[Dict[str, Any]] = []
-        for cand in pool120:
+        total = len(pool120)
+        progress_every = max(1, total // 10)
+        ts0 = time.monotonic()
+        for idx, cand in enumerate(pool120, start=1):
+            if idx == 1 or idx % progress_every == 0 or idx == total:
+                logger.info(
+                    "[WATCHLIST][PIPELINE][B_TOP50][PROGRESS] processed=%s/%s scored=%s elapsed=%.1fs",
+                    idx,
+                    total,
+                    len(scored),
+                    time.monotonic() - ts0,
+                )
             code = cand["code"]
             item = dict(cand)
             reject_reasons = list(item.get("reject_reasons", []))
@@ -831,7 +857,18 @@ class WatchlistBuilder:
             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30][FLOW] provider missing -> flow weight disabled by item")
 
         scored: List[Dict[str, Any]] = []
-        for cand in top50:
+        total = len(top50)
+        progress_every = max(1, total // 10)
+        ts0 = time.monotonic()
+        for idx, cand in enumerate(top50, start=1):
+            if idx == 1 or idx % progress_every == 0 or idx == total:
+                logger.info(
+                    "[WATCHLIST][PIPELINE][C_FINAL30][PROGRESS] processed=%s/%s scored=%s elapsed=%.1fs",
+                    idx,
+                    total,
+                    len(scored),
+                    time.monotonic() - ts0,
+                )
             code = cand["code"]
             item = dict(cand)
             reject_reasons = list(item.get("reject_reasons", []))

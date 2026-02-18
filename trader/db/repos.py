@@ -634,7 +634,14 @@ class UniverseRepo:
                 }
         return None
 
-    def get_universe_members(self, *, env: str, strategy: str, as_of_date: str) -> list[dict]:
+    def get_universe_members(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of_date: str,
+        allow_fallback: bool = True,
+    ) -> list[dict]:
         """
         Get universe members for given (env, strategy, as_of_date).
         
@@ -656,6 +663,14 @@ class UniverseRepo:
         with self.engine.begin() as conn:
             run_id = conn.execute(stmt).scalar()
         if not run_id:
+            if not allow_fallback:
+                logger.info(
+                    "[UNIVERSE][DB][LOAD][MISS] env=%s strategy=%s as_of=%s members=0",
+                    env,
+                    strategy,
+                    as_of_date,
+                )
+                return []
             logger.info(
                 "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (trying fallback)",
                 env, strategy, as_of_date
@@ -685,6 +700,14 @@ class UniverseRepo:
             return []
         members = self._fetch_members_for_run(str(run_id), env=env, strategy=strategy)
         if not members:
+            if not allow_fallback:
+                logger.info(
+                    "[UNIVERSE][DB][LOAD][MISS] env=%s strategy=%s as_of=%s members=0",
+                    env,
+                    strategy,
+                    as_of_date,
+                )
+                return []
             logger.info(
                 "[UNIVERSE][DB][LOAD] env=%s strategy=%s as_of=%s members=0 (trying fallback)",
                 env, strategy, as_of_date

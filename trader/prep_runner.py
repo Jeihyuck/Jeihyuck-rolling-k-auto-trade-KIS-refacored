@@ -24,7 +24,6 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 from trader.time_utils import now_kst, resolve_derived_as_of
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
-from trader.config import EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
 
 logger = logging.getLogger(__name__)
 
@@ -136,55 +135,61 @@ def _load_db_ohlcv_df(*, engine, code: str, as_of: date, count: int) -> pd.DataF
 
 def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[dict]:
     """
-    Ensure universe exists in DB for (env, strategy, as_of).
-    If missing and emergency_build/force_rebuild enabled -> build + save + reload.
-    If still missing -> fail hard (no silent fallback).
+    Ensure universe exists in DB for (env, strategy, as_of) with strict as_of semantics.
+    - Load with fallback disabled.
+    - If missing (or force always), build and persist for exact as_of.
+    - Reload exact as_of and fail hard when still empty.
     """
     repo = UniverseRepo(engine)
     as_of_s = as_of.isoformat()
 
-    # 1) load
-    members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
-
-    # 2) decide build
+    no_fallback = os.getenv("UNIVERSE_NO_FALLBACK", "1") == "1"
+    build_if_missing = os.getenv("UNIVERSE_BUILD_IF_MISSING", "1") == "1"
     force_always = os.getenv("UNIVERSE_FORCE_REBUILD_ALWAYS", "0") == "1"
 
-    should_build = False
-    reason = ""
+    # 1) strict as_of load (no fallback)
+    members = repo.get_universe_members(
+        env=env,
+        strategy=strategy,
+        as_of_date=as_of_s,
+        allow_fallback=False,
+    )
 
-    if len(members) == 0 and EMERGENCY_UNIVERSE_BUILD:
-        should_build = True
-        reason = "emergency_missing"
-    elif FORCE_UNIVERSE_REBUILD:
-        if force_always:
-            should_build = True
-            reason = "force_always"
-        elif len(members) == 0:
-            should_build = True
-            reason = "force_missing"
-        else:
-            # 안전장치: 이미 있으면 강제 재빌드 스킵
-            logger.info(
-                "[UNIVERSE][AUTO_BUILD][SKIP] universe already exists (members=%d). "
-                "Set UNIVERSE_FORCE_REBUILD_ALWAYS=1 to rebuild anyway.",
-                len(members),
-            )
-            should_build = False
-
+    # 2) build trigger
+    should_build = force_always or len(members) == 0
     if should_build:
+        if len(members) == 0 and not build_if_missing:
+            raise RuntimeError(
+                f"Universe missing and auto-build disabled: env={env} strategy={strategy} as_of={as_of_s}"
+            )
+
+        reason = "force_always" if force_always else "missing_as_of"
         logger.warning(
-            "[UNIVERSE][AUTO_BUILD] trigger build: env=%s strategy=%s as_of=%s (members=%d) reason=%s emergency=%s force=%s",
-            env, strategy, as_of_s, len(members), reason, EMERGENCY_UNIVERSE_BUILD, FORCE_UNIVERSE_REBUILD
+            "[UNIVERSE][AUTO_BUILD][RUN] env=%s strategy=%s as_of=%s reason=%s no_fallback=%s build_if_missing=%s",
+            env,
+            strategy,
+            as_of_s,
+            reason,
+            no_fallback,
+            build_if_missing,
         )
         built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
-        logger.info("[UNIVERSE][AUTO_BUILD] built_members=%d (saved by builder)", len(built))
-        members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of_s)
+        logger.info("[UNIVERSE][DB][UPSERT/SAVE] env=%s strategy=%s as_of=%s members=%d", env, strategy, as_of_s, len(built))
+        logger.info("[UNIVERSE][AUTO_BUILD][DONE] as_of=%s members=%d", as_of_s, len(built))
 
-    # 5) hard fail if still empty
+        # 3) strict reload verification (exact as_of only)
+        members = repo.get_universe_members(
+            env=env,
+            strategy=strategy,
+            as_of_date=as_of_s,
+            allow_fallback=False,
+        )
+
+    # 4) hard fail if exact as_of still empty
     if len(members) == 0:
         raise RuntimeError(
-            f"Universe empty after ensure/build: env={env} strategy={strategy} as_of={as_of_s} "
-            f"(emergency={EMERGENCY_UNIVERSE_BUILD}, force={FORCE_UNIVERSE_REBUILD})"
+            f"Universe build/save failed: as_of universe is empty after ensure/build: "
+            f"env={env} strategy={strategy} as_of={as_of_s}"
         )
 
     return members

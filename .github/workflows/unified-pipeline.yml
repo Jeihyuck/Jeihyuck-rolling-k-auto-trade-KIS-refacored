@@ -92,6 +92,18 @@ on:
         description: "1=force rebuild universe for as_of"
         required: true
         default: "1"
+      UNIVERSE_NO_FALLBACK:
+        description: "1=disable universe fallback and require exact as_of"
+        required: true
+        default: "1"
+      UNIVERSE_BUILD_IF_MISSING:
+        description: "1=auto-build universe when exact as_of is missing"
+        required: true
+        default: "1"
+      UNIVERSE_FORCE_REBUILD_ALWAYS:
+        description: "1=always rebuild universe for as_of even if already exists"
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -144,6 +156,9 @@ env:
   CANDIDATE_POOL_PREFETCH_DAYS: "520"
   CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
   CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+  UNIVERSE_NO_FALLBACK: "1"
+  UNIVERSE_BUILD_IF_MISSING: "1"
+  UNIVERSE_FORCE_REBUILD_ALWAYS: "1"
 
 jobs:
   resolve:
@@ -301,6 +316,9 @@ jobs:
       # universe flags (new)
       UNIVERSE_EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
       UNIVERSE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
+      UNIVERSE_NO_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_NO_FALLBACK || '1' }}
+      UNIVERSE_BUILD_IF_MISSING: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_BUILD_IF_MISSING || '1' }}
+      UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '1' }}
 
       # universe flags (legacy aliases)
       EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
@@ -410,6 +428,9 @@ jobs:
           echo "FORCE_CANDIDATE: ${FORCE_CANDIDATE}"
           echo "UNIVERSE_EMERGENCY_BUILD: ${UNIVERSE_EMERGENCY_BUILD:-}"
           echo "UNIVERSE_FORCE_REBUILD: ${UNIVERSE_FORCE_REBUILD:-}"
+          echo "UNIVERSE_NO_FALLBACK: ${UNIVERSE_NO_FALLBACK:-}"
+          echo "UNIVERSE_BUILD_IF_MISSING: ${UNIVERSE_BUILD_IF_MISSING:-}"
+          echo "UNIVERSE_FORCE_REBUILD_ALWAYS: ${UNIVERSE_FORCE_REBUILD_ALWAYS:-}"
           echo "ALLOW_LIVE_GATE: ${ALLOW_LIVE_GATE}"
           echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
           echo "DRYRUN: ${DRYRUN}"
@@ -545,24 +566,24 @@ jobs:
           python -m trader.db.migrate
           python -m trader.minervini_runner
 
-      - name: Fail if universe fallback occurred (prep)
+      - name: Fail if as_of universe missing after ensure/build (prep)
         if: ${{ always() && needs.resolve.outputs.run_mode == 'prep' }}
         run: |
           set -euo pipefail
           if [ ! -f /tmp/prep.log ]; then
-            echo "::warning::prep.log not found - skipping fallback check"
+            echo "::warning::prep.log not found - skipping universe as_of check"
             exit 0
           fi
-          
-          if grep -q "\[UNIVERSE\]\[DB\]\[LOAD\].*members=0 (no run)" /tmp/prep.log; then
-            echo "::error::Universe missing for as_of (members=0). This run would fallback. Failing to prevent false success."
+
+          if grep -q "Universe build/save failed: as_of universe is empty after ensure/build" /tmp/prep.log; then
+            echo "::error::Universe as_of is empty after ensure/build. Failing run."
             exit 1
           fi
-          if grep -q "\[UNIVERSE\]\[DB\]\[LOAD\]\[FALLBACK\]" /tmp/prep.log; then
-            echo "::error::Universe fallback detected. Failing to prevent using stale universe."
+          if ! grep -Eq "\[UNIVERSE\]\[DB\]\[LOAD\].*members=[1-9][0-9]*" /tmp/prep.log; then
+            echo "::error::Universe as_of successful load (members>0) not found in prep log."
             exit 1
           fi
-          echo "OK: universe loaded without fallback."
+          echo "OK: universe as_of exists after ensure/build."
       - name: Scan for SQLite artifacts
         if: always()
         run: |
