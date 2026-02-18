@@ -28,6 +28,7 @@ from .schema import (
     uuid_value_for_url,
 )
 from trader.db.json_safe import json_sanitize
+from trader.db.retry import run_with_db_retry
 from trader.time_utils import now_kst
 from trader.time_coerce import to_date
 from trader.run_context import RunContext
@@ -2214,8 +2215,8 @@ class ReconcileLogRepo:
             logger.exception("[RECONCILE_LOG][APPEND][FAIL] payload_keys=%s", list(payload.keys()))
 
 
-def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
-    schema = schema_for_engine(engine)
+def load_price_daily_conn(conn: sa.Connection, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    schema = schema_for_engine(conn.engine)
     stmt = sa.select(schema.price_daily).where(
         and_(
             schema.price_daily.c.code == code,
@@ -2223,63 +2224,87 @@ def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date
             schema.price_daily.c.date <= end_date,
         )
     ).order_by(schema.price_daily.c.date)
-    with engine.connect() as conn:
-        result = conn.execute(stmt)
-        rows = result.fetchall()
-        return [
-            {
-                "date": row.date.strftime("%Y%m%d"),
-                "open": float(row.open) if row.open else None,
-                "high": float(row.high) if row.high else None,
-                "low": float(row.low) if row.low else None,
-                "close": float(row.close) if row.close else None,
-                "volume": float(row.volume) if row.volume else None,
-                "value": float(row.value) if row.value else None,
-            }
-            for row in rows
-        ]
+    result = conn.execute(stmt)
+    rows = result.fetchall()
+    return [
+        {
+            "date": row.date.strftime("%Y%m%d"),
+            "open": float(row.open) if row.open else None,
+            "high": float(row.high) if row.high else None,
+            "low": float(row.low) if row.low else None,
+            "close": float(row.close) if row.close else None,
+            "volume": float(row.volume) if row.volume else None,
+            "value": float(row.value) if row.value else None,
+        }
+        for row in rows
+    ]
+
+
+def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    def _op() -> List[Dict[str, Any]]:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            return load_price_daily_conn(conn, code, start_date, end_date)
+
+    return run_with_db_retry(
+        engine,
+        fn=_op,
+        operation="load_price_daily",
+        max_attempts=5,
+    )
+
+
+def upsert_price_daily_conn(conn: sa.Connection, candles: List[Dict[str, Any]], market: str, code: str) -> None:
+    if not candles:
+        return
+    schema = schema_for_engine(conn.engine)
+    for candle in candles:
+        payload = {
+            "market": market,
+            "code": code,
+            "date": candle["date"],
+            "open": candle.get("open"),
+            "high": candle.get("high"),
+            "low": candle.get("low"),
+            "close": candle.get("close"),
+            "volume": candle.get("volume"),
+            "value": candle.get("value"),
+            "source": "KIS",
+        }
+        conflict_cols = ["market", "code", "date"]
+        update_cols = {k: v for k, v in payload.items() if k not in conflict_cols}
+
+        if conn.dialect.name == "postgresql":
+            stmt = pg_insert(schema.price_daily).values(**payload).on_conflict_do_update(
+                index_elements=conflict_cols,
+                set_=update_cols
+            )
+            conn.execute(stmt)
+        else:
+            try:
+                conn.execute(sa.insert(schema.price_daily).values(**payload))
+            except IntegrityError:
+                where_clause = and_(
+                    schema.price_daily.c.market == market,
+                    schema.price_daily.c.code == code,
+                    schema.price_daily.c.date == candle["date"]
+                )
+                conn.execute(sa.update(schema.price_daily).where(where_clause).values(**update_cols))
 
 
 def upsert_price_daily(engine: Engine, candles: List[Dict[str, Any]], market: str, code: str) -> None:
     if not candles:
         return
-    schema = schema_for_engine(engine)
-    with engine.begin() as conn:
-        for candle in candles:
-            payload = {
-                "market": market,
-                "code": code,
-                "date": candle["date"],
-                "open": candle.get("open"),
-                "high": candle.get("high"),
-                "low": candle.get("low"),
-                "close": candle.get("close"),
-                "volume": candle.get("volume"),
-                "value": candle.get("value"),
-                "source": "KIS",
-            }
-            conflict_cols = ["market", "code", "date"]
-            update_cols = {k: v for k, v in payload.items() if k not in conflict_cols}
-            
-            if conn.dialect.name == "postgresql":
-                # Use PostgreSQL-specific upsert
-                stmt = pg_insert(schema.price_daily).values(**payload).on_conflict_do_update(
-                    index_elements=conflict_cols,
-                    set_=update_cols
-                )
-                conn.execute(stmt)
-            else:
-                # Fallback upsert for non-PostgreSQL dialects
-                try:
-                    conn.execute(sa.insert(schema.price_daily).values(**payload))
-                except IntegrityError:
-                    # Update existing row
-                    where_clause = and_(
-                        schema.price_daily.c.market == market,
-                        schema.price_daily.c.code == code,
-                        schema.price_daily.c.date == candle["date"]
-                    )
-                    conn.execute(sa.update(schema.price_daily).where(where_clause).values(**update_cols))
+
+    def _op() -> None:
+        with engine.begin() as conn:
+            upsert_price_daily_conn(conn, candles, market, code)
+
+    run_with_db_retry(
+        engine,
+        fn=_op,
+        operation="upsert_price_daily",
+        max_attempts=5,
+    )
 
 
 # Backward compatibility alias

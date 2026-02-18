@@ -14,7 +14,8 @@ from trader.time_utils import now_kst, prev_business_day
 from trader.universe.krx_safe import patch_pykrx_logging
 from trader.utils.ohlcv import normalize_ohlcv
 from trader.db.engine import make_engine
-from trader.db.repos import load_price_daily, upsert_price_daily
+from trader.db.repos import load_price_daily, load_price_daily_conn, upsert_price_daily, upsert_price_daily_conn
+from trader.db.retry import run_with_db_retry
 from trader.cache_ttl import daily_cache, DAILY_BAR_TTL_SEC
 from trader.rate_limit import get_kis_gate
 from trader.config import ALLOW_KIS_DAILY_FALLBACK, MARKET_MAP, is_diag_mode
@@ -425,8 +426,7 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
 
     date_min = min(dates)
     date_max = max(dates)
-    inserted = 0
-    updated = 0
+    symbol_candles: list[tuple[str, list[dict]]] = []
 
     for symbol in clean_symbols:
         df = fdr.DataReader(symbol, start=date_min, end=date_max)
@@ -437,9 +437,6 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
         df = df[df["Date"].dt.date.isin(dates)]
         if df.empty:
             continue
-
-        existing = load_price_daily(engine, symbol, date_min, date_max)
-        existing_dates = {str(row.get("date"))[:10] for row in existing}
 
         candles = []
         for _, row in df.iterrows():
@@ -459,15 +456,32 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
                 }
             )
 
-        if not candles:
-            continue
+        if candles:
+            symbol_candles.append((symbol, candles))
 
-        new_dates = {c["date"] for c in candles}
-        inserted += len(new_dates - existing_dates)
-        updated += len(new_dates & existing_dates)
+    def _apply_db_changes() -> tuple[int, int]:
+        inserted_local = 0
+        updated_local = 0
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            for symbol, candles in symbol_candles:
+                existing = load_price_daily_conn(conn, symbol, date_min, date_max)
+                existing_dates = {str(row.get("date"))[:10] for row in existing}
 
-        market = MARKET_MAP.get(symbol, "KOSPI")
-        upsert_price_daily(engine, candles, market, symbol)
+                new_dates = {c["date"] for c in candles}
+                inserted_local += len(new_dates - existing_dates)
+                updated_local += len(new_dates & existing_dates)
+
+                market = MARKET_MAP.get(symbol, "KOSPI")
+                upsert_price_daily_conn(conn, candles, market, symbol)
+
+        return inserted_local, updated_local
+
+    inserted, updated = run_with_db_retry(
+        engine,
+        fn=_apply_db_changes,
+        operation="upsert_ohlcv_delta_db",
+        max_attempts=5,
+    )
 
     logger.info(
         "[OHLCV][DELTA_UPSERT] symbols=%s days=%s dates=%s inserted=%s updated=%s",

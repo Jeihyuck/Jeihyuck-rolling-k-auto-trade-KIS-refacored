@@ -104,6 +104,15 @@ on:
         description: "1=always rebuild universe for as_of even if already exists"
         required: true
         default: "1"
+      DB_MIGRATE_MODE:
+        description: "auto | always | off (auto=run only when pending migration exists)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - always
+          - off
 
 permissions:
   contents: read
@@ -159,6 +168,7 @@ env:
   UNIVERSE_NO_FALLBACK: "1"
   UNIVERSE_BUILD_IF_MISSING: "1"
   UNIVERSE_FORCE_REBUILD_ALWAYS: "1"
+  DB_MIGRATE_MODE: "auto"
 
 jobs:
   resolve:
@@ -319,6 +329,7 @@ jobs:
       UNIVERSE_NO_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_NO_FALLBACK || '1' }}
       UNIVERSE_BUILD_IF_MISSING: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_BUILD_IF_MISSING || '1' }}
       UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '1' }}
+      DB_MIGRATE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.DB_MIGRATE_MODE || 'auto' }}
 
       # universe flags (legacy aliases)
       EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
@@ -431,11 +442,82 @@ jobs:
           echo "UNIVERSE_NO_FALLBACK: ${UNIVERSE_NO_FALLBACK:-}"
           echo "UNIVERSE_BUILD_IF_MISSING: ${UNIVERSE_BUILD_IF_MISSING:-}"
           echo "UNIVERSE_FORCE_REBUILD_ALWAYS: ${UNIVERSE_FORCE_REBUILD_ALWAYS:-}"
+          echo "DB_MIGRATE_MODE: ${DB_MIGRATE_MODE:-auto}"
           echo "ALLOW_LIVE_GATE: ${ALLOW_LIVE_GATE}"
           echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
           echo "DRYRUN: ${DRYRUN}"
           echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
           echo "======================================"
+
+      - name: Decide DB migrate plan
+        id: db_migrate_plan
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          mode_raw="${DB_MIGRATE_MODE:-auto}"
+          mode="$(echo "${mode_raw}" | tr '[:upper:]' '[:lower:]')"
+
+          if [[ "${mode}" == "always" ]]; then
+            echo "should_migrate=1" >> "$GITHUB_OUTPUT"
+            echo "reason=forced_always" >> "$GITHUB_OUTPUT"
+            echo "pending_count=-1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${mode}" == "off" ]]; then
+            echo "should_migrate=0" >> "$GITHUB_OUTPUT"
+            echo "reason=forced_off" >> "$GITHUB_OUTPUT"
+            echo "pending_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python - <<'PY' > /tmp/db_migrate_plan.out
+          import glob
+          import os
+          import sqlalchemy as sa
+          from trader.db.engine import make_engine
+
+          files = sorted(
+              os.path.basename(path)
+              for path in glob.glob("migrations/*.sql")
+              if os.path.isfile(path)
+          )
+          if not files:
+              print("should_migrate=0")
+              print("reason=no_migration_files")
+              print("pending_count=0")
+              raise SystemExit(0)
+
+          engine = make_engine()
+          with engine.begin() as conn:
+              conn.exec_driver_sql(
+                  """
+                  CREATE TABLE IF NOT EXISTS schema_migrations (
+                      version TEXT PRIMARY KEY,
+                      applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                  )
+                  """
+              )
+              applied = {row[0] for row in conn.execute(sa.text("SELECT version FROM schema_migrations"))}
+
+          pending = [version for version in files if version not in applied]
+          print(f"should_migrate={1 if pending else 0}")
+          print(f"reason={'pending_found' if pending else 'no_pending'}")
+          print(f"pending_count={len(pending)}")
+          PY
+
+          cat /tmp/db_migrate_plan.out >> "$GITHUB_OUTPUT"
+          echo "[DB][MIGRATE][PLAN] $(cat /tmp/db_migrate_plan.out | tr '\n' ' ')"
+
+      - name: Set MIGRATE_MODE=OFF when no pending
+        if: ${{ steps.db_migrate_plan.outputs.should_migrate != '1' }}
+        run: |
+          set -euo pipefail
+          echo "MIGRATE_MODE=OFF" >> "$GITHUB_ENV"
+          echo "[DB][MIGRATE][SKIP] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
 
       - name: Dump key env (universe/candidate)
         run: |
@@ -509,9 +591,12 @@ jobs:
           
           echo "======================================"
 
-      - name: DB migrate
+      - name: DB migrate (conditional)
+        if: ${{ steps.db_migrate_plan.outputs.should_migrate == '1' }}
         run: |
           set -euo pipefail
+          echo "MIGRATE_MODE=AUTO" >> "$GITHUB_ENV"
+          echo "[DB][MIGRATE][RUN] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
           python -m trader.db.migrate
 
       - name: Run (mode switch)
@@ -563,7 +648,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/repo
         run: |
           set -euo pipefail
-          python -m trader.db.migrate
           python -m trader.minervini_runner
 
       - name: Fail if as_of universe missing after ensure/build (prep)
