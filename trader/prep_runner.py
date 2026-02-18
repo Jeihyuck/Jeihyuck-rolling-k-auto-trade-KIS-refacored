@@ -17,7 +17,11 @@ from trader.db.repos import LedgerEventsRepo, UniverseRepo, WatchlistRepo
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import build_and_save_watchlist
-from trader.data.ohlcv_provider import compute_required_prefetch_days, upsert_ohlcv_delta
+from trader.data.ohlcv_provider import (
+    compute_required_prefetch_days,
+    find_symbols_with_insufficient_history,
+    upsert_ohlcv_delta,
+)
 from trader.exporter import export_watchlist_bundle
 from trader.report.pdf_report import generate_watchlist_pdf
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
@@ -226,7 +230,10 @@ def main() -> int:
         symbols.append(bench)
 
     t_ohlcv = time.monotonic()
+    prefetch_mode = os.getenv("OHLCV_PREFETCH_MODE", "auto").strip().lower()
     prefetch_days = int(os.getenv("PREFETCH_DAYS", "5"))
+    delta_days = max(1, int(os.getenv("OHLCV_DELTA_DAYS", "5")))
+    auto_min_history_days = max(1, int(os.getenv("OHLCV_AUTO_MIN_HISTORY_DAYS", "150")))
     vcp_lookback = int(os.getenv("MINERVINI_BASE_LOOKBACK_MAX", "80"))
     rs_lookbacks = [
         int(os.getenv("RS_LOOKBACK_DAYS", "63")),
@@ -239,18 +246,57 @@ def main() -> int:
     )
 
     logger.info(
-        "[PREP][PHASE] ohlcv_delta_upsert_start symbols=%s need_days=%s benchmark=%s",
+        "[PREP][PHASE] ohlcv_prefetch_start symbols=%s mode=%s prefetch_days=%s delta_days=%s need_days=%s benchmark=%s",
         len(symbols),
+        prefetch_mode,
+        prefetch_days,
+        delta_days,
         need_days,
         bench,
     )
 
-    delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=int(need_days))
+    if prefetch_mode not in {"auto", "full", "delta"}:
+        logger.warning("[PREP][OHLCV][MODE_INVALID] mode=%s -> fallback=auto", prefetch_mode)
+        prefetch_mode = "auto"
+
+    delta_result = {"symbols": 0, "inserted": 0, "updated": 0, "failed": 0, "failed_symbols": [], "dates": []}
+    full_result = {"symbols": 0, "inserted": 0, "updated": 0, "failed": 0, "failed_symbols": [], "dates": []}
+
+    if prefetch_mode == "delta":
+        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
+    elif prefetch_mode == "full":
+        full_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=int(need_days))
+    else:
+        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
+        insufficient_symbols, _ = find_symbols_with_insufficient_history(
+            symbols=symbols,
+            as_of=as_of,
+            min_history_days=auto_min_history_days,
+        )
+        logger.info(
+            "[PREP][OHLCV][AUTO_CHECK] min_history_days=%s insufficient=%s/%s",
+            auto_min_history_days,
+            len(insufficient_symbols),
+            len(symbols),
+        )
+        if insufficient_symbols:
+            sample = sorted(insufficient_symbols)[:10]
+            logger.warning(
+                "[PREP][OHLCV][AUTO_BACKFILL] symbols=%s need_days=%s sample=%s",
+                len(insufficient_symbols),
+                need_days,
+                sample,
+            )
+            full_result = upsert_ohlcv_delta(symbols=insufficient_symbols, as_of=as_of, days=int(need_days))
+        else:
+            logger.info("[PREP][OHLCV][AUTO_BACKFILL] skipped (all symbols have enough history)")
+
     logger.info(
-        "[OHLCV][PREFETCH_DONE] symbols=%s days>=%s benchmark=%s",
-        len(symbols),
-        need_days,
+        "[OHLCV][PREFETCH_DONE] mode=%s benchmark=%s delta=%s full=%s",
+        prefetch_mode,
         bench,
+        to_jsonable(delta_result),
+        to_jsonable(full_result),
     )
 
     dt_ohlcv = time.monotonic() - t_ohlcv
@@ -467,7 +513,9 @@ def main() -> int:
         {
             "as_of": as_of.isoformat(),
             "symbols": len(symbols),
+            "ohlcv_prefetch_mode": prefetch_mode,
             "delta": delta_result,
+            "full": full_result,
             "derived_upserted": derived_upserted,
             "pool_size": len(pool_codes or []),
             "watchlist_size": len(watchlist or []),

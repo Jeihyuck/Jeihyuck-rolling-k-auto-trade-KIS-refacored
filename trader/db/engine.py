@@ -77,7 +77,7 @@ def _connect_args_for_db_url(db_url: str) -> dict:
       -> prepare_threshold=None
     """
     connect_args: dict = {
-        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "15")),
         "keepalives": int(os.getenv("DB_KEEPALIVES", "1")),
         "keepalives_idle": int(os.getenv("DB_KEEPALIVES_IDLE", "30")),
         "keepalives_interval": int(os.getenv("DB_KEEPALIVES_INTERVAL", "10")),
@@ -104,7 +104,7 @@ def make_engine() -> sa.Engine:
             connect_args=connect_args,
             execution_options={"compiled_cache": None},
             pool_pre_ping=True,
-            pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "180")),
+            pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
             pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),

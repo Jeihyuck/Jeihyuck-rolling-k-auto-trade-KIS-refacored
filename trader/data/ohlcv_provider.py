@@ -408,6 +408,33 @@ def _recent_trading_dates(as_of: date, days: int) -> list[date]:
     return sorted(dates)
 
 
+def find_symbols_with_insufficient_history(
+    *,
+    symbols: list[str],
+    as_of: date,
+    min_history_days: int = 150,
+) -> tuple[list[str], dict[str, int]]:
+    """Return symbols with insufficient OHLCV history and per-symbol row counts."""
+    engine = make_engine()
+    clean_symbols = [str(s).zfill(6) for s in symbols if s]
+    if not clean_symbols:
+        return [], {}
+
+    need_rows = max(1, int(min_history_days))
+    start_date = as_of - timedelta(days=max(need_rows * 3, need_rows + 30))
+    counts: dict[str, int] = {}
+    insufficient: list[str] = []
+
+    for symbol in clean_symbols:
+        candles = load_price_daily(engine, symbol, start_date, as_of)
+        rows = len(candles)
+        counts[symbol] = rows
+        if rows < need_rows:
+            insufficient.append(symbol)
+
+    return insufficient, counts
+
+
 def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dict:
     """Fetch recent trading days only and upsert to DB."""
     if os.getenv("MODE") == "trade" and days >= 260:
@@ -548,40 +575,57 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1.0)
 
+    failed_symbols: list[str] = []
+
     def _apply_db_changes() -> tuple[int, int]:
         inserted_local = 0
         updated_local = 0
-        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            for symbol, candles in symbol_candles:
-                existing = load_price_daily_conn(conn, symbol, date_min, date_max)
-                existing_dates = {str(row.get("date"))[:10] for row in existing}
+        for symbol, candles in symbol_candles:
+            def _apply_symbol() -> tuple[int, int]:
+                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                    existing = load_price_daily_conn(conn, symbol, date_min, date_max)
+                    existing_dates = {str(row.get("date"))[:10] for row in existing}
+                    new_dates = {c["date"] for c in candles}
 
-                new_dates = {c["date"] for c in candles}
-                inserted_local += len(new_dates - existing_dates)
-                updated_local += len(new_dates & existing_dates)
+                    market = MARKET_MAP.get(symbol, "KOSPI")
+                    upsert_price_daily_conn(conn, candles, market, symbol)
+                    return len(new_dates - existing_dates), len(new_dates & existing_dates)
 
-                market = MARKET_MAP.get(symbol, "KOSPI")
-                upsert_price_daily_conn(conn, candles, market, symbol)
+            try:
+                inserted_one, updated_one = run_with_db_retry(
+                    engine,
+                    fn=_apply_symbol,
+                    operation=f"upsert_ohlcv_delta_db:{symbol}",
+                    max_attempts=5,
+                )
+                inserted_local += inserted_one
+                updated_local += updated_one
+            except Exception as exc:
+                failed_symbols.append(symbol)
+                logger.warning("[OHLCV][DELTA_UPSERT][DB_FAIL] symbol=%s err=%s", symbol, exc)
 
         return inserted_local, updated_local
 
-    inserted, updated = run_with_db_retry(
-        engine,
-        fn=_apply_db_changes,
-        operation="upsert_ohlcv_delta_db",
-        max_attempts=5,
-    )
+    inserted, updated = _apply_db_changes()
 
     logger.info(
-        "[OHLCV][DELTA_UPSERT][DONE] symbols=%s days=%s dates=%s inserted=%s updated=%s elapsed_total=%.1fs",
+        "[OHLCV][DELTA_UPSERT][DONE] symbols=%s days=%s dates=%s inserted=%s updated=%s failed=%s elapsed_total=%.1fs",
         len(clean_symbols),
         days,
         [d.isoformat() for d in dates],
         inserted,
         updated,
+        len(failed_symbols),
         time.monotonic() - ts0,
     )
-    return {"symbols": len(clean_symbols), "inserted": inserted, "updated": updated, "dates": dates}
+    return {
+        "symbols": len(clean_symbols),
+        "inserted": inserted,
+        "updated": updated,
+        "failed": len(failed_symbols),
+        "failed_symbols": failed_symbols,
+        "dates": dates,
+    }
 
 
 def ensure_ohlcv_history(*, symbols: list[str], lookback_days: int = 520) -> None:

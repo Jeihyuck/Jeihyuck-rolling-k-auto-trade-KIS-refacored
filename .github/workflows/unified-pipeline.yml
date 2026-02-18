@@ -32,6 +32,15 @@ on:
         description: "Delta days for OHLCV (default 5)"
         required: true
         default: "5"
+      OHLCV_PREFETCH_MODE:
+        description: "auto | full | delta (auto=history sufficient면 delta만)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - full
+          - delta
       FORCE_CANDIDATE:
         description: "1=force rebuild candidate pool"
         required: true
@@ -91,7 +100,7 @@ on:
       UNIVERSE_FORCE_REBUILD:
         description: "1=force rebuild universe for as_of"
         required: true
-        default: "1"
+        default: "0"
       UNIVERSE_NO_FALLBACK:
         description: "1=disable universe fallback and require exact as_of"
         required: true
@@ -103,7 +112,7 @@ on:
       UNIVERSE_FORCE_REBUILD_ALWAYS:
         description: "1=always rebuild universe for as_of even if already exists"
         required: true
-        default: "1"
+        default: "0"
       DB_MIGRATE_MODE:
         description: "auto | always | off (auto=run only when pending migration exists)"
         required: true
@@ -118,8 +127,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: unified-single-yml
-  cancel-in-progress: false
+  group: pb1-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MODE || 'auto' }}
+  cancel-in-progress: true
 
 env:
   TZ: Asia/Seoul
@@ -134,6 +143,7 @@ env:
   # ✅ Delta 기본: 최근 5일 델타 (전일 누락 흡수용)
   PREFETCH_DAYS: "5"
   OHLCV_DELTA_DAYS: "5"
+  OHLCV_PREFETCH_MODE: "auto"
 
   # ✅ RS Benchmark backfill (229200 KOSPI 지수)
   RS_BENCHMARK: "229200"
@@ -167,7 +177,7 @@ env:
   CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
   UNIVERSE_NO_FALLBACK: "1"
   UNIVERSE_BUILD_IF_MISSING: "1"
-  UNIVERSE_FORCE_REBUILD_ALWAYS: "1"
+  UNIVERSE_FORCE_REBUILD_ALWAYS: "0"
   DB_MIGRATE_MODE: "auto"
 
 jobs:
@@ -277,7 +287,7 @@ jobs:
   run:
     needs: [resolve]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
     defaults:
       run:
         shell: bash
@@ -310,6 +320,7 @@ jobs:
       # ✅ delta 기본(수동입력 있으면 override)
       PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.PREFETCH_DAYS || '1' }}
       OHLCV_DELTA_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_DELTA_DAYS || '5' }}
+      OHLCV_PREFETCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_PREFETCH_MODE || 'auto' }}
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
@@ -328,7 +339,7 @@ jobs:
       UNIVERSE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
       UNIVERSE_NO_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_NO_FALLBACK || '1' }}
       UNIVERSE_BUILD_IF_MISSING: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_BUILD_IF_MISSING || '1' }}
-      UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '1' }}
+      UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '0' }}
       DB_MIGRATE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.DB_MIGRATE_MODE || 'auto' }}
 
       # universe flags (legacy aliases)
@@ -436,6 +447,7 @@ jobs:
           echo "ENV: ${STRATEGY_ENV}"
           echo "PREFETCH_DAYS: ${PREFETCH_DAYS}"
           echo "OHLCV_DELTA_DAYS: ${OHLCV_DELTA_DAYS}"
+          echo "OHLCV_PREFETCH_MODE: ${OHLCV_PREFETCH_MODE}"
           echo "FORCE_CANDIDATE: ${FORCE_CANDIDATE}"
           echo "UNIVERSE_EMERGENCY_BUILD: ${UNIVERSE_EMERGENCY_BUILD:-}"
           echo "UNIVERSE_FORCE_REBUILD: ${UNIVERSE_FORCE_REBUILD:-}"
