@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import date
 from pathlib import Path
@@ -168,6 +169,29 @@ def generate_watchlist_pdf(
     story.append(Paragraph("Unified Watchlist Pipeline Report", styles['KoreanTitle']))
     story.append(Paragraph(f"Date: {as_of.strftime('%Y-%m-%d')}", styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
+
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            val = float(value)
+            if math.isnan(val) or math.isinf(val):
+                return default
+            return val
+        except Exception:
+            return default
+
+    def _fmt_float(value: Any, digits: int = 1, default: str = "N/A") -> str:
+        val = _to_float(value, float("nan"))
+        if math.isnan(val) or math.isinf(val):
+            return default
+        return f"{val:.{digits}f}"
+
+    def _fmt_pct(value: Any, digits: int = 2, default: str = "N/A") -> str:
+        val = _to_float(value, float("nan"))
+        if math.isnan(val) or math.isinf(val):
+            return default
+        return f"{val:.{digits}%}"
     
     # 요약
     story.append(Paragraph("Selection Summary", styles['KoreanHeading2']))
@@ -203,9 +227,9 @@ def generate_watchlist_pdf(
                     [
                         str(item.get("rank", "-")),
                         str(item.get("code", "-")),
-                        f"{float(item.get('tech_score', 0) or 0):.1f}",
-                        f"{float(item.get('flow_score', 0) or 0):.3f}",
-                        f"{float(item.get('final_score', item.get('score', 0)) or 0):.1f}",
+                        _fmt_float(item.get("tech_score", 0), digits=1, default="0.0"),
+                        _fmt_float(item.get("flow_score", 0), digits=3, default="0.000"),
+                        _fmt_float(item.get("final_score", item.get("score", 0)), digits=1, default="0.0"),
                         reject_txt,
                     ]
                 )
@@ -248,17 +272,23 @@ def generate_watchlist_pdf(
         scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
         reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
         
+        rs_display = item.get("rs_pctile", scores.get("rs_pctile", notes.get("rs_pctile", 0)))
+        vcp_display = item.get("vcp_score", scores.get("vcp_score", notes.get("vcp_score", 0)))
+        pullback_display = item.get("pullback_pct", notes.get("pullback_pct", 0))
+        foreign_display = item.get("foreign_20_ratio", notes.get("foreign_net_20d", 0))
+        inst_display = item.get("inst_20_ratio", notes.get("inst_net_20d", 0))
+
         detail_text = f"""
         <b>#{i}: {item.get('code')} - {item.get('name', 'N/A')}</b><br/>
-        Final Score: {item.get('final_score', 0):.2f} (Tech: {item.get('tech_score', 0):.1f}, Flow: {item.get('flow_score', 0):.2f})<br/>
+        Final Score: {_fmt_float(item.get('final_score', 0), 2)} (Tech: {_fmt_float(item.get('tech_score', 0), 1)}, Flow: {_fmt_float(item.get('flow_score', 0), 2)})<br/>
         <br/>
         <b>Selection Reasons:</b><br/>
         - Trend Template: {'Yes' if scores.get('trend_template', 0) else 'No'}<br/>
-        - RS Percentile: {item.get('rs_pctile', scores.get('rs_pctile', notes.get('rs_pctile', 0))): .1f}<br/>
-        - VCP Score: {item.get('vcp_score', scores.get('vcp_score', notes.get('vcp_score', 0))):.1f}<br/>
-        - Pullback: {item.get('pullback_pct', notes.get('pullback_pct', 0)): .2%}<br/>
-        - Foreign 20D Flow: {item.get('foreign_20_ratio', notes.get('foreign_net_20d', 0)): .3f}<br/>
-        - Institutional 20D Flow: {item.get('inst_20_ratio', notes.get('inst_net_20d', 0)): .3f}<br/>
+        - RS Percentile: {_fmt_float(rs_display, 1)}<br/>
+        - VCP Score: {_fmt_float(vcp_display, 1)}<br/>
+        - Pullback: {_fmt_pct(pullback_display, 2)}<br/>
+        - Foreign 20D Flow: {_fmt_float(foreign_display, 3)}<br/>
+        - Institutional 20D Flow: {_fmt_float(inst_display, 3)}<br/>
         - Dollar Volume Rank: {scores.get('liquidity_rank', reasons.get('dollar_vol_rank', 'N/A'))}<br/>
         - Reject Reasons: {', '.join(reject_reasons) if reject_reasons else '-'}<br/>
         """

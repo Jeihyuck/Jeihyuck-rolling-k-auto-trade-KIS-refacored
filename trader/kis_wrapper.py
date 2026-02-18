@@ -191,6 +191,10 @@ def safe_strip(val):
     return str(val).strip()
 
 
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
@@ -568,8 +572,8 @@ class KisAPI:
     def __init__(self, kis_env: str | None = None, **kwargs):
         if kis_env is None and "env" in kwargs:
             kis_env = kwargs.pop("env")
-        self.CANO = safe_strip(CANO)
-        self.ACNT_PRDT_CD = safe_strip(ACNT_PRDT_CD)
+        self.CANO = _digits_only(safe_strip(CANO))
+        self.ACNT_PRDT_CD = _digits_only(safe_strip(ACNT_PRDT_CD))
         self.env = safe_strip(kis_env or KIS_ENV or "practice").lower()
         if self.env not in ("practice", "real"):
             self.env = "practice"
@@ -613,6 +617,27 @@ class KisAPI:
         # [NEW] 호가 조회 404 쿨다운 캐시
         self.askbid_unavailable_cache: Dict[str, float] = {}  # code -> unavailable_until_timestamp
         self.askbid_cooldown_sec = int(os.getenv("KIS_ASKBID_COOLDOWN_SEC", "3600"))  # 기본 1시간
+
+    def _account_param_meta(self) -> dict:
+        cano = _digits_only(self.CANO)
+        acnt = _digits_only(self.ACNT_PRDT_CD)
+        return {
+            "env": self.env,
+            "cano_len": len(cano),
+            "acnt_prdt_cd_len": len(acnt),
+            "cano_masked": f"***{cano[-4:]}" if len(cano) >= 4 else "***",
+            "acnt_prdt_cd": acnt,
+        }
+
+    def _validate_account_params(self) -> tuple[bool, str]:
+        meta = self._account_param_meta()
+        cano_len = int(meta.get("cano_len") or 0)
+        acnt_len = int(meta.get("acnt_prdt_cd_len") or 0)
+        if cano_len != 8:
+            return False, f"invalid_cano_len:{cano_len}"
+        if acnt_len != 2:
+            return False, f"invalid_acnt_prdt_cd_len:{acnt_len}"
+        return True, "ok"
 
     def _safe_mode_path(self) -> Path:
         path = botstate_path("runtime", "status", "kis_safe_mode.json")
@@ -2610,6 +2635,19 @@ class KisAPI:
         if not tr_list:
             raise RuntimeError("BALANCE TR 미구성")
         tr = tr_list[0]
+        ok, reason = self._validate_account_params()
+        if not ok:
+            meta = self._account_param_meta()
+            logger.error(
+                "[BALANCE][PARAM_INVALID] reason=%s env=%s cano_len=%s acnt_prdt_cd_len=%s cano=%s acnt_prdt_cd=%s",
+                reason,
+                meta.get("env"),
+                meta.get("cano_len"),
+                meta.get("acnt_prdt_cd_len"),
+                meta.get("cano_masked"),
+                meta.get("acnt_prdt_cd"),
+            )
+            raise KisPermanentError(f"BALANCE_ACCOUNT_PARAM_INVALID:{reason}")
         if os.getenv("KIS_FORCE_500_BALANCE", "0") == "1":
             logger.warning("[BALANCE][FORCE_500] env=KIS_FORCE_500_BALANCE=1 -> simulate temp error")
             _breaker_record_temp_failure("GET", url)
@@ -2632,7 +2670,21 @@ class KisAPI:
         logger.info(f"[잔고조회 요청파라미터] {params}")
         # [CHG] 안전요청 사용
         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
-        return resp.json()
+        payload = resp.json()
+        if str(payload.get("rt_cd") or "") != "0":
+            meta = self._account_param_meta()
+            logger.error(
+                "[BALANCE][API_FAIL] rt_cd=%s msg_cd=%s msg1=%s env=%s cano_len=%s acnt_prdt_cd_len=%s cano=%s acnt_prdt_cd=%s",
+                payload.get("rt_cd"),
+                payload.get("msg_cd"),
+                payload.get("msg1"),
+                meta.get("env"),
+                meta.get("cano_len"),
+                meta.get("acnt_prdt_cd_len"),
+                meta.get("cano_masked"),
+                meta.get("acnt_prdt_cd"),
+            )
+        return payload
 
     def inquire_balance_all(self, *, max_empty_retry: int = 2) -> dict:
         """

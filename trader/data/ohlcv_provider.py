@@ -500,3 +500,15 @@ def ensure_ohlcv_history(*, symbols: list[str], lookback_days: int = 520) -> Non
         strategy=os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool"),
         as_of=now_kst().date(),
     )
+
+
+def compute_required_prefetch_days(
+    *,
+    prefetch_days: int,
+    vcp_lookback: int,
+    rs_lookbacks: list[int],
+) -> int:
+    """Compute minimum OHLCV days needed for watchlist/derived metrics."""
+    sanitized_rs = [int(x) for x in rs_lookbacks if int(x) > 0]
+    rs_need = (max(sanitized_rs) + 50) if sanitized_rs else 120
+    return int(max(int(prefetch_days), int(vcp_lookback) + 50, rs_need, 252 + 50))

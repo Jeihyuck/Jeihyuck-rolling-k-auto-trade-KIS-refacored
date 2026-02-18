@@ -17,7 +17,7 @@ from trader.db.repos import LedgerEventsRepo, UniverseRepo, WatchlistRepo
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import build_and_save_watchlist
-from trader.data.ohlcv_provider import upsert_ohlcv_delta
+from trader.data.ohlcv_provider import compute_required_prefetch_days, upsert_ohlcv_delta
 from trader.exporter import export_watchlist_bundle
 from trader.report.pdf_report import generate_watchlist_pdf
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
@@ -197,6 +197,7 @@ def main() -> int:
     run_migrations(engine)
 
     env = os.getenv("STRATEGY_ENV", "practice").lower()
+    mode = os.getenv("MODE", "prep").strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     as_of = _pick_as_of_date_always_prev()
 
@@ -219,19 +220,26 @@ def main() -> int:
     if bench and bench not in symbols:
         symbols.append(bench)
 
-    # Use a longer backfill window for benchmark so RS lookbacks never fail.
-    # RS rank requires ~127 trading days; use 260/520 to be safe.
-    bench_days = int(os.getenv("BENCH_OHLCV_DAYS", "520"))
-
     t_ohlcv = time.monotonic()
-    delta_days = int(os.getenv("OHLCV_DELTA_DAYS", "1"))
+    prefetch_days = int(os.getenv("PREFETCH_DAYS", "5"))
+    vcp_lookback = int(os.getenv("MINERVINI_BASE_LOOKBACK_MAX", "80"))
+    rs_lookbacks = [
+        int(os.getenv("RS_LOOKBACK_DAYS", "63")),
+        int(os.getenv("RS_LOOKBACK2_DAYS", "126")),
+    ]
+    need_days = compute_required_prefetch_days(
+        prefetch_days=prefetch_days,
+        vcp_lookback=vcp_lookback,
+        rs_lookbacks=rs_lookbacks,
+    )
 
-    # 1) universe + bench: recent delta
-    delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
-
-    # 2) benchmark: long backfill (only for bench) to satisfy RS required window
-    if bench and bench_days > delta_days:
-        upsert_ohlcv_delta(symbols=[bench], as_of=as_of, days=bench_days)
+    delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=int(need_days))
+    logger.info(
+        "[OHLCV][PREFETCH_DONE] symbols=%s days>=%s benchmark=%s",
+        len(symbols),
+        need_days,
+        bench,
+    )
 
     dt_ohlcv = time.monotonic() - t_ohlcv
 
@@ -246,6 +254,12 @@ def main() -> int:
 
     t_pool = time.monotonic()
     force_candidate = os.getenv("FORCE_CANDIDATE", "0") == "1"
+    watchlist_force_rebuild = (
+        force_candidate
+        or _env_true("WATCHLIST_FORCE_REBUILD", "0")
+        or _env_true("PB1_WATCHLIST_FORCE_REBUILD", "0")
+        or mode == "minervini_test"
+    )
 
     def _pool_ohlcv(code: str, days: int = 80):
         return _load_db_ohlcv_df(engine=engine, code=code, as_of=as_of, count=days)
@@ -281,7 +295,7 @@ def main() -> int:
             "rs_min_pctile": minervini_cfg.rs_min_percentile,
             "vcp_min_score": float(os.getenv("VCP_MIN_SCORE", "70")),
         },
-        force_rebuild=bool(force_candidate),
+        force_rebuild=bool(watchlist_force_rebuild),
         flow_provider=flow_provider,
         return_bundle=True,
     )
@@ -337,6 +351,26 @@ def main() -> int:
     if not shortage_reason and len(watchlist) < finaln:
         shortage_reason = f"pipeline_shortage:{len(watchlist)}<{finaln}"
 
+    watchlist_repo = WatchlistRepo(engine)
+    watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+    if watchlist:
+        watchlist_repo.save_watchlist(
+            env=env,
+            strategy=watchlist_final_strategy,
+            as_of=as_of,
+            members=watchlist,
+        )
+        logger.info(
+            "[PREP][WATCHLIST_FINAL][SAVE] strategy=%s as_of=%s n=%s",
+            watchlist_final_strategy,
+            as_of,
+            len(watchlist),
+        )
+
+    run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
+    os.environ["TRADER_RUN_ID"] = run_id
+    ledger_repo = LedgerEventsRepo(engine)
+
     export_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
@@ -358,6 +392,52 @@ def main() -> int:
             "degrade": watchlist_bundle.get("degrade", {}),
         },
     )
+
+    final_df = frames.get("final30", pd.DataFrame())
+    if final_df is None or final_df.empty:
+        logger.error("[PREP][DEGRADED] reason=empty_final30 as_of=%s", as_of)
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_DEGRADED",
+            ts=now_kst(),
+            ok=False,
+            reasons=["empty_final30"],
+            payload_json={"as_of": as_of.isoformat(), "final_count": 0},
+        )
+        return 1
+
+    metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
+    available_cols = [col for col in metric_cols if col in final_df.columns]
+    if available_cols:
+        sample = final_df[available_cols].fillna(0.0)
+        zero_ratio = float((sample == 0.0).all(axis=1).mean()) if len(sample) > 0 else 1.0
+        if zero_ratio >= 0.8:
+            logger.error(
+                "[PREP][DEGRADED] reason=metrics_mostly_zero ratio=%.3f as_of=%s",
+                zero_ratio,
+                as_of,
+            )
+            ledger_repo.append_event(
+                env=env,
+                run_id=run_id,
+                strategy="pb1_pullback_close",
+                run_window="prep",
+                event_type="PREP_DEGRADED",
+                ts=now_kst(),
+                ok=False,
+                reasons=["metrics_mostly_zero"],
+                payload_json={
+                    "as_of": as_of.isoformat(),
+                    "zero_ratio": zero_ratio,
+                    "metric_cols": available_cols,
+                    "final_count": int(len(sample)),
+                },
+            )
+            return 1
+
     try:
         pdf_path = generate_watchlist_pdf(
             as_of=as_of,
@@ -371,10 +451,6 @@ def main() -> int:
         logger.info("[PDF] wrote %s", pdf_path)
     except Exception:
         logger.exception("[REPORT][WATCHLIST][PDF][FAIL] as_of=%s output_dir=%s", as_of, export_dir)
-
-    run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
-    os.environ["TRADER_RUN_ID"] = run_id
-    ledger_repo = LedgerEventsRepo(engine)
     payload = to_jsonable(
         {
             "as_of": as_of.isoformat(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import Any
 from pathlib import Path
@@ -86,7 +87,7 @@ def _normalize_code(value: Any) -> str:
 
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
-    run_id = ctx.run_id
+    run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
     strategy = ctx.strategy
     today = now_kst().strftime("%Y%m%d")
     degraded_reason: str | None = None
@@ -215,12 +216,13 @@ def reconcile_kis(
         logger.error("[KIS][HTTP][FAIL_SOFT] step=holdings err=%s", exc, exc_info=True)
         holdings_rows = []
 
+    ctx: RunContext | None = None
     try:
-        ctx = RunContext(
-            run_id=run_id or "unknown",
-            env=env,
+        exec_mode = "LIVE" if env == "real" else "DIAG"
+        ctx = RunContext.new(
+            account_env=env,
+            exec_mode=exec_mode,
             strategy=strategy,
-            started_at=tick_ts,
             dry_run=False,
         )
         reconcile_result = reconcile_today(engine=engine, kis=kis, ctx=ctx)
@@ -273,10 +275,11 @@ def reconcile_kis(
         )
 
     reconcile_repo = ReconcileLogRepo(engine)
-    reconcile_repo.append_log_from_context(
-        ctx=ctx,
-        action="reconcile_kis",
+    reconcile_repo.append_log(
+        env=env,
+        strategy=strategy,
         tick_ts=now_kst(),
+        action="reconcile_kis",
         details_json={
             "orders": orders_count,
             "fills": fills_count,
@@ -285,6 +288,7 @@ def reconcile_kis(
             "holdings_error": holdings_error,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
+            "run_id": run_id,
         },
     )
     reconcile_result.update(

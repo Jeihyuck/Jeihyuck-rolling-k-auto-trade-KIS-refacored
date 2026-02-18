@@ -11,7 +11,7 @@ import pandas as pd
 from sqlalchemy import Engine
 
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
-from trader.db.repos import WatchlistRepo
+from trader.db.repos import DerivedMinerviniRepo, WatchlistRepo
 from trader.flow_score import calculate_final_score, calculate_flow_score
 from trader.time_coerce import to_date
 
@@ -59,6 +59,236 @@ def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     _map_if_missing("low", ["low_price", "stck_lwpr"])
     _map_if_missing("volume", ["vol", "trade_volume", "acml_vol", "acml_volm"])
     return normalized
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            cleaned = value.replace(",", "").strip()
+            if cleaned == "":
+                return default
+            return float(cleaned)
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
+    features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
+
+    close = _safe_float(derived_row.get("close"), 0.0)
+    ma50 = _safe_float(derived_row.get("ma50"), 0.0)
+    ma150 = _safe_float(derived_row.get("ma150"), 0.0)
+    ma200 = _safe_float(derived_row.get("ma200"), 0.0)
+    trend_checks = [
+        close > ma50 > 0,
+        ma50 > ma150 > 0,
+        ma150 > ma200 > 0,
+        close > ma200 > 0,
+    ]
+    trend_score = float(sum(1 for check in trend_checks if check) * 25.0)
+
+    hi_52w = _safe_float(derived_row.get("hi_52w"), _safe_float(features.get("hi_52w"), 0.0))
+    pullback_pct = 0.0
+    if hi_52w > 0 and close > 0:
+        pullback_pct = max(0.0, (hi_52w - close) / hi_52w)
+    else:
+        pullback_pct = _safe_float(features.get("pullback_pct"), 0.0)
+
+    return {
+        "rs_pctile": _safe_float(derived_row.get("rs_percentile"), _safe_float(features.get("rs_percentile"), 0.0)),
+        "vcp_score": _safe_float(derived_row.get("vcp_score"), _safe_float(features.get("vcp_score"), 0.0)),
+        "atr_pct": _safe_float(derived_row.get("atr_pct"), _safe_float(features.get("atr_pct"), 0.0)),
+        "trend_score": trend_score,
+        "pullback_pct": pullback_pct,
+    }
+
+
+def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(item)
+    out["code"] = str(out.get("code") or "").zfill(6)
+    meta = dict(out.get("meta") or {})
+    meta["code"] = out["code"]
+
+    for key in (
+        "as_of",
+        "rs_pctile",
+        "vcp_score",
+        "atr_pct",
+        "trend_score",
+        "pullback_pct",
+        "flow_score",
+        "tech_score",
+        "final_score",
+        "foreign_20_ratio",
+        "inst_20_ratio",
+    ):
+        if key in out and out.get(key) is not None:
+            meta[key] = out.get(key)
+        elif key in meta and meta.get(key) is not None:
+            out[key] = meta.get(key)
+
+    out["rows"] = _safe_int(out.get("rows", meta.get("rows", 0)), 0)
+    meta["rows"] = out["rows"]
+
+    out["rs_pctile"] = _safe_float(out.get("rs_pctile", meta.get("rs_pctile", 0.0)), 0.0)
+    out["vcp_score"] = _safe_float(out.get("vcp_score", meta.get("vcp_score", 0.0)), 0.0)
+    out["atr_pct"] = _safe_float(out.get("atr_pct", meta.get("atr_pct", 0.0)), 0.0)
+    out["trend_score"] = _safe_float(out.get("trend_score", meta.get("trend_score", 0.0)), 0.0)
+    out["pullback_pct"] = _safe_float(out.get("pullback_pct", meta.get("pullback_pct", 0.0)), 0.0)
+    out["flow_score"] = _safe_float(out.get("flow_score", meta.get("flow_score", 0.0)), 0.0)
+    out["tech_score"] = _safe_float(out.get("tech_score", meta.get("tech_score", out.get("score", 0.0))), 0.0)
+    out["final_score"] = _safe_float(out.get("final_score", meta.get("final_score", out.get("score", 0.0))), 0.0)
+    out["foreign_20_ratio"] = _safe_float(out.get("foreign_20_ratio", meta.get("foreign_20_ratio", 0.0)), 0.0)
+    out["inst_20_ratio"] = _safe_float(out.get("inst_20_ratio", meta.get("inst_20_ratio", 0.0)), 0.0)
+
+    for key in (
+        "rs_pctile",
+        "vcp_score",
+        "atr_pct",
+        "trend_score",
+        "pullback_pct",
+        "flow_score",
+        "tech_score",
+        "final_score",
+        "foreign_20_ratio",
+        "inst_20_ratio",
+    ):
+        meta[key] = out[key]
+
+    out["meta"] = meta
+    return out
+
+
+def _enrich_watchlist_rows(
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    rows: List[Dict[str, Any]],
+    flow_provider: Optional[FlowProvider],
+    ohlcv_provider: Any,
+    flow_window: int,
+    tech_weight: float,
+    flow_weight: float,
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+
+    normalized_rows = [_sync_item_and_meta_fields(dict(row)) for row in rows]
+    symbols = [str(row.get("code") or "").zfill(6) for row in normalized_rows if row.get("code")]
+
+    derived_repo = DerivedMinerviniRepo(engine)
+    derived_rows = derived_repo.load_for_as_of(as_of=as_of, symbols=symbols)
+    derived_map = {str(row.get("symbol") or "").zfill(6): row for row in derived_rows}
+
+    enriched: List[Dict[str, Any]] = []
+    for item in normalized_rows:
+        out = dict(item)
+        code = str(out.get("code") or "").zfill(6)
+        meta = dict(out.get("meta") or {})
+        reject_reasons = list(out.get("reject_reasons", []) or meta.get("reject_reasons", []) or [])
+
+        derived_row = derived_map.get(code)
+        if derived_row is None:
+            if "derived_missing" not in reject_reasons:
+                reject_reasons.append("derived_missing")
+            meta["derived_missing"] = True
+        else:
+            metrics = _extract_derived_metrics(derived_row)
+            for key, value in metrics.items():
+                out[key] = value
+                meta[key] = value
+            meta["derived_missing"] = False
+
+        if flow_provider is not None:
+            flow_weight_effective = float(flow_weight)
+            tech_weight_effective = float(tech_weight)
+            foreign_df: Optional[pd.DataFrame] = None
+            inst_df: Optional[pd.DataFrame] = None
+            ohlcv_df = pd.DataFrame()
+            try:
+                ohlcv_raw, _ = ohlcv_provider(code, count=max(int(flow_window) + 10, 80))
+                ohlcv_df = _normalize_ohlcv_columns(ohlcv_raw if ohlcv_raw is not None else pd.DataFrame())
+            except Exception:
+                ohlcv_df = pd.DataFrame()
+
+            try:
+                foreign_df, inst_df = flow_provider(code, as_of, int(flow_window))
+            except Exception:
+                if "flow_provider_error" not in reject_reasons:
+                    reject_reasons.append("flow_provider_error")
+
+            if foreign_df is None or inst_df is None:
+                flow_weight_effective = 0.0
+                tech_weight_effective = 1.0
+                if "flow_data_missing -> flow_weight_disabled" not in reject_reasons:
+                    reject_reasons.append("flow_data_missing -> flow_weight_disabled")
+
+            flow_result = calculate_flow_score(
+                code=code,
+                ohlcv_df=ohlcv_df if ohlcv_df is not None else pd.DataFrame(),
+                foreign_df=foreign_df,
+                inst_df=inst_df,
+                window=int(flow_window),
+            )
+            flow_score_norm = _safe_float(flow_result.get("flow_score"), 0.0)
+            tech_score_val = _safe_float(out.get("tech_score", 0.0), 0.0)
+
+            out["flow_score"] = flow_score_norm
+            out["foreign_20_ratio"] = _safe_float(flow_result.get("foreign_20_ratio"), 0.0)
+            out["inst_20_ratio"] = _safe_float(flow_result.get("inst_20_ratio"), 0.0)
+            out["final_score"] = calculate_final_score(
+                tech_score=tech_score_val,
+                flow_score=flow_score_norm * 100.0,
+                tech_weight=tech_weight_effective,
+                flow_weight=flow_weight_effective,
+            )
+            meta["weights_effective"] = {
+                "tech_weight": tech_weight_effective,
+                "flow_weight": flow_weight_effective,
+            }
+
+        if _safe_float(out.get("tech_score"), 0.0) <= 0.0:
+            rs_pctile = _safe_float(out.get("rs_pctile"), 0.0)
+            vcp_score = _safe_float(out.get("vcp_score"), 0.0)
+            trend_score = _safe_float(out.get("trend_score"), 0.0)
+            pullback_pct = _safe_float(out.get("pullback_pct"), 0.0)
+            atr_pct = _safe_float(out.get("atr_pct"), 0.0)
+            pullback_score = max(0.0, min(100.0, 100.0 - (pullback_pct * 400.0)))
+            atr_score = max(0.0, min(100.0, 100.0 - abs(atr_pct - 0.04) * 1000.0))
+            out["tech_score"] = (
+                rs_pctile * 0.40
+                + vcp_score * 0.25
+                + trend_score * 0.20
+                + pullback_score * 0.10
+                + atr_score * 0.05
+            )
+
+        out["reject_reasons"] = list(dict.fromkeys(reject_reasons))
+        meta["reject_reasons"] = out["reject_reasons"]
+        out["meta"] = meta
+        out = _sync_item_and_meta_fields(out)
+        enriched.append(out)
+
+    enriched.sort(key=lambda row: _safe_float(row.get("final_score", row.get("score", 0.0)), 0.0), reverse=True)
+    for idx, row in enumerate(enriched, start=1):
+        row["rank"] = _safe_int(row.get("rank") or idx, idx)
+        row.setdefault("rank_final30", idx)
+        row.setdefault("rank_top50", _safe_int(row.get("rank_top50"), 0))
+        row.setdefault("rank_pool120", _safe_int(row.get("rank_pool120"), 0))
+    return enriched
 
 
 class WatchlistBuilder:
@@ -826,6 +1056,23 @@ def build_and_save_watchlist(
                 )
             else:
                 logger.info("[WATCHLIST][CACHE] hit=True as_of=%s members=%s", as_of, len(existing))
+                existing = _enrich_watchlist_rows(
+                    engine=engine,
+                    env=env,
+                    as_of=as_of,
+                    rows=existing,
+                    flow_provider=flow_provider,
+                    ohlcv_provider=ohlcv_provider,
+                    flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
+                    tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
+                    flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+                )
+                repo.save_watchlist(
+                    env=env,
+                    strategy=strategy,
+                    as_of=as_of,
+                    members=existing,
+                )
                 if return_bundle:
                     return existing, {
                         "as_of": as_of,
@@ -858,6 +1105,18 @@ def build_and_save_watchlist(
     except Exception as exc:
         logger.error("[WATCHLIST][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
+
+    watchlist = _enrich_watchlist_rows(
+        engine=engine,
+        env=env,
+        as_of=as_of,
+        rows=watchlist,
+        flow_provider=flow_provider,
+        ohlcv_provider=ohlcv_provider,
+        flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
+        tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
+        flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+    )
 
     repo.save_watchlist(
         env=env,
