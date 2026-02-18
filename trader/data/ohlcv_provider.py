@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -427,37 +429,124 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
     date_min = min(dates)
     date_max = max(dates)
     symbol_candles: list[tuple[str, list[dict]]] = []
+    total = len(clean_symbols)
+    progress_every = max(1, total // 10) if total else 1
+    heartbeat_sec = max(0, int(os.getenv("OHLCV_DELTA_HEARTBEAT_SEC", "60")))
+    slow_fetch_warn_sec = max(1, int(os.getenv("OHLCV_DELTA_SLOW_FETCH_WARN_SEC", "20")))
+    ts0 = time.monotonic()
+    heartbeat_stop = threading.Event()
+    state_lock = threading.Lock()
+    heartbeat_state = {
+        "processed": 0,
+        "collected": 0,
+        "current_symbol": "-",
+    }
 
-    for symbol in clean_symbols:
-        df = fdr.DataReader(symbol, start=date_min, end=date_max)
-        if df is None or df.empty:
-            continue
-        df = df.reset_index()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df[df["Date"].dt.date.isin(dates)]
-        if df.empty:
-            continue
-
-        candles = []
-        for _, row in df.iterrows():
-            dt_val = row.get("Date")
-            if hasattr(dt_val, "date"):
-                date_str = dt_val.date().isoformat()
-            else:
-                date_str = str(dt_val)[:10]
-            candles.append(
-                {
-                    "date": date_str,
-                    "open": float(row.get("Open", 0)),
-                    "high": float(row.get("High", 0)),
-                    "low": float(row.get("Low", 0)),
-                    "close": float(row.get("Close", 0)),
-                    "volume": float(row.get("Volume", 0)),
-                }
+    def _heartbeat_worker() -> None:
+        while not heartbeat_stop.wait(heartbeat_sec):
+            with state_lock:
+                processed_now = int(heartbeat_state["processed"])
+                collected_now = int(heartbeat_state["collected"])
+                current_symbol_now = str(heartbeat_state["current_symbol"])
+            logger.warning(
+                "[OHLCV][DELTA_UPSERT][HEARTBEAT] processed=%s/%s collected=%s current_symbol=%s elapsed=%.1fs",
+                processed_now,
+                total,
+                collected_now,
+                current_symbol_now,
+                time.monotonic() - ts0,
             )
 
-        if candles:
-            symbol_candles.append((symbol, candles))
+    logger.info(
+        "[OHLCV][DELTA_UPSERT][START] symbols=%s as_of=%s days=%s date_range=%s~%s",
+        total,
+        as_of,
+        days,
+        date_min,
+        date_max,
+    )
+
+    heartbeat_thread = None
+    if heartbeat_sec > 0 and total > 0:
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_worker,
+            name="ohlcv-delta-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+    try:
+        for idx, symbol in enumerate(clean_symbols, start=1):
+            with state_lock:
+                heartbeat_state["processed"] = idx - 1
+                heartbeat_state["collected"] = len(symbol_candles)
+                heartbeat_state["current_symbol"] = symbol
+
+            if idx == 1 or idx % progress_every == 0 or idx == total:
+                logger.info(
+                    "[OHLCV][DELTA_UPSERT][PROGRESS] phase=fetch processed=%s/%s collected=%s elapsed=%.1fs",
+                    idx,
+                    total,
+                    len(symbol_candles),
+                    time.monotonic() - ts0,
+                )
+
+            started = time.monotonic()
+            try:
+                df = fdr.DataReader(symbol, start=date_min, end=date_max)
+            except Exception as exc:
+                logger.warning(
+                    "[OHLCV][DELTA_UPSERT][FETCH_FAIL] symbol=%s err=%s",
+                    symbol,
+                    exc,
+                )
+                continue
+
+            fetch_elapsed = time.monotonic() - started
+            if fetch_elapsed >= slow_fetch_warn_sec:
+                logger.warning(
+                    "[OHLCV][DELTA_UPSERT][SLOW_FETCH] symbol=%s elapsed=%.1fs threshold=%ss",
+                    symbol,
+                    fetch_elapsed,
+                    slow_fetch_warn_sec,
+                )
+
+            if df is None or df.empty:
+                continue
+            df = df.reset_index()
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df[df["Date"].dt.date.isin(dates)]
+            if df.empty:
+                continue
+
+            candles = []
+            for _, row in df.iterrows():
+                dt_val = row.get("Date")
+                if hasattr(dt_val, "date"):
+                    date_str = dt_val.date().isoformat()
+                else:
+                    date_str = str(dt_val)[:10]
+                candles.append(
+                    {
+                        "date": date_str,
+                        "open": float(row.get("Open", 0)),
+                        "high": float(row.get("High", 0)),
+                        "low": float(row.get("Low", 0)),
+                        "close": float(row.get("Close", 0)),
+                        "volume": float(row.get("Volume", 0)),
+                    }
+                )
+
+            if candles:
+                symbol_candles.append((symbol, candles))
+    finally:
+        with state_lock:
+            heartbeat_state["processed"] = total
+            heartbeat_state["collected"] = len(symbol_candles)
+            heartbeat_state["current_symbol"] = "-"
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
 
     def _apply_db_changes() -> tuple[int, int]:
         inserted_local = 0
@@ -484,12 +573,13 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
     )
 
     logger.info(
-        "[OHLCV][DELTA_UPSERT] symbols=%s days=%s dates=%s inserted=%s updated=%s",
+        "[OHLCV][DELTA_UPSERT][DONE] symbols=%s days=%s dates=%s inserted=%s updated=%s elapsed_total=%.1fs",
         len(clean_symbols),
         days,
         [d.isoformat() for d in dates],
         inserted,
         updated,
+        time.monotonic() - ts0,
     )
     return {"symbols": len(clean_symbols), "inserted": inserted, "updated": updated, "dates": dates}
 

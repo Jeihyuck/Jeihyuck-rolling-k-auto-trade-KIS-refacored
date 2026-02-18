@@ -238,6 +238,13 @@ def main() -> int:
         rs_lookbacks=rs_lookbacks,
     )
 
+    logger.info(
+        "[PREP][PHASE] ohlcv_delta_upsert_start symbols=%s need_days=%s benchmark=%s",
+        len(symbols),
+        need_days,
+        bench,
+    )
+
     delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=int(need_days))
     logger.info(
         "[OHLCV][PREFETCH_DONE] symbols=%s days>=%s benchmark=%s",
