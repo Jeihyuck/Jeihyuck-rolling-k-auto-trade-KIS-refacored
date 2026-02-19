@@ -93,6 +93,10 @@ CONFIG = {
     "SUBJECT_FLOW_DEGRADED_TURNOVER_MULT": "1.5",
     "SUBJECT_FLOW_DEGRADED_OB_ADD": "10",
     "SUBJECT_FLOW_MAX_CALLS_PER_RUN": "200",
+    # PREP flow policy (전일 확정 수급만 사용, 누락은 non-blocking)
+    "FLOW_MODE": "PREV_CLOSE_ONLY",            # PREV_CLOSE_ONLY | PREV_DAY_ONLY
+    "FLOW_STRICT": "0",                        # 0이면 누락/실패 시 warning only
+    "DEGRADED_EXCLUDE_FLOW": "1",              # 1이면 PREP degraded 판정에서 flow 지표 제외
     "EMERGENCY_GLOBAL_SELL": "false",
     "STRATEGY_REDUCTION_PRIORITY": "5,4,3,2,1",
     # Diagnostics
@@ -463,6 +467,9 @@ SUBJECT_FLOW_EMPTY_POLICY = (_cfg("SUBJECT_FLOW_EMPTY_POLICY") or "TREAT_AS_FAIL
 SUBJECT_FLOW_DEGRADED_TURNOVER_MULT = float(_cfg("SUBJECT_FLOW_DEGRADED_TURNOVER_MULT") or "1.5")
 SUBJECT_FLOW_DEGRADED_OB_ADD = float(_cfg("SUBJECT_FLOW_DEGRADED_OB_ADD") or "10")
 SUBJECT_FLOW_MAX_CALLS_PER_RUN = int(_cfg("SUBJECT_FLOW_MAX_CALLS_PER_RUN") or "200")
+FLOW_MODE = (_cfg("FLOW_MODE") or "PREV_CLOSE_ONLY").upper()
+FLOW_STRICT = _cfg_bool("FLOW_STRICT", fallback=False)
+DEGRADED_EXCLUDE_FLOW = _cfg_bool("DEGRADED_EXCLUDE_FLOW", fallback=True)
 # 전략별 활성/가중치 파싱
 def parse_enabled_strategies(raw: str) -> set[str]:
     strategies: set[str] = set()

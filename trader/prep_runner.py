@@ -79,7 +79,19 @@ def _detect_flow_sources(engine) -> tuple[dict[str, str] | None, dict[str, str] 
 
 def _make_flow_provider(engine):
     foreign_src, inst_src = _detect_flow_sources(engine)
-    logger.info("[FLOW][SOURCE] foreign=%s inst=%s", foreign_src, inst_src)
+    flow_mode = (os.getenv("FLOW_MODE", "PREV_CLOSE_ONLY") or "PREV_CLOSE_ONLY").strip().upper()
+    flow_strict = _env_true("FLOW_STRICT", "0")
+    if flow_mode not in {"PREV_CLOSE_ONLY", "PREV_DAY_ONLY"}:
+        logger.warning("[FLOW][WARN] invalid FLOW_MODE=%s -> fallback=PREV_CLOSE_ONLY", flow_mode)
+        flow_mode = "PREV_CLOSE_ONLY"
+
+    logger.info(
+        "[FLOW][SOURCE] mode=%s strict=%s foreign=%s inst=%s",
+        flow_mode,
+        int(flow_strict),
+        foreign_src,
+        inst_src,
+    )
 
     def _load_df(source: dict[str, str] | None, code: str, as_of: date, window: int) -> pd.DataFrame | None:
         if source is None:
@@ -105,10 +117,21 @@ def _make_flow_provider(engine):
         return df
 
     def _provider(code: str, as_of: date, window: int):
+        # PREP에서는 전일(as_of) 확정치까지만 사용한다.
         try:
-            return _load_df(foreign_src, code, as_of, window), _load_df(inst_src, code, as_of, window)
+            foreign_df = _load_df(foreign_src, code, as_of, window)
+            inst_df = _load_df(inst_src, code, as_of, window)
+            if foreign_df is None or inst_df is None:
+                logger.warning(
+                    "[FLOW][WARN] missing flow symbol=%s as_of=%s foreign_missing=%s inst_missing=%s",
+                    code,
+                    as_of,
+                    int(foreign_df is None),
+                    int(inst_df is None),
+                )
+            return foreign_df, inst_df
         except Exception as exc:
-            logger.debug("[FLOW][LOAD][FAIL] code=%s err=%s", code, exc)
+            logger.warning("[FLOW][WARN] fetch failed symbol=%s as_of=%s err=%s", code, as_of, exc)
             return None, None
 
     return _provider
@@ -209,6 +232,7 @@ def main() -> int:
     mode = os.getenv("MODE", "prep").strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     as_of = _pick_as_of_date_always_prev()
+    degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
@@ -467,16 +491,37 @@ def main() -> int:
         )
         return 1
 
-    metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
-    available_cols = [col for col in metric_cols if col in final_df.columns]
+    core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
+    flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
+
+    flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
+    if flow_available_cols:
+        flow_sample = final_df[flow_available_cols]
+        flow_missing_mask = flow_sample.isna().all(axis=1) | flow_sample.fillna(0.0).eq(0.0).all(axis=1)
+        flow_missing_ratio = float(flow_missing_mask.mean()) if len(flow_sample) > 0 else 1.0
+        if flow_missing_ratio > 0:
+            logger.warning(
+                "[FLOW][WARN] missing_flow_rows=%s/%s ratio=%.3f as_of=%s (non-blocking)",
+                int(flow_missing_mask.sum()),
+                int(len(flow_sample)),
+                flow_missing_ratio,
+                as_of,
+            )
+
+    metric_cols = [col for col in core_metric_cols if col in final_df.columns]
+    if not degraded_exclude_flow:
+        metric_cols.extend(flow_available_cols)
+
+    available_cols = metric_cols
     if available_cols:
         sample = final_df[available_cols].fillna(0.0)
         zero_ratio = float((sample == 0.0).all(axis=1).mean()) if len(sample) > 0 else 1.0
         if zero_ratio >= 0.8:
             logger.error(
-                "[PREP][DEGRADED] reason=metrics_mostly_zero ratio=%.3f as_of=%s",
+                "[PREP][DEGRADED] reason=metrics_mostly_zero ratio=%.3f as_of=%s metric_scope=%s",
                 zero_ratio,
                 as_of,
+                "core_only" if degraded_exclude_flow else "core_plus_flow",
             )
             ledger_repo.append_event(
                 env=env,
@@ -491,6 +536,7 @@ def main() -> int:
                     "as_of": as_of.isoformat(),
                     "zero_ratio": zero_ratio,
                     "metric_cols": available_cols,
+                    "metric_scope": "core_only" if degraded_exclude_flow else "core_plus_flow",
                     "final_count": int(len(sample)),
                 },
             )

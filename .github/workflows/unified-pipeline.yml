@@ -122,6 +122,22 @@ on:
           - auto
           - always
           - off
+      FLOW_MODE:
+        description: "PREV_CLOSE_ONLY | PREV_DAY_ONLY (flow uses as_of/prev-day confirmed only)"
+        required: true
+        default: "PREV_CLOSE_ONLY"
+        type: choice
+        options:
+          - PREV_CLOSE_ONLY
+          - PREV_DAY_ONLY
+      FLOW_STRICT:
+        description: "0=flow missing/fail is warning only (non-blocking)"
+        required: true
+        default: "0"
+      DEGRADED_EXCLUDE_FLOW:
+        description: "1=exclude flow columns from PREP metrics_mostly_zero degraded check"
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -341,6 +357,9 @@ jobs:
       UNIVERSE_BUILD_IF_MISSING: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_BUILD_IF_MISSING || '1' }}
       UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '0' }}
       DB_MIGRATE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.DB_MIGRATE_MODE || 'auto' }}
+      FLOW_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.FLOW_MODE || 'PREV_CLOSE_ONLY' }}
+      FLOW_STRICT: ${{ github.event_name == 'workflow_dispatch' && inputs.FLOW_STRICT || '0' }}
+      DEGRADED_EXCLUDE_FLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.DEGRADED_EXCLUDE_FLOW || '1' }}
 
       # universe flags (legacy aliases)
       EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}

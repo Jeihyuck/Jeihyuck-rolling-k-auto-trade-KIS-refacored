@@ -228,14 +228,25 @@ def _enrich_watchlist_rows(
             try:
                 foreign_df, inst_df = flow_provider(code, as_of, int(flow_window))
             except Exception:
+                logger.warning("[FLOW][WARN] provider exception code=%s as_of=%s", code, as_of, exc_info=True)
                 if "flow_provider_error" not in reject_reasons:
                     reject_reasons.append("flow_provider_error")
 
             if foreign_df is None or inst_df is None:
                 flow_weight_effective = 0.0
                 tech_weight_effective = 1.0
+                meta["flow_missing"] = True
+                logger.warning(
+                    "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s foreign_missing=%s inst_missing=%s",
+                    code,
+                    as_of,
+                    int(foreign_df is None),
+                    int(inst_df is None),
+                )
                 if "flow_data_missing -> flow_weight_disabled" not in reject_reasons:
                     reject_reasons.append("flow_data_missing -> flow_weight_disabled")
+            else:
+                meta["flow_missing"] = False
 
             flow_result = calculate_flow_score(
                 code=code,
