@@ -46,7 +46,7 @@ def calculate_flow_score(
         "dollar_vol_rank": 0,
     }
     
-    if ohlcv_df is None or len(ohlcv_df) < window:
+    if ohlcv_df is None or len(ohlcv_df) < 1:
         logger.debug("[FLOW_SCORE][SKIP] code=%s: insufficient OHLCV data", code)
         return result
     
@@ -56,8 +56,8 @@ def calculate_flow_score(
     
     # 외국인 수급
     foreign_ratio = 0.0
-    if foreign_df is not None and len(foreign_df) >= window:
-        foreign_recent = foreign_df.tail(window)
+    if foreign_df is not None and len(foreign_df) >= 1:
+        foreign_recent = foreign_df.tail(max(1, min(window, len(foreign_df))))
         foreign_net = foreign_recent["net_buy"].sum()
         total_vol = recent["volume"].sum()
         if total_vol > 0:
@@ -65,8 +65,8 @@ def calculate_flow_score(
     
     # 기관 수급
     inst_ratio = 0.0
-    if inst_df is not None and len(inst_df) >= window:
-        inst_recent = inst_df.tail(window)
+    if inst_df is not None and len(inst_df) >= 1:
+        inst_recent = inst_df.tail(max(1, min(window, len(inst_df))))
         inst_net = inst_recent["net_buy"].sum()
         total_vol = recent["volume"].sum()
         if total_vol > 0:

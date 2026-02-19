@@ -614,6 +614,15 @@ jobs:
           echo "[DB][MIGRATE][RUN] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
           python -m trader.db.migrate
 
+      - name: Diagnose runtime paths (pre-run)
+        if: always()
+        run: |
+          set -euo pipefail
+          pwd
+          ls -al
+          ls -al repo || true
+          find . -maxdepth 3 -type d -name runtime || true
+
       - name: Run (mode switch)
         if: ${{ needs.resolve.outputs.run_mode != 'minervini_test' }}
         run: |
@@ -707,7 +716,7 @@ jobs:
         id: runtime_check
         run: |
           set -euo pipefail
-          count=$(find runtime -type f 2>/dev/null | wc -l || true)
+          count=$(find runtime repo/runtime /home/runner/work/_temp/trader_runtime/runtime -type f 2>/dev/null | wc -l || true)
           echo "file_count=${count}" >> "$GITHUB_OUTPUT"
           if [[ "${count}" -gt 0 ]]; then
             echo "has_runtime=1" >> "$GITHUB_OUTPUT"
@@ -723,3 +732,5 @@ jobs:
           name: watchlist-${{ github.run_id }}
           path: |
             runtime/**
+            **/runtime/**
+            /home/runner/work/_temp/trader_runtime/runtime/**

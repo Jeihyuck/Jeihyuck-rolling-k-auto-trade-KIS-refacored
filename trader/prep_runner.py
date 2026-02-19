@@ -8,7 +8,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
-import sqlalchemy as sa
 
 from trader.db.engine import get_engine
 from trader.db.health import assert_db_ready
@@ -25,7 +24,7 @@ from trader.data.ohlcv_provider import (
 from trader.exporter import export_watchlist_bundle
 from trader.report.pdf_report import generate_watchlist_pdf
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
-from trader.time_utils import now_kst, resolve_derived_as_of
+from trader.time_utils import is_market_open_kst, now_kst, prev_business_day, resolve_derived_as_of
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -36,103 +35,152 @@ def _env_true(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _detect_flow_sources(engine) -> tuple[dict[str, str] | None, dict[str, str] | None]:
-    """DB에 존재하는 flow 테이블/컬럼을 탐색한다."""
-    table_candidates = [
-        "investor_flow_daily",
-        "investor_trading_daily",
-        "investor_daily",
-        "flow_daily",
-        "stock_investor_daily",
-    ]
-    date_cols = ["date", "as_of", "trade_date", "dt"]
-    code_cols = ["code", "symbol", "stock_code"]
-    foreign_cols = ["foreign_net_buy", "foreign_net_qty", "frgn_ntby_qty", "foreigner_net_buy"]
-    inst_cols = ["inst_net_buy", "institution_net_buy", "institutional_net_buy", "orgn_ntby_qty"]
-
-    insp = sa.inspect(engine)
-    tables = set(insp.get_table_names())
-    foreign_src = None
-    inst_src = None
-
-    for table in table_candidates:
-        if table not in tables:
-            continue
-        cols = {c["name"] for c in insp.get_columns(table)}
-        date_col = next((c for c in date_cols if c in cols), None)
-        code_col = next((c for c in code_cols if c in cols), None)
-        if not date_col or not code_col:
-            continue
-        if foreign_src is None:
-            flow_col = next((c for c in foreign_cols if c in cols), None)
-            if flow_col:
-                foreign_src = {"table": table, "date_col": date_col, "code_col": code_col, "flow_col": flow_col}
-        if inst_src is None:
-            flow_col = next((c for c in inst_cols if c in cols), None)
-            if flow_col:
-                inst_src = {"table": table, "date_col": date_col, "code_col": code_col, "flow_col": flow_col}
-        if foreign_src and inst_src:
-            break
-
-    return foreign_src, inst_src
+def _resolve_flow_as_of(*, requested_as_of: date, now_ts: datetime | None = None) -> date:
+    now_ts = now_ts or now_kst()
+    trade_date = now_ts.date()
+    if is_market_open_kst(now_ts) or requested_as_of == trade_date:
+        return prev_business_day(trade_date)
+    return requested_as_of
 
 
 def _make_flow_provider(engine):
-    foreign_src, inst_src = _detect_flow_sources(engine)
-    flow_mode = (os.getenv("FLOW_MODE", "PREV_CLOSE_ONLY") or "PREV_CLOSE_ONLY").strip().upper()
-    flow_strict = _env_true("FLOW_STRICT", "0")
-    if flow_mode not in {"PREV_CLOSE_ONLY", "PREV_DAY_ONLY"}:
-        logger.warning("[FLOW][WARN] invalid FLOW_MODE=%s -> fallback=PREV_CLOSE_ONLY", flow_mode)
-        flow_mode = "PREV_CLOSE_ONLY"
+    providers = ["pykrx", "kis"]
+    flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame | None, pd.DataFrame | None, str | None]] = {}
+    kis_api = None
+    kis_init_failed = False
 
-    logger.info(
-        "[FLOW][SOURCE] mode=%s strict=%s foreign=%s inst=%s",
-        flow_mode,
-        int(flow_strict),
-        foreign_src,
-        inst_src,
-    )
+    def _resolve_code_from_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        code_candidates = {code, f"A{code}", code.lstrip("A")}
+        work = df.copy()
+        work.index = work.index.astype(str)
+        matched_idx = next((idx for idx in work.index if idx in code_candidates), None)
+        if matched_idx is None:
+            return pd.DataFrame()
+        row = work.loc[[matched_idx]]
+        return row
 
-    def _load_df(source: dict[str, str] | None, code: str, as_of: date, window: int) -> pd.DataFrame | None:
-        if source is None:
+    def _extract_net_buy(row_df: pd.DataFrame) -> float | None:
+        if row_df is None or row_df.empty:
             return None
-        stmt = sa.text(
-            f"""
-            SELECT {source['date_col']} AS date, {source['flow_col']} AS net_buy
-            FROM {source['table']}
-            WHERE {source['code_col']} = :code
-              AND {source['date_col']} <= :as_of
-            ORDER BY {source['date_col']} DESC
-            LIMIT :lim
-            """
-        )
-        with engine.connect() as conn:
-            rows = conn.execute(stmt, {"code": code, "as_of": as_of, "lim": int(max(window, 20) * 2)}).fetchall()
-        if not rows:
-            return None
-        df = pd.DataFrame(rows, columns=["date", "net_buy"])
-        if df.empty:
-            return None
-        df = df.sort_values("date")
-        return df
+        candidate_cols = [
+            "순매수수량",
+            "순매수거래량",
+            "순매수수량(주)",
+            "순매수거래대금",
+            "순매수대금",
+            "net_buy",
+        ]
+        for col in candidate_cols:
+            if col not in row_df.columns:
+                continue
+            try:
+                val = row_df.iloc[0][col]
+                if isinstance(val, str):
+                    val = val.replace(",", "").strip()
+                return float(val)
+            except Exception:
+                continue
+        return None
 
-    def _provider(code: str, as_of: date, window: int):
-        # PREP에서는 전일(as_of) 확정치까지만 사용한다.
+    def _provider_pykrx(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         try:
-            foreign_df = _load_df(foreign_src, code, as_of, window)
-            inst_df = _load_df(inst_src, code, as_of, window)
-            if foreign_df is None or inst_df is None:
-                logger.warning(
-                    "[FLOW][WARN] missing flow symbol=%s as_of=%s foreign_missing=%s inst_missing=%s",
-                    code,
-                    as_of,
-                    int(foreign_df is None),
-                    int(inst_df is None),
-                )
+            from pykrx import stock
+        except Exception as exc:
+            logger.warning("[FLOW][WARN] pykrx import failed err=%s", exc)
+            return None, None
+
+        ymd = flow_as_of.strftime("%Y%m%d")
+        try:
+            fr_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "외국인")
+            inst_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "기관합계")
+            fr_row = _resolve_code_from_df(fr_all, code)
+            inst_row = _resolve_code_from_df(inst_all, code)
+            fr_net = _extract_net_buy(fr_row)
+            inst_net = _extract_net_buy(inst_row)
+            if fr_net is None or inst_net is None:
+                return None, None
+            foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": fr_net}])
+            inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
             return foreign_df, inst_df
         except Exception as exc:
-            logger.warning("[FLOW][WARN] fetch failed symbol=%s as_of=%s err=%s", code, as_of, exc)
+            logger.warning("[FLOW][WARN] pykrx fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
             return None, None
+
+    def _provider_kis(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+        nonlocal kis_api, kis_init_failed
+        if kis_init_failed:
+            return None, None
+        if kis_api is None:
+            try:
+                from trader.kis_wrapper import KisAPI
+
+                kis_api = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
+            except Exception as exc:
+                kis_init_failed = True
+                logger.warning("[FLOW][WARN] KIS init failed err=%s", exc)
+                return None, None
+
+        try:
+            resp = kis_api.inquire_investor(code, "KOSDAQ")
+            if not resp.get("ok"):
+                return None, None
+            inv = resp.get("inv") or {}
+            foreign_raw = inv.get("frgn_ntby_qty", inv.get("frgn_ntby_tr_pbmn"))
+            inst_raw = inv.get("orgn_ntby_qty", inv.get("orgn_ntby_tr_pbmn"))
+            foreign_net = float(foreign_raw) if foreign_raw is not None else None
+            inst_net = float(inst_raw) if inst_raw is not None else None
+            if foreign_net is None or inst_net is None:
+                return None, None
+            foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}])
+            inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
+            return foreign_df, inst_df
+        except Exception as exc:
+            logger.warning("[FLOW][WARN] KIS fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
+            return None, None
+
+    provider_map = {
+        "pykrx": _provider_pykrx,
+        "kis": _provider_kis,
+    }
+
+    logger.info("[FLOW][SOURCE] providers=%s", providers)
+
+    def _provider(code: str, as_of: date, window: int):
+        flow_as_of = _resolve_flow_as_of(requested_as_of=as_of)
+        cache_key = (str(code).zfill(6), flow_as_of.isoformat(), int(window))
+        cached = flow_cache.get(cache_key)
+        if cached is not None:
+            return cached[0], cached[1]
+
+        for provider_name in providers:
+            provider = provider_map.get(provider_name)
+            if provider is None:
+                continue
+            foreign_df, inst_df = provider(str(code).zfill(6), flow_as_of, int(window))
+            has_foreign = foreign_df is not None and not foreign_df.empty
+            has_inst = inst_df is not None and not inst_df.empty
+            if has_foreign and has_inst:
+                logger.info(
+                    "[FLOW][SOURCE] symbol=%s requested_as_of=%s flow_as_of=%s provider=%s",
+                    str(code).zfill(6),
+                    as_of,
+                    flow_as_of,
+                    provider_name,
+                )
+                flow_cache[cache_key] = (foreign_df, inst_df, provider_name)
+                return foreign_df, inst_df
+
+        logger.warning(
+            "[FLOW][WARN] all providers failed symbol=%s requested_as_of=%s flow_as_of=%s providers=%s",
+            str(code).zfill(6),
+            as_of,
+            flow_as_of,
+            providers,
+        )
+        flow_cache[cache_key] = (None, None, None)
+        return None, None
 
     return _provider
 
@@ -233,6 +281,7 @@ def main() -> int:
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     as_of = _pick_as_of_date_always_prev()
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
+    allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
@@ -489,6 +538,9 @@ def main() -> int:
             reasons=["empty_final30"],
             payload_json={"as_of": as_of.isoformat(), "final_count": 0},
         )
+        if allow_degraded_prep:
+            logger.warning("[PREP][DEGRADED][ALLOW] reason=empty_final30 -> exit=0")
+            return 0
         return 1
 
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
@@ -540,6 +592,9 @@ def main() -> int:
                     "final_count": int(len(sample)),
                 },
             )
+            if allow_degraded_prep:
+                logger.warning("[PREP][DEGRADED][ALLOW] reason=metrics_mostly_zero -> exit=0")
+                return 0
             return 1
 
     try:

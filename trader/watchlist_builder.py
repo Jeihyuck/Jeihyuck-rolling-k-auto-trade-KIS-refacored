@@ -151,8 +151,13 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out["flow_score"] = _safe_float(out.get("flow_score", meta.get("flow_score", 0.0)), 0.0)
     out["tech_score"] = _safe_float(out.get("tech_score", meta.get("tech_score", out.get("score", 0.0))), 0.0)
     out["final_score"] = _safe_float(out.get("final_score", meta.get("final_score", out.get("score", 0.0))), 0.0)
-    out["foreign_20_ratio"] = _safe_float(out.get("foreign_20_ratio", meta.get("foreign_20_ratio", 0.0)), 0.0)
-    out["inst_20_ratio"] = _safe_float(out.get("inst_20_ratio", meta.get("inst_20_ratio", 0.0)), 0.0)
+    flow_missing = bool(out.get("flow_missing") or meta.get("flow_missing"))
+    if flow_missing:
+        out["foreign_20_ratio"] = out.get("foreign_20_ratio", meta.get("foreign_20_ratio"))
+        out["inst_20_ratio"] = out.get("inst_20_ratio", meta.get("inst_20_ratio"))
+    else:
+        out["foreign_20_ratio"] = _safe_float(out.get("foreign_20_ratio", meta.get("foreign_20_ratio", 0.0)), 0.0)
+        out["inst_20_ratio"] = _safe_float(out.get("inst_20_ratio", meta.get("inst_20_ratio", 0.0)), 0.0)
 
     for key in (
         "rs_pctile",
@@ -236,6 +241,8 @@ def _enrich_watchlist_rows(
                 flow_weight_effective = 0.0
                 tech_weight_effective = 1.0
                 meta["flow_missing"] = True
+                out["flow_missing"] = True
+                out["flow_pass"] = True
                 logger.warning(
                     "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s foreign_missing=%s inst_missing=%s",
                     code,
@@ -243,10 +250,10 @@ def _enrich_watchlist_rows(
                     int(foreign_df is None),
                     int(inst_df is None),
                 )
-                if "flow_data_missing -> flow_weight_disabled" not in reject_reasons:
-                    reject_reasons.append("flow_data_missing -> flow_weight_disabled")
             else:
                 meta["flow_missing"] = False
+                out["flow_missing"] = False
+                out["flow_pass"] = True
 
             flow_result = calculate_flow_score(
                 code=code,
@@ -259,8 +266,12 @@ def _enrich_watchlist_rows(
             tech_score_val = _safe_float(out.get("tech_score", 0.0), 0.0)
 
             out["flow_score"] = flow_score_norm
-            out["foreign_20_ratio"] = _safe_float(flow_result.get("foreign_20_ratio"), 0.0)
-            out["inst_20_ratio"] = _safe_float(flow_result.get("inst_20_ratio"), 0.0)
+            if bool(meta.get("flow_missing")):
+                out["foreign_20_ratio"] = None
+                out["inst_20_ratio"] = None
+            else:
+                out["foreign_20_ratio"] = _safe_float(flow_result.get("foreign_20_ratio"), 0.0)
+                out["inst_20_ratio"] = _safe_float(flow_result.get("inst_20_ratio"), 0.0)
             out["final_score"] = calculate_final_score(
                 tech_score=tech_score_val,
                 flow_score=flow_score_norm * 100.0,
@@ -896,15 +907,18 @@ class WatchlistBuilder:
                 try:
                     foreign_df, inst_df = self.flow_provider(code, as_of, self.flow_window)
                 except Exception as exc:
-                    reject_reasons.append("flow_provider_error")
                     logger.debug("[WATCHLIST][PIPELINE][C_FINAL30][FLOW_PROVIDER_FAIL] code=%s err=%s", code, exc)
 
             flow_weight_effective = self.flow_weight
             tech_weight_effective = self.tech_weight
             if foreign_df is None or inst_df is None:
-                reject_reasons.append("flow_data_missing -> flow_weight_disabled")
                 flow_weight_effective = 0.0
                 tech_weight_effective = 1.0
+                item["flow_missing"] = True
+                item["flow_pass"] = True
+            else:
+                item["flow_missing"] = False
+                item["flow_pass"] = True
 
             flow_result = calculate_flow_score(
                 code=code,
@@ -927,8 +941,12 @@ class WatchlistBuilder:
             item.update(
                 {
                     "flow_score": flow_score_norm,
-                    "foreign_20_ratio": float(flow_result.get("foreign_20_ratio", 0.0) or 0.0),
-                    "inst_20_ratio": float(flow_result.get("inst_20_ratio", 0.0) or 0.0),
+                    "foreign_20_ratio": None
+                    if bool(item.get("flow_missing"))
+                    else float(flow_result.get("foreign_20_ratio", 0.0) or 0.0),
+                    "inst_20_ratio": None
+                    if bool(item.get("flow_missing"))
+                    else float(flow_result.get("inst_20_ratio", 0.0) or 0.0),
                     "final_score": float(final_score),
                     "reject_reasons": reject_reasons,
                     "flow_weight_effective": float(flow_weight_effective),
@@ -963,7 +981,7 @@ class WatchlistBuilder:
                 vcp_fail += 1
             if "trend_template_fail" in reasons:
                 trend_fail += 1
-            if any(str(reason).startswith("flow_") for reason in reasons):
+            if any(str(reason).startswith("flow_") for reason in reasons if "missing" not in str(reason)):
                 flow_fail += 1
 
         logger.info(
