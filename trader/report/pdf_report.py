@@ -120,6 +120,7 @@ def generate_watchlist_pdf(
     top50: Optional[List[Dict[str, Any]]] = None,
     reject_summary: Optional[Dict[str, Any]] = None,
     weights: Optional[Dict[str, Any]] = None,
+    formula: str = "",
     as_of: date,
     output_dir: Optional[Path] = None,
 ) -> Path:
@@ -199,8 +200,10 @@ def generate_watchlist_pdf(
         f"Total candidates analyzed: {len(pool120)}<br/>"
         f"Top 50 filtered: {len(top50)}<br/>"
         f"Final selection: {len(final30)}<br/>"
-        f"Selection criteria: FinalScore = TechScore({weights.get('tech_weight', 0.7):.2f}) "
-        f"+ FlowScore({weights.get('flow_weight', 0.3):.2f})"
+        f"Selection criteria: {formula or ('score_final = '
+        + f\"{weights.get('tech_weight', 0.7):.4f}*score_tech + \"
+        + f\"{weights.get('flow_weight', 0.3):.4f}*score_flow + \"
+        + f\"{weights.get('trend_weight', 0.0):.4f}*score_trend\")}"
     )
     story.append(Paragraph(summary_text, styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
@@ -270,6 +273,7 @@ def generate_watchlist_pdf(
         reasons = _normalize_reasons_for_pdf(item.get("reasons"))
         notes = reasons.get("notes") if isinstance(reasons.get("notes"), dict) else {}
         scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         reject_reasons = item.get("reject_reasons") or (item.get("meta") or {}).get("reject_reasons") or []
         
         rs_display = item.get("rs_pctile", scores.get("rs_pctile", notes.get("rs_pctile", 0)))
@@ -277,9 +281,13 @@ def generate_watchlist_pdf(
         pullback_display = item.get("pullback_pct", notes.get("pullback_pct", 0))
         foreign_display = item.get("foreign_20_ratio", notes.get("foreign_net_20d", 0))
         inst_display = item.get("inst_20_ratio", notes.get("inst_net_20d", 0))
+        flow_missing = bool(item.get("flow_missing") or meta.get("flow_missing"))
+        flow_missing_reason = str(item.get("flow_missing_reason") or meta.get("flow_missing_reason") or "unknown")
+        display_name = str(item.get("name") or meta.get("name") or "N/A")
+        liquidity_rank = scores.get("liquidity_rank", item.get("rank_pool120", meta.get("rank_pool120", "N/A")))
 
         detail_text = f"""
-        <b>#{i}: {item.get('code')} - {item.get('name', 'N/A')}</b><br/>
+        <b>#{i}: {item.get('code')} - {display_name}</b><br/>
         Final Score: {_fmt_float(item.get('final_score', 0), 2)} (Tech: {_fmt_float(item.get('tech_score', 0), 1)}, Flow: {_fmt_float(item.get('flow_score', 0), 2)})<br/>
         <br/>
         <b>Selection Reasons:</b><br/>
@@ -287,9 +295,10 @@ def generate_watchlist_pdf(
         - RS Percentile: {_fmt_float(rs_display, 1)}<br/>
         - VCP Score: {_fmt_float(vcp_display, 1)}<br/>
         - Pullback: {_fmt_pct(pullback_display, 2)}<br/>
-        - Foreign 20D Flow: {_fmt_float(foreign_display, 3)}<br/>
-        - Institutional 20D Flow: {_fmt_float(inst_display, 3)}<br/>
-        - Dollar Volume Rank: {scores.get('liquidity_rank', reasons.get('dollar_vol_rank', 'N/A'))}<br/>
+        - Foreign 20D Flow: {'N/A' if flow_missing else _fmt_float(foreign_display, 3)}<br/>
+        - Institutional 20D Flow: {'N/A' if flow_missing else _fmt_float(inst_display, 3)}<br/>
+        - Flow Status: {'N/A (missing: reason=' + flow_missing_reason + ')' if flow_missing else 'OK'}<br/>
+        - Dollar Volume Rank: {liquidity_rank}<br/>
         - Reject Reasons: {', '.join(reject_reasons) if reject_reasons else '-'}<br/>
         """
         

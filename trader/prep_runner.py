@@ -482,6 +482,43 @@ def main() -> int:
     if not shortage_reason and len(watchlist) < finaln:
         shortage_reason = f"pipeline_shortage:{len(watchlist)}<{finaln}"
 
+    bundle_universe = watchlist_bundle.get("universe_scored", []) or []
+    bundle_pool120 = watchlist_bundle.get("pool120", []) or []
+    bundle_top50 = watchlist_bundle.get("top50", []) or []
+    bundle_final30 = watchlist_bundle.get("final30", watchlist or []) or []
+
+    contract_failures: list[str] = []
+    if len(bundle_universe) <= 0:
+        contract_failures.append("contract_universe_scored_empty")
+    if len(bundle_top50) <= 0:
+        contract_failures.append("contract_top50_empty")
+    if len(bundle_pool120) <= 0:
+        contract_failures.append("contract_pool120_empty")
+    if len(bundle_final30) != finaln:
+        contract_failures.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
+
+    if contract_failures:
+        shortage_reason = shortage_reason or ";".join(contract_failures)
+        reject_summary = dict(watchlist_bundle.get("reject_summary", {}) or {})
+        for reason in contract_failures:
+            reject_summary[reason] = int(reject_summary.get(reason, 0)) + 1
+        watchlist_bundle["reject_summary"] = reject_summary
+        watchlist_bundle["shortage_reason"] = shortage_reason
+        watchlist_bundle["degrade"] = {
+            "enabled": True,
+            "used": True,
+            "reason": shortage_reason,
+            "disabled_features": ["watchlist_pipeline_contract"],
+        }
+        allow_contract_degrade = _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep
+        logger.error(
+            "[PREP][WATCHLIST][CONTRACT_FAIL] failures=%s allow_degrade=%s",
+            contract_failures,
+            int(allow_contract_degrade),
+        )
+        if not allow_contract_degrade:
+            return 1
+
     watchlist_repo = WatchlistRepo(engine)
     watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
     if watchlist:
@@ -516,11 +553,14 @@ def main() -> int:
             "as_of": as_of.isoformat(),
             "env": env,
             "weights": watchlist_bundle.get("weights", {}),
+            "weights_effective": watchlist_bundle.get("weights_effective", watchlist_bundle.get("weights", {})),
+            "formula": watchlist_bundle.get("formula", ""),
             "reject_summary": watchlist_bundle.get("reject_summary", {}),
             "expected_finaln": finaln,
             "final_count": int(watchlist_bundle.get("final_count", len(watchlist or []))),
             "shortage_reason": shortage_reason,
             "degrade": watchlist_bundle.get("degrade", {}),
+            "contract_failures": contract_failures,
         },
     )
 
@@ -606,6 +646,7 @@ def main() -> int:
             final30=watchlist_bundle.get("final30", watchlist or []),
             reject_summary=watchlist_bundle.get("reject_summary", {}),
             weights=watchlist_bundle.get("weights", {}),
+            formula=watchlist_bundle.get("formula", ""),
         )
         logger.info("[PDF] wrote %s", pdf_path)
     except Exception:

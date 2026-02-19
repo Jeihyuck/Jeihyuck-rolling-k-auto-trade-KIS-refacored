@@ -85,6 +85,27 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _flow_contract_state(
+    *,
+    foreign_df: Optional[pd.DataFrame],
+    inst_df: Optional[pd.DataFrame],
+    flow_result: Dict[str, Any],
+) -> Tuple[bool, Optional[float], Optional[float], str]:
+    foreign_ratio_raw = flow_result.get("foreign_20_ratio")
+    inst_ratio_raw = flow_result.get("inst_20_ratio")
+    has_foreign_ratio = foreign_ratio_raw is not None
+    has_inst_ratio = inst_ratio_raw is not None
+
+    if has_foreign_ratio or has_inst_ratio:
+        foreign_ratio = _safe_float(foreign_ratio_raw, 0.0) if has_foreign_ratio else None
+        inst_ratio = _safe_float(inst_ratio_raw, 0.0) if has_inst_ratio else None
+        return False, foreign_ratio, inst_ratio, "ratio_available"
+
+    if foreign_df is None or inst_df is None:
+        return True, None, None, "provider_missing"
+    return True, None, None, "ratio_missing"
+
+
 def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
     features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
 
@@ -121,6 +142,8 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out["code"] = str(out.get("code") or "").zfill(6)
     meta = dict(out.get("meta") or {})
     meta["code"] = out["code"]
+    if not str(out.get("name") or "").strip() and str(meta.get("name") or "").strip():
+        out["name"] = str(meta.get("name") or "")
 
     for key in (
         "as_of",
@@ -173,6 +196,21 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     ):
         meta[key] = out[key]
 
+    reject_reasons = list(out.get("reject_reasons", []) or meta.get("reject_reasons", []) or [])
+    if flow_missing:
+        if "flow_data_missing" not in reject_reasons:
+            reject_reasons.append("flow_data_missing")
+        if "flow_weight_disabled" not in reject_reasons:
+            reject_reasons.append("flow_weight_disabled")
+    else:
+        reject_reasons = [
+            reason
+            for reason in reject_reasons
+            if str(reason) not in {"flow_data_missing", "flow_weight_disabled"}
+        ]
+    out["reject_reasons"] = list(dict.fromkeys(reject_reasons))
+    meta["reject_reasons"] = out["reject_reasons"]
+
     out["meta"] = meta
     return out
 
@@ -188,6 +226,7 @@ def _enrich_watchlist_rows(
     flow_window: int,
     tech_weight: float,
     flow_weight: float,
+    trend_weight: float,
 ) -> List[Dict[str, Any]]:
     if not rows:
         return []
@@ -221,6 +260,7 @@ def _enrich_watchlist_rows(
         if flow_provider is not None:
             flow_weight_effective = float(flow_weight)
             tech_weight_effective = float(tech_weight)
+            trend_weight_effective = float(trend_weight)
             foreign_df: Optional[pd.DataFrame] = None
             inst_df: Optional[pd.DataFrame] = None
             ohlcv_df = pd.DataFrame()
@@ -237,24 +277,6 @@ def _enrich_watchlist_rows(
                 if "flow_provider_error" not in reject_reasons:
                     reject_reasons.append("flow_provider_error")
 
-            if foreign_df is None or inst_df is None:
-                flow_weight_effective = 0.0
-                tech_weight_effective = 1.0
-                meta["flow_missing"] = True
-                out["flow_missing"] = True
-                out["flow_pass"] = True
-                logger.warning(
-                    "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s foreign_missing=%s inst_missing=%s",
-                    code,
-                    as_of,
-                    int(foreign_df is None),
-                    int(inst_df is None),
-                )
-            else:
-                meta["flow_missing"] = False
-                out["flow_missing"] = False
-                out["flow_pass"] = True
-
             flow_result = calculate_flow_score(
                 code=code,
                 ohlcv_df=ohlcv_df if ohlcv_df is not None else pd.DataFrame(),
@@ -265,23 +287,47 @@ def _enrich_watchlist_rows(
             flow_score_norm = _safe_float(flow_result.get("flow_score"), 0.0)
             tech_score_val = _safe_float(out.get("tech_score", 0.0), 0.0)
 
+            flow_missing, foreign_ratio, inst_ratio, flow_missing_reason = _flow_contract_state(
+                foreign_df=foreign_df,
+                inst_df=inst_df,
+                flow_result=flow_result,
+            )
+            if flow_missing:
+                flow_weight_effective = 0.0
+                tech_weight_effective = 1.0
+                trend_weight_effective = 0.0
+                logger.warning(
+                    "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s reason=%s",
+                    code,
+                    as_of,
+                    flow_missing_reason,
+                )
+            meta["flow_missing"] = bool(flow_missing)
+            meta["flow_missing_reason"] = flow_missing_reason
+            out["flow_missing"] = bool(flow_missing)
+            out["flow_pass"] = True
+
             out["flow_score"] = flow_score_norm
-            if bool(meta.get("flow_missing")):
-                out["foreign_20_ratio"] = None
-                out["inst_20_ratio"] = None
-            else:
-                out["foreign_20_ratio"] = _safe_float(flow_result.get("foreign_20_ratio"), 0.0)
-                out["inst_20_ratio"] = _safe_float(flow_result.get("inst_20_ratio"), 0.0)
-            out["final_score"] = calculate_final_score(
+            out["foreign_20_ratio"] = foreign_ratio
+            out["inst_20_ratio"] = inst_ratio
+            base_final_score = calculate_final_score(
                 tech_score=tech_score_val,
                 flow_score=flow_score_norm * 100.0,
                 tech_weight=tech_weight_effective,
                 flow_weight=flow_weight_effective,
             )
+            out["final_score"] = float(base_final_score + (_safe_float(out.get("trend_score"), 0.0) * trend_weight_effective))
             meta["weights_effective"] = {
                 "tech_weight": tech_weight_effective,
                 "flow_weight": flow_weight_effective,
+                "trend_weight": trend_weight_effective,
             }
+            meta["formula"] = (
+                "score_final = "
+                f"{tech_weight_effective:.4f}*score_tech + "
+                f"{flow_weight_effective:.4f}*score_flow + "
+                f"{trend_weight_effective:.4f}*score_trend"
+            )
 
         if _safe_float(out.get("tech_score"), 0.0) <= 0.0:
             rs_pctile = _safe_float(out.get("rs_pctile"), 0.0)
@@ -332,6 +378,7 @@ class WatchlistBuilder:
         flow_window: int = 20,
         tech_weight: float = 0.7,
         flow_weight: float = 0.3,
+        trend_weight: float = 0.0,
     ):
         self.ohlcv_provider = ohlcv_provider
         self.minervini_config = minervini_config
@@ -345,6 +392,7 @@ class WatchlistBuilder:
         self.flow_window = flow_window
         self.tech_weight = tech_weight
         self.flow_weight = flow_weight
+        self.trend_weight = trend_weight
         self.last_bundle: Dict[str, Any] = {}
 
     def build(self, *, members: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
@@ -360,6 +408,14 @@ class WatchlistBuilder:
         pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
         top50 = self._stage_b_strategy_scoring(pool120, as_of)
         final30 = self._stage_c_flow_final(top50, as_of)
+
+        contract_failures: List[str] = []
+        if len(universe_scored) <= 0:
+            contract_failures.append("universe_scored_empty")
+        if len(top50) <= 0:
+            contract_failures.append("top50_empty")
+        if len(pool120) <= 0:
+            contract_failures.append("pool120_empty")
 
         degrade_meta = {
             "used": False,
@@ -381,6 +437,24 @@ class WatchlistBuilder:
                 target_n=self.finaln,
             )
 
+        if len(final30) != int(self.finaln):
+            contract_failures.append(f"final30_count_mismatch:{len(final30)}!={int(self.finaln)}")
+
+        allow_degrade = _env_bool("PB1_WATCHLIST_ALLOW_DEGRADE", False)
+        if contract_failures and not allow_degrade:
+            raise RuntimeError("WATCHLIST_PIPELINE_CONTRACT_FAILED: " + ",".join(contract_failures))
+
+        shortage_reason = ""
+        if len(final30) != int(self.finaln):
+            shortage_reason = ";".join(contract_failures) or f"pipeline_shortage:{len(final30)}<{int(self.finaln)}"
+
+        degrade_meta = {
+            **degrade_meta,
+            "enabled": bool(degrade_meta.get("used") or bool(contract_failures)),
+            "reason": shortage_reason,
+            "disabled_features": ["flow"] if any("flow" in reason for reason in contract_failures) else [],
+        }
+
         reject_counter = Counter()
         for item in universe_scored:
             for reason in item.get("reject_reasons", []):
@@ -391,7 +465,19 @@ class WatchlistBuilder:
             "weights": {
                 "tech_weight": self.tech_weight,
                 "flow_weight": self.flow_weight,
+                "trend_weight": self.trend_weight,
             },
+            "weights_effective": {
+                "tech_weight": self.tech_weight,
+                "flow_weight": self.flow_weight,
+                "trend_weight": self.trend_weight,
+            },
+            "formula": (
+                "score_final = "
+                f"{self.tech_weight:.4f}*score_tech + "
+                f"{self.flow_weight:.4f}*score_flow + "
+                f"{self.trend_weight:.4f}*score_trend"
+            ),
             "universe_scored": universe_scored,
             "pool120": pool120,
             "top50": top50,
@@ -400,6 +486,8 @@ class WatchlistBuilder:
             "final_count": len(final30),
             "requested_finaln": int(self.finaln),
             "degrade": degrade_meta,
+            "shortage_reason": shortage_reason,
+            "contract_failures": contract_failures,
         }
 
         logger.info(
@@ -911,14 +999,7 @@ class WatchlistBuilder:
 
             flow_weight_effective = self.flow_weight
             tech_weight_effective = self.tech_weight
-            if foreign_df is None or inst_df is None:
-                flow_weight_effective = 0.0
-                tech_weight_effective = 1.0
-                item["flow_missing"] = True
-                item["flow_pass"] = True
-            else:
-                item["flow_missing"] = False
-                item["flow_pass"] = True
+            trend_weight_effective = self.trend_weight
 
             flow_result = calculate_flow_score(
                 code=code,
@@ -931,22 +1012,44 @@ class WatchlistBuilder:
             flow_score_norm = float(flow_result.get("flow_score", 0.0) or 0.0)
             flow_score_100 = flow_score_norm * 100.0
             tech_score = float(item.get("tech_score", 0.0) or 0.0)
+            flow_missing, foreign_ratio, inst_ratio, flow_missing_reason = _flow_contract_state(
+                foreign_df=foreign_df,
+                inst_df=inst_df,
+                flow_result=flow_result,
+            )
+            if flow_missing:
+                flow_weight_effective = 0.0
+                tech_weight_effective = 1.0
+                trend_weight_effective = 0.0
+
             final_score = calculate_final_score(
                 tech_score=tech_score,
                 flow_score=flow_score_100,
                 tech_weight=tech_weight_effective,
                 flow_weight=flow_weight_effective,
             )
+            final_score = float(final_score + (float(item.get("trend_score", 0.0) or 0.0) * float(trend_weight_effective)))
+
+            item["flow_missing"] = bool(flow_missing)
+            item["flow_missing_reason"] = flow_missing_reason
+            item["flow_pass"] = True
+            if bool(item.get("flow_missing")):
+                if "flow_data_missing" not in reject_reasons:
+                    reject_reasons.append("flow_data_missing")
+                if "flow_weight_disabled" not in reject_reasons:
+                    reject_reasons.append("flow_weight_disabled")
+            else:
+                reject_reasons = [
+                    reason
+                    for reason in reject_reasons
+                    if str(reason) not in {"flow_data_missing", "flow_weight_disabled"}
+                ]
 
             item.update(
                 {
                     "flow_score": flow_score_norm,
-                    "foreign_20_ratio": None
-                    if bool(item.get("flow_missing"))
-                    else float(flow_result.get("foreign_20_ratio", 0.0) or 0.0),
-                    "inst_20_ratio": None
-                    if bool(item.get("flow_missing"))
-                    else float(flow_result.get("inst_20_ratio", 0.0) or 0.0),
+                    "foreign_20_ratio": foreign_ratio,
+                    "inst_20_ratio": inst_ratio,
                     "final_score": float(final_score),
                     "reject_reasons": reject_reasons,
                     "flow_weight_effective": float(flow_weight_effective),
@@ -957,7 +1060,14 @@ class WatchlistBuilder:
             meta["weights_effective"] = {
                 "tech_weight": float(tech_weight_effective),
                 "flow_weight": float(flow_weight_effective),
+                "trend_weight": float(trend_weight_effective),
             }
+            meta["formula"] = (
+                "score_final = "
+                f"{float(tech_weight_effective):.4f}*score_tech + "
+                f"{float(flow_weight_effective):.4f}*score_flow + "
+                f"{float(trend_weight_effective):.4f}*score_trend"
+            )
             item["meta"] = meta
             scored.append(item)
 
@@ -1132,6 +1242,7 @@ def build_and_save_watchlist(
                     flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
                     tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
                     flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+                    trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
                 )
                 repo.save_watchlist(
                     env=env,
@@ -1142,12 +1253,29 @@ def build_and_save_watchlist(
                 if return_bundle:
                     return existing, {
                         "as_of": as_of,
-                        "weights": {"tech_weight": 0.7, "flow_weight": 0.3},
+                        "weights": {
+                            "tech_weight": 0.7,
+                            "flow_weight": 0.3,
+                            "trend_weight": 0.0,
+                        },
+                        "weights_effective": {
+                            "tech_weight": 0.7,
+                            "flow_weight": 0.3,
+                            "trend_weight": 0.0,
+                        },
+                        "formula": "score_final = 0.7000*score_tech + 0.3000*score_flow + 0.0000*score_trend",
                         "universe_scored": [],
                         "pool120": [],
                         "top50": [],
                         "final30": existing,
-                        "reject_summary": {},
+                        "reject_summary": {"cache_bundle_stage_missing": 1},
+                        "shortage_reason": "cache_bundle_stage_missing",
+                        "degrade": {
+                            "enabled": True,
+                            "used": True,
+                            "reason": "cache_bundle_stage_missing",
+                            "disabled_features": ["stage_snapshot"],
+                        },
                     }
                 return existing
 
@@ -1164,6 +1292,7 @@ def build_and_save_watchlist(
         flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
         tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
         flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+        trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
     )
 
     try:
@@ -1182,6 +1311,7 @@ def build_and_save_watchlist(
         flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
         tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
         flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+        trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
     )
 
     repo.save_watchlist(
