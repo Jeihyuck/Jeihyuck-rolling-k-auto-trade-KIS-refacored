@@ -196,14 +196,17 @@ def generate_watchlist_pdf(
     
     # 요약
     story.append(Paragraph("Selection Summary", styles['KoreanHeading2']))
+    selection_formula = formula or (
+        "score_final = "
+        f"{weights.get('tech_weight', 0.7):.4f}*score_tech + "
+        f"{weights.get('flow_weight', 0.3):.4f}*score_flow + "
+        f"{weights.get('trend_weight', 0.0):.4f}*score_trend"
+    )
     summary_text = (
         f"Total candidates analyzed: {len(pool120)}<br/>"
         f"Top 50 filtered: {len(top50)}<br/>"
         f"Final selection: {len(final30)}<br/>"
-        f"Selection criteria: {formula or ('score_final = '
-        + f\"{weights.get('tech_weight', 0.7):.4f}*score_tech + \"
-        + f\"{weights.get('flow_weight', 0.3):.4f}*score_flow + \"
-        + f\"{weights.get('trend_weight', 0.0):.4f}*score_trend\")}"
+        f"Selection criteria: {selection_formula}"
     )
     story.append(Paragraph(summary_text, styles['KoreanBody']))
     story.append(Spacer(1, 0.3 * inch))
