@@ -2670,7 +2670,8 @@ def main() -> int:
         
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
-        derived_count = derived_repo.count_as_of(as_of=derived_as_of)
+        derived_env = os.getenv("STRATEGY_ENV", "practice").strip().lower()
+        derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
         
         # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
         if derived_count <= 0:
@@ -2689,6 +2690,7 @@ def main() -> int:
                 )
                 
                 fallback_as_of = derived_repo.find_latest_available_asof(
+                    env=derived_env,
                     target_as_of=derived_as_of,
                     max_back_days=DERIVED_FALLBACK_MAX_DAYS,
                     ttl_days=CANDIDATE_POOL_TTL_DAYS,
@@ -2722,7 +2724,7 @@ def main() -> int:
                     
                     # ✅ derived_as_of를 fallback으로 교체하여 이후 로직에서 사용
                     derived_as_of = fallback_as_of
-                    derived_count = derived_repo.count_as_of(as_of=derived_as_of)
+                    derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
                     
                     logger.info(
                         "[TRADE_TICK][FALLBACK][DERIVED][OK] fallback_as_of=%s count=%d age=%d",

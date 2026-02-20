@@ -47,6 +47,7 @@ __all__ = [
     "PositionRepo",  # Backward compatibility
     "WatchlistRepo",
     "DerivedMinerviniRepo",
+    "DerivedFlowRepo",
     "WatchlistSnapshotRepo",
     "MinerviniSnapshotRepo",
     "EntryDecisionRepo",
@@ -2469,54 +2470,75 @@ class DerivedMinerviniRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
-    def upsert_rows(self, rows: list[dict]) -> int:
+    def upsert_rows(self, *, env: str, rows: list[dict]) -> int:
         if not rows:
             return 0
         schema = self._schema
+        env_n = _norm_env(env)
+        normalized_rows = []
+        for row in rows:
+            payload = dict(row)
+            payload["env"] = env_n
+            normalized_rows.append(payload)
         with self.engine.begin() as conn:
             if conn.dialect.name == "postgresql":
-                stmt = pg_insert(schema.derived_minervini).values(rows)
+                stmt = pg_insert(schema.derived_minervini).values(normalized_rows)
                 update_cols = {
                     col.name: getattr(stmt.excluded, col.name)
                     for col in schema.derived_minervini.c
-                    if col.name not in {"symbol", "as_of", "created_at"}
+                    if col.name not in {"env", "symbol", "as_of", "created_at"}
                 }
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=[schema.derived_minervini.c.symbol, schema.derived_minervini.c.as_of],
+                    index_elements=[
+                        schema.derived_minervini.c.env,
+                        schema.derived_minervini.c.symbol,
+                        schema.derived_minervini.c.as_of,
+                    ],
                     set_=update_cols,
                 )
                 conn.execute(stmt)
             else:
-                for payload in rows:
+                for payload in normalized_rows:
                     try:
                         conn.execute(sa.insert(schema.derived_minervini).values(**payload))
                     except IntegrityError:
                         where_clause = and_(
+                            schema.derived_minervini.c.env == payload["env"],
                             schema.derived_minervini.c.symbol == payload["symbol"],
                             schema.derived_minervini.c.as_of == payload["as_of"],
                         )
-                        update_cols = {k: v for k, v in payload.items() if k not in {"symbol", "as_of"}}
+                        update_cols = {k: v for k, v in payload.items() if k not in {"env", "symbol", "as_of"}}
                         conn.execute(sa.update(schema.derived_minervini).where(where_clause).values(**update_cols))
-        return len(rows)
+        return len(normalized_rows)
 
-    def load_for_as_of(self, *, as_of: date, symbols: list[str] | None = None) -> list[dict]:
+    def load_for_as_of(self, *, env: str, as_of: date, symbols: list[str] | None = None) -> list[dict]:
         schema = self._schema
-        stmt = select(schema.derived_minervini).where(schema.derived_minervini.c.as_of == to_date(as_of))
+        env_n = _norm_env(env)
+        stmt = select(schema.derived_minervini).where(
+            and_(
+                schema.derived_minervini.c.env == env_n,
+                schema.derived_minervini.c.as_of == to_date(as_of),
+            )
+        )
         if symbols:
             stmt = stmt.where(schema.derived_minervini.c.symbol.in_(symbols))
         with self.engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(row) for row in rows]
 
-    def count_as_of(self, *, as_of: date) -> int:
+    def count_as_of(self, *, env: str, as_of: date) -> int:
         schema = self._schema
+        env_n = _norm_env(env)
         stmt = select(func.count()).select_from(schema.derived_minervini).where(
-            schema.derived_minervini.c.as_of == to_date(as_of)
+            and_(
+                schema.derived_minervini.c.env == env_n,
+                schema.derived_minervini.c.as_of == to_date(as_of),
+            )
         )
         with self.engine.connect() as conn:
             return int(conn.execute(stmt).scalar() or 0)
     
-    def get_latest_as_of(self, *, requested_as_of: date, ttl_days: int = 7) -> date | None:
+    def get_latest_as_of(self, *, env: str, requested_as_of: date, ttl_days: int = 7) -> date | None:
         """
         주어진 as_of 이하의 최신 derived as_of를 찾는다.
         
@@ -2533,12 +2555,18 @@ class DerivedMinerviniRepo:
             date(2026, 2, 9)
         """
         schema = self._schema
+        env_n = _norm_env(env)
         requested_date = to_date(requested_as_of)
         
         # 최신 as_of 찾기 (requested_as_of 이하)
         stmt = (
             select(func.max(schema.derived_minervini.c.as_of))
-            .where(schema.derived_minervini.c.as_of <= requested_date)
+            .where(
+                and_(
+                    schema.derived_minervini.c.env == env_n,
+                    schema.derived_minervini.c.as_of <= requested_date,
+                )
+            )
         )
         
         with self.engine.connect() as conn:
@@ -2576,6 +2604,7 @@ class DerivedMinerviniRepo:
     def load_for_as_of_with_fallback(
         self,
         *,
+        env: str,
         as_of: date,
         symbols: list[str] | None = None,
         ttl_days: int = 7,
@@ -2599,7 +2628,7 @@ class DerivedMinerviniRepo:
             >>> actual  # date(2026, 2, 9)
         """
         # 먼저 요청된 as_of로 시도
-        rows = self.load_for_as_of(as_of=as_of, symbols=symbols)
+        rows = self.load_for_as_of(env=env, as_of=as_of, symbols=symbols)
         
         if rows:
             logger.debug(
@@ -2615,7 +2644,7 @@ class DerivedMinerviniRepo:
             as_of.isoformat(),
         )
         
-        fallback_as_of = self.get_latest_as_of(requested_as_of=as_of, ttl_days=ttl_days)
+        fallback_as_of = self.get_latest_as_of(env=env, requested_as_of=as_of, ttl_days=ttl_days)
         
         if not fallback_as_of:
             logger.warning(
@@ -2625,7 +2654,7 @@ class DerivedMinerviniRepo:
             return [], None
         
         # fallback으로 재로드
-        rows = self.load_for_as_of(as_of=fallback_as_of, symbols=symbols)
+        rows = self.load_for_as_of(env=env, as_of=fallback_as_of, symbols=symbols)
         
         logger.info(
             "[DERIVED][LOAD][FALLBACK_SUCCESS] requested=%s fallback=%s count=%d",
@@ -2639,6 +2668,7 @@ class DerivedMinerviniRepo:
     def find_latest_available_asof(
         self,
         *,
+        env: str,
         target_as_of: date,
         max_back_days: int = 3,
         ttl_days: int = 7,
@@ -2671,6 +2701,7 @@ class DerivedMinerviniRepo:
             date(2026, 2, 9)  # 또는 2026-02-08, 2026-02-07, ...
         """
         schema = self._schema
+        env_n = _norm_env(env)
         target_date = to_date(target_as_of)
         
         # Step 1: 우선순위 탐색 (target, target-1, target-2, ..., target-max_back_days)
@@ -2678,7 +2709,10 @@ class DerivedMinerviniRepo:
             candidate_date = target_date - timedelta(days=i)
             
             stmt = select(func.count()).select_from(schema.derived_minervini).where(
-                schema.derived_minervini.c.as_of == candidate_date
+                and_(
+                    schema.derived_minervini.c.env == env_n,
+                    schema.derived_minervini.c.as_of == candidate_date,
+                )
             )
             
             with self.engine.connect() as conn:
@@ -2707,6 +2741,7 @@ class DerivedMinerviniRepo:
             select(func.max(schema.derived_minervini.c.as_of))
             .where(
                 and_(
+                    schema.derived_minervini.c.env == env_n,
                     schema.derived_minervini.c.as_of >= min_date,
                     schema.derived_minervini.c.as_of <= target_date,
                 )
@@ -2736,6 +2771,68 @@ class DerivedMinerviniRepo:
         )
         
         return latest_as_of
+
+
+class DerivedFlowRepo:
+    """Daily flow feature snapshots used by watchlist/prep diagnostics."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+
+    def upsert_rows(self, *, env: str, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        schema = self._schema
+        env_n = _norm_env(env)
+        normalized_rows = []
+        for row in rows:
+            payload = dict(row)
+            payload["env"] = env_n
+            normalized_rows.append(payload)
+
+        with self.engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                stmt = pg_insert(schema.derived_flow).values(normalized_rows)
+                update_cols = {
+                    col.name: getattr(stmt.excluded, col.name)
+                    for col in schema.derived_flow.c
+                    if col.name not in {"env", "as_of", "symbol", "created_at"}
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        schema.derived_flow.c.env,
+                        schema.derived_flow.c.as_of,
+                        schema.derived_flow.c.symbol,
+                    ],
+                    set_=update_cols,
+                )
+                conn.execute(stmt)
+            else:
+                for payload in normalized_rows:
+                    try:
+                        conn.execute(sa.insert(schema.derived_flow).values(**payload))
+                    except IntegrityError:
+                        where_clause = and_(
+                            schema.derived_flow.c.env == payload["env"],
+                            schema.derived_flow.c.as_of == payload["as_of"],
+                            schema.derived_flow.c.symbol == payload["symbol"],
+                        )
+                        update_cols = {k: v for k, v in payload.items() if k not in {"env", "as_of", "symbol"}}
+                        conn.execute(sa.update(schema.derived_flow).where(where_clause).values(**update_cols))
+        return len(normalized_rows)
+
+    def count_as_of(self, *, env: str, as_of: date) -> int:
+        schema = self._schema
+        env_n = _norm_env(env)
+        stmt = select(func.count()).select_from(schema.derived_flow).where(
+            and_(
+                schema.derived_flow.c.env == env_n,
+                schema.derived_flow.c.as_of == to_date(as_of),
+            )
+        )
+        with self.engine.connect() as conn:
+            return int(conn.execute(stmt).scalar() or 0)
 
 
 def save_watchlist(

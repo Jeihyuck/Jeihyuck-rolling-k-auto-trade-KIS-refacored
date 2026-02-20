@@ -12,7 +12,7 @@ import pandas as pd
 from sqlalchemy import Engine
 
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
-from trader.db.repos import DerivedMinerviniRepo, WatchlistRepo
+from trader.db.repos import DerivedFlowRepo, DerivedMinerviniRepo, WatchlistRepo
 from trader.flow_score import calculate_final_score, calculate_flow_score
 from trader.time_coerce import to_date
 
@@ -235,8 +235,9 @@ def _enrich_watchlist_rows(
     symbols = [str(row.get("code") or "").zfill(6) for row in normalized_rows if row.get("code")]
 
     derived_repo = DerivedMinerviniRepo(engine)
-    derived_rows = derived_repo.load_for_as_of(as_of=as_of, symbols=symbols)
+    derived_rows = derived_repo.load_for_as_of(env=env, as_of=as_of, symbols=symbols)
     derived_map = {str(row.get("symbol") or "").zfill(6): row for row in derived_rows}
+    flow_rows: List[Dict[str, Any]] = []
 
     enriched: List[Dict[str, Any]] = []
     for item in normalized_rows:
@@ -328,6 +329,21 @@ def _enrich_watchlist_rows(
                 f"{flow_weight_effective:.4f}*score_flow + "
                 f"{trend_weight_effective:.4f}*score_trend"
             )
+            flow_rows.append(
+                {
+                    "as_of": to_date(as_of),
+                    "symbol": code,
+                    "flow_score": flow_score_norm,
+                    "foreign_20_ratio": foreign_ratio,
+                    "inst_20_ratio": inst_ratio,
+                    "flow_missing": bool(flow_missing),
+                    "source": "watchlist_flow_provider",
+                    "features_json": {
+                        "flow_missing_reason": flow_missing_reason,
+                        "weights_effective": meta.get("weights_effective", {}),
+                    },
+                }
+            )
 
         if _safe_float(out.get("tech_score"), 0.0) <= 0.0:
             rs_pctile = _safe_float(out.get("rs_pctile"), 0.0)
@@ -357,6 +373,12 @@ def _enrich_watchlist_rows(
         row.setdefault("rank_final30", idx)
         row.setdefault("rank_top50", _safe_int(row.get("rank_top50"), 0))
         row.setdefault("rank_pool120", _safe_int(row.get("rank_pool120"), 0))
+
+    if flow_rows:
+        try:
+            DerivedFlowRepo(engine).upsert_rows(env=env, rows=flow_rows)
+        except Exception:
+            logger.warning("[FLOW][DB][UPSERT_FAIL] env=%s as_of=%s rows=%s", env, as_of, len(flow_rows), exc_info=True)
     return enriched
 
 

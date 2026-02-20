@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import date, timedelta
 from typing import Iterable
@@ -40,6 +41,7 @@ def compute_minervini_features_for_asof(
     *,
     engine,
     symbols: Iterable[str],
+    env: str | None = None,
     as_of: date | str | None = None,
     lookback_days: int | None = None,
 ) -> list[dict]:
@@ -48,6 +50,7 @@ def compute_minervini_features_for_asof(
     symbols_list = [str(s).zfill(6) for s in symbols if s]
     if not symbols_list:
         return []
+    env_n = (env or os.getenv("STRATEGY_ENV", "practice")).strip().lower()
 
     need_days = int(lookback_days or 520)
 
@@ -71,8 +74,14 @@ def compute_minervini_features_for_asof(
             feats = compute_features(df)
             vcp_info = detect_vcp(df, cfg)
             pivot_val, _ = compute_pivot(df, cfg)
-            feats["vcp_ok"] = bool(vcp_info.get("vcp_ok"))
-            feats["vcp_score"] = float(vcp_info.get("score") or 0.0)
+            feats["vcp_ok"] = vcp_info.get("vcp_ok")
+            raw_vcp_score = vcp_info.get("score")
+            feats["vcp_score"] = float(raw_vcp_score) if raw_vcp_score is not None else None
+            feats["vcp_reason"] = str(vcp_info.get("reason") or "unknown")
+            feats["vcp_contractions"] = list(vcp_info.get("contractions") or [])
+            feats["vcp_contraction_ok"] = bool(vcp_info.get("contraction_ok"))
+            feats["vcp_vol_dryup"] = bool(vcp_info.get("vol_dryup"))
+            feats["vcp_tight_close"] = bool(vcp_info.get("tight_close"))
             feats["pivot"] = float(pivot_val) if pd.notna(pivot_val) else None
             features_map[symbol] = feats
         except Exception as exc:
@@ -97,6 +106,7 @@ def compute_minervini_features_for_asof(
         score = float(score_setup(feats, rs_percentile=rs_pct, vcp_info=vcp_info, cfg=cfg))
         rows.append(
             {
+                "env": env_n,
                 "symbol": symbol,
                 "as_of": as_of_date,
                 "close": feats.get("close"),
@@ -114,7 +124,17 @@ def compute_minervini_features_for_asof(
                 "minervini_score": score,
                 "minervini_pass": bool(ok),
                 "features_json": {
-                    **{k: v for k, v in feats.items() if k not in {"close", "ma50", "ma150", "ma200", "ma200_slope", "dollar_vol_50", "atr14", "atr_pct", "rs_percentile", "vcp_score", "vcp_ok", "pivot"}},
+                    **{k: v for k, v in feats.items() if k not in {"close", "ma50", "ma150", "ma200", "ma200_slope", "dollar_vol_50", "atr14", "atr_pct", "rs_percentile", "pivot"}},
+                    "vcp": {
+                        "score": feats.get("vcp_score"),
+                        "ok": feats.get("vcp_ok"),
+                        "reason": feats.get("vcp_reason"),
+                        "contractions": feats.get("vcp_contractions", []),
+                        "contraction_ok": feats.get("vcp_contraction_ok"),
+                        "vol_dryup": feats.get("vcp_vol_dryup"),
+                        "tight_close": feats.get("vcp_tight_close"),
+                        "pivot": float(feats.get("pivot")) if feats.get("pivot") is not None else None,
+                    },
                     "reasons": reasons,
                 },
             }
@@ -127,6 +147,7 @@ def compute_and_store_derived_minervini(
     *,
     engine,
     symbols: Iterable[str],
+    env: str | None = None,
     as_of: date | str | None = None,
     lookback_days: int | None = None,
 ) -> int:
@@ -136,6 +157,7 @@ def compute_and_store_derived_minervini(
     rows = compute_minervini_features_for_asof(
         engine=engine,
         symbols=symbols_list,
+        env=env,
         as_of=as_of_date,
         lookback_days=lookback_days,
     )
@@ -147,7 +169,8 @@ def compute_and_store_derived_minervini(
             r["features_json"] = to_jsonable(fj)
     
     repo = DerivedMinerviniRepo(engine)
-    upserted = repo.upsert_rows(rows)
+    env_n = (env or os.getenv("STRATEGY_ENV", "practice")).strip().lower()
+    upserted = repo.upsert_rows(env=env_n, rows=rows)
     dt = time.monotonic() - start
     logger.info(
         "[DERIVED][MINERVINI] as_of=%s symbols=%s upserted=%s dt=%.2f",

@@ -527,12 +527,12 @@ jobs:
           cat /tmp/db_migrate_plan.out >> "$GITHUB_OUTPUT"
           echo "[DB][MIGRATE][PLAN] $(cat /tmp/db_migrate_plan.out | tr '\n' ' ')"
 
-      - name: Set MIGRATE_MODE=OFF when no pending
+      - name: Keep MIGRATE_MODE=AUTO when no pending
         if: ${{ steps.db_migrate_plan.outputs.should_migrate != '1' }}
         run: |
           set -euo pipefail
-          echo "MIGRATE_MODE=OFF" >> "$GITHUB_ENV"
-          echo "[DB][MIGRATE][SKIP] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
+          echo "MIGRATE_MODE=AUTO" >> "$GITHUB_ENV"
+          echo "[DB][MIGRATE][AUTO_NO_PENDING] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
 
       - name: Dump key env (universe/candidate)
         run: |

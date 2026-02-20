@@ -282,6 +282,7 @@ def main() -> int:
     as_of = _pick_as_of_date_always_prev()
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
+    allow_flow_degraded_prep = _env_true("ALLOW_FLOW_DEGRADED_PREP", "1") or allow_degraded_prep
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
@@ -378,6 +379,7 @@ def main() -> int:
     derived_upserted = compute_and_store_derived_minervini(
         engine=engine,
         symbols=symbols,
+        env=env,
         as_of=as_of,
         lookback_days=int(os.getenv("MINERVINI_OHLCV_DAYS", "520")),
     )
@@ -587,6 +589,7 @@ def main() -> int:
     flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
 
     flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
+    flow_missing_ratio = 0.0
     if flow_available_cols:
         flow_sample = final_df[flow_available_cols]
         flow_missing_mask = flow_sample.isna().all(axis=1) | flow_sample.fillna(0.0).eq(0.0).all(axis=1)
@@ -599,6 +602,35 @@ def main() -> int:
                 flow_missing_ratio,
                 as_of,
             )
+    else:
+        flow_missing_ratio = 1.0
+
+    if flow_missing_ratio >= 1.0:
+        logger.error(
+            "[PREP][FLOW][SCHEMA_OR_EMPTY] as_of=%s reason=derived_flow_missing_or_empty allow_flow_degraded=%s",
+            as_of,
+            int(allow_flow_degraded_prep),
+        )
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_DEGRADED",
+            ts=now_kst(),
+            ok=False,
+            reasons=["flow_data_missing_all"],
+            payload_json={
+                "as_of": as_of.isoformat(),
+                "flow_available_cols": flow_available_cols,
+                "flow_missing_ratio": flow_missing_ratio,
+                "degraded_mode": "tech_only_warn" if allow_flow_degraded_prep else "schema_error",
+            },
+        )
+        if not allow_flow_degraded_prep:
+            return 1
+        logger.warning("[PREP][FLOW][DEGRADED_WARN] tech-only mode enabled -> continue")
+        degraded_exclude_flow = True
 
     metric_cols = [col for col in core_metric_cols if col in final_df.columns]
     if not degraded_exclude_flow:

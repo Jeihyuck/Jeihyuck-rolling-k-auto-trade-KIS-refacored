@@ -154,15 +154,28 @@ def compute_features(df: pd.DataFrame) -> Dict[str, float]:
 
 def detect_vcp(df: pd.DataFrame, cfg: MinerviniConfig) -> dict:
     df = df.sort_values("date")
-    window = df.tail(cfg.base_lookback_max)
-    if window.empty or len(window) < cfg.base_lookback_max // 2:
+    required_cols = {"high", "low", "close", "volume"}
+    if not required_cols.issubset(df.columns):
         return {
-            "vcp_ok": False,
+            "vcp_ok": None,
             "contractions": [],
             "contraction_ok": False,
             "vol_dryup": False,
             "tight_close": False,
-            "score": 0.0,
+            "score": None,
+            "reason": "missing_required_columns",
+        }
+
+    window = df.tail(cfg.base_lookback_max)
+    if window.empty or len(window) < cfg.base_lookback_max // 2:
+        return {
+            "vcp_ok": None,
+            "contractions": [],
+            "contraction_ok": False,
+            "vol_dryup": False,
+            "tight_close": False,
+            "score": None,
+            "reason": "insufficient_window",
         }
 
     ranges = (window["high"] - window["low"]).to_numpy()
@@ -186,11 +199,13 @@ def detect_vcp(df: pd.DataFrame, cfg: MinerviniConfig) -> dict:
                 break
 
     vol_dryup = False
-    if len(window) >= 50:
-        vol10 = float(window["volume"].tail(10).mean())
-        vol50 = float(window["volume"].tail(50).mean())
-        if vol50 > 0:
-            vol_dryup = vol10 <= vol50 * cfg.vol_dryup_ratio
+    base_n = min(50, len(window))
+    recent_n = min(10, max(5, len(window) // 4))
+    if base_n > recent_n and recent_n > 0:
+        vol_recent = float(window["volume"].tail(recent_n).mean())
+        vol_base = float(window["volume"].tail(base_n).mean())
+        if vol_base > 0:
+            vol_dryup = vol_recent <= vol_base * cfg.vol_dryup_ratio
 
     tight_close = False
     if len(window) >= 5:
@@ -200,9 +215,34 @@ def detect_vcp(df: pd.DataFrame, cfg: MinerviniConfig) -> dict:
             tight_close = (float(recent.max()) - float(recent.min())) / mean_close <= cfg.tight_close_max_pct
 
     vcp_ok = contraction_ok and vol_dryup and tight_close
-    score = 0.0
+
+    contraction_component = 0.0
+    if len(contractions) >= 2:
+        improvements = 0
+        comparable = 0
+        for prev, curr in zip(contractions, contractions[1:]):
+            if prev > 0 and np.isfinite(prev) and np.isfinite(curr):
+                comparable += 1
+                if curr < prev:
+                    improvements += 1
+        if comparable > 0:
+            contraction_component = 8.0 * (improvements / comparable)
+
+    vol_component = 4.0 if vol_dryup else 0.0
+    tight_component = 3.0 if tight_close else 0.0
+    score = float(max(0.0, min(15.0, contraction_component + vol_component + tight_component)))
+
     if vcp_ok:
-        score = min(15.0, 5.0 + 5.0 * (len(contractions) - 1))
+        reason = "ok"
+    else:
+        failed = []
+        if not contraction_ok:
+            failed.append("contraction_not_confirmed")
+        if not vol_dryup:
+            failed.append("volume_not_dryup")
+        if not tight_close:
+            failed.append("tight_close_not_met")
+        reason = ";".join(failed) if failed else "vcp_not_confirmed"
 
     return {
         "vcp_ok": vcp_ok,
@@ -211,6 +251,7 @@ def detect_vcp(df: pd.DataFrame, cfg: MinerviniConfig) -> dict:
         "vol_dryup": vol_dryup,
         "tight_close": tight_close,
         "score": score,
+        "reason": reason,
     }
 
 

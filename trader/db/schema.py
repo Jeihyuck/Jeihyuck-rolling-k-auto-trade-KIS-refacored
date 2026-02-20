@@ -45,6 +45,7 @@ class SchemaTables:
     pb1_watchlist: sa.Table
     job_checkpoints: sa.Table
     derived_minervini: sa.Table
+    derived_flow: sa.Table
     uses_native_uuid: bool
 
 
@@ -291,6 +292,7 @@ def _build_schema(database_url: str) -> SchemaTables:
     derived_minervini = sa.Table(
         "derived_minervini",
         metadata,
+        sa.Column("env", sa.String, nullable=False, server_default=sa.text("'practice'")),
         sa.Column("symbol", sa.String, nullable=False),
         sa.Column("as_of", sa.Date, nullable=False),
         sa.Column("close", sa.Float),
@@ -310,9 +312,29 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("features_json", sa.JSON, nullable=False, default=dict),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-        sa.PrimaryKeyConstraint("symbol", "as_of"),
+        sa.PrimaryKeyConstraint("env", "symbol", "as_of"),
+        sa.Index("ix_derived_minervini_env_as_of", "env", "as_of"),
         sa.Index("ix_derived_minervini_as_of", "as_of"),
         sa.Index("ix_derived_minervini_symbol", "symbol"),
+    )
+
+    derived_flow = sa.Table(
+        "derived_flow",
+        metadata,
+        sa.Column("env", sa.String, nullable=False),
+        sa.Column("as_of", sa.Date, nullable=False),
+        sa.Column("symbol", sa.String, nullable=False),
+        sa.Column("flow_score", sa.Float),
+        sa.Column("foreign_20_ratio", sa.Float),
+        sa.Column("inst_20_ratio", sa.Float),
+        sa.Column("flow_missing", sa.Boolean, nullable=False, server_default=sa.text("false")),
+        sa.Column("source", sa.String),
+        sa.Column("features_json", sa.JSON, nullable=False, default=dict),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
+        sa.PrimaryKeyConstraint("env", "as_of", "symbol"),
+        sa.Index("ix_derived_flow_env_as_of", "env", "as_of"),
+        sa.Index("ix_derived_flow_symbol_as_of", "symbol", "as_of"),
     )
 
     job_checkpoints = sa.Table(
@@ -340,6 +362,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         pb1_watchlist=pb1_watchlist,
         job_checkpoints=job_checkpoints,
         derived_minervini=derived_minervini,
+        derived_flow=derived_flow,
         uses_native_uuid=uses_native_uuid,
     )
 
@@ -379,4 +402,5 @@ RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 PRICE_DAILY = DEFAULT_SCHEMA.price_daily
 PB1_WATCHLIST = DEFAULT_SCHEMA.pb1_watchlist
 DERIVED_MINERVINI = DEFAULT_SCHEMA.derived_minervini
+DERIVED_FLOW = DEFAULT_SCHEMA.derived_flow
 JOB_CHECKPOINTS = DEFAULT_SCHEMA.job_checkpoints

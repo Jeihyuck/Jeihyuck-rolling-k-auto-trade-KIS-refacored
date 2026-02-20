@@ -1609,6 +1609,7 @@ class PB1Engine:
                 
                 # ✅ CRITICAL: fallback 지원 버전 사용 (최대 7일 이내)
                 derived_rows, actual_as_of = derived_repo.load_for_as_of_with_fallback(
+                    env=self.env,
                     as_of=today_val,
                     symbols=symbol_list,
                     ttl_days=7,
