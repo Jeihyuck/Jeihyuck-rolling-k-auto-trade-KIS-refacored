@@ -546,8 +546,20 @@ def main() -> int:
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
         "pool120": pd.DataFrame(watchlist_bundle.get("pool120", [])),
         "top50": pd.DataFrame(watchlist_bundle.get("top50", [])),
-        "final30": pd.DataFrame(watchlist_bundle.get("final30", watchlist or [])),
+        "final30": pd.DataFrame((watchlist or watchlist_bundle.get("final30", []))),
     }
+    final30_df = frames.get("final30", pd.DataFrame())
+    if final30_df is not None and not final30_df.empty:
+        score_final_nonzero = int((pd.to_numeric(final30_df.get("score_final"), errors="coerce").fillna(0.0) > 0.0).sum()) if "score_final" in final30_df.columns else 0
+        final_score_nonzero = int((pd.to_numeric(final30_df.get("final_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "final_score" in final30_df.columns else 0
+        tech_score_nonzero = int((pd.to_numeric(final30_df.get("tech_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "tech_score" in final30_df.columns else 0
+        logger.info(
+            "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s",
+            int(len(final30_df)),
+            tech_score_nonzero,
+            final_score_nonzero,
+            score_final_nonzero,
+        )
     export_watchlist_bundle(
         out_dir=export_dir,
         frames_dict=frames,

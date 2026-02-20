@@ -68,6 +68,17 @@ def _normalize_reasons(value: Any) -> Dict[str, Any]:
 
 def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(record or {})
+    meta = dict(normalized.get("meta") or {})
+
+    def _pick(*keys: str, default: Any = 0.0) -> Any:
+        for key in keys:
+            if key in normalized and normalized.get(key) is not None:
+                return normalized.get(key)
+        for key in keys:
+            if key in meta and meta.get(key) is not None:
+                return meta.get(key)
+        return default
+
     reject_reasons = _as_list(normalized.get("reject_reasons"))
     reasons = _normalize_reasons(normalized.get("reasons"))
 
@@ -82,34 +93,50 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     scores = normalized.get("scores")
     if not isinstance(scores, dict):
         scores = {}
-    scores.setdefault("rs_pctile", float(normalized.get("rs_pctile", 0.0) or 0.0))
-    scores.setdefault("vcp_score", float(normalized.get("vcp_score", 0.0) or 0.0))
-    scores.setdefault("trend_template", 1 if float(normalized.get("trend_score", 0.0) or 0.0) >= 100.0 else 0)
-    scores.setdefault("liquidity_rank", int(normalized.get("rank_pool120", 0) or 0))
-    scores.setdefault("pullback_score", max(0.0, min(100.0, 100.0 - float(normalized.get("pullback_pct", 0.0) or 0.0) * 400.0)))
-    scores.setdefault("foreign_score", max(0.0, min(100.0, float(normalized.get("foreign_20_ratio", 0.0) or 0.0) * 100.0)))
-    scores.setdefault("inst_score", max(0.0, min(100.0, float(normalized.get("inst_20_ratio", 0.0) or 0.0) * 100.0)))
+    scores.setdefault("rs_pctile", float(_pick("rs_pctile") or 0.0))
+    scores.setdefault("vcp_score", float(_pick("vcp_score") or 0.0))
+    scores.setdefault("trend_template", 1 if float(_pick("trend_score") or 0.0) >= 100.0 else 0)
+    scores.setdefault("liquidity_rank", int(_pick("rank_pool120", "pool_rank", default=0) or 0))
+    scores.setdefault("pullback_score", max(0.0, min(100.0, 100.0 - float(_pick("pullback_pct") or 0.0) * 400.0)))
+    scores.setdefault("foreign_score", max(0.0, min(100.0, float(_pick("foreign_20_ratio") or 0.0) * 100.0)))
+    scores.setdefault("inst_score", max(0.0, min(100.0, float(_pick("inst_20_ratio") or 0.0) * 100.0)))
     normalized["scores"] = scores
 
-    normalized["as_of"] = str(normalized.get("as_of") or "")
-    normalized["name"] = str(normalized.get("name") or "")
-    normalized["tech_score"] = float(normalized.get("tech_score", normalized.get("score_tech", 0.0)) or 0.0)
-    normalized["flow_score"] = float(normalized.get("flow_score", normalized.get("score_flow", 0.0)) or 0.0)
-    normalized["final_score"] = float(normalized.get("final_score", normalized.get("score_final", normalized.get("score", 0.0))) or 0.0)
+    normalized["as_of"] = str(_pick("as_of", default="") or "")
+    normalized["name"] = str(_pick("name", default="") or "")
+    normalized["tech_score"] = float(_pick("tech_score", "score_tech") or 0.0)
+    normalized["flow_score"] = float(_pick("flow_score", "score_flow") or 0.0)
+    normalized["final_score"] = float(_pick("final_score", "score_final", "score") or 0.0)
 
     normalized["filters_passed"] = _as_list(normalized.get("filters_passed"))
     normalized["filters_failed"] = _as_list(normalized.get("filters_failed") or failed)
 
-    normalized["rank_pool120"] = int(normalized.get("rank_pool120", 0) or 0)
-    normalized["rank_top50"] = int(normalized.get("rank_top50", 0) or 0)
-    normalized["rank_final30"] = int(normalized.get("rank_final30", 0) or 0)
+    normalized["rank_pool120"] = int(_pick("rank_pool120", default=0) or 0)
+    normalized["rank_top50"] = int(_pick("rank_top50", default=0) or 0)
+    normalized["rank_final30"] = int(_pick("rank_final30", default=0) or 0)
 
-    normalized["score_liq"] = float(normalized.get("score_liq", normalized.get("liq_avg", 0.0)) or 0.0)
-    normalized["score_tech"] = float(normalized.get("score_tech", normalized.get("tech_score", 0.0)) or 0.0)
-    normalized["score_flow"] = float(normalized.get("score_flow", normalized.get("flow_score", 0.0)) or 0.0)
-    normalized["score_final"] = float(
-        normalized.get("score_final", normalized.get("final_score", normalized.get("score", 0.0))) or 0.0
-    )
+    normalized["score_liq"] = float(_pick("score_liq", "liq_avg") or 0.0)
+
+    score_tech = float(_pick("score_tech", "tech_score") or 0.0)
+    if score_tech <= 0.0:
+        fallback_tech = float(_pick("tech_score", default=0.0) or 0.0)
+        if fallback_tech > 0.0:
+            score_tech = fallback_tech
+    normalized["score_tech"] = score_tech
+
+    score_flow = float(_pick("score_flow", "flow_score") or 0.0)
+    if score_flow <= 0.0:
+        fallback_flow = float(_pick("flow_score", default=0.0) or 0.0)
+        if fallback_flow > 0.0:
+            score_flow = fallback_flow
+    normalized["score_flow"] = score_flow
+
+    score_final = float(_pick("score_final", "final_score", "score") or 0.0)
+    if score_final <= 0.0:
+        fallback_final = float(_pick("final_score", "score", default=0.0) or 0.0)
+        if fallback_final > 0.0:
+            score_final = fallback_final
+    normalized["score_final"] = score_final
 
     for key in _REQUIRED_EXPORT_KEYS:
         if key in {"filters_passed", "filters_failed"}:
@@ -144,6 +171,16 @@ def export_watchlist_bundle(
     for name, frame in frames_dict.items():
         safe_name = name.strip().lower()
         df = _normalize_frame(frame if frame is not None else pd.DataFrame())
+        if not df.empty:
+            score_final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0
+            final_score_nonzero = int((df["final_score"].fillna(0.0) > 0.0).sum()) if "final_score" in df.columns else 0
+            logger.info(
+                "[EXPORT][SCORES] name=%s rows=%s score_final_nonzero=%s final_score_nonzero=%s",
+                safe_name,
+                int(len(df)),
+                score_final_nonzero,
+                final_score_nonzero,
+            )
 
         csv_path = out_dir / f"{safe_name}.csv"
         df.to_csv(csv_path, index=False)
@@ -154,7 +191,8 @@ def export_watchlist_bundle(
         payload = [_normalize_record(rec) for rec in df.to_dict(orient="records")]
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        logger.info("[EXPORT] wrote %s", json_path)
+        payload_nonzero = sum(1 for rec in payload if float(rec.get("score_final", 0.0) or 0.0) > 0.0)
+        logger.info("[EXPORT] wrote %s rows=%s score_final_nonzero=%s", json_path, len(payload), payload_nonzero)
         written[f"{safe_name}_json"] = json_path
 
     meta_path = out_dir / "meta.json"

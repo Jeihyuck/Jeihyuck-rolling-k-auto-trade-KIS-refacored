@@ -174,6 +174,10 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out["flow_score"] = _safe_float(out.get("flow_score", meta.get("flow_score", 0.0)), 0.0)
     out["tech_score"] = _safe_float(out.get("tech_score", meta.get("tech_score", out.get("score", 0.0))), 0.0)
     out["final_score"] = _safe_float(out.get("final_score", meta.get("final_score", out.get("score", 0.0))), 0.0)
+    out["score_tech"] = _safe_float(out.get("score_tech", meta.get("score_tech", out.get("tech_score", 0.0))), 0.0)
+    out["score_flow"] = _safe_float(out.get("score_flow", meta.get("score_flow", out.get("flow_score", 0.0))), 0.0)
+    out["score_final"] = _safe_float(out.get("score_final", meta.get("score_final", out.get("final_score", out.get("score", 0.0)))), 0.0)
+    out["score"] = _safe_float(out.get("score", out.get("score_final", out.get("final_score", 0.0))), 0.0)
     flow_missing = bool(out.get("flow_missing") or meta.get("flow_missing"))
     if flow_missing:
         out["foreign_20_ratio"] = out.get("foreign_20_ratio", meta.get("foreign_20_ratio"))
@@ -191,6 +195,10 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
         "flow_score",
         "tech_score",
         "final_score",
+        "score_tech",
+        "score_flow",
+        "score_final",
+        "score",
         "foreign_20_ratio",
         "inst_20_ratio",
     ):
@@ -376,7 +384,19 @@ def _enrich_watchlist_rows(
 
     if flow_rows:
         try:
-            DerivedFlowRepo(engine).upsert_rows(env=env, rows=flow_rows)
+            flow_repo = DerivedFlowRepo(engine)
+            upserted = flow_repo.upsert_rows(env=env, rows=flow_rows)
+            as_of_count = flow_repo.count_as_of(env=env, as_of=to_date(as_of))
+            missing_count = sum(1 for row in flow_rows if bool(row.get("flow_missing")))
+            logger.info(
+                "[FLOW][DB][UPSERT_OK] env=%s as_of=%s input_rows=%s upserted=%s as_of_count=%s missing_rows=%s",
+                env,
+                as_of,
+                len(flow_rows),
+                upserted,
+                as_of_count,
+                missing_count,
+            )
         except Exception:
             logger.warning("[FLOW][DB][UPSERT_FAIL] env=%s as_of=%s rows=%s", env, as_of, len(flow_rows), exc_info=True)
     return enriched
