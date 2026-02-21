@@ -402,7 +402,7 @@ jobs:
           ls -la repo || true
           echo "---- repo/trader ----"
           ls -la repo/trader | head -n 80 || true
-          test -f repo/trader/minervini_runner.py && echo "OK: minervini_runner.py exists" || (echo "::error::missing repo/trader/minervini_runner.py" && exit 1)
+          test -f repo/trader/minervini_v2_runner.py && echo "OK: minervini_v2_runner.py exists" || (echo "::error::missing repo/trader/minervini_v2_runner.py" && exit 1)
 
       - name: Import check (preflight)
         shell: bash
@@ -425,7 +425,7 @@ jobs:
               python -c "import trader.candidate_pool_builder; print('✅ trader.candidate_pool_builder - OK')"
               python -c "import trader.trade_tick; print('✅ trader.trade_tick - OK')"
               ;;
-            minervini_test) python -c "import trader.minervini_runner; print('✅ trader.minervini_runner - OK')" ;;
+            minervini_test) python -c "import trader.minervini_v2_runner; print('✅ trader.minervini_v2_runner - OK')" ;;
             *) echo "::error::Unknown MODE=${MODE}"; exit 1 ;;
           esac
 
@@ -684,7 +684,22 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/repo
         run: |
           set -euo pipefail
-          python -m trader.minervini_runner
+          # if AS_OF_OVERRIDE not provided, choose last trading day in KST
+          if [[ -z "${AS_OF_OVERRIDE:-}" ]]; then
+            dow=$(TZ=Asia/Seoul date +%u)  # 1=Mon ... 7=Sun
+            if [[ "$dow" == "1" ]]; then
+              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '3 days ago' +%F)"  # Fri
+            elif [[ "$dow" == "6" ]]; then
+              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '1 day ago' +%F)"   # Fri
+            elif [[ "$dow" == "7" ]]; then
+              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '2 days ago' +%F)"  # Fri
+            else
+              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d 'yesterday' +%F)"   # prev day
+            fi
+            echo "AS_OF_OVERRIDE=$AS_OF_OVERRIDE" >> "$GITHUB_ENV"
+          fi
+          echo "[AS_OF_OVERRIDE]=$AS_OF_OVERRIDE"
+          python -m trader.minervini_v2_runner
 
       - name: Fail if as_of universe missing after ensure/build (prep)
         if: ${{ always() && needs.resolve.outputs.run_mode == 'prep' }}
