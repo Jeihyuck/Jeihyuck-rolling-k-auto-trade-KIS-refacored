@@ -9,6 +9,11 @@ on:
 
   workflow_dispatch:
     inputs:
+      AS_OF_OVERRIDE:
+        description: "Force as_of date (e.g., 2026-02-19). Leave empty to auto."
+        required: false
+        default: ""
+        
       MODE:
         description: "prep | candidate | trade | both | minervini_test"
         required: true
@@ -293,7 +298,7 @@ jobs:
         shell: bash
         working-directory: repo
     env:
-      TZ: Asia/Seoul
+      AS_OF_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.AS_OF_OVERRIDE || '' }}
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
 
