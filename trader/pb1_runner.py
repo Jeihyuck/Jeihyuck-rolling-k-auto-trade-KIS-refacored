@@ -1623,6 +1623,17 @@ def run_once(
             return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
 
     logger.info(
+        "[PB1_RUNNER][CFG] phase=%s as_of=%s TRADE_INPUT=%s MIN_BUYABLE=%s RELAX_PASSES=%s RS_MIN=%s VCP_MIN=%s",
+        phase_for_log,
+        as_of,
+        os.getenv("TRADE_INPUT", "final30"),
+        os.getenv("MIN_BUYABLE", "5"),
+        os.getenv("RELAX_PASSES", "3"),
+        os.getenv("MINERVINI_RS_MIN_PCTILE", "80"),
+        os.getenv("MINERVINI_VCP_MIN_SCORE", "70"),
+    )
+
+    logger.info(
         "[PB1][RUN-START] event=%s now_kst=%s trading_day=%s market_window=%s window=%s phase=%s phase_reason=%s DRY_RUN=%s DISABLE_LIVE_TRADING=%s LIVE_TRADING_ENABLED=%s STRATEGY_MODE=%s PB1_ENTRY_ENABLED=%s",
         event_name_lower or "unknown",
         now.isoformat(),
@@ -1987,7 +1998,7 @@ def run_once(
             reason=",".join(db_write_reasons),
             now=now,
         )
-        touched_files = []
+        touched_files = engine_runner.get_touched_files() if engine_runner and hasattr(engine_runner, "get_touched_files") else []
     except Exception as exc:
         logger.exception("[PB1][FAIL] unexpected error")
         phase_context = phase_for_log or phase_override_arg or "unknown"

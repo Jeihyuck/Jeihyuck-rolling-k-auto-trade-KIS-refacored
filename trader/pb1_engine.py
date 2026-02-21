@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
 
@@ -140,6 +141,14 @@ from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
+from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
+from trader.final_list_store import get_as_of_date, load_final30, save_final30
+from trader.minervini_filter import compute_minervini_signals, select_buyable_with_relax
+from trader.minervini_store import write_minervini_signals
+from trader.strategies.pb1_pullback_close import (
+    compute_features as compute_pb1_features,
+    evaluate_setup as evaluate_pb1_setup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +633,7 @@ class PB1Engine:
         self.entry_reserve_krw: float | None = None
         self.target_new_positions: int | None = None
         self._budget_plan_meta: dict[str, Any] | None = None
+        self._touched_files: list[Path] = []
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -4353,6 +4363,88 @@ class PB1Engine:
         }
         return members
 
+    def get_touched_files(self) -> list[Path]:
+        return list(self._touched_files)
+
+    def _build_universe(self) -> list[dict]:
+        payload = run_rebalance(str(get_as_of_date()), return_by_market=True)
+        selected = payload.get("selected") if isinstance(payload, dict) else []
+        members: list[dict] = []
+        for item in selected or []:
+            code = str((item or {}).get("code") or "").zfill(6)
+            if not code:
+                continue
+            members.append(
+                {
+                    "code": code,
+                    "market": (item or {}).get("market") or "",
+                    "name": (item or {}).get("name") or self._code_name_map.get(code, ""),
+                }
+            )
+        return members
+
+    @staticmethod
+    def _final30_sort_key(cf: CandidateFeature) -> tuple[float, float, float, float]:
+        feats = cf.features or {}
+        pullback = float(feats.get("pullback_pct") or float("inf"))
+        vol_c = float(feats.get("vol_contraction") or float("inf"))
+        volu_raw = feats.get("volu_contraction")
+        try:
+            volu_v = float(volu_raw)
+        except (TypeError, ValueError):
+            volu_v = float("nan")
+        volu_c = volu_v if np.isfinite(volu_v) else float("inf")
+        trend_strength = float(feats.get("trend_strength") or 0.0)
+        return (pullback, vol_c, volu_c, -trend_strength)
+
+    def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
+        code_market = {
+            str(m.get("code") or "").zfill(6): (m.get("market") or "")
+            for m in (self._load_universe() or [])
+            if m.get("code")
+        }
+        candidates: list[CandidateFeature] = []
+        for raw_code in codes or []:
+            code = str(raw_code or "").zfill(6)
+            if not code:
+                continue
+            market = code_market.get(code, "")
+            try:
+                df, meta = self._fetch_daily(code, days=int(PB1_OHLCV_DAYS_BASE))
+                if df is None or df.empty:
+                    continue
+                features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                features["market"] = market
+                features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else False
+                setup_ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume)
+                cf = CandidateFeature(
+                    code=code,
+                    market=market,
+                    features=features,
+                    setup_ok=bool(setup_ok),
+                    reasons=list(reasons or []),
+                    mode=1,
+                    mode_reasons=["pb1_from_final30"],
+                )
+                candidates.append(cf)
+            except Exception as exc:
+                logger.debug("[PB1][FINAL30][CAND_FAIL] code=%s err=%s", code, exc)
+                continue
+        return candidates
+
+    def _select_final30_codes(self, candidates: list[CandidateFeature]) -> list[str]:
+        setup_ok = [cf for cf in candidates if cf.setup_ok]
+        ranked = sorted(setup_ok, key=self._final30_sort_key)
+        return [cf.code for cf in ranked[:30]]
+
+    def _load_entry_final30_or_abort(self, as_of: str) -> list[str]:
+        final30_codes = load_final30(self.env, as_of) or []
+        if not final30_codes:
+            logger.error("[PB1][ENTRY][GUARD] final30 missing -> abort as_of=%s env=%s", as_of, self.env)
+            raise SystemExit(2)
+        logger.info("[FINAL30][LOAD] as_of=%s count=%s", as_of, len(final30_codes))
+        return final30_codes
+
     def _resolve_scan_members_for_entry(self, universe_members: list[dict], watchlist_members: list[dict], watchlist_reason: str) -> tuple[list[dict], str]:
         """
         Entry scan target must be deterministic:
@@ -5246,20 +5338,62 @@ class PB1Engine:
         
         # ✅ universe_members는 보유/리포트/정산용으로만 로드
         universe_members = self._load_universe()
+        as_of_final = get_as_of_date()
+        force_final30_rebuild = env_bool("FORCE_FINAL30_REBUILD", False)
+        final30_codes: list[str] = []
+
+        if self.phase == "prep":
+            existing_final30 = load_final30(self.env, as_of_final)
+            if existing_final30 and not force_final30_rebuild:
+                final30_codes = existing_final30
+                logger.info("[FINAL30][REUSE] as_of=%s count=%s", as_of_final, len(final30_codes))
+            else:
+                prep_members = self._build_universe()
+                prep_codes = [str(m.get("code") or "").zfill(6) for m in prep_members if m.get("code")]
+                prep_candidates = self._compute_candidates_from_codes(prep_codes)
+                final30_codes = self._select_final30_codes(prep_candidates)
+                final30_path = save_final30(
+                    env=self.env,
+                    as_of=as_of_final,
+                    symbols=final30_codes,
+                    meta={
+                        "source": "prep",
+                        "input_count": len(prep_codes),
+                        "setup_ok_count": len([c for c in prep_candidates if c.setup_ok]),
+                        "selected_count": len(final30_codes),
+                    },
+                    overwrite=force_final30_rebuild,
+                )
+                self._touched_files.append(final30_path)
+                logger.info("[FINAL30][SAVE] as_of=%s count=%s path=%s", as_of_final, len(final30_codes), final30_path)
+
+        if self.phase == "entry":
+            final30_codes = self._load_entry_final30_or_abort(as_of_final)
+            trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
+            logger.info("[PB1][ENTRY][INPUT] TRADE_INPUT=%s FINAL_LIST_NAME=%s", trade_input, os.getenv("FINAL_LIST_NAME", "final30"))
         
         # ✅ scan_members: 후보군 우선, 단일 함수로 결정 (이후 절대 덮어쓰지 않음)
         watchlist_members = []
         watchlist_reason = ""
         
-        if self.phase in {"prep", "entry"}:
+        if self.phase == "prep":
             watchlist_members, watchlist_reason = self._load_today_watchlist_members()
         
-        # ✅ CRITICAL: scan_members는 이 함수 호출로만 결정 (이후 절대 변경 금지)
-        scan_members, scan_source = self._resolve_scan_members_for_entry(
-            universe_members=universe_members,
-            watchlist_members=watchlist_members,
-            watchlist_reason=watchlist_reason,
-        )
+        # ✅ CRITICAL: entry는 final30만 입력으로 사용 (유니버스/후보 재생성 금지)
+        if self.phase == "entry":
+            code_market = {
+                str(m.get("code") or "").zfill(6): (m.get("market") or "")
+                for m in universe_members
+                if m.get("code")
+            }
+            scan_members = [{"code": c, "market": code_market.get(c, "")} for c in final30_codes]
+            scan_source = "final30"
+        else:
+            scan_members, scan_source = self._resolve_scan_members_for_entry(
+                universe_members=universe_members,
+                watchlist_members=watchlist_members,
+                watchlist_reason=watchlist_reason,
+            )
         
         # ✅ 디버그 로그: 원인 추적용 (재발 방지)
         logger.info(
@@ -5334,58 +5468,141 @@ class PB1Engine:
         after_dedup_count = 0
         orderable_candidates: list[CandidateFeature] = []
         minervini_report_path: str | None = None
+        buyable_codes: set[str] = set()
+        buyable_report: dict[str, Any] = {}
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
-            # Minervini 적용 전 시간 기록
-            t_minervini_start = time.monotonic()
-            
-            candidates = self._compute_candidates(scan_members)
-            
-            # Minervini 적용 시간 기록 (_compute_candidates 내부에서 Minervini 수행)
-            dt_minervini = time.monotonic() - t_minervini_start
-            
-            # [ENTRY][CANDIDATES] 초기 카운트
-            data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
-            logger.info(
-                "[ENTRY][CANDIDATES] trace=%s start scan_count=%s source=%s data_ok=%s dt_minervini=%.2f",
-                trace_id,
-                len(scan_members),
-                scan_source,
-                data_ok_count,
-                dt_minervini,
-            )
-            
-            # PB1 필터 시간 기록
-            t_pb1_start = time.monotonic()
-            (
-                candidates,
-                selected_tier,
-                selected_thresholds,
-                all_reason_counts,
-                tiers_tried,
-                relax_passes_used,
-                applied_min_score,
-                applied_require_both,
-            ) = self._select_candidates_with_fallback(candidates)
-            dt_pb1_filter = time.monotonic() - t_pb1_start
-            
-            logger.info(
-                "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
-                trace_id,
-                data_ok_count,
-                len([c for c in candidates if c.setup_ok]),
-                dt_pb1_filter,
-                selected_tier,
-                relax_passes_used,
-            )
-            if not any(c.setup_ok for c in candidates):
-                self._apply_score_fallback(candidates)
-            setup_ok_codes = [c.code for c in candidates if c.setup_ok]
-            candidates = self._size_positions(candidates)
-            ok_after_risk = sorted(
-                [c for c in candidates if c.setup_ok],
-                key=lambda c: float(c.features.get("score") or 0.0),
-                reverse=True,
-            )
+            if self.phase == "entry":
+                t_pb1_start = time.monotonic()
+                candidates = self._compute_candidates_from_codes(final30_codes)
+                dt_pb1_filter = time.monotonic() - t_pb1_start
+                dt_minervini = 0.0
+                data_ok_count = len(candidates)
+                logger.info(
+                    "[ENTRY][CANDIDATES] trace=%s start scan_count=%s source=%s data_ok=%s dt_minervini=%.2f",
+                    trace_id,
+                    len(scan_members),
+                    scan_source,
+                    data_ok_count,
+                    dt_minervini,
+                )
+                logger.info(
+                    "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
+                    trace_id,
+                    data_ok_count,
+                    len([c for c in candidates if c.setup_ok]),
+                    dt_pb1_filter,
+                    "final30_pb1",
+                    0,
+                )
+
+                setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+                t_minervini_start = time.monotonic()
+                signals = compute_minervini_signals(
+                    self,
+                    as_of=as_of_final,
+                    symbols=final30_codes,
+                    benchmark=str(os.getenv("RS_BENCHMARK", "229200")),
+                )
+                signals["final30"] = list(final30_codes)
+                buyable_codes_list, buyable_report = select_buyable_with_relax(
+                    signals=signals,
+                    min_buyable=int(os.getenv("MIN_BUYABLE", "5") or 5),
+                    relax_passes=int(os.getenv("RELAX_PASSES", "3") or 3),
+                    rs_step=int(os.getenv("RS_PCTILE_STEP", "5") or 5),
+                    vcp_step=int(os.getenv("VCP_SCORE_STEP", "5") or 5),
+                    keep_trend=(os.getenv("KEEP_TREND_TEMPLATE_ALWAYS", "1") == "1"),
+                )
+                dt_minervini = time.monotonic() - t_minervini_start
+                buyable_codes = set(buyable_codes_list)
+                signal_item_map = {
+                    str(item.get("code") or "").zfill(6): item
+                    for item in (signals.get("items") or [])
+                    if item.get("code")
+                }
+
+                pass_counts = buyable_report.get("pass_counts") or {}
+                logger.info(
+                    "[MINERVINI][RELAX] target=%s pass0=%s pass1=%s pass2=%s pass3=%s used=%s rs_cut=%s vcp_cut=%s",
+                    int(os.getenv("MIN_BUYABLE", "5") or 5),
+                    pass_counts.get("pass0", 0),
+                    pass_counts.get("pass1", 0),
+                    pass_counts.get("pass2", 0),
+                    pass_counts.get("pass3", 0),
+                    buyable_report.get("relax_level_used"),
+                    buyable_report.get("rs_cut_used"),
+                    buyable_report.get("vcp_cut_used"),
+                )
+
+                minervini_path = write_minervini_signals(
+                    base_dir=Path("bot_state"),
+                    env=self.env,
+                    run_id=str(self.run_id),
+                    signals=signals,
+                    buyable_report=buyable_report,
+                )
+                self._touched_files.append(minervini_path)
+                logger.info("[MINERVINI][STORE] path=%s", minervini_path)
+
+                for cf in candidates:
+                    cf.features["minervini_buyable"] = cf.code in buyable_codes
+                    signal_item = signal_item_map.get(cf.code) or {}
+                    if signal_item.get("pivot") is not None:
+                        cf.features["pivot"] = signal_item.get("pivot")
+                    if cf.setup_ok and cf.code not in buyable_codes:
+                        cf.setup_ok = False
+                        cf.reasons = list(cf.reasons or []) + ["minervini_not_buyable"]
+
+                candidates = self._size_positions(candidates)
+                ok_after_risk = sorted(
+                    [c for c in candidates if c.setup_ok and c.code in buyable_codes],
+                    key=lambda c: float(c.features.get("score") or 0.0),
+                    reverse=True,
+                )
+            else:
+                t_minervini_start = time.monotonic()
+                candidates = self._compute_candidates(scan_members)
+                dt_minervini = time.monotonic() - t_minervini_start
+                data_ok_count = len([cf for cf in candidates if cf.features.get("data_ok")])
+                logger.info(
+                    "[ENTRY][CANDIDATES] trace=%s start scan_count=%s source=%s data_ok=%s dt_minervini=%.2f",
+                    trace_id,
+                    len(scan_members),
+                    scan_source,
+                    data_ok_count,
+                    dt_minervini,
+                )
+
+                t_pb1_start = time.monotonic()
+                (
+                    candidates,
+                    selected_tier,
+                    selected_thresholds,
+                    all_reason_counts,
+                    tiers_tried,
+                    relax_passes_used,
+                    applied_min_score,
+                    applied_require_both,
+                ) = self._select_candidates_with_fallback(candidates)
+                dt_pb1_filter = time.monotonic() - t_pb1_start
+
+                logger.info(
+                    "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
+                    trace_id,
+                    data_ok_count,
+                    len([c for c in candidates if c.setup_ok]),
+                    dt_pb1_filter,
+                    selected_tier,
+                    relax_passes_used,
+                )
+                if not any(c.setup_ok for c in candidates):
+                    self._apply_score_fallback(candidates)
+                setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+                candidates = self._size_positions(candidates)
+                ok_after_risk = sorted(
+                    [c for c in candidates if c.setup_ok],
+                    key=lambda c: float(c.features.get("score") or 0.0),
+                    reverse=True,
+                )
             after_risk_check_count = len(ok_after_risk)
             candidate_codes = [cf.code for cf in ok_after_risk]
             logger.info(
@@ -5473,7 +5690,7 @@ class PB1Engine:
                 )
             
             minervini_report_path = run_minervini_report(
-                members,
+                scan_members,
                 self.minervini_config,
                 as_of=self._today,
                 candidates=candidates,
@@ -5523,6 +5740,33 @@ class PB1Engine:
                 self.current_code = cf.code
                 close_price = float(cf.features.get("close") or 0.0)
                 order_price = float(cf.features.get("order_price") or close_price or 0.0)
+                if self.phase == "entry" and cf.code in buyable_codes:
+                    pivot_val = self._to_float(cf.features.get("pivot"))
+                    if pivot_val and order_price > 0:
+                        if order_price <= pivot_val * 1.003:
+                            self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
+                            self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_price * float(cf.planned_qty or 0),
+                                reasons=["pivot_not_broken"],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+                        if order_price > pivot_val * 1.03:
+                            self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
+                            self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_price * float(cf.planned_qty or 0),
+                                reasons=["pivot_overshoot"],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
                 planned_cap = float(cf.features.get("planned_cap") or (order_price * float(cf.planned_qty or 0)))
                 if cf.planned_qty <= 0:
                     self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)

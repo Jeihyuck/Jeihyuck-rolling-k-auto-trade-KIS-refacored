@@ -323,6 +323,13 @@ jobs:
       OHLCV_PREFETCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_PREFETCH_MODE || 'auto' }}
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
+      TRADE_INPUT: "final30"
+      FORCE_FINAL30_REBUILD: "0"
+      MIN_BUYABLE: "5"
+      RELAX_PASSES: "3"
+      RS_PCTILE_STEP: "5"
+      VCP_SCORE_STEP: "5"
+      KEEP_TREND_TEMPLATE_ALWAYS: "1"
       PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
