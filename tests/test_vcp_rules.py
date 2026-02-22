@@ -14,7 +14,7 @@ def _base_df() -> pd.DataFrame:
 
     lows[-55] = 60.0
     lows[-25] = 75.0
-    lows[-10] = 83.0
+    lows[-10] = 88.0
 
     for i in range(10):
         closes[-10 + i] = 95.0 + (0.2 if i % 2 else -0.2)
@@ -51,7 +51,7 @@ def test_vcp_fail_tight_reason() -> None:
         df.iloc[-10 + i, df.columns.get_loc("close")] = 70.0 + i * 3.0
     df.iloc[-1, df.columns.get_loc("close")] = 80.0
     close = float(df["close"].iloc[-1])
-    _vals, reasons, vcp_pass, checks = _vcp_eval(df, close, atr_pct=0.07)
+    _vals, reasons, vcp_pass, checks = _vcp_eval(df, close, atr_pct=0.09)
     assert checks["tight_ok"] is False
     assert vcp_pass is False
     assert "vcp_not_tight" in reasons

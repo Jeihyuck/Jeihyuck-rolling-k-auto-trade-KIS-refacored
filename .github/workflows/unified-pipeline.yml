@@ -163,6 +163,13 @@ env:
   ALLOW_LIVE_GATE: "0"
 
   ATR_MAX_PCT: "0.10"
+  MINERVINI_VCP_MAX_RECENT_RANGE_PCT: "0.41"
+  MINERVINI_VCP_PIVOT_NEAR_PCT: "0.16"
+  MINERVINI_VCP_VOL_SHRINK_MODE: "median"
+  MINERVINI_VCP_VOL_SHRINK_TOL: "1.65"
+  MINERVINI_VCP_TIGHTNESS_TOL_MULT: "1.30"
+  MINERVINI_RESULT_VERSION: "v2_relaxed_vcp"
+  MINERVINI_INPUT_SOURCE: "final30"
   PB1_RUN_IN_MINERVINI_TEST: "0"
   FORCE_COMPUTE_ON_CUTOFF: "1"
   BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
@@ -328,6 +335,13 @@ jobs:
       OHLCV_PREFETCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_PREFETCH_MODE || 'auto' }}
       FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
       ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
+      MINERVINI_VCP_MAX_RECENT_RANGE_PCT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_MAX_RECENT_RANGE_PCT || '0.41' }}
+      MINERVINI_VCP_PIVOT_NEAR_PCT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_PIVOT_NEAR_PCT || '0.16' }}
+      MINERVINI_VCP_VOL_SHRINK_MODE: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_VOL_SHRINK_MODE || 'median' }}
+      MINERVINI_VCP_VOL_SHRINK_TOL: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_VOL_SHRINK_TOL || '1.65' }}
+      MINERVINI_VCP_TIGHTNESS_TOL_MULT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_TIGHTNESS_TOL_MULT || '1.30' }}
+      MINERVINI_RESULT_VERSION: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_RESULT_VERSION || 'v2_relaxed_vcp' }}
+      MINERVINI_INPUT_SOURCE: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_INPUT_SOURCE || 'final30' }}
       TRADE_INPUT: "final30"
       FORCE_FINAL30_REBUILD: "0"
       MIN_BUYABLE: "5"
@@ -684,6 +698,12 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/repo
         run: |
           set -euo pipefail
+          export MODE="minervini_test"
+          export MINERVINI_INPUT_SOURCE="final30"
+          export UNIVERSE_FORCE_REBUILD="0"
+          export EMERGENCY_BUILD="0"
+          export FORCE_CANDIDATE="0"
+
           # if AS_OF_OVERRIDE not provided, choose last trading day in KST
           if [[ -z "${AS_OF_OVERRIDE:-}" ]]; then
             dow=$(TZ=Asia/Seoul date +%u)  # 1=Mon ... 7=Sun
@@ -699,6 +719,7 @@ jobs:
             echo "AS_OF_OVERRIDE=$AS_OF_OVERRIDE" >> "$GITHUB_ENV"
           fi
           echo "[AS_OF_OVERRIDE]=$AS_OF_OVERRIDE"
+          echo "[MINERVINI][RUN] mode=${MODE} input_source=${MINERVINI_INPUT_SOURCE} UNIVERSE_FORCE_REBUILD=${UNIVERSE_FORCE_REBUILD} EMERGENCY_BUILD=${EMERGENCY_BUILD} FORCE_CANDIDATE=${FORCE_CANDIDATE}"
           python -m trader.minervini_v2_runner
 
       - name: Fail if as_of universe missing after ensure/build (prep)
