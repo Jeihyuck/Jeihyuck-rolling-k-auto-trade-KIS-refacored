@@ -4438,12 +4438,38 @@ class PB1Engine:
         return [cf.code for cf in ranked[:30]]
 
     def _load_entry_final30_or_abort(self, as_of: str) -> list[str]:
+        """
+        ✅ FIX B-ENTRY: final30 로드 (없으면 watchlist_final_locked로 대체)
+        
+        Returns:
+            codes list
+        Raises:
+            SystemExit(2) if both final30 and watchlist_final unavailable
+        """
         final30_codes = load_final30(self.env, as_of) or []
-        if not final30_codes:
-            logger.error("[PB1][ENTRY][GUARD] final30 missing -> abort as_of=%s env=%s", as_of, self.env)
-            raise SystemExit(2)
-        logger.info("[FINAL30][LOAD] as_of=%s count=%s", as_of, len(final30_codes))
-        return final30_codes
+        if final30_codes:
+            logger.info("[FINAL30][LOAD] as_of=%s count=%s source=final30_snapshot", as_of, len(final30_codes))
+            return final30_codes
+        
+        # ✅ final30 스냅샷 없으면 watchlist_final(universe_context)로 대체
+        if self._universe_context and self._universe_context.members:
+            fallback_codes = [m.get("code") for m in self._universe_context.members if m.get("code")]
+            fallback_source = self._universe_context.meta.get("source", "unknown") if self._universe_context.meta else "unknown"
+            logger.warning(
+                "[PB1][ENTRY][FINAL30_FALLBACK] as_of=%s final30_snapshot_missing -> using watchlist source=%s count=%s",
+                as_of,
+                fallback_source,
+                len(fallback_codes),
+            )
+            return fallback_codes
+        
+        # 둘 다 없으면 abort
+        logger.error(
+            "[PB1][ENTRY][GUARD] final30_missing -> abort as_of=%s env=%s (no watchlist_final fallback available)",
+            as_of,
+            self.env
+        )
+        raise SystemExit(2)
 
     def _resolve_scan_members_for_entry(self, universe_members: list[dict], watchlist_members: list[dict], watchlist_reason: str) -> tuple[list[dict], str]:
         """
@@ -5338,7 +5364,23 @@ class PB1Engine:
         
         # ✅ universe_members는 보유/리포트/정산용으로만 로드
         universe_members = self._load_universe()
-        as_of_final = get_as_of_date()
+        
+        # ✅ FIX B: actual_as_of를 universe_context에서 추출 (trade 모드에서 watchlist lock된 as_of)
+        # 리포트용 today() 날짜가 아니라, 실제 데이터 기반 as_of를 사용
+        if self._universe_context and self._universe_context.as_of_date:
+            as_of_final = self._universe_context.as_of_date
+            reason = f"universe_context (source={self._universe_context.meta.get('source', 'unknown') if self._universe_context.meta else 'unknown'})"
+        else:
+            as_of_final = get_as_of_date()
+            reason = "fallback_today"
+        
+        logger.info(
+            "[PB1][ASOF][CONTEXT] as_of_final=%s reason=%s universe_context_available=%s",
+            as_of_final,
+            reason,
+            bool(self._universe_context),
+        )
+        
         force_final30_rebuild = env_bool("FORCE_FINAL30_REBUILD", False)
         final30_codes: list[str] = []
 

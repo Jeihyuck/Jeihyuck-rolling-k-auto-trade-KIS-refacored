@@ -644,58 +644,64 @@ def _load_universe_context(
     repo = UniverseRepo(engine)
     env = _norm_env(env)
     members = repo.get_universe_members(env=env, strategy=strategy, as_of_date=as_of)
+    universe_actual_as_of = as_of  # 기본값 (fallback 감지 필요)
+    
     if not members and is_db_only_mode():
         fallback = repo.get_current_universe_snapshot(env, strategy)
         if fallback and fallback.get("members"):
+            universe_actual_as_of = str(fallback.get("as_of") or as_of)
             logger.warning(
-                "[PB1][UNIVERSE][DB_ONLY] fallback_current run_id=%s as_of=%s members=%s",
+                "[PB1][UNIVERSE][DB_ONLY] fallback_current run_id=%s requested_as_of=%s actual_as_of=%s members=%s",
                 fallback.get("run_id"),
-                fallback.get("as_of"),
+                as_of,
+                universe_actual_as_of,
                 fallback.get("members_count"),
             )
             return UniverseContext(
-                as_of_date=str(fallback.get("as_of") or as_of),
+                as_of_date=universe_actual_as_of,
                 members=fallback.get("members") or [],
                 selected_path=None,
-                meta={"source": "db_only", "as_of": fallback.get("as_of")},
+                meta={"source": "db_only", "requested_as_of": as_of, "actual_as_of": universe_actual_as_of},
                 is_empty=False,
             )
         env = _norm_env(env)
         latest = _safe_load_universe_snapshot(repo, env=env, strategy=strategy, as_of=as_of)
         members = (latest or {}).get("members") or []
         if latest and latest.get("members"):
+            universe_actual_as_of = str(latest.get("as_of") or as_of)
             logger.warning(
-                "[PB1][UNIVERSE][DB_ONLY] fallback_latest run_id=%s as_of=%s members=%s",
+                "[PB1][UNIVERSE][DB_ONLY] fallback_latest run_id=%s requested_as_of=%s actual_as_of=%s members=%s",
                 latest.get("run_id"),
-                latest.get("as_of"),
+                as_of,
+                universe_actual_as_of,
                 latest.get("members_count"),
             )
             return UniverseContext(
-                as_of_date=str(latest.get("as_of") or as_of),
+                as_of_date=universe_actual_as_of,
                 members=latest.get("members") or [],
                 selected_path=None,
-                meta={"source": "db_only", "as_of": latest.get("as_of")},
+                meta={"source": "db_only", "requested_as_of": as_of, "actual_as_of": universe_actual_as_of},
                 is_empty=False,
             )
         logger.error("[PB1][UNIVERSE][DB_ONLY][MISS] env=%s strategy=%s as_of=%s", env, strategy, as_of)
         raise RuntimeError("db_only_universe_missing")
     if not members:
         logger.warning(
-            "[PB1][UNIVERSE][EMPTY_OK] as_of=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
+            "[PB1][UNIVERSE][EMPTY_OK] requested_as_of=%s -> skip trading (오늘은 조건 맞는 종목 없음(미너비니 필터 0))",
             as_of,
         )
         return UniverseContext(
             as_of_date=as_of,
             members=[],
             selected_path=None,
-            meta={"source": "db", "as_of": as_of},
+            meta={"source": "db", "requested_as_of": as_of, "actual_as_of": as_of},
             is_empty=True,
         )
     return UniverseContext(
         as_of_date=as_of,
         members=members,
         selected_path=None,
-        meta={"source": "db", "as_of": as_of},
+        meta={"source": "db", "requested_as_of": as_of, "actual_as_of": as_of},
         is_empty=False,
     )
 
@@ -1102,8 +1108,20 @@ def run_once(
             violations.append("DB_ONLY == '1'")
         if os.getenv("NONTRADING_SMOKE") == "1":
             violations.append("NONTRADING_SMOKE == '1'")
+        
+        # ✅ FIX C: LIVE 플래그 충돌 시 DIAG로 강등 (abort 대신)
         if violations:
-            raise RuntimeError(f"LIVE mode violations: {', '.join(violations)}")
+            logger.error(
+                "="*80
+            )
+            logger.error("[PB1][LIVE][CONFLICT] CRITICAL: intended_live=True but conflicts detected:")
+            for v in violations:
+                logger.error(f"  - {v}")
+            logger.error("  ACTION: Downgrading mode to DIAG, blocking all orders, calculation mode only")
+            logger.error("="*80
+            )
+            # 충돌이면 intended_live를 false로 내리기 (다음 로직에서 mode를 DIAG로 강등)
+            intended_live = False
     
     now = _get_now_kst()
     if now.tzinfo is None:
@@ -1154,6 +1172,14 @@ def run_once(
             auto_window,
         )
         market_window = auto_window
+    
+    # ✅ FIX C: LIVE 플래그 충돌 감지 후 mode 강등
+    if mode == "LIVE" and not intended_live:
+        logger.error("="*80)
+        logger.error("[PB1][LIVE][DOWNGRADE] Downgrading mode from LIVE to DIAG due to LIVE flag conflicts")
+        logger.error("="*80)
+        mode = "DIAG"
+    
     effective_mode = mode
     if smoke_enabled:
         trading_day = True

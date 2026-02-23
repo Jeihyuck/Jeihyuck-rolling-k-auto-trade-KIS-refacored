@@ -248,3 +248,68 @@ def resolve_derived_as_of(now: datetime | None = None, cli_as_of: date | str | N
     
     return derived_as_of
 
+
+class AsOfContext:
+    """
+    Trade 엔진 입력의 as_of 컨텍스트를 단일 구조로 통일.
+    
+    - trade_date: 오늘 거래일 (예: 2026-02-23)
+    - requested_as_of: derived_as_of (요청 기준, 예: 2026-02-20)
+    - actual_as_of: DB/폴백 확정 (반드시 사용, 예: 2026-02-19) ✅
+    - reason: override / intraday_use_prev_close / fallback 등
+    """
+    
+    def __init__(
+        self,
+        trade_date: date | str,
+        requested_as_of: date | str,
+        actual_as_of: date | str,
+        reason: str = "default",
+    ):
+        """
+        Args:
+            trade_date: 오늘 거래일 (str="YYYY-MM-DD" 또는 date)
+            requested_as_of: 요청 기준 (watchlist 로드 전 기준)
+            actual_as_of: 실제 사용 (DB/watchlist에서 확정)
+            reason: 컨텍스트 생성 이유
+        """
+        self.trade_date = self._to_date(trade_date)
+        self.requested_as_of = self._to_date(requested_as_of)
+        self.actual_as_of = self._to_date(actual_as_of)
+        self.reason = reason or "default"
+        
+        # 간단한 검증
+        if self.actual_as_of > self.trade_date:
+            logger.warning(
+                "[AsOfContext][VALIDATION] actual_as_of(%s) > trade_date(%s) - 미래값 사용 주의",
+                self.actual_as_of.isoformat(),
+                self.trade_date.isoformat(),
+            )
+    
+    @staticmethod
+    def _to_date(d: date | str) -> date:
+        if isinstance(d, date):
+            return d
+        if isinstance(d, str):
+            s = d.strip()
+            if "T" in s:
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+            return date.fromisoformat(s)
+        raise TypeError(f"AsOfContext: expected date|str, got {type(d)}")
+    
+    def to_dict(self) -> dict:
+        """dict로 변환 (로깅/전달용)."""
+        return {
+            "trade_date": self.trade_date.isoformat(),
+            "requested_as_of": self.requested_as_of.isoformat(),
+            "actual_as_of": self.actual_as_of.isoformat(),
+            "reason": self.reason,
+        }
+    
+    def __repr__(self) -> str:
+        return (
+            f"AsOfContext(trade_date={self.trade_date.isoformat()}, "
+            f"requested={self.requested_as_of.isoformat()}, "
+            f"actual={self.actual_as_of.isoformat()}, "
+            f"reason={self.reason})"
+        )
