@@ -183,8 +183,19 @@ def detect_vcp(df: pd.DataFrame, cfg: MinerviniConfig) -> dict:
     range_pct = np.where(closes > 0, ranges / closes, 0.0)
 
     segments = np.array_split(range_pct, cfg.vcp_max_contractions)
-    contractions = [float(np.nanmax(seg)) for seg in segments if len(seg) > 0]
-    contractions = [c for c in contractions if np.isfinite(c)]
+    
+    # Compute contractions with NaN handling to avoid RuntimeWarning
+    contractions = []
+    for seg in segments:
+        if len(seg) == 0:
+            continue
+        # Remove NaN values before computing max
+        seg_clean = seg[~np.isnan(seg)]
+        if len(seg_clean) == 0:
+            continue  # Skip segments with all NaN
+        max_val = float(np.max(seg_clean))
+        if np.isfinite(max_val):
+            contractions.append(max_val)
 
     contraction_ok = False
     if len(contractions) >= cfg.vcp_min_contractions:

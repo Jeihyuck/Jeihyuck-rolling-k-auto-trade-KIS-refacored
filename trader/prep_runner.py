@@ -16,7 +16,13 @@ from trader.db.migrate import run_migrations
 from trader.db.repos import LedgerEventsRepo, UniverseRepo, WatchlistRepo
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import build_and_save_candidate_pool
-from trader.watchlist_builder import build_and_save_watchlist
+from trader.watchlist_builder import (
+    build_and_save_watchlist,
+    recover_bundle_from_db,
+    rebuild_bundle,
+    save_bundle,
+    WatchlistBundle,
+)
 from trader.data.ohlcv_provider import (
     compute_required_prefetch_days,
     find_symbols_with_insufficient_history,
@@ -549,10 +555,187 @@ def main() -> int:
             _count_score_nonzero(bundle_final30, score_keys),
             contract_source,
         )
+        
+        # RECOVERY ROUTINE: Attempt to recover bundle from DB or rebuild
+        recovery_attempted = False
+        recovery_success = False
+        
+        if contract_source == "cache_bundle_missing" or any("contract_" in f for f in contract_failures):
+            logger.warning(
+                "[PREP][WATCHLIST][RECOVERY][START] attempting bundle recovery... source=%s",
+                contract_source,
+            )
+            recovery_attempted = True
+            
+            # Step 1: Try DB recovery
+            try:
+                recovered_bundle = recover_bundle_from_db(
+                    engine=engine,
+                    env=env,
+                    as_of=as_of,
+                    min_pool=pool_min,
+                    exact_top50=topk,
+                    exact_final30=finaln,
+                )
+                
+                if recovered_bundle and recovered_bundle.is_complete(
+                    min_pool=pool_min,
+                    exact_top50=topk,
+                    exact_final30=finaln,
+                ):
+                    # DB recovery successful - use recovered bundle
+                    bundle_universe = recovered_bundle.universe_scored
+                    bundle_pool120 = recovered_bundle.pool120
+                    bundle_top50 = recovered_bundle.top50
+                    bundle_final30 = recovered_bundle.final30
+                    watchlist = recovered_bundle.final30
+                    
+                    # Update watchlist_bundle
+                    watchlist_bundle.update({
+                        "universe_scored": bundle_universe,
+                        "pool120": bundle_pool120,
+                        "top50": bundle_top50,
+                        "final30": bundle_final30,
+                        "final_count": len(bundle_final30),
+                        "shortage_reason": "",
+                        "degrade": {
+                            "enabled": False,
+                            "used": False,
+                            "reason": "recovered_from_db",
+                            "disabled_features": [],
+                        },
+                    })
+                    
+                    recovery_success = True
+                    logger.info(
+                        "[PREP][WATCHLIST][RECOVERY][DB_SUCCESS] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+                        env,
+                        as_of,
+                        len(bundle_universe),
+                        len(bundle_pool120),
+                        len(bundle_top50),
+                        len(bundle_final30),
+                    )
+                else:
+                    logger.warning(
+                        "[PREP][WATCHLIST][RECOVERY][DB_FAIL] bundle incomplete or missing -> will try rebuild"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[PREP][WATCHLIST][RECOVERY][DB_ERROR] err=%s -> will try rebuild",
+                    exc,
+                    exc_info=True,
+                )
+            
+            # Step 2: If DB recovery failed, try rebuild
+            if not recovery_success:
+                try:
+                    logger.warning(
+                        "[PREP][WATCHLIST][RECOVERY][REBUILD][START] rebuilding bundle from scratch..."
+                    )
+                    
+                    rebuilt_bundle = rebuild_bundle(
+                        engine=engine,
+                        env=env,
+                        as_of=as_of,
+                        members=members,
+                        ohlcv_provider=_watchlist_ohlcv,
+                        minervini_config={
+                            "rs_min_pctile": minervini_cfg.rs_min_percentile,
+                            "vcp_min_score": float(os.getenv("VCP_MIN_SCORE", "70")),
+                        },
+                        flow_provider=flow_provider,
+                    )
+                    
+                    if rebuilt_bundle and rebuilt_bundle.is_complete(
+                        min_pool=pool_min,
+                        exact_top50=topk,
+                        exact_final30=finaln,
+                    ):
+                        # Rebuild successful - save and use
+                        save_bundle(
+                            engine=engine,
+                            env=env,
+                            as_of=as_of,
+                            bundle=rebuilt_bundle,
+                        )
+                        
+                        bundle_universe = rebuilt_bundle.universe_scored
+                        bundle_pool120 = rebuilt_bundle.pool120
+                        bundle_top50 = rebuilt_bundle.top50
+                        bundle_final30 = rebuilt_bundle.final30
+                        watchlist = rebuilt_bundle.final30
+                        
+                        # Update watchlist_bundle
+                        watchlist_bundle.update({
+                            "universe_scored": bundle_universe,
+                            "pool120": bundle_pool120,
+                            "top50": bundle_top50,
+                            "final30": bundle_final30,
+                            "final_count": len(bundle_final30),
+                            "shortage_reason": "",
+                            "degrade": {
+                                "enabled": False,
+                                "used": False,
+                                "reason": "recovered_by_rebuild",
+                                "disabled_features": [],
+                            },
+                        })
+                        
+                        recovery_success = True
+                        logger.info(
+                            "[PREP][WATCHLIST][RECOVERY][REBUILD_SUCCESS] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+                            env,
+                            as_of,
+                            len(bundle_universe),
+                            len(bundle_pool120),
+                            len(bundle_top50),
+                            len(bundle_final30),
+                        )
+                    else:
+                        logger.error(
+                            "[PREP][WATCHLIST][RECOVERY][REBUILD_INCOMPLETE] bundle still incomplete after rebuild"
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "[PREP][WATCHLIST][RECOVERY][REBUILD_ERROR] err=%s",
+                        exc,
+                        exc_info=True,
+                    )
+        
+        # If recovery failed or not attempted, apply degradation policy
+        if recovery_attempted and not recovery_success:
+            logger.error(
+                "[PREP][WATCHLIST][RECOVERY][FINAL_FAIL] all recovery attempts failed -> apply degrade policy"
+            )
+            watchlist_bundle["degrade"]["reason"] = f"recovery_failed:{shortage_reason}"
+            watchlist_bundle["meta"] = watchlist_bundle.get("meta", {})
+            watchlist_bundle["meta"]["recover_failed_reason"] = shortage_reason
+        
+        # Re-check contract failures after recovery
+        contract_failures_after_recovery = []
+        if len(bundle_universe) <= 0:
+            contract_failures_after_recovery.append("contract_universe_scored_empty")
+        if len(bundle_pool120) < pool_min:
+            contract_failures_after_recovery.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
+        if len(bundle_top50) < topk:
+            contract_failures_after_recovery.append(f"contract_top50_too_small:{len(bundle_top50)}<{topk}")
+        if len(bundle_final30) != finaln:
+            contract_failures_after_recovery.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
+        
+        if contract_failures_after_recovery:
+            logger.warning(
+                "[PREP][WATCHLIST][CONTRACT_FAIL][AFTER_RECOVERY] failures=%s allow_degrade=%s",
+                contract_failures_after_recovery,
+                int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
+            )
+        else:
+            logger.info("[PREP][WATCHLIST][CONTRACT][RECOVERED] all contract requirements met after recovery")
+        
         allow_contract_degrade = _env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true(
             "PB1_WATCHLIST_ALLOW_DEGRADE", "0"
         ) or allow_degraded_prep
-        if not allow_contract_degrade:
+        if contract_failures_after_recovery and not allow_contract_degrade:
             return 1
 
     watchlist_repo = WatchlistRepo(engine)
@@ -770,6 +953,53 @@ def main() -> int:
         as_of.isoformat(),
         len(symbols),
     )
+
+    # Final diagnostic logging for bundle validation
+    bundle_source = watchlist_bundle.get("degrade", {}).get("reason", "unknown")
+    if watchlist_bundle.get("degrade", {}).get("used"):
+        bundle_source = f"degraded:{bundle_source}"
+    else:
+        bundle_source = watchlist_bundle.get("meta", {}).get("source", "fresh_build")
+    
+    # Verify DB saved counts
+    watchlist_repo = WatchlistRepo(engine)
+    saved_counts = {}
+    for strategy_key in ["pb1_universe_scored", "pb1_pool120", "pb1_top50", "pb1_watchlist_final"]:
+        try:
+            rows, _ = watchlist_repo.load_watchlist(
+                env=env,
+                strategy=strategy_key,
+                as_of=as_of,
+                allow_latest_fallback=False,
+            )
+            saved_counts[strategy_key] = len(rows) if rows else 0
+        except Exception:
+            saved_counts[strategy_key] = -1  # Error indicator
+    
+    logger.info(
+        "[PREP][BUNDLE][FINAL_STATE] as_of=%s bundle_source=%s "
+        "rows_universe=%s rows_pool120=%s rows_top50=%s rows_final30=%s "
+        "saved_universe=%s saved_pool120=%s saved_top50=%s saved_final30=%s",
+        as_of.isoformat(),
+        bundle_source,
+        len(bundle_universe),
+        len(bundle_pool120),
+        len(bundle_top50),
+        len(bundle_final30),
+        saved_counts.get("pb1_universe_scored", -1),
+        saved_counts.get("pb1_pool120", -1),
+        saved_counts.get("pb1_top50", -1),
+        saved_counts.get("pb1_watchlist_final", -1),
+    )
+    
+    # Alert if any saved counts are 0 (data loss indicator)
+    missing_keys = [k for k, v in saved_counts.items() if v == 0]
+    if missing_keys:
+        logger.error(
+            "[PREP][BUNDLE][DATA_LOSS_DETECTED] missing_strategies=%s as_of=%s -> CRITICAL: intermediate stages not saved to DB",
+            missing_keys,
+            as_of.isoformat(),
+        )
 
     logger.info(
         "[PREP][DONE] as_of=%s symbols=%s pool=%s watchlist=%s dt=%.2f",

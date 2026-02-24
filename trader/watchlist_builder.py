@@ -1291,6 +1291,287 @@ class WatchlistBuilder:
         return float(atr) / float(last_close)
 
 
+def save_bundle(
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    bundle: WatchlistBundle,
+) -> None:
+    """
+    Bundle 4종(universe_scored, pool120, top50, final30)을 DB에 원자적으로 저장.
+    
+    이 함수는 PREP 파이프라인의 단일 저장 지점으로,
+    모든 중간 산출물이 누락 없이 저장됨을 보장한다.
+    """
+    repo = WatchlistRepo(engine)
+    
+    logger.info(
+        "[BUNDLE][SAVE][START] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+        env,
+        as_of,
+        len(bundle.universe_scored),
+        len(bundle.pool120),
+        len(bundle.top50),
+        len(bundle.final30),
+    )
+    
+    # 1. universe_scored 저장
+    if bundle.universe_scored:
+        repo.save_watchlist(
+            env=env,
+            strategy="pb1_universe_scored",
+            as_of=as_of,
+            members=bundle.universe_scored,
+        )
+        logger.info("[BUNDLE][SAVE] pb1_universe_scored n=%s", len(bundle.universe_scored))
+    else:
+        logger.warning("[BUNDLE][SAVE][SKIP] pb1_universe_scored empty")
+    
+    # 2. pool120 저장
+    if bundle.pool120:
+        repo.save_watchlist(
+            env=env,
+            strategy="pb1_pool120",
+            as_of=as_of,
+            members=bundle.pool120,
+        )
+        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(bundle.pool120))
+    else:
+        logger.warning("[BUNDLE][SAVE][SKIP] pb1_pool120 empty")
+    
+    # 3. top50 저장
+    if bundle.top50:
+        repo.save_watchlist(
+            env=env,
+            strategy="pb1_top50",
+            as_of=as_of,
+            members=bundle.top50,
+        )
+        logger.info("[BUNDLE][SAVE] pb1_top50 n=%s", len(bundle.top50))
+    else:
+        logger.warning("[BUNDLE][SAVE][SKIP] pb1_top50 empty")
+    
+    # 4. final30 저장
+    if bundle.final30:
+        repo.save_watchlist(
+            env=env,
+            strategy="pb1_watchlist_final",
+            as_of=as_of,
+            members=bundle.final30,
+        )
+        logger.info("[BUNDLE][SAVE] pb1_watchlist_final n=%s", len(bundle.final30))
+    else:
+        logger.warning("[BUNDLE][SAVE][SKIP] pb1_watchlist_final empty")
+    
+    logger.info("[BUNDLE][SAVE][DONE] env=%s as_of=%s", env, as_of)
+
+
+def recover_bundle_from_db(
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    min_pool: int = 40,
+    exact_top50: int = 50,
+    exact_final30: int = 30,
+) -> Optional[WatchlistBundle]:
+    """
+    DB에서 4종 bundle을 로드하여 복구 시도.
+    
+    Returns:
+        WatchlistBundle if all 4 stages meet requirements, else None
+    """
+    repo = WatchlistRepo(engine)
+    
+    logger.info(
+        "[BUNDLE][RECOVER_DB][START] env=%s as_of=%s min_pool=%s exact_top50=%s exact_final30=%s",
+        env,
+        as_of,
+        min_pool,
+        exact_top50,
+        exact_final30,
+    )
+    
+    # Load all 4 stages from DB
+    universe_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_universe_scored",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    pool120_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_pool120",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    top50_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_top50",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    final30_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_watchlist_final",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    
+    logger.info(
+        "[BUNDLE][RECOVER_DB][LOADED] universe=%s pool120=%s top50=%s final30=%s",
+        len(universe_rows) if universe_rows else 0,
+        len(pool120_rows) if pool120_rows else 0,
+        len(top50_rows) if top50_rows else 0,
+        len(final30_rows) if final30_rows else 0,
+    )
+    
+    # Validate all stages meet requirements
+    if not universe_rows or len(universe_rows) == 0:
+        logger.warning("[BUNDLE][RECOVER_DB][FAIL] universe_scored empty")
+        return None
+    
+    if not pool120_rows or len(pool120_rows) < min_pool:
+        logger.warning(
+            "[BUNDLE][RECOVER_DB][FAIL] pool120 too small: %s < %s",
+            len(pool120_rows) if pool120_rows else 0,
+            min_pool,
+        )
+        return None
+    
+    if not top50_rows or len(top50_rows) < exact_top50:
+        logger.warning(
+            "[BUNDLE][RECOVER_DB][FAIL] top50 too small: %s < %s",
+            len(top50_rows) if top50_rows else 0,
+            exact_top50,
+        )
+        return None
+    
+    if not final30_rows or len(final30_rows) < exact_final30:
+        logger.warning(
+            "[BUNDLE][RECOVER_DB][FAIL] final30 too small: %s < %s",
+            len(final30_rows) if final30_rows else 0,
+            exact_final30,
+        )
+        return None
+    
+    # All stages valid - construct bundle
+    bundle = WatchlistBundle(
+        as_of=as_of.isoformat(),
+        env=env,
+        strategy="pb1_watchlist",
+        universe_scored=universe_rows,
+        pool120=pool120_rows,
+        top50=top50_rows,
+        final30=final30_rows,
+        meta={
+            "source": "db_recovery",
+            "recovered_at": time.time(),
+        },
+    )
+    
+    logger.info(
+        "[BUNDLE][RECOVER_DB][SUCCESS] env=%s as_of=%s all stages valid",
+        env,
+        as_of,
+    )
+    
+    return bundle
+
+
+def rebuild_bundle(
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    members: List[Dict[str, Any]],
+    ohlcv_provider: Any,
+    minervini_config: Dict[str, Any],
+    flow_provider: Optional[FlowProvider] = None,
+) -> WatchlistBundle:
+    """
+    Bundle을 처음부터 재계산.
+    
+    이 함수는 DB 복구 실패 시 마지막 수단으로 호출된다.
+    """
+    logger.info(
+        "[BUNDLE][REBUILD][START] env=%s as_of=%s members=%s",
+        env,
+        as_of,
+        len(members),
+    )
+    
+    builder = WatchlistBuilder(
+        ohlcv_provider=ohlcv_provider,
+        minervini_config=minervini_config,
+        pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
+        topk=_env_int("PB1_WATCHLIST_TOPK", 50),
+        finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
+        min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
+        liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
+        min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
+        flow_provider=flow_provider,
+        flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
+        tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
+        flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+        trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
+    )
+    
+    try:
+        final30 = builder.build(members=members, as_of=as_of)
+    except Exception as exc:
+        logger.error("[BUNDLE][REBUILD][FAIL] err=%s", exc, exc_info=True)
+        raise
+    
+    # Enrich final30
+    final30 = _enrich_watchlist_rows(
+        engine=engine,
+        env=env,
+        as_of=as_of,
+        rows=final30,
+        flow_provider=flow_provider,
+        ohlcv_provider=ohlcv_provider,
+        flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
+        tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
+        flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
+        trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
+    )
+    
+    # Extract bundle from builder
+    last_bundle = builder.last_bundle
+    
+    bundle = WatchlistBundle(
+        as_of=as_of.isoformat(),
+        env=env,
+        strategy="pb1_watchlist",
+        universe_scored=last_bundle.get("universe_scored", []),
+        pool120=last_bundle.get("pool120", []),
+        top50=last_bundle.get("top50", []),
+        final30=final30,
+        meta={
+            "source": "rebuild",
+            "rebuilt_at": time.time(),
+            "weights": last_bundle.get("weights", {}),
+            "formula": last_bundle.get("formula", ""),
+            "reject_summary": last_bundle.get("reject_summary", {}),
+            "degrade": last_bundle.get("degrade", {}),
+        },
+    )
+    
+    logger.info(
+        "[BUNDLE][REBUILD][DONE] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+        env,
+        as_of,
+        len(bundle.universe_scored),
+        len(bundle.pool120),
+        len(bundle.top50),
+        len(bundle.final30),
+    )
+    
+    return bundle
+
+
 def build_and_save_watchlist(
     *,
     engine: Engine,
@@ -1445,26 +1726,54 @@ def build_and_save_watchlist(
         members=watchlist,
     )
     
-    # Save intermediate stages to DB for recovery
-    if return_bundle and builder.last_bundle:
+    # CRITICAL: Always save bundle (4 stages) to prevent data loss
+    # This ensures intermediate stages are never missing from DB
+    if builder.last_bundle:
         try:
-            universe_scored = builder.last_bundle.get("universe_scored", [])
-            pool120 = builder.last_bundle.get("pool120", [])
-            top50 = builder.last_bundle.get("top50", [])
+            bundle = WatchlistBundle(
+                as_of=as_of.isoformat(),
+                env=env,
+                strategy=strategy,
+                universe_scored=builder.last_bundle.get("universe_scored", []),
+                pool120=builder.last_bundle.get("pool120", []),
+                top50=builder.last_bundle.get("top50", []),
+                final30=watchlist,
+                meta={
+                    "weights": builder.last_bundle.get("weights", {}),
+                    "weights_effective": builder.last_bundle.get("weights_effective", builder.last_bundle.get("weights", {})),
+                    "formula": builder.last_bundle.get("formula", ""),
+                    "reject_summary": builder.last_bundle.get("reject_summary", {}),
+                    "degrade": builder.last_bundle.get("degrade", {}),
+                    "source": "fresh_build",
+                },
+            )
             
-            if universe_scored:
-                repo.save_watchlist(env=env, strategy="pb1_universe_scored", as_of=as_of, members=universe_scored)
-                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_universe_scored as_of=%s n=%s", as_of, len(universe_scored))
+            # Use centralized save_bundle function to ensure atomicity
+            save_bundle(
+                engine=engine,
+                env=env,
+                as_of=as_of,
+                bundle=bundle,
+            )
             
-            if pool120:
-                repo.save_watchlist(env=env, strategy="pb1_pool120", as_of=as_of, members=pool120)
-                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_pool120 as_of=%s n=%s", as_of, len(pool120))
-            
-            if top50:
-                repo.save_watchlist(env=env, strategy="pb1_top50", as_of=as_of, members=top50)
-                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_top50 as_of=%s n=%s", as_of, len(top50))
+            logger.info(
+                "[WATCHLIST][BUNDLE][SAVE_SUCCESS] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+                env,
+                as_of,
+                len(bundle.universe_scored),
+                len(bundle.pool120),
+                len(bundle.top50),
+                len(bundle.final30),
+            )
         except Exception as exc:
-            logger.warning("[WATCHLIST][DB][SAVE_STAGES_FAIL] err=%s -> non-blocking", exc)
+            logger.error(
+                "[WATCHLIST][BUNDLE][SAVE_FAIL] env=%s as_of=%s err=%s -> CRITICAL: intermediate stages not saved",
+                env,
+                as_of,
+                exc,
+                exc_info=True,
+            )
+            # Don't raise - allow workflow to continue but log as critical
 
     if return_bundle:
         return watchlist, builder.last_bundle

@@ -192,21 +192,35 @@ def export_watchlist_bundle(
     
     if validation_failures:
         logger.error(
-            "[EXPORT][VALIDATION_FAIL] failures=%s -> will export with warnings, check source data",
+            "[EXPORT][VALIDATION_FAIL] failures=%s -> BLOCKING export to prevent corrupt data",
             validation_failures
         )
         # Add validation failures to meta for debugging
         meta_dict = dict(meta_dict) if meta_dict else {}
         meta_dict["export_validation_failures"] = validation_failures
+        meta_dict["export_blocked"] = True
+        meta_dict["export_blocked_reason"] = "validation_failed"
+        
+        # Write minimal meta.json to document the failure
+        meta_path = out_dir / "meta.json"
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(meta_dict, f, ensure_ascii=False, indent=2, default=str)
+        logger.info("[EXPORT][META_ONLY] wrote failure meta to %s", meta_path)
+        
+        # Raise exception to signal PREP that export failed
+        raise ValueError(
+            f"EXPORT_VALIDATION_FAILED: {validation_failures}. "
+            f"Source data must be fixed before export. Check PREP pipeline for bundle recovery."
+        )
 
     for name, frame in frames_dict.items():
         safe_name = name.strip().lower()
         df = _normalize_frame(frame if frame is not None else pd.DataFrame())
         
-        # Log warning for empty critical frames
+        # Log warning for empty critical frames (should not happen if validation passed)
         if df.empty and name in {"universe_scored", "pool120", "top50", "final30"}:
             logger.warning(
-                "[EXPORT][EMPTY_FRAME] name=%s rows=0 -> exporting empty file (CHECK SOURCE)",
+                "[EXPORT][EMPTY_FRAME] name=%s rows=0 -> this should not happen after validation",
                 safe_name
             )
         
