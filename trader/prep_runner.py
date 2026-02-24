@@ -490,14 +490,32 @@ def main() -> int:
     bundle_final30 = watchlist_bundle.get("final30", watchlist or []) or []
 
     contract_failures: list[str] = []
+    pool_min = int(os.getenv("PB1_WATCHLIST_POOL_MIN", "40"))
+    topk = int(os.getenv("PB1_WATCHLIST_TOPK", "50"))
+
     if len(bundle_universe) <= 0:
         contract_failures.append("contract_universe_scored_empty")
-    if len(bundle_top50) <= 0:
-        contract_failures.append("contract_top50_empty")
-    if len(bundle_pool120) <= 0:
-        contract_failures.append("contract_pool120_empty")
+    if len(bundle_pool120) < pool_min:
+        contract_failures.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
+    if len(bundle_top50) < topk:
+        contract_failures.append(f"contract_top50_too_small:{len(bundle_top50)}<{topk}")
     if len(bundle_final30) != finaln:
         contract_failures.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
+
+    def _count_score_nonzero(rows: list[dict], keys: tuple[str, ...]) -> int:
+        count = 0
+        for row in rows:
+            val = None
+            for key in keys:
+                if key in row and row.get(key) is not None:
+                    val = row.get(key)
+                    break
+            try:
+                if float(val or 0.0) > 0.0:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+        return count
 
     if contract_failures:
         shortage_reason = shortage_reason or ";".join(contract_failures)
@@ -512,12 +530,27 @@ def main() -> int:
             "reason": shortage_reason,
             "disabled_features": ["watchlist_pipeline_contract"],
         }
-        allow_contract_degrade = _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep
+        reject_keys = set(reject_summary.keys())
+        contract_source = "cache_bundle_missing" if "cache_bundle_stage_missing" in reject_keys else "watchlist_bundle"
+        score_keys = ("score_final", "final_score", "score", "tech_score")
         logger.error(
-            "[PREP][WATCHLIST][CONTRACT_FAIL] failures=%s allow_degrade=%s",
+            "[PREP][WATCHLIST][CONTRACT_FAIL] failures=%s allow_degrade=%s as_of=%s rows_universe=%s rows_pool120=%s rows_top50=%s rows_final30=%s score_nonzero={universe:%s,pool120:%s,top50:%s,final30:%s} source=%s",
             contract_failures,
-            int(allow_contract_degrade),
+            int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
+            as_of.isoformat(),
+            len(bundle_universe),
+            len(bundle_pool120),
+            len(bundle_top50),
+            len(bundle_final30),
+            _count_score_nonzero(bundle_universe, score_keys),
+            _count_score_nonzero(bundle_pool120, score_keys),
+            _count_score_nonzero(bundle_top50, score_keys),
+            _count_score_nonzero(bundle_final30, score_keys),
+            contract_source,
         )
+        allow_contract_degrade = _env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true(
+            "PB1_WATCHLIST_ALLOW_DEGRADE", "0"
+        ) or allow_degraded_prep
         if not allow_contract_degrade:
             return 1
 
@@ -560,23 +593,28 @@ def main() -> int:
             final_score_nonzero,
             score_final_nonzero,
         )
-    export_watchlist_bundle(
-        out_dir=export_dir,
-        frames_dict=frames,
-        meta_dict={
-            "as_of": as_of.isoformat(),
-            "env": env,
-            "weights": watchlist_bundle.get("weights", {}),
-            "weights_effective": watchlist_bundle.get("weights_effective", watchlist_bundle.get("weights", {})),
-            "formula": watchlist_bundle.get("formula", ""),
-            "reject_summary": watchlist_bundle.get("reject_summary", {}),
-            "expected_finaln": finaln,
-            "final_count": int(watchlist_bundle.get("final_count", len(watchlist or []))),
-            "shortage_reason": shortage_reason,
-            "degrade": watchlist_bundle.get("degrade", {}),
-            "contract_failures": contract_failures,
-        },
-    )
+    runtime_exported = False
+    try:
+        export_watchlist_bundle(
+            out_dir=export_dir,
+            frames_dict=frames,
+            meta_dict={
+                "as_of": as_of.isoformat(),
+                "env": env,
+                "weights": watchlist_bundle.get("weights", {}),
+                "weights_effective": watchlist_bundle.get("weights_effective", watchlist_bundle.get("weights", {})),
+                "formula": watchlist_bundle.get("formula", ""),
+                "reject_summary": watchlist_bundle.get("reject_summary", {}),
+                "expected_finaln": finaln,
+                "final_count": int(watchlist_bundle.get("final_count", len(watchlist or []))),
+                "shortage_reason": shortage_reason,
+                "degrade": watchlist_bundle.get("degrade", {}),
+                "contract_failures": contract_failures,
+            },
+        )
+        runtime_exported = True
+    except Exception:
+        logger.exception("[PREP][EXPORT][FAIL] as_of=%s out_dir=%s", as_of, export_dir)
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:
@@ -698,13 +736,16 @@ def main() -> int:
     payload = to_jsonable(
         {
             "as_of": as_of.isoformat(),
+            "env": env,
             "symbols": len(symbols),
             "ohlcv_prefetch_mode": prefetch_mode,
             "delta": delta_result,
             "full": full_result,
             "derived_upserted": derived_upserted,
+            "universe_size": len(members),
             "pool_size": len(pool_codes or []),
-            "watchlist_size": len(watchlist or []),
+            "final_size": len(watchlist or []),
+            "runtime_exported": runtime_exported,
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
                 "derived": round(dt_derived, 2),

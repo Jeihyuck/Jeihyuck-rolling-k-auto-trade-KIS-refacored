@@ -1516,6 +1516,11 @@ class LedgerEventsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def _payload_as_of_expr(self) -> sa.sql.ClauseElement:
+        if self.engine.dialect.name == "postgresql":
+            return self._schema.ledger_events.c.payload_json["as_of"].astext
+        return func.json_extract(self._schema.ledger_events.c.payload_json, "$.as_of")
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -1835,6 +1840,41 @@ class LedgerEventsRepo:
             max_attempts,
         )
         return None
+
+    def prep_done_status(
+        self,
+        *,
+        env: str,
+        as_of: date | str,
+        strategies: Iterable[str] | None = None,
+    ) -> tuple[bool, int]:
+        schema = self._schema
+        as_of_date = to_date(as_of)
+        as_of_str = as_of_date.isoformat()
+        payload_as_of = self._payload_as_of_expr()
+        as_of_match = or_(
+            func.date(schema.ledger_events.c.ts) == as_of_date,
+            payload_as_of == as_of_str,
+        )
+
+        stmt = select(func.count()).select_from(schema.ledger_events)
+        if strategies:
+            strategies_norm = [s.strip().lower() for s in strategies if s and str(s).strip()]
+            if strategies_norm:
+                stmt = stmt.select_from(
+                    schema.ledger_events.join(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
+                ).where(func.lower(schema.runs.c.strategy).in_(strategies_norm))
+
+        stmt = stmt.where(
+            and_(
+                schema.ledger_events.c.env == _norm_env(env),
+                schema.ledger_events.c.event_type == "PREP_DONE",
+                as_of_match,
+            )
+        )
+        with self.engine.connect() as conn:
+            count = conn.execute(stmt).scalar() or 0
+        return int(count) > 0, int(count)
 
     def has_event_type_on_date(self, *, env: str, event_type: str, as_of: date | str) -> bool:
         schema = self._schema

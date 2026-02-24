@@ -8,6 +8,7 @@ import signal
 import traceback
 import time as time_mod
 import copy
+from collections import Counter
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,6 +56,7 @@ from trader.config import (
     resolve_strategy_mode,
 )
 from trader.runtime_paths import runtime_root, runtime_path
+from trader.logging_utils import append_jsonl
 from trader.db.engine import make_engine
 from trader.db.health import assert_db_ready
 from trader.db.locks import acquire_advisory_lock, release_advisory_lock
@@ -349,6 +351,75 @@ def _log_db_only_universe_precheck(
         snapshot.get("members_count"),
         snapshot.get("sample_codes"),
     )
+
+
+def generate_run_summary_json(
+    *,
+    run_id: str,
+    trace_id: str,
+    env: str,
+    engine: object,
+    as_of_requested: str | None = None,
+    as_of_used: str | None = None,
+    watchlist_as_of: str | None = None,
+    universe_as_of: str | None = None,
+    fallback_used: bool = False,
+) -> str | None:
+    """
+    RUN 요약 JSON 생성 및 저장.
+    
+    파일: runtime/summary/run_{run_id}.json
+    
+    포함 내용:
+    - run_id, trace, env, as_of 관련
+    - counts: scanned/pb1_ok/minervini_ok/risk_ok/sizing_ok/orders
+    - drop reason 집계
+    """
+    try:
+        summary_root = runtime_path("runtime", "summary")
+        summary_root.mkdir(parents=True, exist_ok=True)
+        
+        summary_path = summary_root / f"run_{run_id}.json"
+        
+        # engine에서 필요한 정보 추출
+        total_candidates = getattr(engine, "total_candidates", 0)
+        ok_count = getattr(engine, "ok_count", 0)
+        reject_reason_counts = getattr(engine, "reject_reason_counts", {})
+        
+        payload = {
+            "run_id": str(run_id),
+            "trace": str(trace_id),
+            "env": str(env),
+            "as_of_requested": as_of_requested,
+            "as_of_used": as_of_used,
+            "watchlist_as_of": watchlist_as_of,
+            "universe_as_of": universe_as_of,
+            "fallback_used": bool(fallback_used),
+            "counts": {
+                "scanned": int(total_candidates),
+                "passed": int(ok_count),
+            },
+            "drop_reasons": reject_reason_counts or {},
+        }
+        
+        summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            "[RUN_SUMMARY] path=%s run_id=%s scanned=%s passed=%s drop_reasons=%s",
+            summary_path,
+            run_id,
+            total_candidates,
+            ok_count,
+            len(reject_reason_counts),
+        )
+        return str(summary_path)
+    except Exception as e:
+        logger.warning(
+            "[RUN_SUMMARY][FAIL] run_id=%s error=%s",
+            run_id,
+            type(e).__name__,
+            exc_info=False,
+        )
+        return None
 
 
 def get_balance_state(
@@ -2006,6 +2077,25 @@ def run_once(
             result = engine_runner.run_close_cancel()
         else:
             result = engine_runner.run()
+        
+        # ✅ RUN 요약 JSON 생성
+        try:
+            trace_id = getattr(engine_runner, 'run_id', str(run_record_id))
+            as_of_used = getattr(engine_runner, '_universe_as_of', None)
+            generate_run_summary_json(
+                run_id=str(run_record_id),
+                trace_id=str(trace_id),
+                env=kis_env or "practice",
+                engine=engine_runner,
+                as_of_requested=None,
+                as_of_used=as_of_used,
+                watchlist_as_of=None,
+                universe_as_of=None,
+                fallback_used=False,
+            )
+        except Exception as e:
+            logger.warning("[RUN_SUMMARY][GENERATE_FAIL] %s", type(e).__name__, exc_info=False)
+        
         # Save top_candidates for next run to limit OHLCV queries
         if engine_runner and hasattr(engine_runner, 'top_candidates'):
             top_candidates_path = runtime_path("top_candidates.json")
@@ -2685,10 +2775,15 @@ def main() -> int:
         ledger_repo = LedgerEventsRepo(engine)
         
         # PREP_DONE 체크는 derived_as_of 기준으로
-        prep_done = ledger_repo.has_event_type_on_date(
+        prep_done, prep_done_count = ledger_repo.prep_done_status(
             env=os.getenv("STRATEGY_ENV", "practice").lower(),
-            event_type="PREP_DONE",
             as_of=derived_as_of,
+        )
+        logger.info(
+            "[TRADE_TICK][PREP_DONE_CHECK] source=db_ledger prep_done=%s matched_events_count=%s derived_as_of=%s",
+            int(prep_done),
+            prep_done_count,
+            derived_as_of.isoformat(),
         )
         if not prep_done:
             if allow_wl_only and watchlist_loaded_for_guard:
@@ -2699,9 +2794,10 @@ def main() -> int:
                 )
             else:
                 logger.warning(
-                    "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s",
+                    "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s prep_done_check_source=db_ledger matched_events_count=%s",
                     derived_as_of.isoformat(),
                     trade_date.isoformat(),
+                    prep_done_count,
                 )
                 return 0
         

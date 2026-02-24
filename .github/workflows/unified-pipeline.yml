@@ -774,11 +774,15 @@ jobs:
           fi
 
       - name: Upload runtime outputs
-        if: ${{ always() && steps.runtime_check.outputs.has_runtime == '1' }}
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: watchlist-${{ github.run_id }}
+          name: runtime-${{ github.run_id }}
           path: |
             runtime/**
-            **/runtime/**
+            _temp/trader_runtime/runtime/signals/**/*.jsonl
+            _temp/trader_runtime/runtime/events/**/*.jsonl
+            _temp/trader_runtime/runtime/reports/**/*.json
+            _temp/trader_runtime/runtime/summary/**/*.json
             /home/runner/work/_temp/trader_runtime/runtime/**
+          if-no-files-found: warn

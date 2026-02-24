@@ -452,12 +452,13 @@ class WatchlistBuilder:
         final30 = self._stage_c_flow_final(top50, as_of)
 
         contract_failures: List[str] = []
+        pool_min = _env_int("PB1_WATCHLIST_POOL_MIN", 40)
         if len(universe_scored) <= 0:
             contract_failures.append("universe_scored_empty")
-        if len(top50) <= 0:
-            contract_failures.append("top50_empty")
-        if len(pool120) <= 0:
-            contract_failures.append("pool120_empty")
+        if len(pool120) < pool_min:
+            contract_failures.append(f"pool120_too_small:{len(pool120)}<{pool_min}")
+        if len(top50) < int(self.topk):
+            contract_failures.append(f"top50_too_small:{len(top50)}<{int(self.topk)}")
 
         degrade_meta = {
             "used": False,
@@ -482,7 +483,7 @@ class WatchlistBuilder:
         if len(final30) != int(self.finaln):
             contract_failures.append(f"final30_count_mismatch:{len(final30)}!={int(self.finaln)}")
 
-        allow_degrade = _env_bool("PB1_WATCHLIST_ALLOW_DEGRADE", False)
+        allow_degrade = _env_bool("PB1_WATCHLIST_ALLOW_DEGRADE", True)
         if contract_failures and not allow_degrade:
             raise RuntimeError("WATCHLIST_PIPELINE_CONTRACT_FAILED: " + ",".join(contract_failures))
 

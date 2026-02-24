@@ -62,6 +62,58 @@ def _candidate_attr(candidate: object, name: str, default=None):
     return default
 
 
+def _extract_numeric_details(candidate: object) -> dict:
+    """
+    rejected 리스트를 위해 후보자의 수치 세부사항 추출
+    주요 수치: rs_pctile, vcp_score, regime_pass, pullback_pct, vol_contraction, close, ma20, ma50, ma200 등
+    """
+    details = {}
+    features = _candidate_attr(candidate, "features", {})
+    
+    if not features:
+        return details
+    
+    # Minervini scores
+    for key in ["rs_pctile", "rs_percentile", "vcp_score", "regime_pass"]:
+        val = features.get(key)
+        if val is not None:
+            details[key] = val
+    
+    # PB1 filters
+    for key in ["pullback_pct", "vol_contraction", "volu_contraction", 
+                "vol_contraction_ratio", "volu_contraction_ratio"]:
+        val = features.get(key)
+        if val is not None:
+            details[key] = val
+    
+    # Price & MA
+    for key in ["close", "ma20", "ma50", "ma200", "ma20_slope", "pivot", "tight_low"]:
+        val = features.get(key)
+        if val is not None:
+            details[key] = val
+    
+    # Risk metrics
+    for key in ["atr14", "atr_pct", "atr_max_pct"]:
+        val = features.get(key)
+        if val is not None:
+            details[key] = val
+    
+    # Sizing details
+    sizing_reason = _candidate_attr(candidate, "sizing_reason", None)
+    sizing_details = _candidate_attr(candidate, "sizing_details", {})
+    if sizing_reason:
+        details["sizing_reason"] = sizing_reason
+    if sizing_details:
+        details["sizing_details"] = sizing_details
+    
+    # Detail reasons (minervini_not_buyable 시 세부 원인)
+    detail_reasons = _candidate_attr(candidate, "detail_reasons", None)
+    if detail_reasons:
+        details["minervini_detail_reasons"] = detail_reasons
+    
+    return details
+
+
 def run_minervini_report(
     universe_members: list[dict],
     cfg: object,
@@ -95,13 +147,16 @@ def run_minervini_report(
         mapped_reasons = _map_reason_codes(reasons)
         for reason in mapped_reasons:
             reason_counts[reason] += 1
-        rejected_payload.append(
-            {
-                "code": code,
-                "name": name_map.get(code),
-                "reasons": mapped_reasons,
-            }
-        )
+        
+        # 수치 세부사항 추가
+        numeric_details = _extract_numeric_details(cf)
+        rejected_item = {
+            "code": code,
+            "name": name_map.get(code),
+            "reasons": mapped_reasons,
+        }
+        rejected_item.update(numeric_details)
+        rejected_payload.append(rejected_item)
 
     payload = {
         "input_members": len(universe_members),

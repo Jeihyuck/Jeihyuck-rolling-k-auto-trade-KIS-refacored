@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
+from trader.logging_utils import append_jsonl
 from trader.config import (
     CAP_CAP,
     LEDGER_BASE_DIR,
@@ -383,6 +384,8 @@ class CandidateFeature:
     planned_qty: int = 0
     planned_value: float = 0.0
     score: float | None = None
+    sizing_reason: str | None = None  # 명확한 reason 코드 (BUDGET_INSUFFICIENT_FOR_1_SHARE, MIN_ORDER_NOTIONAL_FAIL 등)
+    sizing_details: Dict[str, Any] | None = None  # 수치 정보: buy_budget, price, qty, shortfall 등
 
 
 @dataclass
@@ -2644,10 +2647,42 @@ class PB1Engine:
             )
             if budget_cap > 0:
                 qty = min(qty, int(budget_cap // order_px))
-            if min_order_krw > 0 and qty * order_px < min_order_krw:
-                qty = 0
+            
+            # ===== New: 명확한 sizing_reason 계산 =====
             reserve_krw = float(self.entry_reserve_krw or 0.0)
             usable_cash = float(self.entry_usable_krw or 0.0)
+            sizing_reason: str | None = None
+            sizing_details: dict[str, Any] = {}
+            
+            # 1단계: qty=0 여부 체크 (예산 부족)
+            if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
+                qty = 0
+                # 예산 부족: 1주(price)도 못 삼
+                sizing_reason = "BUDGET_INSUFFICIENT_FOR_1_SHARE"
+                sizing_details = {
+                    "buy_budget_after_reserve": tick_budget,
+                    "price": order_px,
+                    "required_for_1_share": order_px,
+                    "shortfall": max(0, order_px - tick_budget),
+                    "usable_cash": usable_cash,
+                    "reserve_applied": reserve_krw,
+                }
+            else:
+                # 2단계: qty>=1인데 최소주문금액 체크
+                planned_notional = float(qty * order_px)
+                if min_order_krw > 0 and planned_notional < min_order_krw:
+                    qty = 0
+                    sizing_reason = "MIN_ORDER_NOTIONAL_FAIL"
+                    sizing_details = {
+                        "qty": qty,
+                        "price": order_px,
+                        "planned_notional": planned_notional,
+                        "min_order_krw": min_order_krw,
+                        "shortfall": max(0, min_order_krw - planned_notional),
+                    }
+                # 3단계: qty>=1이고 최소주문 조건도 충족하면 OK
+            
+            # 기존 sizing_reasons 로직 (하위호환성)
             sizing_reasons: list[str] = []
             if qty <= 0:
                 if tick_budget <= 0:
@@ -2662,8 +2697,9 @@ class PB1Engine:
                     sizing_reasons.append("reserve_applied")
                 if not sizing_reasons:
                     sizing_reasons.append("planned_qty_zero_or_min_order")
+            
             logger.info(
-                "[PB1][SIZING] code=%s cash_usable=%s tick_budget=%s reserve=%s px=%s qty=%s min_order_krw=%s ok=%s reason=%s",
+                "[PB1][SIZING] code=%s cash_usable=%.0f tick_budget=%.0f reserve=%.0f px=%.0f qty=%s min_order_krw=%.0f ok=%s reason=%s detail=%s",
                 self._display_code(cf.code),
                 usable_cash,
                 tick_budget,
@@ -2672,11 +2708,14 @@ class PB1Engine:
                 qty,
                 min_order_krw,
                 int(qty > 0),
-                sizing_reasons or ["ok"],
+                sizing_reason or "OK",
+                sizing_details or {},
             )
             if qty <= 0:
                 cf.setup_ok = False
                 cf.reasons.append("planned_qty_zero_or_min_order")
+                cf.sizing_reason = sizing_reason
+                cf.sizing_details = sizing_details
                 continue
             cf.planned_qty = qty
             cf.planned_value = float(qty * order_px)
@@ -2684,6 +2723,8 @@ class PB1Engine:
             cf.features["planned_value"] = cf.planned_value
             cf.features["initial_stop"] = float(stop0)
             cf.features["stop_price"] = float(stop0)
+            cf.sizing_reason = "OK"
+            cf.sizing_details = {"qty": qty, "price": order_px, "notional": cf.planned_value}
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
             logger.info(
                 "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f%% value20=%s tick_budget=%.0f",
@@ -4362,6 +4403,86 @@ class PB1Engine:
             if m.get("code")
         }
         return members
+
+    def _write_entry_scorecard_jsonl(self, candidates: list[CandidateFeature] | None = None) -> None:
+        """
+        각 종목별 스코어카드를 JSONL로 기록
+        파일: runtime/signals/pb1_entry/{YYYY-MM-DD}/run_{trace}.jsonl
+        """
+        if not candidates:
+            candidates = []
+        
+        try:
+            today = self._today
+            scorecard_dir = runtime_path("runtime", "signals", "pb1_entry", today)
+            scorecard_dir.mkdir(parents=True, exist_ok=True)
+            
+            scorecard_path = scorecard_dir / f"run_{self.run_id}.jsonl"
+            
+            for cf in candidates:
+                code = str(cf.code or "").zfill(6)
+                features = cf.features or {}
+                sizing_reason = getattr(cf, 'sizing_reason', None)
+                sizing_details = getattr(cf, 'sizing_details', {}) or {}
+                detail_reasons = getattr(cf, 'detail_reasons', None)
+                
+                scorecard_record = {
+                    "run_id": str(self.run_id),
+                    "trace": str(self.run_id),
+                    "env": self.env,
+                    "as_of_used": self._universe_as_of,
+                    "code": code,
+                    "setup_ok": bool(cf.setup_ok),
+                    "reasons": cf.reasons or [],
+                    # PB1 주요 수치
+                    "pb1": {
+                        "pullback_pct": features.get("pullback_pct"),
+                        "vol_contraction": features.get("vol_contraction"),
+                        "volu_contraction": features.get("volu_contraction"),
+                        "close_vs_ma": features.get("close_vs_ma"),
+                        "score": cf.score,
+                    },
+                    # Minervini 평가
+                    "minervini": {
+                        "buyable": cf.setup_ok,
+                        "detail_reasons": detail_reasons,
+                        "rs_pctile": features.get("rs_pctile"),
+                        "vcp_score": features.get("vcp_score"),
+                        "regime_pass": features.get("regime_pass"),
+                    },
+                    # Risk 평가
+                    "risk": {
+                        "atr_pct": features.get("atr_pct"),
+                        "atr14": features.get("atr14"),
+                        "ok": not any("atr" in r for r in (cf.reasons or [])),
+                    },
+                    # Sizing 정보
+                    "sizing": {
+                        "qty": cf.planned_qty,
+                        "price": features.get("order_price"),
+                        "reason": sizing_reason,
+                        "details": sizing_details,
+                    },
+                    # Final 결정
+                    "final": {
+                        "selected": bool(cf.setup_ok and cf.planned_qty > 0),
+                        "drop_reasons": cf.reasons or [],
+                    },
+                }
+                
+                append_jsonl(str(scorecard_path), scorecard_record)
+            
+            logger.info(
+                "[PB1][SCORECARD][JSONL] written count=%s path=%s",
+                len(candidates),
+                scorecard_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "[PB1][SCORECARD][FAIL] error=%s",
+                type(e).__name__,
+                exc_info=False,
+            )
 
     def get_touched_files(self) -> list[Path]:
         return list(self._touched_files)
@@ -6477,6 +6598,13 @@ class PB1Engine:
         intents_skipped = self._setup_reason_counter.most_common(3)
         logger.info("[PB1][TICK_SUMMARY] candidates_ok=%d priced_ok=%d intents_created=%d intents_skipped_reason_top3=%s",
                     candidates_ok, priced_ok, intents_created, intents_skipped)
+        
+        # ✅ 스코어카드 JSONL 작성 (선택사항: 성능 영향 최소화)
+        # try:
+        #     self._write_entry_scorecard_jsonl()
+        # except Exception as e:
+        #     logger.warning("[PB1][SCORECARD_WRITE_FAIL] %s", type(e).__name__)
+        
         return RunResult(
             status=final_status,
             notes=final_notes,
