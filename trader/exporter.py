@@ -167,10 +167,49 @@ def export_watchlist_bundle(
     """Watchlist 산출물을 CSV/JSON으로 저장한다."""
     out_dir.mkdir(parents=True, exist_ok=True)
     written: Dict[str, Path] = {}
+    
+    # Validate critical frames before export
+    validation_failures = []
+    if "universe_scored" in frames_dict:
+        df = frames_dict["universe_scored"]
+        if df is None or df.empty or len(df) == 0:
+            validation_failures.append("universe_scored:empty")
+    
+    if "pool120" in frames_dict:
+        df = frames_dict["pool120"]
+        if df is None or df.empty or len(df) < 40:
+            validation_failures.append(f"pool120:too_small:{len(df) if df is not None else 0}")
+    
+    if "top50" in frames_dict:
+        df = frames_dict["top50"]
+        if df is None or df.empty or len(df) < 50:
+            validation_failures.append(f"top50:too_small:{len(df) if df is not None else 0}")
+    
+    if "final30" in frames_dict:
+        df = frames_dict["final30"]
+        if df is None or df.empty or len(df) < 30:
+            validation_failures.append(f"final30:too_small:{len(df) if df is not None else 0}")
+    
+    if validation_failures:
+        logger.error(
+            "[EXPORT][VALIDATION_FAIL] failures=%s -> will export with warnings, check source data",
+            validation_failures
+        )
+        # Add validation failures to meta for debugging
+        meta_dict = dict(meta_dict) if meta_dict else {}
+        meta_dict["export_validation_failures"] = validation_failures
 
     for name, frame in frames_dict.items():
         safe_name = name.strip().lower()
         df = _normalize_frame(frame if frame is not None else pd.DataFrame())
+        
+        # Log warning for empty critical frames
+        if df.empty and name in {"universe_scored", "pool120", "top50", "final30"}:
+            logger.warning(
+                "[EXPORT][EMPTY_FRAME] name=%s rows=0 -> exporting empty file (CHECK SOURCE)",
+                safe_name
+            )
+        
         if not df.empty:
             score_final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0
             final_score_nonzero = int((df["final_score"].fillna(0.0) > 0.0).sum()) if "final_score" in df.columns else 0
@@ -184,7 +223,7 @@ def export_watchlist_bundle(
 
         csv_path = out_dir / f"{safe_name}.csv"
         df.to_csv(csv_path, index=False)
-        logger.info("[EXPORT] wrote %s", csv_path)
+        logger.info("[EXPORT] wrote %s rows=%s", csv_path, len(df))
         written[f"{safe_name}_csv"] = csv_path
 
         json_path = out_dir / f"{safe_name}.json"

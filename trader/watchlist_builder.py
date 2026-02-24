@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,6 +20,54 @@ from trader.time_coerce import to_date
 logger = logging.getLogger(__name__)
 
 FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]
+
+
+@dataclass
+class WatchlistBundle:
+    """
+    Watchlist pipeline intermediate results bundle.
+    
+    All stages must have valid data (non-empty) for bundle to be considered complete.
+    This ensures cache hit only when all stages are available.
+    """
+    as_of: str
+    env: str
+    strategy: str
+    universe_scored: List[Dict[str, Any]]  # rows > 0 required
+    pool120: List[Dict[str, Any]]          # rows == 120 required
+    top50: List[Dict[str, Any]]            # rows == 50 required
+    final30: List[Dict[str, Any]]          # rows == 30 required
+    meta: Dict[str, Any]
+    
+    def is_complete(self, *, min_pool: int = 40, exact_top50: int = 50, exact_final30: int = 30) -> bool:
+        """
+        Check if bundle meets minimum requirements.
+        
+        Returns:
+            True if all stages have sufficient data
+        """
+        if not self.universe_scored or len(self.universe_scored) == 0:
+            return False
+        if not self.pool120 or len(self.pool120) < min_pool:
+            return False
+        if not self.top50 or len(self.top50) < exact_top50:
+            return False
+        if not self.final30 or len(self.final30) < exact_final30:
+            return False
+        return True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for backward compatibility."""
+        return {
+            "as_of": self.as_of,
+            "env": self.env,
+            "strategy": self.strategy,
+            "universe_scored": self.universe_scored,
+            "pool120": self.pool120,
+            "top50": self.top50,
+            "final30": self.final30,
+            **self.meta,
+        }
 
 
 def _env_int(key: str, default: int) -> int:
@@ -1275,6 +1324,35 @@ def build_and_save_watchlist(
                 )
             else:
                 logger.info("[WATCHLIST][CACHE] hit=True as_of=%s members=%s", as_of, len(existing))
+                
+                # Attempt to load intermediate stages from DB
+                bundle_recovered = False
+                universe_scored = []
+                pool120 = []
+                top50 = []
+                
+                try:
+                    # Try loading intermediate stages from DB
+                    universe_rows, _ = repo.load_watchlist(env=env, strategy="pb1_universe_scored", as_of=as_of, allow_latest_fallback=False)
+                    pool120_rows, _ = repo.load_watchlist(env=env, strategy="pb1_pool120", as_of=as_of, allow_latest_fallback=False)
+                    top50_rows, _ = repo.load_watchlist(env=env, strategy="pb1_top50", as_of=as_of, allow_latest_fallback=False)
+                    
+                    if universe_rows and len(universe_rows) > 0:
+                        universe_scored = universe_rows
+                    if pool120_rows and len(pool120_rows) >= 40:
+                        pool120 = pool120_rows
+                    if top50_rows and len(top50_rows) >= 50:
+                        top50 = top50_rows
+                    
+                    if universe_scored and pool120 and top50:
+                        bundle_recovered = True
+                        logger.info(
+                            "[WATCHLIST][CACHE][BUNDLE_RECOVERED] universe=%s pool120=%s top50=%s final30=%s",
+                            len(universe_scored), len(pool120), len(top50), len(existing)
+                        )
+                except Exception as exc:
+                    logger.warning("[WATCHLIST][CACHE][BUNDLE_RECOVERY_FAIL] err=%s -> will use degrade mode", exc)
+                
                 existing = _enrich_watchlist_rows(
                     engine=engine,
                     env=env,
@@ -1293,7 +1371,9 @@ def build_and_save_watchlist(
                     as_of=as_of,
                     members=existing,
                 )
+                
                 if return_bundle:
+                    degrade_reason = "cache_bundle_stage_recovered" if bundle_recovered else "cache_bundle_stage_missing"
                     return existing, {
                         "as_of": as_of,
                         "weights": {
@@ -1307,17 +1387,17 @@ def build_and_save_watchlist(
                             "trend_weight": 0.0,
                         },
                         "formula": "score_final = 0.7000*score_tech + 0.3000*score_flow + 0.0000*score_trend",
-                        "universe_scored": [],
-                        "pool120": [],
-                        "top50": [],
+                        "universe_scored": universe_scored,
+                        "pool120": pool120,
+                        "top50": top50,
                         "final30": existing,
-                        "reject_summary": {"cache_bundle_stage_missing": 1},
-                        "shortage_reason": "cache_bundle_stage_missing",
+                        "reject_summary": {degrade_reason: 1},
+                        "shortage_reason": "" if bundle_recovered else degrade_reason,
                         "degrade": {
-                            "enabled": True,
-                            "used": True,
-                            "reason": "cache_bundle_stage_missing",
-                            "disabled_features": ["stage_snapshot"],
+                            "enabled": not bundle_recovered,
+                            "used": not bundle_recovered,
+                            "reason": degrade_reason,
+                            "disabled_features": [] if bundle_recovered else ["stage_snapshot"],
                         },
                     }
                 return existing
@@ -1357,12 +1437,34 @@ def build_and_save_watchlist(
         trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
     )
 
+    # Save final30 to DB (main strategy)
     repo.save_watchlist(
         env=env,
         strategy=strategy,
         as_of=as_of,
         members=watchlist,
     )
+    
+    # Save intermediate stages to DB for recovery
+    if return_bundle and builder.last_bundle:
+        try:
+            universe_scored = builder.last_bundle.get("universe_scored", [])
+            pool120 = builder.last_bundle.get("pool120", [])
+            top50 = builder.last_bundle.get("top50", [])
+            
+            if universe_scored:
+                repo.save_watchlist(env=env, strategy="pb1_universe_scored", as_of=as_of, members=universe_scored)
+                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_universe_scored as_of=%s n=%s", as_of, len(universe_scored))
+            
+            if pool120:
+                repo.save_watchlist(env=env, strategy="pb1_pool120", as_of=as_of, members=pool120)
+                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_pool120 as_of=%s n=%s", as_of, len(pool120))
+            
+            if top50:
+                repo.save_watchlist(env=env, strategy="pb1_top50", as_of=as_of, members=top50)
+                logger.info("[WATCHLIST][DB][SAVE] strategy=pb1_top50 as_of=%s n=%s", as_of, len(top50))
+        except Exception as exc:
+            logger.warning("[WATCHLIST][DB][SAVE_STAGES_FAIL] err=%s -> non-blocking", exc)
 
     if return_bundle:
         return watchlist, builder.last_bundle

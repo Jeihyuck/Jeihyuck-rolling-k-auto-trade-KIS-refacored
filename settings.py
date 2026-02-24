@@ -1,6 +1,12 @@
 # settings.py (전체 통합형 예시: 실전 전략 + API + 환경옵션 한눈에 관리)
 import os
 import logging
+from pathlib import Path
+
+# === 프로젝트 경로 설정 (절대경로 기반) ===
+PROJECT_ROOT = Path(__file__).resolve().parent
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 def safe_strip(val):
     """모든 입력값에서 개행, 캐리지리턴, 양쪽 공백 제거."""

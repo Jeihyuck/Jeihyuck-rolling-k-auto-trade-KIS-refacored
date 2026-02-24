@@ -7,8 +7,10 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
+from trader.runtime_paths import runtime_path
+
 logger = logging.getLogger(__name__)
-RECONCILE_GUARD_FILE = Path("runtime") / "reconcile_guard.json"
+RECONCILE_GUARD_FILE = runtime_path("runtime", "reconcile_guard.json")
 EMPTY_STREAK_MIN = 2
 EMPTY_STREAK_MAX = 3
 

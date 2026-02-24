@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pandas as pd
 
+from settings import RUNTIME_DIR
 from trader.db.engine import get_engine
 from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
@@ -574,7 +575,7 @@ def main() -> int:
     os.environ["TRADER_RUN_ID"] = run_id
     ledger_repo = LedgerEventsRepo(engine)
 
-    export_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
+    export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
         "pool120": pd.DataFrame(watchlist_bundle.get("pool120", [])),

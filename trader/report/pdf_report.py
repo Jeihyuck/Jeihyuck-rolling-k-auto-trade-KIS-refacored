@@ -29,6 +29,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from trader.runtime_paths import runtime_path
+
 logger = logging.getLogger(__name__)
 
 # 한글 폰트 설정 시도 (없으면 기본 폰트 사용)
@@ -140,7 +142,7 @@ def generate_watchlist_pdf(
         생성된 PDF 파일 경로
     """
     if output_dir is None:
-        output_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
+        output_dir = runtime_path("runtime", "watchlist", as_of.strftime("%Y-%m-%d"))
     
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "report.pdf"
@@ -333,7 +335,7 @@ def generate_minervini_pdf(
         생성된 PDF 파일 경로
     """
     if output_dir is None:
-        output_dir = Path("runtime/reports/minervini") / as_of.strftime("%Y-%m-%d")
+        output_dir = runtime_path("runtime", "reports", "minervini", as_of.strftime("%Y-%m-%d"))
     
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "minervini_report.pdf"
@@ -465,7 +467,7 @@ def generate_exit_analysis_pdf(
     exit_date = exit_snapshot.get("exit_date", date.today())
     
     if output_dir is None:
-        output_dir = Path("runtime/reports/exit") / exit_date.strftime("%Y-%m-%d")
+        output_dir = runtime_path("runtime", "reports", "exit", exit_date.strftime("%Y-%m-%d"))
     
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{code}_exit_report.pdf"

@@ -32,6 +32,7 @@ from trader.db.repos import WatchlistRepo
 from trader.flow_score import calculate_flow_score, rank_by_dollar_volume, calculate_final_score
 from trader.ohlcv_prefetch import prefetch_ohlcv_to_db
 from trader.report.pdf_report import generate_watchlist_pdf
+from trader.runtime_paths import runtime_path
 from trader.time_utils import now_kst, prev_business_day
 from trader.time_coerce import to_date
 
@@ -477,7 +478,7 @@ class CandidatePoolBuilder:
         logger.info("[FINAL30_PIPELINE][30] selected=%s", len(final30))
         
         # JSON 저장
-        output_dir = Path("runtime/watchlist") / as_of.strftime("%Y-%m-%d")
+        output_dir = runtime_path("runtime", "watchlist", as_of.strftime("%Y-%m-%d"))
         output_dir.mkdir(parents=True, exist_ok=True)
         
         with open(output_dir / "final30.json", "w") as f:

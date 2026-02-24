@@ -33,24 +33,23 @@ class RunContext:
     window: Optional[str] = None
     phase: Optional[str] = None
     dry_run: bool = False
+    run_id: Optional[str] = None  # Added for compatibility
+    
+    def __post_init__(self):
+        """Auto-generate run_id if not provided."""
+        if not self.run_id:
+            parts = []
+            if self.gh_run_number:
+                parts.append(str(self.gh_run_number))
+            if self.git_sha:
+                parts.append(self.git_sha[:8])
+            self.run_id = "-".join(parts) if parts else "local"
     
     # DEPRECATED: Kept for backward compatibility, will be removed
     @property
     def env(self) -> str:
         """Deprecated: Use account_env instead."""
         return self.account_env
-    
-    @property
-    def run_id(self) -> str:
-        """Deprecated: run_id is being removed from the system."""
-        import warnings
-        warnings.warn(
-            "run_id is deprecated and will be removed. "
-            "Do not use run_id for filtering or storage.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        return "deprecated"
 
     @classmethod
     def new(
