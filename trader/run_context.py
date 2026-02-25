@@ -34,6 +34,57 @@ class RunContext:
     phase: Optional[str] = None
     dry_run: bool = False
     run_id: Optional[str] = None  # Added for compatibility
+
+    def __init__(
+        self,
+        *args,
+        env: Optional[str] = None,
+        strategy: Optional[str] = None,
+        gh_run_number: Optional[int] = None,
+        git_sha: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Accept flexible keyword arguments to avoid unexpected-kw errors.
+
+        env, strategy, gh_run_number, git_sha are optional, and any additional
+        kwargs are stored as attributes on the instance.
+        """
+        account_env = kwargs.pop("account_env", None)
+        exec_mode = kwargs.pop("exec_mode", None)
+        started_at = kwargs.pop("started_at", None)
+        window = kwargs.pop("window", None)
+        phase = kwargs.pop("phase", None)
+        dry_run = kwargs.pop("dry_run", False)
+        run_id = kwargs.pop("run_id", None)
+
+        if account_env is None and env is not None:
+            account_env = env
+
+        if strategy is None and "strategy" in kwargs:
+            strategy = kwargs.pop("strategy")
+
+        self.account_env = account_env
+        self.exec_mode = exec_mode
+        self.strategy = strategy
+        self.started_at = started_at or datetime.now()
+        self.gh_run_number = gh_run_number
+        self.git_sha = git_sha
+        self.window = window
+        self.phase = phase
+        self.dry_run = dry_run
+        self.run_id = run_id
+
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+        self.__post_init__()
+
+        if args:
+            try:
+                super().__init__(*args)
+            except TypeError:
+                super().__init__()
     
     def __post_init__(self):
         """Auto-generate run_id if not provided."""
