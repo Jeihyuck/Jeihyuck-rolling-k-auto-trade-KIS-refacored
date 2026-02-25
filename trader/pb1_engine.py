@@ -1911,6 +1911,7 @@ class PB1Engine:
             # [MINERVINI] RS/VCP 필터 적용 전 카운트
             before_minervini = len([cf for cf in candidates if cf.features.get("data_ok")])
             debug_mode = os.getenv("MINERVINI_DEBUG") == "1"
+            t_minervini_enter = time.monotonic()
             
             rs_fail_count = 0
             vcp_fail_count = 0

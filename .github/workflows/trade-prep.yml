@@ -1,0 +1,297 @@
+name: Trade Prep (KST 08:00)
+
+on:
+  # KST 08:00 = UTC 23:00 (previous day)
+  # Mon-Fri KST 08:00 = Sun-Thu UTC 23:00
+  schedule:
+    - cron: "0 23 * * 0-4"
+
+  workflow_dispatch:
+    inputs:
+      AS_OF_OVERRIDE:
+        description: "Force as_of date (e.g., 2026-02-24). Leave empty for auto (prev trading day)."
+        required: false
+        default: ""
+      STRATEGY_ENV:
+        description: "practice | real"
+        required: true
+        default: "practice"
+        type: choice
+        options:
+          - practice
+          - real
+      OHLCV_PREFETCH_MODE:
+        description: "auto | full | delta"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - full
+          - delta
+      FORCE_CANDIDATE:
+        description: "1=force rebuild candidate pool"
+        required: true
+        default: "0"
+      ALLOW_DEGRADED_PREP:
+        description: "1=allow degraded prep (continue on partial data)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prep-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: "1"
+  DB_DISABLE_PREPARED_STATEMENTS: "1"
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: repo
+    env:
+      AS_OF_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.AS_OF_OVERRIDE || '' }}
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      # ✅ DB secrets
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      # ✅ KIS API (for flow data if needed)
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+
+      # ✅ Mode settings
+      MODE: "prep"
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.STRATEGY_ENV || 'practice' }}
+      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.STRATEGY_ENV || 'practice' }}
+      STRATEGY_MODE: "DIAG"
+      
+      # ✅ Force block all trading in prep
+      FORCE_BLOCK_LIVE: "1"
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      NO_TRADE: "1"
+
+      # ✅ OHLCV prefetch settings
+      OHLCV_PREFETCH_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.OHLCV_PREFETCH_MODE || 'auto' }}
+      PREFETCH_DAYS: "5"
+      OHLCV_DELTA_DAYS: "5"
+      OHLCV_AUTO_MIN_HISTORY_DAYS: "150"
+      MINERVINI_OHLCV_DAYS: "520"
+      
+      # ✅ Benchmark
+      RS_BENCHMARK: "229200"
+      BENCH_OHLCV_DAYS: "520"
+
+      # ✅ Universe settings
+      UNIVERSE_NO_FALLBACK: "0"
+      UNIVERSE_BUILD_IF_MISSING: "1"
+      UNIVERSE_FORCE_REBUILD_ALWAYS: "0"
+      CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+
+      # ✅ Candidate pool
+      FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_CANDIDATE || '0' }}
+      CANDIDATE_POOL_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.FORCE_CANDIDATE || '0' }}
+
+      # ✅ Minervini Stage B 완화 설정
+      RS_MIN_PCTILE: "70"
+      VCP_MIN_SCORE: "60"
+      MINERVINI_VCP_PIVOT_NEAR_PCT: "0.30"
+      REGIME_MODE: "RELAXED"
+
+      # ✅ VCP 설정
+      MINERVINI_VCP_MAX_RECENT_RANGE_PCT: "0.45"
+      MINERVINI_VCP_VOL_SHRINK_MODE: "median"
+      MINERVINI_VCP_VOL_SHRINK_TOL: "1.80"
+      MINERVINI_VCP_TIGHTNESS_TOL_MULT: "1.40"
+
+      # ✅ Watchlist settings
+      PB1_WATCHLIST_STRATEGY: "pb1_watchlist"
+      PB1_WATCHLIST_FINALN: "30"
+      PB1_WATCHLIST_POOL_MIN: "40"
+      PB1_WATCHLIST_TOPK: "50"
+      PB1_WATCHLIST_FORCE_REBUILD: "0"
+      WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+
+      # ✅ Flow settings (prep에서는 fallback 허용)
+      FLOW_MODE: "PREV_CLOSE_ONLY"
+      FLOW_STRICT: "0"
+      DEGRADED_EXCLUDE_FLOW: "1"
+      ALLOW_FLOW_DEGRADED_PREP: "1"
+
+      # ✅ Degraded mode settings
+      ALLOW_DEGRADED_PREP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ALLOW_DEGRADED_PREP || '1' }}
+      PREP_CONTRACT_ALLOW_DEGRADE: "1"
+      PB1_WATCHLIST_ALLOW_DEGRADE: "1"
+
+      # ✅ DB migration
+      DB_MIGRATE_MODE: "auto"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m pip install "SQLAlchemy>=2.0" "psycopg[binary]>=3.1"
+
+      - name: Verify imports
+        run: |
+          set -euo pipefail
+          python -c "import trader; print('✅ trader')"
+          python -c "import trader.prep_runner; print('✅ trader.prep_runner')"
+          python -c "import trader.db.migrate; print('✅ trader.db.migrate')"
+
+      - name: Guard postgres-only
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only"
+            exit 1
+          fi
+
+      - name: Print effective config
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "Trade Prep (KST 08:00) - Configuration"
+          echo "======================================"
+          echo "Time: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "MODE: ${MODE}"
+          echo "STRATEGY_ENV: ${STRATEGY_ENV}"
+          echo "AS_OF_OVERRIDE: ${AS_OF_OVERRIDE:-<auto>}"
+          echo "OHLCV_PREFETCH_MODE: ${OHLCV_PREFETCH_MODE}"
+          echo "FORCE_CANDIDATE: ${FORCE_CANDIDATE}"
+          echo "ALLOW_DEGRADED_PREP: ${ALLOW_DEGRADED_PREP}"
+          echo "RS_MIN_PCTILE: ${RS_MIN_PCTILE}"
+          echo "VCP_MIN_SCORE: ${VCP_MIN_SCORE}"
+          echo "MINERVINI_VCP_PIVOT_NEAR_PCT: ${MINERVINI_VCP_PIVOT_NEAR_PCT}"
+          echo "REGIME_MODE: ${REGIME_MODE}"
+          echo "======================================"
+
+      - name: DB migrate (auto)
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          echo "[DB][MIGRATE] Running migrations..."
+          python -m trader.db.migrate
+
+      - name: Run PREP
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "[PREP] Starting prep workflow"
+          echo "======================================"
+          python -m trader.prep_runner 2>&1 | tee /tmp/prep.log
+          echo "======================================"
+          echo "[PREP] Completed successfully"
+          echo "======================================"
+
+      - name: Verify prep outputs
+        if: always()
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          
+          if [ ! -f /tmp/prep.log ]; then
+            echo "::warning::prep.log not found - cannot verify outputs"
+            exit 0
+          fi
+
+          echo "======================================"
+          echo "[PREP][VERIFY] Checking prep outputs"
+          echo "======================================"
+
+          # Check PREP_DONE event
+          if grep -q "event_type=PREP_DONE" /tmp/prep.log; then
+            echo "✅ PREP_DONE event recorded"
+          else
+            echo "::error::PREP_DONE event NOT found in logs"
+            exit 1
+          fi
+
+          # Check derived_minervini count
+          if grep -Eq "derived_upserted.*[1-9][0-9]+" /tmp/prep.log; then
+            echo "✅ derived_minervini data created"
+          else
+            echo "::warning::derived_minervini count may be 0"
+          fi
+
+          # Check final30 creation
+          if grep -Eq "\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].*n=[1-9][0-9]*" /tmp/prep.log; then
+            echo "✅ final30 watchlist saved"
+          else
+            echo "::warning::final30 watchlist may be missing or empty"
+          fi
+
+          # Check for critical errors
+          if grep -q "Universe build/save failed" /tmp/prep.log; then
+            echo "::error::Universe build/save failed"
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "[PREP][VERIFY] Verification complete"
+          echo "======================================"
+
+      - name: Scan for SQLite artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "✅ No SQLite artifacts"
+
+      - name: Upload runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prep-runtime-${{ github.run_id }}
+          path: |
+            runtime/**
+            repo/runtime/**
+            /tmp/prep.log
+          if-no-files-found: warn

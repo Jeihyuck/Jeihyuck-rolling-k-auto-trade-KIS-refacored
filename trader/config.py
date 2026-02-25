@@ -237,7 +237,7 @@ CONFIG = {
     "DERIVED_FALLBACK_ENABLED": "1",                  # fallback 활성화 (0=비활성화)
     "DERIVED_FALLBACK_WARN_AGE_DAYS": "2",            # fallback age가 이 값 이상이면 경고 (기본 2)
     # Minervini v2 tuning
-    "MINERVINI_RS_MIN": "0.80",
+    "MINERVINI_RS_MIN": "0.70",
     "MINERVINI_MAX_PYRAMID": "3",
     "MINERVINI_ADD_ON_R": "1.5",
     "MINERVINI_BREAKOUT_VOL_MULT": "1.5",
@@ -250,12 +250,12 @@ CONFIG = {
     "RS_BENCHMARK": "229200",
     "RS_LOOKBACK_DAYS": "63",
     "RS_LOOKBACK2_DAYS": "126",
-    "RS_MIN_PCTILE": "80",
+    "RS_MIN_PCTILE": "70",
     "RS_COMPOSITE_W1": "0.6",
     "RS_COMPOSITE_W2": "0.4",
     # Market regime
     "REGIME_INDEX": "229200",
-    "REGIME_MODE": "STRICT",
+    "REGIME_MODE": "RELAXED",
     "REGIME_MA_FAST": "50",
     "REGIME_MA_SLOW": "200",
     "REGIME_BREADTH_WINDOW": "20",
@@ -264,8 +264,8 @@ CONFIG = {
     "REGIME_MIN_RISK": "0.0",
     # VCP/trigger
     "VCP_LOOKBACK": "120",
-    "VCP_MIN_SCORE": "70",
-    "PIVOT_BUFFER_PCT": "0.15",
+    "VCP_MIN_SCORE": "60",
+    "PIVOT_BUFFER_PCT": "0.30",
     "BREAKOUT_VOL_MULT": "1.5",
     "ENTRY_MODE": "BOTH",
     # Liquidity/gap/slippage
@@ -536,16 +536,16 @@ def _resolve_min_order_krw() -> float:
 MIN_ORDER_KRW = _resolve_min_order_krw()
 
 # ================================================================
-# [NEW] Sizing 최소 1주 보장 옵션
+# [NEW] Sizing 최소 1주 보장 옵션 (단계 B 완화: 기본 활성화)
 # ================================================================
-SIZING_ALLOW_MIN_1_SHARE = _cfg_bool("SIZING_ALLOW_MIN_1_SHARE", fallback=False)
+SIZING_ALLOW_MIN_1_SHARE = _cfg_bool("SIZING_ALLOW_MIN_1_SHARE", fallback=True)
 SIZING_MIN_1_SHARE_TOPN = int(_cfg("SIZING_MIN_1_SHARE_TOPN") or "0")
 
 # ================================================================
-# [NEW] 주문 가격 slippage 설정
+# [NEW] 주문 가격 slippage 설정 (단계 B 완화: ask 대신 현재가 사용)
 # ================================================================
 PRICE_SLIPPAGE_PCT_BUY = float(_cfg("PRICE_SLIPPAGE_PCT_BUY") or "0.005")  # 0.5% 기본
-PRICE_USE_ASK_IF_AVAILABLE = _cfg_bool("PRICE_USE_ASK_IF_AVAILABLE", fallback=True)
+PRICE_USE_ASK_IF_AVAILABLE = _cfg_bool("PRICE_USE_ASK_IF_AVAILABLE", fallback=False)
 
 logger.info(
     "[CONFIG][SIZING] allow_min_1_share=%s topn=%s slippage_buy=%.3f%% use_ask=%s",

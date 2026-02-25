@@ -753,6 +753,29 @@ def main() -> int:
             as_of,
             len(watchlist),
         )
+        
+        # ✅ CRITICAL: Save final30_snapshot for trade tick
+        from trader.final_list_store import save_final30
+        final30_codes = [str(m.get("code") or "").zfill(6) for m in watchlist if m.get("code")]
+        final30_meta = {
+            "strategy": watchlist_final_strategy,
+            "source": "prep_runner",
+            "bundle_source": watchlist_bundle.get("degrade", {}).get("reason", "fresh_build"),
+            "final_count": len(watchlist),
+        }
+        final30_path = save_final30(
+            env=env,
+            as_of=as_of.isoformat(),
+            symbols=final30_codes,
+            meta=final30_meta,
+            overwrite=True,
+        )
+        logger.info(
+            "[PREP][FINAL30_SNAPSHOT][SAVE] as_of=%s count=%s path=%s",
+            as_of.isoformat(),
+            len(final30_codes),
+            final30_path,
+        )
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id

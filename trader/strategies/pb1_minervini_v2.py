@@ -10,8 +10,8 @@ import pandas as pd
 
 @dataclass
 class MinerviniConfig:
-    # Trend template
-    rs_min_percentile: float = 0.80
+    # Trend template (단계 B 완화)
+    rs_min_percentile: float = 0.70  # 80 -> 70으로 완화
     min_dollar_vol_50d: float = 2.0e9
 
     # VCP / base
@@ -23,10 +23,10 @@ class MinerviniConfig:
     vol_dryup_ratio: float = 0.70
     tight_close_max_pct: float = 0.015
 
-    # Entry
-    pivot_buffer_pct: float = 0.0015
+    # Entry (단계 B 완화)
+    pivot_buffer_pct: float = 0.0030  # 0.0015 -> 0.0030으로 완화
     breakout_vol_mult_20: float = 1.5
-    max_extension_from_pivot: float = 0.05
+    max_extension_from_pivot: float = 0.30  # 0.05 -> 0.30으로 완화
 
     # Stop / trail
     initial_stop_pct: float = 0.075

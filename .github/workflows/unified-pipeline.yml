@@ -1,10 +1,9 @@
-name: "Unified (Prep Delta + Trade Tick)"
+name: "Trade Tick (Intraday)"
 
 on:
-  # ✅ 1) Prep Delta: Mon-Fri 08:40 KST = Sun-Thu 23:40 UTC
-  # ✅ 2) Trade Tick: Mon-Fri 09:00~15:30 KST every 5 min (UTC 00:00~06:30)
+  # ✅ Trade Tick: Mon-Fri 09:00~15:30 KST every 5 min (UTC 00:00~06:30)
+  # ✅ Prep은 별도 워크플로(trade-prep.yml)에서 KST 08:00에 실행
   schedule:
-    - cron: "40 23 * * 0-4"
     - cron: "0-30/5 0-6 * * 1-5"
 
   workflow_dispatch:

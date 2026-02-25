@@ -2905,6 +2905,21 @@ def main() -> int:
                 derived_count,
             )
         
+        # ✅ DIAGNOSTIC: final30_snapshot 존재 여부 체크
+        from trader.final_list_store import load_final30
+        final30_codes = load_final30(env=derived_env, as_of=derived_as_of.isoformat())
+        if final30_codes:
+            logger.info(
+                "[TRADE_TICK][FINAL30_SNAPSHOT][OK] derived_as_of=%s count=%d",
+                derived_as_of.isoformat(),
+                len(final30_codes),
+            )
+        else:
+            logger.warning(
+                "[TRADE_TICK][FINAL30_SNAPSHOT][MISSING] derived_as_of=%s -> will use watchlist_final fallback",
+                derived_as_of.isoformat(),
+            )
+        
         watchlist_repo = WatchlistRepo(engine)
         watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
         ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
