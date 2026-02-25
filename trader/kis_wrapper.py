@@ -34,7 +34,12 @@ from settings import APP_KEY, APP_SECRET, API_BASE_URL, CANO, ACNT_PRDT_CD, KIS_
 from trader.kis_rate_limiter import get_kis_limiter
 from trader.runtime_paths import runtime_path
 from trader.time_utils import is_trading_day, is_trading_window, now_kst
-from trader.config import DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL, MARKET_MAP, SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_RETRY
+from trader.config import (
+    DAILY_CAPITAL as DEFAULT_DAILY_CAPITAL,
+    MARKET_MAP,
+    SUBJECT_FLOW_TIMEOUT_SEC,
+    SUBJECT_FLOW_RETRY,
+)
 from trader.fills import append_fill
 from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
@@ -3028,19 +3033,24 @@ class KisAPI:
     # -------------------------------
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+        
+        # Live Gate 체크: config에서 계산된 정책 사용
+        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
+        
+        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
             logger.warning(
-                "[ORDER][BLOCKED] reason=force_block_live code=%s side=%s qty=%s",
+                "[ORDER][BLOCKED] reason=%s code=%s side=%s qty=%s",
+                LIVE_GATE_STATUS.reason,
                 body.get("PDNO"),
                 "SELL" if is_sell else "BUY",
                 body.get("ORD_QTY"),
             )
             return {
                 "blocked": True,
-                "reason": "force_block_live",
+                "reason": LIVE_GATE_STATUS.reason,
                 "rt_cd": "1",
-                "msg_cd": "FORCE_BLOCK_LIVE",
-                "msg1": "force_block_live",
+                "msg_cd": "LIVE_GATE_BLOCKED",
+                "msg1": LIVE_GATE_STATUS.reason,
             }
         _assert_orders_allowed("order_cash")
 
@@ -3305,26 +3315,32 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
+        # Live Gate 체크: config에서 계산된 정책 사용
+        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
+        
         # ✅ 진입 로그: wrapper까지 주문이 도달했는지 즉시 확인
         logger.info(
-            "[ORDER][WRAPPER][ENTER] func=buy_stock_limit code=%s qty=%s price=%s FORCE_BLOCK_LIVE=%s NO_TRADE=%s",
+            "[ORDER][WRAPPER][ENTER] func=buy_stock_limit code=%s qty=%s price=%s allow_live_gate=%s force_block_live=%s reason=%s NO_TRADE=%s",
             pdno, qty, price,
-            os.getenv("FORCE_BLOCK_LIVE", "0"),
+            int(ALLOW_LIVE_GATE),
+            int(FORCE_BLOCK_LIVE),
+            LIVE_GATE_STATUS.reason,
             os.getenv("NO_TRADE", "0")
         )
         
-        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
             logger.warning(
-                "[ORDER][BLOCKED] reason=force_block_live code=%s side=BUY qty=%s",
+                "[ORDER][BLOCKED] reason=%s code=%s side=BUY qty=%s",
+                LIVE_GATE_STATUS.reason,
                 pdno,
                 qty,
             )
             return {
                 "blocked": True,
-                "reason": "force_block_live",
+                "reason": LIVE_GATE_STATUS.reason,
                 "rt_cd": "1",
-                "msg_cd": "FORCE_BLOCK_LIVE",
-                "msg1": "force_block_live",
+                "msg_cd": "LIVE_GATE_BLOCKED",
+                "msg1": LIVE_GATE_STATUS.reason,
             }
         _assert_orders_allowed("buy_stock_limit")
         
@@ -3390,18 +3406,22 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        if os.getenv("FORCE_BLOCK_LIVE", "0") == "1":
+        # Live Gate 체크: config에서 계산된 정책 사용
+        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
+        
+        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
             logger.warning(
-                "[ORDER][BLOCKED] reason=force_block_live code=%s side=SELL qty=%s",
+                "[ORDER][BLOCKED] reason=%s code=%s side=SELL qty=%s",
+                LIVE_GATE_STATUS.reason,
                 pdno,
                 qty,
             )
             return {
                 "blocked": True,
-                "reason": "force_block_live",
+                "reason": LIVE_GATE_STATUS.reason,
                 "rt_cd": "1",
-                "msg_cd": "FORCE_BLOCK_LIVE",
-                "msg1": "force_block_live",
+                "msg_cd": "LIVE_GATE_BLOCKED",
+                "msg1": LIVE_GATE_STATUS.reason,
             }
         _assert_orders_allowed("sell_stock_limit")
         

@@ -1745,6 +1745,21 @@ def run_once(
         os.getenv("STRATEGY_MODE"),
         os.getenv("PB1_ENTRY_ENABLED"),
     )
+    
+    # Live Gate 상태 로깅 (시간 기반 자동 정책)
+    try:
+        from trader.config import LIVE_GATE_STATUS
+        logger.info(
+            "[LIVE_GATE_STATUS] allow_live_gate=%s force_block_live=%s reason=%s trading_day=%s window=%s now_kst=%s",
+            int(LIVE_GATE_STATUS.allow_live_gate),
+            int(LIVE_GATE_STATUS.force_block_live),
+            LIVE_GATE_STATUS.reason,
+            int(LIVE_GATE_STATUS.trading_day),
+            LIVE_GATE_STATUS.window,
+            LIVE_GATE_STATUS.now_kst.isoformat(),
+        )
+    except Exception as e:
+        logger.warning("[LIVE_GATE_STATUS] failed to log: %s", e)
 
     # Ensure defined for all branches (prevents NameError in non-trading-day path)
     dry_run_reason = "unknown"

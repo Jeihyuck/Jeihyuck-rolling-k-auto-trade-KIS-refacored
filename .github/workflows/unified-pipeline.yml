@@ -198,8 +198,10 @@ jobs:
     outputs:
       run_mode: ${{ steps.set.outputs.run_mode }}
       strategy_env: ${{ steps.set.outputs.strategy_env }}
+      strategy_mode: ${{ steps.set.outputs.strategy_mode }}
       allow_live_gate: ${{ steps.set.outputs.allow_live_gate }}
       force_block_live: ${{ steps.set.outputs.force_block_live }}
+      kill_switch: ${{ steps.set.outputs.kill_switch }}
       dryrun: ${{ steps.set.outputs.dryrun }}
       analysis_only: ${{ steps.set.outputs.analysis_only }}
     steps:
@@ -208,10 +210,16 @@ jobs:
           set -euo pipefail
 
           # ----- 기본값(스케줄) -----
+          # AUTO LIVE ARMING: compute_live_gate()가 시간 기반으로 자동 결정
+          # - STRATEGY_MODE만 설정하면 거래 시간대 자동 감지
+          # - FORCE_BLOCK_LIVE=0 (긴급 상황에만 1로 설정)
+          # - KILL_SWITCH는 별도 환경변수로 설정 가능 (최우선 차단)
           RUN_MODE="prep"
           STRATEGY_ENV="practice"
+          STRATEGY_MODE="DIAG"
           ALLOW_LIVE_GATE="0"
-          FORCE_BLOCK_LIVE="1"
+          FORCE_BLOCK_LIVE="0"
+          KILL_SWITCH="0"
           DRYRUN="0"
           ANALYSIS_ONLY="0"
 
@@ -224,10 +232,13 @@ jobs:
             
             # workflow_dispatch에서는 prep 모드일 때 강제 차단
             if [[ "${RUN_MODE}" == "prep" ]]; then
+              STRATEGY_MODE="DIAG"
               ALLOW_LIVE_GATE="0"
               FORCE_BLOCK_LIVE="1"
-              echo "[RESOLVE] prep mode detected - forcing ALLOW_LIVE_GATE=0, FORCE_BLOCK_LIVE=1"
+              echo "[RESOLVE] prep mode detected - forcing STRATEGY_MODE=DIAG, FORCE_BLOCK_LIVE=1"
             else
+              # trade 모드: time-based policy에 맡김
+              STRATEGY_MODE="LIVE"
               ALLOW_LIVE_GATE="${{ inputs.ALLOW_LIVE_GATE }}"
               FORCE_BLOCK_LIVE="${{ inputs.FORCE_BLOCK_LIVE }}"
             fi
@@ -246,9 +257,10 @@ jobs:
             # KST 08:40 = prep delta
             if [[ "${KST_HOUR}" == "08" && "${KST_MIN}" == "40" ]]; then
               RUN_MODE="prep"
+              STRATEGY_MODE="DIAG"
               ALLOW_LIVE_GATE="0"
               FORCE_BLOCK_LIVE="1"
-              echo "[RESOLVE] Detected prep delta window (08:40 KST)"
+              echo "[RESOLVE] Detected prep delta window (08:40 KST) - STRATEGY_MODE=DIAG"
             # KST 09:00~15:30 on weekdays (Mon-Fri) = trade tick  
             elif [[ "${KST_DOW}" -ge 1 && "${KST_DOW}" -le 5 ]]; then
               # Convert to minutes for easier comparison
@@ -258,29 +270,34 @@ jobs:
               
               if [[ "${KST_MINUTES}" -ge "${START_MIN}" && "${KST_MINUTES}" -le "${END_MIN}" ]]; then
                 RUN_MODE="trade"
+                STRATEGY_MODE="LIVE"
                 ALLOW_LIVE_GATE="1"
                 FORCE_BLOCK_LIVE="0"
-                echo "[RESOLVE] Detected trade tick window (${KST_TIME} KST)"
+                echo "[RESOLVE] Detected trade tick window (${KST_TIME} KST) - STRATEGY_MODE=LIVE (auto gate active)"
               else
-                # Outside market hours - run trade but with safety
+                # Outside market hours - run trade but with DIAG mode
                 RUN_MODE="trade"
+                STRATEGY_MODE="DIAG"
                 ALLOW_LIVE_GATE="0"
-                FORCE_BLOCK_LIVE="1"
-                echo "[RESOLVE] Outside market hours (${KST_TIME} KST) - running trade with gates blocked"
+                FORCE_BLOCK_LIVE="0"
+                echo "[RESOLVE] Outside market hours (${KST_TIME} KST) - STRATEGY_MODE=DIAG (auto gate will block)"
               fi
             else
-              # Weekend - run trade but blocked
+              # Weekend - run trade but DIAG mode
               RUN_MODE="trade"
+              STRATEGY_MODE="DIAG"
               ALLOW_LIVE_GATE="0"
-              FORCE_BLOCK_LIVE="1"
-              echo "[RESOLVE] Weekend detected - running trade with gates blocked"
+              FORCE_BLOCK_LIVE="0"
+              echo "[RESOLVE] Weekend detected - STRATEGY_MODE=DIAG (auto gate will block)"
             fi
           fi
 
           echo "run_mode=${RUN_MODE}" >> "$GITHUB_OUTPUT"
           echo "strategy_env=${STRATEGY_ENV}" >> "$GITHUB_OUTPUT"
+          echo "strategy_mode=${STRATEGY_MODE}" >> "$GITHUB_OUTPUT"
           echo "allow_live_gate=${ALLOW_LIVE_GATE}" >> "$GITHUB_OUTPUT"
           echo "force_block_live=${FORCE_BLOCK_LIVE}" >> "$GITHUB_OUTPUT"
+          echo "kill_switch=${KILL_SWITCH}" >> "$GITHUB_OUTPUT"
           echo "dryrun=${DRYRUN}" >> "$GITHUB_OUTPUT"
           echo "analysis_only=${ANALYSIS_ONLY}" >> "$GITHUB_OUTPUT"
 
@@ -290,8 +307,10 @@ jobs:
           echo "event: ${GITHUB_EVENT_NAME}"
           echo "mode: ${RUN_MODE}"
           echo "env: ${STRATEGY_ENV}"
+          echo "strategy_mode: ${STRATEGY_MODE}"
           echo "allow_live_gate: ${ALLOW_LIVE_GATE}"
           echo "force_block_live: ${FORCE_BLOCK_LIVE}"
+          echo "kill_switch: ${KILL_SWITCH}"
           echo "dryrun: ${DRYRUN}"
           echo "analysis_only: ${ANALYSIS_ONLY}"
           echo "======================================"
@@ -324,10 +343,15 @@ jobs:
       MODE: ${{ needs.resolve.outputs.run_mode }}
       STRATEGY_ENV: ${{ needs.resolve.outputs.strategy_env }}
       KIS_ENV: ${{ needs.resolve.outputs.strategy_env }}
+      STRATEGY_MODE: ${{ needs.resolve.outputs.strategy_mode }}
       ALLOW_LIVE_GATE: ${{ needs.resolve.outputs.allow_live_gate }}
       FORCE_BLOCK_LIVE: ${{ needs.resolve.outputs.force_block_live }}
+      KILL_SWITCH: ${{ needs.resolve.outputs.kill_switch }}
       DRYRUN: ${{ needs.resolve.outputs.dryrun }}
       ANALYSIS_ONLY: ${{ needs.resolve.outputs.analysis_only }}
+      
+      # Optional: 개장 직후 버퍼 (초)
+      OPEN_BUFFER_SEC: "5"
 
       # ✅ delta 기본(수동입력 있으면 override)
       PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.PREFETCH_DAYS || '1' }}

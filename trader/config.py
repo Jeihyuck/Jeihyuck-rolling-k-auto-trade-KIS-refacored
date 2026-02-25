@@ -534,6 +534,27 @@ def _resolve_min_order_krw() -> float:
 
 
 MIN_ORDER_KRW = _resolve_min_order_krw()
+
+# ================================================================
+# [NEW] Sizing 최소 1주 보장 옵션
+# ================================================================
+SIZING_ALLOW_MIN_1_SHARE = _cfg_bool("SIZING_ALLOW_MIN_1_SHARE", fallback=False)
+SIZING_MIN_1_SHARE_TOPN = int(_cfg("SIZING_MIN_1_SHARE_TOPN") or "0")
+
+# ================================================================
+# [NEW] 주문 가격 slippage 설정
+# ================================================================
+PRICE_SLIPPAGE_PCT_BUY = float(_cfg("PRICE_SLIPPAGE_PCT_BUY") or "0.005")  # 0.5% 기본
+PRICE_USE_ASK_IF_AVAILABLE = _cfg_bool("PRICE_USE_ASK_IF_AVAILABLE", fallback=True)
+
+logger.info(
+    "[CONFIG][SIZING] allow_min_1_share=%s topn=%s slippage_buy=%.3f%% use_ask=%s",
+    int(SIZING_ALLOW_MIN_1_SHARE),
+    SIZING_MIN_1_SHARE_TOPN,
+    PRICE_SLIPPAGE_PCT_BUY * 100,
+    int(PRICE_USE_ASK_IF_AVAILABLE),
+)
+
 STRATEGY_INTENTS_PATH = Path(
     _cfg("STRATEGY_INTENTS_PATH") or runtime_path(*Path(CONFIG["STRATEGY_INTENTS_PATH"]).parts)
 )
@@ -1106,3 +1127,53 @@ def resolve_strategy_mode(
     in_market = trading_day and (market_open <= now_kst.time() <= market_close)
     mode = "LIVE" if in_market else "DIAG"
     return mode, trading_day, window, "auto"
+
+
+# ================================================================
+# Live Gate - 시간 기반 자동 Live Trading 허용/차단
+# ================================================================
+from trader.live_gate import compute_live_gate, LiveGateStatus
+
+# 현재 시각 기준으로 live gate 상태 계산
+_now_kst_init = datetime.now(KST)
+
+# KIS_ENV 가져오기 (settings.py에서 import)
+from settings import KIS_ENV as _KIS_ENV_FROM_SETTINGS
+
+# Strategy mode 결정
+_strategy_mode_raw = os.getenv("STRATEGY_MODE", "").strip().upper()
+if not _strategy_mode_raw:
+    # 자동 결정: 거래 시간대이면 LIVE, 아니면 DIAG
+    _auto_mode, _, _, _ = resolve_strategy_mode(_now_kst_init)
+    _strategy_mode_raw = _auto_mode
+
+# Dry-run / Analysis-only 플래그
+_dryrun = env_bool("DRY_RUN", default=False)
+_analysis_only = MINERVINI_ONLY  # 이미 위에서 정의됨
+
+# Live Gate 상태 계산
+LIVE_GATE_STATUS: LiveGateStatus = compute_live_gate(
+    _now_kst_init,
+    kis_env=_KIS_ENV_FROM_SETTINGS,
+    strategy_mode=_strategy_mode_raw,
+    dryrun=_dryrun,
+    analysis_only=_analysis_only,
+)
+
+# 전역 변수로 공개
+ALLOW_LIVE_GATE: bool = LIVE_GATE_STATUS.allow_live_gate
+FORCE_BLOCK_LIVE: bool = LIVE_GATE_STATUS.force_block_live
+
+# 로깅
+logger.info(
+    "[LIVE_GATE] allow_live_gate=%s force_block_live=%s reason=%s trading_day=%s window=%s now_kst=%s strategy_mode=%s dryrun=%s analysis_only=%s",
+    int(ALLOW_LIVE_GATE),
+    int(FORCE_BLOCK_LIVE),
+    LIVE_GATE_STATUS.reason,
+    int(LIVE_GATE_STATUS.trading_day),
+    LIVE_GATE_STATUS.window,
+    LIVE_GATE_STATUS.now_kst.isoformat(),
+    _strategy_mode_raw,
+    int(_dryrun),
+    int(_analysis_only),
+)

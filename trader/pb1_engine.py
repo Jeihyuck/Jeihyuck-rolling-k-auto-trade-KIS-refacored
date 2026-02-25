@@ -66,6 +66,10 @@ from trader.config import (
     PB1_MAX_PRICE_FETCH_PER_TICK,
     PB1_EARLY_STOP_ENABLED,
     MIN_ORDER_KRW,
+    SIZING_ALLOW_MIN_1_SHARE,
+    SIZING_MIN_1_SHARE_TOPN,
+    PRICE_SLIPPAGE_PCT_BUY,
+    PRICE_USE_ASK_IF_AVAILABLE,
     MINERVINI_ADD_ON_R,
     MINERVINI_BREAKOUT_VOL_MULT,
     MINERVINI_HEAVY_VOL_MULT,
@@ -2649,24 +2653,60 @@ class PB1Engine:
                 qty = min(qty, int(budget_cap // order_px))
             
             # ===== New: 명확한 sizing_reason 계산 =====
+            # ⚠️ CRITICAL: reserve는 _resolve_entry_capital()에서 이미 적용됨
+            # usable = base_cash * (1 - reserve_pct)
+            # 따라서 여기서 reserve_krw는 "정보용"이지, 재차감하지 않음!
             reserve_krw = float(self.entry_reserve_krw or 0.0)
             usable_cash = float(self.entry_usable_krw or 0.0)
             sizing_reason: str | None = None
             sizing_details: dict[str, Any] = {}
             
+            # rank 계산 (최소 1주 보장용)
+            rank = ranked.index(cf) + 1 if cf in ranked else 999
+            
             # 1단계: qty=0 여부 체크 (예산 부족)
             if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
-                qty = 0
-                # 예산 부족: 1주(price)도 못 삼
-                sizing_reason = "BUDGET_INSUFFICIENT_FOR_1_SHARE"
-                sizing_details = {
-                    "buy_budget_after_reserve": tick_budget,
-                    "price": order_px,
-                    "required_for_1_share": order_px,
-                    "shortfall": max(0, order_px - tick_budget),
-                    "usable_cash": usable_cash,
-                    "reserve_applied": reserve_krw,
-                }
+                # 최소 1주 보장 옵션 체크
+                min_1_share_allowed = (
+                    SIZING_ALLOW_MIN_1_SHARE
+                    and rank <= SIZING_MIN_1_SHARE_TOPN
+                    and usable_cash >= order_px
+                )
+                
+                if min_1_share_allowed:
+                    # ✅ 최소 1주 보장 (상위 N개 종목에 한해)
+                    qty = 1
+                    sizing_reason = "FORCE_MIN_1_SHARE"
+                    sizing_details = {
+                        "rank": rank,
+                        "topn": SIZING_MIN_1_SHARE_TOPN,
+                        "price": order_px,
+                        "usable_cash": usable_cash,
+                        "tick_budget": tick_budget,
+                        "forced_qty": 1,
+                    }
+                    logger.info(
+                        "[PB1][SIZING][MIN1] code=%s rank=%s/%s price=%.0f usable=%.0f → qty=1 (FORCED)",
+                        self._display_code(cf.code),
+                        rank,
+                        SIZING_MIN_1_SHARE_TOPN,
+                        order_px,
+                        usable_cash,
+                    )
+                else:
+                    # ❌ 예산 부족: 1주도 못 삼
+                    qty = 0
+                    sizing_reason = "BUDGET_INSUFFICIENT_FOR_1_SHARE"
+                    sizing_details = {
+                        "rank": rank,
+                        "buy_budget_after_reserve": tick_budget,
+                        "price": order_px,
+                        "required_for_1_share": order_px,
+                        "shortfall": max(0, order_px - tick_budget),
+                        "usable_cash": usable_cash,
+                        "reserve_applied_at_capital_level": reserve_krw,
+                        "min_1_share_topn": SIZING_MIN_1_SHARE_TOPN,
+                    }
             else:
                 # 2단계: qty>=1인데 최소주문금액 체크
                 planned_notional = float(qty * order_px)
@@ -2674,6 +2714,7 @@ class PB1Engine:
                     qty = 0
                     sizing_reason = "MIN_ORDER_NOTIONAL_FAIL"
                     sizing_details = {
+                        "rank": rank,
                         "qty": qty,
                         "price": order_px,
                         "planned_notional": planned_notional,
@@ -2699,8 +2740,9 @@ class PB1Engine:
                     sizing_reasons.append("planned_qty_zero_or_min_order")
             
             logger.info(
-                "[PB1][SIZING] code=%s cash_usable=%.0f tick_budget=%.0f reserve=%.0f px=%.0f qty=%s min_order_krw=%.0f ok=%s reason=%s detail=%s",
+                "[PB1][SIZING] code=%s rank=%s cash_usable=%.0f tick_budget=%.0f reserve=%.0f px=%.0f qty=%s min_order_krw=%.0f ok=%s reason=%s detail=%s",
                 self._display_code(cf.code),
+                rank,
                 usable_cash,
                 tick_budget,
                 reserve_krw,
