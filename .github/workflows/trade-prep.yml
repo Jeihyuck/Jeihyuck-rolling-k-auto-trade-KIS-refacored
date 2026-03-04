@@ -37,6 +37,10 @@ on:
         description: "1=allow degraded prep (continue on partial data)"
         required: true
         default: "1"
+      ALLOW_KIS_DATA_HTTP_IN_DIAG:
+        description: "1=allow KIS data HTTP in DIAG mode (marketcap, quote, etc.)"
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -81,7 +85,7 @@ jobs:
       STRATEGY_MODE: "DIAG"
       
       # ✅ KIS HTTP settings for DIAG mode
-      ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"  # Allow KIS data endpoints in DIAG (trading endpoints still blocked)
+      ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
       
       # ✅ Force block all trading in prep
       FORCE_BLOCK_LIVE: "1"
