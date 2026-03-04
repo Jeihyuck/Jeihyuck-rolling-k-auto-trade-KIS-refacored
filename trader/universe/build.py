@@ -14,7 +14,7 @@ from typing import Iterable
 from trader.config import (
     PB1_MIN_CANDLES,
 )
-from trader.data.ohlcv_provider import ChainOHLCVProvider, KRXOHLCVProvider
+from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.repos import UniverseRepo
@@ -595,7 +595,17 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     validate_history = os.getenv("UNIVERSE_VALIDATE_OHLCV", "1").lower() in {"1", "true", "yes", "on"}
     min_candles = int(os.getenv("UNIVERSE_MIN_CANDLES", str(max(PB1_MIN_CANDLES, 50))))
-    ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env) if validate_history else None
+    
+    # [FIX] OHLCV provider를 KIS 기반으로 변경 (KIS → KRX fallback)
+    ohlcv_provider = None
+    if validate_history:
+        try:
+            kis_for_ohlcv = kis_provider.kis if kis_provider else KisAPI()
+            ohlcv_provider = ChainOHLCVProvider([KISOHLCVProvider(kis_for_ohlcv), KRXOHLCVProvider()], env=env)
+        except Exception as exc:
+            logger.warning("[UNIVERSE][OHLCV][INIT_FAIL] falling back to KRX-only: %s", exc)
+            ohlcv_provider = ChainOHLCVProvider([KRXOHLCVProvider()], env=env)
+    
     logger.info(
         "[UNIVERSE][SANITIZE][START] members=%s validate_history=%s min_candles=%s",
         len(members),

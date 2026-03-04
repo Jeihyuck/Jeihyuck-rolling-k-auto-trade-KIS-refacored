@@ -121,7 +121,12 @@ class KISMarketcapTopProvider:
 
         tr_id = self._pick_tr_id()
         market_code = self._market_code(market)
-        params = {**self.params, "fid_cond_mrkt_div_code": market_code}
+        # [FIX] FID_INPUT_CNT_1 필수 파라미터 추가 (시가총액 상위 조회 개수)
+        params = {
+            **self.params,
+            "fid_cond_mrkt_div_code": market_code,
+            "fid_input_cnt_1": str(n),
+        }
 
         try:
             headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]

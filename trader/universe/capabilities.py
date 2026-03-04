@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 ALLOWED_PROVIDER_CHAIN = {
-    # KIS provider 우선 사용 (FDR KRX LOGOUT 문제 회피)
-    "practice": ["kis_marketcap_top", "seed_static", "fdr_kospi100_kosdaq100", "fdr_marketcap_top"],
-    "real": ["kis_marketcap_top", "fdr_kospi100_kosdaq100", "fdr_marketcap_top", "seed_static"],
+    # FDR 제거 - KIS와 seed_static만 사용 (FDR KRX scraping 실패 문제 해결)
+    "practice": ["kis_marketcap_top", "seed_static"],
+    "real": ["kis_marketcap_top", "seed_static"],
 }
 
 
