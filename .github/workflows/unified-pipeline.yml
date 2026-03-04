@@ -89,10 +89,6 @@ on:
         description: "1=enable order endpoint testing (with safety guards)"
         required: true
         default: "0"
-      ORDER_TEST_SYMBOLS:
-        description: "Comma-separated whitelist of symbols allowed for order testing (e.g., 005930,035720)"
-        required: false
-        default: ""
       MAX_ORDER_KRW_TEST:
         description: "Maximum order amount in KRW for order testing (default 50000)"
         required: false
@@ -383,10 +379,10 @@ jobs:
       FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
       BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
       ORDER_TEST_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
-      ORDER_TEST_WHITELIST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST_SYMBOLS || '' }}
+      ORDER_TEST_WHITELIST: ""
       ORDER_TEST_MAX_KRW: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_ORDER_KRW_TEST || '50000' }}
       ORDER_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
-      ORDER_TEST_SYMBOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST_SYMBOLS || '' }}
+      ORDER_TEST_SYMBOLS: ""
       MAX_ORDER_KRW_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_ORDER_KRW_TEST || '50000' }}
 
       # ✅ 유니버스 자동 생성 옵션 (수동 실행 시에만 활성화, 스케줄은 0)
