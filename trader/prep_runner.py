@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -776,6 +777,22 @@ def main() -> int:
             len(final30_codes),
             final30_path,
         )
+
+        signal_dir = Path("signals")
+        signal_dir.mkdir(parents=True, exist_ok=True)
+        signal_path = signal_dir / "final30.json"
+        signal_payload = {
+            "as_of": as_of.isoformat(),
+            "env": env,
+            "count": len(watchlist),
+            "items": watchlist,
+            "meta": {
+                "strategy": watchlist_final_strategy,
+                "bundle_source": watchlist_bundle.get("degrade", {}).get("reason", "fresh_build"),
+            },
+        }
+        signal_path.write_text(json.dumps(signal_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[PREP][SIGNALS][FINAL30_JSON] path=%s count=%s", signal_path, len(watchlist))
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id

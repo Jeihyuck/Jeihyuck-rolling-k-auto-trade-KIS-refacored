@@ -21,8 +21,6 @@ from trader.db.repos import UniverseRepo
 from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
-from trader.universe.providers.fdr_kospi_kosdaq_100 import fetch_kospi100_kosdaq100
-from trader.universe.providers.fdr_marketcap_top import fetch_marketcap_top
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
@@ -49,11 +47,11 @@ def _parse_as_of_date(val: str) -> date | None:
 
 
 def _prefer_provider_order(chain: list[str]) -> list[str]:
-    """Prefer live providers first, then static, then caches."""
+    """Prefer live providers first, then static, then emergency seed."""
     preferred = [
-        "fdr_kospi100_kosdaq100",
-        "fdr_marketcap_top",
+        "kis_marketcap_top",
         "seed_static",
+        "emergency_seed",
     ]
     ordered = [name for name in preferred if name in chain]
     tail = [name for name in chain if name not in ordered]
@@ -72,8 +70,8 @@ def _resolve_seed_dir() -> Path:
 SEED_DIR = _resolve_seed_dir()
 SEED_PATH_KOSPI = SEED_DIR / "kospi_mcap_100.csv"
 SEED_PATH_KOSDAQ = SEED_DIR / "kosdaq_mcap_100.csv"
-TARGETS = {"KOSPI": 100, "KOSDAQ": 100}
-DEFAULT_PROVIDER = "fdr_kospi100_kosdaq100"
+TARGETS = {"KOSPI": 150, "KOSDAQ": 150}
+DEFAULT_PROVIDER = "kis_marketcap_top"
 TICKER_PATTERN = re.compile(r"^\d{6}$")
 
 
@@ -391,6 +389,53 @@ def _load_static_seed() -> dict | None:
     }
 
 
+def _load_emergency_seed() -> dict | None:
+    emergency_path = Path("data") / "universe_seed.csv"
+    rows = _load_seed_rows(emergency_path)
+    if not rows:
+        return None
+
+    selected_codes = [str(row.get("code") or "").zfill(6) for row in rows if row.get("code")]
+    selected_codes = _dedup([code for code in selected_codes if code])
+    target_total = TARGETS["KOSPI"] + TARGETS["KOSDAQ"]
+    selected_codes = selected_codes[:target_total]
+
+    members: list[dict] = []
+    selected_by_market: dict[str, list[dict]] = {"KOSPI": [], "KOSDAQ": []}
+    split = TARGETS["KOSPI"]
+    for idx, code in enumerate(selected_codes, start=1):
+        market = "KOSPI" if idx <= split else "KOSDAQ"
+        rank = len(selected_by_market[market]) + 1
+        member = {
+            "code": code,
+            "market": market,
+            "weight": None,
+            "rank": rank,
+            "meta_json": {"name": None, "source": "emergency_seed"},
+        }
+        members.append(member)
+        selected_by_market[market].append({"code": code, "rank": rank, "name": None})
+
+    if not members:
+        return None
+
+    payload = _normalize_payload(
+        {
+            "selected": [m["code"] for m in members],
+            "selected_by_market": selected_by_market,
+        }
+    )
+    return {
+        "payload": payload,
+        "members": members,
+        "source": "fallback:emergency_seed",
+        "params": {
+            "path": str(emergency_path),
+            "target_total": target_total,
+        },
+    }
+
+
 def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
     try:
         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
@@ -432,71 +477,13 @@ def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple
 
 
 def _build_from_fdr(as_of_date: str, targets: dict[str, int]) -> tuple[dict | None, str]:
-    try:
-        rows_by_market = fetch_marketcap_top(targets)
-    except Exception as exc:  # pragma: no cover - network/remote failure
-        logger.warning("[UNIVERSE][FDR][FAIL] as_of=%s err=%s", as_of_date, exc)
-        return None, "fdr_fetch_fail"
-
-    if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
-        return None, "fdr_rows_missing"
-
-    kospi_rows = rows_by_market["KOSPI"][: targets.get("KOSPI", 0)]
-    kosdaq_rows = rows_by_market["KOSDAQ"][: targets.get("KOSDAQ", 0)]
-    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
-    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
-
-    selected_by_market = {
-        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-    }
-    payload = _normalize_payload(
-        {
-            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-            "selected_by_market": selected_by_market,
-        }
-    )
-    params = {"as_of": as_of_date, "targets": targets}
-    members = _build_members_from_payload(selected_by_market)
-    return {"payload": payload, "members": members, "source": "fdr_marketcap_top", "params": params}, "fdr_marketcap_top"
+    _ = as_of_date, targets
+    return None, "fdr_disabled"
 
 
 def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict | None, str]:
-    try:
-        rows_by_market = fetch_kospi100_kosdaq100(target=target)
-    except Exception as exc:  # pragma: no cover - network/remote failure
-        logger.warning("[UNIVERSE][FDR-KOSPI100][FAIL] as_of=%s err=%s", as_of_date, exc)
-        return None, "fdr_kospi100_fetch_fail"
-
-    if not rows_by_market.get("KOSPI") or not rows_by_market.get("KOSDAQ"):
-        return None, "fdr_kospi100_rows_missing"
-
-    kospi_rows = rows_by_market["KOSPI"][:target]
-    kosdaq_rows = rows_by_market["KOSDAQ"][:target]
-    _write_seed_rows(SEED_PATH_KOSPI, kospi_rows)
-    _write_seed_rows(SEED_PATH_KOSDAQ, kosdaq_rows)
-
-    selected_by_market = {
-        "KOSPI": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kospi_rows)],
-        "KOSDAQ": [{"code": row["code"], "rank": idx + 1, "name": row.get("name")} for idx, row in enumerate(kosdaq_rows)],
-    }
-    payload = _normalize_payload(
-        {
-            "selected": [row["code"] for row in kospi_rows + kosdaq_rows],
-            "selected_by_market": selected_by_market,
-        }
-    )
-    params = {"as_of": as_of_date, "target": target}
-    members = _build_members_from_payload(selected_by_market)
-    return (
-        {
-            "payload": payload,
-            "members": members,
-            "source": "fdr_kospi100_kosdaq100",
-            "params": params,
-        },
-        "fdr_kospi100_kosdaq100",
-    )
+    _ = as_of_date, target
+    return None, "fdr_disabled"
 
 
 def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> list[dict]:
@@ -565,11 +552,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             provider_name,
         )
 
-        if provider_name == "fdr_kospi100_kosdaq100":
-            result, reason = _build_from_fdr_kospi100(as_of_date, target=TARGETS["KOSPI"])
-        elif provider_name == "fdr_marketcap_top":
-            result, reason = _build_from_fdr(as_of_date, TARGETS)
-        elif provider_name == "kis_marketcap_top":
+        if provider_name == "kis_marketcap_top":
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
             else:
@@ -577,6 +560,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         elif provider_name == "seed_static":
             result = _load_static_seed()
             reason = "seed_static" if result else "seed_missing"
+        elif provider_name == "emergency_seed":
+            result = _load_emergency_seed()
+            reason = "emergency_seed" if result else "emergency_seed_missing"
         else:
             logger.warning("[UNIVERSE][PROVIDER][UNKNOWN] env=%s provider=%s", env, provider_name)
             continue

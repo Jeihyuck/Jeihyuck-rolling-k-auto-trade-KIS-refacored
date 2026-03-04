@@ -15,6 +15,13 @@ from sqlalchemy import Engine
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.db.repos import DerivedFlowRepo, DerivedMinerviniRepo, WatchlistRepo
 from trader.flow_score import calculate_final_score, calculate_flow_score
+from trader.factors.multifactor import (
+    compute_ai_rs_scores,
+    compute_liquidity_score,
+    compute_rs_features,
+    compute_volatility_score,
+    optimize_meta_k,
+)
 from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
@@ -462,7 +469,7 @@ class WatchlistBuilder:
         pooln: int = 120,
         topk: int = 50,
         finaln: int = 30,
-        min_price: float = 2000.0,
+        min_price: float = 3000.0,
         liq_days: int = 20,
         min_rows: int = 30,
         flow_provider: Optional[FlowProvider] = None,
@@ -484,6 +491,16 @@ class WatchlistBuilder:
         self.tech_weight = tech_weight
         self.flow_weight = flow_weight
         self.trend_weight = trend_weight
+        self.min_avg_value20 = _env_float("LIQ_MIN_AVG_VALUE20", 300_000_000.0)
+        self.min_turnover_pct = _env_float("LIQ_MIN_TURNOVER_PCT", 0.3)
+        self.final_weights = {
+            "ai_rs": _env_float("FINAL30_W_AI_RS", 0.30),
+            "trend": _env_float("FINAL30_W_TREND", 0.20),
+            "pullback": _env_float("FINAL30_W_PULLBACK", 0.15),
+            "liquidity": _env_float("FINAL30_W_LIQUIDITY", 0.15),
+            "flow": _env_float("FINAL30_W_FLOW", 0.10),
+            "volatility": _env_float("FINAL30_W_VOLATILITY", 0.10),
+        }
         self.last_bundle: Dict[str, Any] = {}
 
     def build(self, *, members: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
@@ -555,20 +572,29 @@ class WatchlistBuilder:
         self.last_bundle = {
             "as_of": as_of,
             "weights": {
-                "tech_weight": self.tech_weight,
-                "flow_weight": self.flow_weight,
-                "trend_weight": self.trend_weight,
+                "ai_rs": self.final_weights["ai_rs"],
+                "trend": self.final_weights["trend"],
+                "pullback": self.final_weights["pullback"],
+                "liquidity": self.final_weights["liquidity"],
+                "flow": self.final_weights["flow"],
+                "volatility": self.final_weights["volatility"],
             },
             "weights_effective": {
-                "tech_weight": self.tech_weight,
-                "flow_weight": self.flow_weight,
-                "trend_weight": self.trend_weight,
+                "ai_rs": self.final_weights["ai_rs"],
+                "trend": self.final_weights["trend"],
+                "pullback": self.final_weights["pullback"],
+                "liquidity": self.final_weights["liquidity"],
+                "flow": self.final_weights["flow"],
+                "volatility": self.final_weights["volatility"],
             },
             "formula": (
                 "score_final = "
-                f"{self.tech_weight:.4f}*score_tech + "
-                f"{self.flow_weight:.4f}*score_flow + "
-                f"{self.trend_weight:.4f}*score_trend"
+                f"{self.final_weights['ai_rs']:.4f}*ai_rs + "
+                f"{self.final_weights['trend']:.4f}*trend + "
+                f"{self.final_weights['pullback']:.4f}*pullback + "
+                f"{self.final_weights['liquidity']:.4f}*liquidity + "
+                f"{self.final_weights['flow']:.4f}*flow + "
+                f"{self.final_weights['volatility']:.4f}*volatility"
             ),
             "universe_scored": universe_scored,
             "pool120": pool120,
@@ -675,6 +701,12 @@ class WatchlistBuilder:
             "foreign_20_ratio": 0.0,
             "inst_20_ratio": 0.0,
             "flow_score": 0.0,
+            "ai_rs_score": 0.0,
+            "meta_k": 0.5,
+            "breakout_target": 0.0,
+            "breakout_score": 0.0,
+            "liquidity_score": 0.0,
+            "volatility_score": 0.0,
             "tech_score": 0.0,
             "final_score": 0.0,
             "reject_reasons": [],
@@ -920,8 +952,24 @@ class WatchlistBuilder:
                 universe_items.append(item)
                 continue
 
+            market_cap = _safe_float((m.get("meta_json") or {}).get("market_cap"), 0.0)
+            turnover_pct = 0.0
+            if market_cap > 0:
+                turnover_pct = float(liq_avg) / market_cap * 100.0
+
+            if float(liq_avg) <= float(self.min_avg_value20):
+                item["reject_reasons"].append("avg_volume20_below_min")
+                universe_items.append(item)
+                continue
+            if turnover_pct <= float(self.min_turnover_pct):
+                item["reject_reasons"].append("turnover_below_min")
+                universe_items.append(item)
+                continue
+
             item["liq_avg"] = float(liq_avg)
             item["last_close"] = float(last_close)
+            item["turnover_pct"] = float(turnover_pct)
+            item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
             item["meta"] = {"as_of": as_of.isoformat()}
             candidates.append(item)
             universe_items.append(item)
@@ -939,6 +987,17 @@ class WatchlistBuilder:
 
         normalized_pool = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in pool120]
         normalized_universe = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in universe_items]
+
+        if len(normalized_pool) < 40:
+            fallback = [
+                row for row in normalized_universe
+                if row.get("code") and "price_below_min" not in list(row.get("reject_reasons", []) or [])
+            ]
+            normalized_pool = fallback[:40]
+            for idx, item in enumerate(normalized_pool, start=1):
+                item["pool_rank"] = idx
+                item["rank"] = idx
+            logger.warning("[WATCHLIST][PIPELINE][A_POOL120][FALLBACK] pool<40 -> fallback=%s", len(normalized_pool))
 
         logger.info(
             "[WATCHLIST][PIPELINE][A_POOL120] kept=%s universe=%s excluded_rows=%s excluded_price=%s excluded_nan=%s",
@@ -968,9 +1027,11 @@ class WatchlistBuilder:
         rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
         if rs_min_pctile <= 1.0:
             rs_min_pctile = rs_min_pctile * 100.0
+        rs_min_pctile = max(70.0, rs_min_pctile)
         vcp_min_score = float(self.minervini_config.get("vcp_min_score", 70.0) or 70.0)
 
         scored: List[Dict[str, Any]] = []
+        ai_feature_rows: List[Dict[str, Any]] = []
         total = len(pool120)
         progress_every = max(1, total // 10)
         ts0 = time.monotonic()
@@ -1001,20 +1062,39 @@ class WatchlistBuilder:
                 continue
 
             rs_pctile = self._compute_rs_percentile(df["close"], bench_close)
+            rs_features = compute_rs_features(df["close"], bench_close)
             vcp_score = self._compute_vcp_score(df)
             pullback_pct = self._compute_pullback_pct(df)
             trend_score = self._compute_trend_score(df)
             atr_pct = self._compute_atr_pct(df)
+            volatility_score = compute_volatility_score(atr_pct)
+            k_opt, breakout_target, breakout_score = optimize_meta_k(df, lookback=20)
+
+            vol20 = float(df["volume"].tail(20).mean() or 0.0)
+            vol60 = float(df["volume"].tail(60).mean() or 0.0)
+            volume_trend = (vol20 / vol60 - 1.0) if vol60 > 0 else 0.0
+            momentum = float(df["close"].iloc[-1] / df["close"].iloc[-21] - 1.0) if len(df) >= 21 else 0.0
+            volatility = float(df["close"].pct_change().tail(60).std() or 0.0)
 
             pullback_score = max(0.0, min(100.0, 100.0 - (pullback_pct * 400.0)))
             atr_score = max(0.0, min(100.0, 100.0 - abs(atr_pct - 0.04) * 1000.0))
             tech_score = (
-                rs_pctile * 0.40
-                + vcp_score * 0.25
+                rs_pctile * 0.35
+                + vcp_score * 0.20
                 + trend_score * 0.20
                 + pullback_score * 0.10
                 + atr_score * 0.05
+                + breakout_score * 0.10
             )
+
+            lookback_52w = min(252, len(df))
+            high_52w = float(df["high"].tail(lookback_52w).max() or 0.0)
+            low_52w = float(df["low"].tail(lookback_52w).min() or 0.0)
+            last_close = float(df["close"].iloc[-1] or 0.0)
+            if high_52w > 0 and last_close < high_52w * 0.75:
+                reject_reasons.append("below_75pct_52w_high")
+            if low_52w > 0 and last_close < low_52w * 1.3:
+                reject_reasons.append("below_130pct_52w_low")
 
             if rs_pctile < rs_min_pctile:
                 reject_reasons.append("rs_below_min")
@@ -1026,15 +1106,46 @@ class WatchlistBuilder:
             item.update(
                 {
                     "rs_pctile": float(rs_pctile),
+                    "rs63": float(rs_features.get("rs63", 0.0)),
+                    "rs126": float(rs_features.get("rs126", 0.0)),
+                    "rs252": float(rs_features.get("rs252", 0.0)),
+                    "rs_score": float(rs_features.get("rs_score", 0.0)),
                     "vcp_score": float(vcp_score),
                     "pullback_pct": float(pullback_pct),
                     "trend_score": float(trend_score),
                     "atr_pct": float(atr_pct),
+                    "volatility_score": float(volatility_score),
+                    "meta_k": float(k_opt),
+                    "breakout_target": float(breakout_target),
+                    "breakout_score": float(breakout_score),
                     "tech_score": float(tech_score),
                     "reject_reasons": reject_reasons,
                 }
             )
             scored.append(item)
+            ai_feature_rows.append(
+                {
+                    "code": code,
+                    "rs63": float(rs_features.get("rs63", 0.0)),
+                    "rs126": float(rs_features.get("rs126", 0.0)),
+                    "rs252": float(rs_features.get("rs252", 0.0)),
+                    "rs_score": float(rs_features.get("rs_score", 0.0)),
+                    "volume_trend": float(volume_trend),
+                    "volatility": float(volatility),
+                    "momentum": float(momentum),
+                }
+            )
+
+        ai_rs_map = compute_ai_rs_scores(ai_feature_rows)
+        for item in scored:
+            item["ai_rs_score"] = float(ai_rs_map.get(str(item.get("code") or "").zfill(6), item.get("rs_pctile", 0.0)))
+            item["tech_score"] = (
+                float(item.get("ai_rs_score", 0.0)) * 0.45
+                + float(item.get("trend_score", 0.0)) * 0.20
+                + max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0)) * 400.0)) * 0.15
+                + float(item.get("vcp_score", 0.0)) * 0.10
+                + float(item.get("volatility_score", 0.0)) * 0.10
+            )
 
         scored.sort(key=lambda x: x.get("tech_score", 0.0), reverse=True)
         top50 = scored[: self.topk]
@@ -1046,6 +1157,14 @@ class WatchlistBuilder:
             item.setdefault("reject_reasons", []).append("not_in_top50")
 
         normalized = [self._normalize_item(item, score_key="tech_score", rank_key="top50_rank") for item in top50]
+
+        if len(normalized) < 30:
+            fallback = [self._normalize_item(item, score_key="tech_score", rank_key="top50_rank") for item in pool120[:30]]
+            for idx, item in enumerate(fallback, start=1):
+                item["top50_rank"] = idx
+                item["rank"] = idx
+            normalized = fallback
+            logger.warning("[WATCHLIST][PIPELINE][B_TOP50][FALLBACK] top50<30 -> fallback=%s", len(normalized))
 
         logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(normalized), len(pool120))
         return normalized
@@ -1114,13 +1233,25 @@ class WatchlistBuilder:
                 tech_weight_effective = 1.0
                 trend_weight_effective = 0.0
 
-            final_score = calculate_final_score(
-                tech_score=tech_score,
-                flow_score=flow_score_100,
-                tech_weight=tech_weight_effective,
-                flow_weight=flow_weight_effective,
+            flow_factor_score = max(0.0, min(100.0, flow_score_100))
+            item["foreign_net_buy_5d"] = foreign_ratio
+            item["institution_net_buy_5d"] = inst_ratio
+            item["flow_factor_score"] = flow_factor_score
+
+            ai_rs_score = float(item.get("ai_rs_score", item.get("rs_pctile", 0.0)) or 0.0)
+            trend_score = float(item.get("trend_score", 0.0) or 0.0)
+            pullback_score = max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0) or 0.0) * 400.0))
+            liquidity_score = float(item.get("liquidity_score", 0.0) or 0.0)
+            volatility_score = float(item.get("volatility_score", compute_volatility_score(float(item.get("atr_pct", 0.0) or 0.0))) or 0.0)
+
+            final_score = (
+                ai_rs_score * self.final_weights["ai_rs"]
+                + trend_score * self.final_weights["trend"]
+                + pullback_score * self.final_weights["pullback"]
+                + liquidity_score * self.final_weights["liquidity"]
+                + flow_factor_score * self.final_weights["flow"]
+                + volatility_score * self.final_weights["volatility"]
             )
-            final_score = float(final_score + (float(item.get("trend_score", 0.0) or 0.0) * float(trend_weight_effective)))
 
             item["flow_missing"] = bool(flow_missing)
             item["flow_missing_reason"] = flow_missing_reason
@@ -1143,6 +1274,8 @@ class WatchlistBuilder:
                     "foreign_20_ratio": foreign_ratio,
                     "inst_20_ratio": inst_ratio,
                     "final_score": float(final_score),
+                    "volatility_score": float(volatility_score),
+                    "liquidity_score": float(liquidity_score),
                     "reject_reasons": reject_reasons,
                     "flow_weight_effective": float(flow_weight_effective),
                     "tech_weight_effective": float(tech_weight_effective),
@@ -1508,7 +1641,7 @@ def rebuild_bundle(
         pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
         topk=_env_int("PB1_WATCHLIST_TOPK", 50),
         finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
-        min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
+        min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 3000.0),
         liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
         min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
         flow_provider=flow_provider,
@@ -1658,16 +1791,22 @@ def build_and_save_watchlist(
                     return existing, {
                         "as_of": as_of,
                         "weights": {
-                            "tech_weight": 0.7,
-                            "flow_weight": 0.3,
-                            "trend_weight": 0.0,
+                            "ai_rs": 0.30,
+                            "trend": 0.20,
+                            "pullback": 0.15,
+                            "liquidity": 0.15,
+                            "flow": 0.10,
+                            "volatility": 0.10,
                         },
                         "weights_effective": {
-                            "tech_weight": 0.7,
-                            "flow_weight": 0.3,
-                            "trend_weight": 0.0,
+                            "ai_rs": 0.30,
+                            "trend": 0.20,
+                            "pullback": 0.15,
+                            "liquidity": 0.15,
+                            "flow": 0.10,
+                            "volatility": 0.10,
                         },
-                        "formula": "score_final = 0.7000*score_tech + 0.3000*score_flow + 0.0000*score_trend",
+                        "formula": "score_final = 0.3000*ai_rs + 0.2000*trend + 0.1500*pullback + 0.1500*liquidity + 0.1000*flow + 0.1000*volatility",
                         "universe_scored": universe_scored,
                         "pool120": pool120,
                         "top50": top50,
@@ -1689,7 +1828,7 @@ def build_and_save_watchlist(
         pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
         topk=_env_int("PB1_WATCHLIST_TOPK", 50),
         finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
-        min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
+        min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 3000.0),
         liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
         min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
         flow_provider=flow_provider,
@@ -1865,7 +2004,7 @@ def load_today_watchlist_with_fallback(
             pooln=_env_int("PB1_WATCHLIST_TOPK", 50),
             topk=_env_int("PB1_WATCHLIST_TOPK", 50),
             finaln=_env_int("PB1_WATCHLIST_TOPK", 50),
-            min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 2000.0),
+            min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 3000.0),
             liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
             min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
         )
