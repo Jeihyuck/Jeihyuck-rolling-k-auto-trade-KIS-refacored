@@ -76,6 +76,26 @@ def kis_http_enabled() -> bool:
     return True
 
 
+def is_trading_endpoint(url: str) -> bool:
+    """
+    주문/거래 엔드포인트 여부 판별.
+    True면 주문 엔드포인트(차단 대상), False면 데이터 엔드포인트(허용 가능).
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    # 주문 관련 엔드포인트만 True
+    return "/trading/order-cash" in path or "/trading/order-" in path
+
+
+def kis_data_http_allowed_in_diag() -> bool:
+    """
+    DIAG 모드에서 KIS 데이터 HTTP 허용 여부.
+    ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 데이터 조회 허용.
+    """
+    return os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip() == "1"
+
+
 # ✅ Export public exceptions
 __all__ = [
     "KisAPI",
@@ -724,16 +744,19 @@ class KisAPI:
     def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
-        - KIS_HTTP_ENABLED 체크 (DIAG 모드에서 차단)
-        - DIAG 모드에서 KIS API 하드 블록 (환경변수 제어)
+        - DIAG 모드: 주문 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
+        - MINERVINI_ONLY: FORCE_HTTP=1이 아니면 전체 차단
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
         """
-        # ✅ KIS_HTTP_ENABLED 차단
-        if not kis_http_enabled():
-            logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=%s", os.getenv("STRATEGY_MODE"), url)
+        strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+        force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
+        
+        # ✅ MINERVINI_ONLY: FORCE_HTTP 없으면 전체 차단
+        from trader.config import MINERVINI_ONLY
+        if MINERVINI_ONLY and not force_http:
+            logger.warning("[KIS][HTTP_DISABLED] MINERVINI_ONLY mode, endpoint=%s", url)
             
-            # Stub response 반환
             class _DiagDummyResponse:
                 status_code = 200
                 text = ""
@@ -744,13 +767,27 @@ class KisAPI:
 
             return _DiagDummyResponse()
         
-        # ✅ DIAG 모드 KIS API 차단 (KIS_HTTP_ENABLED=1이면 읽기 허용)
-        strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+        # ✅ DIAG 모드 세분화: 주문은 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
         kis_http_env = str(os.getenv("KIS_HTTP_ENABLED", "0")).strip()
-        force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
-
+        
         if strategy_mode == "DIAG" and kis_http_env != "1" and not force_http:
-            raise KISBlockedError(f"KIS API blocked in DIAG mode (KIS_HTTP_ENABLED=0): {method} {url}")
+            # 주문 엔드포인트는 무조건 차단
+            if is_trading_endpoint(url):
+                raise KISBlockedError(f"KIS API trading endpoint blocked in DIAG mode: {method} {url}")
+            
+            # 데이터 엔드포인트는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
+            if not kis_data_http_allowed_in_diag():
+                logger.warning("[KIS][DATA_HTTP_DISABLED] mode=DIAG endpoint=%s -> set ALLOW_KIS_DATA_HTTP_IN_DIAG=1 to enable", url)
+                
+                class _DiagDummyResponse:
+                    status_code = 200
+                    text = ""
+
+                    @staticmethod
+                    def json() -> dict:
+                        return {"_kis_disabled": True, "rt_cd": "0", "msg1": "KIS_HTTP_DISABLED"}
+
+                return _DiagDummyResponse()
         
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
             logger.warning("[NET][DIAG] KIS calls disabled; skipping request method=%s url=%s", method, url)
@@ -959,12 +996,18 @@ class KisAPI:
             return token
 
     def _issue_token_and_expire(self):
-        # ✅ DIAG 모드에서 KIS HTTP 차단 시 더미 토큰 반환
+        # ✅ DIAG 모드 세분화: ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 실제 토큰 발급 시도
+        strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         if not kis_http_enabled():
-            logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=token -> returning dummy token", os.getenv("STRATEGY_MODE"))
-            from datetime import timedelta, timezone
-            exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
-            return "DIAG_DUMMY_TOKEN", 21600  # (token, expires_in)
+            # DIAG이고 데이터 허용이면 실제 토큰 발급 시도 (아래 로직으로 진행)
+            if strategy_mode == "DIAG" and kis_data_http_allowed_in_diag():
+                logger.info("[KIS][TOKEN] mode=DIAG ALLOW_KIS_DATA_HTTP_IN_DIAG=1 -> issuing real token")
+            else:
+                # 완전 차단 모드: 더미 토큰 반환
+                logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=token -> returning dummy token", os.getenv("STRATEGY_MODE"))
+                from datetime import timedelta, timezone
+                exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+                return "DIAG_DUMMY_TOKEN", 21600  # (token, expires_in)
         
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
