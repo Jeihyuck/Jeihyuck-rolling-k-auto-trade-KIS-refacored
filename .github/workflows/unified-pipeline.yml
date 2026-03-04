@@ -349,6 +349,9 @@ jobs:
       DRYRUN: ${{ needs.resolve.outputs.dryrun }}
       ANALYSIS_ONLY: ${{ needs.resolve.outputs.analysis_only }}
       
+      # ✅ KIS HTTP settings for DIAG mode
+      ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"
+      
       # Optional: 개장 직후 버퍼 (초)
       OPEN_BUFFER_SEC: "5"
 

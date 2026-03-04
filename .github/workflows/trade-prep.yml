@@ -80,6 +80,9 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.STRATEGY_ENV || 'practice' }}
       STRATEGY_MODE: "DIAG"
       
+      # ✅ KIS HTTP settings for DIAG mode
+      ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"  # Allow KIS data endpoints in DIAG (trading endpoints still blocked)
+      
       # ✅ Force block all trading in prep
       FORCE_BLOCK_LIVE: "1"
       DISABLE_LIVE_TRADING: "1"
