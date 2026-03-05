@@ -52,7 +52,8 @@ def _resolve_flow_as_of(*, requested_as_of: date, now_ts: datetime | None = None
 
 
 def _make_flow_provider(engine):
-    providers = ["pykrx", "kis"]
+    # ✅ FIX: KIS 우선으로 변경 (pykrx JSONDecodeError 방지)
+    providers = ["kis", "pykrx"]
     flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame | None, pd.DataFrame | None, str | None]] = {}
     kis_api = None
     kis_init_failed = False
@@ -153,7 +154,7 @@ def _make_flow_provider(engine):
         "kis": _provider_kis,
     }
 
-    logger.info("[FLOW][SOURCE] providers=%s", providers)
+    logger.info("[FLOW][SOURCE] providers=%s priority=KIS→pykrx(fallback)", providers)
 
     def _provider(code: str, as_of: date, window: int):
         flow_as_of = _resolve_flow_as_of(requested_as_of=as_of)

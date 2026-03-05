@@ -276,7 +276,8 @@ def _run_build_watchlist_job() -> int:
         kis = KisAPI()
         krx_provider = KRXOHLCVProvider()
         kis_provider = KISOHLCVProvider(kis)
-        ohlcv_provider = ChainOHLCVProvider([krx_provider, kis_provider])
+        # ✅ FIX: KIS 우선으로 변경 (pykrx JSONDecodeError 방지)
+        ohlcv_provider = ChainOHLCVProvider([kis_provider, krx_provider])
         
         def _fetch_daily(code: str, count: int = 100):
             """pb1_engine._fetch_daily 호환 래퍼"""
