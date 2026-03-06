@@ -1,13 +1,16 @@
 """PB1 Watchlist Builder - 120 -> 50 -> 30 unified pipeline."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import Engine
@@ -1864,6 +1867,27 @@ def build_and_save_watchlist(
         as_of=as_of,
         members=watchlist,
     )
+    
+    # Save final30 snapshot to JSON (for fallback)
+    try:
+        snapshot_dir = Path(os.getenv("GITHUB_WORKSPACE", "."))
+        snapshot_dir = snapshot_dir / "repo" / "runtime" / "snapshots" if (snapshot_dir / "repo").exists() else snapshot_dir / "runtime" / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        
+        final30_snapshot = {
+            "as_of": as_of.isoformat(),
+            "env": env,
+            "strategy": strategy,
+            "watchlist": watchlist,
+            "count": len(watchlist),
+            "saved_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        }
+        
+        snapshot_path = snapshot_dir / "final30.json"
+        snapshot_path.write_text(json.dumps(final30_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[WATCHLIST][SNAPSHOT][SAVE] path=%s count=%s", snapshot_path, len(watchlist))
+    except Exception as exc:
+        logger.warning("[WATCHLIST][SNAPSHOT][SAVE_FAIL] err=%s -> continuing", exc)
     
     # CRITICAL: Always save bundle (4 stages) to prevent data loss
     # This ensures intermediate stages are never missing from DB

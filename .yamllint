@@ -1,0 +1,16 @@
+---
+extends: default
+rules:
+  line-length: disable
+  indentation:
+    spaces: 2
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  key-duplicates: enable
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 0

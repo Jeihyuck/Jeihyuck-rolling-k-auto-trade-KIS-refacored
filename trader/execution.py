@@ -37,6 +37,8 @@ from .signals import (
 )
 from .metrics import vwap_guard
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "fetch_rebalancing_targets",
     "_init_position_state",
@@ -54,7 +56,52 @@ __all__ = [
     "record_entry_state",
     "update_position_meta",
     "update_position_flags",
+    "validate_order_params",
 ]
+
+
+def validate_order_params(
+    *,
+    quantity: int | float,
+    price: float,
+    symbol: str = "",
+) -> tuple[bool, str]:
+    """
+    Validate order parameters before submission.
+    
+    Args:
+        quantity: Order quantity (shares)
+        price: Order price (KRW)
+        symbol: Stock symbol for logging
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    # Validate quantity
+    if quantity is None or quantity <= 0:
+        msg = f"[ORDER_VALIDATION] Invalid quantity: {quantity}"
+        logger.error(msg)
+        return False, msg
+    
+    # Validate price
+    if price is None or price <= 0:
+        msg = f"[ORDER_VALIDATION] Invalid price: {price}"
+        logger.error(msg)
+        return False, msg
+    
+    # Warn on extreme quantities
+    if quantity > 100000:
+        logger.warning("[ORDER_VALIDATION] Unusually large quantity: %s for %s", quantity, symbol)
+    
+    # Warn on extreme prices
+    if price > 1000000:
+        logger.warning("[ORDER_VALIDATION] Unusually high price: %s for %s", price, symbol)
+    
+    logger.debug("[ORDER_VALIDATION] OK symbol=%s qty=%s price=%s", symbol, quantity, price)
+    return True, ""
+
+
+
 
 
 def _format_order_response_reason(resp: Dict[str, Any] | None) -> str:

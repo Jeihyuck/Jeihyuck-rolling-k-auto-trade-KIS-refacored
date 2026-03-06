@@ -675,6 +675,30 @@ jobs:
           ls -al repo || true
           find . -maxdepth 3 -type d -name runtime || true
 
+      - name: Ensure PREP ready (fallback for trade)
+        if: ${{ needs.resolve.outputs.run_mode == 'trade' }}
+        shell: bash
+        working-directory: repo
+        env:
+          PYTHONPATH: ${{ github.workspace }}/repo
+        run: |
+          set -euo pipefail
+          echo "======================================"
+          echo "[PREP][FALLBACK] Ensure PREP ready before trade"
+          echo "======================================"
+          
+          # Check if final30 exists
+          if [ -f runtime/snapshots/final30.json ] && [ -s runtime/snapshots/final30.json ]; then
+            echo "[PREP][FALLBACK] Found final30.json - PREP OK"
+          else
+            echo "[PREP][FALLBACK] PREP outputs missing - attempting rebuild"
+            python -m trader.prep_runner || echo "[PREP][FALLBACK] prep_runner failed - will use snapshot fallback"
+          fi
+          
+          echo "======================================"
+          echo "[PREP][FALLBACK] Completed"
+          echo "======================================"
+
       - name: Run (mode switch)
         if: ${{ needs.resolve.outputs.run_mode != 'minervini_test' }}
         run: |

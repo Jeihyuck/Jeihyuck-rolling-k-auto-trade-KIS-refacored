@@ -95,6 +95,72 @@ logger = logging.getLogger(__name__)
 log = logger
 
 
+def check_prep_done() -> bool:
+    """
+    Check if PREP has completed and final30 watchlist is available.
+    
+    Returns:
+        bool: True if PREP is ready, False otherwise
+    """
+    try:
+        runtime_base = Path(os.getenv("GITHUB_WORKSPACE", "."))
+        runtime_dir = runtime_base / "repo" / "runtime" if (runtime_base / "repo").exists() else runtime_base / "runtime"
+        
+        # Check for final30 snapshot/watchlist
+        final30_candidates = [
+            runtime_dir / "snapshots" / "final30.json",
+            runtime_dir / "watchlist" / f"final30_{(now_kst().date()).isoformat()}.json",
+        ]
+        
+        for candidate_path in final30_candidates:
+            if candidate_path.exists() and candidate_path.stat().st_size > 100:
+                logger.info("[PREP_CHECK] Found final30 at %s", candidate_path)
+                return True
+        
+        logger.warning("[PREP_CHECK] PREP outputs not found")
+        return False
+    except Exception as e:
+        logger.error("[PREP_CHECK] Error checking PREP status: %s", e)
+        return False
+
+
+def load_snapshot_fallback(snapshot_name: str = "final30") -> list | None:
+    """
+    Load snapshot from JSON file as fallback when PREP missing.
+    
+    Args:
+        snapshot_name: snapshot file name (e.g., "final30")
+    
+    Returns:
+        List of watchlist items or None on failure
+    """
+    try:
+        runtime_base = Path(os.getenv("GITHUB_WORKSPACE", "."))
+        runtime_dir = runtime_base / "repo" / "runtime" if (runtime_base / "repo").exists() else runtime_base / "runtime"
+        
+        snapshot_path = runtime_dir / "snapshots" / f"{snapshot_name}.json"
+        
+        if not snapshot_path.exists():
+            logger.warning("[SNAPSHOT_FALLBACK] File not found: %s", snapshot_path)
+            return None
+        
+        with snapshot_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        watchlist = data.get("watchlist", [])
+        
+        if not watchlist:
+            logger.warning("[SNAPSHOT_FALLBACK] Empty watchlist in snapshot")
+            return None
+        
+        logger.info("[SNAPSHOT_FALLBACK] Loaded %s items from %s", len(watchlist), snapshot_path)
+        return watchlist
+        
+    except Exception as e:
+        logger.error("[SNAPSHOT_FALLBACK] Error loading snapshot: %s", e)
+        return None
+
+
 def resolve_env(cli_env: str | None) -> str:
     if cli_env:
         return str(cli_env).strip().lower()
