@@ -78,6 +78,7 @@ from trader.diagnostics.nontrading_smoke import (
 )
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
+from trader.entry_engine import scan_all_strategies, calculate_position_size
 from trader.reconcile_kis import reconcile_kis, reconcile_today
 from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
@@ -2159,6 +2160,57 @@ def run_once(
                 phase_override_arg,
                 dry_run,
             )
+        
+        # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
+        entry_signals_result = {}
+        if phase_override_arg == "entry" and not close_cancel_only:
+            try:
+                # Watchlist 로드 (universe_ctx에서)
+                watchlist_members = universe_ctx.members if universe_ctx else []
+                
+                if watchlist_members:
+                    logger.info("[ENTRY_SCAN] start scanning %s symbols", len(watchlist_members))
+                    
+                    # OHLCV Provider 설정
+                    def ohlcv_provider_for_entry(code: str, days: int):
+                        """Entry scan용 OHLCV provider"""
+                        try:
+                            from trader.data.ohlcv_provider import KISOHLCVProvider
+                            provider = KISOHLCVProvider(kis)
+                            result = provider.get_ohlcv(code, days)
+                            return result.df
+                        except Exception as exc:
+                            logger.debug("[ENTRY_SCAN][OHLCV] code=%s days=%s err=%s", code, days, exc)
+                            return None
+                    
+                    # Entry Scan 실행
+                    entry_signals_result = scan_all_strategies(
+                        watchlist=watchlist_members,
+                        ohlcv_provider=ohlcv_provider_for_entry,
+                    )
+                    
+                    logger.info(
+                        "[ENTRY_SCAN] completed - breakout=%s pullback=%s momentum=%s unique=%s",
+                        len(entry_signals_result.get("breakout", [])),
+                        len(entry_signals_result.get("pullback", [])),
+                        len(entry_signals_result.get("momentum", [])),
+                        len(entry_signals_result.get("all", [])),
+                    )
+                    
+                    # 시그널 요약 로그
+                    for signal in entry_signals_result.get("all", [])[:5]:  # 상위 5개만 로그
+                        logger.info(
+                            "[ENTRY_SIGNAL] %s %s: strategy=%s strength=%.3f close=%.0f",
+                            signal.code,
+                            signal.name,
+                            signal.strategy,
+                            signal.signal_strength,
+                            signal.close,
+                        )
+                else:
+                    logger.warning("[ENTRY_SCAN] skipped - no watchlist members")
+            except Exception as exc:
+                logger.warning("[ENTRY_SCAN] failed - %s", exc, exc_info=True)
         
         if close_cancel_only:
             result = engine_runner.run_close_cancel()

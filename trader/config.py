@@ -264,7 +264,7 @@ CONFIG = {
     "REGIME_MIN_RISK": "0.0",
     # VCP/trigger
     "VCP_LOOKBACK": "120",
-    "VCP_MIN_SCORE": "40",
+    "VCP_MIN_SCORE": "45",
     "PIVOT_BUFFER_PCT": "0.30",
     "BREAKOUT_VOL_MULT": "1.5",
     "ENTRY_MODE": "BOTH",
