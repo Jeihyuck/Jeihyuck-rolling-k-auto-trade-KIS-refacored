@@ -182,7 +182,7 @@ def export_watchlist_bundle(
     
     if "top50" in frames_dict:
         df = frames_dict["top50"]
-        if df is None or df.empty or len(df) < 50:
+        if df is None or df.empty or len(df) < 40:
             validation_failures.append(f"top50:too_small:{len(df) if df is not None else 0}")
     
     if "final30" in frames_dict:

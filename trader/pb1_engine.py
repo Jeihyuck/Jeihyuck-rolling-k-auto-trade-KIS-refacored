@@ -148,7 +148,8 @@ from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.final_list_store import get_as_of_date, load_final30, save_final30
-from trader.minervini_filter import compute_minervini_signals, select_buyable_with_relax
+from trader.minervini_filter import compute_minervini_signals, select_buyable_with_relax, minervini_filter
+from trader.entry_signals import breakout_signal, pullback_signal, momentum_signal
 from trader.minervini_store import write_minervini_signals
 from trader.strategies.pb1_pullback_close import (
     compute_features as compute_pb1_features,
@@ -1239,6 +1240,15 @@ class PB1Engine:
             )
 
     def _fetch_holdings_snapshot(self) -> dict:
+        # ✅ DIAG bypass: skip balance check when account params invalid
+        skip_balance = os.getenv("SKIP_BALANCE_CHECK", "0") == "1"
+        if skip_balance:
+            logger.info("[BALANCE][SKIP] SKIP_BALANCE_CHECK=1 -> return empty snapshot")
+            return {
+                "output1": [],
+                "output2": [{"dnca_tot_amt": "0", "scts_evlu_amt": "0"}],
+            }
+        
         if self._balance_snapshot is not None:
             self.balance_tick_cache_hits += 1
             source = self._balance_snapshot_source or "tick_cache"
@@ -5777,6 +5787,84 @@ class PB1Engine:
                     data_ok_count,
                     dt_minervini,
                 )
+
+                # ✅ [HEDGE_FUND] Entry Signals 적용 (breakout/pullback/momentum)
+                entry_signals_enabled = os.getenv("ENTRY_SIGNALS_ENABLED", "1") == "1"
+                if entry_signals_enabled and candidates:
+                    logger.info("[ENTRY_SCAN] start")
+                    t_entry_start = time.monotonic()
+                    breakout_count = 0
+                    pullback_count = 0
+                    momentum_count = 0
+                    no_signal_count = 0
+                    
+                    # OHLCV 데이터 필요량 (signals 체크용)
+                    signal_ohlcv_days = int(os.getenv("ENTRY_SIGNAL_OHLCV_DAYS", "260"))
+                    
+                    for cf in candidates:
+                        if not cf.features.get("data_ok"):
+                            continue
+                        
+                        # OHLCV 데이터 가져오기
+                        try:
+                            df, meta = self._fetch_daily(cf.code, days=signal_ohlcv_days)
+                            if df is None or df.empty or len(df) < 51:
+                                cf.features["entry_signal"] = "no_data"
+                                no_signal_count += 1
+                                continue
+                            
+                            # Entry signal 체크 (우선순위: breakout > pullback > momentum)
+                            if breakout_signal(df):
+                                cf.features["entry_signal"] = "breakout"
+                                breakout_count += 1
+                            elif pullback_signal(df):
+                                cf.features["entry_signal"] = "pullback"
+                                pullback_count += 1
+                            elif momentum_signal(df):
+                                cf.features["entry_signal"] = "momentum"
+                                momentum_count += 1
+                            else:
+                                cf.features["entry_signal"] = "none"
+                                no_signal_count += 1
+                        
+                        except Exception as exc:
+                            logger.debug("[ENTRY][SIGNAL][ERROR] code=%s error=%s", cf.code, exc)
+                            cf.features["entry_signal"] = "error"
+                            no_signal_count += 1
+                    
+                    dt_entry_signals = time.monotonic() - t_entry_start
+                    
+                    logger.info(
+                        "[ENTRY][SIGNAL] breakout=%s pullback=%s momentum=%s no_signal=%s dt=%.2f",
+                        breakout_count,
+                        pullback_count,
+                        momentum_count,
+                        no_signal_count,
+                        dt_entry_signals,
+                    )
+                    logger.info("[ENTRY_SCAN] breakout signals=%s", breakout_count)
+                    logger.info("[ENTRY_SCAN] pullback signals=%s", pullback_count)
+                    logger.info("[ENTRY_SCAN] momentum signals=%s", momentum_count)
+                    
+                    # Entry signal이 없는 종목 필터링 (옵션)
+                    filter_no_signal = os.getenv("ENTRY_SIGNAL_REQUIRED", "0") == "1"
+                    if filter_no_signal:
+                        before_filter = len([c for c in candidates if c.features.get("data_ok")])
+                        for cf in candidates:
+                            signal = cf.features.get("entry_signal")
+                            if signal in ("none", "no_data", "error"):
+                                if cf.setup_ok:
+                                    cf.setup_ok = False
+                                    cf.reasons = list(cf.reasons or []) + ["no_entry_signal"]
+                        after_filter = len([c for c in candidates if c.setup_ok])
+                        logger.info(
+                            "[ENTRY][SIGNAL][FILTER] before=%s after=%s filtered=%s",
+                            before_filter,
+                            after_filter,
+                            before_filter - after_filter,
+                        )
+                else:
+                    logger.debug("[ENTRY][SIGNAL] disabled (ENTRY_SIGNALS_ENABLED=%s)", os.getenv("ENTRY_SIGNALS_ENABLED", "1"))
 
                 t_pb1_start = time.monotonic()
                 (

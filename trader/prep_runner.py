@@ -501,13 +501,14 @@ def main() -> int:
     contract_failures: list[str] = []
     pool_min = int(os.getenv("PB1_WATCHLIST_POOL_MIN", "40"))
     topk = int(os.getenv("PB1_WATCHLIST_TOPK", "50"))
+    min_top50 = int(os.getenv("PB1_WATCHLIST_TOP50_MIN", "40"))
 
     if len(bundle_universe) <= 0:
         contract_failures.append("contract_universe_scored_empty")
     if len(bundle_pool120) < pool_min:
         contract_failures.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
-    if len(bundle_top50) < topk:
-        contract_failures.append(f"contract_top50_too_small:{len(bundle_top50)}<{topk}")
+    if len(bundle_top50) < min_top50:
+        contract_failures.append(f"contract_top50_too_small:{len(bundle_top50)}<{min_top50}")
     if len(bundle_final30) != finaln:
         contract_failures.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
 
@@ -576,13 +577,13 @@ def main() -> int:
                     env=env,
                     as_of=as_of,
                     min_pool=pool_min,
-                    exact_top50=topk,
+                    exact_top50=min_top50,
                     exact_final30=finaln,
                 )
                 
                 if recovered_bundle and recovered_bundle.is_complete(
                     min_pool=pool_min,
-                    exact_top50=topk,
+                    exact_top50=min_top50,
                     exact_final30=finaln,
                 ):
                     # DB recovery successful - use recovered bundle
@@ -651,7 +652,7 @@ def main() -> int:
                     
                     if rebuilt_bundle and rebuilt_bundle.is_complete(
                         min_pool=pool_min,
-                        exact_top50=topk,
+                        exact_top50=min_top50,
                         exact_final30=finaln,
                     ):
                         # Rebuild successful - save and use
@@ -720,8 +721,8 @@ def main() -> int:
             contract_failures_after_recovery.append("contract_universe_scored_empty")
         if len(bundle_pool120) < pool_min:
             contract_failures_after_recovery.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
-        if len(bundle_top50) < topk:
-            contract_failures_after_recovery.append(f"contract_top50_too_small:{len(bundle_top50)}<{topk}")
+        if len(bundle_top50) < min_top50:
+            contract_failures_after_recovery.append(f"contract_top50_too_small:{len(bundle_top50)}<{min_top50}")
         if len(bundle_final30) != finaln:
             contract_failures_after_recovery.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
         

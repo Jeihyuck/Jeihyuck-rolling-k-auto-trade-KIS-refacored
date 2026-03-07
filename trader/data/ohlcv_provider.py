@@ -61,7 +61,7 @@ class KISOHLCVProvider:
         try:
             engine = make_engine()
             end_date = now_kst().date()
-            start_date = end_date - timedelta(days=max(days, 120))
+            start_date = end_date - timedelta(days=max(days, 260))
             candles = load_price_daily(engine, symbol, start_date, end_date)
             if len(candles) >= days:
                 df = pd.DataFrame(candles)
@@ -120,8 +120,8 @@ class KISOHLCVProvider:
             )
 
         # KIS fallback (LIVE 모드에서만 실행됨)
-        # [FIX] D. day window에서 days <= 120이면 fallback 허용 (watchlist 생성/엔트리에 필수)
-        fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 120)
+        # [FIX] D. day window에서 days <= 260이면 fallback 허용 (watchlist 생성/엔트리에 필수)
+        fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 260)
         if not fallback_allowed:
             logger.warning("[OHLCV][DB][NO_FALLBACK] symbol=%s days=%d", symbol, days)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "db", "error": "no_fallback", "volume_missing": True})
@@ -132,7 +132,7 @@ class KISOHLCVProvider:
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "gate_blocked", "volume_missing": True})
 
         try:
-            candles = self.kis.get_daily_candles(symbol, count=max(days, 120))  # type: ignore[attr-defined]
+            candles = self.kis.get_daily_candles(symbol, count=max(days, 260))  # type: ignore[attr-defined]
             logger.info("[OHLCV][KIS][FALLBACK] symbol=%s days=%d rows=%d", symbol, days, len(candles))
             # DB upsert for self-healing
             if candles:

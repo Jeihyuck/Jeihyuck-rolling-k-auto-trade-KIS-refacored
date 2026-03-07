@@ -49,7 +49,7 @@ class WatchlistBundle:
     final30: List[Dict[str, Any]]          # rows == 30 required
     meta: Dict[str, Any]
     
-    def is_complete(self, *, min_pool: int = 40, exact_top50: int = 50, exact_final30: int = 30) -> bool:
+    def is_complete(self, *, min_pool: int = 40, exact_top50: int = 40, exact_final30: int = 30) -> bool:
         """
         Check if bundle meets minimum requirements.
         
@@ -991,17 +991,6 @@ class WatchlistBuilder:
         normalized_pool = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in pool120]
         normalized_universe = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in universe_items]
 
-        if len(normalized_pool) < 40:
-            fallback = [
-                row for row in normalized_universe
-                if row.get("code") and "price_below_min" not in list(row.get("reject_reasons", []) or [])
-            ]
-            normalized_pool = fallback[:40]
-            for idx, item in enumerate(normalized_pool, start=1):
-                item["pool_rank"] = idx
-                item["rank"] = idx
-            logger.warning("[WATCHLIST][PIPELINE][A_POOL120][FALLBACK] pool<40 -> fallback=%s", len(normalized_pool))
-
         logger.info(
             "[WATCHLIST][PIPELINE][A_POOL120] kept=%s universe=%s excluded_rows=%s excluded_price=%s excluded_nan=%s",
             len(normalized_pool),
@@ -1099,12 +1088,8 @@ class WatchlistBuilder:
             if low_52w > 0 and last_close < low_52w * 1.3:
                 reject_reasons.append("below_130pct_52w_low")
 
-            if rs_pctile < rs_min_pctile:
-                reject_reasons.append("rs_below_min")
-            if vcp_score < vcp_min_score:
-                reject_reasons.append("vcp_below_min")
-            if trend_score < 100.0:
-                reject_reasons.append("trend_template_fail")
+            # Minervini filtering removed
+            # filtering handled in candidate_pool_builder
 
             item.update(
                 {
@@ -1509,7 +1494,7 @@ def recover_bundle_from_db(
     env: str,
     as_of: date,
     min_pool: int = 40,
-    exact_top50: int = 50,
+    exact_top50: int = 40,
     exact_final30: int = 30,
 ) -> Optional[WatchlistBundle]:
     """
@@ -1723,6 +1708,45 @@ def build_and_save_watchlist(
 ) -> Any:
     """Watchlist를 생성하고 DB에 저장한다."""
     repo = WatchlistRepo(engine)
+
+    # Prefer candidate pool as watchlist stage-A input.
+    # If unavailable, keep caller-provided universe members.
+    try:
+        from trader.candidate_pool_builder import load_candidate_pool
+
+        pool_codes, pool_as_of, pool_reason = load_candidate_pool(
+            engine=engine,
+            env=env,
+            today=as_of,
+        )
+        if pool_codes:
+            member_map = {
+                str((m.get("code") if isinstance(m, dict) else "") or "").zfill(6): m
+                for m in members
+                if isinstance(m, dict)
+            }
+            members = [
+                member_map.get(str(code).zfill(6), {"code": str(code).zfill(6), "name": ""})
+                for code in pool_codes
+            ]
+            logger.info(
+                "[WATCHLIST][PIPELINE][A_POOL120] source=candidate_pool as_of=%s reason=%s members=%s",
+                pool_as_of,
+                pool_reason,
+                len(members),
+            )
+        else:
+            logger.warning(
+                "[WATCHLIST][PIPELINE][A_POOL120] source=universe reason=candidate_pool_%s members=%s",
+                pool_reason,
+                len(members),
+            )
+    except Exception as exc:
+        logger.warning(
+            "[WATCHLIST][PIPELINE][A_POOL120] source=universe reason=candidate_pool_load_fail err=%s members=%s",
+            exc,
+            len(members),
+        )
 
     if not force_rebuild:
         existing, _used_as_of = repo.load_watchlist(

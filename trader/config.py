@@ -250,7 +250,7 @@ CONFIG = {
     "RS_BENCHMARK": "229200",
     "RS_LOOKBACK_DAYS": "63",
     "RS_LOOKBACK2_DAYS": "126",
-    "RS_MIN_PCTILE": "70",
+    "RS_MIN_PCTILE": "60",
     "RS_COMPOSITE_W1": "0.6",
     "RS_COMPOSITE_W2": "0.4",
     # Market regime
@@ -264,7 +264,7 @@ CONFIG = {
     "REGIME_MIN_RISK": "0.0",
     # VCP/trigger
     "VCP_LOOKBACK": "120",
-    "VCP_MIN_SCORE": "60",
+    "VCP_MIN_SCORE": "40",
     "PIVOT_BUFFER_PCT": "0.30",
     "BREAKOUT_VOL_MULT": "1.5",
     "ENTRY_MODE": "BOTH",
@@ -847,7 +847,7 @@ def _normalize_index_code(raw: str | None, fallback: str) -> str:
 RS_BENCHMARK = _normalize_index_code(_cfg("RS_BENCHMARK"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
 RS_LOOKBACK_DAYS = int(_cfg("RS_LOOKBACK_DAYS") or "63")
 RS_LOOKBACK2_DAYS = int(_cfg("RS_LOOKBACK2_DAYS") or "126")
-RS_MIN_PCTILE = float(_cfg("RS_MIN_PCTILE") or "80")
+RS_MIN_PCTILE = float(_cfg("RS_MIN_PCTILE") or "60")
 RS_COMPOSITE_W1 = float(_cfg("RS_COMPOSITE_W1") or "0.6")
 RS_COMPOSITE_W2 = float(_cfg("RS_COMPOSITE_W2") or "0.4")
 REGIME_INDEX = _normalize_index_code(_cfg("REGIME_INDEX"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
@@ -859,7 +859,7 @@ REGIME_MAX_RISK = float(_cfg("REGIME_MAX_RISK") or "1.0")
 REGIME_MID_RISK = float(_cfg("REGIME_MID_RISK") or "0.6")
 REGIME_MIN_RISK = float(_cfg("REGIME_MIN_RISK") or "0.0")
 VCP_LOOKBACK = int(_cfg("VCP_LOOKBACK") or "120")
-VCP_MIN_SCORE = int(_cfg("VCP_MIN_SCORE") or "70")
+VCP_MIN_SCORE = int(_cfg("VCP_MIN_SCORE") or "40")
 PIVOT_BUFFER_PCT = float(_cfg("PIVOT_BUFFER_PCT") or "0.15")
 BREAKOUT_VOL_MULT = float(_cfg("BREAKOUT_VOL_MULT") or "1.5")
 ENTRY_MODE = (_cfg("ENTRY_MODE") or "BOTH").strip().upper()

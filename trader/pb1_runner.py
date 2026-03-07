@@ -1204,6 +1204,9 @@ def run_once(
     runtime_dir: Path | None = None,
     max_seconds: int = 0,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    # ✅ Initialize universe_strategy with default value
+    universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+    
     workflow_run_id = None
     for env_var in ["GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "WORKFLOW_RUN_ID"]:
         value = os.getenv(env_var)
@@ -1359,12 +1362,14 @@ def run_once(
     # ✅ DIAG_FULL_EXEC: DIAG 모드에서 window/phase 강제 우회
     diag_full_exec = env_bool("PB1_DIAG_FULL_EXEC", False)
     if diag_full_exec and mode == "DIAG":
-        logger.info("[PB1][DIAG_FULL_EXEC] force window=day, phase=entry (bypass window/phase gates)")
+        # ✅ FORCE_PB1_PHASE가 설정되어 있으면 존중, 없으면 fallback to prep (for entry_scan)
+        diag_phase = force_phase_env if force_phase_env else "prep"
+        logger.info("[PB1][DIAG_FULL_EXEC] force window=day, phase=%s (bypass window/phase gates)", diag_phase)
         market_window = "day"
         window_label = "day"
-        resolved_phase = "entry"
+        resolved_phase = diag_phase
         phase_reason = "diag_full_exec_override"
-        context_reasons.append("diag_full_exec:forced_day_entry")
+        context_reasons.append("diag_full_exec:forced_day_" + diag_phase)
     
     if window is not None:
         resolved_window = window

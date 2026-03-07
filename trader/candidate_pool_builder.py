@@ -27,6 +27,8 @@ from trader.config import (
     CANDIDATE_POOL_MIN_ROWS,
     MARKET_MAP,
     MINERVINI_ONLY,
+    RS_MIN_PCTILE,
+    VCP_MIN_SCORE,
 )
 from trader.db.repos import WatchlistRepo
 from trader.flow_score import calculate_flow_score, rank_by_dollar_volume, calculate_final_score
@@ -134,6 +136,7 @@ class CandidatePoolBuilder:
                 
                 # 추세 점수 (간단히 MA20 > MA50 > MA200 체크)
                 trend_score = 0
+                trend_ok = False
                 if len(df) >= 200:
                     ma20 = df["close"].rolling(20).mean().iloc[-1]
                     ma50 = df["close"].rolling(50).mean().iloc[-1]
@@ -142,11 +145,25 @@ class CandidatePoolBuilder:
                         trend_score += 1
                     if ma50 > ma200:
                         trend_score += 1
+                    trend_ok = bool(ma20 > ma50 > ma200)
                 elif len(df) >= 50:
                     ma20 = df["close"].rolling(20).mean().iloc[-1]
                     ma50 = df["close"].rolling(50).mean().iloc[-1]
                     if ma20 > ma50:
                         trend_score += 1
+                    trend_ok = bool(ma20 > ma50)
+
+                ret_90d = ((df["close"].iloc[-1] / df["close"].iloc[-90]) - 1.0) if len(df) >= 90 else 0.0
+                ret_180d = ((df["close"].iloc[-1] / df["close"].iloc[-180]) - 1.0) if len(df) >= 180 else 0.0
+                rs_raw_score = ret_90d * 0.6 + ret_180d * 0.4
+
+                vol_recent = float(df["volume"].tail(10).mean() or 0.0)
+                vol_prior = float(df["volume"].tail(30).head(20).mean() or 0.0)
+                if vol_prior > 0:
+                    contraction_ratio = max(0.0, min(1.0, 1.0 - (vol_recent / vol_prior)))
+                    vcp_score = contraction_ratio * 100.0
+                else:
+                    vcp_score = 0.0
                 
                 # 변동성 필터 (과도한 변동성 제외)
                 volatility = recent["close"].pct_change().std()
@@ -162,6 +179,9 @@ class CandidatePoolBuilder:
                     "score": composite_score,
                     "avg_value": avg_value,
                     "trend_score": trend_score,
+                    "trend_ok": trend_ok,
+                    "rs_raw_score": float(rs_raw_score),
+                    "vcp_score": float(vcp_score),
                 })
                 
             except Exception as exc:
@@ -237,15 +257,59 @@ class CandidatePoolBuilder:
                 )
             raise RuntimeError(f"candidate pool scored=0 from {len(codes)} universe members")
         
+        # Cross-sectional RS percentile 계산
+        rs_raw_scores = [float(item.get("rs_raw_score", 0.0) or 0.0) for item in scored]
+        if rs_raw_scores:
+            rs_series = pd.Series(rs_raw_scores)
+            rs_pctiles = (rs_series.rank(pct=True) * 100.0).tolist()
+            for item, pct in zip(scored, rs_pctiles):
+                item["rs_percentile"] = float(pct)
+        else:
+            for item in scored:
+                item["rs_percentile"] = 0.0
+
+        # --- Minervini filter ---
+        filtered_scored = []
+        filtered_out = 0
+        for row in scored:
+            if float(row.get("rs_percentile", 0.0) or 0.0) < float(RS_MIN_PCTILE):
+                filtered_out += 1
+                continue
+            if float(row.get("vcp_score", 0.0) or 0.0) < float(VCP_MIN_SCORE):
+                filtered_out += 1
+                continue
+            if not bool(row.get("trend_ok", False)):
+                filtered_out += 1
+                continue
+            filtered_scored.append(row)
+
+        if not filtered_scored:
+            logger.warning("[CANDIDATE_POOL][BUILD][MINERVINI] candidate pool empty -> fallback to RS ranking")
+            fallback_ranked = sorted(
+                scored,
+                key=lambda x: float(x.get("rs_percentile", 0.0) or 0.0),
+                reverse=True,
+            )
+            filtered_scored = fallback_ranked[: self.target_size]
+
+        logger.info(
+            "[CANDIDATE_POOL][BUILD][MINERVINI] input=%s filtered_out=%s kept=%s rs_min=%s vcp_min=%s",
+            len(scored),
+            filtered_out,
+            len(filtered_scored),
+            RS_MIN_PCTILE,
+            VCP_MIN_SCORE,
+        )
+
         # 점수 내림차순 정렬 후 상위 target_size개 선택
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        selected = scored[:self.target_size]
+        filtered_scored.sort(key=lambda x: x["score"], reverse=True)
+        selected = filtered_scored[:self.target_size]
         
         result_codes = [item["code"] for item in selected]
         
         logger.info(
             "[CANDIDATE_POOL][BUILD][DONE] as_of=%s universe_size=%s scored=%s selected=%s",
-            as_of, len(codes), len(scored), len(result_codes)
+            as_of, len(codes), len(filtered_scored), len(result_codes)
         )
         
         # ✅ selected < min_size 즉시 실패 처리
@@ -255,7 +319,7 @@ class CandidatePoolBuilder:
                 "[CANDIDATE_POOL][BUILD][FAIL] selected=%s < min_size=%s (from %s scored). "
                 "Filter criteria too strict or data quality issue. "
                 "Consider: (1) lowering min_price=%s, (2) lowering min_rows=%s, (3) increasing target_size=%s",
-                len(result_codes), min_size, len(scored), self.min_price, self.min_rows, self.target_size
+                len(result_codes), min_size, len(filtered_scored), self.min_price, self.min_rows, self.target_size
             )
             raise RuntimeError(f"candidate pool size {len(result_codes)} < min_size {min_size}")
         

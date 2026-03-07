@@ -268,3 +268,29 @@ def select_buyable_with_relax(
         "regime_pass": True,
     }
     return chosen_codes, report
+
+
+def minervini_filter(df: pd.DataFrame) -> bool:
+    """
+    Minervini Trend Template 필터
+    - 가격 > MA50 > MA150 > MA200
+    - 가격 > 52주 저점 * 1.3
+    """
+    if len(df) < 200:
+        return False
+    
+    ma50 = df['close'].rolling(50).mean().iloc[-1]
+    ma150 = df['close'].rolling(150).mean().iloc[-1]
+    ma200 = df['close'].rolling(200).mean().iloc[-1]
+    price = df['close'].iloc[-1]
+    
+    # 조건 1: price > ma50 > ma150 > ma200
+    cond1 = price > ma50
+    cond2 = ma50 > ma150
+    cond3 = ma150 > ma200
+    
+    # 조건 2: price > 52주 저점 * 1.3
+    week52_low = df['low'].rolling(52 * 5).min().iloc[-1]  # 52주 = 약 260일
+    cond4 = price > week52_low * 1.3
+    
+    return cond1 and cond2 and cond3 and cond4
