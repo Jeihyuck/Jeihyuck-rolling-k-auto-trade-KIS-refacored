@@ -293,6 +293,11 @@ def main() -> int:
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
     allow_flow_degraded_prep = _env_true("ALLOW_FLOW_DEGRADED_PREP", "1") or allow_degraded_prep
+    
+    # ✅ FIX: Define pool_min, topk, finaln at the top to avoid NameError
+    pool_min = int(os.getenv("PB1_WATCHLIST_POOL_MIN", "40"))
+    topk = int(os.getenv("PB1_WATCHLIST_TOPK", "50"))
+    finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
@@ -417,6 +422,14 @@ def main() -> int:
         skip_prefetch=True,
     )
     dt_pool = time.monotonic() - t_pool
+    
+    # ✅ FIX: candidate_pool 120개만 watchlist에 전달 (재필터링 방지)
+    pool_members = [m for m in members if str(m.get("code", "")).zfill(6) in {str(c).zfill(6) for c in pool_codes}]
+    logger.info(
+        "[PREP][CANDIDATE_POOL][DONE] selected=%s pool_members=%s",
+        len(pool_codes),
+        len(pool_members),
+    )
 
     t_watchlist = time.monotonic()
 
@@ -429,12 +442,13 @@ def main() -> int:
     minervini_cfg = MinerviniConfig(rs_min_percentile=float(os.getenv("RS_MIN_PCTILE", "80")) / 100.0)
     
     # ✅ FIX: PREP에서는 절대 캐시를 사용하지 않음 (단일 진실 원천 확립)
+    # ✅ FIX: pool_members (120개)만 전달하여 A단계 재필터링 방지
     watchlist_result = build_and_save_watchlist(
         engine=engine,
         env=env,
         strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
         as_of=as_of,
-        members=members,
+        members=pool_members,
         ohlcv_provider=_watchlist_ohlcv,
         minervini_config={
             "rs_min_pctile": minervini_cfg.rs_min_percentile,
@@ -464,39 +478,11 @@ def main() -> int:
         }
     dt_watchlist = time.monotonic() - t_watchlist
 
-    # watchlist 최종 검증 (30 미만이어도 계속 진행, 가능한 만큼 산출)
-    finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
+    # ✅ FIX: PREP에서는 현재 as_of만 사용, 이전 watchlist cache 재사용 금지
     shortage_reason = ""
     if len(watchlist) < finaln:
-        logger.warning(
-            "[PREP][WATCHLIST][TOO_SMALL] got=%s expected=%s -> reload from DB (soft)",
-            len(watchlist), finaln
-        )
-        watchlist_repo = WatchlistRepo(engine)
-        rows, _used_as_of = watchlist_repo.load_watchlist(
-            env=env,
-            strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
-            as_of=as_of
-        )
-        if rows:
-            watchlist = rows
-            watchlist_bundle["final30"] = rows
-            watchlist_bundle["final_count"] = len(rows)
-            if len(rows) >= finaln:
-                logger.info("[PREP][WATCHLIST][FIXED_FROM_DB] count=%s", len(watchlist))
-            else:
-                shortage_reason = f"db_too_small:{len(rows)}<{finaln}"
-                logger.warning(
-                    "[PREP][WATCHLIST][DB_TOO_SMALL][SOFT] db_count=%s expected=%s -> continue",
-                    len(rows),
-                    finaln,
-                )
-        else:
-            shortage_reason = f"db_missing:{as_of.isoformat()}"
-            logger.warning("[PREP][WATCHLIST][MISSING][SOFT] env=%s as_of=%s -> continue", env, as_of)
-
-    if not shortage_reason and len(watchlist) < finaln:
-        shortage_reason = f"pipeline_shortage:{len(watchlist)}<{finaln}"
+        shortage_reason = f"CURRENT_ASOF_WATCHLIST_TOO_SMALL:{len(watchlist)}<{finaln}"
+        raise RuntimeError(shortage_reason)
 
     bundle_universe = watchlist_bundle.get("universe_scored", []) or []
     bundle_pool120 = watchlist_bundle.get("pool120", []) or []
@@ -510,8 +496,8 @@ def main() -> int:
         top50=bundle_top50,
         final30=bundle_final30,
         min_universe=150,
-        min_pool=int(os.getenv("PB1_WATCHLIST_POOL_MIN", "80")),
-        min_top50=int(os.getenv("PB1_WATCHLIST_TOP50_MIN", "40")),
+        min_pool=pool_min,
+        min_top50=topk,
         exact_final30=finaln,
     )
 
@@ -580,13 +566,13 @@ def main() -> int:
                     env=env,
                     as_of=as_of,
                     min_pool=pool_min,
-                    exact_top50=min_top50,
+                    exact_top50=topk,
                     exact_final30=finaln,
                 )
                 
                 if recovered_bundle and recovered_bundle.is_complete(
                     min_pool=pool_min,
-                    exact_top50=min_top50,
+                    exact_top50=topk,
                     exact_final30=finaln,
                 ):
                     # DB recovery successful - use recovered bundle
@@ -655,7 +641,7 @@ def main() -> int:
                     
                     if rebuilt_bundle and rebuilt_bundle.is_complete(
                         min_pool=pool_min,
-                        exact_top50=min_top50,
+                        exact_top50=topk,
                         exact_final30=finaln,
                     ):
                         # Rebuild successful - save and use
@@ -724,10 +710,11 @@ def main() -> int:
             contract_failures_after_recovery.append("contract_universe_scored_empty")
         if len(bundle_pool120) < pool_min:
             contract_failures_after_recovery.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
-        if len(bundle_top50) < min_top50:
-            contract_failures_after_recovery.append(f"contract_top50_too_small:{len(bundle_top50)}<{min_top50}")
-        if len(bundle_final30) != finaln:
-            contract_failures_after_recovery.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
+        if len(bundle_top50) < topk:
+            contract_failures_after_recovery.append(f"contract_top50_too_small:{len(bundle_top50)}<{topk}")
+        # ✅ FIX: Change from != to < for final30 validation
+        if len(bundle_final30) < finaln:
+            contract_failures_after_recovery.append(f"contract_final30_too_small:{len(bundle_final30)}<{finaln}")
         
         if contract_failures_after_recovery:
             logger.warning(
@@ -870,34 +857,38 @@ def main() -> int:
             return 0
         return 1
 
-    # ✅ FIX: Flow validation - check coverage on final30 basis
-    core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
-    flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
-
-    flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
-    
-    # Calculate flow coverage (how many final30 rows have flow data)
+    # ✅ FIX: Flow validation - check DB-level coverage on final30 symbols
+    final30_codes = [str(row.get("code", "")).zfill(6) for row in watchlist if row.get("code")]
     flow_coverage = 0.0
-    flow_missing_count = 0
     
-    if flow_available_cols:
-        flow_sample = final_df[flow_available_cols]
-        flow_missing_mask = flow_sample.isna().all(axis=1) | flow_sample.fillna(0.0).eq(0.0).all(axis=1)
-        flow_missing_count = int(flow_missing_mask.sum())
-        flow_coverage = 1.0 - (flow_missing_count / max(len(flow_sample), 1))
+    if final30_codes:
+        from trader.db.repos import DerivedFlowRepo
+        flow_repo = DerivedFlowRepo(engine)
         
-        if flow_missing_count > 0:
-            logger.warning(
-                "[FLOW][COVERAGE] missing=%s/%s coverage=%.1f%% as_of=%s",
-                flow_missing_count,
-                len(flow_sample),
+        try:
+            # Load flow data from DB for final30 symbols
+            flow_rows = flow_repo.load_by_symbols(env=env, as_of=as_of, symbols=final30_codes)
+            covered = {str(r.get("symbol", "")).zfill(6) for r in flow_rows if not r.get("flow_missing", True)}
+            flow_coverage = len(covered) / max(len(final30_codes), 1)
+            flow_missing_count = len(final30_codes) - len(covered)
+            
+            logger.info(
+                "[FLOW][DB][COVERAGE] covered=%s/%s coverage=%.1f%% as_of=%s",
+                len(covered),
+                len(final30_codes),
                 flow_coverage * 100.0,
                 as_of,
             )
+        except Exception as exc:
+            logger.warning(
+                "[FLOW][DB][COVERAGE][FAIL] err=%s -> coverage=0%%",
+                exc,
+                exc_info=True,
+            )
+            flow_coverage = 0.0
+            flow_missing_count = len(final30_codes)
     else:
-        flow_coverage = 0.0
-        flow_missing_count = len(final_df)
-        logger.warning("[FLOW][COVERAGE] no flow columns found - coverage=0%%")
+        flow_missing_count = 0
     
     # Flow validation policy
     prep_status = "DONE"
@@ -913,7 +904,7 @@ def main() -> int:
         )
         
         if not allow_flow_degraded_prep:
-            prep_status = "FAIL"
+            raise RuntimeError(f"FLOW_COVERAGE_TOO_LOW:{flow_coverage:.2f}")
         else:
             prep_status = "DEGRADED"
             degraded_exclude_flow = True
@@ -937,8 +928,13 @@ def main() -> int:
             as_of,
         )
 
+    # Prepare metric columns for export
+    core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
+    flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
+    
     metric_cols = [col for col in core_metric_cols if col in final_df.columns]
     if not degraded_exclude_flow:
+        flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
         metric_cols.extend(flow_available_cols)
 
     available_cols = metric_cols

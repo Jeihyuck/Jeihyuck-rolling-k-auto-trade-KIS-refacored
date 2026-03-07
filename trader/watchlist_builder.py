@@ -213,8 +213,9 @@ def validate_watchlist_contract(
     if len(top50) < min_top50:
         failures.append(f"contract_top50_too_small:{len(top50)}<{min_top50}")
     
-    if len(final30) != exact_final30:
-        failures.append(f"contract_final30_count_mismatch:{len(final30)}!={exact_final30}")
+    # ✅ FIX: Change from != to < for final30 validation
+    if len(final30) < exact_final30:
+        failures.append(f"contract_final30_too_small:{len(final30)}<{exact_final30}")
     
     if failures:
         logger.error(
@@ -610,8 +611,16 @@ class WatchlistBuilder:
         )
 
         pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
+        # ✅ FIX: pool120 score 검증 (liq_avg 기준)
+        self._assert_nonzero_scores(pool120, "POOL120", score_key="liq_avg")
+        
         top50 = self._stage_b_strategy_scoring(pool120, as_of)
+        # ✅ FIX: top50 score 검증 (tech_score 기준)
+        self._assert_nonzero_scores(top50, "TOP50", score_key="tech_score")
+        
         final30 = self._stage_c_flow_final(top50, as_of)
+        # ✅ FIX: final30 score 검증 (final_score 기준)
+        self._assert_nonzero_scores(final30, "FINAL30", score_key="final_score")
 
         contract_failures: List[str] = []
         pool_min = _env_int("PB1_WATCHLIST_POOL_MIN", 40)
@@ -968,10 +977,8 @@ class WatchlistBuilder:
         }
 
     def _stage_a_liquidity_filter(self, members: List[Dict[str, Any]], as_of: date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        excluded_rows = 0
-        excluded_price = 0
-        excluded_nan = 0
-
+        # ✅ FIX: A단계는 candidate_pool에서 이미 필터링된 120개를 받음
+        # 재필터링 없이 정렬만 수행
         candidates: List[Dict[str, Any]] = []
         universe_items: List[Dict[str, Any]] = []
         total = len(members)
@@ -982,13 +989,10 @@ class WatchlistBuilder:
             code = str(m.get("code") or "").zfill(6)
             if idx == 1 or idx % progress_every == 0 or idx == total:
                 logger.info(
-                    "[WATCHLIST][PIPELINE][A_POOL120][PROGRESS] processed=%s/%s candidates=%s excluded(rows=%s,price=%s,nan=%s) elapsed=%.1fs",
+                    "[WATCHLIST][PIPELINE][A_POOL120][PROGRESS] processed=%s/%s candidates=%s elapsed=%.1fs",
                     idx,
                     total,
                     len(candidates),
-                    excluded_rows,
-                    excluded_price,
-                    excluded_nan,
                     time.monotonic() - ts0,
                 )
             if not code:
@@ -1000,14 +1004,12 @@ class WatchlistBuilder:
                 df, _meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 30, 260))
             except Exception as exc:
                 item["reject_reasons"].append("ohlcv_fetch_error")
-                excluded_rows += 1
                 logger.debug("[WATCHLIST][PIPELINE][A_POOL120][OHLCV_FAIL] code=%s err=%s", code, exc)
                 universe_items.append(item)
                 continue
 
             if df is None or df.empty:
                 item["reject_reasons"].append("ohlcv_empty")
-                excluded_rows += 1
                 universe_items.append(item)
                 continue
 
@@ -1015,28 +1017,16 @@ class WatchlistBuilder:
 
             rows = len(df)
             item["rows"] = rows
-            if rows < self.min_rows:
-                item["reject_reasons"].append("rows_below_min")
-                excluded_rows += 1
-                universe_items.append(item)
-                continue
-
+            
+            # ✅ FIX: 필터링 제거, 데이터 계산만 수행
             if "close" not in df.columns or "volume" not in df.columns:
                 item["reject_reasons"].append("missing_close_or_volume")
-                excluded_nan += 1
                 universe_items.append(item)
                 continue
 
             last_close = df["close"].iloc[-1]
             if pd.isna(last_close):
                 item["reject_reasons"].append("last_close_nan")
-                excluded_nan += 1
-                universe_items.append(item)
-                continue
-            if float(last_close) < self.min_price:
-                item["reject_reasons"].append("price_below_min")
-                excluded_price += 1
-                item["last_close"] = float(last_close)
                 universe_items.append(item)
                 continue
 
@@ -1044,7 +1034,6 @@ class WatchlistBuilder:
             liq_avg = (recent["close"] * recent["volume"]).mean()
             if pd.isna(liq_avg):
                 item["reject_reasons"].append("liq_nan")
-                excluded_nan += 1
                 universe_items.append(item)
                 continue
 
@@ -1053,15 +1042,7 @@ class WatchlistBuilder:
             if market_cap > 0:
                 turnover_pct = float(liq_avg) / market_cap * 100.0
 
-            if float(liq_avg) <= float(self.min_avg_value20):
-                item["reject_reasons"].append("avg_volume20_below_min")
-                universe_items.append(item)
-                continue
-            if turnover_pct <= float(self.min_turnover_pct):
-                item["reject_reasons"].append("turnover_below_min")
-                universe_items.append(item)
-                continue
-
+            # ✅ FIX: 필터링 제거, 모든 항목을 candidates에 추가
             item["liq_avg"] = float(liq_avg)
             item["last_close"] = float(last_close)
             item["turnover_pct"] = float(turnover_pct)
@@ -1070,6 +1051,7 @@ class WatchlistBuilder:
             candidates.append(item)
             universe_items.append(item)
 
+        # ✅ FIX: 정렬만 수행, 필터링 없음
         candidates.sort(key=lambda x: x.get("liq_avg", 0.0), reverse=True)
         pool120 = candidates[: self.pooln]
 
@@ -1085,12 +1067,10 @@ class WatchlistBuilder:
         normalized_universe = [self._normalize_item(item, score_key="liq_avg", rank_key="pool_rank") for item in universe_items]
 
         logger.info(
-            "[WATCHLIST][PIPELINE][A_POOL120] kept=%s universe=%s excluded_rows=%s excluded_price=%s excluded_nan=%s",
+            "[WATCHLIST][PIPELINE][A_POOL120] members=%s kept=%s universe=%s",
+            total,
             len(normalized_pool),
             len(normalized_universe),
-            excluded_rows,
-            excluded_price,
-            excluded_nan,
         )
         return normalized_pool, normalized_universe
 
@@ -1411,6 +1391,28 @@ class WatchlistBuilder:
             self.finaln,
         )
         return normalized_final
+    
+    def _attach_final_scores(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        ✅ FIX: score_final을 명시적으로 강제 계산
+        tech_score와 flow_score가 있으면 가중합으로 계산
+        """
+        for r in rows:
+            tech_score = float(r.get("tech_score", 0.0) or 0.0)
+            flow_score = float(r.get("flow_score", 0.0) or 0.0)
+            # tech_weight=0.7, flow_weight=0.3이 기본값
+            r["score_final"] = tech_score * self.tech_weight + flow_score * self.flow_weight
+        return rows
+    
+    def _assert_nonzero_scores(self, rows: List[Dict[str, Any]], stage_name: str, score_key: str = "score_final") -> None:
+        """
+        ✅ FIX: 저장 전 검증 - 모든 score가 0이면 에러
+        """
+        if not rows:
+            return
+        nonzero = sum(1 for r in rows if float(r.get(score_key, 0.0) or 0.0) > 0)
+        if nonzero == 0:
+            raise RuntimeError(f"{stage_name}_SCORES_ALL_ZERO (score_key={score_key})")
 
     def _compute_rs_percentile(self, stock_close: pd.Series, bench_close: Optional[pd.Series]) -> float:
         if bench_close is None or len(stock_close) < RS_LOOKBACK_DAYS or len(bench_close) < RS_LOOKBACK_DAYS:
