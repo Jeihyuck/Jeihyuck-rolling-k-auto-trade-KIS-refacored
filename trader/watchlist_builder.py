@@ -144,6 +144,99 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def validate_scores(rows: List[Dict[str, Any]], stage_name: str) -> None:
+    """
+    Validate that rows have non-zero scores.
+    
+    Args:
+        rows: List of scored items
+        stage_name: Stage identifier for error messaging
+        
+    Raises:
+        ValueError: If rows are empty or all scores are zero
+    """
+    if not rows:
+        raise ValueError(f"[SCORE_VALIDATION][FAIL] {stage_name}: empty rows")
+    
+    score_keys = ("score_final", "final_score", "score", "tech_score", "liq_avg")
+    nonzero_count = 0
+    
+    for row in rows:
+        for key in score_keys:
+            val = row.get(key)
+            if val is not None:
+                try:
+                    if float(val) > 0:
+                        nonzero_count += 1
+                        break
+                except (TypeError, ValueError):
+                    continue
+    
+    if nonzero_count == 0:
+        raise ValueError(
+            f"[SCORE_VALIDATION][FAIL] {stage_name}: all scores are zero (checked keys: {score_keys})"
+        )
+    
+    logger.info(
+        "[SCORE_VALIDATION][OK] %s: total=%s nonzero=%s",
+        stage_name,
+        len(rows),
+        nonzero_count,
+    )
+
+
+def validate_watchlist_contract(
+    *,
+    universe_scored: List[Dict[str, Any]],
+    pool120: List[Dict[str, Any]],
+    top50: List[Dict[str, Any]],
+    final30: List[Dict[str, Any]],
+    min_universe: int = 150,
+    min_pool: int = 80,
+    min_top50: int = 40,
+    exact_final30: int = 30,
+) -> List[str]:
+    """
+    Validate watchlist bundle contract.
+    
+    Returns:
+        List of contract failure reasons (empty if all validations pass)
+    """
+    failures = []
+    
+    if len(universe_scored) < min_universe:
+        failures.append(f"contract_universe_too_small:{len(universe_scored)}<{min_universe}")
+    
+    if len(pool120) < min_pool:
+        failures.append(f"contract_pool120_too_small:{len(pool120)}<{min_pool}")
+    
+    if len(top50) < min_top50:
+        failures.append(f"contract_top50_too_small:{len(top50)}<{min_top50}")
+    
+    if len(final30) != exact_final30:
+        failures.append(f"contract_final30_count_mismatch:{len(final30)}!={exact_final30}")
+    
+    if failures:
+        logger.error(
+            "[CONTRACT_VALIDATION][FAIL] failures=%s universe=%s pool120=%s top50=%s final30=%s",
+            failures,
+            len(universe_scored),
+            len(pool120),
+            len(top50),
+            len(final30),
+        )
+    else:
+        logger.info(
+            "[CONTRACT_VALIDATION][OK] universe=%s pool120=%s top50=%s final30=%s",
+            len(universe_scored),
+            len(pool120),
+            len(top50),
+            len(final30),
+        )
+    
+    return failures
+
+
 def _flow_contract_state(
     *,
     foreign_df: Optional[pd.DataFrame],
@@ -1424,6 +1517,8 @@ def save_bundle(
     
     이 함수는 PREP 파이프라인의 단일 저장 지점으로,
     모든 중간 산출물이 누락 없이 저장됨을 보장한다.
+    
+    ✅ FIX: pb1_pool120은 더 이상 별도로 저장하지 않음 (pb1_candidate_pool이 진실의 원천)
     """
     repo = WatchlistRepo(engine)
     
@@ -1449,15 +1544,9 @@ def save_bundle(
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_universe_scored empty")
     
-    # 2. pool120 저장
+    # 2. pool120 - NO LONGER SAVED (use pb1_candidate_pool as single source of truth)
     if bundle.pool120:
-        repo.save_watchlist(
-            env=env,
-            strategy="pb1_pool120",
-            as_of=as_of,
-            members=bundle.pool120,
-        )
-        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(bundle.pool120))
+        logger.info("[BUNDLE][SAVE][INFO] pool120 n=%s (NOT saved to DB - use pb1_candidate_pool)", len(bundle.pool120))
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_pool120 empty")
     
@@ -1500,8 +1589,10 @@ def recover_bundle_from_db(
     """
     DB에서 4종 bundle을 로드하여 복구 시도.
     
+    ✅ FIX: pb1_pool120은 로드하지 않음 (pb1_candidate_pool을 진실의 원천으로 사용)
+    
     Returns:
-        WatchlistBundle if all 4 stages meet requirements, else None
+        WatchlistBundle if all 3 stages meet requirements, else None
     """
     repo = WatchlistRepo(engine)
     
@@ -1514,19 +1605,14 @@ def recover_bundle_from_db(
         exact_final30,
     )
     
-    # Load all 4 stages from DB
+    # Load 3 stages from DB (pool120 is derived from candidate_pool)
     universe_rows, _ = repo.load_watchlist(
         env=env,
         strategy="pb1_universe_scored",
         as_of=as_of,
         allow_latest_fallback=False,
     )
-    pool120_rows, _ = repo.load_watchlist(
-        env=env,
-        strategy="pb1_pool120",
-        as_of=as_of,
-        allow_latest_fallback=False,
-    )
+    
     top50_rows, _ = repo.load_watchlist(
         env=env,
         strategy="pb1_top50",
@@ -1540,10 +1626,31 @@ def recover_bundle_from_db(
         allow_latest_fallback=False,
     )
     
+    # Load pool120 from candidate_pool (single source of truth)
+    pool120_rows = []
+    try:
+        from trader.candidate_pool_builder import load_candidate_pool
+        
+        pool_codes, pool_as_of, pool_reason = load_candidate_pool(
+            engine=engine,
+            env=env,
+            today=as_of,
+        )
+        if pool_codes:
+            # Create minimal pool120 rows with codes
+            pool120_rows = [{"code": str(code).zfill(6), "name": ""} for code in pool_codes]
+            logger.info(
+                "[BUNDLE][RECOVER_DB][POOL120] source=candidate_pool count=%s reason=%s",
+                len(pool120_rows),
+                pool_reason,
+            )
+    except Exception as exc:
+        logger.warning("[BUNDLE][RECOVER_DB][POOL120] candidate_pool_load_fail err=%s", exc)
+    
     logger.info(
         "[BUNDLE][RECOVER_DB][LOADED] universe=%s pool120=%s top50=%s final30=%s",
         len(universe_rows) if universe_rows else 0,
-        len(pool120_rows) if pool120_rows else 0,
+        len(pool120_rows),
         len(top50_rows) if top50_rows else 0,
         len(final30_rows) if final30_rows else 0,
     )
@@ -1589,6 +1696,7 @@ def recover_bundle_from_db(
         meta={
             "source": "db_recovery",
             "recovered_at": time.time(),
+            "pool120_source": "candidate_pool",
         },
     )
     
@@ -1703,10 +1811,18 @@ def build_and_save_watchlist(
     ohlcv_provider: Any,
     minervini_config: Dict[str, Any],
     force_rebuild: bool = False,
+    use_cache: bool = True,
+    source_of_truth: str = "candidate_pool",
     flow_provider: Optional[FlowProvider] = None,
     return_bundle: bool = False,
 ) -> Any:
-    """Watchlist를 생성하고 DB에 저장한다."""
+    """
+    Watchlist를 생성하고 DB에 저장한다.
+    
+    Args:
+        use_cache: If False, skip all cache lookups and force fresh build (default: True)
+        source_of_truth: Pool source - "candidate_pool" (recommended) or "universe"
+    """
     repo = WatchlistRepo(engine)
 
     # Prefer candidate pool as watchlist stage-A input.
@@ -1748,7 +1864,8 @@ def build_and_save_watchlist(
             len(members),
         )
 
-    if not force_rebuild:
+    # ✅ FIX: Skip cache when use_cache=False (e.g., during PREP)
+    if use_cache and not force_rebuild:
         existing, _used_as_of = repo.load_watchlist(
             env=env,
             strategy=strategy,
@@ -1766,22 +1883,38 @@ def build_and_save_watchlist(
             else:
                 logger.info("[WATCHLIST][CACHE] hit=True as_of=%s members=%s", as_of, len(existing))
                 
-                # Attempt to load intermediate stages from DB
+                # ✅ FIX: Load intermediate stages from DB (excluding pb1_pool120 - use candidate_pool instead)
                 bundle_recovered = False
                 universe_scored = []
                 pool120 = []
                 top50 = []
                 
                 try:
-                    # Try loading intermediate stages from DB
+                    # Load universe and top50 from DB
                     universe_rows, _ = repo.load_watchlist(env=env, strategy="pb1_universe_scored", as_of=as_of, allow_latest_fallback=False)
-                    pool120_rows, _ = repo.load_watchlist(env=env, strategy="pb1_pool120", as_of=as_of, allow_latest_fallback=False)
                     top50_rows, _ = repo.load_watchlist(env=env, strategy="pb1_top50", as_of=as_of, allow_latest_fallback=False)
+                    
+                    # Load pool120 from candidate_pool (single source of truth)
+                    try:
+                        from trader.candidate_pool_builder import load_candidate_pool
+                        
+                        pool_codes, pool_as_of, pool_reason = load_candidate_pool(
+                            engine=engine,
+                            env=env,
+                            today=as_of,
+                        )
+                        if pool_codes:
+                            pool120 = [{"code": str(code).zfill(6), "name": ""} for code in pool_codes]
+                            logger.info(
+                                "[WATCHLIST][CACHE][POOL120] source=candidate_pool count=%s reason=%s",
+                                len(pool120),
+                                pool_reason,
+                            )
+                    except Exception as exc_pool:
+                        logger.warning("[WATCHLIST][CACHE][POOL120] candidate_pool_fail err=%s", exc_pool)
                     
                     if universe_rows and len(universe_rows) > 0:
                         universe_scored = universe_rows
-                    if pool120_rows and len(pool120_rows) >= 40:
-                        pool120 = pool120_rows
                     if top50_rows and len(top50_rows) >= 50:
                         top50 = top50_rows
                     

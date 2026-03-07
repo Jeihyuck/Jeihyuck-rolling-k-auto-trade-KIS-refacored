@@ -23,6 +23,7 @@ from trader.watchlist_builder import (
     rebuild_bundle,
     save_bundle,
     WatchlistBundle,
+    validate_watchlist_contract,
 )
 from trader.data.ohlcv_provider import (
     compute_required_prefetch_days,
@@ -426,6 +427,8 @@ def main() -> int:
     flow_provider = _make_flow_provider(engine)
 
     minervini_cfg = MinerviniConfig(rs_min_percentile=float(os.getenv("RS_MIN_PCTILE", "80")) / 100.0)
+    
+    # ✅ FIX: PREP에서는 절대 캐시를 사용하지 않음 (단일 진실 원천 확립)
     watchlist_result = build_and_save_watchlist(
         engine=engine,
         env=env,
@@ -437,7 +440,9 @@ def main() -> int:
             "rs_min_pctile": minervini_cfg.rs_min_percentile,
             "vcp_min_score": float(os.getenv("VCP_MIN_SCORE", "70")),
         },
-        force_rebuild=bool(watchlist_force_rebuild),
+        force_rebuild=True,
+        use_cache=False,
+        source_of_truth="candidate_pool",
         flow_provider=flow_provider,
         return_bundle=True,
     )
@@ -498,19 +503,17 @@ def main() -> int:
     bundle_top50 = watchlist_bundle.get("top50", []) or []
     bundle_final30 = watchlist_bundle.get("final30", watchlist or []) or []
 
-    contract_failures: list[str] = []
-    pool_min = int(os.getenv("PB1_WATCHLIST_POOL_MIN", "40"))
-    topk = int(os.getenv("PB1_WATCHLIST_TOPK", "50"))
-    min_top50 = int(os.getenv("PB1_WATCHLIST_TOP50_MIN", "40"))
-
-    if len(bundle_universe) <= 0:
-        contract_failures.append("contract_universe_scored_empty")
-    if len(bundle_pool120) < pool_min:
-        contract_failures.append(f"contract_pool120_too_small:{len(bundle_pool120)}<{pool_min}")
-    if len(bundle_top50) < min_top50:
-        contract_failures.append(f"contract_top50_too_small:{len(bundle_top50)}<{min_top50}")
-    if len(bundle_final30) != finaln:
-        contract_failures.append(f"contract_final30_count_mismatch:{len(bundle_final30)}!={finaln}")
+    # ✅ FIX: Use centralized contract validation function
+    contract_failures = validate_watchlist_contract(
+        universe_scored=bundle_universe,
+        pool120=bundle_pool120,
+        top50=bundle_top50,
+        final30=bundle_final30,
+        min_universe=150,
+        min_pool=int(os.getenv("PB1_WATCHLIST_POOL_MIN", "80")),
+        min_top50=int(os.getenv("PB1_WATCHLIST_TOP50_MIN", "40")),
+        exact_final30=finaln,
+    )
 
     def _count_score_nonzero(rows: list[dict], keys: tuple[str, ...]) -> int:
         count = 0
@@ -842,9 +845,15 @@ def main() -> int:
     except Exception:
         logger.exception("[PREP][EXPORT][FAIL] as_of=%s out_dir=%s", as_of, export_dir)
 
+    # ✅ FIX: Initialize prep_status and flow_coverage early
+    prep_status = "DONE"
+    flow_coverage = 0.0
+    degraded_exclude_flow = False
+
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:
         logger.error("[PREP][DEGRADED] reason=empty_final30 as_of=%s", as_of)
+        prep_status = "DEGRADED"
         ledger_repo.append_event(
             env=env,
             run_id=run_id,
@@ -854,59 +863,79 @@ def main() -> int:
             ts=now_kst(),
             ok=False,
             reasons=["empty_final30"],
-            payload_json={"as_of": as_of.isoformat(), "final_count": 0},
+            payload_json={"as_of": as_of.isoformat(), "final_count": 0, "flow_coverage": 0.0},
         )
         if allow_degraded_prep:
             logger.warning("[PREP][DEGRADED][ALLOW] reason=empty_final30 -> exit=0")
             return 0
         return 1
 
+    # ✅ FIX: Flow validation - check coverage on final30 basis
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
     flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
 
     flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
-    flow_missing_ratio = 0.0
+    
+    # Calculate flow coverage (how many final30 rows have flow data)
+    flow_coverage = 0.0
+    flow_missing_count = 0
+    
     if flow_available_cols:
         flow_sample = final_df[flow_available_cols]
         flow_missing_mask = flow_sample.isna().all(axis=1) | flow_sample.fillna(0.0).eq(0.0).all(axis=1)
-        flow_missing_ratio = float(flow_missing_mask.mean()) if len(flow_sample) > 0 else 1.0
-        if flow_missing_ratio > 0:
+        flow_missing_count = int(flow_missing_mask.sum())
+        flow_coverage = 1.0 - (flow_missing_count / max(len(flow_sample), 1))
+        
+        if flow_missing_count > 0:
             logger.warning(
-                "[FLOW][WARN] missing_flow_rows=%s/%s ratio=%.3f as_of=%s (non-blocking)",
-                int(flow_missing_mask.sum()),
-                int(len(flow_sample)),
-                flow_missing_ratio,
+                "[FLOW][COVERAGE] missing=%s/%s coverage=%.1f%% as_of=%s",
+                flow_missing_count,
+                len(flow_sample),
+                flow_coverage * 100.0,
                 as_of,
             )
     else:
-        flow_missing_ratio = 1.0
-
-    if flow_missing_ratio >= 1.0:
+        flow_coverage = 0.0
+        flow_missing_count = len(final_df)
+        logger.warning("[FLOW][COVERAGE] no flow columns found - coverage=0%%")
+    
+    # Flow validation policy
+    prep_status = "DONE"
+    degraded_exclude_flow = False
+    
+    if flow_coverage < 0.5:
+        # Flow coverage < 50% → FAIL
         logger.error(
-            "[PREP][FLOW][SCHEMA_OR_EMPTY] as_of=%s reason=derived_flow_missing_or_empty allow_flow_degraded=%s",
+            "[PREP][FLOW][FAIL] coverage=%.1f%% < 50%% as_of=%s allow_flow_degraded=%s",
+            flow_coverage * 100.0,
             as_of,
             int(allow_flow_degraded_prep),
         )
-        ledger_repo.append_event(
-            env=env,
-            run_id=run_id,
-            strategy="pb1_pullback_close",
-            run_window="prep",
-            event_type="PREP_DEGRADED",
-            ts=now_kst(),
-            ok=False,
-            reasons=["flow_data_missing_all"],
-            payload_json={
-                "as_of": as_of.isoformat(),
-                "flow_available_cols": flow_available_cols,
-                "flow_missing_ratio": flow_missing_ratio,
-                "degraded_mode": "tech_only_warn" if allow_flow_degraded_prep else "schema_error",
-            },
-        )
+        
         if not allow_flow_degraded_prep:
-            return 1
-        logger.warning("[PREP][FLOW][DEGRADED_WARN] tech-only mode enabled -> continue")
-        degraded_exclude_flow = True
+            prep_status = "FAIL"
+        else:
+            prep_status = "DEGRADED"
+            degraded_exclude_flow = True
+            logger.warning("[PREP][FLOW][DEGRADED] tech-only mode enabled -> continue")
+    
+    elif flow_coverage < 0.8:
+        # Flow coverage 50%-80% → DEGRADED
+        logger.warning(
+            "[PREP][FLOW][DEGRADED] coverage=%.1f%% between 50%%-80%% as_of=%s",
+            flow_coverage * 100.0,
+            as_of,
+        )
+        prep_status = "DEGRADED"
+        degraded_exclude_flow = False  # Keep flow data but mark as degraded
+    
+    else:
+        # Flow coverage >= 80% → OK
+        logger.info(
+            "[PREP][FLOW][OK] coverage=%.1f%% >= 80%% as_of=%s",
+            flow_coverage * 100.0,
+            as_of,
+        )
 
     metric_cols = [col for col in core_metric_cols if col in final_df.columns]
     if not degraded_exclude_flow:
@@ -918,32 +947,16 @@ def main() -> int:
         zero_ratio = float((sample == 0.0).all(axis=1).mean()) if len(sample) > 0 else 1.0
         if zero_ratio >= 0.8:
             logger.error(
-                "[PREP][DEGRADED] reason=metrics_mostly_zero ratio=%.3f as_of=%s metric_scope=%s",
+                "[PREP][METRICS][MOSTLY_ZERO] ratio=%.3f as_of=%s metric_scope=%s",
                 zero_ratio,
                 as_of,
                 "core_only" if degraded_exclude_flow else "core_plus_flow",
             )
-            ledger_repo.append_event(
-                env=env,
-                run_id=run_id,
-                strategy="pb1_pullback_close",
-                run_window="prep",
-                event_type="PREP_DEGRADED",
-                ts=now_kst(),
-                ok=False,
-                reasons=["metrics_mostly_zero"],
-                payload_json={
-                    "as_of": as_of.isoformat(),
-                    "zero_ratio": zero_ratio,
-                    "metric_cols": available_cols,
-                    "metric_scope": "core_only" if degraded_exclude_flow else "core_plus_flow",
-                    "final_count": int(len(sample)),
-                },
-            )
-            if allow_degraded_prep:
-                logger.warning("[PREP][DEGRADED][ALLOW] reason=metrics_mostly_zero -> exit=0")
-                return 0
-            return 1
+            
+            if not allow_degraded_prep:
+                prep_status = "FAIL"
+            else:
+                prep_status = "DEGRADED"
 
     try:
         pdf_path = generate_watchlist_pdf(
@@ -959,6 +972,7 @@ def main() -> int:
         logger.info("[PDF] wrote %s", pdf_path)
     except Exception:
         logger.exception("[REPORT][WATCHLIST][PDF][FAIL] as_of=%s output_dir=%s", as_of, export_dir)
+    
     payload = to_jsonable(
         {
             "as_of": as_of.isoformat(),
@@ -972,6 +986,9 @@ def main() -> int:
             "pool_size": len(pool_codes or []),
             "final_size": len(watchlist or []),
             "runtime_exported": runtime_exported,
+            "flow_coverage": flow_coverage,
+            "contract_failures": contract_failures,
+            "prep_status": prep_status,
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
                 "derived": round(dt_derived, 2),
@@ -981,20 +998,68 @@ def main() -> int:
             },
         }
     )
-    ledger_repo.append_event(
-        env=env,
-        run_id=run_id,
-        strategy="pb1_pullback_close",
-        run_window="prep",
-        event_type="PREP_DONE",
-        ts=now_kst(),
-        payload_json=payload,
-    )
-    logger.info(
-        "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s symbols=%s",
-        as_of.isoformat(),
-        len(symbols),
-    )
+    
+    # ✅ FIX: Mutually exclusive PREP event logging
+    if prep_status == "FAIL":
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_FAIL",
+            ts=now_kst(),
+            ok=False,
+            reasons=contract_failures + ["flow_coverage_too_low" if flow_coverage < 0.5 else ""],
+            payload_json=payload,
+        )
+        logger.error(
+            "[LEDGER_EVENT] event_type=PREP_FAIL as_of=%s contract_failures=%s flow_coverage=%.1f%%",
+            as_of.isoformat(),
+            contract_failures,
+            flow_coverage * 100.0,
+        )
+        return 1
+    
+    elif prep_status == "DEGRADED":
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_DEGRADED",
+            ts=now_kst(),
+            ok=False,
+            reasons=contract_failures + ["flow_coverage_degraded" if flow_coverage < 0.8 else ""],
+            payload_json=payload,
+        )
+        logger.warning(
+            "[LEDGER_EVENT] event_type=PREP_DEGRADED as_of=%s contract_failures=%s flow_coverage=%.1f%%",
+            as_of.isoformat(),
+            contract_failures,
+            flow_coverage * 100.0,
+        )
+        if allow_degraded_prep:
+            logger.warning("[PREP][DEGRADED][ALLOW] -> exit=0")
+            return 0
+        return 1
+    
+    else:
+        # prep_status == "DONE"
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_DONE",
+            ts=now_kst(),
+            payload_json=payload,
+        )
+        logger.info(
+            "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s symbols=%s flow_coverage=%.1f%%",
+            as_of.isoformat(),
+            len(symbols),
+            flow_coverage * 100.0,
+        )
 
     # Final diagnostic logging for bundle validation
     bundle_source = watchlist_bundle.get("degrade", {}).get("reason", "unknown")
