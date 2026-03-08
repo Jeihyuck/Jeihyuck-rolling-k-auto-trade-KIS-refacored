@@ -211,10 +211,19 @@ def validate_watchlist_contract(
     """
     Validate watchlist bundle contract.
     
+    Note: In current architecture, universe_scored is actually candidate_pool-based (~120),
+    not broader universe (~196+). Contract threshold min_universe=150 is structurally
+    mismatched with this. Consider adjusting threshold or refactoring to use broader universe.
+    
     Returns:
         List of contract failure reasons (empty if all validations pass)
     """
     failures = []
+    
+    # Log contract mode for clarity
+    logger.info(
+        "[CONTRACT][POLICY] mode=candidate_pool_based universe_scored_source=candidate_pool note=threshold_150_may_structurally_fail"
+    )
     
     if len(universe_scored) < min_universe:
         failures.append(f"contract_universe_too_small:{len(universe_scored)}<{min_universe}")
@@ -2587,8 +2596,56 @@ def save_bundle(
         len(bundle.final30),
     )
     
+    # Helper function to log DataFrame fields and scores
+    def _log_stage_fields(stage_name: str, stage_data: List[Dict[str, Any]]) -> None:
+        if not stage_data:
+            return
+        df = pd.DataFrame(stage_data)
+        has_breakout = 1 if "breakout_score" in df.columns else 0
+        has_pullback = 1 if "pullback_score" in df.columns else 0
+        has_momentum = 1 if "momentum_score" in df.columns else 0
+        has_tech = 1 if "tech_score" in df.columns or "score_tech" in df.columns else 0
+        has_final = 1 if "score_final" in df.columns or "final_score" in df.columns else 0
+        
+        breakout_nonzero = int((df["breakout_score"].fillna(0.0) > 0.0).sum()) if "breakout_score" in df.columns else 0
+        pullback_nonzero = int((df["pullback_score"].fillna(0.0) > 0.0).sum()) if "pullback_score" in df.columns else 0
+        momentum_nonzero = int((df["momentum_score"].fillna(0.0) > 0.0).sum()) if "momentum_score" in df.columns else 0
+        tech_nonzero = int((df["tech_score"].fillna(0.0) > 0.0).sum()) if "tech_score" in df.columns else 0
+        if tech_nonzero == 0 and "score_tech" in df.columns:
+            tech_nonzero = int((df["score_tech"].fillna(0.0) > 0.0).sum())
+        final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0
+        if final_nonzero == 0 and "final_score" in df.columns:
+            final_nonzero = int((df["final_score"].fillna(0.0) > 0.0).sum())
+        
+        logger.info(
+            "[BUNDLE][DATAFRAME][FIELDS] stage=%s includes_breakout=%s includes_pullback=%s includes_momentum=%s includes_tech=%s includes_final=%s",
+            stage_name,
+            has_breakout,
+            has_pullback,
+            has_momentum,
+            has_tech,
+            has_final,
+        )
+        logger.info(
+            "[BUNDLE][DATAFRAME][SCORES] stage=%s rows=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s tech_nonzero=%s final_nonzero=%s",
+            stage_name,
+            len(df),
+            breakout_nonzero,
+            pullback_nonzero,
+            momentum_nonzero,
+            tech_nonzero,
+            final_nonzero,
+        )
+    
     # 1. universe_scored - FULL universe (should be 196, not 120)
+    # Note: In current architecture, this is actually candidate_pool-based (120)
+    # TODO: Refactor to use broader universe (196+) as true "universe_scored"
     if bundle.universe_scored:
+        _log_stage_fields("universe_scored", bundle.universe_scored)
+        logger.info(
+            "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=candidate_pool rows=%s note=should_be_broader_universe",
+            len(bundle.universe_scored),
+        )
         repo.save_watchlist(
             env=env,
             strategy="pb1_universe_scored",
@@ -2601,6 +2658,7 @@ def save_bundle(
     
     # 2. pool120 - NOW SAVED (not skipped)
     if bundle.pool120:
+        _log_stage_fields("pool120", bundle.pool120)
         repo.save_watchlist(
             env=env,
             strategy="pb1_pool120",
@@ -2613,6 +2671,7 @@ def save_bundle(
     
     # 3. top50 저장
     if bundle.top50:
+        _log_stage_fields("top50", bundle.top50)
         repo.save_watchlist(
             env=env,
             strategy="pb1_top50",
@@ -2625,6 +2684,7 @@ def save_bundle(
     
     # 4. final30 저장
     if bundle.final30:
+        _log_stage_fields("final30", bundle.final30)
         repo.save_watchlist(
             env=env,
             strategy="pb1_watchlist_final",
@@ -2908,8 +2968,16 @@ def build_and_save_watchlist(
     """
     repo = WatchlistRepo(engine)
 
+    # Track upstream universe count before candidate pool filtering
+    upstream_universe_count = len(members)
+    logger.info(
+        "[WATCHLIST][UNIVERSE][UPSTREAM] count=%s source=universe_repo",
+        upstream_universe_count,
+    )
+
     # Prefer candidate pool as watchlist stage-A input.
     # If unavailable, keep caller-provided universe members.
+    pool_source = "universe"
     try:
         from trader.candidate_pool_builder import load_candidate_pool
 
@@ -2928,11 +2996,13 @@ def build_and_save_watchlist(
                 member_map.get(str(code).zfill(6), {"code": str(code).zfill(6), "name": ""})
                 for code in pool_codes
             ]
+            pool_source = "candidate_pool"
             logger.info(
-                "[WATCHLIST][PIPELINE][A_POOL120] source=candidate_pool as_of=%s reason=%s members=%s",
+                "[WATCHLIST][PIPELINE][A_POOL120] source=candidate_pool as_of=%s reason=%s members=%s upstream_universe=%s",
                 pool_as_of,
                 pool_reason,
                 len(members),
+                upstream_universe_count,
             )
         else:
             logger.warning(

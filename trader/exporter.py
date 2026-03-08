@@ -238,6 +238,32 @@ def export_watchlist_bundle(
                 safe_name
             )
         
+        # Log field presence before export
+        if not df.empty:
+            has_breakout = 1 if "breakout_score" in df.columns else 0
+            has_pullback = 1 if "pullback_score" in df.columns else 0
+            has_momentum = 1 if "momentum_score" in df.columns else 0
+            has_rs = 1 if "rs_score" in df.columns or "rs_pctile" in df.columns else 0
+            has_vcp = 1 if "vcp_score" in df.columns else 0
+            has_trend = 1 if "trend_score" in df.columns or "trend_template" in df.columns else 0
+            has_tech = 1 if "tech_score" in df.columns or "score_tech" in df.columns else 0
+            has_flow = 1 if "flow_score" in df.columns or "score_flow" in df.columns else 0
+            has_final = 1 if "score_final" in df.columns or "final_score" in df.columns else 0
+            
+            logger.info(
+                "[EXPORT][FIELDS] name=%s includes_breakout=%s includes_pullback=%s includes_momentum=%s includes_rs=%s includes_vcp=%s includes_trend=%s includes_tech=%s includes_flow=%s includes_final=%s",
+                safe_name,
+                has_breakout,
+                has_pullback,
+                has_momentum,
+                has_rs,
+                has_vcp,
+                has_trend,
+                has_tech,
+                has_flow,
+                has_final,
+            )
+        
         if not df.empty:
             tech_nonzero = int((df["tech_score"].fillna(0.0) > 0.0).sum()) if "tech_score" in df.columns else 0
             score_final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0

@@ -889,12 +889,18 @@ def main() -> int:
         score_final_nonzero = int((pd.to_numeric(final30_df.get("score_final"), errors="coerce").fillna(0.0) > 0.0).sum()) if "score_final" in final30_df.columns else 0
         final_score_nonzero = int((pd.to_numeric(final30_df.get("final_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "final_score" in final30_df.columns else 0
         tech_score_nonzero = int((pd.to_numeric(final30_df.get("tech_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "tech_score" in final30_df.columns else 0
+        breakout_nonzero = int((pd.to_numeric(final30_df.get("breakout_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "breakout_score" in final30_df.columns else 0
+        pullback_nonzero = int((pd.to_numeric(final30_df.get("pullback_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "pullback_score" in final30_df.columns else 0
+        momentum_nonzero = int((pd.to_numeric(final30_df.get("momentum_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "momentum_score" in final30_df.columns else 0
         logger.info(
-            "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s",
+            "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             int(len(final30_df)),
             tech_score_nonzero,
             final_score_nonzero,
             score_final_nonzero,
+            breakout_nonzero,
+            pullback_nonzero,
+            momentum_nonzero,
         )
     runtime_exported = False
     try:
