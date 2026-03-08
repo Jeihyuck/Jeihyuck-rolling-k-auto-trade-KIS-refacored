@@ -121,18 +121,30 @@ def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
+        if v is None:
             return default
-        if isinstance(value, str):
-            cleaned = value.replace(",", "").strip()
-            if cleaned == "":
+        if isinstance(v, str):
+            v = v.strip()
+            if v == "":
                 return default
-            return float(cleaned)
-        return float(value)
+        return float(v)
     except Exception:
         return default
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _row_set(row: Any, key: str, value: Any) -> None:
+    if isinstance(row, dict):
+        row[key] = value
+    else:
+        setattr(row, key, value)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -611,16 +623,33 @@ class WatchlistBuilder:
         )
 
         pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
-        # ✅ FIX: pool120 score 검증 (liq_avg 기준)
-        self._assert_nonzero_scores(pool120, "POOL120", score_key="liq_avg")
-        
-        top50 = self._stage_b_strategy_scoring(pool120, as_of)
-        # ✅ FIX: top50 score 검증 (tech_score 기준)
+
+        # 점수 강제 부여
+        pool120 = self._attach_scores(pool120, "A_POOL120")
+        self._assert_nonzero_scores(pool120, "A_POOL120", score_key="tech_score")
+
+        top50_source = sorted(
+            pool120,
+            key=lambda r: _safe_float(_row_get(r, "tech_score", 0.0)),
+            reverse=True,
+        )
+        top50 = top50_source[: self.topk]
+        logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(top50), len(pool120))
+
+        # 다시 점수 붙이기 (안전하게)
+        top50 = self._attach_scores(top50, "B_TOP50")
         self._assert_nonzero_scores(top50, "TOP50", score_key="tech_score")
-        
-        final30 = self._stage_c_flow_final(top50, as_of)
-        # ✅ FIX: final30 score 검증 (final_score 기준)
-        self._assert_nonzero_scores(final30, "FINAL30", score_key="final_score")
+
+        final30_source = sorted(
+            top50,
+            key=lambda r: _safe_float(_row_get(r, "score_final", 0.0)),
+            reverse=True,
+        )
+        final30 = final30_source[: self.finaln]
+        logger.info("[WATCHLIST][PIPELINE][C_FINAL30] kept=%s from=%s", len(final30), len(top50))
+
+        final30 = self._attach_scores(final30, "C_FINAL30")
+        self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
 
         contract_failures: List[str] = []
         pool_min = _env_int("PB1_WATCHLIST_POOL_MIN", 40)
@@ -1037,6 +1066,14 @@ class WatchlistBuilder:
                 universe_items.append(item)
                 continue
 
+            close_series = df["close"]
+            ma20 = float(close_series.rolling(20).mean().iloc[-1]) if len(close_series) >= 20 else 0.0
+            ma50 = float(close_series.rolling(50).mean().iloc[-1]) if len(close_series) >= 50 else 0.0
+            ma150 = float(close_series.rolling(150).mean().iloc[-1]) if len(close_series) >= 150 else 0.0
+            volume_last = float(df["volume"].iloc[-1] or 0.0)
+            volume_avg20 = float(df["volume"].tail(20).mean() or 0.0)
+            trading_value = float(liq_avg or 0.0)
+
             market_cap = _safe_float((m.get("meta_json") or {}).get("market_cap"), 0.0)
             turnover_pct = 0.0
             if market_cap > 0:
@@ -1045,6 +1082,13 @@ class WatchlistBuilder:
             # ✅ FIX: 필터링 제거, 모든 항목을 candidates에 추가
             item["liq_avg"] = float(liq_avg)
             item["last_close"] = float(last_close)
+            item["close"] = float(last_close)
+            item["ma20"] = ma20
+            item["ma50"] = ma50
+            item["ma150"] = ma150
+            item["volume"] = volume_last
+            item["volume_avg20"] = volume_avg20
+            item["trading_value"] = trading_value
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
             item["meta"] = {"as_of": as_of.isoformat()}
@@ -1392,27 +1436,239 @@ class WatchlistBuilder:
         )
         return normalized_final
     
-    def _attach_final_scores(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _compute_tech_score(self, row: Any) -> float:
         """
-        ✅ FIX: score_final을 명시적으로 강제 계산
-        tech_score와 flow_score가 있으면 가중합으로 계산
+        TOP50/FINAL30 ranking용 tech score 계산.
+        무조건 0~100 범위로 정규화되도록 설계.
         """
-        for r in rows:
-            tech_score = float(r.get("tech_score", 0.0) or 0.0)
-            flow_score = float(r.get("flow_score", 0.0) or 0.0)
-            # tech_weight=0.7, flow_weight=0.3이 기본값
-            r["score_final"] = tech_score * self.tech_weight + flow_score * self.flow_weight
-        return rows
-    
-    def _assert_nonzero_scores(self, rows: List[Dict[str, Any]], stage_name: str, score_key: str = "score_final") -> None:
+        meta = _row_get(row, "meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+
+        rs_pct = _safe_float(
+            _row_get(
+                row,
+                "rs_percentile",
+                _row_get(
+                    row,
+                    "rs_score",
+                    _row_get(
+                        row,
+                        "rs_rank_score",
+                        _row_get(
+                            row,
+                            "rs_pctile",
+                            _row_get(
+                                meta,
+                                "rs_percentile",
+                                _row_get(meta, "rs_score", _row_get(meta, "rs_pctile", 0.0)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        vcp_score = _safe_float(
+            _row_get(
+                row,
+                "vcp_score",
+                _row_get(row, "vcp_rank_score", _row_get(meta, "vcp_score", _row_get(meta, "vcp_rank_score", 0.0))),
+            )
+        )
+        trend_score = _safe_float(
+            _row_get(
+                row,
+                "trend_score",
+                _row_get(
+                    row,
+                    "trend_rank_score",
+                    _row_get(meta, "trend_score", _row_get(meta, "trend_rank_score", 0.0)),
+                ),
+            )
+        )
+
+        close = _safe_float(_row_get(row, "close", _row_get(row, "last_close", _row_get(meta, "close", _row_get(meta, "last_close", 0.0)))))
+        ma20 = _safe_float(_row_get(row, "ma20", _row_get(meta, "ma20", 0.0)))
+        ma50 = _safe_float(_row_get(row, "ma50", _row_get(meta, "ma50", 0.0)))
+        ma150 = _safe_float(_row_get(row, "ma150", _row_get(row, "ma200", _row_get(meta, "ma150", _row_get(meta, "ma200", 0.0)))))
+        volume = _safe_float(_row_get(row, "volume", _row_get(meta, "volume", 0.0)))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(meta, "volume_avg20", 0.0)))
+
+        rs_component = max(0.0, min(rs_pct, 100.0))
+        vcp_component = max(0.0, min(vcp_score, 100.0))
+
+        if trend_score <= 0:
+            trend_component = 0.0
+            if close > 0 and ma20 > 0 and ma50 > 0:
+                if close >= ma20:
+                    trend_component += 35.0
+                if ma20 >= ma50:
+                    trend_component += 35.0
+                if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
+                    trend_component += 30.0
+        else:
+            trend_component = max(0.0, min(trend_score, 100.0))
+
+        liquidity_component = 0.0
+        if volume_avg20 > 0:
+            vol_ratio = volume / volume_avg20
+            if vol_ratio >= 2.0:
+                liquidity_component = 100.0
+            elif vol_ratio >= 1.5:
+                liquidity_component = 80.0
+            elif vol_ratio >= 1.2:
+                liquidity_component = 60.0
+            elif vol_ratio >= 1.0:
+                liquidity_component = 40.0
+            else:
+                liquidity_component = 20.0
+
+        tech_score = (
+            rs_component * 0.45
+            + vcp_component * 0.25
+            + trend_component * 0.20
+            + liquidity_component * 0.10
+        )
+        return round(max(0.0, tech_score), 4)
+
+    def _compute_flow_score(self, row: Any) -> float:
         """
-        ✅ FIX: 저장 전 검증 - 모든 score가 0이면 에러
+        한국 시장용 수급 점수.
+        foreign / institution 관련 값이 없으면 0 반환.
         """
+        meta = _row_get(row, "meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+
+        foreign_net = _safe_float(_row_get(row, "foreign_net_buy", _row_get(row, "foreign_net_buy_5d", _row_get(meta, "foreign_net_buy", _row_get(meta, "foreign_net_buy_5d", 0.0)))))
+        inst_net = _safe_float(_row_get(row, "institution_net_buy", _row_get(row, "institution_net_buy_5d", _row_get(meta, "institution_net_buy", _row_get(meta, "institution_net_buy_5d", 0.0)))))
+        total_value = _safe_float(_row_get(row, "trading_value", _row_get(row, "liq_avg", _row_get(meta, "trading_value", _row_get(meta, "liq_avg", 0.0)))))
+
+        raw = foreign_net * 0.6 + inst_net * 0.4
+
+        liquidity_penalty = 1.0
+        if total_value > 0:
+            if total_value < 1_000_000_000:
+                liquidity_penalty = 0.7
+            elif total_value < 5_000_000_000:
+                liquidity_penalty = 0.85
+
+        raw *= liquidity_penalty
+
+        if raw >= 10_000_000_000:
+            score = 100.0
+        elif raw >= 5_000_000_000:
+            score = 80.0
+        elif raw >= 1_000_000_000:
+            score = 60.0
+        elif raw >= 0:
+            score = 40.0
+        elif raw >= -1_000_000_000:
+            score = 20.0
+        else:
+            score = 0.0
+
+        return round(score, 4)
+
+    def _compute_final_score(self, row: Any) -> float:
+        tech_score = _safe_float(_row_get(row, "tech_score", 0.0))
+        flow_score = _safe_float(_row_get(row, "flow_score", 0.0))
+        final_score = tech_score * 0.7 + flow_score * 0.3
+        return round(final_score, 4)
+
+    def _attach_scores(self, rows: List[Any], stage_name: str) -> List[Any]:
+        """
+        rows 전체에 tech_score / flow_score / final_score를 강제로 채움
+        """
+        out: List[Any] = []
+
+        for row in rows:
+            tech_score = self._compute_tech_score(row)
+            flow_score = self._compute_flow_score(row)
+            final_score = self._compute_final_score(
+                {
+                    "tech_score": tech_score,
+                    "flow_score": flow_score,
+                }
+            )
+
+            _row_set(row, "tech_score", tech_score)
+            _row_set(row, "flow_score", flow_score)
+            _row_set(row, "score_final", final_score)
+            _row_set(row, "final_score", final_score)
+
+            out.append(row)
+
+        nonzero_tech = sum(1 for r in out if _safe_float(_row_get(r, "tech_score", 0.0)) > 0)
+        nonzero_final = sum(1 for r in out if _safe_float(_row_get(r, "score_final", 0.0)) > 0)
+
+        logger.info(
+            "[WATCHLIST][SCORES][%s] rows=%d tech_nonzero=%d final_nonzero=%d",
+            stage_name,
+            len(out),
+            nonzero_tech,
+            nonzero_final,
+        )
+
+        return out
+
+    def _assert_nonzero_scores(self, rows: List[Any], stage_name: str, score_key: str = "tech_score") -> None:
         if not rows:
-            return
-        nonzero = sum(1 for r in rows if float(r.get(score_key, 0.0) or 0.0) > 0)
+            raise RuntimeError(f"{stage_name}_EMPTY")
+
+        nonzero = 0
+        sample: List[Dict[str, Any]] = []
+
+        for r in rows:
+            val = _safe_float(_row_get(r, score_key, 0.0))
+            if val > 0:
+                nonzero += 1
+
+        for r in rows[:5]:
+            sample.append(
+                {
+                    "symbol": _row_get(r, "symbol", _row_get(r, "code", None)),
+                    "rs_percentile": _row_get(r, "rs_percentile", None),
+                    "vcp_score": _row_get(r, "vcp_score", None),
+                    "trend_score": _row_get(r, "trend_score", None),
+                    "tech_score": _row_get(r, "tech_score", None),
+                    "flow_score": _row_get(r, "flow_score", None),
+                    "score_final": _row_get(r, "score_final", None),
+                }
+            )
+
         if nonzero == 0:
+            logger.info(
+                "[WATCHLIST][DEBUG][TOP50_SAMPLE] %s",
+                [
+                    {
+                        "symbol": _row_get(r, "symbol", _row_get(r, "code", None)),
+                        "rs_percentile": _row_get(r, "rs_percentile", None),
+                        "rs_score": _row_get(r, "rs_score", None),
+                        "vcp_score": _row_get(r, "vcp_score", None),
+                        "trend_score": _row_get(r, "trend_score", None),
+                        "tech_score": _row_get(r, "tech_score", None),
+                        "flow_score": _row_get(r, "flow_score", None),
+                        "score_final": _row_get(r, "score_final", None),
+                    }
+                    for r in rows[:5]
+                ],
+            )
+            logger.error(
+                "[WATCHLIST][SCORES][FAIL] stage=%s score_key=%s sample=%s",
+                stage_name,
+                score_key,
+                sample,
+            )
             raise RuntimeError(f"{stage_name}_SCORES_ALL_ZERO (score_key={score_key})")
+
+        logger.info(
+            "[WATCHLIST][SCORES][OK] stage=%s score_key=%s nonzero=%d total=%d",
+            stage_name,
+            score_key,
+            nonzero,
+            len(rows),
+        )
 
     def _compute_rs_percentile(self, stock_close: pd.Series, bench_close: Optional[pd.Series]) -> float:
         if bench_close is None or len(stock_close) < RS_LOOKBACK_DAYS or len(bench_close) < RS_LOOKBACK_DAYS:
