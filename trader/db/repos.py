@@ -2705,6 +2705,108 @@ class DerivedMinerviniRepo:
         
         return rows, fallback_as_of
     
+    def load_derived(
+        self,
+        *,
+        env: str,
+        as_of: str | date,
+        symbols: list[str] | None = None,
+        allow_fallback: bool = False,
+        ttl_days: int = 7,
+    ) -> list[dict]:
+        """
+        Minervini derived 데이터를 로드한다.
+        
+        이 메서드는 watchlist_builder.py와 prep_runner.py에서 호출되는
+        호환 API다.
+        
+        Args:
+            env: 환경 (prep, live 등)
+            as_of: 요청 날짜 (str 또는 date)
+            symbols: 종목 필터 (옵션, None이면 전체)
+            allow_fallback: True면 해당 날짜에 없을 때 최근 TTL 내 데이터로 fallback
+            ttl_days: fallback 허용 최대 일수
+        
+        Returns:
+            list[dict]: Minervini 점수 row 목록
+                각 row는 최소한 다음 필드를 포함:
+                - symbol: 종목 코드
+                - as_of: 날짜
+                - rs_percentile, rs_score, vcp_score, trend_score
+                - (가능하면) breakout_score, pullback_score, momentum_score
+        
+        Examples:
+            >>> # 정확한 날짜로만 로드
+            >>> rows = repo.load_derived(env="prep", as_of="2026-03-07", allow_fallback=False)
+            >>> len(rows)  # 196 또는 0
+            
+            >>> # fallback 허용
+            >>> rows = repo.load_derived(env="prep", as_of="2026-03-08", allow_fallback=True, ttl_days=7)
+            >>> # 2026-03-08이 없으면 최근 7일 내 최신 데이터 반환
+        """
+        as_of_date = to_date(as_of)
+        
+        if allow_fallback:
+            rows, actual_as_of = self.load_for_as_of_with_fallback(
+                env=env,
+                as_of=as_of_date,
+                symbols=symbols,
+                ttl_days=ttl_days,
+            )
+            
+            if rows:
+                rs_nonzero = sum(1 for r in rows if (r.get("rs_percentile") or 0) > 0 or (r.get("rs_score") or 0) > 0)
+                vcp_nonzero = sum(1 for r in rows if (r.get("vcp_score") or 0) > 0)
+                trend_nonzero = sum(1 for r in rows if (r.get("trend_score") or 0) > 0)
+                
+                logger.info(
+                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                    env,
+                    as_of_date.isoformat(),
+                    actual_as_of.isoformat() if actual_as_of else "None",
+                    len(rows),
+                    1 if actual_as_of != as_of_date else 0,
+                    rs_nonzero,
+                    vcp_nonzero,
+                    trend_nonzero,
+                )
+            else:
+                logger.warning(
+                    "[DERIVED][LOAD][EMPTY] env=%s requested_as_of=%s fallback=%d",
+                    env,
+                    as_of_date.isoformat(),
+                    1,
+                )
+            
+            return rows
+        else:
+            # Strict mode: 정확한 as_of만 허용
+            rows = self.load_for_as_of(env=env, as_of=as_of_date, symbols=symbols)
+            
+            if rows:
+                rs_nonzero = sum(1 for r in rows if (r.get("rs_percentile") or 0) > 0 or (r.get("rs_score") or 0) > 0)
+                vcp_nonzero = sum(1 for r in rows if (r.get("vcp_score") or 0) > 0)
+                trend_nonzero = sum(1 for r in rows if (r.get("trend_score") or 0) > 0)
+                
+                logger.info(
+                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=0 rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                    env,
+                    as_of_date.isoformat(),
+                    as_of_date.isoformat(),
+                    len(rows),
+                    rs_nonzero,
+                    vcp_nonzero,
+                    trend_nonzero,
+                )
+            else:
+                logger.warning(
+                    "[DERIVED][LOAD][EMPTY] env=%s requested_as_of=%s fallback=0",
+                    env,
+                    as_of_date.isoformat(),
+                )
+            
+            return rows
+    
     def find_latest_available_asof(
         self,
         *,

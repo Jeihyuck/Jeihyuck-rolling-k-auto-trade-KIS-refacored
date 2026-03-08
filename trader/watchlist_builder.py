@@ -627,8 +627,19 @@ class WatchlistBuilder:
         )
 
         pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
+        
+        logger.info(
+            "[WATCHLIST][STAGE_COUNTS] raw=%d universe_items=%d pool120=%d",
+            len(members),
+            len(universe_scored),
+            len(pool120),
+        )
 
-        # A단계는 derived/minervini 점수 merge 이후 score 부여
+        # A단계: universe_scored와 pool120 모두에 derived/minervini 점수 merge 및 score 부여
+        # ✅ FIX: universe_scored도 함께 처리하여 pb1_universe_scored 테이블에 nonzero scores 저장
+        universe_scored = self._merge_derived_scores(universe_scored, as_of=as_of)
+        universe_scored = self._attach_scores(universe_scored, "UNIVERSE_SCORED")
+        
         pool120 = self._merge_derived_scores(pool120, as_of=as_of)
         pool120 = self._attach_scores(pool120, "A_POOL120")
         self._assert_nonzero_scores(pool120, "A_POOL120", score_key="tech_score")
@@ -644,6 +655,13 @@ class WatchlistBuilder:
         # 다시 점수 붙이기 (안전하게)
         top50 = self._attach_scores(top50, "B_TOP50")
         self._assert_nonzero_scores(top50, "TOP50", score_key="tech_score")
+        
+        logger.info(
+            "[WATCHLIST][STAGE_COUNTS] universe=%d pool120=%d top50=%d",
+            len(universe_scored),
+            len(pool120),
+            len(top50),
+        )
 
         final30_source = sorted(
             top50,
@@ -656,10 +674,22 @@ class WatchlistBuilder:
         final30 = self._attach_scores(final30, "C_FINAL30")
         self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
 
+        logger.info(
+            "[WATCHLIST][STAGE_COUNTS] universe=%d pool120=%d top50=%d final30=%d",
+            len(universe_scored),
+            len(pool120),
+            len(top50),
+            len(final30),
+        )
+
         contract_failures: List[str] = []
         pool_min = _env_int("PB1_WATCHLIST_POOL_MIN", 40)
+        universe_min = _env_int("PB1_WATCHLIST_UNIVERSE_MIN", 150)
+        
         if len(universe_scored) <= 0:
             contract_failures.append("universe_scored_empty")
+        elif len(universe_scored) < universe_min:
+            contract_failures.append(f"contract_universe_too_small:{len(universe_scored)}<{universe_min}")
         if len(pool120) < pool_min:
             contract_failures.append(f"pool120_too_small:{len(pool120)}<{pool_min}")
         if len(top50) < int(self.topk):
@@ -1458,61 +1488,101 @@ class WatchlistBuilder:
         Load Minervini/derived scores from all available sources.
         
         Priority:
-          1. derived_minervini repo (DerivedMinerviniRepo)
-          2. pb1_universe_scored watchlist bundle
-          3. best_k_meta universe score source
+          1. derived_minervini repo (direct)
+          2. derived_minervini repo (fallback to recent snapshot)
+          3. pb1_universe_scored watchlist bundle (quality-checked)
         
         Returns:
             Dict[symbol, row] with rs/vcp/trend/breakout/pullback/momentum scores
+            
+        Raises:
+            RuntimeError if no valid source with nonzero scores is found
         """
         derived_map: Dict[str, Dict[str, Any]] = {}
         
-        # Source 1: DerivedMinerviniRepo
+        def _check_quality(rows: List[Any], source_name: str) -> tuple[bool, int, int, int]:
+            """Check if source has valid nonzero scores."""
+            if not rows:
+                return False, 0, 0, 0
+            
+            rs_nonzero = sum(1 for r in rows 
+                            if _safe_float(_row_get(r, "rs_percentile", _row_get(r, "rs_score", 0.0))) > 0)
+            vcp_nonzero = sum(1 for r in rows 
+                             if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
+            trend_nonzero = sum(1 for r in rows 
+                               if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
+            
+            # Quality check: at least one core score type must be nonzero
+            is_valid = (rs_nonzero > 0) or (vcp_nonzero > 0) or (trend_nonzero > 0)
+            
+            return is_valid, rs_nonzero, vcp_nonzero, trend_nonzero
+        
+        # Source 1: DerivedMinerviniRepo (direct)
         if self.repo and hasattr(self.repo, 'engine'):
+            logger.info("[WATCHLIST][DERIVED_SOURCE][TRY] source=derived_minervini as_of=%s", as_of)
             try:
                 from trader.db.repos import DerivedMinerviniRepo
                 minervini_repo = DerivedMinerviniRepo(self.repo.engine)
-                derived_rows = minervini_repo.load_derived(env=self.env or "prep", as_of=as_of)
                 
-                if derived_rows:
+                # Try direct load first
+                derived_rows = minervini_repo.load_derived(
+                    env=self.env or "prep",
+                    as_of=as_of,
+                    allow_fallback=False
+                )
+                
+                is_valid, rs_nonzero, vcp_nonzero, trend_nonzero = _check_quality(derived_rows, "derived_minervini")
+                
+                if not derived_rows:
+                    logger.info("[WATCHLIST][DERIVED_SOURCE][MISS] source=derived_minervini reason=no_rows trying_fallback=True")
+                    
+                    # Try with fallback
+                    derived_rows = minervini_repo.load_derived(
+                        env=self.env or "prep",
+                        as_of=as_of,
+                        allow_fallback=True,
+                        ttl_days=7
+                    )
+                    
+                    is_valid, rs_nonzero, vcp_nonzero, trend_nonzero = _check_quality(derived_rows, "derived_minervini_fallback")
+                    
+                    if not derived_rows:
+                        logger.warning("[WATCHLIST][DERIVED_SOURCE][MISS] source=derived_minervini_fallback reason=no_rows")
+                    elif not is_valid:
+                        logger.warning(
+                            "[WATCHLIST][DERIVED_SOURCE][REJECT] source=derived_minervini_fallback reason=all_scores_zero rows=%d",
+                            len(derived_rows)
+                        )
+                        derived_rows = []  # Reject all-zero source
+                
+                if derived_rows and is_valid:
                     for row in derived_rows:
                         sym = self._norm_symbol(row)
                         if sym:
                             derived_map[sym] = row
                     
-                    # Log source stats
-                    rs_nonzero = sum(1 for r in derived_rows 
-                                    if _safe_float(_row_get(r, "rs_percentile", _row_get(r, "rs_score", 0.0))) > 0)
-                    vcp_nonzero = sum(1 for r in derived_rows 
-                                     if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
-                    trend_nonzero = sum(1 for r in derived_rows 
-                                       if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
-                    
                     logger.info(
-                        "[WATCHLIST][DERIVED_SOURCE] source=derived_minervini rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                        "[WATCHLIST][DERIVED_SOURCE][OK] source=derived_minervini rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
                         len(derived_rows), rs_nonzero, vcp_nonzero, trend_nonzero
                     )
-                    
-                    if rs_nonzero > 0 or vcp_nonzero > 0 or trend_nonzero > 0:
-                        return derived_map  # Use this source if it has data
-                    else:
-                        logger.warning(
-                            "[WATCHLIST][DERIVED_SOURCE] source=derived_minervini has rows but all scores are zero"
-                        )
+                    return derived_map  # Success - use this source
+                
             except Exception as e:
-                logger.warning(
-                    "[WATCHLIST][DERIVED_SOURCE] failed to load from derived_minervini: %s",
-                    str(e)
+                logger.error(
+                    "[WATCHLIST][DERIVED_SOURCE][ERROR] source=derived_minervini error=%s",
+                    str(e),
+                    exc_info=True
                 )
         
-        # Source 2: pb1_universe_scored watchlist bundle
+        # Source 2: pb1_universe_scored watchlist bundle (fallback)
         if self.repo and self.env:
+            logger.info("[WATCHLIST][DERIVED_SOURCE][TRY] source=pb1_universe_scored as_of=%s", as_of)
             try:
                 loaded = self.repo.load_watchlist(
                     env=self.env,
                     strategy="pb1_universe_scored",
                     as_of=as_of,
-                    allow_latest_fallback=False,
+                    allow_latest_fallback=True,  # Allow fallback for this source too
                 )
                 scored_rows: List[Any] = []
                 if isinstance(loaded, tuple):
@@ -1520,31 +1590,39 @@ class WatchlistBuilder:
                 else:
                     scored_rows = loaded or []
                 
-                if scored_rows:
+                is_valid, rs_nonzero, vcp_nonzero, trend_nonzero = _check_quality(scored_rows, "pb1_universe_scored")
+                
+                if not scored_rows:
+                    logger.warning("[WATCHLIST][DERIVED_SOURCE][MISS] source=pb1_universe_scored reason=no_rows")
+                elif not is_valid:
+                    logger.warning(
+                        "[WATCHLIST][DERIVED_SOURCE][REJECT] source=pb1_universe_scored reason=all_scores_zero rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                        len(scored_rows), rs_nonzero, vcp_nonzero, trend_nonzero
+                    )
+                else:
+                    # Valid fallback source
                     for row in scored_rows:
                         sym = self._norm_symbol(row)
                         if sym and sym not in derived_map:
                             derived_map[sym] = row
                     
-                    rs_nonzero = sum(1 for r in scored_rows 
-                                    if _safe_float(_row_get(r, "rs_percentile", _row_get(r, "rs_score", 0.0))) > 0)
-                    vcp_nonzero = sum(1 for r in scored_rows 
-                                     if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
-                    trend_nonzero = sum(1 for r in scored_rows 
-                                       if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
-                    
                     logger.info(
-                        "[WATCHLIST][DERIVED_SOURCE] source=pb1_universe_scored rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                        "[WATCHLIST][DERIVED_SOURCE][OK] source=pb1_universe_scored rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
                         len(scored_rows), rs_nonzero, vcp_nonzero, trend_nonzero
                     )
+                    return derived_map  # Success - use fallback
+                    
             except Exception as e:
                 logger.warning(
-                    "[WATCHLIST][DERIVED_SOURCE] failed to load from pb1_universe_scored: %s",
+                    "[WATCHLIST][DERIVED_SOURCE][ERROR] source=pb1_universe_scored error=%s",
                     str(e)
                 )
         
+        # If we get here, no valid source was found
         if not derived_map:
-            logger.warning("[WATCHLIST][DERIVED_SOURCE] no source data loaded - scores will use fallback calculations")
+            error_msg = "No valid derived score source found - all sources either empty or all-zero scores"
+            logger.error("[WATCHLIST][DERIVED_SOURCE][FAIL] %s", error_msg)
+            raise RuntimeError(error_msg)
         
         return derived_map
 
@@ -1620,16 +1698,42 @@ class WatchlistBuilder:
             out.append(row)
 
         # Enhanced logging with all score types
+        rs_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "rs_score", 0.0)) > 0)
+        vcp_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
+        trend_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
+        breakout_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0)
+        pullback_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0)
+        momentum_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0)
+        
         logger.info(
             "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
             len(out),
-            sum(1 for r in out if _safe_float(_row_get(r, "rs_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "trend_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0),
+            rs_nonzero,
+            vcp_nonzero,
+            trend_nonzero,
+            breakout_nonzero,
+            pullback_nonzero,
+            momentum_nonzero,
         )
+        
+        # Quality check: verify merge result quality
+        min_expected_rows = int(len(rows) * 0.90)  # 90% of input rows
+        quality_failures = []
+        
+        if len(out) < min_expected_rows:
+            quality_failures.append(f"row_count_low:{len(out)}<{min_expected_rows}")
+        
+        if rs_nonzero == 0 and vcp_nonzero == 0 and trend_nonzero == 0:
+            quality_failures.append("all_minervini_scores_zero")
+        
+        if breakout_nonzero == 0 and pullback_nonzero == 0 and momentum_nonzero == 0:
+            quality_failures.append("all_entry_scores_zero")
+        
+        if quality_failures:
+            error_msg = f"DERIVED_MERGE quality check failed: {';'.join(quality_failures)}"
+            logger.error("[WATCHLIST][DERIVED_MERGE][FAIL] %s", error_msg)
+            raise RuntimeError(error_msg)
+        
         return out
     
     def _compute_breakout_score(self, row: Any) -> float:
@@ -1943,6 +2047,29 @@ class WatchlistBuilder:
         breakout_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0)
         pullback_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0)
         momentum_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0)
+        
+        # Entry style detailed logging
+        logger.info(
+            "[SCORE][BREAKOUT][%s] input=%d nonzero=%d missing=%d",
+            stage_name,
+            len(out),
+            breakout_nonzero,
+            len(out) - breakout_nonzero,
+        )
+        logger.info(
+            "[SCORE][PULLBACK][%s] input=%d nonzero=%d missing=%d",
+            stage_name,
+            len(out),
+            pullback_nonzero,
+            len(out) - pullback_nonzero,
+        )
+        logger.info(
+            "[SCORE][MOMENTUM][%s] input=%d nonzero=%d missing=%d",
+            stage_name,
+            len(out),
+            momentum_nonzero,
+            len(out) - momentum_nonzero,
+        )
         
         logger.info(
             "[WATCHLIST][SCORES][%s] rows=%d tech_nonzero=%d final_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",

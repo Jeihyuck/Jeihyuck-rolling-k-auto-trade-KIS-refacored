@@ -403,12 +403,26 @@ def main() -> int:
     # ✅ VERIFY: Check derived_minervini scores immediately after computation
     logger.info("[PREP][DERIVED][MINERVINI] upserted=%s", derived_upserted)
     
+    # Derived verification with FAIL on quality issues
+    derived_verify_passed = False
+    derived_verify_reason = ""
+    
     try:
         from trader.db.repos import DerivedMinerviniRepo
         minervini_repo = DerivedMinerviniRepo(engine)
-        verify_rows = minervini_repo.load_derived(env=env, as_of=as_of)
+        verify_rows = minervini_repo.load_derived(env=env, as_of=as_of, allow_fallback=False)
         
-        if verify_rows:
+        if not verify_rows:
+            derived_verify_reason = "no_rows_loaded"
+            logger.error(
+                "[PREP][DERIVED_VERIFY][FAIL] as_of=%s rows=0 reason=%s",
+                as_of,
+                derived_verify_reason,
+            )
+        else:
+            row_count = len(verify_rows)
+            expected_min_rows = int(len(symbols) * 0.80)  # 80% of universe
+            
             rs_nonzero = sum(1 for r in verify_rows if float(r.get("rs_percentile", 0) or 0) > 0 or float(r.get("rs_score", 0) or 0) > 0)
             vcp_nonzero = sum(1 for r in verify_rows if float(r.get("vcp_score", 0) or 0) > 0)
             trend_nonzero = sum(1 for r in verify_rows if float(r.get("trend_score", 0) or 0) > 0)
@@ -416,26 +430,53 @@ def main() -> int:
             pullback_nonzero = sum(1 for r in verify_rows if float(r.get("pullback_score", 0) or 0) > 0)
             momentum_nonzero = sum(1 for r in verify_rows if float(r.get("momentum_score", 0) or 0) > 0)
             
-            logger.info(
-                "[PREP][DERIVED_VERIFY] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
-                as_of,
-                len(verify_rows),
-                rs_nonzero,
-                vcp_nonzero,
-                trend_nonzero,
-                breakout_nonzero,
-                pullback_nonzero,
-                momentum_nonzero,
-            )
+            # Quality checks
+            quality_failures = []
+            
+            if row_count < expected_min_rows:
+                quality_failures.append(f"row_count_too_low:{row_count}<{expected_min_rows}")
             
             if rs_nonzero == 0 and vcp_nonzero == 0 and trend_nonzero == 0:
-                logger.warning(
-                    "[PREP][DERIVED_VERIFY][WARN] all Minervini scores are zero - watchlist merge may fail"
+                quality_failures.append("all_minervini_scores_zero")
+            
+            if quality_failures:
+                derived_verify_passed = False
+                derived_verify_reason = ";".join(quality_failures)
+                logger.error(
+                    "[PREP][DERIVED_VERIFY][FAIL] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d reason=%s",
+                    as_of,
+                    row_count,
+                    rs_nonzero,
+                    vcp_nonzero,
+                    trend_nonzero,
+                    breakout_nonzero,
+                    pullback_nonzero,
+                    momentum_nonzero,
+                    derived_verify_reason,
                 )
-        else:
-            logger.warning("[PREP][DERIVED_VERIFY][WARN] no derived rows loaded - check Minervini compute/store logic")
+            else:
+                derived_verify_passed = True
+                logger.info(
+                    "[PREP][DERIVED_VERIFY][OK] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+                    as_of,
+                    row_count,
+                    rs_nonzero,
+                    vcp_nonzero,
+                    trend_nonzero,
+                    breakout_nonzero,
+                    pullback_nonzero,
+                    momentum_nonzero,
+                )
     except Exception as e:
-        logger.warning("[PREP][DERIVED_VERIFY][ERROR] verification failed: %s", str(e))
+        derived_verify_passed = False
+        derived_verify_reason = f"exception:{str(e)}"
+        logger.error("[PREP][DERIVED_VERIFY][ERROR] verification failed: %s", str(e), exc_info=True)
+    
+    # FAIL PREP if derived verification failed (unless explicitly disabled)
+    if not derived_verify_passed and not _env_true("SKIP_DERIVED_VERIFY", "0"):
+        error_msg = f"PREP FAILED: derived_minervini verification failed - {derived_verify_reason}"
+        logger.error("[PREP][FATAL] %s", error_msg)
+        raise RuntimeError(error_msg)
 
     t_pool = time.monotonic()
     force_candidate = os.getenv("FORCE_CANDIDATE", "0") == "1"
