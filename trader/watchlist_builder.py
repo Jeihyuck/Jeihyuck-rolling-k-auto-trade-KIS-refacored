@@ -1872,6 +1872,9 @@ class WatchlistBuilder:
         )
         
         return round(max(0.0, min(tech_score, 100.0)), 4)
+
+    def _compute_flow_score(self, row: Any) -> float:
+        """
         한국 시장용 수급 점수.
         foreign / institution 관련 값이 없으면 0 반환.
         """
@@ -2145,11 +2148,6 @@ def save_bundle(
     as_of: date,
     bundle: WatchlistBundle,
 ) -> None:
-    """
-    Bundle 4종(universe_scored, pool120, top50, final30)을 DB에 원자적으로 저장.
-    
-    이 함수는 PREP 파이프라인의 단일 저장 지점으로,
-    모든 중간 산출물이 누락 없이 저장됨을 보장한다.
     """
     Save watchlist bundle to DB.
     
