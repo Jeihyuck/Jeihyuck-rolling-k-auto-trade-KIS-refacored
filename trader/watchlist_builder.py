@@ -1441,129 +1441,416 @@ class WatchlistBuilder:
         )
         return normalized_final
 
-    def _merge_derived_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+    def _norm_symbol(self, row: Any) -> str:
         """
-        rows(symbol 기반)에 derived/minervini 점수를 붙인다.
-        없는 경우 0이 아니라 fallback 계산값을 넣는다.
+        Normalize symbol from various field names to 6-digit format.
         """
-        symbols: List[str] = []
-        for r in rows:
-            sym = _row_get(r, "symbol", _row_get(r, "code", None))
-            if sym:
-                symbols.append(str(sym))
+        sym = (
+            _row_get(row, "symbol", None) or
+            _row_get(row, "code", None) or
+            _row_get(row, "stock_code", None) or
+            ""
+        )
+        return str(sym).zfill(6) if sym else ""
 
-        derived_map: Dict[str, Any] = {}
-
-        # 가능하면 universe_scored DB 번들에서 우선 로드
-        try:
-            scored_rows: List[Any] = []
-            if self.repo is not None and self.env:
+    def _load_minervini_source_map(self, as_of: date) -> Dict[str, Dict[str, Any]]:
+        """
+        Load Minervini/derived scores from all available sources.
+        
+        Priority:
+          1. derived_minervini repo (DerivedMinerviniRepo)
+          2. pb1_universe_scored watchlist bundle
+          3. best_k_meta universe score source
+        
+        Returns:
+            Dict[symbol, row] with rs/vcp/trend/breakout/pullback/momentum scores
+        """
+        derived_map: Dict[str, Dict[str, Any]] = {}
+        
+        # Source 1: DerivedMinerviniRepo
+        if self.repo and hasattr(self.repo, 'engine'):
+            try:
+                from trader.db.repos import DerivedMinerviniRepo
+                minervini_repo = DerivedMinerviniRepo(self.repo.engine)
+                derived_rows = minervini_repo.load_derived(env=self.env or "prep", as_of=as_of)
+                
+                if derived_rows:
+                    for row in derived_rows:
+                        sym = self._norm_symbol(row)
+                        if sym:
+                            derived_map[sym] = row
+                    
+                    # Log source stats
+                    rs_nonzero = sum(1 for r in derived_rows 
+                                    if _safe_float(_row_get(r, "rs_percentile", _row_get(r, "rs_score", 0.0))) > 0)
+                    vcp_nonzero = sum(1 for r in derived_rows 
+                                     if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
+                    trend_nonzero = sum(1 for r in derived_rows 
+                                       if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
+                    
+                    logger.info(
+                        "[WATCHLIST][DERIVED_SOURCE] source=derived_minervini rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                        len(derived_rows), rs_nonzero, vcp_nonzero, trend_nonzero
+                    )
+                    
+                    if rs_nonzero > 0 or vcp_nonzero > 0 or trend_nonzero > 0:
+                        return derived_map  # Use this source if it has data
+                    else:
+                        logger.warning(
+                            "[WATCHLIST][DERIVED_SOURCE] source=derived_minervini has rows but all scores are zero"
+                        )
+            except Exception as e:
+                logger.warning(
+                    "[WATCHLIST][DERIVED_SOURCE] failed to load from derived_minervini: %s",
+                    str(e)
+                )
+        
+        # Source 2: pb1_universe_scored watchlist bundle
+        if self.repo and self.env:
+            try:
                 loaded = self.repo.load_watchlist(
                     env=self.env,
                     strategy="pb1_universe_scored",
                     as_of=as_of,
                     allow_latest_fallback=False,
                 )
+                scored_rows: List[Any] = []
                 if isinstance(loaded, tuple):
                     scored_rows = loaded[0] or []
                 else:
                     scored_rows = loaded or []
-        except Exception:
-            scored_rows = []
+                
+                if scored_rows:
+                    for row in scored_rows:
+                        sym = self._norm_symbol(row)
+                        if sym and sym not in derived_map:
+                            derived_map[sym] = row
+                    
+                    rs_nonzero = sum(1 for r in scored_rows 
+                                    if _safe_float(_row_get(r, "rs_percentile", _row_get(r, "rs_score", 0.0))) > 0)
+                    vcp_nonzero = sum(1 for r in scored_rows 
+                                     if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0)
+                    trend_nonzero = sum(1 for r in scored_rows 
+                                       if _safe_float(_row_get(r, "trend_score", 0.0)) > 0)
+                    
+                    logger.info(
+                        "[WATCHLIST][DERIVED_SOURCE] source=pb1_universe_scored rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                        len(scored_rows), rs_nonzero, vcp_nonzero, trend_nonzero
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[WATCHLIST][DERIVED_SOURCE] failed to load from pb1_universe_scored: %s",
+                    str(e)
+                )
+        
+        if not derived_map:
+            logger.warning("[WATCHLIST][DERIVED_SOURCE] no source data loaded - scores will use fallback calculations")
+        
+        return derived_map
 
-        for r in scored_rows:
-            sym = _row_get(r, "symbol", _row_get(r, "code", None))
-            if sym:
-                derived_map[str(sym)] = r
-
+    def _merge_derived_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+        """
+        Merge derived Minervini scores into watchlist rows.
+        
+        Uses _load_minervini_source_map to get scores from all available sources.
+        Falls back to calculated values only when source data is unavailable.
+        """
+        derived_map = self._load_minervini_source_map(as_of)
+        
         out: List[Any] = []
         for row in rows:
-            sym = _row_get(row, "symbol", _row_get(row, "code", None))
-            ref = derived_map.get(str(sym)) if sym is not None else None
+            sym = self._norm_symbol(row)
+            ref = derived_map.get(sym) if sym else None
 
+            # Priority: ref source -> current row -> fallback calculation
             rs_percentile = _safe_float(_row_get(ref, "rs_percentile", _row_get(row, "rs_percentile", 0.0)))
-            rs_score = _safe_float(_row_get(ref, "rs_score", _row_get(row, "rs_score", rs_percentile)))
+            rs_score = _safe_float(_row_get(ref, "rs_score", _row_get(row, "rs_score", 0.0)))
             vcp_score = _safe_float(_row_get(ref, "vcp_score", _row_get(row, "vcp_score", 0.0)))
             trend_score = _safe_float(_row_get(ref, "trend_score", _row_get(row, "trend_score", 0.0)))
+            
+            # Also copy MA and price data from ref if available
+            ma20 = _safe_float(_row_get(ref, "ma20", _row_get(row, "ma20", 0.0)))
+            ma50 = _safe_float(_row_get(ref, "ma50", _row_get(row, "ma50", 0.0)))
+            ma150 = _safe_float(_row_get(ref, "ma150", _row_get(row, "ma150", 0.0)))
+            close = _safe_float(_row_get(ref, "close", _row_get(row, "close", 0.0)))
+            volume = _safe_float(_row_get(ref, "volume", _row_get(row, "volume", 0.0)))
+            volume_avg20 = _safe_float(_row_get(ref, "volume_avg20", _row_get(row, "volume_avg20", 0.0)))
+            
+            # Copy breakout/pullback/momentum scores if present in ref
+            breakout_score = _safe_float(_row_get(ref, "breakout_score", _row_get(row, "breakout_score", 0.0)))
+            pullback_score = _safe_float(_row_get(ref, "pullback_score", _row_get(row, "pullback_score", 0.0)))
+            momentum_score = _safe_float(_row_get(ref, "momentum_score", _row_get(row, "momentum_score", 0.0)))
+            entry_style = _row_get(ref, "entry_style", _row_get(row, "entry_style", None))
 
-            # fallback 1: rs_score가 없으면 rs_percentile 사용
+            # Fallback 1: rs_score가 없으면 rs_percentile 사용
             if rs_score <= 0 and rs_percentile > 0:
                 rs_score = rs_percentile
 
-            # fallback 2: trend_score가 없으면 MA 구조로 즉석 계산
+            # Fallback 2: trend_score가 없으면 MA 구조로 즉석 계산
             if trend_score <= 0:
-                close = _safe_float(_row_get(row, "close", 0.0))
-                ma20 = _safe_float(_row_get(row, "ma20", 0.0))
-                ma50 = _safe_float(_row_get(row, "ma50", 0.0))
-                ma150 = _safe_float(_row_get(row, "ma150", 0.0))
-
                 tmp = 0.0
                 if close > 0 and ma20 > 0 and close >= ma20:
-                    tmp += 35.0
+                    tmp += 25.0
                 if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
-                    tmp += 35.0
+                    tmp += 25.0
                 if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
-                    tmp += 30.0
+                    tmp += 25.0
+                # MA150 slope check (simplified)
+                if ma150 > 0:
+                    tmp += 25.0
                 trend_score = tmp
 
+            # Set all fields
             _row_set(row, "rs_percentile", rs_percentile)
             _row_set(row, "rs_score", rs_score)
             _row_set(row, "vcp_score", vcp_score)
             _row_set(row, "trend_score", trend_score)
+            _row_set(row, "ma20", ma20)
+            _row_set(row, "ma50", ma50)
+            _row_set(row, "ma150", ma150)
+            _row_set(row, "close", close)
+            _row_set(row, "volume", volume)
+            _row_set(row, "volume_avg20", volume_avg20)
+            _row_set(row, "breakout_score", breakout_score)
+            _row_set(row, "pullback_score", pullback_score)
+            _row_set(row, "momentum_score", momentum_score)
+            if entry_style:
+                _row_set(row, "entry_style", entry_style)
 
             out.append(row)
 
+        # Enhanced logging with all score types
         logger.info(
-            "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+            "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
             len(out),
             sum(1 for r in out if _safe_float(_row_get(r, "rs_score", 0.0)) > 0),
             sum(1 for r in out if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0),
             sum(1 for r in out if _safe_float(_row_get(r, "trend_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0),
         )
         return out
     
-    def _compute_tech_score(self, row: Any) -> float:
+    def _compute_breakout_score(self, row: Any) -> float:
         """
-        TOP50/FINAL30 ranking용 tech score 계산.
-        무조건 0~100 범위로 정규화되도록 설계.
+        Calculate breakout score based on:
+        - Proximity to 20/55-day highs
+        - Volume surge
+        - Resistance breakout
+        
+        Returns score in 0-100 range.
         """
-        rs_pct = _safe_float(_row_get(row, "rs_percentile", _row_get(row, "rs_score", 0.0)))
-        rs_score = _safe_float(_row_get(row, "rs_score", rs_pct))
-        vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
-        trend_score = _safe_float(_row_get(row, "trend_score", 0.0))
+        close = _safe_float(_row_get(row, "close", 0.0))
+        high_20d = _safe_float(_row_get(row, "high_20d", _row_get(row, "high20", 0.0)))
+        high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
+        volume = _safe_float(_row_get(row, "volume", 0.0))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+        
+        score = 0.0
+        
+        # Near 20-day high
+        if close > 0 and high_20d > 0:
+            ratio = close / high_20d
+            if ratio >= 0.98:
+                score += 35.0
+            elif ratio >= 0.95:
+                score += 20.0
+        
+        # Near 55-day high
+        if close > 0 and high_55d > 0:
+            ratio = close / high_55d
+            if ratio >= 0.97:
+                score += 35.0
+            elif ratio >= 0.93:
+                score += 20.0
+        
+        # Volume surge
+        if volume > 0 and volume_avg20 > 0:
+            vol_ratio = volume / volume_avg20
+            if vol_ratio >= 1.5:
+                score += 30.0
+            elif vol_ratio >= 1.2:
+                score += 15.0
+        
+        return min(score, 100.0)
 
+    def _compute_pullback_score(self, row: Any) -> float:
+        """
+        Calculate pullback score based on:
+        - Staying above key MAs during pullback
+        - Pullback depth in optimal range (3-18%)
+        - Volume contraction during pullback
+        
+        Returns score in 0-100 range.
+        """
         close = _safe_float(_row_get(row, "close", 0.0))
         ma20 = _safe_float(_row_get(row, "ma20", 0.0))
         ma50 = _safe_float(_row_get(row, "ma50", 0.0))
-        ma150 = _safe_float(_row_get(row, "ma150", 0.0))
+        high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
         volume = _safe_float(_row_get(row, "volume", 0.0))
         volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+        
+        score = 0.0
+        
+        # Staying above MA20
+        if close > 0 and ma20 > 0 and close >= ma20:
+            score += 25.0
+        # Or at least above MA50
+        elif close > 0 and ma50 > 0 and close >= ma50:
+            score += 15.0
+        
+        # Pullback depth check
+        if close > 0 and high_55d > 0:
+            pullback_pct = ((high_55d - close) / high_55d) * 100.0
+            if 3.0 <= pullback_pct <= 18.0:
+                score += 40.0
+            elif 1.0 <= pullback_pct <= 25.0:
+                score += 25.0
+        
+        # Volume contraction during pullback
+        if volume > 0 and volume_avg20 > 0:
+            vol_ratio = volume / volume_avg20
+            if vol_ratio < 0.8:
+                score += 35.0
+            elif vol_ratio < 1.0:
+                score += 20.0
+        
+        return min(score, 100.0)
 
-        # RS fallback
-        rs_component = rs_score if rs_score > 0 else rs_pct
-        rs_component = max(0.0, min(rs_component, 100.0))
+    def _compute_momentum_score(self, row: Any) -> float:
+        """
+        Calculate momentum score based on:
+        - 20/60/120-day returns
+        - Relative strength maintenance
+        
+        Returns score in 0-100 range.
+        """
+        ret_20d = _safe_float(_row_get(row, "ret_20d", _row_get(row, "ret20", 0.0)))
+        ret_60d = _safe_float(_row_get(row, "ret_60d", _row_get(row, "ret60", 0.0)))
+        ret_120d = _safe_float(_row_get(row, "ret_120d", _row_get(row, "ret120", 0.0)))
+        rs_score = _safe_float(_row_get(row, "rs_score", 0.0))
+        
+        score = 0.0
+        
+        # 20-day return
+        if ret_20d > 0:
+            score += 25.0
+        
+        # 60-day return
+        if ret_60d > 0:
+            score += 35.0
+        
+        # 120-day return
+        if ret_120d > 0:
+            score += 40.0
+        
+        # Bonus for strong RS
+        if rs_score >= 80:
+            score = min(score * 1.1, 100.0)
+        
+        return min(score, 100.0)
 
-        # VCP fallback
+    def _compute_tech_score(self, row: Any) -> float:
+        """
+        Calculate comprehensive tech score with 5 components:
+        1. RS component (30%)
+        2. VCP component (20%)
+        3. Trend component (20%)
+        4. Entry component (20%) - max(breakout, pullback, momentum)
+        5. Liquidity component (10%)
+        
+        All components are 0-100 normalized.
+        Returns final score in 0-100 range.
+        """
+        # 1. RS Component
+        rs_pct = _safe_float(_row_get(row, "rs_percentile", 0.0))
+        rs_score = _safe_float(_row_get(row, "rs_score", rs_pct))
+        rs_component = max(0.0, min(rs_score if rs_score > 0 else rs_pct, 100.0))
+        
+        # 2. VCP Component
+        vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
         if vcp_score <= 0:
-            # VCP score가 없으면 과도하게 0을 주지 않고 중립값 사용
-            vcp_component = 30.0
+            # Fallback VCP calculation
+            close = _safe_float(_row_get(row, "close", 0.0))
+            high_20d = _safe_float(_row_get(row, "high_20d", _row_get(row, "high20", 0.0)))
+            volume = _safe_float(_row_get(row, "volume", 0.0))
+            volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+            
+            vcp_tmp = 0.0
+            # Volatility contraction (8-12 week pattern) - simplified
+            if volume > 0 and volume_avg20 > 0 and volume / volume_avg20 < 1.0:
+                vcp_tmp += 40.0
+            # Near high
+            if close > 0 and high_20d > 0 and close / high_20d >= 0.90:
+                vcp_tmp += 30.0
+            # Volume contraction
+            if volume > 0 and volume_avg20 > 0 and volume / volume_avg20 < 0.8:
+                vcp_tmp += 30.0
+            
+            vcp_component = max(0.0, min(vcp_tmp, 100.0))
         else:
             vcp_component = max(0.0, min(vcp_score, 100.0))
-
-        # Trend fallback
+        
+        # 3. Trend Component
+        trend_score = _safe_float(_row_get(row, "trend_score", 0.0))
         if trend_score <= 0:
-            t = 0.0
+            # Fallback trend calculation
+            close = _safe_float(_row_get(row, "close", 0.0))
+            ma20 = _safe_float(_row_get(row, "ma20", 0.0))
+            ma50 = _safe_float(_row_get(row, "ma50", 0.0))
+            ma150 = _safe_float(_row_get(row, "ma150", 0.0))
+            
+            trend_tmp = 0.0
             if close > 0 and ma20 > 0 and close >= ma20:
-                t += 35.0
+                trend_tmp += 25.0
             if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
-                t += 35.0
+                trend_tmp += 25.0
             if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
-                t += 30.0
-            trend_component = t
+                trend_tmp += 25.0
+            if ma150 > 0:  # Simplified MA150 slope positive check
+                trend_tmp += 25.0
+            
+            trend_component = max(0.0, min(trend_tmp, 100.0))
         else:
             trend_component = max(0.0, min(trend_score, 100.0))
-
-        liquidity_component = 20.0
+        
+        # 4. Entry Component - Calculate or retrieve all three entry styles
+        breakout_score = _safe_float(_row_get(row, "breakout_score", 0.0))
+        pullback_score = _safe_float(_row_get(row, "pullback_score", 0.0))
+        momentum_score = _safe_float(_row_get(row, "momentum_score", 0.0))
+        
+        # Calculate if not present
+        if breakout_score <= 0:
+            breakout_score = self._compute_breakout_score(row)
+            _row_set(row, "breakout_score", breakout_score)
+        
+        if pullback_score <= 0:
+            pullback_score = self._compute_pullback_score(row)
+            _row_set(row, "pullback_score", pullback_score)
+        
+        if momentum_score <= 0:
+            momentum_score = self._compute_momentum_score(row)
+            _row_set(row, "momentum_score", momentum_score)
+        
+        # Entry component = max of the three styles
+        entry_component = max(breakout_score, pullback_score, momentum_score)
+        _row_set(row, "entry_component", entry_component)
+        
+        # Determine selected entry style
+        if entry_component == breakout_score:
+            entry_style_selected = "BREAKOUT"
+        elif entry_component == pullback_score:
+            entry_style_selected = "PULLBACK"
+        else:
+            entry_style_selected = "MOMENTUM"
+        _row_set(row, "entry_style_selected", entry_style_selected)
+        
+        # 5. Liquidity Component
+        volume = _safe_float(_row_get(row, "volume", 0.0))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+        
+        liquidity_component = 20.0  # Default low score
         if volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
             if vol_ratio >= 2.0:
@@ -1574,17 +1861,17 @@ class WatchlistBuilder:
                 liquidity_component = 60.0
             elif vol_ratio >= 1.0:
                 liquidity_component = 40.0
-
+        
+        # Final weighted tech score
         tech_score = (
-            rs_component * 0.45
-            + vcp_component * 0.25
-            + trend_component * 0.20
-            + liquidity_component * 0.10
+            rs_component * 0.30 +
+            vcp_component * 0.20 +
+            trend_component * 0.20 +
+            entry_component * 0.20 +
+            liquidity_component * 0.10
         )
-        return round(max(0.0, tech_score), 4)
-
-    def _compute_flow_score(self, row: Any) -> float:
-        """
+        
+        return round(max(0.0, min(tech_score, 100.0)), 4)
         한국 시장용 수급 점수.
         foreign / institution 관련 값이 없으면 0 반환.
         """
@@ -1630,7 +1917,8 @@ class WatchlistBuilder:
 
     def _attach_scores(self, rows: List[Any], stage_name: str) -> List[Any]:
         """
-        rows 전체에 tech_score / flow_score / final_score를 강제로 채움
+        Attach tech_score, flow_score, and final_score to all rows.
+        Enhanced with entry-style scores logging.
         """
         out: List[Any] = []
 
@@ -1646,14 +1934,25 @@ class WatchlistBuilder:
 
             out.append(row)
 
+        # Enhanced logging with all score types
+        tech_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "tech_score", 0.0)) > 0)
+        final_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "score_final", 0.0)) > 0)
+        breakout_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0)
+        pullback_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0)
+        momentum_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0)
+        
         logger.info(
-            "[WATCHLIST][SCORES][%s] rows=%d tech_nonzero=%d final_nonzero=%d",
+            "[WATCHLIST][SCORES][%s] rows=%d tech_nonzero=%d final_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
             stage_name,
             len(out),
-            sum(1 for r in out if _safe_float(_row_get(r, "tech_score", 0.0)) > 0),
-            sum(1 for r in out if _safe_float(_row_get(r, "score_final", 0.0)) > 0),
+            tech_nonzero,
+            final_nonzero,
+            breakout_nonzero,
+            pullback_nonzero,
+            momentum_nonzero,
         )
 
+        # Sample output with all fields
         logger.info(
             "[WATCHLIST][SCORES][%s][SAMPLE] %s",
             stage_name,
@@ -1664,6 +1963,10 @@ class WatchlistBuilder:
                     "rs_score": _row_get(r, "rs_score", None),
                     "vcp_score": _row_get(r, "vcp_score", None),
                     "trend_score": _row_get(r, "trend_score", None),
+                    "breakout_score": _row_get(r, "breakout_score", None),
+                    "pullback_score": _row_get(r, "pullback_score", None),
+                    "momentum_score": _row_get(r, "momentum_score", None),
+                    "entry_style_selected": _row_get(r, "entry_style_selected", None),
                     "tech_score": _row_get(r, "tech_score", None),
                     "flow_score": _row_get(r, "flow_score", None),
                     "score_final": _row_get(r, "score_final", None),
@@ -1847,8 +2150,14 @@ def save_bundle(
     
     이 함수는 PREP 파이프라인의 단일 저장 지점으로,
     모든 중간 산출물이 누락 없이 저장됨을 보장한다.
+    """
+    Save watchlist bundle to DB.
     
-    ✅ FIX: pb1_pool120은 더 이상 별도로 저장하지 않음 (pb1_candidate_pool이 진실의 원천)
+    Saves all 4 stages:
+    - pb1_universe_scored (full universe with scores)
+    - pb1_pool120 (A-stage filtered pool)
+    - pb1_top50 (B-stage top 50)
+    - pb1_watchlist_final (C-stage final 30)
     """
     repo = WatchlistRepo(engine)
     
@@ -1862,7 +2171,7 @@ def save_bundle(
         len(bundle.final30),
     )
     
-    # 1. universe_scored 저장
+    # 1. universe_scored - FULL universe (should be 196, not 120)
     if bundle.universe_scored:
         repo.save_watchlist(
             env=env,
@@ -1874,9 +2183,15 @@ def save_bundle(
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_universe_scored empty")
     
-    # 2. pool120 - NO LONGER SAVED (use pb1_candidate_pool as single source of truth)
+    # 2. pool120 - NOW SAVED (not skipped)
     if bundle.pool120:
-        logger.info("[BUNDLE][SAVE][INFO] pool120 n=%s (NOT saved to DB - use pb1_candidate_pool)", len(bundle.pool120))
+        repo.save_watchlist(
+            env=env,
+            strategy="pb1_pool120",
+            as_of=as_of,
+            members=bundle.pool120,
+        )
+        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(bundle.pool120))
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_pool120 empty")
     
@@ -1917,12 +2232,16 @@ def recover_bundle_from_db(
     exact_final30: int = 30,
 ) -> Optional[WatchlistBundle]:
     """
-    DB에서 4종 bundle을 로드하여 복구 시도.
+    Recover watchlist bundle from DB.
     
-    ✅ FIX: pb1_pool120은 로드하지 않음 (pb1_candidate_pool을 진실의 원천으로 사용)
+    Loads all 4 stages:
+    - pb1_universe_scored
+    - pb1_pool120 (with fallback to pb1_candidate_pool if missing)
+    - pb1_top50
+    - pb1_watchlist_final
     
     Returns:
-        WatchlistBundle if all 3 stages meet requirements, else None
+        WatchlistBundle if all stages meet requirements, else None
     """
     repo = WatchlistRepo(engine)
     
@@ -1935,13 +2254,50 @@ def recover_bundle_from_db(
         exact_final30,
     )
     
-    # Load 3 stages from DB (pool120 is derived from candidate_pool)
+    # Load all 4 stages from DB
     universe_rows, _ = repo.load_watchlist(
         env=env,
         strategy="pb1_universe_scored",
         as_of=as_of,
         allow_latest_fallback=False,
     )
+    
+    # Try loading pb1_pool120 first (normal path)
+    pool120_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_pool120",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    
+    # Fallback to candidate_pool if pb1_pool120 is missing
+    if not pool120_rows or len(pool120_rows) < min_pool:
+        logger.warning(
+            "[BUNDLE][RECOVER_DB][POOL120_FALLBACK] pb1_pool120 missing or too small (%s), trying pb1_candidate_pool",
+            len(pool120_rows) if pool120_rows else 0
+        )
+        try:
+            from trader.candidate_pool_builder import load_candidate_pool
+            
+            pool_codes, pool_as_of, pool_reason = load_candidate_pool(
+                engine=engine,
+                env=env,
+                today=as_of,
+            )
+            if pool_codes:
+                # Create minimal pool120 rows with codes
+                pool120_rows = [{"code": str(code).zfill(6), "name": ""} for code in pool_codes]
+                logger.warning(
+                    "[BUNDLE][RECOVER_DB][POOL120_FALLBACK] source=pb1_candidate_pool reason=pb1_pool120_missing count=%s",
+                    len(pool120_rows)
+                )
+        except Exception as exc:
+            logger.warning("[BUNDLE][RECOVER_DB][POOL120_FALLBACK] candidate_pool_load_fail err=%s", exc)
+    else:
+        logger.info(
+            "[BUNDLE][RECOVER_DB][POOL120] source=pb1_pool120 count=%s",
+            len(pool120_rows)
+        )
     
     top50_rows, _ = repo.load_watchlist(
         env=env,
@@ -1956,31 +2312,10 @@ def recover_bundle_from_db(
         allow_latest_fallback=False,
     )
     
-    # Load pool120 from candidate_pool (single source of truth)
-    pool120_rows = []
-    try:
-        from trader.candidate_pool_builder import load_candidate_pool
-        
-        pool_codes, pool_as_of, pool_reason = load_candidate_pool(
-            engine=engine,
-            env=env,
-            today=as_of,
-        )
-        if pool_codes:
-            # Create minimal pool120 rows with codes
-            pool120_rows = [{"code": str(code).zfill(6), "name": ""} for code in pool_codes]
-            logger.info(
-                "[BUNDLE][RECOVER_DB][POOL120] source=candidate_pool count=%s reason=%s",
-                len(pool120_rows),
-                pool_reason,
-            )
-    except Exception as exc:
-        logger.warning("[BUNDLE][RECOVER_DB][POOL120] candidate_pool_load_fail err=%s", exc)
-    
     logger.info(
         "[BUNDLE][RECOVER_DB][LOADED] universe=%s pool120=%s top50=%s final30=%s",
         len(universe_rows) if universe_rows else 0,
-        len(pool120_rows),
+        len(pool120_rows) if pool120_rows else 0,
         len(top50_rows) if top50_rows else 0,
         len(final30_rows) if final30_rows else 0,
     )

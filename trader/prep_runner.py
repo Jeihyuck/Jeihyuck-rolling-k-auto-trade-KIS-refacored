@@ -400,6 +400,43 @@ def main() -> int:
     )
     dt_derived = time.monotonic() - t_derived
 
+    # ✅ VERIFY: Check derived_minervini scores immediately after computation
+    logger.info("[PREP][DERIVED][MINERVINI] upserted=%s", derived_upserted)
+    
+    try:
+        from trader.db.repos import DerivedMinerviniRepo
+        minervini_repo = DerivedMinerviniRepo(engine)
+        verify_rows = minervini_repo.load_derived(env=env, as_of=as_of)
+        
+        if verify_rows:
+            rs_nonzero = sum(1 for r in verify_rows if float(r.get("rs_percentile", 0) or 0) > 0 or float(r.get("rs_score", 0) or 0) > 0)
+            vcp_nonzero = sum(1 for r in verify_rows if float(r.get("vcp_score", 0) or 0) > 0)
+            trend_nonzero = sum(1 for r in verify_rows if float(r.get("trend_score", 0) or 0) > 0)
+            breakout_nonzero = sum(1 for r in verify_rows if float(r.get("breakout_score", 0) or 0) > 0)
+            pullback_nonzero = sum(1 for r in verify_rows if float(r.get("pullback_score", 0) or 0) > 0)
+            momentum_nonzero = sum(1 for r in verify_rows if float(r.get("momentum_score", 0) or 0) > 0)
+            
+            logger.info(
+                "[PREP][DERIVED_VERIFY] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+                as_of,
+                len(verify_rows),
+                rs_nonzero,
+                vcp_nonzero,
+                trend_nonzero,
+                breakout_nonzero,
+                pullback_nonzero,
+                momentum_nonzero,
+            )
+            
+            if rs_nonzero == 0 and vcp_nonzero == 0 and trend_nonzero == 0:
+                logger.warning(
+                    "[PREP][DERIVED_VERIFY][WARN] all Minervini scores are zero - watchlist merge may fail"
+                )
+        else:
+            logger.warning("[PREP][DERIVED_VERIFY][WARN] no derived rows loaded - check Minervini compute/store logic")
+    except Exception as e:
+        logger.warning("[PREP][DERIVED_VERIFY][ERROR] verification failed: %s", str(e))
+
     t_pool = time.monotonic()
     force_candidate = os.getenv("FORCE_CANDIDATE", "0") == "1"
     watchlist_force_rebuild = (

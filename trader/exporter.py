@@ -104,9 +104,22 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized["as_of"] = str(_pick("as_of", default="") or "")
     normalized["name"] = str(_pick("name", default="") or "")
-    normalized["tech_score"] = float(_pick("tech_score", "score_tech") or 0.0)
-    normalized["flow_score"] = float(_pick("flow_score", "score_flow") or 0.0)
-    normalized["final_score"] = float(_pick("final_score", "score_final", "score") or 0.0)
+    
+    # Enhanced score normalization with proper priority
+    tech_score = float(_pick("tech_score", "score_tech", default=0.0) or 0.0)
+    flow_score = float(_pick("flow_score", "score_flow", default=0.0) or 0.0)
+    score_final = float(_pick("score_final", "final_score", "score", default=0.0) or 0.0)
+    
+    normalized["tech_score"] = tech_score
+    normalized["flow_score"] = flow_score
+    normalized["final_score"] = score_final
+    
+    # Add entry-style scores
+    normalized["breakout_score"] = float(_pick("breakout_score", default=0.0) or 0.0)
+    normalized["pullback_score"] = float(_pick("pullback_score", default=0.0) or 0.0)
+    normalized["momentum_score"] = float(_pick("momentum_score", default=0.0) or 0.0)
+    normalized["entry_style_selected"] = str(_pick("entry_style_selected", "entry_style", default="") or "")
+    normalized["entry_component"] = float(_pick("entry_component", default=0.0) or 0.0)
 
     normalized["filters_passed"] = _as_list(normalized.get("filters_passed"))
     normalized["filters_failed"] = _as_list(normalized.get("filters_failed") or failed)
@@ -117,6 +130,7 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized["score_liq"] = float(_pick("score_liq", "liq_avg") or 0.0)
 
+    # Legacy score_tech/score_flow/score_final for backward compatibility
     score_tech = float(_pick("score_tech", "tech_score") or 0.0)
     if score_tech <= 0.0:
         fallback_tech = float(_pick("tech_score", default=0.0) or 0.0)
@@ -124,19 +138,19 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
             score_tech = fallback_tech
     normalized["score_tech"] = score_tech
 
-    score_flow = float(_pick("score_flow", "flow_score") or 0.0)
-    if score_flow <= 0.0:
+    score_flow_legacy = float(_pick("score_flow", "flow_score") or 0.0)
+    if score_flow_legacy <= 0.0:
         fallback_flow = float(_pick("flow_score", default=0.0) or 0.0)
         if fallback_flow > 0.0:
-            score_flow = fallback_flow
-    normalized["score_flow"] = score_flow
+            score_flow_legacy = fallback_flow
+    normalized["score_flow"] = score_flow_legacy
 
-    score_final = float(_pick("score_final", "final_score", "score") or 0.0)
-    if score_final <= 0.0:
+    score_final_legacy = float(_pick("score_final", "final_score", "score") or 0.0)
+    if score_final_legacy <= 0.0:
         fallback_final = float(_pick("final_score", "score", default=0.0) or 0.0)
         if fallback_final > 0.0:
-            score_final = fallback_final
-    normalized["score_final"] = score_final
+            score_final_legacy = fallback_final
+    normalized["score_final"] = score_final_legacy
 
     for key in _REQUIRED_EXPORT_KEYS:
         if key in {"filters_passed", "filters_failed"}:
@@ -225,14 +239,23 @@ def export_watchlist_bundle(
             )
         
         if not df.empty:
+            tech_nonzero = int((df["tech_score"].fillna(0.0) > 0.0).sum()) if "tech_score" in df.columns else 0
             score_final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0
             final_score_nonzero = int((df["final_score"].fillna(0.0) > 0.0).sum()) if "final_score" in df.columns else 0
+            breakout_nonzero = int((df["breakout_score"].fillna(0.0) > 0.0).sum()) if "breakout_score" in df.columns else 0
+            pullback_nonzero = int((df["pullback_score"].fillna(0.0) > 0.0).sum()) if "pullback_score" in df.columns else 0
+            momentum_nonzero = int((df["momentum_score"].fillna(0.0) > 0.0).sum()) if "momentum_score" in df.columns else 0
+            
             logger.info(
-                "[EXPORT][SCORES] name=%s rows=%s score_final_nonzero=%s final_score_nonzero=%s",
+                "[EXPORT][SCORES] name=%s rows=%s tech_nonzero=%s score_final_nonzero=%s final_score_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
                 safe_name,
                 int(len(df)),
+                tech_nonzero,
                 score_final_nonzero,
                 final_score_nonzero,
+                breakout_nonzero,
+                pullback_nonzero,
+                momentum_nonzero,
             )
 
         csv_path = out_dir / f"{safe_name}.csv"
