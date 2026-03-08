@@ -1725,15 +1725,306 @@ class WatchlistBuilder:
         
         if rs_nonzero == 0 and vcp_nonzero == 0 and trend_nonzero == 0:
             quality_failures.append("all_minervini_scores_zero")
-        
+
+        entry_recompute_summary: Dict[str, int] = {
+            "breakout_valid": 0,
+            "pullback_valid": 0,
+            "momentum_valid": 0,
+            "breakout_nonzero": breakout_nonzero,
+            "pullback_nonzero": pullback_nonzero,
+            "momentum_nonzero": momentum_nonzero,
+        }
+        recompute_ran = False
+
         if breakout_nonzero == 0 and pullback_nonzero == 0 and momentum_nonzero == 0:
-            quality_failures.append("all_entry_scores_zero")
+            recompute_ran = True
+            logger.warning(
+                "[WATCHLIST][ENTRY_RECOMPUTE][START] reason=all_entry_scores_zero rows=%d",
+                len(out),
+            )
+            out, entry_recompute_summary = self._recompute_entry_scores(out, as_of=as_of)
+            breakout_nonzero = entry_recompute_summary["breakout_nonzero"]
+            pullback_nonzero = entry_recompute_summary["pullback_nonzero"]
+            momentum_nonzero = entry_recompute_summary["momentum_nonzero"]
+            logger.info(
+                "[WATCHLIST][ENTRY_RECOMPUTE][DONE] breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+                breakout_nonzero,
+                pullback_nonzero,
+                momentum_nonzero,
+            )
+
+            if breakout_nonzero == 0 and pullback_nonzero == 0 and momentum_nonzero == 0:
+                if (
+                    entry_recompute_summary["breakout_valid"] == 0
+                    and entry_recompute_summary["pullback_valid"] == 0
+                    and entry_recompute_summary["momentum_valid"] == 0
+                ):
+                    quality_failures.append("entry_scores_missing_in_derived_and_recompute_not_run")
+                elif (
+                    entry_recompute_summary["breakout_valid"] == 0
+                    or entry_recompute_summary["pullback_valid"] == 0
+                    or entry_recompute_summary["momentum_valid"] == 0
+                ):
+                    missing_inputs: List[str] = []
+                    if entry_recompute_summary["breakout_valid"] == 0:
+                        missing_inputs.append("pivot")
+                    if entry_recompute_summary["pullback_valid"] == 0:
+                        missing_inputs.append("atr")
+                    if entry_recompute_summary["momentum_valid"] == 0:
+                        missing_inputs.append("rs")
+                    quality_failures.append(f"entry_score_inputs_missing:{','.join(missing_inputs)}")
+                else:
+                    quality_failures.append("entry_score_logic_all_zero_despite_valid_inputs")
+                    quality_failures.append("all_entry_scores_zero_after_recompute")
+
+        if (
+            not recompute_ran
+            and breakout_nonzero == 0
+            and pullback_nonzero == 0
+            and momentum_nonzero == 0
+        ):
+            quality_failures.append("entry_scores_missing_in_derived_and_recompute_not_run")
         
         if quality_failures:
             error_msg = f"DERIVED_MERGE quality check failed: {';'.join(quality_failures)}"
+            logger.error(
+                "[WATCHLIST][DERIVED_MERGE][FAIL] reason=%s breakout_valid=%d pullback_valid=%d momentum_valid=%d",
+                ';'.join(quality_failures),
+                entry_recompute_summary["breakout_valid"],
+                entry_recompute_summary["pullback_valid"],
+                entry_recompute_summary["momentum_valid"],
+            )
             logger.error("[WATCHLIST][DERIVED_MERGE][FAIL] %s", error_msg)
             raise RuntimeError(error_msg)
         
+        return out
+
+    def _numericize_entry_score(self, value: Any, score_name: str) -> float:
+        """Normalize booleans/NaN/inf to deterministic 0..100 numeric score."""
+        bool_true = 0
+        nan_count = 0
+        clipped = 0
+        out = 0.0
+
+        if isinstance(value, bool):
+            bool_true = 1 if value else 0
+            out = 100.0 if value else 0.0
+        else:
+            try:
+                out = float(value)
+                if pd.isna(out):
+                    nan_count = 1
+                    out = 0.0
+            except Exception:
+                out = 0.0
+
+        if out < 0.0:
+            out = 0.0
+            clipped = 1
+        elif out > 100.0:
+            out = 100.0
+            clipped = 1
+
+        logger.debug(
+            "[SCORE][%s][NUMERICIZE] bool_true=%d nan=%d clipped=%d nonzero=%d",
+            score_name,
+            bool_true,
+            nan_count,
+            clipped,
+            1 if out > 0 else 0,
+        )
+        return out
+
+    def _recompute_entry_scores(self, rows: List[Any], as_of: date) -> Tuple[List[Any], Dict[str, int]]:
+        out = self._recompute_breakout_scores(rows, as_of)
+        out = self._recompute_pullback_scores(out, as_of)
+        out = self._recompute_momentum_scores(out, as_of)
+
+        summary = {
+            "breakout_valid": sum(
+                1
+                for r in out
+                if _safe_float(_row_get(r, "close", 0.0)) > 0
+                and (
+                    _safe_float(_row_get(r, "pivot", 0.0)) > 0
+                    or _safe_float(_row_get(r, "high_55d", _row_get(r, "high55", 0.0))) > 0
+                )
+            ),
+            "pullback_valid": sum(
+                1
+                for r in out
+                if _safe_float(_row_get(r, "close", 0.0)) > 0
+                and _safe_float(_row_get(r, "high_55d", _row_get(r, "high55", 0.0))) > 0
+                and (
+                    _safe_float(_row_get(r, "ma20", 0.0)) > 0
+                    or _safe_float(_row_get(r, "ma50", 0.0)) > 0
+                )
+            ),
+            "momentum_valid": sum(
+                1
+                for r in out
+                if _safe_float(_row_get(r, "rs_score", _row_get(r, "rs_percentile", 0.0))) > 0
+            ),
+            "breakout_nonzero": sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0),
+            "pullback_nonzero": sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0),
+            "momentum_nonzero": sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0),
+        }
+        return out, summary
+
+    def _recompute_breakout_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+        out: List[Any] = []
+        has_close = has_high = has_volume = has_pivot = 0
+        valid_inputs = nonzero = missing_pivot = missing_volume = failed_condition = 0
+
+        for row in rows:
+            close = _safe_float(_row_get(row, "close", 0.0))
+            high = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
+            volume = _safe_float(_row_get(row, "volume", 0.0))
+            volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(row, "vol20", 0.0)))
+            pivot = _safe_float(_row_get(row, "pivot", 0.0))
+
+            has_close += 1 if close > 0 else 0
+            has_high += 1 if high > 0 else 0
+            has_volume += 1 if volume > 0 else 0
+            has_pivot += 1 if pivot > 0 else 0
+
+            if pivot <= 0 and high <= 0:
+                missing_pivot += 1
+            if volume <= 0 or volume_avg20 <= 0:
+                missing_volume += 1
+
+            score = self._compute_breakout_score(row)
+            score = self._numericize_entry_score(score, "BREAKOUT")
+            _row_set(row, "breakout_score", score)
+
+            if close > 0 and (pivot > 0 or high > 0):
+                valid_inputs += 1
+            if score > 0:
+                nonzero += 1
+            else:
+                failed_condition += 1
+            out.append(row)
+
+        logger.info(
+            "[SCORE][BREAKOUT][INPUTS] rows=%d has_close=%d has_high=%d has_volume=%d has_pivot=%d",
+            len(out),
+            has_close,
+            has_high,
+            has_volume,
+            has_pivot,
+        )
+        logger.info(
+            "[SCORE][BREAKOUT][RESULT] rows=%d valid_inputs=%d nonzero=%d missing_pivot=%d missing_volume=%d failed_condition=%d",
+            len(out),
+            valid_inputs,
+            nonzero,
+            missing_pivot,
+            missing_volume,
+            failed_condition,
+        )
+        return out
+
+    def _recompute_pullback_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+        out: List[Any] = []
+        has_close = has_ma = has_atr = has_pullback_depth = 0
+        valid_inputs = nonzero = missing_ma = missing_atr = outside_depth_range = 0
+
+        for row in rows:
+            close = _safe_float(_row_get(row, "close", 0.0))
+            ma20 = _safe_float(_row_get(row, "ma20", 0.0))
+            ma50 = _safe_float(_row_get(row, "ma50", 0.0))
+            atr = _safe_float(_row_get(row, "atr", _row_get(row, "atr14", 0.0)))
+            high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
+            pullback_depth = ((high_55d - close) / high_55d) * 100.0 if high_55d > 0 and close > 0 else 0.0
+
+            has_close += 1 if close > 0 else 0
+            has_ma += 1 if (ma20 > 0 or ma50 > 0) else 0
+            has_atr += 1 if atr > 0 else 0
+            has_pullback_depth += 1 if high_55d > 0 and close > 0 else 0
+
+            if ma20 <= 0 and ma50 <= 0:
+                missing_ma += 1
+            if atr <= 0:
+                missing_atr += 1
+            if not (1.0 <= pullback_depth <= 25.0):
+                outside_depth_range += 1
+
+            score = self._compute_pullback_score(row)
+            score = self._numericize_entry_score(score, "PULLBACK")
+            _row_set(row, "pullback_score", score)
+
+            if close > 0 and high_55d > 0 and (ma20 > 0 or ma50 > 0):
+                valid_inputs += 1
+            if score > 0:
+                nonzero += 1
+            out.append(row)
+
+        logger.info(
+            "[SCORE][PULLBACK][INPUTS] rows=%d has_close=%d has_ma=%d has_atr=%d has_pullback_depth=%d",
+            len(out),
+            has_close,
+            has_ma,
+            has_atr,
+            has_pullback_depth,
+        )
+        logger.info(
+            "[SCORE][PULLBACK][RESULT] rows=%d valid_inputs=%d nonzero=%d missing_ma=%d missing_atr=%d outside_depth_range=%d",
+            len(out),
+            valid_inputs,
+            nonzero,
+            missing_ma,
+            missing_atr,
+            outside_depth_range,
+        )
+        return out
+
+    def _recompute_momentum_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+        out: List[Any] = []
+        has_rs = has_trend = has_return = 0
+        valid_inputs = nonzero = missing_rs = weak_trend = 0
+
+        for row in rows:
+            rs = _safe_float(_row_get(row, "rs_score", _row_get(row, "rs_percentile", 0.0)))
+            trend = _safe_float(_row_get(row, "trend_score", 0.0))
+            ret20 = _safe_float(_row_get(row, "ret_20d", _row_get(row, "ret20", 0.0)))
+            ret60 = _safe_float(_row_get(row, "ret_60d", _row_get(row, "ret60", 0.0)))
+            ret120 = _safe_float(_row_get(row, "ret_120d", _row_get(row, "ret120", 0.0)))
+            has_return_row = 1 if (ret20 != 0 or ret60 != 0 or ret120 != 0) else 0
+
+            has_rs += 1 if rs > 0 else 0
+            has_trend += 1 if trend > 0 else 0
+            has_return += has_return_row
+
+            if rs <= 0:
+                missing_rs += 1
+            if trend <= 0:
+                weak_trend += 1
+
+            score = self._compute_momentum_score(row)
+            score = self._numericize_entry_score(score, "MOMENTUM")
+            _row_set(row, "momentum_score", score)
+
+            if rs > 0:
+                valid_inputs += 1
+            if score > 0:
+                nonzero += 1
+            out.append(row)
+
+        logger.info(
+            "[SCORE][MOMENTUM][INPUTS] rows=%d has_rs=%d has_trend=%d has_return=%d",
+            len(out),
+            has_rs,
+            has_trend,
+            has_return,
+        )
+        logger.info(
+            "[SCORE][MOMENTUM][RESULT] rows=%d valid_inputs=%d nonzero=%d missing_rs=%d weak_trend=%d",
+            len(out),
+            valid_inputs,
+            nonzero,
+            missing_rs,
+            weak_trend,
+        )
         return out
     
     def _compute_breakout_score(self, row: Any) -> float:

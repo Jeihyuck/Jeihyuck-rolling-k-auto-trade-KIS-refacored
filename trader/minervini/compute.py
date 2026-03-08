@@ -18,6 +18,135 @@ from trader.utils.json_sanitize import to_jsonable
 logger = logging.getLogger(__name__)
 
 
+def _score_or_zero(value: object) -> float:
+    """Convert score-like input to numeric 0..100 with safe fallback to 0."""
+    if value is None:
+        return 0.0
+    try:
+        if isinstance(value, bool):
+            return 100.0 if value else 0.0
+        out = float(value)
+        if pd.isna(out) or out == float("inf") or out == float("-inf"):
+            return 0.0
+        return max(0.0, min(100.0, out))
+    except Exception:
+        return 0.0
+
+
+def _compute_trend_score(feats: dict) -> float:
+    close = _score_or_zero(feats.get("close"))
+    ma20 = _score_or_zero(feats.get("ma20"))
+    ma50 = _score_or_zero(feats.get("ma50"))
+    ma150 = _score_or_zero(feats.get("ma150"))
+    ma200 = _score_or_zero(feats.get("ma200"))
+    ma200_slope = _score_or_zero(feats.get("ma200_slope"))
+
+    score = 0.0
+    if close > 0 and ma20 > 0 and close >= ma20:
+        score += 25.0
+    if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
+        score += 25.0
+    if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
+        score += 25.0
+    if ma150 > 0 and ma200 > 0 and ma150 >= ma200:
+        score += 15.0
+    if ma200 > 0 and ma200_slope > 0:
+        score += 10.0
+    return max(0.0, min(100.0, score))
+
+
+def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[float, float, float, dict]:
+    close = _score_or_zero(feats.get("close") or latest.get("close"))
+    high = _score_or_zero(latest.get("high"))
+    low = _score_or_zero(latest.get("low"))
+    volume = _score_or_zero(latest.get("volume") or feats.get("last_volume"))
+    volume_avg20 = _score_or_zero(feats.get("vol20"))
+    atr = _score_or_zero(feats.get("atr14"))
+    ma20 = _score_or_zero(feats.get("ma20"))
+    ma50 = _score_or_zero(feats.get("ma50"))
+    hi_52w = _score_or_zero(feats.get("hi_52w"))
+    pivot = _score_or_zero(feats.get("pivot"))
+    ret_63 = _score_or_zero((feats.get("ret_63") or 0.0) * 100.0)
+    ret_126 = _score_or_zero((feats.get("ret_126") or 0.0) * 100.0)
+
+    # Breakout score (0~100)
+    breakout = 0.0
+    if close > 0 and pivot > 0:
+        ratio = close / pivot
+        if ratio >= 1.00:
+            breakout += 55.0
+        elif ratio >= 0.98:
+            breakout += 35.0
+    elif close > 0 and hi_52w > 0:
+        ratio = close / hi_52w
+        if ratio >= 0.98:
+            breakout += 40.0
+        elif ratio >= 0.95:
+            breakout += 25.0
+
+    if volume > 0 and volume_avg20 > 0:
+        vol_ratio = volume / volume_avg20
+        if vol_ratio >= 1.50:
+            breakout += 35.0
+        elif vol_ratio >= 1.20:
+            breakout += 20.0
+
+    if atr > 0 and close > 0:
+        atr_pct = (atr / close) * 100.0
+        if 1.0 <= atr_pct <= 5.0:
+            breakout += 10.0
+
+    # Pullback score (0~100)
+    pullback = 0.0
+    pullback_depth = 0.0
+    if hi_52w > 0 and close > 0:
+        pullback_depth = max(0.0, ((hi_52w - close) / hi_52w) * 100.0)
+
+    if close > 0 and ma20 > 0 and close >= ma20:
+        pullback += 25.0
+    elif close > 0 and ma50 > 0 and close >= ma50:
+        pullback += 15.0
+
+    if 3.0 <= pullback_depth <= 18.0:
+        pullback += 40.0
+    elif 1.0 <= pullback_depth <= 25.0:
+        pullback += 25.0
+
+    if volume > 0 and volume_avg20 > 0:
+        vol_ratio = volume / volume_avg20
+        if vol_ratio < 0.80:
+            pullback += 35.0
+        elif vol_ratio < 1.00:
+            pullback += 20.0
+
+    # Momentum score (0~100)
+    momentum = 0.0
+    if ret_63 > 0:
+        momentum += 35.0
+    if ret_126 > 0:
+        momentum += 45.0
+    if rs_pct >= 80.0:
+        momentum += 20.0
+    elif rs_pct >= 65.0:
+        momentum += 10.0
+
+    breakout_score = _score_or_zero(breakout)
+    pullback_score = _score_or_zero(pullback)
+    momentum_score = _score_or_zero(momentum)
+
+    context = {
+        "close": close,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "atr": atr,
+        "pivot": pivot,
+        "pullback_depth": pullback_depth,
+        "rs_percentile": rs_pct,
+    }
+    return breakout_score, pullback_score, momentum_score, context
+
+
 def _as_of_date(value: date | str | None) -> date:
     if value is None:
         return now_kst().date()
@@ -63,6 +192,8 @@ def compute_minervini_features_for_asof(
 
     cfg = MinerviniConfig(rs_min_percentile=RS_MIN_PCTILE / 100.0)
 
+    entry_diag_samples: list[dict] = []
+
     for symbol in symbols_list:
         df = _load_df_from_db(engine=engine, symbol=symbol, as_of=as_of_date, days=need_days)
         # 데이터 부족 시 스킵 (NaN 생성 방지)
@@ -83,6 +214,11 @@ def compute_minervini_features_for_asof(
             feats["vcp_vol_dryup"] = bool(vcp_info.get("vol_dryup"))
             feats["vcp_tight_close"] = bool(vcp_info.get("tight_close"))
             feats["pivot"] = float(pivot_val) if pd.notna(pivot_val) else None
+            if not df.empty:
+                latest = df.iloc[-1]
+                feats["latest_high"] = float(latest.get("high", 0.0) or 0.0)
+                feats["latest_low"] = float(latest.get("low", 0.0) or 0.0)
+                feats["latest_volume"] = float(latest.get("volume", 0.0) or 0.0)
             features_map[symbol] = feats
         except Exception as exc:
             logger.debug("[DERIVED][MINERVINI][FEATURE_FAIL] symbol=%s err=%s", symbol, exc)
@@ -104,6 +240,17 @@ def compute_minervini_features_for_asof(
         ok, reasons = evaluate_filters(feats, cfg)
         vcp_info = {"score": feats.get("vcp_score"), "vcp_ok": feats.get("vcp_ok")}
         score = float(score_setup(feats, rs_percentile=rs_pct, vcp_info=vcp_info, cfg=cfg))
+        trend_score = _compute_trend_score(feats)
+        breakout_score, pullback_score, momentum_score, entry_ctx = _compute_entry_scores(
+            feats,
+            {
+                "high": feats.get("latest_high"),
+                "low": feats.get("latest_low"),
+                "volume": feats.get("latest_volume"),
+                "close": feats.get("close"),
+            },
+            rs_pct,
+        )
         rows.append(
             {
                 "env": env_n,
@@ -118,7 +265,12 @@ def compute_minervini_features_for_asof(
                 "atr": feats.get("atr14"),
                 "atr_pct": feats.get("atr_pct"),
                 "rs_percentile": rs_pct,
+                "rs_score": rs_pct,
                 "vcp_score": feats.get("vcp_score"),
+                "trend_score": trend_score,
+                "breakout_score": breakout_score,
+                "pullback_score": pullback_score,
+                "momentum_score": momentum_score,
                 "vcp_ok": feats.get("vcp_ok"),
                 "pivot": feats.get("pivot"),
                 "minervini_score": score,
@@ -135,10 +287,58 @@ def compute_minervini_features_for_asof(
                         "tight_close": feats.get("vcp_tight_close"),
                         "pivot": float(feats.get("pivot")) if feats.get("pivot") is not None else None,
                     },
+                    "entry_scores": {
+                        "breakout_score": breakout_score,
+                        "pullback_score": pullback_score,
+                        "momentum_score": momentum_score,
+                        "trend_score": trend_score,
+                    },
                     "reasons": reasons,
                 },
             }
         )
+        if len(entry_diag_samples) < 5:
+            entry_diag_samples.append(
+                {
+                    "symbol": symbol,
+                    "close": entry_ctx["close"],
+                    "pivot_price": entry_ctx["pivot"],
+                    "pullback_depth": entry_ctx["pullback_depth"],
+                    "rs_percentile": entry_ctx["rs_percentile"],
+                    "breakout_score": breakout_score,
+                    "pullback_score": pullback_score,
+                    "momentum_score": momentum_score,
+                }
+            )
+
+    has_close = sum(1 for r in rows if _score_or_zero(r.get("close")) > 0)
+    has_high = sum(1 for r in rows if _score_or_zero(((r.get("features_json") or {}).get("latest_high"))) > 0)
+    has_low = sum(1 for r in rows if _score_or_zero(((r.get("features_json") or {}).get("latest_low"))) > 0)
+    has_volume = sum(1 for r in rows if _score_or_zero(((r.get("features_json") or {}).get("last_volume"))) > 0)
+    has_atr = sum(1 for r in rows if _score_or_zero(r.get("atr")) > 0)
+    has_rs = sum(1 for r in rows if _score_or_zero(r.get("rs_percentile")) > 0)
+    breakout_nonzero = sum(1 for r in rows if _score_or_zero(r.get("breakout_score")) > 0)
+    pullback_nonzero = sum(1 for r in rows if _score_or_zero(r.get("pullback_score")) > 0)
+    momentum_nonzero = sum(1 for r in rows if _score_or_zero(r.get("momentum_score")) > 0)
+
+    logger.info(
+        "[DERIVED][MINERVINI][ENTRY_INPUTS] rows=%d has_close=%d has_high=%d has_low=%d has_volume=%d has_atr=%d has_rs=%d",
+        len(rows),
+        has_close,
+        has_high,
+        has_low,
+        has_volume,
+        has_atr,
+        has_rs,
+    )
+    logger.info(
+        "[DERIVED][MINERVINI][ENTRY_SCORES] rows=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+        len(rows),
+        breakout_nonzero,
+        pullback_nonzero,
+        momentum_nonzero,
+    )
+    logger.info("[DERIVED][MINERVINI][ENTRY_SCORES][SAMPLE] %s", entry_diag_samples)
 
     return rows
 
@@ -164,9 +364,31 @@ def compute_and_store_derived_minervini(
     
     # NaN/Inf 완전 차단 (DB upsert 직전 sanitize)
     for r in rows:
+        for score_key in ("rs_score", "trend_score", "breakout_score", "pullback_score", "momentum_score"):
+            r[score_key] = _score_or_zero(r.get(score_key))
         fj = r.get("features_json")
         if fj is not None:
             r["features_json"] = to_jsonable(fj)
+
+    includes_breakout = int(any("breakout_score" in r for r in rows))
+    includes_pullback = int(any("pullback_score" in r for r in rows))
+    includes_momentum = int(any("momentum_score" in r for r in rows))
+    breakout_nonzero = sum(1 for r in rows if _score_or_zero(r.get("breakout_score")) > 0)
+    pullback_nonzero = sum(1 for r in rows if _score_or_zero(r.get("pullback_score")) > 0)
+    momentum_nonzero = sum(1 for r in rows if _score_or_zero(r.get("momentum_score")) > 0)
+
+    logger.info(
+        "[DERIVED][MINERVINI][UPSERT_SCHEMA] includes_breakout=%d includes_pullback=%d includes_momentum=%d",
+        includes_breakout,
+        includes_pullback,
+        includes_momentum,
+    )
+    logger.info(
+        "[DERIVED][MINERVINI][UPSERT_NONZERO] breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+        breakout_nonzero,
+        pullback_nonzero,
+        momentum_nonzero,
+    )
     
     repo = DerivedMinerviniRepo(engine)
     env_n = (env or os.getenv("STRATEGY_ENV", "practice")).strip().lower()

@@ -2551,6 +2551,35 @@ class DerivedMinerviniRepo:
                         conn.execute(sa.update(schema.derived_minervini).where(where_clause).values(**update_cols))
         return len(normalized_rows)
 
+    @staticmethod
+    def _to_float(value: object, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _normalize_derived_row(self, row: dict) -> dict:
+        """Guarantee watchlist-facing score fields exist and are numeric."""
+        out = dict(row)
+        features = out.get("features_json") if isinstance(out.get("features_json"), dict) else {}
+        entry_scores = features.get("entry_scores") if isinstance(features, dict) else {}
+        if not isinstance(entry_scores, dict):
+            entry_scores = {}
+
+        rs_percentile = self._to_float(out.get("rs_percentile"), 0.0)
+        out["rs_percentile"] = rs_percentile
+        out["rs_score"] = self._to_float(out.get("rs_score"), rs_percentile)
+
+        # Backward-compat: keep vcp_score/trend_score if only in features_json payload.
+        out["vcp_score"] = self._to_float(out.get("vcp_score"), self._to_float(features.get("vcp_score"), 0.0))
+        out["trend_score"] = self._to_float(out.get("trend_score"), self._to_float(entry_scores.get("trend_score"), 0.0))
+        out["breakout_score"] = self._to_float(out.get("breakout_score"), self._to_float(entry_scores.get("breakout_score"), 0.0))
+        out["pullback_score"] = self._to_float(out.get("pullback_score"), self._to_float(entry_scores.get("pullback_score"), 0.0))
+        out["momentum_score"] = self._to_float(out.get("momentum_score"), self._to_float(entry_scores.get("momentum_score"), 0.0))
+        return out
+
     def load_for_as_of(self, *, env: str, as_of: date, symbols: list[str] | None = None) -> list[dict]:
         schema = self._schema
         env_n = _norm_env(env)
@@ -2564,7 +2593,7 @@ class DerivedMinerviniRepo:
             stmt = stmt.where(schema.derived_minervini.c.symbol.in_(symbols))
         with self.engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
-        return [dict(row) for row in rows]
+        return [self._normalize_derived_row(dict(row)) for row in rows]
 
     def count_as_of(self, *, env: str, as_of: date) -> int:
         schema = self._schema
@@ -2755,12 +2784,26 @@ class DerivedMinerviniRepo:
             )
             
             if rows:
+                rows = [self._normalize_derived_row(r) for r in rows]
                 rs_nonzero = sum(1 for r in rows if (r.get("rs_percentile") or 0) > 0 or (r.get("rs_score") or 0) > 0)
                 vcp_nonzero = sum(1 for r in rows if (r.get("vcp_score") or 0) > 0)
                 trend_nonzero = sum(1 for r in rows if (r.get("trend_score") or 0) > 0)
+                breakout_nonzero = sum(1 for r in rows if (r.get("breakout_score") or 0) > 0)
+                pullback_nonzero = sum(1 for r in rows if (r.get("pullback_score") or 0) > 0)
+                momentum_nonzero = sum(1 for r in rows if (r.get("momentum_score") or 0) > 0)
+                includes_breakout = int(any("breakout_score" in r for r in rows))
+                includes_pullback = int(any("pullback_score" in r for r in rows))
+                includes_momentum = int(any("momentum_score" in r for r in rows))
+
+                logger.info(
+                    "[DERIVED][LOAD][FIELDS] includes_breakout=%d includes_pullback=%d includes_momentum=%d",
+                    includes_breakout,
+                    includes_pullback,
+                    includes_momentum,
+                )
                 
                 logger.info(
-                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
                     env,
                     as_of_date.isoformat(),
                     actual_as_of.isoformat() if actual_as_of else "None",
@@ -2769,6 +2812,9 @@ class DerivedMinerviniRepo:
                     rs_nonzero,
                     vcp_nonzero,
                     trend_nonzero,
+                    breakout_nonzero,
+                    pullback_nonzero,
+                    momentum_nonzero,
                 )
             else:
                 logger.warning(
@@ -2784,12 +2830,26 @@ class DerivedMinerviniRepo:
             rows = self.load_for_as_of(env=env, as_of=as_of_date, symbols=symbols)
             
             if rows:
+                rows = [self._normalize_derived_row(r) for r in rows]
                 rs_nonzero = sum(1 for r in rows if (r.get("rs_percentile") or 0) > 0 or (r.get("rs_score") or 0) > 0)
                 vcp_nonzero = sum(1 for r in rows if (r.get("vcp_score") or 0) > 0)
                 trend_nonzero = sum(1 for r in rows if (r.get("trend_score") or 0) > 0)
+                breakout_nonzero = sum(1 for r in rows if (r.get("breakout_score") or 0) > 0)
+                pullback_nonzero = sum(1 for r in rows if (r.get("pullback_score") or 0) > 0)
+                momentum_nonzero = sum(1 for r in rows if (r.get("momentum_score") or 0) > 0)
+                includes_breakout = int(any("breakout_score" in r for r in rows))
+                includes_pullback = int(any("pullback_score" in r for r in rows))
+                includes_momentum = int(any("momentum_score" in r for r in rows))
+
+                logger.info(
+                    "[DERIVED][LOAD][FIELDS] includes_breakout=%d includes_pullback=%d includes_momentum=%d",
+                    includes_breakout,
+                    includes_pullback,
+                    includes_momentum,
+                )
                 
                 logger.info(
-                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=0 rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+                    "[DERIVED][LOAD] env=%s requested_as_of=%s actual_as_of=%s rows=%d fallback=0 rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
                     env,
                     as_of_date.isoformat(),
                     as_of_date.isoformat(),
@@ -2797,6 +2857,9 @@ class DerivedMinerviniRepo:
                     rs_nonzero,
                     vcp_nonzero,
                     trend_nonzero,
+                    breakout_nonzero,
+                    pullback_nonzero,
+                    momentum_nonzero,
                 )
             else:
                 logger.warning(

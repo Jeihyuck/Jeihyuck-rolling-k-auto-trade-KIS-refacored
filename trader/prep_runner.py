@@ -429,6 +429,9 @@ def main() -> int:
             breakout_nonzero = sum(1 for r in verify_rows if float(r.get("breakout_score", 0) or 0) > 0)
             pullback_nonzero = sum(1 for r in verify_rows if float(r.get("pullback_score", 0) or 0) > 0)
             momentum_nonzero = sum(1 for r in verify_rows if float(r.get("momentum_score", 0) or 0) > 0)
+            entry_scores_deferred_to_watchlist = 1 if (
+                breakout_nonzero == 0 and pullback_nonzero == 0 and momentum_nonzero == 0
+            ) else 0
             
             # Quality checks
             quality_failures = []
@@ -457,7 +460,7 @@ def main() -> int:
             else:
                 derived_verify_passed = True
                 logger.info(
-                    "[PREP][DERIVED_VERIFY][OK] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+                    "[PREP][DERIVED_VERIFY][OK] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d entry_scores_deferred_to_watchlist=%d",
                     as_of,
                     row_count,
                     rs_nonzero,
@@ -466,6 +469,7 @@ def main() -> int:
                     breakout_nonzero,
                     pullback_nonzero,
                     momentum_nonzero,
+                    entry_scores_deferred_to_watchlist,
                 )
     except Exception as e:
         derived_verify_passed = False
