@@ -724,6 +724,11 @@ def main() -> int:
             )
         else:
             logger.info("[PREP][WATCHLIST][CONTRACT][RECOVERED] all contract requirements met after recovery")
+
+        # Use post-recovery contract state for downstream payload/event decisions.
+        contract_failures = contract_failures_after_recovery
+        if not contract_failures:
+            shortage_reason = ""
         
         allow_contract_degrade = _env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true(
             "PB1_WATCHLIST_ALLOW_DEGRADE", "0"
@@ -867,7 +872,7 @@ def main() -> int:
         
         try:
             # Load flow data from DB for final30 symbols
-            flow_rows = flow_repo.load_by_symbols(env=env, as_of=as_of, symbols=final30_codes)
+            flow_rows = flow_repo.load_for_as_of(env=env, as_of=as_of, symbols=final30_codes)
             covered = {str(r.get("symbol", "")).zfill(6) for r in flow_rows if not r.get("flow_missing", True)}
             flow_coverage = len(covered) / max(len(final30_codes), 1)
             flow_missing_count = len(final30_codes) - len(covered)

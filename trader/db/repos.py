@@ -2874,6 +2874,21 @@ class DerivedFlowRepo:
         with self.engine.connect() as conn:
             return int(conn.execute(stmt).scalar() or 0)
 
+    def load_for_as_of(self, *, env: str, as_of: date, symbols: list[str] | None = None) -> list[dict]:
+        schema = self._schema
+        env_n = _norm_env(env)
+        stmt = select(schema.derived_flow).where(
+            and_(
+                schema.derived_flow.c.env == env_n,
+                schema.derived_flow.c.as_of == to_date(as_of),
+            )
+        )
+        if symbols:
+            stmt = stmt.where(schema.derived_flow.c.symbol.in_(symbols))
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(row) for row in rows]
+
 
 def save_watchlist(
     engine: Engine,

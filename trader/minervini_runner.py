@@ -129,6 +129,8 @@ def run_diag_minervini_only(
         builder = WatchlistBuilder(
             ohlcv_provider=_ohlcv_provider,
             minervini_config=minervini_config,
+            env=env,
+            repo=WatchlistRepo(engine),
             pooln=120,
             topk=50,
             finaln=30,

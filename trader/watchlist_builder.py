@@ -575,6 +575,8 @@ class WatchlistBuilder:
         *,
         ohlcv_provider: Any,
         minervini_config: Dict[str, Any],
+        env: Optional[str] = None,
+        repo: Optional[WatchlistRepo] = None,
         pooln: int = 120,
         topk: int = 50,
         finaln: int = 30,
@@ -589,6 +591,8 @@ class WatchlistBuilder:
     ):
         self.ohlcv_provider = ohlcv_provider
         self.minervini_config = minervini_config
+        self.env = env
+        self.repo = repo
         self.pooln = pooln
         self.topk = topk
         self.finaln = finaln
@@ -624,7 +628,8 @@ class WatchlistBuilder:
 
         pool120, universe_scored = self._stage_a_liquidity_filter(members, as_of)
 
-        # 점수 강제 부여
+        # A단계는 derived/minervini 점수 merge 이후 score 부여
+        pool120 = self._merge_derived_scores(pool120, as_of=as_of)
         pool120 = self._attach_scores(pool120, "A_POOL120")
         self._assert_nonzero_scores(pool120, "A_POOL120", score_key="tech_score")
 
@@ -1435,81 +1440,130 @@ class WatchlistBuilder:
             self.finaln,
         )
         return normalized_final
+
+    def _merge_derived_scores(self, rows: List[Any], as_of: date) -> List[Any]:
+        """
+        rows(symbol 기반)에 derived/minervini 점수를 붙인다.
+        없는 경우 0이 아니라 fallback 계산값을 넣는다.
+        """
+        symbols: List[str] = []
+        for r in rows:
+            sym = _row_get(r, "symbol", _row_get(r, "code", None))
+            if sym:
+                symbols.append(str(sym))
+
+        derived_map: Dict[str, Any] = {}
+
+        # 가능하면 universe_scored DB 번들에서 우선 로드
+        try:
+            scored_rows: List[Any] = []
+            if self.repo is not None and self.env:
+                loaded = self.repo.load_watchlist(
+                    env=self.env,
+                    strategy="pb1_universe_scored",
+                    as_of=as_of,
+                    allow_latest_fallback=False,
+                )
+                if isinstance(loaded, tuple):
+                    scored_rows = loaded[0] or []
+                else:
+                    scored_rows = loaded or []
+        except Exception:
+            scored_rows = []
+
+        for r in scored_rows:
+            sym = _row_get(r, "symbol", _row_get(r, "code", None))
+            if sym:
+                derived_map[str(sym)] = r
+
+        out: List[Any] = []
+        for row in rows:
+            sym = _row_get(row, "symbol", _row_get(row, "code", None))
+            ref = derived_map.get(str(sym)) if sym is not None else None
+
+            rs_percentile = _safe_float(_row_get(ref, "rs_percentile", _row_get(row, "rs_percentile", 0.0)))
+            rs_score = _safe_float(_row_get(ref, "rs_score", _row_get(row, "rs_score", rs_percentile)))
+            vcp_score = _safe_float(_row_get(ref, "vcp_score", _row_get(row, "vcp_score", 0.0)))
+            trend_score = _safe_float(_row_get(ref, "trend_score", _row_get(row, "trend_score", 0.0)))
+
+            # fallback 1: rs_score가 없으면 rs_percentile 사용
+            if rs_score <= 0 and rs_percentile > 0:
+                rs_score = rs_percentile
+
+            # fallback 2: trend_score가 없으면 MA 구조로 즉석 계산
+            if trend_score <= 0:
+                close = _safe_float(_row_get(row, "close", 0.0))
+                ma20 = _safe_float(_row_get(row, "ma20", 0.0))
+                ma50 = _safe_float(_row_get(row, "ma50", 0.0))
+                ma150 = _safe_float(_row_get(row, "ma150", 0.0))
+
+                tmp = 0.0
+                if close > 0 and ma20 > 0 and close >= ma20:
+                    tmp += 35.0
+                if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
+                    tmp += 35.0
+                if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
+                    tmp += 30.0
+                trend_score = tmp
+
+            _row_set(row, "rs_percentile", rs_percentile)
+            _row_set(row, "rs_score", rs_score)
+            _row_set(row, "vcp_score", vcp_score)
+            _row_set(row, "trend_score", trend_score)
+
+            out.append(row)
+
+        logger.info(
+            "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d",
+            len(out),
+            sum(1 for r in out if _safe_float(_row_get(r, "rs_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "vcp_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "trend_score", 0.0)) > 0),
+        )
+        return out
     
     def _compute_tech_score(self, row: Any) -> float:
         """
         TOP50/FINAL30 ranking용 tech score 계산.
         무조건 0~100 범위로 정규화되도록 설계.
         """
-        meta = _row_get(row, "meta", {})
-        if not isinstance(meta, dict):
-            meta = {}
+        rs_pct = _safe_float(_row_get(row, "rs_percentile", _row_get(row, "rs_score", 0.0)))
+        rs_score = _safe_float(_row_get(row, "rs_score", rs_pct))
+        vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
+        trend_score = _safe_float(_row_get(row, "trend_score", 0.0))
 
-        rs_pct = _safe_float(
-            _row_get(
-                row,
-                "rs_percentile",
-                _row_get(
-                    row,
-                    "rs_score",
-                    _row_get(
-                        row,
-                        "rs_rank_score",
-                        _row_get(
-                            row,
-                            "rs_pctile",
-                            _row_get(
-                                meta,
-                                "rs_percentile",
-                                _row_get(meta, "rs_score", _row_get(meta, "rs_pctile", 0.0)),
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        )
-        vcp_score = _safe_float(
-            _row_get(
-                row,
-                "vcp_score",
-                _row_get(row, "vcp_rank_score", _row_get(meta, "vcp_score", _row_get(meta, "vcp_rank_score", 0.0))),
-            )
-        )
-        trend_score = _safe_float(
-            _row_get(
-                row,
-                "trend_score",
-                _row_get(
-                    row,
-                    "trend_rank_score",
-                    _row_get(meta, "trend_score", _row_get(meta, "trend_rank_score", 0.0)),
-                ),
-            )
-        )
+        close = _safe_float(_row_get(row, "close", 0.0))
+        ma20 = _safe_float(_row_get(row, "ma20", 0.0))
+        ma50 = _safe_float(_row_get(row, "ma50", 0.0))
+        ma150 = _safe_float(_row_get(row, "ma150", 0.0))
+        volume = _safe_float(_row_get(row, "volume", 0.0))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
 
-        close = _safe_float(_row_get(row, "close", _row_get(row, "last_close", _row_get(meta, "close", _row_get(meta, "last_close", 0.0)))))
-        ma20 = _safe_float(_row_get(row, "ma20", _row_get(meta, "ma20", 0.0)))
-        ma50 = _safe_float(_row_get(row, "ma50", _row_get(meta, "ma50", 0.0)))
-        ma150 = _safe_float(_row_get(row, "ma150", _row_get(row, "ma200", _row_get(meta, "ma150", _row_get(meta, "ma200", 0.0)))))
-        volume = _safe_float(_row_get(row, "volume", _row_get(meta, "volume", 0.0)))
-        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(meta, "volume_avg20", 0.0)))
+        # RS fallback
+        rs_component = rs_score if rs_score > 0 else rs_pct
+        rs_component = max(0.0, min(rs_component, 100.0))
 
-        rs_component = max(0.0, min(rs_pct, 100.0))
-        vcp_component = max(0.0, min(vcp_score, 100.0))
+        # VCP fallback
+        if vcp_score <= 0:
+            # VCP score가 없으면 과도하게 0을 주지 않고 중립값 사용
+            vcp_component = 30.0
+        else:
+            vcp_component = max(0.0, min(vcp_score, 100.0))
 
+        # Trend fallback
         if trend_score <= 0:
-            trend_component = 0.0
-            if close > 0 and ma20 > 0 and ma50 > 0:
-                if close >= ma20:
-                    trend_component += 35.0
-                if ma20 >= ma50:
-                    trend_component += 35.0
-                if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
-                    trend_component += 30.0
+            t = 0.0
+            if close > 0 and ma20 > 0 and close >= ma20:
+                t += 35.0
+            if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
+                t += 35.0
+            if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
+                t += 30.0
+            trend_component = t
         else:
             trend_component = max(0.0, min(trend_score, 100.0))
 
-        liquidity_component = 0.0
+        liquidity_component = 20.0
         if volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
             if vol_ratio >= 2.0:
@@ -1520,8 +1574,6 @@ class WatchlistBuilder:
                 liquidity_component = 60.0
             elif vol_ratio >= 1.0:
                 liquidity_component = 40.0
-            else:
-                liquidity_component = 20.0
 
         tech_score = (
             rs_component * 0.45
@@ -1585,12 +1637,7 @@ class WatchlistBuilder:
         for row in rows:
             tech_score = self._compute_tech_score(row)
             flow_score = self._compute_flow_score(row)
-            final_score = self._compute_final_score(
-                {
-                    "tech_score": tech_score,
-                    "flow_score": flow_score,
-                }
-            )
+            final_score = round(tech_score * 0.7 + flow_score * 0.3, 4)
 
             _row_set(row, "tech_score", tech_score)
             _row_set(row, "flow_score", flow_score)
@@ -1599,15 +1646,30 @@ class WatchlistBuilder:
 
             out.append(row)
 
-        nonzero_tech = sum(1 for r in out if _safe_float(_row_get(r, "tech_score", 0.0)) > 0)
-        nonzero_final = sum(1 for r in out if _safe_float(_row_get(r, "score_final", 0.0)) > 0)
-
         logger.info(
             "[WATCHLIST][SCORES][%s] rows=%d tech_nonzero=%d final_nonzero=%d",
             stage_name,
             len(out),
-            nonzero_tech,
-            nonzero_final,
+            sum(1 for r in out if _safe_float(_row_get(r, "tech_score", 0.0)) > 0),
+            sum(1 for r in out if _safe_float(_row_get(r, "score_final", 0.0)) > 0),
+        )
+
+        logger.info(
+            "[WATCHLIST][SCORES][%s][SAMPLE] %s",
+            stage_name,
+            [
+                {
+                    "symbol": _row_get(r, "symbol", _row_get(r, "code", None)),
+                    "rs_percentile": _row_get(r, "rs_percentile", None),
+                    "rs_score": _row_get(r, "rs_score", None),
+                    "vcp_score": _row_get(r, "vcp_score", None),
+                    "trend_score": _row_get(r, "trend_score", None),
+                    "tech_score": _row_get(r, "tech_score", None),
+                    "flow_score": _row_get(r, "flow_score", None),
+                    "score_final": _row_get(r, "score_final", None),
+                }
+                for r in out[:5]
+            ],
         )
 
         return out
@@ -1638,6 +1700,16 @@ class WatchlistBuilder:
             )
 
         if nonzero == 0:
+            if stage_name == "A_POOL120" and score_key == "tech_score":
+                alt_nonzero = sum(1 for r in rows if _safe_float(_row_get(r, "score_final", 0.0)) > 0)
+                if alt_nonzero > 0:
+                    logger.warning(
+                        "[WATCHLIST][SCORES][DEGRADE] stage=%s tech_score all zero but score_final nonzero=%d",
+                        stage_name,
+                        alt_nonzero,
+                    )
+                    return
+
             logger.info(
                 "[WATCHLIST][DEBUG][TOP50_SAMPLE] %s",
                 [
@@ -1992,6 +2064,8 @@ def rebuild_bundle(
     builder = WatchlistBuilder(
         ohlcv_provider=ohlcv_provider,
         minervini_config=minervini_config,
+        env=env,
+        repo=WatchlistRepo(engine),
         pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
         topk=_env_int("PB1_WATCHLIST_TOPK", 50),
         finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
@@ -2243,6 +2317,8 @@ def build_and_save_watchlist(
     builder = WatchlistBuilder(
         ohlcv_provider=ohlcv_provider,
         minervini_config=minervini_config,
+        env=env,
+        repo=repo,
         pooln=_env_int("PB1_WATCHLIST_POOLN", 120),
         topk=_env_int("PB1_WATCHLIST_TOPK", 50),
         finaln=_env_int("PB1_WATCHLIST_FINALN", 30),
@@ -2440,6 +2516,8 @@ def load_today_watchlist_with_fallback(
         builder = WatchlistBuilder(
             ohlcv_provider=ohlcv_provider,
             minervini_config=minervini_config,
+            env=env,
+            repo=repo,
             pooln=_env_int("PB1_WATCHLIST_TOPK", 50),
             topk=_env_int("PB1_WATCHLIST_TOPK", 50),
             finaln=_env_int("PB1_WATCHLIST_TOPK", 50),
