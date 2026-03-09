@@ -146,9 +146,10 @@ def test_final30_consistency_lhs_prefers_scored_df_not_saved_df():
     saved_light_df = pd.DataFrame([{"code": "000001", "meta": {}, "rank": 1, "score": 1}])
 
     selected_df, label = _select_final30_scored_df_for_export(
-        watchlist_result_final30_df=scored_df,
-        watchlist_bundle_final30_scored_df=pd.DataFrame(),
+        watchlist_result={"final30_scored": scored_df},
+        watchlist_bundle={},
         bundle_final30_scored_before_save_df=saved_light_df,
+        final30_saved_df=saved_light_df,
     )
 
     assert label == "watchlist_result.final30_scored"
@@ -159,9 +160,21 @@ def test_final30_consistency_lhs_prefers_scored_df_not_saved_df():
 def test_final30_consistency_lhs_missing_scored_source_raises():
     with pytest.raises(RuntimeError, match="final30_scored_source_missing"):
         _select_final30_scored_df_for_export(
-            watchlist_result_final30_df=pd.DataFrame([{"code": "000001", "score": 1}]),
-            watchlist_bundle_final30_scored_df=pd.DataFrame(),
+            watchlist_result={"final30": [{"code": "000001", "score": 1}]},
+            watchlist_bundle={},
             bundle_final30_scored_before_save_df=pd.DataFrame([{"code": "000001", "meta": {}}]),
+            final30_saved_df=pd.DataFrame([{"code": "000001", "meta": {}}]),
+        )
+
+
+def test_final30_selector_rejects_skinny_bundle_final30():
+    skinny_final30 = [{"code": "000001", "meta": {}, "rank": 1, "score": 1.2}]
+    with pytest.raises(RuntimeError, match="final30_scored_source_missing"):
+        _select_final30_scored_df_for_export(
+            watchlist_result={},
+            watchlist_bundle={"final30": skinny_final30},
+            bundle_final30_scored_before_save_df=pd.DataFrame(skinny_final30),
+            final30_saved_df=pd.DataFrame(skinny_final30),
         )
 
 

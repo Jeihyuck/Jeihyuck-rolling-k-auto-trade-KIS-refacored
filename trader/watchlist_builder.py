@@ -25,6 +25,7 @@ from trader.factors.multifactor import (
     compute_volatility_score,
     optimize_meta_k,
 )
+from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,57 @@ def _env_float(key: str, default: float) -> float:
 def _env_bool(key: str, default: bool) -> bool:
     val = os.getenv(key, str(default)).lower()
     return val in ("1", "true", "yes", "on")
+
+
+def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    saved_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows or [], start=1):
+        item = dict(row or {})
+        score = item.get("score")
+        if score is None:
+            score = item.get("score_final")
+        if score is None:
+            score = item.get("final_score")
+        try:
+            score_val = float(score or 0.0)
+        except Exception:
+            score_val = 0.0
+        saved_rows.append(
+            {
+                "code": str(item.get("code") or "").zfill(6),
+                "meta": item.get("meta", {}),
+                "rank": int(item.get("rank") or idx),
+                "score": score_val,
+            }
+        )
+    return saved_rows
+
+
+def _log_final30_scored_rows(prefix: str, rows: List[Dict[str, Any]]) -> None:
+    df = pd.DataFrame(rows or [])
+    logger.info(
+        "%s rows=%s has_tech_score=%s has_score_final=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",
+        prefix,
+        int(len(df)),
+        int(resolve_score_column(df, "tech") is not None),
+        int(resolve_score_column(df, "final") is not None),
+        int(resolve_score_column(df, "breakout") is not None),
+        int(resolve_score_column(df, "pullback") is not None),
+        int(resolve_score_column(df, "momentum") is not None),
+    )
+
+
+def _log_final30_scored_df_ready(final30_scored_df: pd.DataFrame) -> None:
+    logger.info(
+        "[WATCHLIST][FINAL30_SCORED][READY] rows=%s cols=%s has_tech=%s has_final=%s has_breakout=%s has_pullback=%s has_momentum=%s",
+        len(final30_scored_df),
+        list(final30_scored_df.columns),
+        "tech_score" in final30_scored_df.columns,
+        ("score_final" in final30_scored_df.columns) or ("final_score" in final30_scored_df.columns),
+        "breakout_score" in final30_scored_df.columns,
+        "pullback_score" in final30_scored_df.columns,
+        "momentum_score" in final30_scored_df.columns,
+    )
 
 
 def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -775,9 +827,13 @@ class WatchlistBuilder:
                 f"{self.final_weights['volatility']:.4f}*volatility"
             ),
             "universe_scored": universe_scored,
+            "universe_scored_df": universe_scored,
             "pool120": pool120,
+            "pool120_scored": pool120,
             "top50": top50,
+            "top50_scored": top50,
             "final30": final30,
+            "final30_scored": final30,
             "reject_summary": dict(reject_counter),
             "final_count": len(final30),
             "requested_finaln": int(self.finaln),
@@ -3012,12 +3068,6 @@ def build_and_save_watchlist(
                 len(members),
                 as_of,
             )
-            if pool_reason == "future_snapshot":
-                logger.warning(
-                    "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_future_snapshot members=%s requested_as_of=%s",
-                    len(members),
-                    as_of,
-                )
     except Exception as exc:
         logger.warning(
             "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_load_fail err=%s members=%s requested_as_of=%s",
@@ -3109,6 +3159,17 @@ def build_and_save_watchlist(
                 )
                 
                 if return_bundle:
+                    final30_scored_rows = [dict(row) for row in (existing or [])]
+                    final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+                    _log_final30_scored_df_ready(final30_scored_df)
+                    final30_saved_rows = _build_final30_saved_rows(existing or [])
+                    final30_snapshot_rows = [dict(row) for row in (existing or [])]
+                    logger.info(
+                        "[BUNDLE][KEEP][FINAL30_SCORED] rows=%s has_scores=%s",
+                        len(final30_scored_rows),
+                        int(len(final30_scored_rows) > 0),
+                    )
+                    _log_final30_scored_rows("[WATCHLIST][RETURN][FINAL30_SCORED]", final30_scored_rows)
                     degrade_reason = "cache_bundle_stage_recovered" if bundle_recovered else "cache_bundle_stage_missing"
                     return existing, {
                         "as_of": as_of,
@@ -3130,9 +3191,15 @@ def build_and_save_watchlist(
                         },
                         "formula": "score_final = 0.3000*ai_rs + 0.2000*trend + 0.1500*pullback + 0.1500*liquidity + 0.1000*flow + 0.1000*volatility",
                         "universe_scored": universe_scored,
+                        "universe_scored_df": universe_scored,
                         "pool120": pool120,
+                        "pool120_scored": pool120,
                         "top50": top50,
+                        "top50_scored": top50,
                         "final30": existing,
+                        "final30_scored": final30_scored_df,
+                        "final30_saved": final30_saved_rows,
+                        "final30_snapshot_df": final30_snapshot_rows,
                         "reject_summary": {degrade_reason: 1},
                         "shortage_reason": "" if bundle_recovered else degrade_reason,
                         "degrade": {
@@ -3209,6 +3276,35 @@ def build_and_save_watchlist(
         logger.info("[WATCHLIST][SNAPSHOT][SAVE] path=%s count=%s", snapshot_path, len(watchlist))
     except Exception as exc:
         logger.warning("[WATCHLIST][SNAPSHOT][SAVE_FAIL] err=%s -> continuing", exc)
+
+    final30_scored_rows = [
+        dict(row)
+        for row in (
+            (builder.last_bundle or {}).get("final30_scored")
+            or (builder.last_bundle or {}).get("final30")
+            or watchlist
+            or []
+        )
+    ]
+    final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+    _log_final30_scored_df_ready(final30_scored_df)
+    final30_saved_rows = _build_final30_saved_rows(watchlist or [])
+    final30_saved_df = pd.DataFrame(final30_saved_rows).copy(deep=True)
+    final30_snapshot_rows = [dict(row) for row in (watchlist or [])]
+    if builder.last_bundle:
+        builder.last_bundle["final30_scored"] = final30_scored_df
+        builder.last_bundle["final30_saved"] = final30_saved_rows
+        builder.last_bundle["final30_saved_df"] = final30_saved_df
+        builder.last_bundle["final30_snapshot_df"] = final30_snapshot_rows
+        builder.last_bundle["top50_scored"] = builder.last_bundle.get("top50_scored", builder.last_bundle.get("top50", []))
+        builder.last_bundle["pool120_scored"] = builder.last_bundle.get("pool120_scored", builder.last_bundle.get("pool120", []))
+        builder.last_bundle["universe_scored_df"] = builder.last_bundle.get("universe_scored_df", builder.last_bundle.get("universe_scored", []))
+        logger.info(
+            "[BUNDLE][KEEP][FINAL30_SCORED] rows=%s has_scores=%s",
+            len(final30_scored_rows),
+            int(len(final30_scored_rows) > 0),
+        )
+        _log_final30_scored_rows("[WATCHLIST][RETURN][FINAL30_SCORED]", final30_scored_rows)
     
     # CRITICAL: Always save bundle (4 stages) to prevent data loss
     # This ensures intermediate stages are never missing from DB
@@ -3252,6 +3348,7 @@ def build_and_save_watchlist(
                     "source": "fresh_build",
                 },
             )
+            setattr(bundle, "final30_scored", final30_scored_df.copy(deep=True))
             
             # Use centralized save_bundle function to ensure atomicity
             save_bundle(
@@ -3281,6 +3378,15 @@ def build_and_save_watchlist(
             # Don't raise - allow workflow to continue but log as critical
 
     if return_bundle:
+        if builder.last_bundle is None:
+            builder.last_bundle = {}
+        builder.last_bundle.setdefault("final30_scored", final30_scored_df)
+        builder.last_bundle.setdefault("final30_saved", final30_saved_rows)
+        builder.last_bundle.setdefault("final30_saved_df", final30_saved_df)
+        builder.last_bundle.setdefault("final30_snapshot_df", final30_snapshot_rows)
+        builder.last_bundle.setdefault("top50_scored", builder.last_bundle.get("top50", []))
+        builder.last_bundle.setdefault("pool120_scored", builder.last_bundle.get("pool120", []))
+        builder.last_bundle.setdefault("universe_scored_df", builder.last_bundle.get("universe_scored", []))
         return watchlist, builder.last_bundle
     return watchlist
 

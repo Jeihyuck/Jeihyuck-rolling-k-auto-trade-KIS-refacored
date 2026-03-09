@@ -6,6 +6,7 @@ import time
 import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pandas as pd
@@ -231,22 +232,124 @@ def _has_required_final30_score_fields(df: pd.DataFrame) -> bool:
     return has_required_score_fields(df, ("tech", "final", "breakout", "pullback", "momentum"))
 
 
+def _extract_container_value(container: Any, key: str) -> Any:
+    if container is None:
+        return None
+    if isinstance(container, dict):
+        return container.get(key)
+    if hasattr(container, key):
+        return getattr(container, key)
+    return None
+
+
+def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _as_dataframe(value: Any) -> pd.DataFrame:
+    if value is None:
+        return pd.DataFrame()
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+    if isinstance(value, list):
+        return pd.DataFrame(value)
+    if isinstance(value, tuple):
+        return pd.DataFrame(list(value))
+    if isinstance(value, dict):
+        return pd.DataFrame([value])
+    return pd.DataFrame()
+
+
+def _is_scored_final30_df(df: pd.DataFrame) -> bool:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    skinny_cols = {"code", "meta", "rank", "score"}
+    normalized_cols = {str(col) for col in df.columns}
+    if normalized_cols.issubset(skinny_cols):
+        return False
+    matched = 0
+    for logical_name in ("tech", "final", "breakout", "pullback", "momentum"):
+        if resolve_score_column(df, logical_name) is not None:
+            matched += 1
+    return matched >= 2
+
+
+def _is_valid_final30_scored_df(df: Any) -> bool:
+    if not isinstance(df, pd.DataFrame):
+        return False
+    if df is None or getattr(df, "empty", True):
+        return False
+    cols = set(df.columns)
+    has_code = "code" in cols
+    has_tech = "tech_score" in cols
+    has_final = ("score_final" in cols) or ("final_score" in cols)
+    has_entry = (
+        ("breakout_score" in cols)
+        or ("pullback_score" in cols)
+        or ("momentum_score" in cols)
+    )
+    return has_code and has_tech and has_final and has_entry
+
+
 def _select_final30_scored_df_for_export(
     *,
-    watchlist_result_final30_df: pd.DataFrame,
-    watchlist_bundle_final30_scored_df: pd.DataFrame,
+    watchlist_result: Any,
+    watchlist_bundle: Any,
     bundle_final30_scored_before_save_df: pd.DataFrame,
+    final30_saved_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
-    candidates = [
-        ("watchlist_result.final30_scored", watchlist_result_final30_df),
-        ("watchlist_bundle.final30_scored", watchlist_bundle_final30_scored_df),
+    watchlist_result_attr = _safe_get(watchlist_result, "final30_scored")
+    watchlist_result_dict = watchlist_result.get("final30_scored") if isinstance(watchlist_result, dict) else None
+    watchlist_bundle_attr = _safe_get(watchlist_bundle, "final30_scored")
+    watchlist_bundle_dict = watchlist_bundle.get("final30_scored") if isinstance(watchlist_bundle, dict) else None
+
+    candidates: list[tuple[str, Any]] = [
+        ("watchlist_result.final30_scored", watchlist_result_attr),
+        ("watchlist_result[\"final30_scored\"]", watchlist_result_dict),
+        ("watchlist_bundle.final30_scored", watchlist_bundle_attr),
+        ("watchlist_bundle[\"final30_scored\"]", watchlist_bundle_dict),
         ("bundle_final30_scored_before_save", bundle_final30_scored_before_save_df),
     ]
-    for label, candidate_df in candidates:
+
+    details: list[dict[str, Any]] = []
+    for label, candidate_value in candidates:
+        candidate_df = _as_dataframe(candidate_value)
+        if _is_valid_final30_scored_df(candidate_df):
+            logger.info(
+                "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s cols=%s",
+                label,
+                int(len(candidate_df)),
+                list(candidate_df.columns),
+            )
+            return candidate_df.copy(deep=True), label
         if candidate_df is None or candidate_df.empty:
-            continue
-        if _has_required_final30_score_fields(candidate_df):
-            return candidate_df.copy(), label
+            details.append({"label": label, "state": "none"})
+        else:
+            details.append(
+                {
+                    "label": label,
+                    "state": "present",
+                    "rows": int(len(candidate_df)),
+                    "cols": list(candidate_df.columns),
+                }
+            )
+    if final30_saved_df is not None and not final30_saved_df.empty:
+        details.append(
+            {
+                "label": "watchlist_bundle.final30_saved",
+                "state": "present",
+                "rows": int(len(final30_saved_df)),
+                "cols": list(final30_saved_df.columns),
+            }
+        )
+    logger.error(
+        "[PREP][EXPORT][FINAL30][SOURCE][FAIL] no_valid_scored_source details=%s",
+        details,
+    )
     raise RuntimeError("final30_scored_source_missing")
 
 
@@ -281,6 +384,14 @@ def _assert_same_nonzero(stage: str, inmem: int, exported: int) -> None:
         raise RuntimeError(
             f"{stage}_SCORE_MISMATCH: inmem={inmem} exported={exported}"
         )
+
+
+def _handle_export_consistency_failure(*, strict_export: bool) -> None:
+    if strict_export:
+        raise RuntimeError("PREP_EXPORT_FINAL30_CONSISTENCY_FAILED")
+    logger.warning(
+        "[PREP][EXPORT][NON_STRICT] consistency_failed_but_continue required_states=derived+final30+prep_done",
+    )
 
 
 def _as_of_today() -> date:
@@ -1018,26 +1129,18 @@ def main() -> int:
     ledger_repo = LedgerEventsRepo(engine)
 
     export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
-    final30_saved_df = pd.DataFrame(watchlist_bundle.get("final30_saved", []))
-    final30_signals_df = pd.DataFrame(watchlist_bundle.get("final30", []))
-    watchlist_result_final30_df = pd.DataFrame(watchlist or [])
-    bundle_final30_scored_df = pd.DataFrame(watchlist_bundle.get("final30_scored", []))
+    final30_saved_df = pd.DataFrame(_safe_get(watchlist_bundle, "final30_saved", []))
+    bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "final30_scored")
+    bundle_final30_scored_before_save_df = _as_dataframe(bundle_final30_scored_before_save)
 
     try:
         final30_scored_df_for_export, final30_source_label = _select_final30_scored_df_for_export(
-            watchlist_result_final30_df=watchlist_result_final30_df,
-            watchlist_bundle_final30_scored_df=bundle_final30_scored_df,
-            bundle_final30_scored_before_save_df=final30_signals_df,
+            watchlist_result=watchlist_result,
+            watchlist_bundle=watchlist_bundle,
+            bundle_final30_scored_before_save_df=bundle_final30_scored_before_save_df,
+            final30_saved_df=final30_saved_df,
         )
     except RuntimeError:
-        logger.error(
-            "[PREP][EXPORT][FINAL30][SOURCE][FAIL] no_valid_scored_source candidates=%s",
-            [
-                "watchlist_result.final30_scored",
-                "watchlist_bundle.final30_scored",
-                "bundle_final30_scored_before_save",
-            ],
-        )
         raise RuntimeError("final30_scored_source_missing")
 
     frames = {
@@ -1132,8 +1235,8 @@ def main() -> int:
             },
         )
         runtime_exported = True
-        exported_final30 = pd.read_csv(export_dir / "final30.csv")
-        post_stats_full, post_cols = _collect_final30_nonzero_stats(exported_final30)
+        exporter_final30_df = pd.read_csv(export_dir / "final30.csv")
+        post_stats_full, post_cols = _collect_final30_nonzero_stats(exporter_final30_df)
         post_stats = {
             "tech_nonzero": int(post_stats_full["tech_nonzero"]),
             "final_nonzero": int(post_stats_full["final_nonzero"]),
@@ -1144,7 +1247,7 @@ def main() -> int:
         }
         rhs_source_label = "exporter_final30_df"
         lhs_has_required = _has_required_final30_score_fields(final30_scored_df_for_export)
-        rhs_has_required = _has_required_final30_score_fields(exported_final30)
+        rhs_has_required = _has_required_final30_score_fields(exporter_final30_df)
         logger.info(
             "[PREP][EXPORT][CONSISTENCY] lhs=%s rhs=%s",
             final30_source_label,
@@ -1152,16 +1255,16 @@ def main() -> int:
         )
         logger.info(
             "[PREP][EXPORT][CONSISTENCY][FIELDS] lhs_has_tech=%s rhs_has_tech=%s lhs_has_final=%s rhs_has_final=%s lhs_has_breakout=%s rhs_has_breakout=%s lhs_has_pullback=%s rhs_has_pullback=%s lhs_has_momentum=%s rhs_has_momentum=%s",
-            int(inmem_cols.get("tech") is not None),
-            int(post_cols.get("tech") is not None),
-            int(inmem_cols.get("final") is not None),
-            int(post_cols.get("final") is not None),
-            int(inmem_cols.get("breakout") is not None),
-            int(post_cols.get("breakout") is not None),
-            int(inmem_cols.get("pullback") is not None),
-            int(post_cols.get("pullback") is not None),
-            int(inmem_cols.get("momentum") is not None),
-            int(post_cols.get("momentum") is not None),
+            "tech_score" in final30_scored_df_for_export.columns,
+            "tech_score" in exporter_final30_df.columns,
+            (("score_final" in final30_scored_df_for_export.columns) or ("final_score" in final30_scored_df_for_export.columns)),
+            (("score_final" in exporter_final30_df.columns) or ("final_score" in exporter_final30_df.columns)),
+            "breakout_score" in final30_scored_df_for_export.columns,
+            "breakout_score" in exporter_final30_df.columns,
+            "pullback_score" in final30_scored_df_for_export.columns,
+            "pullback_score" in exporter_final30_df.columns,
+            "momentum_score" in final30_scored_df_for_export.columns,
+            "momentum_score" in exporter_final30_df.columns,
         )
         if not lhs_has_required or not rhs_has_required:
             logger.error(
@@ -1169,7 +1272,7 @@ def main() -> int:
                 final30_source_label,
                 rhs_source_label,
                 sorted(final30_scored_df_for_export.columns.tolist()),
-                sorted(exported_final30.columns.tolist()),
+                sorted(exporter_final30_df.columns.tolist()),
             )
             raise RuntimeError("final30_scored_fields_missing_for_consistency")
 
@@ -1231,11 +1334,7 @@ def main() -> int:
             export_dir,
             int(strict_export),
         )
-        if strict_export:
-            raise RuntimeError("PREP_EXPORT_FINAL30_CONSISTENCY_FAILED")
-        logger.warning(
-            "[PREP][EXPORT][NON_STRICT] consistency_failed_but_continue required_states=derived+final30+prep_done",
-        )
+        _handle_export_consistency_failure(strict_export=strict_export)
 
     # ✅ FIX: Initialize prep_status and flow_coverage early
     prep_status = "DONE"

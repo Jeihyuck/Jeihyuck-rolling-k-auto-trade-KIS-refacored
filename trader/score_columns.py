@@ -5,7 +5,7 @@ from typing import Mapping
 import pandas as pd
 
 SCORE_ALIAS_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "tech": ("tech_score", "tech", "score_tech"),
+    "tech": ("tech_score", "score_tech", "tech"),
     "final": ("score_final", "final_score", "score"),
     "breakout": ("breakout_score", "score_breakout", "breakout"),
     "pullback": ("pullback_score", "score_pullback", "pullback"),
