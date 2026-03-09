@@ -279,9 +279,13 @@ def _is_scored_final30_df(df: pd.DataFrame) -> bool:
 
 
 def _is_valid_final30_scored_df(df: Any) -> bool:
+    if df is None:
+        return False
     if not isinstance(df, pd.DataFrame):
         return False
-    if df is None or getattr(df, "empty", True):
+    if getattr(df, "empty", True):
+        return False
+    if not hasattr(df, "columns"):
         return False
     cols = set(df.columns)
     has_code = "code" in cols
@@ -302,22 +306,36 @@ def _select_final30_scored_df_for_export(
     bundle_final30_scored_before_save_df: pd.DataFrame,
     final30_saved_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
-    watchlist_result_attr = _safe_get(watchlist_result, "final30_scored")
-    watchlist_result_dict = watchlist_result.get("final30_scored") if isinstance(watchlist_result, dict) else None
-    watchlist_bundle_attr = _safe_get(watchlist_bundle, "final30_scored")
-    watchlist_bundle_dict = watchlist_bundle.get("final30_scored") if isinstance(watchlist_bundle, dict) else None
-
     candidates: list[tuple[str, Any]] = [
-        ("watchlist_result.final30_scored", watchlist_result_attr),
-        ("watchlist_result[\"final30_scored\"]", watchlist_result_dict),
-        ("watchlist_bundle.final30_scored", watchlist_bundle_attr),
-        ("watchlist_bundle[\"final30_scored\"]", watchlist_bundle_dict),
+        ("watchlist_result.final30_scored", _safe_get(watchlist_result, "final30_scored")),
+        ("watchlist_bundle.final30_scored", _safe_get(watchlist_bundle, "final30_scored")),
+        (
+            "watchlist_result.bundle_final30_scored_before_save",
+            _safe_get(watchlist_result, "bundle_final30_scored_before_save"),
+        ),
+        (
+            "watchlist_bundle.bundle_final30_scored_before_save",
+            _safe_get(watchlist_bundle, "bundle_final30_scored_before_save"),
+        ),
         ("bundle_final30_scored_before_save", bundle_final30_scored_before_save_df),
     ]
 
     details: list[dict[str, Any]] = []
-    for label, candidate_value in candidates:
-        candidate_df = _as_dataframe(candidate_value)
+    for label, candidate in candidates:
+        candidate_df = _as_dataframe(candidate)
+        is_valid = _is_valid_final30_scored_df(candidate_df)
+        if candidate_df is None or candidate_df.empty:
+            details.append({"label": label, "state": "none"})
+            continue
+        details.append(
+            {
+                "label": label,
+                "state": "present",
+                "rows": int(len(candidate_df)) if hasattr(candidate_df, "__len__") else None,
+                "cols": list(candidate_df.columns) if hasattr(candidate_df, "columns") else None,
+                "valid": is_valid,
+            }
+        )
         if _is_valid_final30_scored_df(candidate_df):
             logger.info(
                 "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s cols=%s",
@@ -326,17 +344,6 @@ def _select_final30_scored_df_for_export(
                 list(candidate_df.columns),
             )
             return candidate_df.copy(deep=True), label
-        if candidate_df is None or candidate_df.empty:
-            details.append({"label": label, "state": "none"})
-        else:
-            details.append(
-                {
-                    "label": label,
-                    "state": "present",
-                    "rows": int(len(candidate_df)),
-                    "cols": list(candidate_df.columns),
-                }
-            )
     if final30_saved_df is not None and not final30_saved_df.empty:
         details.append(
             {
@@ -1130,7 +1137,11 @@ def main() -> int:
 
     export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
     final30_saved_df = pd.DataFrame(_safe_get(watchlist_bundle, "final30_saved", []))
-    bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "final30_scored")
+    bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "bundle_final30_scored_before_save")
+    if bundle_final30_scored_before_save is None:
+        bundle_final30_scored_before_save = _safe_get(watchlist_result, "bundle_final30_scored_before_save")
+    if bundle_final30_scored_before_save is None:
+        bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "final30_scored")
     bundle_final30_scored_before_save_df = _as_dataframe(bundle_final30_scored_before_save)
 
     try:

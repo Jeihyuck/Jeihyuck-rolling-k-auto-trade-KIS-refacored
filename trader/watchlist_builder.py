@@ -3161,6 +3161,7 @@ def build_and_save_watchlist(
                 if return_bundle:
                     final30_scored_rows = [dict(row) for row in (existing or [])]
                     final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+                    bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
                     _log_final30_scored_df_ready(final30_scored_df)
                     final30_saved_rows = _build_final30_saved_rows(existing or [])
                     final30_snapshot_rows = [dict(row) for row in (existing or [])]
@@ -3171,7 +3172,7 @@ def build_and_save_watchlist(
                     )
                     _log_final30_scored_rows("[WATCHLIST][RETURN][FINAL30_SCORED]", final30_scored_rows)
                     degrade_reason = "cache_bundle_stage_recovered" if bundle_recovered else "cache_bundle_stage_missing"
-                    return existing, {
+                    result = {
                         "as_of": as_of,
                         "weights": {
                             "ai_rs": 0.30,
@@ -3198,6 +3199,7 @@ def build_and_save_watchlist(
                         "top50_scored": top50,
                         "final30": existing,
                         "final30_scored": final30_scored_df,
+                        "bundle_final30_scored_before_save": bundle_final30_scored_before_save,
                         "final30_saved": final30_saved_rows,
                         "final30_snapshot_df": final30_snapshot_rows,
                         "reject_summary": {degrade_reason: 1},
@@ -3209,6 +3211,13 @@ def build_and_save_watchlist(
                             "disabled_features": [] if bundle_recovered else ["stage_snapshot"],
                         },
                     }
+                    logger.info(
+                        "[WATCHLIST][RETURN][FINAL30_SCORED] result_has=%s bundle_has=%s before_save_has=%s",
+                        hasattr(result, "final30_scored") or (isinstance(result, dict) and "final30_scored" in result),
+                        hasattr(result, "final30_scored") or (isinstance(result, dict) and "final30_scored" in result),
+                        hasattr(result, "bundle_final30_scored_before_save") or (isinstance(result, dict) and "bundle_final30_scored_before_save" in result),
+                    )
+                    return existing, result
                 return existing
 
     builder = WatchlistBuilder(
@@ -3287,12 +3296,14 @@ def build_and_save_watchlist(
         )
     ]
     final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+    bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
     _log_final30_scored_df_ready(final30_scored_df)
     final30_saved_rows = _build_final30_saved_rows(watchlist or [])
     final30_saved_df = pd.DataFrame(final30_saved_rows).copy(deep=True)
     final30_snapshot_rows = [dict(row) for row in (watchlist or [])]
     if builder.last_bundle:
         builder.last_bundle["final30_scored"] = final30_scored_df
+        builder.last_bundle["bundle_final30_scored_before_save"] = bundle_final30_scored_before_save
         builder.last_bundle["final30_saved"] = final30_saved_rows
         builder.last_bundle["final30_saved_df"] = final30_saved_df
         builder.last_bundle["final30_snapshot_df"] = final30_snapshot_rows
@@ -3349,6 +3360,7 @@ def build_and_save_watchlist(
                 },
             )
             setattr(bundle, "final30_scored", final30_scored_df.copy(deep=True))
+            setattr(bundle, "bundle_final30_scored_before_save", bundle_final30_scored_before_save.copy(deep=True))
             
             # Use centralized save_bundle function to ensure atomicity
             save_bundle(
@@ -3381,12 +3393,19 @@ def build_and_save_watchlist(
         if builder.last_bundle is None:
             builder.last_bundle = {}
         builder.last_bundle.setdefault("final30_scored", final30_scored_df)
+        builder.last_bundle.setdefault("bundle_final30_scored_before_save", bundle_final30_scored_before_save)
         builder.last_bundle.setdefault("final30_saved", final30_saved_rows)
         builder.last_bundle.setdefault("final30_saved_df", final30_saved_df)
         builder.last_bundle.setdefault("final30_snapshot_df", final30_snapshot_rows)
         builder.last_bundle.setdefault("top50_scored", builder.last_bundle.get("top50", []))
         builder.last_bundle.setdefault("pool120_scored", builder.last_bundle.get("pool120", []))
         builder.last_bundle.setdefault("universe_scored_df", builder.last_bundle.get("universe_scored", []))
+        logger.info(
+            "[WATCHLIST][RETURN][FINAL30_SCORED] result_has=%s bundle_has=%s before_save_has=%s",
+            hasattr(builder.last_bundle, "final30_scored") or (isinstance(builder.last_bundle, dict) and "final30_scored" in builder.last_bundle),
+            hasattr(builder.last_bundle, "final30_scored") or (isinstance(builder.last_bundle, dict) and "final30_scored" in builder.last_bundle),
+            hasattr(builder.last_bundle, "bundle_final30_scored_before_save") or (isinstance(builder.last_bundle, dict) and "bundle_final30_scored_before_save" in builder.last_bundle),
+        )
         return watchlist, builder.last_bundle
     return watchlist
 
