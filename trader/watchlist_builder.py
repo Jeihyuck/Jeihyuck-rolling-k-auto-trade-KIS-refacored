@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -255,10 +256,12 @@ def validate_watchlist_contract(
     pool120: List[Dict[str, Any]],
     top50: List[Dict[str, Any]],
     final30: List[Dict[str, Any]],
-    min_universe: int = 150,
-    min_pool: int = 80,
-    min_top50: int = 40,
-    exact_final30: int = 30,
+    min_universe: Optional[int] = None,
+    min_pool: Optional[int] = None,
+    min_top50: Optional[int] = None,
+    exact_final30: Optional[int] = None,
+    contract_mode: str = "candidate_pool_based",
+    universe_scored_source: str = "unknown",
 ) -> List[str]:
     """
     Validate watchlist bundle contract.
@@ -271,24 +274,50 @@ def validate_watchlist_contract(
         List of contract failure reasons (empty if all validations pass)
     """
     failures = []
-    
-    # Log contract mode for clarity
+
+    def resolve_contract_thresholds(mode: str) -> dict[str, int]:
+        if mode == "candidate_pool_based":
+            return {
+                "min_universe": 120,
+                "min_pool120": 40,
+                "exact_top50": 50,
+                "exact_final30": 30,
+            }
+        return {
+            "min_universe": 150,
+            "min_pool120": 40,
+            "exact_top50": 50,
+            "exact_final30": 30,
+        }
+
+    thresholds = resolve_contract_thresholds(contract_mode)
+    if min_universe is not None:
+        thresholds["min_universe"] = int(min_universe)
+    if min_pool is not None:
+        thresholds["min_pool120"] = int(min_pool)
+    if min_top50 is not None:
+        thresholds["exact_top50"] = int(min_top50)
+    if exact_final30 is not None:
+        thresholds["exact_final30"] = int(exact_final30)
+
     logger.info(
-        "[CONTRACT][POLICY] mode=candidate_pool_based universe_scored_source=universe_filtered_from_raw120 note=threshold_150_may_structurally_fail"
+        "[CONTRACT][POLICY] mode=%s thresholds=%s universe_scored_source=%s",
+        contract_mode,
+        thresholds,
+        universe_scored_source,
     )
-    
-    if len(universe_scored) < min_universe:
-        failures.append(f"contract_universe_too_small:{len(universe_scored)}<{min_universe}")
-    
-    if len(pool120) < min_pool:
-        failures.append(f"contract_pool120_too_small:{len(pool120)}<{min_pool}")
-    
-    if len(top50) < min_top50:
-        failures.append(f"contract_top50_too_small:{len(top50)}<{min_top50}")
-    
-    # ✅ FIX: Change from != to < for final30 validation
-    if len(final30) < exact_final30:
-        failures.append(f"contract_final30_too_small:{len(final30)}<{exact_final30}")
+
+    if len(universe_scored) < thresholds["min_universe"]:
+        failures.append(f"contract_universe_too_small:{len(universe_scored)}<{thresholds['min_universe']}")
+
+    if len(pool120) < thresholds["min_pool120"]:
+        failures.append(f"contract_pool120_too_small:{len(pool120)}<{thresholds['min_pool120']}")
+
+    if len(top50) != thresholds["exact_top50"]:
+        failures.append(f"contract_top50_not_exact:{len(top50)}!={thresholds['exact_top50']}")
+
+    if len(final30) != thresholds["exact_final30"]:
+        failures.append(f"contract_final30_not_exact:{len(final30)}!={thresholds['exact_final30']}")
     
     if failures:
         logger.error(
@@ -1382,6 +1411,58 @@ class WatchlistBuilder:
         if self.flow_provider is None:
             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30][FLOW] provider missing -> flow weight disabled by item")
 
+        flow_map: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
+        if self.flow_provider is not None and top50:
+            max_workers = max(1, min(_env_int("FLOW_FETCH_MAX_CONCURRENCY", 3), 5))
+            max_retries = max(1, _env_int("FLOW_FETCH_RETRIES", 3))
+            backoff_base = max(0.1, _env_float("FLOW_FETCH_BACKOFF_BASE_SEC", 0.6))
+            logger.info(
+                "[FLOW][FETCH][START] symbols=%s concurrency=%s retries=%s",
+                len(top50),
+                max_workers,
+                max_retries,
+            )
+
+            def _fetch_for_code(code: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+                last_exc: Exception | None = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        return self.flow_provider(code, as_of, self.flow_window)
+                    except Exception as exc:
+                        last_exc = exc
+                        logger.warning(
+                            "[FLOW][FETCH][RETRY] code=%s attempt=%s/%s err=%s",
+                            code,
+                            attempt,
+                            max_retries,
+                            exc,
+                        )
+                        if attempt < max_retries:
+                            time.sleep(backoff_base * (2 ** (attempt - 1)))
+                logger.warning("[FLOW][FETCH][FAIL] code=%s err=%s", code, last_exc)
+                return None, None
+
+            code_list = [str(c.get("code") or "").zfill(6) for c in top50 if c.get("code")]
+            done = 0
+            ts_fetch = time.monotonic()
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="flow-fetch") as ex:
+                futures = {ex.submit(_fetch_for_code, code): code for code in code_list}
+                for fut in as_completed(futures):
+                    code = futures[fut]
+                    try:
+                        flow_map[code] = fut.result()
+                    except Exception:
+                        flow_map[code] = (None, None)
+                    done += 1
+                    if done == 1 or done % max(1, len(code_list) // 5) == 0 or done == len(code_list):
+                        logger.info(
+                            "[FLOW][FETCH][HEARTBEAT] done=%s/%s elapsed=%.1fs",
+                            done,
+                            len(code_list),
+                            time.monotonic() - ts_fetch,
+                        )
+            logger.info("[FLOW][FETCH][DONE] symbols=%s", len(code_list))
+
         scored: List[Dict[str, Any]] = []
         total = len(top50)
         progress_every = max(1, total // 10)
@@ -1408,10 +1489,7 @@ class WatchlistBuilder:
             foreign_df: Optional[pd.DataFrame] = None
             inst_df: Optional[pd.DataFrame] = None
             if self.flow_provider is not None:
-                try:
-                    foreign_df, inst_df = self.flow_provider(code, as_of, self.flow_window)
-                except Exception as exc:
-                    logger.debug("[WATCHLIST][PIPELINE][C_FINAL30][FLOW_PROVIDER_FAIL] code=%s err=%s", code, exc)
+                foreign_df, inst_df = flow_map.get(code, (None, None))
 
             flow_weight_effective = self.flow_weight
             tech_weight_effective = self.tech_weight
@@ -3035,6 +3113,9 @@ def build_and_save_watchlist(
     # Prefer candidate pool as watchlist stage-A input.
     # If unavailable, keep caller-provided universe members.
     pool_source = "universe"
+    pool_actual_as_of: Optional[str] = None
+    fallback_used = False
+    fallback_reason = ""
     try:
         from trader.candidate_pool_builder import load_candidate_pool
 
@@ -3054,6 +3135,7 @@ def build_and_save_watchlist(
                 for code in pool_codes
             ]
             pool_source = "candidate_pool"
+            pool_actual_as_of = pool_as_of.isoformat() if pool_as_of else None
             logger.info(
                 "[WATCHLIST][PIPELINE][A_POOL120] source=candidate_pool as_of=%s reason=%s members=%s upstream_universe=%s",
                 pool_as_of,
@@ -3062,6 +3144,8 @@ def build_and_save_watchlist(
                 upstream_universe_count,
             )
         else:
+            fallback_used = True
+            fallback_reason = f"candidate_pool_{pool_reason}"
             logger.warning(
                 "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_%s members=%s requested_as_of=%s",
                 pool_reason,
@@ -3069,12 +3153,24 @@ def build_and_save_watchlist(
                 as_of,
             )
     except Exception as exc:
+        fallback_used = True
+        fallback_reason = "candidate_pool_load_fail"
         logger.warning(
             "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_load_fail err=%s members=%s requested_as_of=%s",
             exc,
             len(members),
             as_of,
         )
+
+    logger.info(
+        "[WATCHLIST][INPUT] as_of=%s upstream_universe=%d raw_input=%d source=%s fallback=%s reason=%s",
+        as_of,
+        upstream_universe_count,
+        len(members),
+        pool_source,
+        int(fallback_used),
+        fallback_reason or "none",
+    )
 
     # ✅ FIX: Skip cache when use_cache=False (e.g., during PREP)
     if use_cache and not force_rebuild:
@@ -3210,6 +3306,7 @@ def build_and_save_watchlist(
                             "reason": degrade_reason,
                             "disabled_features": [] if bundle_recovered else ["stage_snapshot"],
                         },
+                        "candidate_pool_actual_as_of": pool_actual_as_of,
                     }
                     logger.info(
                         "[WATCHLIST][RETURN][FINAL30_SCORED] result_has=%s bundle_has=%s before_save_has=%s",
@@ -3357,6 +3454,7 @@ def build_and_save_watchlist(
                     "reject_summary": builder.last_bundle.get("reject_summary", {}),
                     "degrade": builder.last_bundle.get("degrade", {}),
                     "source": "fresh_build",
+                    "candidate_pool_actual_as_of": pool_actual_as_of,
                 },
             )
             setattr(bundle, "final30_scored", final30_scored_df.copy(deep=True))

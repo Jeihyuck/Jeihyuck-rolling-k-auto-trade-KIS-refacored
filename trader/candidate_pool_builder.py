@@ -37,6 +37,7 @@ from trader.report.pdf_report import generate_watchlist_pdf
 from trader.runtime_paths import runtime_path
 from trader.time_utils import now_kst, prev_business_day
 from trader.time_coerce import to_date
+from trader.snapshot_policy import validate_snapshot_date
 
 logger = logging.getLogger(__name__)
 
@@ -697,12 +698,16 @@ def load_candidate_pool(
         (pool_codes, pool_as_of, reason)
         - pool_codes: 종목코드 리스트 또는 None
         - pool_as_of: 후보군 생성 기준일 또는 None
-        - reason: "hit" | "expired" | "missing" | "too_small"
+        - reason: "hit" | "not_found" | "future_snapshot" | "stale_snapshot" | "too_small" | "forced_rebuild"
     """
     # [CRITICAL] MINERVINI_ONLY=1이면 강제 재생성 금지
     if MINERVINI_ONLY:
         force_rebuild = False
         logger.info("[CANDIDATE_POOL][MINERVINI_ONLY] force_rebuild disabled")
+
+    if force_rebuild:
+        logger.info("[CANDIDATE_POOL][LOAD] miss reason=forced_rebuild")
+        return None, None, "forced_rebuild"
     
     repo = WatchlistRepo(engine)
     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
@@ -718,11 +723,17 @@ def load_candidate_pool(
                 "[CANDIDATE_POOL][MINERVINI_ONLY] No existing candidate pool in DB. "
                 "MINERVINI_ONLY requires existing pool. Run pool build first."
             )
-        logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing")
-        return None, None, "missing"
+        logger.warning("[CANDIDATE_POOL][LOAD] miss reason=not_found")
+        return None, None, "not_found"
     
-    # Date guard: never allow a snapshot newer than requested_as_of.
-    if latest_date > requested_as_of:
+    # Unified snapshot policy guard for future/stale behavior.
+    date_guard = validate_snapshot_date(
+        requested_as_of=requested_as_of,
+        actual_as_of=latest_date,
+        ttl_days=CANDIDATE_POOL_TTL_DAYS,
+        allow_stale=True,
+    )
+    if date_guard.is_future:
         logger.error(
             "[CANDIDATE_POOL][DATE_GUARD] requested_as_of=%s actual_as_of=%s action=reject_future_snapshot",
             requested_as_of,
@@ -733,10 +744,19 @@ def load_candidate_pool(
             requested_as_of,
             latest_date,
         )
+        logger.info(
+            "[CANDIDATE_POOL][CACHE] requested_as_of=%s actual_as_of=%s hit=%s exact=%s stale_days=%s ttl_days=%s",
+            requested_as_of,
+            latest_date,
+            False,
+            False,
+            date_guard.stale_days,
+            CANDIDATE_POOL_TTL_DAYS,
+        )
         return None, None, "future_snapshot"
 
-    # TTL 검사
-    age_days = max(0, (requested_as_of - latest_date).days)
+    age_days = date_guard.stale_days
+    exact_hit = bool(date_guard.is_exact)
     if age_days > CANDIDATE_POOL_TTL_DAYS:
         if MINERVINI_ONLY:
             logger.warning(
@@ -745,10 +765,19 @@ def load_candidate_pool(
             )
         else:
             logger.warning(
-                "[CANDIDATE_POOL][LOAD] miss reason=expired as_of=%s age=%s ttl=%s",
+                "[CANDIDATE_POOL][LOAD] miss reason=stale_snapshot as_of=%s age=%s ttl=%s",
                 latest_date, age_days, CANDIDATE_POOL_TTL_DAYS
             )
-            return None, None, "expired"
+            logger.info(
+                "[CANDIDATE_POOL][CACHE] requested_as_of=%s actual_as_of=%s hit=%s exact=%s stale_days=%s ttl_days=%s",
+                requested_as_of,
+                latest_date,
+                False,
+                exact_hit,
+                age_days,
+                CANDIDATE_POOL_TTL_DAYS,
+            )
+            return None, None, "stale_snapshot"
     
     # 후보군 로드
     pool_members, _ = repo.load_watchlist(
@@ -779,6 +808,15 @@ def load_candidate_pool(
                 "[CANDIDATE_POOL][LOAD] miss reason=too_small as_of=%s size=%s min=%s",
                 latest_date, len(pool_codes), CANDIDATE_POOL_MIN_SIZE
             )
+            logger.info(
+                "[CANDIDATE_POOL][CACHE] requested_as_of=%s actual_as_of=%s hit=%s exact=%s stale_days=%s ttl_days=%s",
+                requested_as_of,
+                latest_date,
+                False,
+                exact_hit,
+                age_days,
+                CANDIDATE_POOL_TTL_DAYS,
+            )
             return None, None, "too_small"
     
     logger.info(
@@ -787,6 +825,15 @@ def load_candidate_pool(
         latest_date,
         len(pool_codes),
         age_days,
+    )
+    logger.info(
+        "[CANDIDATE_POOL][CACHE] requested_as_of=%s actual_as_of=%s hit=%s exact=%s stale_days=%s ttl_days=%s",
+        requested_as_of,
+        latest_date,
+        True,
+        exact_hit,
+        age_days,
+        CANDIDATE_POOL_TTL_DAYS,
     )
     
     return pool_codes, latest_date, "hit"

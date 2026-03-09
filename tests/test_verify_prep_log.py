@@ -47,7 +47,8 @@ event_type=PREP_DONE
 [PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=120 rs_nonzero=120 vcp_nonzero=120 trend_nonzero=120
 [PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
 [EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
-contract_universe_too_small:120<150
+[CONTRACT_VALIDATION][FAIL] failures=['contract_universe_too_small:120<150']
+[PREP][WATCHLIST][CONTRACT_FAIL] failures=['contract_universe_too_small:120<150']
 [PREP][WATCHLIST][RECOVERY][DB_SUCCESS]
 [PREP][WATCHLIST_FINAL][SAVE] n=30
 """
@@ -142,6 +143,59 @@ event_type=PREP_DONE
 
         results = parse_log_file(log_path)
         assert results.exporter_preserved_scores is False
+        assert results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
+def test_verify_candidate_pool_future_reject_is_non_fatal():
+    log_content = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
+[PREP][DERIVED][MINERVINI] upserted=196
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[CANDIDATE_POOL][DATE_GUARD] requested_as_of=2026-03-08 actual_as_of=2026-03-09 action=reject_future_snapshot
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
+[PREP][WATCHLIST_FINAL][SAVE] n=30
+"""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        from scripts.verify_prep_log import parse_log_file
+
+        results = parse_log_file(log_path)
+        assert results.candidate_pool_future_rejected is True
+        assert not results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
+def test_verify_traceback_is_critical_failure():
+    log_content = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
+[PREP][DERIVED][MINERVINI] upserted=196
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
+[PREP][WATCHLIST_FINAL][SAVE] n=30
+Traceback (most recent call last)
+RuntimeError: boom
+"""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        from scripts.verify_prep_log import parse_log_file
+
+        results = parse_log_file(log_path)
+        assert results.traceback_detected is True
         assert results.has_critical_failure()
     finally:
         log_path.unlink()

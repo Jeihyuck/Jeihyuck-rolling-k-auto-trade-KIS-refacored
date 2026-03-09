@@ -60,7 +60,7 @@ env:
 jobs:
   prep:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -147,6 +147,7 @@ jobs:
       ALLOW_DEGRADED_PREP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ALLOW_DEGRADED_PREP || '1' }}
       PREP_CONTRACT_ALLOW_DEGRADE: "1"
       PB1_WATCHLIST_ALLOW_DEGRADE: "1"
+      REPORT_FAILMODE_SOFT: "1"
 
       # ✅ DB migration
       DB_MIGRATE_MODE: "auto"
@@ -220,6 +221,7 @@ jobs:
           python -m trader.db.migrate
 
       - name: Run PREP
+        timeout-minutes: 35
         shell: bash
         working-directory: repo
         env:
@@ -229,13 +231,14 @@ jobs:
           echo "======================================"
           echo "[PREP] Starting prep workflow"
           echo "======================================"
-          python -m trader.prep_runner 2>&1 | tee /tmp/prep.log
+          python -m trader.prep_runner 2>&1 | tee prep.log
           echo "======================================"
           echo "[PREP] Completed successfully"
           echo "======================================"
 
       - name: Verify prep outputs
         if: always()
+        timeout-minutes: 5
         shell: bash
         working-directory: repo
         env:
@@ -243,13 +246,12 @@ jobs:
         run: |
           set -euo pipefail
           
-          if [ ! -f /tmp/prep.log ]; then
+          if [ ! -f prep.log ]; then
             echo "::warning::prep.log not found - cannot verify outputs"
             exit 0
           fi
 
-          # Use Python-based verification script (recovery-aware)
-          python scripts/verify_prep_log.py /tmp/prep.log
+          bash .github/workflows/scripts/verify_prep.sh prep.log
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -273,7 +275,8 @@ jobs:
         with:
           name: prep-runtime-${{ github.run_id }}
           path: |
-            runtime/**
-            repo/runtime/**
-            /tmp/prep.log
+            repo/prep.log
+            repo/runtime/watchlist/**
+            repo/signals/final30.json
+            repo/bot_state/trader_ledger/reports/**
           if-no-files-found: warn

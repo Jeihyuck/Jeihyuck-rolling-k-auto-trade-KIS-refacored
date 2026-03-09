@@ -460,6 +460,8 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
     progress_every = max(1, total // 10) if total else 1
     heartbeat_sec = max(0, int(os.getenv("OHLCV_DELTA_HEARTBEAT_SEC", "60")))
     slow_fetch_warn_sec = max(1, int(os.getenv("OHLCV_DELTA_SLOW_FETCH_WARN_SEC", "20")))
+    fetch_retries = max(1, int(os.getenv("OHLCV_FETCH_RETRIES", "3")))
+    fetch_backoff_base = max(0.1, float(os.getenv("OHLCV_FETCH_BACKOFF_BASE_SEC", "0.7")))
     ts0 = time.monotonic()
     heartbeat_stop = threading.Event()
     state_lock = threading.Lock()
@@ -519,13 +521,30 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
                 )
 
             started = time.monotonic()
-            try:
-                df = fdr.DataReader(symbol, start=date_min, end=date_max)
-            except Exception as exc:
+            df = None
+            fetch_err = None
+            for attempt in range(1, fetch_retries + 1):
+                try:
+                    df = fdr.DataReader(symbol, start=date_min, end=date_max)
+                    fetch_err = None
+                    break
+                except Exception as exc:
+                    fetch_err = exc
+                    logger.warning(
+                        "[OHLCV][DELTA_UPSERT][FETCH_RETRY] symbol=%s attempt=%s/%s err=%s",
+                        symbol,
+                        attempt,
+                        fetch_retries,
+                        exc,
+                    )
+                    if attempt < fetch_retries:
+                        time.sleep(fetch_backoff_base * (2 ** (attempt - 1)))
+
+            if fetch_err is not None:
                 logger.warning(
                     "[OHLCV][DELTA_UPSERT][FETCH_FAIL] symbol=%s err=%s",
                     symbol,
-                    exc,
+                    fetch_err,
                 )
                 continue
 

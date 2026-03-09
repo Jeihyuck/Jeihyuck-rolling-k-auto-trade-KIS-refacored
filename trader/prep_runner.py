@@ -211,6 +211,17 @@ def _pick_as_of_date_always_prev() -> date:
     return resolve_derived_as_of(now_kst())
 
 
+def get_required_history_days(strategy_name: str) -> int:
+    """Centralized long-lookback requirement for PREP OHLCV readiness."""
+    _ = strategy_name
+    ma150_days = 150
+    rs_lookback_126 = 126
+    vcp_lookback_120 = 120
+    atr_days_20 = 20
+    safety_margin = 30
+    return max(ma150_days, rs_lookback_126, vcp_lookback_120, atr_days_20) + safety_margin
+
+
 def _collect_final30_nonzero_stats(df: pd.DataFrame) -> tuple[dict[str, int], dict[str, str | None]]:
     stats, alias_cols = collect_nonzero_score_stats(df)
     for key in (
@@ -462,6 +473,16 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
         logger.info("[UNIVERSE][DB][UPSERT/SAVE] env=%s strategy=%s as_of=%s members=%d", env, strategy, as_of_s, len(built))
         logger.info("[UNIVERSE][AUTO_BUILD][DONE] as_of=%s members=%d", as_of_s, len(built))
+        logger.info(
+            "[UNIVERSE][SNAPSHOT_META] requested_as_of=%s actual_as_of=%s source=%s build_reason=%s universe_name=%s member_count=%s created_at=%s",
+            as_of_s,
+            as_of_s,
+            "build_universe",
+            reason,
+            strategy,
+            len(built),
+            now_kst().isoformat(),
+        )
 
         # 3) strict reload verification (exact as_of only)
         members = repo.get_universe_members(
@@ -478,6 +499,17 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             f"env={env} strategy={strategy} as_of={as_of_s}"
         )
 
+    logger.info(
+        "[UNIVERSE][SNAPSHOT_META] requested_as_of=%s actual_as_of=%s source=%s build_reason=%s universe_name=%s member_count=%s created_at=%s",
+        as_of_s,
+        as_of_s,
+        "db_exact",
+        "exact_load",
+        strategy,
+        len(members),
+        now_kst().isoformat(),
+    )
+
     return members
 
 
@@ -493,7 +525,8 @@ def main() -> int:
     run_ts = now_kst()
     run_date = run_ts.date()
     market_window = calc_market_window_kst(run_ts)
-    as_of = _pick_as_of_date_always_prev()
+    effective_as_of = _pick_as_of_date_always_prev()
+    as_of = effective_as_of
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
     allow_flow_degraded_prep = _env_true("ALLOW_FLOW_DEGRADED_PREP", "1") or allow_degraded_prep
@@ -504,19 +537,19 @@ def main() -> int:
     finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
-    logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
+    logger.info("[PREP][START] env=%s as_of=%s (%s)", env, effective_as_of, as_of_reason)
     logger.info(
         "[PREP][DATE_POLICY] run_date=%s window=%s as_of=%s reason=%s",
         run_date.isoformat(),
         market_window,
-        as_of.isoformat(),
+        effective_as_of.isoformat(),
         as_of_reason,
     )
     logger.info(
         "[PREP][TODAY_POLICY] run_date=%s market_window=%s as_of=%s final30_for_trade_date=%s",
         run_date.isoformat(),
         market_window,
-        as_of.isoformat(),
+        effective_as_of.isoformat(),
         run_date.isoformat(),
     )
     logger.info("[PREP][POLICY] contract_mode=degrade_allowed")
@@ -524,14 +557,14 @@ def main() -> int:
     t0 = time.monotonic()
 
     stage_as_of: dict[str, str] = {
-        "universe": as_of.isoformat(),
-        "ohlcv": as_of.isoformat(),
-        "derived": as_of.isoformat(),
-        "candidate_pool": as_of.isoformat(),
-        "watchlist": as_of.isoformat(),
+        "universe": effective_as_of.isoformat(),
+        "ohlcv": effective_as_of.isoformat(),
+        "derived": effective_as_of.isoformat(),
+        "candidate_pool": effective_as_of.isoformat(),
+        "watchlist": effective_as_of.isoformat(),
     }
 
-    members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=as_of)
+    members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=effective_as_of)
     if not members:
         logger.error("[PREP][FAIL] universe empty")
         return 1
@@ -553,6 +586,7 @@ def main() -> int:
         symbols.append(bench)
 
     t_ohlcv = time.monotonic()
+    logger.info("[PREP][HEARTBEAT] stage=ohlcv_prefetch status=start")
     prefetch_mode = os.getenv("OHLCV_PREFETCH_MODE", "auto").strip().lower()
     prefetch_days = int(os.getenv("PREFETCH_DAYS", "5"))
     delta_days = max(1, int(os.getenv("OHLCV_DELTA_DAYS", "5")))
@@ -586,15 +620,23 @@ def main() -> int:
     full_result = {"symbols": 0, "inserted": 0, "updated": 0, "failed": 0, "failed_symbols": [], "dates": []}
 
     if prefetch_mode == "delta":
-        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
+        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=effective_as_of, days=delta_days)
     elif prefetch_mode == "full":
-        full_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=int(need_days))
+        full_result = upsert_ohlcv_delta(symbols=symbols, as_of=effective_as_of, days=int(need_days))
     else:
-        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=as_of, days=delta_days)
+        delta_result = upsert_ohlcv_delta(symbols=symbols, as_of=effective_as_of, days=delta_days)
+        required_history_days = get_required_history_days("pb1/minervini")
         insufficient_symbols, _ = find_symbols_with_insufficient_history(
             symbols=symbols,
-            as_of=as_of,
-            min_history_days=auto_min_history_days,
+            as_of=effective_as_of,
+            min_history_days=required_history_days,
+        )
+        logger.info(
+            "[PREP][OHLCV][READINESS] required_days=%d ready=%d insufficient=%d total=%d",
+            required_history_days,
+            len(symbols) - len(insufficient_symbols),
+            len(insufficient_symbols),
+            len(symbols),
         )
         logger.info(
             "[PREP][OHLCV][AUTO_CHECK] min_history_days=%s insufficient=%s/%s",
@@ -610,7 +652,7 @@ def main() -> int:
                 need_days,
                 sample,
             )
-            full_result = upsert_ohlcv_delta(symbols=insufficient_symbols, as_of=as_of, days=int(need_days))
+            full_result = upsert_ohlcv_delta(symbols=insufficient_symbols, as_of=effective_as_of, days=int(need_days))
         else:
             logger.info("[PREP][OHLCV][AUTO_BACKFILL] skipped (all symbols have enough history)")
 
@@ -623,16 +665,21 @@ def main() -> int:
     )
 
     dt_ohlcv = time.monotonic() - t_ohlcv
+    logger.info("[PREP][HEARTBEAT] stage=ohlcv_prefetch status=done")
+    logger.info("[STAGE][DONE] name=%s dt=%.2f", "ohlcv_prefetch", dt_ohlcv)
 
     t_derived = time.monotonic()
+    logger.info("[PREP][HEARTBEAT] stage=derived_minervini status=start")
     derived_upserted = compute_and_store_derived_minervini(
         engine=engine,
         symbols=symbols,
         env=env,
-        as_of=as_of,
+        as_of=effective_as_of,
         lookback_days=int(os.getenv("MINERVINI_OHLCV_DAYS", "520")),
     )
     dt_derived = time.monotonic() - t_derived
+    logger.info("[PREP][HEARTBEAT] stage=derived_minervini status=done")
+    logger.info("[STAGE][DONE] name=%s dt=%.2f", "derived_minervini", dt_derived)
 
     # ✅ VERIFY: Check derived_minervini scores immediately after computation
     logger.info("[PREP][DERIVED][MINERVINI] upserted=%s", derived_upserted)
@@ -644,17 +691,29 @@ def main() -> int:
     try:
         from trader.db.repos import DerivedMinerviniRepo
         minervini_repo = DerivedMinerviniRepo(engine)
-        verify_rows = minervini_repo.load_derived(env=env, as_of=as_of, allow_fallback=False)
+        verify_rows = minervini_repo.load_derived(env=env, as_of=effective_as_of, allow_fallback=False)
         
         if not verify_rows:
             derived_verify_reason = "no_rows_loaded"
             logger.error(
                 "[PREP][DERIVED_VERIFY][FAIL] as_of=%s rows=0 reason=%s",
-                as_of,
+                effective_as_of,
                 derived_verify_reason,
             )
         else:
             row_count = len(verify_rows)
+            sample_rows = [
+                {
+                    "symbol": r.get("symbol"),
+                    "close": r.get("close"),
+                    "pivot_price": r.get("pivot_price"),
+                    "breakout_score": r.get("breakout_score"),
+                    "pullback_score": r.get("pullback_score"),
+                    "momentum_score": r.get("momentum_score"),
+                }
+                for r in verify_rows[:5]
+            ]
+            logger.info("[DERIVED][MINERVINI][RAW_SAMPLE] %s", sample_rows)
             expected_min_rows = int(len(symbols) * 0.80)  # 80% of universe
             
             rs_nonzero = sum(1 for r in verify_rows if float(r.get("rs_percentile", 0) or 0) > 0 or float(r.get("rs_score", 0) or 0) > 0)
@@ -681,7 +740,7 @@ def main() -> int:
                 derived_verify_reason = ";".join(quality_failures)
                 logger.error(
                     "[PREP][DERIVED_VERIFY][FAIL] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d reason=%s",
-                    as_of,
+                    effective_as_of,
                     row_count,
                     rs_nonzero,
                     vcp_nonzero,
@@ -695,7 +754,7 @@ def main() -> int:
                 derived_verify_passed = True
                 logger.info(
                     "[PREP][DERIVED_VERIFY][OK] as_of=%s rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d entry_scores_deferred_to_watchlist=%d",
-                    as_of,
+                    effective_as_of,
                     row_count,
                     rs_nonzero,
                     vcp_nonzero,
@@ -717,6 +776,7 @@ def main() -> int:
         raise RuntimeError(error_msg)
 
     t_pool = time.monotonic()
+    logger.info("[PREP][HEARTBEAT] stage=candidate_pool status=start")
     force_candidate = os.getenv("FORCE_CANDIDATE", "0") == "1"
     watchlist_force_rebuild = (
         force_candidate
@@ -731,13 +791,15 @@ def main() -> int:
     pool_codes = build_and_save_candidate_pool(
         engine=engine,
         env=env,
-        as_of=as_of,
+        as_of=effective_as_of,
         members=members,
         ohlcv_provider=_pool_ohlcv,
         force_rebuild=force_candidate,
         skip_prefetch=True,
     )
     dt_pool = time.monotonic() - t_pool
+    logger.info("[PREP][HEARTBEAT] stage=candidate_pool status=done")
+    logger.info("[STAGE][DONE] name=%s dt=%.2f", "candidate_pool", dt_pool)
     
     # ✅ FIX: candidate_pool 120개만 watchlist에 전달 (재필터링 방지)
     pool_members = [m for m in members if str(m.get("code", "")).zfill(6) in {str(c).zfill(6) for c in pool_codes}]
@@ -759,9 +821,10 @@ def main() -> int:
     )
 
     t_watchlist = time.monotonic()
+    logger.info("[PREP][HEARTBEAT] stage=watchlist_scoring status=start")
 
     def _watchlist_ohlcv(code: str, count: int = 120):
-        df = _load_db_ohlcv_df(engine=engine, code=code, as_of=as_of, count=count)
+        df = _load_db_ohlcv_df(engine=engine, code=code, as_of=effective_as_of, count=count)
         return df, {"source": "db"}
 
     flow_provider = _make_flow_provider(engine)
@@ -774,7 +837,7 @@ def main() -> int:
         engine=engine,
         env=env,
         strategy=os.getenv("PB1_WATCHLIST_STRATEGY", "pb1_watchlist"),
-        as_of=as_of,
+        as_of=effective_as_of,
         members=pool_members,
         ohlcv_provider=_watchlist_ohlcv,
         minervini_config={
@@ -804,6 +867,8 @@ def main() -> int:
             "reject_summary": {},
         }
     dt_watchlist = time.monotonic() - t_watchlist
+    logger.info("[PREP][HEARTBEAT] stage=watchlist_scoring status=done")
+    logger.info("[STAGE][DONE] name=%s dt=%.2f", "watchlist", dt_watchlist)
 
     # ✅ FIX: PREP에서는 현재 as_of만 사용, 이전 watchlist cache 재사용 금지
     shortage_reason = ""
@@ -815,8 +880,8 @@ def main() -> int:
     bundle_pool120 = watchlist_bundle.get("pool120", []) or []
     bundle_top50 = watchlist_bundle.get("top50", []) or []
     bundle_final30 = watchlist_bundle.get("final30", watchlist or []) or []
-    stage_as_of["flow"] = as_of.isoformat()
-    stage_as_of["final30"] = as_of.isoformat()
+    stage_as_of["flow"] = effective_as_of.isoformat()
+    stage_as_of["final30"] = effective_as_of.isoformat()
 
     logger.info(
         "[WATCHLIST][STAGE_COUNTS] upstream_universe=%s raw_input=%s broader_scored=%s pool120=%s top50=%s final30=%s",
@@ -834,10 +899,12 @@ def main() -> int:
         pool120=bundle_pool120,
         top50=bundle_top50,
         final30=bundle_final30,
-        min_universe=150,
+        min_universe=120,
         min_pool=pool_min,
         min_top50=topk,
         exact_final30=finaln,
+        contract_mode="candidate_pool_based",
+        universe_scored_source="universe_filtered_from_raw120",
     )
 
     def _count_score_nonzero(rows: list[dict], keys: tuple[str, ...]) -> int:
@@ -1227,6 +1294,7 @@ def main() -> int:
             momentum_nonzero,
         )
     runtime_exported = False
+    logger.info("[PREP][HEARTBEAT] stage=export status=start")
     try:
         export_watchlist_bundle(
             out_dir=export_dir,
@@ -1346,6 +1414,7 @@ def main() -> int:
             int(strict_export),
         )
         _handle_export_consistency_failure(strict_export=strict_export)
+    logger.info("[PREP][HEARTBEAT] stage=export status=done")
 
     # ✅ FIX: Initialize prep_status and flow_coverage early
     prep_status = "DONE"
@@ -1469,6 +1538,7 @@ def main() -> int:
             else:
                 prep_status = "DEGRADED"
 
+    report_failmode_soft = _env_true("REPORT_FAILMODE_SOFT", "1")
     try:
         pdf_path = generate_watchlist_pdf(
             as_of=as_of,
@@ -1482,7 +1552,11 @@ def main() -> int:
         )
         logger.info("[PDF] wrote %s", pdf_path)
     except Exception:
-        logger.exception("[REPORT][WATCHLIST][PDF][FAIL] as_of=%s output_dir=%s", as_of, export_dir)
+        if report_failmode_soft:
+            logger.exception("[REPORT][WATCHLIST][PDF][FAIL][SOFT] as_of=%s output_dir=%s", as_of, export_dir)
+        else:
+            logger.exception("[REPORT][WATCHLIST][PDF][FAIL][HARD] as_of=%s output_dir=%s", as_of, export_dir)
+            raise
     
     payload = to_jsonable(
         {

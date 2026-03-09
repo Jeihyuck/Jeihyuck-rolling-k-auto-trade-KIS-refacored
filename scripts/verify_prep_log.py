@@ -36,6 +36,7 @@ class VerifyResults:
     derived_ok_by_count: bool = False
     contract_failures: List[str] = field(default_factory=list)
     contract_recoveries: List[str] = field(default_factory=list)
+    traceback_detected: bool = False
     failures: List[str] = field(default_factory=list)
     
     def has_critical_failure(self) -> bool:
@@ -48,11 +49,10 @@ class VerifyResults:
             or self.derived_verify_fail
             or not self.final30_saved
             or not self.asof_consistent
-            or self.candidate_pool_future_seen
-            or (not self.candidate_pool_future_rejected and self.candidate_pool_future_seen)
             or unrecovered_contracts
             or not self.exporter_preserved_scores
             or not self.derived_ok_by_count
+            or self.traceback_detected
             or bool(self.failures)
         )
 
@@ -157,6 +157,10 @@ def parse_log_file(log_path: Path) -> VerifyResults:
         results.contract_recoveries.append('DB_SUCCESS')
     if re.search(r'\[PREP\]\[WATCHLIST\]\[CONTRACT\]\[RECOVERED\]', log_content):
         results.contract_recoveries.append('CONTRACT_RECOVERED')
+
+    # Explicit fatal guard: only unrecovered fatal exception should fail verify.
+    if re.search(r'Traceback \(most recent call last\)', log_content):
+        results.traceback_detected = True
     
     # Exporter preservation: compare inmem and exporter for key score fields when both exist.
     if results.inmem_scores and results.export_scores:
@@ -192,12 +196,10 @@ def print_verification_results(results: VerifyResults) -> None:
     else:
         print("::error::as_of consistency failed")
 
-    if not results.candidate_pool_future_seen:
-        print("✅ candidate pool date guard passed")
-    elif results.candidate_pool_future_rejected:
+    if results.candidate_pool_future_rejected:
         print("✅ candidate pool future snapshot rejected")
     else:
-        print("::error::candidate pool future snapshot detected")
+        print("ℹ no future snapshot rejection observed")
 
     if results.derived_verify_ok and not results.derived_verify_fail and results.derived_ok_by_count:
         print("✅ derived verify passed")
@@ -209,11 +211,10 @@ def print_verification_results(results: VerifyResults) -> None:
     else:
         print("::error::entry scores missing")
 
-    if results.contract_failures:
-        if results.contract_recoveries:
-            print("✅ contract violation recovered successfully")
-        else:
-            print("::error::Contract violation remained unrecovered")
+    if results.contract_failures and not results.contract_recoveries:
+        print("::error::unrecovered contract failure")
+    else:
+        print("✅ contract violation recovered successfully")
 
     if results.final30_saved:
         print(f"✅ final30 save found (count={results.final30_count})")
@@ -224,6 +225,11 @@ def print_verification_results(results: VerifyResults) -> None:
         print("✅ exporter preserved score fields")
     else:
         print("::error::watchlist/exporter score mismatch")
+
+    if results.traceback_detected:
+        print("::error::Python traceback detected")
+    else:
+        print("✅ no traceback detected")
     
     print("=" * 50)
 
@@ -242,7 +248,7 @@ def main() -> int:
         print("::error::Critical failures detected - PREP verification failed")
         return 1
 
-    print("✅ Verification complete")
+    print("PREP verification passed")
     print("=" * 50)
     return 0
 

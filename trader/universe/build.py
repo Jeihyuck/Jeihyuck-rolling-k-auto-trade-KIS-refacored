@@ -684,6 +684,10 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             provider=source,
             members=members,
             reason=last_reason,
+            requested_as_of=as_of_date,
+            actual_as_of=as_of_date,
+            build_reason=last_reason,
+            universe_name=strategy,
         )
     except Exception as exc:
         error_reason = f"store_fail:{exc}"

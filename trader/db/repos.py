@@ -781,6 +781,10 @@ class UniverseRepo:
         strategy: str,
         as_of_date: str,
         provider: str,
+        requested_as_of: str | None = None,
+        actual_as_of: str | None = None,
+        build_reason: str | None = None,
+        universe_name: str | None = None,
     ) -> str:
         """
         Idempotent start:
@@ -790,6 +794,8 @@ class UniverseRepo:
         """
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
+        requested_as_of_d = _as_date(requested_as_of or as_of_date)
+        actual_as_of_d = _as_date(actual_as_of or as_of_date)
         now = now_kst().isoformat()
         
         try:
@@ -813,6 +819,10 @@ class UniverseRepo:
                               status="RUNNING",
                               members_count=0,
                               error_reason=None,
+                              requested_as_of=requested_as_of_d,
+                              actual_as_of=actual_as_of_d,
+                              build_reason=build_reason,
+                              universe_name=universe_name or strategy_key,
                           )
                     )
                     logger.info(
@@ -828,6 +838,10 @@ class UniverseRepo:
                         run_id=run_id,
                         strategy=strategy_key,
                         provider=provider,
+                        requested_as_of=requested_as_of_d,
+                        actual_as_of=actual_as_of_d,
+                        build_reason=build_reason,
+                        universe_name=universe_name or strategy_key,
                         as_of=as_of_d,
                         created_ts=now,
                         status="RUNNING",
@@ -895,6 +909,10 @@ class UniverseRepo:
         provider: str,
         members: list[dict],
         reason: str | None = None,
+        requested_as_of: str | None = None,
+        actual_as_of: str | None = None,
+        build_reason: str | None = None,
+        universe_name: str | None = None,
     ) -> None:
         """
         Store universe snapshot to DB (UNIVERSE_RUNS + UNIVERSE_MEMBERS + UNIVERSE_CURRENT).
@@ -902,6 +920,8 @@ class UniverseRepo:
         """
         members_list = list(members)
         as_of_d = _as_date(as_of_date)
+        requested_as_of_d = _as_date(requested_as_of or as_of_date)
+        actual_as_of_d = _as_date(actual_as_of or as_of_date)
         db_url = str(self.engine.url)
         strategy_key = self._strategy_key(env, strategy)
         members_count = len(members_list)
@@ -917,6 +937,10 @@ class UniverseRepo:
                           status="SUCCESS",
                           members_count=members_count,
                           error_reason=None,
+                          requested_as_of=requested_as_of_d,
+                          actual_as_of=actual_as_of_d,
+                          build_reason=build_reason or reason,
+                          universe_name=universe_name or strategy_key,
                           created_ts=now,
                       )
                 )
