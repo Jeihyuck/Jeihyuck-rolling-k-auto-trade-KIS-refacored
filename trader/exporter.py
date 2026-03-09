@@ -3,11 +3,67 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Hashable, Mapping
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_SCORE_ALIAS_CANDIDATES = {
+    "tech": ("tech_score", "tech"),
+    "final": ("score_final", "final_score"),
+    "breakout": ("breakout_score", "score_breakout", "breakout"),
+    "pullback": ("pullback_score", "score_pullback", "pullback"),
+    "momentum": ("momentum_score", "score_momentum", "momentum"),
+    "rs": ("rs_score",),
+    "vcp": ("vcp_score",),
+    "trend": ("trend_score",),
+}
+
+
+def _resolve_alias_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    if df is None or df.empty:
+        return None
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _count_nonzero_by_alias(df: pd.DataFrame, candidates: tuple[str, ...]) -> tuple[int, str | None]:
+    col = _resolve_alias_column(df, candidates)
+    if col is None:
+        return 0, None
+    vals = pd.to_numeric(df[col], errors="coerce")
+    return int((vals.fillna(0.0) > 0.0).sum()), col
+
+
+def _collect_score_nonzero_stats(df: pd.DataFrame) -> tuple[Dict[str, int], Dict[str, str | None]]:
+    stats = {
+        "tech_nonzero": 0,
+        "final_nonzero": 0,
+        "score_final_nonzero": 0,
+        "breakout_nonzero": 0,
+        "pullback_nonzero": 0,
+        "momentum_nonzero": 0,
+    }
+    alias_cols: Dict[str, str | None] = {
+        "tech": None,
+        "final": None,
+        "breakout": None,
+        "pullback": None,
+        "momentum": None,
+    }
+    if df is None or df.empty:
+        return stats, alias_cols
+
+    stats["tech_nonzero"], alias_cols["tech"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["tech"])
+    stats["final_nonzero"], alias_cols["final"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["final"])
+    stats["score_final_nonzero"] = stats["final_nonzero"]
+    stats["breakout_nonzero"], alias_cols["breakout"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["breakout"])
+    stats["pullback_nonzero"], alias_cols["pullback"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["pullback"])
+    stats["momentum_nonzero"], alias_cols["momentum"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["momentum"])
+    return stats, alias_cols
 
 _REQUIRED_EXPORT_KEYS = [
     "as_of",
@@ -80,8 +136,9 @@ def _normalize_reasons(value: Any) -> Dict[str, Any]:
     return {"raw": str(value)}
 
 
-def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(record or {})
+def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
+    # Pandas records can carry non-str key types; normalize keys to strings for stable schema handling.
+    normalized: Dict[str, Any] = {str(k): v for k, v in dict(record or {}).items()}
     meta = dict(normalized.get("meta") or {})
 
     def _pick(*keys: str, default: Any = 0.0) -> Any:
@@ -260,13 +317,17 @@ def export_watchlist_bundle(
     for name, frame in frames_dict.items():
         safe_name = name.strip().lower()
         pre_df = frame if frame is not None else pd.DataFrame()
-        pre_stats = {
-            "tech_nonzero": int((pd.to_numeric(pre_df.get("tech_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "tech_score" in pre_df.columns else 0,
-            "score_final_nonzero": int((pd.to_numeric(pre_df.get("score_final"), errors="coerce").fillna(0.0) > 0.0).sum()) if "score_final" in pre_df.columns else 0,
-            "breakout_nonzero": int((pd.to_numeric(pre_df.get("breakout_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "breakout_score" in pre_df.columns else 0,
-            "pullback_nonzero": int((pd.to_numeric(pre_df.get("pullback_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "pullback_score" in pre_df.columns else 0,
-            "momentum_nonzero": int((pd.to_numeric(pre_df.get("momentum_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "momentum_score" in pre_df.columns else 0,
-        }
+        pre_stats, pre_alias_cols = _collect_score_nonzero_stats(pre_df)
+        if safe_name == "final30":
+            logger.info("[EXPORT][FINAL30][SOURCE_COLUMNS] cols=%s", sorted(pre_df.columns.tolist()))
+            logger.info(
+                "[EXPORT][FINAL30][ALIAS] breakout_col=%s pullback_col=%s momentum_col=%s tech_col=%s final_col=%s",
+                pre_alias_cols.get("breakout") or "",
+                pre_alias_cols.get("pullback") or "",
+                pre_alias_cols.get("momentum") or "",
+                pre_alias_cols.get("tech") or "",
+                pre_alias_cols.get("final") or "",
+            )
         logger.info(
             "[EXPORT][PRE_NORMALIZE][SCORES] name=%s rows=%s tech_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             safe_name,
@@ -314,12 +375,13 @@ def export_watchlist_bundle(
             )
         
         if not df.empty:
-            tech_nonzero = int((df["tech_score"].fillna(0.0) > 0.0).sum()) if "tech_score" in df.columns else 0
-            score_final_nonzero = int((df["score_final"].fillna(0.0) > 0.0).sum()) if "score_final" in df.columns else 0
-            final_score_nonzero = int((df["final_score"].fillna(0.0) > 0.0).sum()) if "final_score" in df.columns else 0
-            breakout_nonzero = int((df["breakout_score"].fillna(0.0) > 0.0).sum()) if "breakout_score" in df.columns else 0
-            pullback_nonzero = int((df["pullback_score"].fillna(0.0) > 0.0).sum()) if "pullback_score" in df.columns else 0
-            momentum_nonzero = int((df["momentum_score"].fillna(0.0) > 0.0).sum()) if "momentum_score" in df.columns else 0
+            post_stats, _post_alias_cols = _collect_score_nonzero_stats(df)
+            tech_nonzero = post_stats["tech_nonzero"]
+            score_final_nonzero = post_stats["score_final_nonzero"]
+            final_score_nonzero = post_stats["final_nonzero"]
+            breakout_nonzero = post_stats["breakout_nonzero"]
+            pullback_nonzero = post_stats["pullback_nonzero"]
+            momentum_nonzero = post_stats["momentum_nonzero"]
             
             logger.info(
                 "[EXPORT][SCORES] name=%s rows=%s tech_nonzero=%s score_final_nonzero=%s final_score_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",

@@ -45,6 +45,17 @@ from trader.universe.build import build_universe
 
 logger = logging.getLogger(__name__)
 
+_SCORE_ALIAS_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "tech": ("tech_score", "tech"),
+    "final": ("score_final", "final_score"),
+    "breakout": ("breakout_score", "score_breakout", "breakout"),
+    "pullback": ("pullback_score", "score_pullback", "pullback"),
+    "momentum": ("momentum_score", "score_momentum", "momentum"),
+    "rs": ("rs_score",),
+    "vcp": ("vcp_score",),
+    "trend": ("trend_score",),
+}
+
 
 def _env_true(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
@@ -213,6 +224,96 @@ def _count_nonzero(df: pd.DataFrame, col: str) -> int:
     return int((vals.fillna(0.0) > 0.0).sum())
 
 
+def _resolve_alias_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    if df is None or df.empty:
+        return None
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _count_nonzero_by_alias(df: pd.DataFrame, candidates: tuple[str, ...]) -> tuple[int, str | None]:
+    col = _resolve_alias_column(df, candidates)
+    if col is None:
+        return 0, None
+    vals = pd.to_numeric(df[col], errors="coerce")
+    return int((vals.fillna(0.0) > 0.0).sum()), col
+
+
+def _collect_final30_nonzero_stats(df: pd.DataFrame) -> tuple[dict[str, int], dict[str, str | None]]:
+    stats: dict[str, int] = {
+        "tech_nonzero": 0,
+        "final_nonzero": 0,
+        "score_final_nonzero": 0,
+        "breakout_nonzero": 0,
+        "pullback_nonzero": 0,
+        "momentum_nonzero": 0,
+        "rs_nonzero": 0,
+        "vcp_nonzero": 0,
+        "trend_nonzero": 0,
+    }
+    alias_cols: dict[str, str | None] = {
+        "tech": None,
+        "final": None,
+        "breakout": None,
+        "pullback": None,
+        "momentum": None,
+        "rs": None,
+        "vcp": None,
+        "trend": None,
+    }
+    if df is None or df.empty:
+        return stats, alias_cols
+
+    stats["tech_nonzero"], alias_cols["tech"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["tech"])
+    stats["final_nonzero"], alias_cols["final"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["final"])
+    stats["score_final_nonzero"] = stats["final_nonzero"]
+    stats["breakout_nonzero"], alias_cols["breakout"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["breakout"])
+    stats["pullback_nonzero"], alias_cols["pullback"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["pullback"])
+    stats["momentum_nonzero"], alias_cols["momentum"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["momentum"])
+    stats["rs_nonzero"], alias_cols["rs"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["rs"])
+    stats["vcp_nonzero"], alias_cols["vcp"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["vcp"])
+    stats["trend_nonzero"], alias_cols["trend"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["trend"])
+    return stats, alias_cols
+
+
+def _has_required_final30_score_fields(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    required_keys = ("tech", "final", "breakout", "pullback", "momentum")
+    for key in required_keys:
+        if _resolve_alias_column(df, _SCORE_ALIAS_CANDIDATES[key]) is None:
+            return False
+    return True
+
+
+def _debug_compare_nonzero(
+    *,
+    key: str,
+    inmem: int,
+    exported: int,
+    lhs_source: str,
+    rhs_source: str,
+    lhs_col: str | None,
+    rhs_col: str | None,
+) -> None:
+    logger.info(
+        "[PREP][EXPORT][COMPARE] key=%s inmem=%s exported=%s lhs_source=%s rhs_source=%s",
+        key,
+        inmem,
+        exported,
+        lhs_source,
+        rhs_source,
+    )
+    logger.info(
+        "[PREP][EXPORT][COMPARE][FIELDS] key=%s lhs_col=%s rhs_col=%s",
+        key,
+        lhs_col or "",
+        rhs_col or "",
+    )
+
+
 def _assert_same_nonzero(stage: str, inmem: int, exported: int) -> None:
     if int(inmem) != int(exported):
         raise RuntimeError(
@@ -358,8 +459,14 @@ def main() -> int:
     # ---- RS benchmark handling (229200 etc.) ----
     bench = os.getenv("RS_BENCHMARK", "229200").strip()
 
-    # Universe symbols
-    symbols = [m.get("code") for m in members if m.get("code")]
+    # Universe symbols (strict str list for downstream typed functions)
+    symbols: list[str] = []
+    for member in members:
+        code = member.get("code")
+        if isinstance(code, str):
+            code_norm = code.strip()
+            if code_norm:
+                symbols.append(code_norm)
 
     # Ensure benchmark included for downstream RS/Stage_B computations
     if bench and bench not in symbols:
@@ -949,12 +1056,22 @@ def main() -> int:
     ledger_repo = LedgerEventsRepo(engine)
 
     export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
+    final30_signals_df = pd.DataFrame(watchlist_bundle.get("final30", []))
+    watchlist_result_final30_df = pd.DataFrame(watchlist or [])
+    final30_scored_df_for_export = watchlist_result_final30_df
+    final30_source_label = "watchlist_result.final30_scored"
+    if final30_scored_df_for_export.empty or not _has_required_final30_score_fields(final30_scored_df_for_export):
+        if not final30_signals_df.empty:
+            final30_scored_df_for_export = final30_signals_df
+            final30_source_label = "watchlist_bundle.final30_saved"
+
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
         "pool120": pd.DataFrame(watchlist_bundle.get("pool120", [])),
         "top50": pd.DataFrame(watchlist_bundle.get("top50", [])),
-        "final30": pd.DataFrame(watchlist_bundle.get("final30", [])),
+        "final30": final30_scored_df_for_export,
     }
+    final30_saved_df = frames["final30"]
 
     # Single as_of contract across PREP stages.
     consistent = int(all(v == as_of.isoformat() for v in stage_as_of.values()))
@@ -972,7 +1089,7 @@ def main() -> int:
     if consistent != 1:
         raise RuntimeError("PREP_ASOF_CONSISTENCY_FAILED")
 
-    final30_df = frames.get("final30", pd.DataFrame())
+    final30_df = final30_scored_df_for_export
     inmem_stats: dict[str, int] = {
         "tech_nonzero": 0,
         "final_nonzero": 0,
@@ -982,12 +1099,31 @@ def main() -> int:
         "momentum_nonzero": 0,
     }
     if final30_df is not None and not final30_df.empty:
-        score_final_nonzero = _count_nonzero(final30_df, "score_final")
-        final_score_nonzero = _count_nonzero(final30_df, "final_score")
-        tech_score_nonzero = _count_nonzero(final30_df, "tech_score")
-        breakout_nonzero = _count_nonzero(final30_df, "breakout_score")
-        pullback_nonzero = _count_nonzero(final30_df, "pullback_score")
-        momentum_nonzero = _count_nonzero(final30_df, "momentum_score")
+        logger.info(
+            "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s",
+            final30_source_label,
+            int(len(final30_df)),
+        )
+        logger.info("[PREP][EXPORT][FINAL30][COLUMNS] cols=%s", sorted(final30_df.columns.tolist()))
+        logger.info(
+            "[PREP][EXPORT][FINAL30][FIELDS] has_tech_score=%s has_score_final=%s has_final_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_score=%s has_vcp_score=%s has_trend_score=%s",
+            int("tech_score" in final30_df.columns),
+            int("score_final" in final30_df.columns),
+            int("final_score" in final30_df.columns),
+            int("breakout_score" in final30_df.columns),
+            int("pullback_score" in final30_df.columns),
+            int("momentum_score" in final30_df.columns),
+            int("rs_score" in final30_df.columns),
+            int("vcp_score" in final30_df.columns),
+            int("trend_score" in final30_df.columns),
+        )
+        final30_stats, inmem_cols = _collect_final30_nonzero_stats(final30_df)
+        score_final_nonzero = int(final30_stats["score_final_nonzero"])
+        final_score_nonzero = int(final30_stats["final_nonzero"])
+        tech_score_nonzero = int(final30_stats["tech_nonzero"])
+        breakout_nonzero = int(final30_stats["breakout_nonzero"])
+        pullback_nonzero = int(final30_stats["pullback_nonzero"])
+        momentum_nonzero = int(final30_stats["momentum_nonzero"])
         inmem_stats = {
             "tech_nonzero": tech_score_nonzero,
             "final_nonzero": final_score_nonzero,
@@ -1027,14 +1163,91 @@ def main() -> int:
         )
         runtime_exported = True
         exported_final30 = pd.read_csv(export_dir / "final30.csv")
+        post_stats_full, post_cols = _collect_final30_nonzero_stats(exported_final30)
         post_stats = {
-            "tech_nonzero": _count_nonzero(exported_final30, "tech_score"),
-            "final_nonzero": _count_nonzero(exported_final30, "final_score"),
-            "score_final_nonzero": _count_nonzero(exported_final30, "score_final"),
-            "breakout_nonzero": _count_nonzero(exported_final30, "breakout_score"),
-            "pullback_nonzero": _count_nonzero(exported_final30, "pullback_score"),
-            "momentum_nonzero": _count_nonzero(exported_final30, "momentum_score"),
+            "tech_nonzero": int(post_stats_full["tech_nonzero"]),
+            "final_nonzero": int(post_stats_full["final_nonzero"]),
+            "score_final_nonzero": int(post_stats_full["score_final_nonzero"]),
+            "breakout_nonzero": int(post_stats_full["breakout_nonzero"]),
+            "pullback_nonzero": int(post_stats_full["pullback_nonzero"]),
+            "momentum_nonzero": int(post_stats_full["momentum_nonzero"]),
         }
+        rhs_source_label = "exporter_final30_df"
+        lhs_has_required = _has_required_final30_score_fields(final30_saved_df)
+        rhs_has_required = _has_required_final30_score_fields(exported_final30)
+        logger.info(
+            "[PREP][EXPORT][CONSISTENCY] lhs=%s rhs=%s",
+            "final30_scored_df_for_export",
+            rhs_source_label,
+        )
+        logger.info(
+            "[PREP][EXPORT][CONSISTENCY][FIELDS] lhs_has_tech=%s rhs_has_tech=%s lhs_has_final=%s rhs_has_final=%s lhs_has_breakout=%s rhs_has_breakout=%s lhs_has_pullback=%s rhs_has_pullback=%s lhs_has_momentum=%s rhs_has_momentum=%s",
+            int(inmem_cols.get("tech") is not None),
+            int(post_cols.get("tech") is not None),
+            int(inmem_cols.get("final") is not None),
+            int(post_cols.get("final") is not None),
+            int(inmem_cols.get("breakout") is not None),
+            int(post_cols.get("breakout") is not None),
+            int(inmem_cols.get("pullback") is not None),
+            int(post_cols.get("pullback") is not None),
+            int(inmem_cols.get("momentum") is not None),
+            int(post_cols.get("momentum") is not None),
+        )
+        if not lhs_has_required or not rhs_has_required:
+            logger.error(
+                "[PREP][EXPORT][CONSISTENCY][MISSING_FIELDS] lhs_source=%s rhs_source=%s lhs_cols=%s rhs_cols=%s",
+                final30_source_label,
+                rhs_source_label,
+                sorted(final30_saved_df.columns.tolist()),
+                sorted(exported_final30.columns.tolist()),
+            )
+            raise RuntimeError("final30_scored_fields_missing_for_consistency")
+
+        _debug_compare_nonzero(
+            key="final30_tech",
+            inmem=inmem_stats["tech_nonzero"],
+            exported=post_stats["tech_nonzero"],
+            lhs_source=final30_source_label,
+            rhs_source=rhs_source_label,
+            lhs_col=inmem_cols.get("tech"),
+            rhs_col=post_cols.get("tech"),
+        )
+        _debug_compare_nonzero(
+            key="final30_score_final",
+            inmem=inmem_stats["score_final_nonzero"],
+            exported=post_stats["score_final_nonzero"],
+            lhs_source=final30_source_label,
+            rhs_source=rhs_source_label,
+            lhs_col=inmem_cols.get("final"),
+            rhs_col=post_cols.get("final"),
+        )
+        _debug_compare_nonzero(
+            key="final30_breakout",
+            inmem=inmem_stats["breakout_nonzero"],
+            exported=post_stats["breakout_nonzero"],
+            lhs_source=final30_source_label,
+            rhs_source=rhs_source_label,
+            lhs_col=inmem_cols.get("breakout"),
+            rhs_col=post_cols.get("breakout"),
+        )
+        _debug_compare_nonzero(
+            key="final30_pullback",
+            inmem=inmem_stats["pullback_nonzero"],
+            exported=post_stats["pullback_nonzero"],
+            lhs_source=final30_source_label,
+            rhs_source=rhs_source_label,
+            lhs_col=inmem_cols.get("pullback"),
+            rhs_col=post_cols.get("pullback"),
+        )
+        _debug_compare_nonzero(
+            key="final30_momentum",
+            inmem=inmem_stats["momentum_nonzero"],
+            exported=post_stats["momentum_nonzero"],
+            lhs_source=final30_source_label,
+            rhs_source=rhs_source_label,
+            lhs_col=inmem_cols.get("momentum"),
+            rhs_col=post_cols.get("momentum"),
+        )
         _assert_same_nonzero("final30_tech", inmem_stats["tech_nonzero"], post_stats["tech_nonzero"])
         _assert_same_nonzero("final30_score_final", inmem_stats["score_final_nonzero"], post_stats["score_final_nonzero"])
         _assert_same_nonzero("final30_breakout", inmem_stats["breakout_nonzero"], post_stats["breakout_nonzero"])
