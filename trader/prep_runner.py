@@ -33,7 +33,13 @@ from trader.data.ohlcv_provider import (
 from trader.exporter import export_watchlist_bundle
 from trader.report.pdf_report import generate_watchlist_pdf
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
-from trader.time_utils import is_market_open_kst, now_kst, prev_business_day, resolve_derived_as_of
+from trader.time_utils import (
+    calc_market_window_kst,
+    is_market_open_kst,
+    now_kst,
+    prev_business_day,
+    resolve_derived_as_of,
+)
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -200,6 +206,20 @@ def _pick_as_of_date_always_prev() -> date:
     return resolve_derived_as_of(now_kst())
 
 
+def _count_nonzero(df: pd.DataFrame, col: str) -> int:
+    if df is None or df.empty or col not in df.columns:
+        return 0
+    vals = pd.to_numeric(df[col], errors="coerce")
+    return int((vals.fillna(0.0) > 0.0).sum())
+
+
+def _assert_same_nonzero(stage: str, inmem: int, exported: int) -> None:
+    if int(inmem) != int(exported):
+        raise RuntimeError(
+            f"{stage}_SCORE_MISMATCH: inmem={inmem} exported={exported}"
+        )
+
+
 def _as_of_today() -> date:
     """Deprecated: 전일 고정을 위해 _pick_as_of_date_always_prev() 사용"""
     return now_kst().date()
@@ -289,6 +309,9 @@ def main() -> int:
     env = os.getenv("STRATEGY_ENV", "practice").lower()
     mode = os.getenv("MODE", "prep").strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
+    run_ts = now_kst()
+    run_date = run_ts.date()
+    market_window = calc_market_window_kst(run_ts)
     as_of = _pick_as_of_date_always_prev()
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
@@ -301,7 +324,31 @@ def main() -> int:
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, as_of, as_of_reason)
+    logger.info(
+        "[PREP][DATE_POLICY] run_date=%s window=%s as_of=%s reason=%s",
+        run_date.isoformat(),
+        market_window,
+        as_of.isoformat(),
+        as_of_reason,
+    )
+    logger.info(
+        "[PREP][TODAY_POLICY] run_date=%s market_window=%s as_of=%s final30_for_trade_date=%s",
+        run_date.isoformat(),
+        market_window,
+        as_of.isoformat(),
+        run_date.isoformat(),
+    )
+    logger.info("[PREP][POLICY] contract_mode=degrade_allowed")
+    logger.info("[PREP][POLICY] verify_mode=degrade_allowed")
     t0 = time.monotonic()
+
+    stage_as_of: dict[str, str] = {
+        "universe": as_of.isoformat(),
+        "ohlcv": as_of.isoformat(),
+        "derived": as_of.isoformat(),
+        "candidate_pool": as_of.isoformat(),
+        "watchlist": as_of.isoformat(),
+    }
 
     members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=as_of)
     if not members:
@@ -513,6 +560,17 @@ def main() -> int:
         len(pool_members),
     )
 
+    # Candidate pool source and pipeline stage counts for today's policy diagnostics.
+    logger.info(
+        "[WATCHLIST][STAGE_COUNTS] upstream_universe=%s raw_input=%s broader_scored=%s pool120=%s top50=%s final30=%s",
+        len(members),
+        len(pool_members),
+        0,
+        0,
+        0,
+        0,
+    )
+
     t_watchlist = time.monotonic()
 
     def _watchlist_ohlcv(code: str, count: int = 120):
@@ -570,6 +628,18 @@ def main() -> int:
     bundle_pool120 = watchlist_bundle.get("pool120", []) or []
     bundle_top50 = watchlist_bundle.get("top50", []) or []
     bundle_final30 = watchlist_bundle.get("final30", watchlist or []) or []
+    stage_as_of["flow"] = as_of.isoformat()
+    stage_as_of["final30"] = as_of.isoformat()
+
+    logger.info(
+        "[WATCHLIST][STAGE_COUNTS] upstream_universe=%s raw_input=%s broader_scored=%s pool120=%s top50=%s final30=%s",
+        len(members),
+        len(pool_members),
+        len(bundle_universe),
+        len(bundle_pool120),
+        len(bundle_top50),
+        len(bundle_final30),
+    )
 
     # ✅ FIX: Use centralized contract validation function
     contract_failures = validate_watchlist_contract(
@@ -833,6 +903,7 @@ def main() -> int:
             as_of,
             len(watchlist),
         )
+        stage_as_of["final30"] = as_of.isoformat()
         
         # ✅ CRITICAL: Save final30_snapshot for trade tick
         from trader.final_list_store import save_final30
@@ -882,16 +953,49 @@ def main() -> int:
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
         "pool120": pd.DataFrame(watchlist_bundle.get("pool120", [])),
         "top50": pd.DataFrame(watchlist_bundle.get("top50", [])),
-        "final30": pd.DataFrame((watchlist or watchlist_bundle.get("final30", []))),
+        "final30": pd.DataFrame(watchlist_bundle.get("final30", [])),
     }
+
+    # Single as_of contract across PREP stages.
+    consistent = int(all(v == as_of.isoformat() for v in stage_as_of.values()))
+    logger.info(
+        "[PREP][ASOF_CONSISTENCY] universe=%s ohlcv=%s derived=%s candidate_pool=%s watchlist=%s flow=%s final30=%s consistent=%s",
+        stage_as_of.get("universe", ""),
+        stage_as_of.get("ohlcv", ""),
+        stage_as_of.get("derived", ""),
+        stage_as_of.get("candidate_pool", ""),
+        stage_as_of.get("watchlist", ""),
+        stage_as_of.get("flow", ""),
+        stage_as_of.get("final30", ""),
+        consistent,
+    )
+    if consistent != 1:
+        raise RuntimeError("PREP_ASOF_CONSISTENCY_FAILED")
+
     final30_df = frames.get("final30", pd.DataFrame())
+    inmem_stats: dict[str, int] = {
+        "tech_nonzero": 0,
+        "final_nonzero": 0,
+        "score_final_nonzero": 0,
+        "breakout_nonzero": 0,
+        "pullback_nonzero": 0,
+        "momentum_nonzero": 0,
+    }
     if final30_df is not None and not final30_df.empty:
-        score_final_nonzero = int((pd.to_numeric(final30_df.get("score_final"), errors="coerce").fillna(0.0) > 0.0).sum()) if "score_final" in final30_df.columns else 0
-        final_score_nonzero = int((pd.to_numeric(final30_df.get("final_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "final_score" in final30_df.columns else 0
-        tech_score_nonzero = int((pd.to_numeric(final30_df.get("tech_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "tech_score" in final30_df.columns else 0
-        breakout_nonzero = int((pd.to_numeric(final30_df.get("breakout_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "breakout_score" in final30_df.columns else 0
-        pullback_nonzero = int((pd.to_numeric(final30_df.get("pullback_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "pullback_score" in final30_df.columns else 0
-        momentum_nonzero = int((pd.to_numeric(final30_df.get("momentum_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "momentum_score" in final30_df.columns else 0
+        score_final_nonzero = _count_nonzero(final30_df, "score_final")
+        final_score_nonzero = _count_nonzero(final30_df, "final_score")
+        tech_score_nonzero = _count_nonzero(final30_df, "tech_score")
+        breakout_nonzero = _count_nonzero(final30_df, "breakout_score")
+        pullback_nonzero = _count_nonzero(final30_df, "pullback_score")
+        momentum_nonzero = _count_nonzero(final30_df, "momentum_score")
+        inmem_stats = {
+            "tech_nonzero": tech_score_nonzero,
+            "final_nonzero": final_score_nonzero,
+            "score_final_nonzero": score_final_nonzero,
+            "breakout_nonzero": breakout_nonzero,
+            "pullback_nonzero": pullback_nonzero,
+            "momentum_nonzero": momentum_nonzero,
+        }
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             int(len(final30_df)),
@@ -922,8 +1026,23 @@ def main() -> int:
             },
         )
         runtime_exported = True
+        exported_final30 = pd.read_csv(export_dir / "final30.csv")
+        post_stats = {
+            "tech_nonzero": _count_nonzero(exported_final30, "tech_score"),
+            "final_nonzero": _count_nonzero(exported_final30, "final_score"),
+            "score_final_nonzero": _count_nonzero(exported_final30, "score_final"),
+            "breakout_nonzero": _count_nonzero(exported_final30, "breakout_score"),
+            "pullback_nonzero": _count_nonzero(exported_final30, "pullback_score"),
+            "momentum_nonzero": _count_nonzero(exported_final30, "momentum_score"),
+        }
+        _assert_same_nonzero("final30_tech", inmem_stats["tech_nonzero"], post_stats["tech_nonzero"])
+        _assert_same_nonzero("final30_score_final", inmem_stats["score_final_nonzero"], post_stats["score_final_nonzero"])
+        _assert_same_nonzero("final30_breakout", inmem_stats["breakout_nonzero"], post_stats["breakout_nonzero"])
+        _assert_same_nonzero("final30_pullback", inmem_stats["pullback_nonzero"], post_stats["pullback_nonzero"])
+        _assert_same_nonzero("final30_momentum", inmem_stats["momentum_nonzero"], post_stats["momentum_nonzero"])
     except Exception:
         logger.exception("[PREP][EXPORT][FAIL] as_of=%s out_dir=%s", as_of, export_dir)
+        raise RuntimeError("PREP_EXPORT_FINAL30_CONSISTENCY_FAILED")
 
     # ✅ FIX: Initialize prep_status and flow_coverage early
     prep_status = "DONE"

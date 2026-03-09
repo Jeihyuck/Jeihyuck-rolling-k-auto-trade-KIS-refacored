@@ -707,6 +707,8 @@ def load_candidate_pool(
     repo = WatchlistRepo(engine)
     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
     
+    requested_as_of = today
+
     # 최신 후보군 날짜 조회
     latest_date = repo.get_latest_watchlist_date(env=env, strategy=strategy)
     
@@ -719,8 +721,22 @@ def load_candidate_pool(
         logger.warning("[CANDIDATE_POOL][LOAD] miss reason=missing")
         return None, None, "missing"
     
+    # Date guard: never allow a snapshot newer than requested_as_of.
+    if latest_date > requested_as_of:
+        logger.error(
+            "[CANDIDATE_POOL][DATE_GUARD] requested_as_of=%s actual_as_of=%s action=reject_future_snapshot",
+            requested_as_of,
+            latest_date,
+        )
+        logger.warning(
+            "[CANDIDATE_POOL][LOAD] miss reason=future_snapshot requested_as_of=%s actual_as_of=%s",
+            requested_as_of,
+            latest_date,
+        )
+        return None, None, "future_snapshot"
+
     # TTL 검사
-    age_days = (today - latest_date).days
+    age_days = (requested_as_of - latest_date).days
     if age_days > CANDIDATE_POOL_TTL_DAYS:
         if MINERVINI_ONLY:
             logger.warning(
@@ -766,8 +782,11 @@ def load_candidate_pool(
             return None, None, "too_small"
     
     logger.info(
-        "[CANDIDATE_POOL][LOAD] hit=True as_of=%s size=%s age=%s",
-        latest_date, len(pool_codes), age_days
+        "[CANDIDATE_POOL][LOAD] hit=True as_of=%s actual_as_of=%s size=%s age=%s",
+        requested_as_of,
+        latest_date,
+        len(pool_codes),
+        age_days,
     )
     
     return pool_codes, latest_date, "hit"

@@ -2643,7 +2643,7 @@ def save_bundle(
     if bundle.universe_scored:
         _log_stage_fields("universe_scored", bundle.universe_scored)
         logger.info(
-            "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=candidate_pool rows=%s note=should_be_broader_universe",
+            "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=universe_filtered rows=%s",
             len(bundle.universe_scored),
         )
         repo.save_watchlist(
@@ -2967,6 +2967,7 @@ def build_and_save_watchlist(
         source_of_truth: Pool source - "candidate_pool" (recommended) or "universe"
     """
     repo = WatchlistRepo(engine)
+    upstream_members = list(members or [])
 
     # Track upstream universe count before candidate pool filtering
     upstream_universe_count = len(members)
@@ -3205,11 +3206,32 @@ def build_and_save_watchlist(
     # This ensures intermediate stages are never missing from DB
     if builder.last_bundle:
         try:
+            broader_universe_scored = list(builder.last_bundle.get("universe_scored", []) or [])
+            try:
+                # Build broader scored universe from upstream members for pb1_universe_scored contract.
+                _pool_unused, upstream_universe_rows = builder._stage_a_liquidity_filter(upstream_members, as_of)
+                upstream_universe_rows = builder._merge_derived_scores(upstream_universe_rows, as_of=as_of)
+                upstream_universe_rows = builder._attach_scores(upstream_universe_rows, "UNIVERSE_SCORED_BROADER")
+                if len(upstream_universe_rows) >= len(broader_universe_scored):
+                    broader_universe_scored = upstream_universe_rows
+            except Exception as exc:
+                logger.warning("[WATCHLIST][SAVE_SCOPE][BROADER_FALLBACK] reason=%s", exc)
+
+            logger.info(
+                "[WATCHLIST][STAGE_COUNTS] upstream_universe=%s raw_input=%s broader_scored=%s pool120=%s top50=%s final30=%s",
+                len(upstream_members),
+                len(members),
+                len(broader_universe_scored),
+                len(builder.last_bundle.get("pool120", []) or []),
+                len(builder.last_bundle.get("top50", []) or []),
+                len(watchlist),
+            )
+
             bundle = WatchlistBundle(
                 as_of=as_of.isoformat(),
                 env=env,
                 strategy=strategy,
-                universe_scored=builder.last_bundle.get("universe_scored", []),
+                universe_scored=broader_universe_scored,
                 pool120=builder.last_bundle.get("pool120", []),
                 top50=builder.last_bundle.get("top50", []),
                 final30=watchlist,

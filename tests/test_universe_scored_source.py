@@ -52,7 +52,7 @@ def test_bundle_save_logs_universe_source():
             
             # Verify source logging
             assert "[WATCHLIST][SAVE_SCOPE]" in log_output
-            assert "pb1_universe_scored_source=candidate_pool" in log_output
+            assert "pb1_universe_scored_source=universe_filtered" in log_output
             assert "rows=120" in log_output
             
             # Verify bundle DataFrame field logs
@@ -77,7 +77,7 @@ def test_build_watchlist_logs_upstream_universe():
     # Mock dependencies
     with (
         patch("trader.watchlist_builder.WatchlistRepo") as MockRepo,
-        patch("trader.watchlist_builder.load_candidate_pool") as mock_load_pool,
+        patch("trader.candidate_pool_builder.load_candidate_pool") as mock_load_pool,
     ):
         # Mock candidate pool to return 120 items
         mock_load_pool.return_value = (

@@ -32,6 +32,20 @@ _REQUIRED_EXPORT_KEYS = [
 ]
 
 
+def _safe_float(val: Any) -> float | None:
+    try:
+        if val is None:
+            return None
+        if isinstance(val, str) and not val.strip():
+            return None
+        out = float(val)
+        if pd.isna(out):
+            return None
+        return out
+    except Exception:
+        return None
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -72,12 +86,28 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
     def _pick(*keys: str, default: Any = 0.0) -> Any:
         for key in keys:
-            if key in normalized and normalized.get(key) is not None:
-                return normalized.get(key)
+            if key in normalized:
+                val = normalized.get(key)
+                if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                    return val
         for key in keys:
-            if key in meta and meta.get(key) is not None:
-                return meta.get(key)
+            if key in meta:
+                val = meta.get(key)
+                if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                    return val
         return default
+
+    def _pick_score(*keys: str) -> float:
+        # Keep original score values if present; do not overwrite with default 0.
+        for key in keys:
+            val = _safe_float(normalized.get(key, None))
+            if val is not None:
+                return float(val)
+        for key in keys:
+            val = _safe_float(meta.get(key, None))
+            if val is not None:
+                return float(val)
+        return 0.0
 
     reject_reasons = _as_list(normalized.get("reject_reasons"))
     reasons = _normalize_reasons(normalized.get("reasons"))
@@ -106,18 +136,18 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized["name"] = str(_pick("name", default="") or "")
     
     # Enhanced score normalization with proper priority
-    tech_score = float(_pick("tech_score", "score_tech", default=0.0) or 0.0)
-    flow_score = float(_pick("flow_score", "score_flow", default=0.0) or 0.0)
-    score_final = float(_pick("score_final", "final_score", "score", default=0.0) or 0.0)
+    tech_score = _pick_score("tech_score", "score_tech")
+    flow_score = _pick_score("flow_score", "score_flow")
+    score_final = _pick_score("score_final", "final_score", "score")
     
     normalized["tech_score"] = tech_score
     normalized["flow_score"] = flow_score
     normalized["final_score"] = score_final
     
     # Add entry-style scores
-    normalized["breakout_score"] = float(_pick("breakout_score", default=0.0) or 0.0)
-    normalized["pullback_score"] = float(_pick("pullback_score", default=0.0) or 0.0)
-    normalized["momentum_score"] = float(_pick("momentum_score", default=0.0) or 0.0)
+    normalized["breakout_score"] = _pick_score("breakout_score", "score_breakout")
+    normalized["pullback_score"] = _pick_score("pullback_score", "score_pullback")
+    normalized["momentum_score"] = _pick_score("momentum_score", "score_momentum")
     normalized["entry_style_selected"] = str(_pick("entry_style_selected", "entry_style", default="") or "")
     normalized["entry_component"] = float(_pick("entry_component", default=0.0) or 0.0)
 
@@ -128,26 +158,26 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized["rank_top50"] = int(_pick("rank_top50", default=0) or 0)
     normalized["rank_final30"] = int(_pick("rank_final30", default=0) or 0)
 
-    normalized["score_liq"] = float(_pick("score_liq", "liq_avg") or 0.0)
+    normalized["score_liq"] = _pick_score("score_liq", "liq_avg")
 
     # Legacy score_tech/score_flow/score_final for backward compatibility
-    score_tech = float(_pick("score_tech", "tech_score") or 0.0)
+    score_tech = _pick_score("score_tech", "tech_score")
     if score_tech <= 0.0:
-        fallback_tech = float(_pick("tech_score", default=0.0) or 0.0)
+        fallback_tech = _pick_score("tech_score")
         if fallback_tech > 0.0:
             score_tech = fallback_tech
     normalized["score_tech"] = score_tech
 
-    score_flow_legacy = float(_pick("score_flow", "flow_score") or 0.0)
+    score_flow_legacy = _pick_score("score_flow", "flow_score")
     if score_flow_legacy <= 0.0:
-        fallback_flow = float(_pick("flow_score", default=0.0) or 0.0)
+        fallback_flow = _pick_score("flow_score")
         if fallback_flow > 0.0:
             score_flow_legacy = fallback_flow
     normalized["score_flow"] = score_flow_legacy
 
-    score_final_legacy = float(_pick("score_final", "final_score", "score") or 0.0)
+    score_final_legacy = _pick_score("score_final", "final_score", "score")
     if score_final_legacy <= 0.0:
-        fallback_final = float(_pick("final_score", "score", default=0.0) or 0.0)
+        fallback_final = _pick_score("final_score", "score")
         if fallback_final > 0.0:
             score_final_legacy = fallback_final
     normalized["score_final"] = score_final_legacy
@@ -229,6 +259,25 @@ def export_watchlist_bundle(
 
     for name, frame in frames_dict.items():
         safe_name = name.strip().lower()
+        pre_df = frame if frame is not None else pd.DataFrame()
+        pre_stats = {
+            "tech_nonzero": int((pd.to_numeric(pre_df.get("tech_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "tech_score" in pre_df.columns else 0,
+            "score_final_nonzero": int((pd.to_numeric(pre_df.get("score_final"), errors="coerce").fillna(0.0) > 0.0).sum()) if "score_final" in pre_df.columns else 0,
+            "breakout_nonzero": int((pd.to_numeric(pre_df.get("breakout_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "breakout_score" in pre_df.columns else 0,
+            "pullback_nonzero": int((pd.to_numeric(pre_df.get("pullback_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "pullback_score" in pre_df.columns else 0,
+            "momentum_nonzero": int((pd.to_numeric(pre_df.get("momentum_score"), errors="coerce").fillna(0.0) > 0.0).sum()) if "momentum_score" in pre_df.columns else 0,
+        }
+        logger.info(
+            "[EXPORT][PRE_NORMALIZE][SCORES] name=%s rows=%s tech_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
+            safe_name,
+            int(len(pre_df)),
+            pre_stats["tech_nonzero"],
+            pre_stats["score_final_nonzero"],
+            pre_stats["breakout_nonzero"],
+            pre_stats["pullback_nonzero"],
+            pre_stats["momentum_nonzero"],
+        )
+
         df = _normalize_frame(frame if frame is not None else pd.DataFrame())
         
         # Log warning for empty critical frames (should not happen if validation passed)
@@ -283,6 +332,37 @@ def export_watchlist_bundle(
                 pullback_nonzero,
                 momentum_nonzero,
             )
+            logger.info(
+                "[EXPORT][POST_NORMALIZE][SCORES] name=%s rows=%s tech_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
+                safe_name,
+                int(len(df)),
+                tech_nonzero,
+                score_final_nonzero,
+                breakout_nonzero,
+                pullback_nonzero,
+                momentum_nonzero,
+            )
+
+            if pre_stats["tech_nonzero"] > tech_nonzero or pre_stats["score_final_nonzero"] > score_final_nonzero:
+                logger.warning(
+                    "[EXPORT][VALUE_RESET][WARN] name=%s tech_pre=%s tech_post=%s final_pre=%s final_post=%s",
+                    safe_name,
+                    pre_stats["tech_nonzero"],
+                    tech_nonzero,
+                    pre_stats["score_final_nonzero"],
+                    score_final_nonzero,
+                )
+            if pre_stats["breakout_nonzero"] > breakout_nonzero or pre_stats["pullback_nonzero"] > pullback_nonzero or pre_stats["momentum_nonzero"] > momentum_nonzero:
+                logger.warning(
+                    "[EXPORT][FIELD_LOSS][WARN] name=%s breakout_pre=%s breakout_post=%s pullback_pre=%s pullback_post=%s momentum_pre=%s momentum_post=%s",
+                    safe_name,
+                    pre_stats["breakout_nonzero"],
+                    breakout_nonzero,
+                    pre_stats["pullback_nonzero"],
+                    pullback_nonzero,
+                    pre_stats["momentum_nonzero"],
+                    momentum_nonzero,
+                )
 
         csv_path = out_dir / f"{safe_name}.csv"
         df.to_csv(csv_path, index=False)

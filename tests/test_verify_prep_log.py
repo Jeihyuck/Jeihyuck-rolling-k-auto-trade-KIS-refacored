@@ -1,4 +1,4 @@
-"""Test verify_prep_log.py script functionality."""
+"""Tests for policy-aware verify_prep_log parser."""
 from __future__ import annotations
 
 import tempfile
@@ -7,13 +7,17 @@ from pathlib import Path
 import pytest
 
 
-def test_verify_prep_done_success():
-    """Test that PREP_DONE event is detected."""
+def test_verify_success_full_policy_path():
     log_content = """
 [PREP][START] as_of=2026-03-08
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
 [PREP][DERIVED][MINERVINI] upserted=196
-[DERIVED][LOAD] rows=196
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[PREP][WATCHLIST_FINAL][SAVE] n=30
 event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=30.1
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
         f.write(log_content)
@@ -24,20 +28,28 @@ event_type=PREP_DONE
         
         results = parse_log_file(log_path)
         assert results.prep_done is True
+        assert results.prep_done_log is True
         assert results.derived_count == 196
+        assert results.asof_consistent is True
+        assert results.exporter_preserved_scores is True
+        assert not results.has_critical_failure()
     finally:
         log_path.unlink()
 
 
 def test_verify_contract_recovery_success():
-    """Test that contract failure + recovery is treated as success."""
     log_content = """
 [PREP][START] as_of=2026-03-08
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
 event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
 [PREP][DERIVED][MINERVINI] upserted=120
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=120 rs_nonzero=120 vcp_nonzero=120 trend_nonzero=120
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
 contract_universe_too_small:120<150
 [PREP][WATCHLIST][RECOVERY][DB_SUCCESS]
-[PREP][WATCHLIST][FINAL][SAVE] n=30
+[PREP][WATCHLIST_FINAL][SAVE] n=30
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
         f.write(log_content)
@@ -56,13 +68,17 @@ contract_universe_too_small:120<150
 
 
 def test_verify_contract_unrecovered_failure():
-    """Test that unrecovered contract failure is detected."""
     log_content = """
 [PREP][START] as_of=2026-03-08
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
 event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
 [PREP][DERIVED][MINERVINI] upserted=120
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=120 rs_nonzero=120 vcp_nonzero=120 trend_nonzero=120
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
 contract_universe_too_small:120<150
-[PREP][WATCHLIST][FINAL][SAVE] n=30
+[PREP][WATCHLIST_FINAL][SAVE] n=30
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
         f.write(log_content)
@@ -80,16 +96,17 @@ contract_universe_too_small:120<150
         log_path.unlink()
 
 
-def test_verify_entry_scores_present():
-    """Test that entry score detection works."""
+def test_verify_asof_consistency_failure():
     log_content = """
 [PREP][START] as_of=2026-03-08
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-07 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=0
 event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
 [PREP][DERIVED][MINERVINI] upserted=196
-breakout_nonzero=30
-pullback_nonzero=30
-momentum_nonzero=30
-[PREP][WATCHLIST][FINAL][SAVE] n=30
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[PREP][WATCHLIST_FINAL][SAVE] n=30
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
         f.write(log_content)
@@ -97,22 +114,24 @@ momentum_nonzero=30
     
     try:
         from scripts.verify_prep_log import parse_log_file
-        
+
         results = parse_log_file(log_path)
-        assert results.breakout_nonzero == 30
-        assert results.pullback_nonzero == 30
-        assert results.momentum_nonzero == 30
-        assert not results.has_warnings()
+        assert results.asof_consistent is False
+        assert results.has_critical_failure()
     finally:
         log_path.unlink()
 
 
-def test_verify_derived_count_patterns():
-    """Test that derived count is extracted from multiple log patterns."""
-    # Test pattern 1: [PREP][DERIVED][MINERVINI] upserted=196
+def test_verify_exporter_score_mismatch_failure():
     log1 = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
 [PREP][DERIVED][MINERVINI] upserted=196
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=0 pullback_nonzero=0 momentum_nonzero=0
 event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 symbols=196 pool=120 watchlist=30 dt=31.0
+[PREP][WATCHLIST_FINAL][SAVE] n=30
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
         f.write(log1)
@@ -120,26 +139,10 @@ event_type=PREP_DONE
     
     try:
         from scripts.verify_prep_log import parse_log_file
-        
+
         results = parse_log_file(log_path)
-        assert results.derived_count == 196
-    finally:
-        log_path.unlink()
-    
-    # Test pattern 2: [DERIVED][LOAD] rows=196
-    log2 = """
-[DERIVED][LOAD] rows=196
-event_type=PREP_DONE
-"""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
-        f.write(log2)
-        log_path = Path(f.name)
-    
-    try:
-        from scripts.verify_prep_log import parse_log_file
-        
-        results = parse_log_file(log_path)
-        assert results.derived_count == 196
+        assert results.exporter_preserved_scores is False
+        assert results.has_critical_failure()
     finally:
         log_path.unlink()
 
