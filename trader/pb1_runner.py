@@ -2163,6 +2163,7 @@ def run_once(
         
         # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
         entry_signals_result = {}
+        entry_scan_compat_failed = False
         if phase_override_arg == "entry" and not close_cancel_only:
             try:
                 # Watchlist 로드 (universe_ctx에서)
@@ -2210,12 +2211,19 @@ def run_once(
                 else:
                     logger.warning("[ENTRY_SCAN] skipped - no watchlist members")
             except Exception as exc:
-                logger.warning("[ENTRY_SCAN] failed - %s", exc, exc_info=True)
+                entry_scan_compat_failed = True
+                logger.warning(
+                    "[ENTRY_SCAN][COMPAT_FAIL] reason=%s fallback=pb1_engine_internal_scan severity=non_fatal",
+                    exc,
+                    exc_info=True,
+                )
         
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
         else:
             result = engine_runner.run()
+            if entry_scan_compat_failed:
+                logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
         
         # ✅ RUN 요약 JSON 생성
         try:

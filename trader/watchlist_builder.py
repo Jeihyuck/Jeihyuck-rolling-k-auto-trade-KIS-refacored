@@ -222,7 +222,7 @@ def validate_watchlist_contract(
     
     # Log contract mode for clarity
     logger.info(
-        "[CONTRACT][POLICY] mode=candidate_pool_based universe_scored_source=candidate_pool note=threshold_150_may_structurally_fail"
+        "[CONTRACT][POLICY] mode=candidate_pool_based universe_scored_source=universe_filtered_from_raw120 note=threshold_150_may_structurally_fail"
     )
     
     if len(universe_scored) < min_universe:
@@ -2643,7 +2643,7 @@ def save_bundle(
     if bundle.universe_scored:
         _log_stage_fields("universe_scored", bundle.universe_scored)
         logger.info(
-            "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=universe_filtered rows=%s",
+            "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=universe_filtered_from_raw120 rows=%s",
             len(bundle.universe_scored),
         )
         repo.save_watchlist(
@@ -3007,15 +3007,23 @@ def build_and_save_watchlist(
             )
         else:
             logger.warning(
-                "[WATCHLIST][PIPELINE][A_POOL120] source=universe reason=candidate_pool_%s members=%s",
+                "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_%s members=%s requested_as_of=%s",
                 pool_reason,
                 len(members),
+                as_of,
             )
+            if pool_reason == "future_snapshot":
+                logger.warning(
+                    "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_future_snapshot members=%s requested_as_of=%s",
+                    len(members),
+                    as_of,
+                )
     except Exception as exc:
         logger.warning(
-            "[WATCHLIST][PIPELINE][A_POOL120] source=universe reason=candidate_pool_load_fail err=%s members=%s",
+            "[WATCHLIST][PIPELINE][A_POOL120] source=universe_fallback reason=candidate_pool_load_fail err=%s members=%s requested_as_of=%s",
             exc,
             len(members),
+            as_of,
         )
 
     # ✅ FIX: Skip cache when use_cache=False (e.g., during PREP)

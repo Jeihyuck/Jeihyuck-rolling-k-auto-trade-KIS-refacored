@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from trader.prep_runner import _assert_same_nonzero, _collect_final30_nonzero_stats
+from trader.prep_runner import (
+    _assert_same_nonzero,
+    _collect_final30_nonzero_stats,
+    _select_final30_scored_df_for_export,
+)
+from trader.exporter import _collect_score_nonzero_stats
 
 
 def test_prep_final30_stats_alias_primary_columns():
@@ -122,3 +128,69 @@ def test_pb1_final30_export_regression_counts_30():
     assert stats["breakout_nonzero"] == 30
     assert stats["pullback_nonzero"] == 30
     assert stats["momentum_nonzero"] == 30
+
+
+def test_final30_consistency_lhs_prefers_scored_df_not_saved_df():
+    scored_df = pd.DataFrame(
+        [
+            {
+                "code": "000001",
+                "tech_score": 1,
+                "score_final": 1,
+                "breakout_score": 1,
+                "pullback_score": 1,
+                "momentum_score": 1,
+            }
+        ]
+    )
+    saved_light_df = pd.DataFrame([{"code": "000001", "meta": {}, "rank": 1, "score": 1}])
+
+    selected_df, label = _select_final30_scored_df_for_export(
+        watchlist_result_final30_df=scored_df,
+        watchlist_bundle_final30_scored_df=pd.DataFrame(),
+        bundle_final30_scored_before_save_df=saved_light_df,
+    )
+
+    assert label == "watchlist_result.final30_scored"
+    assert "tech_score" in selected_df.columns
+    assert "meta" not in selected_df.columns
+
+
+def test_final30_consistency_lhs_missing_scored_source_raises():
+    with pytest.raises(RuntimeError, match="final30_scored_source_missing"):
+        _select_final30_scored_df_for_export(
+            watchlist_result_final30_df=pd.DataFrame([{"code": "000001", "score": 1}]),
+            watchlist_bundle_final30_scored_df=pd.DataFrame(),
+            bundle_final30_scored_before_save_df=pd.DataFrame([{"code": "000001", "meta": {}}]),
+        )
+
+
+def test_exporter_and_prep_use_same_alias_nonzero_counts():
+    df = pd.DataFrame(
+        [
+            {
+                "code": "000001",
+                "score_tech": 10,
+                "score": 20,
+                "score_breakout": 30,
+                "score_pullback": 40,
+                "score_momentum": 50,
+            },
+            {
+                "code": "000002",
+                "score_tech": 11,
+                "score": 21,
+                "score_breakout": 31,
+                "score_pullback": 41,
+                "score_momentum": 51,
+            },
+        ]
+    )
+    prep_stats, _ = _collect_final30_nonzero_stats(df)
+    export_stats, _ = _collect_score_nonzero_stats(df)
+
+    assert prep_stats["tech_nonzero"] == export_stats["tech_nonzero"] == 2
+    assert prep_stats["score_final_nonzero"] == export_stats["score_final_nonzero"] == 2
+    assert prep_stats["breakout_nonzero"] == export_stats["breakout_nonzero"] == 2
+    assert prep_stats["pullback_nonzero"] == export_stats["pullback_nonzero"] == 2
+    assert prep_stats["momentum_nonzero"] == export_stats["momentum_nonzero"] == 2

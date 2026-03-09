@@ -307,6 +307,9 @@ def _format_reason_counts(counter: Counter[str]) -> str:
         return "none"
     parts = [f"{key}:{count}" for key, count in counter.most_common()]
     return ",".join(parts)
+    
+def _classify_no_candidate_result() -> tuple[str, str]:
+    return "OK_NO_TRADE", "NO_CANDIDATES_AFTER_RELAX"
 
 
 def _log_balance_snapshot_shape(snapshot: Any, *, label: str) -> None:
@@ -6451,8 +6454,9 @@ class PB1Engine:
             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
                 top_reasons = all_reason_counts.most_common(3)
-                final_status = "NO_TRADE"
+                final_status, final_reason = _classify_no_candidate_result()
                 final_notes = f"no_candidates:{top_reasons or 'none'}"
+                logger.info("[TRADE][NO_CANDIDATES][CLASSIFY] type=strategy_empty not_system_error=1")
                 logger.info(
                     "[PB1][NO_TRADE] reason=no_candidates tiers_tried=%s tier=%s total=%s relax_passes=%s min_score=%.1f top_reasons=%s",
                     tiers_tried or ["none"],
@@ -6461,6 +6465,11 @@ class PB1Engine:
                     relax_passes_used,
                     applied_min_score,
                     top_reasons or "none",
+                )
+                logger.info(
+                    "[RUN_SUMMARY][RESULT] status=%s reason=%s",
+                    final_status,
+                    final_reason,
                 )
                 if self.phase in {"prep", "entry"}:
                     logger.info(

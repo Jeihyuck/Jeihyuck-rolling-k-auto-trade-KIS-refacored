@@ -31,6 +31,11 @@ from trader.data.ohlcv_provider import (
     upsert_ohlcv_delta,
 )
 from trader.exporter import export_watchlist_bundle
+from trader.score_columns import (
+    collect_nonzero_score_stats,
+    has_required_score_fields,
+    resolve_score_column,
+)
 from trader.report.pdf_report import generate_watchlist_pdf
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 from trader.time_utils import (
@@ -44,18 +49,6 @@ from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
 logger = logging.getLogger(__name__)
-
-_SCORE_ALIAS_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "tech": ("tech_score", "tech"),
-    "final": ("score_final", "final_score"),
-    "breakout": ("breakout_score", "score_breakout", "breakout"),
-    "pullback": ("pullback_score", "score_pullback", "pullback"),
-    "momentum": ("momentum_score", "score_momentum", "momentum"),
-    "rs": ("rs_score",),
-    "vcp": ("vcp_score",),
-    "trend": ("trend_score",),
-}
-
 
 def _env_true(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
@@ -217,75 +210,44 @@ def _pick_as_of_date_always_prev() -> date:
     return resolve_derived_as_of(now_kst())
 
 
-def _count_nonzero(df: pd.DataFrame, col: str) -> int:
-    if df is None or df.empty or col not in df.columns:
-        return 0
-    vals = pd.to_numeric(df[col], errors="coerce")
-    return int((vals.fillna(0.0) > 0.0).sum())
-
-
-def _resolve_alias_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
-    if df is None or df.empty:
-        return None
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return None
-
-
-def _count_nonzero_by_alias(df: pd.DataFrame, candidates: tuple[str, ...]) -> tuple[int, str | None]:
-    col = _resolve_alias_column(df, candidates)
-    if col is None:
-        return 0, None
-    vals = pd.to_numeric(df[col], errors="coerce")
-    return int((vals.fillna(0.0) > 0.0).sum()), col
-
-
 def _collect_final30_nonzero_stats(df: pd.DataFrame) -> tuple[dict[str, int], dict[str, str | None]]:
-    stats: dict[str, int] = {
-        "tech_nonzero": 0,
-        "final_nonzero": 0,
-        "score_final_nonzero": 0,
-        "breakout_nonzero": 0,
-        "pullback_nonzero": 0,
-        "momentum_nonzero": 0,
-        "rs_nonzero": 0,
-        "vcp_nonzero": 0,
-        "trend_nonzero": 0,
-    }
-    alias_cols: dict[str, str | None] = {
-        "tech": None,
-        "final": None,
-        "breakout": None,
-        "pullback": None,
-        "momentum": None,
-        "rs": None,
-        "vcp": None,
-        "trend": None,
-    }
-    if df is None or df.empty:
-        return stats, alias_cols
-
-    stats["tech_nonzero"], alias_cols["tech"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["tech"])
-    stats["final_nonzero"], alias_cols["final"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["final"])
-    stats["score_final_nonzero"] = stats["final_nonzero"]
-    stats["breakout_nonzero"], alias_cols["breakout"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["breakout"])
-    stats["pullback_nonzero"], alias_cols["pullback"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["pullback"])
-    stats["momentum_nonzero"], alias_cols["momentum"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["momentum"])
-    stats["rs_nonzero"], alias_cols["rs"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["rs"])
-    stats["vcp_nonzero"], alias_cols["vcp"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["vcp"])
-    stats["trend_nonzero"], alias_cols["trend"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["trend"])
+    stats, alias_cols = collect_nonzero_score_stats(df)
+    for key in (
+        "tech_nonzero",
+        "final_nonzero",
+        "score_final_nonzero",
+        "breakout_nonzero",
+        "pullback_nonzero",
+        "momentum_nonzero",
+        "rs_nonzero",
+        "vcp_nonzero",
+        "trend_nonzero",
+    ):
+        stats.setdefault(key, 0)
     return stats, alias_cols
 
 
 def _has_required_final30_score_fields(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-    required_keys = ("tech", "final", "breakout", "pullback", "momentum")
-    for key in required_keys:
-        if _resolve_alias_column(df, _SCORE_ALIAS_CANDIDATES[key]) is None:
-            return False
-    return True
+    return has_required_score_fields(df, ("tech", "final", "breakout", "pullback", "momentum"))
+
+
+def _select_final30_scored_df_for_export(
+    *,
+    watchlist_result_final30_df: pd.DataFrame,
+    watchlist_bundle_final30_scored_df: pd.DataFrame,
+    bundle_final30_scored_before_save_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    candidates = [
+        ("watchlist_result.final30_scored", watchlist_result_final30_df),
+        ("watchlist_bundle.final30_scored", watchlist_bundle_final30_scored_df),
+        ("bundle_final30_scored_before_save", bundle_final30_scored_before_save_df),
+    ]
+    for label, candidate_df in candidates:
+        if candidate_df is None or candidate_df.empty:
+            continue
+        if _has_required_final30_score_fields(candidate_df):
+            return candidate_df.copy(), label
+    raise RuntimeError("final30_scored_source_missing")
 
 
 def _debug_compare_nonzero(
@@ -1056,14 +1018,27 @@ def main() -> int:
     ledger_repo = LedgerEventsRepo(engine)
 
     export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
+    final30_saved_df = pd.DataFrame(watchlist_bundle.get("final30_saved", []))
     final30_signals_df = pd.DataFrame(watchlist_bundle.get("final30", []))
     watchlist_result_final30_df = pd.DataFrame(watchlist or [])
-    final30_scored_df_for_export = watchlist_result_final30_df
-    final30_source_label = "watchlist_result.final30_scored"
-    if final30_scored_df_for_export.empty or not _has_required_final30_score_fields(final30_scored_df_for_export):
-        if not final30_signals_df.empty:
-            final30_scored_df_for_export = final30_signals_df
-            final30_source_label = "watchlist_bundle.final30_saved"
+    bundle_final30_scored_df = pd.DataFrame(watchlist_bundle.get("final30_scored", []))
+
+    try:
+        final30_scored_df_for_export, final30_source_label = _select_final30_scored_df_for_export(
+            watchlist_result_final30_df=watchlist_result_final30_df,
+            watchlist_bundle_final30_scored_df=bundle_final30_scored_df,
+            bundle_final30_scored_before_save_df=final30_signals_df,
+        )
+    except RuntimeError:
+        logger.error(
+            "[PREP][EXPORT][FINAL30][SOURCE][FAIL] no_valid_scored_source candidates=%s",
+            [
+                "watchlist_result.final30_scored",
+                "watchlist_bundle.final30_scored",
+                "bundle_final30_scored_before_save",
+            ],
+        )
+        raise RuntimeError("final30_scored_source_missing")
 
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
@@ -1071,7 +1046,6 @@ def main() -> int:
         "top50": pd.DataFrame(watchlist_bundle.get("top50", [])),
         "final30": final30_scored_df_for_export,
     }
-    final30_saved_df = frames["final30"]
 
     # Single as_of contract across PREP stages.
     consistent = int(all(v == as_of.isoformat() for v in stage_as_of.values()))
@@ -1106,16 +1080,12 @@ def main() -> int:
         )
         logger.info("[PREP][EXPORT][FINAL30][COLUMNS] cols=%s", sorted(final30_df.columns.tolist()))
         logger.info(
-            "[PREP][EXPORT][FINAL30][FIELDS] has_tech_score=%s has_score_final=%s has_final_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_score=%s has_vcp_score=%s has_trend_score=%s",
-            int("tech_score" in final30_df.columns),
-            int("score_final" in final30_df.columns),
-            int("final_score" in final30_df.columns),
-            int("breakout_score" in final30_df.columns),
-            int("pullback_score" in final30_df.columns),
-            int("momentum_score" in final30_df.columns),
-            int("rs_score" in final30_df.columns),
-            int("vcp_score" in final30_df.columns),
-            int("trend_score" in final30_df.columns),
+            "[PREP][EXPORT][FINAL30][FIELDS] has_tech_score=%s has_score_final=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",
+            int(resolve_score_column(final30_df, "tech") is not None),
+            int(resolve_score_column(final30_df, "final") is not None),
+            int(resolve_score_column(final30_df, "breakout") is not None),
+            int(resolve_score_column(final30_df, "pullback") is not None),
+            int(resolve_score_column(final30_df, "momentum") is not None),
         )
         final30_stats, inmem_cols = _collect_final30_nonzero_stats(final30_df)
         score_final_nonzero = int(final30_stats["score_final_nonzero"])
@@ -1173,11 +1143,11 @@ def main() -> int:
             "momentum_nonzero": int(post_stats_full["momentum_nonzero"]),
         }
         rhs_source_label = "exporter_final30_df"
-        lhs_has_required = _has_required_final30_score_fields(final30_saved_df)
+        lhs_has_required = _has_required_final30_score_fields(final30_scored_df_for_export)
         rhs_has_required = _has_required_final30_score_fields(exported_final30)
         logger.info(
             "[PREP][EXPORT][CONSISTENCY] lhs=%s rhs=%s",
-            "final30_scored_df_for_export",
+            final30_source_label,
             rhs_source_label,
         )
         logger.info(
@@ -1198,7 +1168,7 @@ def main() -> int:
                 "[PREP][EXPORT][CONSISTENCY][MISSING_FIELDS] lhs_source=%s rhs_source=%s lhs_cols=%s rhs_cols=%s",
                 final30_source_label,
                 rhs_source_label,
-                sorted(final30_saved_df.columns.tolist()),
+                sorted(final30_scored_df_for_export.columns.tolist()),
                 sorted(exported_final30.columns.tolist()),
             )
             raise RuntimeError("final30_scored_fields_missing_for_consistency")
@@ -1254,8 +1224,18 @@ def main() -> int:
         _assert_same_nonzero("final30_pullback", inmem_stats["pullback_nonzero"], post_stats["pullback_nonzero"])
         _assert_same_nonzero("final30_momentum", inmem_stats["momentum_nonzero"], post_stats["momentum_nonzero"])
     except Exception:
-        logger.exception("[PREP][EXPORT][FAIL] as_of=%s out_dir=%s", as_of, export_dir)
-        raise RuntimeError("PREP_EXPORT_FINAL30_CONSISTENCY_FAILED")
+        strict_export = _env_true("PREP_EXPORT_STRICT", "1")
+        logger.exception(
+            "[PREP][EXPORT][FAIL] as_of=%s out_dir=%s strict=%s",
+            as_of,
+            export_dir,
+            int(strict_export),
+        )
+        if strict_export:
+            raise RuntimeError("PREP_EXPORT_FINAL30_CONSISTENCY_FAILED")
+        logger.warning(
+            "[PREP][EXPORT][NON_STRICT] consistency_failed_but_continue required_states=derived+final30+prep_done",
+        )
 
     # ✅ FIX: Initialize prep_status and flow_coverage early
     prep_status = "DONE"

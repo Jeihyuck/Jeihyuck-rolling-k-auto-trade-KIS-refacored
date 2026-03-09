@@ -736,7 +736,7 @@ def load_candidate_pool(
         return None, None, "future_snapshot"
 
     # TTL 검사
-    age_days = (requested_as_of - latest_date).days
+    age_days = max(0, (requested_as_of - latest_date).days)
     if age_days > CANDIDATE_POOL_TTL_DAYS:
         if MINERVINI_ONLY:
             logger.warning(

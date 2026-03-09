@@ -1,8 +1,7 @@
-"""Regression tests for trader.entry_engine backward-compatible public API."""
+"""Regression tests for trader.entry_engine public API and static compat path."""
 
 from __future__ import annotations
-
-from types import SimpleNamespace
+import inspect
 
 
 def test_entry_engine_public_api_import_and_callable():
@@ -13,37 +12,17 @@ def test_entry_engine_public_api_import_and_callable():
     assert callable(calculate_position_size)
 
 
-def test_scan_all_strategies_wrapper_delegates_to_legacy(monkeypatch):
-    """Compat wrapper should delegate calls to the legacy implementation."""
-    import trader.entry_engine as entry_engine
+def test_scan_all_strategies_wrapper_uses_package_scanner():
+    """Compat wrapper should route through package scanner adapter."""
+    from trader.entry_engine import scan_all_strategies
 
-    calls = {"count": 0, "args": None}
-
-    def fake_scan_all_strategies(**kwargs):
-        calls["count"] += 1
-        calls["args"] = kwargs
-        return {"all": []}
-
-    fake_legacy_module = SimpleNamespace(
-        scan_all_strategies=fake_scan_all_strategies,
-        calculate_position_size=lambda **_: {"shares": 0},
-    )
-
-    monkeypatch.setattr(
-        entry_engine,
-        "_load_legacy_entry_engine_module",
-        lambda: fake_legacy_module,
-    )
-
-    result = entry_engine.scan_all_strategies(
+    result = scan_all_strategies(
         watchlist=[{"code": "005930", "name": "Samsung"}],
         ohlcv_provider=lambda *_: None,
     )
 
-    assert result == {"all": []}
-    assert calls["count"] == 1
-    assert "watchlist" in calls["args"]
-    assert "ohlcv_provider" in calls["args"]
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"breakout", "pullback", "momentum", "all"}
 
 
 def test_pb1_runner_main_import_regression():
@@ -51,3 +30,12 @@ def test_pb1_runner_main_import_regression():
     from trader.pb1_runner import main
 
     assert callable(main)
+
+
+def test_entry_engine_no_dynamic_legacy_loader_symbols():
+    import trader.entry_engine as entry_engine
+
+    assert not hasattr(entry_engine, "_load_legacy_entry_engine_module")
+    module_source = inspect.getsource(entry_engine)
+    assert "spec_from_file_location" not in module_source
+    assert "exec_module" not in module_source

@@ -114,6 +114,15 @@ def _extract_numeric_details(candidate: object) -> dict:
     return details
 
 
+def _collect_relax_pass_counts(candidates: list[object]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for candidate in candidates or []:
+        features = _candidate_attr(candidate, "features", {}) or {}
+        label = str(features.get("relax_pass") or features.get("relax_label") or "unknown")
+        counts[label] += 1
+    return dict(counts)
+
+
 def run_minervini_report(
     universe_members: list[dict],
     cfg: object,
@@ -160,9 +169,14 @@ def run_minervini_report(
 
     payload = {
         "input_members": len(universe_members),
+        "total_scanned": len(candidates or []),
+        "after_pb1_filter": len(candidates_payload),
+        "after_relax_pass_counts": _collect_relax_pass_counts(candidates or []),
         "candidates": candidates_payload,
         "rejected": rejected_payload,
         "reason_counts": dict(reason_counts),
+        "rejection_reason_histogram": dict(reason_counts),
+        "top_rejected_symbols": rejected_payload[:10],
         "cfg_snapshot": _cfg_snapshot(cfg),
     }
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

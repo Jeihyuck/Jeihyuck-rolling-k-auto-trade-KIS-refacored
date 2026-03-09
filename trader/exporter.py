@@ -7,62 +7,15 @@ from typing import Any, Dict, Hashable, Mapping
 
 import pandas as pd
 
+from trader.score_columns import collect_nonzero_score_stats
+
 logger = logging.getLogger(__name__)
-
-_SCORE_ALIAS_CANDIDATES = {
-    "tech": ("tech_score", "tech"),
-    "final": ("score_final", "final_score"),
-    "breakout": ("breakout_score", "score_breakout", "breakout"),
-    "pullback": ("pullback_score", "score_pullback", "pullback"),
-    "momentum": ("momentum_score", "score_momentum", "momentum"),
-    "rs": ("rs_score",),
-    "vcp": ("vcp_score",),
-    "trend": ("trend_score",),
-}
-
-
-def _resolve_alias_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
-    if df is None or df.empty:
-        return None
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return None
-
-
-def _count_nonzero_by_alias(df: pd.DataFrame, candidates: tuple[str, ...]) -> tuple[int, str | None]:
-    col = _resolve_alias_column(df, candidates)
-    if col is None:
-        return 0, None
-    vals = pd.to_numeric(df[col], errors="coerce")
-    return int((vals.fillna(0.0) > 0.0).sum()), col
-
-
 def _collect_score_nonzero_stats(df: pd.DataFrame) -> tuple[Dict[str, int], Dict[str, str | None]]:
-    stats = {
-        "tech_nonzero": 0,
-        "final_nonzero": 0,
-        "score_final_nonzero": 0,
-        "breakout_nonzero": 0,
-        "pullback_nonzero": 0,
-        "momentum_nonzero": 0,
-    }
-    alias_cols: Dict[str, str | None] = {
-        "tech": None,
-        "final": None,
-        "breakout": None,
-        "pullback": None,
-        "momentum": None,
-    }
-    if df is None or df.empty:
-        return stats, alias_cols
-
-    stats["tech_nonzero"], alias_cols["tech"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["tech"])
-    stats["final_nonzero"], alias_cols["final"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["final"])
-    stats["score_final_nonzero"] = stats["final_nonzero"]
-    stats["breakout_nonzero"], alias_cols["breakout"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["breakout"])
-    stats["pullback_nonzero"], alias_cols["pullback"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["pullback"])
-    stats["momentum_nonzero"], alias_cols["momentum"] = _count_nonzero_by_alias(df, _SCORE_ALIAS_CANDIDATES["momentum"])
+    stats, alias_cols = collect_nonzero_score_stats(df, ("tech", "final", "breakout", "pullback", "momentum"))
+    for key in ("tech_nonzero", "final_nonzero", "score_final_nonzero", "breakout_nonzero", "pullback_nonzero", "momentum_nonzero"):
+        stats.setdefault(key, 0)
+    for key in ("tech", "final", "breakout", "pullback", "momentum"):
+        alias_cols.setdefault(key, None)
     return stats, alias_cols
 
 _REQUIRED_EXPORT_KEYS = [
