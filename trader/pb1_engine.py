@@ -653,6 +653,7 @@ class PB1Engine:
         self.entry_block_reason = entry_block_reason
         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
         self.window_internal = self._resolve_window_internal()
+        self.bootstrap_enabled = False
         self.filter_thresholds = self._resolve_filter_thresholds()
         self.entry_capital_krw: float | None = None
         self.entry_usable_krw: float | None = None
@@ -768,6 +769,8 @@ class PB1Engine:
             return False
 
     def _resolve_filter_thresholds(self) -> FilterThresholds:
+        bootstrap_enabled = getattr(self, "bootstrap_enabled", False)
+        phase = getattr(self, "phase", None)
         intraday = self._is_intraday_threshold_window()
         volu_max = PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX
         thresholds = FilterThresholds(
@@ -788,7 +791,7 @@ class PB1Engine:
             thresholds.pullback_max,
             thresholds.require_both_contractions,
         )
-        if self.bootstrap_enabled and self.phase in {"prep", "entry"}:
+        if bootstrap_enabled and phase in {"prep", "entry"}:
             thresholds = thresholds.with_overrides(
                 vol_contraction_max=float(BOOTSTRAP_PB1_VOL_MAX),
                 volu_contraction_max=float(BOOTSTRAP_PB1_VOLU_MAX),

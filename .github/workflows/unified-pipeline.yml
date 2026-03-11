@@ -686,13 +686,56 @@ jobs:
           echo "======================================"
           echo "[PREP][FALLBACK] Ensure PREP ready before trade"
           echo "======================================"
-          
-          # Check if final30 exists
-          if [ -f runtime/snapshots/final30.json ] && [ -s runtime/snapshots/final30.json ]; then
-            echo "[PREP][FALLBACK] Found final30.json - PREP OK"
+
+          WINDOW="${MARKET_WINDOW:-}"
+          if [ -z "${WINDOW}" ]; then
+            KST_HOUR="$(TZ=Asia/Seoul date '+%H')"
+            KST_MIN="$(TZ=Asia/Seoul date '+%M')"
+            KST_DOW="$(TZ=Asia/Seoul date '+%u')"
+            KST_MINUTES=$((10#${KST_HOUR} * 60 + 10#${KST_MIN}))
+            if [[ "${KST_DOW}" -ge 1 && "${KST_DOW}" -le 5 ]]; then
+              if [[ "${KST_MINUTES}" -lt 540 ]]; then
+                WINDOW="preopen"
+              elif [[ "${KST_MINUTES}" -lt 660 ]]; then
+                WINDOW="morning"
+              elif [[ "${KST_MINUTES}" -le 930 ]]; then
+                WINDOW="intraday"
+              else
+                WINDOW="after"
+              fi
+            else
+              WINDOW="day"
+            fi
+          fi
+
+          DERIVED_ASOF="${DERIVED_ASOF:-${AS_OF_OVERRIDE:-}}"
+          if [ -z "${DERIVED_ASOF}" ]; then
+            DERIVED_ASOF="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; now = datetime.now(ZoneInfo("Asia/Seoul")); d = now.date() - timedelta(days=1); print(d.isoformat())')"
+          fi
+
+          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} as_of=${DERIVED_ASOF} window=${WINDOW} source=db_ledger"
+
+          set +e
+          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --as-of "${DERIVED_ASOF}" --window "${WINDOW}"
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            echo "[PREP][FALLBACK] readiness satisfied from db/ledger -> skip rebuild"
+          elif [ "$rc" -eq 10 ]; then
+            case "${WINDOW}" in
+              morning|intraday|day)
+                echo "[PREP][FALLBACK] readiness missing in intraday window -> rebuild blocked"
+                exit 1
+                ;;
+              *)
+                echo "[PREP][FALLBACK] readiness missing outside intraday -> attempting rebuild"
+                python -m trader.prep_runner
+                ;;
+            esac
           else
-            echo "[PREP][FALLBACK] PREP outputs missing - attempting rebuild"
-            python -m trader.prep_runner || echo "[PREP][FALLBACK] prep_runner failed - will use snapshot fallback"
+            echo "::error::prep readiness check failed unexpectedly"
+            exit 1
           fi
           
           echo "======================================"
