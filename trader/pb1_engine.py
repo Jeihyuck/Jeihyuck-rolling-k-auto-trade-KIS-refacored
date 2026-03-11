@@ -653,8 +653,22 @@ class PB1Engine:
         self.entry_block_reason = entry_block_reason
         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
         self.window_internal = self._resolve_window_internal()
-        self.bootstrap_enabled = False
+        self.bootstrap_enabled = bool(self._bool_env("PB1_BOOTSTRAP_ENABLED", PB1_BOOTSTRAP_ENABLE))
+        self.bootstrap_config = self._resolve_bootstrap_config()
+        self.force_min1_enabled = bool(self._bool_env("PB1_FORCE_MIN1", self.bootstrap_config["force_min1_enabled"]))
+        self.force_min1_topn = max(1, int(self._int_env("PB1_FORCE_MIN1_TOPN", int(self.bootstrap_config["force_min1_topn"]))))
+        self.order_candidate_mode = (os.getenv("PB1_ORDER_CANDIDATE_MODE") or "normal").strip().lower() or "normal"
+        logger.info(
+            "[PB1][BOOTSTRAP][INIT] enabled=%s force_min1=%s force_min1_topn=%s phase=%s window=%s",
+            self.bootstrap_enabled,
+            self.force_min1_enabled,
+            self.force_min1_topn,
+            self.phase,
+            self.window,
+        )
+        self.effective_entry_filters = self._resolve_effective_entry_filters()
         self.filter_thresholds = self._resolve_filter_thresholds()
+        self.minervini_config.rs_min_percentile = float(self.effective_entry_filters["rs_min_pctile"]) / 100.0
         self.entry_capital_krw: float | None = None
         self.entry_usable_krw: float | None = None
         self.entry_tick_budget_krw: float | None = None
@@ -662,12 +676,12 @@ class PB1Engine:
         self.target_new_positions: int | None = None
         self._budget_plan_meta: dict[str, Any] | None = None
         self._touched_files: list[Path] = []
-        self.bootstrap_enabled = bool(PB1_BOOTSTRAP_ENABLE)
         self.order_possible_cash_krw: float = 0.0
         self._debug_score_cut_codes: list[str] = []
         self._debug_risk_ok_codes: list[str] = []
         self._debug_sizing_ok_codes: list[str] = []
         self._debug_sizing_fail_items: list[dict[str, Any]] = []
+        self._debug_summary: dict[str, Any] = {}
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -707,6 +721,96 @@ class PB1Engine:
         except ValueError:
             logger.warning("[PB1][ENV] invalid %s=%s fallback=%s", name, raw, default)
             return default
+
+    @staticmethod
+    def _bool_env(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        return parse_bool_any(raw, default=bool(default))
+
+    def _resolve_bootstrap_config(self) -> dict[str, Any]:
+        return {
+            "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", BOOTSTRAP_MINERVINI_RS_MIN_PCTILE)),
+            "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", BOOTSTRAP_MINERVINI_VCP_MIN_SCORE)),
+            "relax_passes": int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", int(BOOTSTRAP_RELAX_PASSES))),
+            "vol_max": float(self._float_env("PB1_BOOTSTRAP_VOL_MAX", BOOTSTRAP_PB1_VOL_MAX)),
+            "volu_max": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", BOOTSTRAP_PB1_VOLU_MAX)),
+            "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", BOOTSTRAP_PB1_PULLBACK_MIN)),
+            "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", BOOTSTRAP_PB1_PULLBACK_MAX)),
+            "require_both_contractions": bool(
+                self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS)
+            ),
+            "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", BOOTSTRAP_PB1_MIN_SCORE_BASE)),
+            "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", BOOTSTRAP_PB1_MIN_SCORE_FLOOR)),
+            "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", BOOTSTRAP_PB1_MIN_SCORE_STEP)),
+            "score_keep_topn": int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN))),
+            "force_min1_enabled": bool(self._bool_env("PB1_FORCE_MIN1", BOOTSTRAP_FORCE_MIN_1_SHARE)),
+            "force_min1_topn": int(self._int_env("PB1_FORCE_MIN1_TOPN", int(BOOTSTRAP_MIN1_TOPN))),
+            "min_buyable": int(self._int_env("MIN_BUYABLE", 1)),
+        }
+
+    def _resolve_effective_entry_filters(self) -> dict[str, Any]:
+        defaults = {
+            "rs_min_pctile": float(RS_MIN_PCTILE),
+            "vcp_min_score": float(VCP_MIN_SCORE),
+            "vol_max": float(PB1_VOL_MAX),
+            "volu_max": float(PB1_VOLU_MAX),
+            "volu_max_intraday": float(PB1_VOLU_MAX_INTRADAY),
+            "pullback_min": float(PB1_PULLBACK_MIN),
+            "pullback_max": float(PB1_PULLBACK_MAX),
+            "require_both_contractions": bool(PB1_REQUIRE_BOTH_CONTRACTIONS),
+            "min_score_base": float(PB1_MIN_SCORE_BASE),
+            "min_score_floor": float(PB1_MIN_SCORE_FLOOR),
+            "min_score_step": float(PB1_MIN_SCORE_STEP),
+            "relax_passes": int(PB1_RELAX_MAX_PASSES),
+            "min_buyable": max(1, int(self._int_env("MIN_BUYABLE", 5))),
+            "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN)))),
+        }
+        env_overrides = {
+            "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", defaults["rs_min_pctile"])),
+            "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", defaults["vcp_min_score"])),
+            "vol_max": float(self._float_env("PB1_BOOTSTRAP_VOL_MAX", defaults["vol_max"])),
+            "volu_max": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max"])),
+            "volu_max_intraday": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max_intraday"])),
+            "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", defaults["pullback_min"])),
+            "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", defaults["pullback_max"])),
+            "require_both_contractions": bool(self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", defaults["require_both_contractions"])),
+            "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", defaults["min_score_base"])),
+            "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", defaults["min_score_floor"])),
+            "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", defaults["min_score_step"])),
+            "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", defaults["relax_passes"]))),
+            "min_buyable": max(1, int(self._int_env("MIN_BUYABLE", defaults["min_buyable"]))),
+            "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", defaults["score_keep_topn"]))),
+        }
+        effective = dict(defaults)
+        effective.update(env_overrides)
+        if self.bootstrap_enabled and self.phase == "entry":
+            effective.update(
+                {
+                    "rs_min_pctile": 60.0,
+                    "vcp_min_score": 45.0,
+                    "vol_max": 1.15,
+                    "volu_max": 1.15,
+                    "volu_max_intraday": 1.15,
+                    "pullback_min": 0.02,
+                    "pullback_max": 0.25,
+                    "require_both_contractions": False,
+                    "min_score_base": 55.0,
+                    "min_score_floor": 45.0,
+                    "min_score_step": 5.0,
+                    "relax_passes": 5,
+                    "min_buyable": 1,
+                    "score_keep_topn": 3,
+                }
+            )
+        logger.info(
+            "[PB1][EFFECTIVE_FILTERS] phase=%s window=%s filters=%s",
+            self.phase,
+            self.window,
+            effective,
+        )
+        return effective
 
     def _record_simulated_order(
         self,
@@ -769,16 +873,15 @@ class PB1Engine:
             return False
 
     def _resolve_filter_thresholds(self) -> FilterThresholds:
-        bootstrap_enabled = getattr(self, "bootstrap_enabled", False)
-        phase = getattr(self, "phase", None)
         intraday = self._is_intraday_threshold_window()
-        volu_max = PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX
+        filters = getattr(self, "effective_entry_filters", {}) or {}
+        volu_max = float(filters.get("volu_max_intraday" if intraday else "volu_max", PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX))
         thresholds = FilterThresholds(
-            vol_contraction_max=PB1_VOL_MAX,
+            vol_contraction_max=float(filters.get("vol_max", PB1_VOL_MAX)),
             volu_contraction_max=volu_max,
-            pullback_min=PB1_PULLBACK_MIN,
-            pullback_max=PB1_PULLBACK_MAX,
-            require_both_contractions=PB1_REQUIRE_BOTH_CONTRACTIONS,
+            pullback_min=float(filters.get("pullback_min", PB1_PULLBACK_MIN)),
+            pullback_max=float(filters.get("pullback_max", PB1_PULLBACK_MAX)),
+            require_both_contractions=bool(filters.get("require_both_contractions", PB1_REQUIRE_BOTH_CONTRACTIONS)),
         )
         logger.info(
             "[PB1][THRESHOLDS] intraday=%s phase=%s window=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
@@ -791,24 +894,6 @@ class PB1Engine:
             thresholds.pullback_max,
             thresholds.require_both_contractions,
         )
-        if bootstrap_enabled and phase in {"prep", "entry"}:
-            thresholds = thresholds.with_overrides(
-                vol_contraction_max=float(BOOTSTRAP_PB1_VOL_MAX),
-                volu_contraction_max=float(BOOTSTRAP_PB1_VOLU_MAX),
-                pullback_min=float(BOOTSTRAP_PB1_PULLBACK_MIN),
-                pullback_max=float(BOOTSTRAP_PB1_PULLBACK_MAX),
-                require_both_contractions=bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS),
-            )
-            logger.warning(
-                "[PB1][BOOTSTRAP] enabled=1 thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s min_score_base:%.1f min_score_floor:%.1f}",
-                thresholds.vol_contraction_max,
-                thresholds.volu_contraction_max,
-                thresholds.pullback_min,
-                thresholds.pullback_max,
-                thresholds.require_both_contractions,
-                float(BOOTSTRAP_PB1_MIN_SCORE_BASE),
-                float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR),
-            )
         return thresholds
 
     def _resolve_strict_thresholds(self) -> FilterThresholds:
@@ -2138,6 +2223,8 @@ class PB1Engine:
     ) -> List[CandidateFeature]:
         evaluated: List[CandidateFeature] = []
         cfg = self.minervini_config
+        rs_min_pctile = float(self.effective_entry_filters.get("rs_min_pctile", RS_MIN_PCTILE))
+        vcp_min_score = float(self.effective_entry_filters.get("vcp_min_score", VCP_MIN_SCORE))
         for cf in candidates:
             clone = self._clone_candidate(cf)
             data_ok = bool(clone.features.get("data_ok"))
@@ -2160,6 +2247,35 @@ class PB1Engine:
                 )
             
             hard_reasons: list[str] = []
+            soft_reasons: list[str] = []
+
+            pullback = self._to_float(clone.features.get("pullback_pct"))
+            vol_c = self._to_float(clone.features.get("vol_contraction"))
+            volu_c = self._to_float(clone.features.get("volu_contraction"))
+            rs_pctile = self._to_float(clone.features.get("rs_percentile"))
+            vcp_score = self._to_float(clone.features.get("vcp_score"))
+
+            if pullback is None or not (float(thresholds.pullback_min) <= pullback <= float(thresholds.pullback_max)):
+                hard_reasons.append("pullback_out_of_band")
+
+            vol_fail = vol_c is None or float(vol_c) > float(thresholds.vol_contraction_max)
+            volu_fail = (not bool(clone.features.get("volume_missing", False))) and (
+                volu_c is None or float(volu_c) > float(thresholds.volu_contraction_max)
+            )
+            if bool(thresholds.require_both_contractions):
+                if vol_fail:
+                    hard_reasons.append("vol_contraction_fail")
+                if volu_fail:
+                    hard_reasons.append("volu_contraction_fail")
+            else:
+                if vol_fail and volu_fail:
+                    hard_reasons.append("contraction_fail")
+
+            if rs_pctile is None or float(rs_pctile) < rs_min_pctile:
+                hard_reasons.append("rs_below_min")
+            if vcp_score is None or float(vcp_score) < vcp_min_score:
+                hard_reasons.append("vcp_fail")
+
             if not clone.features.get("liq_ok", True):
                 reasons.append("liquidity_fail")
             if not clone.features.get("spread_ok", True):
@@ -2181,7 +2297,7 @@ class PB1Engine:
             if gap_hard_max_pct and gap_pct is not None and gap_pct > gap_hard_max_pct:
                 hard_reasons.append("gap_fail")
 
-            soft_reasons = [r for r in reasons if r not in hard_reason_set]
+            soft_reasons.extend([r for r in reasons if r not in hard_reason_set])
 
             base_score = 0.0
             try:
@@ -2204,7 +2320,7 @@ class PB1Engine:
             if not score_ok:
                 soft_reasons.append("score_below_min")
 
-            must_fail = bool(hard_reasons) or not score_ok or (not soft_mode and not ok)
+            must_fail = bool(hard_reasons) or not score_ok or (not soft_mode and (not ok or bool(soft_reasons)))
             if must_fail:
                 clone.setup_ok = False
                 clone.reasons = hard_reasons + soft_reasons if soft_reasons or hard_reasons else ["unspecified_fail"]
@@ -2319,21 +2435,22 @@ class PB1Engine:
         self,
         candidates: List[CandidateFeature],
     ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str], int, float, bool]:
+        filters = self.effective_entry_filters
         strict_thresholds = self._resolve_strict_thresholds()
         if self.bootstrap_enabled:
             medium_thresholds = self.filter_thresholds.with_overrides(
-                vol_contraction_max=min(float(BOOTSTRAP_PB1_VOL_MAX), 1.10),
-                volu_contraction_max=min(float(BOOTSTRAP_PB1_VOLU_MAX), 1.10),
-                pullback_min=max(float(BOOTSTRAP_PB1_PULLBACK_MIN), 0.01),
-                pullback_max=min(float(BOOTSTRAP_PB1_PULLBACK_MAX), 0.22),
+                vol_contraction_max=min(float(filters["vol_max"]), 1.10),
+                volu_contraction_max=min(float(filters["volu_max"]), 1.10),
+                pullback_min=max(float(filters["pullback_min"]), 0.01),
+                pullback_max=min(float(filters["pullback_max"]), 0.22),
                 require_both_contractions=False,
             )
             loose_thresholds = self.filter_thresholds.with_overrides(
-                vol_contraction_max=float(BOOTSTRAP_PB1_VOL_MAX),
-                volu_contraction_max=float(BOOTSTRAP_PB1_VOLU_MAX),
-                pullback_min=float(BOOTSTRAP_PB1_PULLBACK_MIN),
-                pullback_max=float(BOOTSTRAP_PB1_PULLBACK_MAX),
-                require_both_contractions=bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS),
+                vol_contraction_max=float(filters["vol_max"]),
+                volu_contraction_max=float(filters["volu_max"]),
+                pullback_min=float(filters["pullback_min"]),
+                pullback_max=float(filters["pullback_max"]),
+                require_both_contractions=bool(filters["require_both_contractions"]),
             )
         else:
             medium_thresholds = self.filter_thresholds.with_overrides(
@@ -2361,20 +2478,14 @@ class PB1Engine:
         tiers_tried: list[str] = []
         all_reason_counts: Counter[str] = Counter()
         relax_passes_used = 0
-        applied_min_score = float(BOOTSTRAP_PB1_MIN_SCORE_BASE if self.bootstrap_enabled else PB1_MIN_SCORE_BASE)
-        applied_require_both = bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS if self.bootstrap_enabled else PB1_REQUIRE_BOTH_CONTRACTIONS)
+        applied_min_score = float(filters["min_score_base"])
+        applied_require_both = bool(filters["require_both_contractions"])
 
         min_score_values: list[float] = []
-        if self.bootstrap_enabled:
-            current = float(BOOTSTRAP_PB1_MIN_SCORE_BASE)
-            floor = float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR)
-            step = max(float(BOOTSTRAP_PB1_MIN_SCORE_STEP), 1.0)
-            max_passes = max(1, int(BOOTSTRAP_RELAX_PASSES))
-        else:
-            current = float(PB1_MIN_SCORE_BASE)
-            floor = float(PB1_MIN_SCORE_FLOOR)
-            step = max(float(PB1_MIN_SCORE_STEP), 1.0)
-            max_passes = max(1, int(PB1_RELAX_MAX_PASSES))
+        current = float(filters["min_score_base"])
+        floor = float(filters["min_score_floor"])
+        step = max(float(filters["min_score_step"]), 1.0)
+        max_passes = max(1, int(filters["relax_passes"]))
         while current >= floor and len(min_score_values) < max_passes:
             min_score_values.append(current)
             current -= step
@@ -2384,12 +2495,12 @@ class PB1Engine:
         relax_passes: list[tuple[float, bool, str]] = [
             (
                 score,
-                bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS if self.bootstrap_enabled else PB1_REQUIRE_BOTH_CONTRACTIONS),
+                bool(filters["require_both_contractions"]),
                 "score_relax",
             )
             for score in min_score_values
         ]
-        if (not self.bootstrap_enabled) and PB1_REQUIRE_BOTH_CONTRACTIONS and len(relax_passes) < max_passes + 1:
+        if (not self.bootstrap_enabled) and bool(filters["require_both_contractions"]) and len(relax_passes) < max_passes + 1:
             relax_passes.append((min_score_values[-1], False, "require_both_off"))
 
         for min_score, require_both, relax_label in relax_passes:
@@ -2508,19 +2619,15 @@ class PB1Engine:
         candidates: List[CandidateFeature],
         target_new_positions: int,
     ) -> tuple[float, set[str]]:
+        filters = self.effective_entry_filters
         ok_setups = [c for c in candidates if c.setup_ok]
         if not ok_setups:
-            base_default = float(BOOTSTRAP_PB1_MIN_SCORE_BASE if self.bootstrap_enabled else PB1_MIN_SCORE_BASE)
+            base_default = float(filters["min_score_base"])
             return base_default, set()
         target = min(max(1, target_new_positions), len(ok_setups)) if target_new_positions > 0 else min(1, len(ok_setups))
-        if self.bootstrap_enabled:
-            base_cut = float(BOOTSTRAP_PB1_MIN_SCORE_BASE)
-            floor_cut = float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR)
-            step = max(float(BOOTSTRAP_PB1_MIN_SCORE_STEP), 1.0)
-        else:
-            base_cut = float(PB1_MIN_SCORE_BASE)
-            floor_cut = float(PB1_MIN_SCORE_FLOOR)
-            step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+        base_cut = float(filters["min_score_base"])
+        floor_cut = float(filters["min_score_floor"])
+        step = max(float(filters["min_score_step"]), 1.0)
         applied_cut = base_cut
         selected: list[CandidateFeature] = []
         current_cut = base_cut
@@ -2539,7 +2646,7 @@ class PB1Engine:
             ordered = sorted(ok_setups, key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
             selected = ordered[:target]
         if self.bootstrap_enabled and len(selected) <= 1:
-            keep_n = max(1, int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN))
+            keep_n = max(1, int(filters["score_keep_topn"]))
             ordered = sorted(ok_setups, key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
             selected = ordered[: min(keep_n, len(ordered))]
             kept_codes = [c.code for c in selected]
@@ -2560,6 +2667,12 @@ class PB1Engine:
             len(ok_setups),
             len(selected_codes),
             applied_cut,
+        )
+        logger.info(
+            "[PB1][SCORE_CUT][RESULT] applied_cut=%.1f after_count=%s codes=%s",
+            applied_cut,
+            len(selected_codes),
+            sorted(selected_codes),
         )
         return applied_cut, selected_codes
 
@@ -2662,12 +2775,14 @@ class PB1Engine:
             filtered.append(cf)
 
         risk_ok_codes = [c.code for c in filtered]
+        risk_fail_items = [
+            (c.code, list(c.reasons or []))
+            for c in ok_list
+            if not c.setup_ok
+        ]
         self._debug_risk_ok_codes = risk_ok_codes
-        logger.info(
-            "[PB1][RISK_GATE][CODES] count=%s codes=%s",
-            len(risk_ok_codes),
-            risk_ok_codes,
-        )
+        logger.info("[PB1][RISK_GATE][PASS] count=%s codes=%s", len(risk_ok_codes), risk_ok_codes)
+        logger.info("[PB1][RISK_GATE][FAIL] count=%s sample=%s", len(risk_fail_items), risk_fail_items[:10])
 
         if not filtered:
             return candidates
@@ -2729,9 +2844,10 @@ class PB1Engine:
         target_new_positions = max(1, int(self.target_new_positions or len(ranked) or 1))
         per_position_budget = min(max_pos_krw, tick_budget / target_new_positions) if tick_budget > 0 else max_pos_krw
         self._budget_plan_meta = {"risk_krw": risk_krw, "per_position_budget": per_position_budget}
-        bootstrap_force_min1 = bool(self.bootstrap_enabled and BOOTSTRAP_FORCE_MIN_1_SHARE)
-        bootstrap_min1_topn = max(1, int(BOOTSTRAP_MIN1_TOPN))
+        force_min1_enabled = bool(self.force_min1_enabled)
+        force_min1_topn = max(1, int(self.force_min1_topn))
         order_possible_cash = float(self.order_possible_cash_krw or 0.0)
+        allocated_slots = 0
         for cf in ranked:
             if not cf.setup_ok:
                 continue
@@ -2787,58 +2903,33 @@ class PB1Engine:
             # 1단계: qty=0 여부 체크 (예산 부족)
             if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
                 # 최소 1주 보장 옵션 체크
+                remaining_slots = max(0, int(target_new_positions) - int(allocated_slots))
                 min_1_share_allowed = (
-                    SIZING_ALLOW_MIN_1_SHARE
-                    and rank <= SIZING_MIN_1_SHARE_TOPN
-                    and usable_cash >= order_px
-                )
-                bootstrap_min1_allowed = (
-                    bootstrap_force_min1
-                    and rank <= bootstrap_min1_topn
+                    force_min1_enabled
+                    and rank <= force_min1_topn
                     and qty <= 0
-                    and order_px <= tick_budget
-                    and order_px <= usable_cash
-                    and (order_possible_cash <= 0 or order_px <= order_possible_cash)
-                    and (min_order_krw <= 0 or order_px >= min_order_krw)
+                    and order_px >= min_order_krw
+                    and usable_cash >= order_px
+                    and (order_possible_cash <= 0 or order_possible_cash >= order_px)
+                    and remaining_slots >= 1
                 )
-                
-                if bootstrap_min1_allowed:
+
+                if min_1_share_allowed:
                     qty = 1
-                    sizing_reason = "BOOTSTRAP_FORCE_MIN_1_SHARE"
+                    sizing_reason = "FORCE_MIN1_TOPN"
                     sizing_details = {
                         "rank": rank,
-                        "topn": bootstrap_min1_topn,
+                        "topn": force_min1_topn,
                         "price": order_px,
                         "usable_cash": usable_cash,
                         "tick_budget": tick_budget,
                         "order_possible_cash": order_possible_cash,
                         "forced_qty": 1,
                     }
-                    logger.warning(
-                        "[PB1][BOOTSTRAP][MIN1_FORCE] code=%s rank=%s price=%.0f tick_budget=%.0f usable=%.0f -> qty=1",
-                        self._display_code(cf.code),
-                        rank,
-                        order_px,
-                        tick_budget,
-                        usable_cash,
-                    )
-                elif min_1_share_allowed:
-                    # ✅ 최소 1주 보장 (상위 N개 종목에 한해)
-                    qty = 1
-                    sizing_reason = "FORCE_MIN_1_SHARE"
-                    sizing_details = {
-                        "rank": rank,
-                        "topn": SIZING_MIN_1_SHARE_TOPN,
-                        "price": order_px,
-                        "usable_cash": usable_cash,
-                        "tick_budget": tick_budget,
-                        "forced_qty": 1,
-                    }
                     logger.info(
-                        "[PB1][SIZING][MIN1] code=%s rank=%s/%s price=%.0f usable=%.0f → qty=1 (FORCED)",
+                        "[PB1][SIZING][FORCE_MIN1] code=%s rank=%s price=%s usable_cash=%s qty=1 reason=FORCE_MIN1_TOPN",
                         self._display_code(cf.code),
                         rank,
-                        SIZING_MIN_1_SHARE_TOPN,
                         order_px,
                         usable_cash,
                     )
@@ -2858,9 +2949,8 @@ class PB1Engine:
                         "tick_budget": tick_budget,
                         "order_px": order_px,
                         "order_possible_cash": order_possible_cash,
-                        "bootstrap_force_min1": int(bootstrap_force_min1),
-                        "bootstrap_min1_topn": bootstrap_min1_topn,
-                        "min_1_share_topn": SIZING_MIN_1_SHARE_TOPN,
+                        "force_min1_enabled": int(force_min1_enabled),
+                        "force_min1_topn": force_min1_topn,
                     }
             else:
                 # 2단계: qty>=1인데 최소주문금액 체크
@@ -2923,6 +3013,7 @@ class PB1Engine:
             cf.sizing_reason = "OK"
             cf.sizing_details = {"qty": qty, "price": order_px, "notional": cf.planned_value}
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+            allocated_slots += 1
             logger.info(
                 "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f%% value20=%s tick_budget=%.0f",
                 cf.code,
@@ -2947,8 +3038,8 @@ class PB1Engine:
         ]
         self._debug_sizing_ok_codes = sized_ok
         self._debug_sizing_fail_items = sized_fail
-        logger.info("[PB1][SIZING][OK_CODES] count=%s codes=%s", len(sized_ok), sized_ok)
-        logger.info("[PB1][SIZING][FAIL_CODES] count=%s items=%s", len(sized_fail), sized_fail)
+        logger.info("[PB1][SIZING][PASS] count=%s codes=%s", len(sized_ok), sized_ok)
+        logger.info("[PB1][SIZING][FAIL] count=%s sample=%s", len(sized_fail), sized_fail[:10])
 
         return candidates
 
@@ -4770,6 +4861,33 @@ class PB1Engine:
         ranked = sorted(setup_ok, key=self._final30_sort_key)
         return [cf.code for cf in ranked[:30]]
 
+    @staticmethod
+    def _normalize_final30_rows(rows: list[dict]) -> tuple[list[dict], list[str]]:
+        required_defaults: dict[str, Any] = {
+            "code": "",
+            "name": "",
+            "score_final": 0.0,
+            "tech_score": 0.0,
+            "flow_score": 0.0,
+            "rs_percentile": 0.0,
+            "vcp_score": 0.0,
+            "breakout_score": 0.0,
+            "pullback_score": 0.0,
+            "momentum_score": 0.0,
+            "entry_style_selected": "unknown",
+        }
+        normalized: list[dict] = []
+        missing_cols: set[str] = set()
+        for row in rows or []:
+            item = dict(row or {})
+            for key, default in required_defaults.items():
+                if key not in item:
+                    missing_cols.add(key)
+                    item[key] = default
+            item["code"] = str(item.get("code") or "").zfill(6)
+            normalized.append(item)
+        return normalized, sorted(missing_cols)
+
     def _load_entry_final30_or_abort(self, as_of: str) -> list[str]:
         """
         ✅ FIX B-ENTRY: final30 로드 (없으면 watchlist_final_locked로 대체)
@@ -4786,7 +4904,10 @@ class PB1Engine:
         
         # ✅ final30 스냅샷 없으면 watchlist_final(universe_context)로 대체
         if self._universe_context and self._universe_context.members:
-            fallback_codes = [m.get("code") for m in self._universe_context.members if m.get("code")]
+            normalized_rows, missing_cols = self._normalize_final30_rows(self._universe_context.members)
+            if missing_cols:
+                logger.warning("[FINAL30][FALLBACK][NORMALIZE] missing_cols=%s", missing_cols)
+            fallback_codes = [m.get("code") for m in normalized_rows if m.get("code")]
             fallback_source = self._universe_context.meta.get("source", "unknown") if self._universe_context.meta else "unknown"
             logger.warning(
                 "[PB1][ENTRY][FINAL30_FALLBACK] as_of=%s final30_snapshot_missing -> using watchlist source=%s count=%s",
@@ -5254,6 +5375,19 @@ class PB1Engine:
             logger.info(
                 "[MINERVINI_ONLY] calc_allowed=1 order_allowed=0 (bypass cutoff/window for analytics only)"
             )
+
+        diag_compute_only = (
+            (os.getenv("STRATEGY_MODE") or "").strip().upper() == "DIAG"
+            and (
+                env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
+                or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
+                or env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
+                or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
+            )
+        )
+        if diag_compute_only:
+            order_allowed = False
+            logger.info("[DIAG][ENTRY_COMPUTE] enabled=1 submit_orders=0")
         
         # ✅ DIAG_FULL_EXEC: entry gate 우회
         diag_full_exec = bool(getattr(self, "diag_full_exec", False))
@@ -5789,6 +5923,12 @@ class PB1Engine:
             "[DEBUG][SCAN_MEMBERS] source=%s scan_len=%d watchlist_len=%d universe_len=%d",
             scan_source, len(scan_members), len(watchlist_members or []), len(universe_members or [])
         )
+        logger.info(
+            "[ENTRY][SCAN_INPUT] source=%s count=%s codes=%s",
+            scan_source,
+            len(scan_members),
+            [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")],
+        )
         
         logger.info(
             "[ENTRY][PIPE][START] trace=%s scan_count=%d source=%s slots=%d tick_budget=%.0f entry_allowed=%s",
@@ -5847,8 +5987,8 @@ class PB1Engine:
         all_reason_counts: Counter[str] = Counter()
         tiers_tried: list[str] = []
         relax_passes_used = 0
-        applied_min_score = float(PB1_MIN_SCORE_BASE)
-        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
+        applied_min_score = float(self.effective_entry_filters.get("min_score_base", PB1_MIN_SCORE_BASE))
+        applied_require_both = bool(self.effective_entry_filters.get("require_both_contractions", PB1_REQUIRE_BOTH_CONTRACTIONS))
         setup_ok_codes: list[str] = []
         drop_reason_counter: Counter[str] = Counter()
         drop_examples: Dict[str, list[str]] = {}
@@ -5856,6 +5996,8 @@ class PB1Engine:
         after_buyable_check_count = 0
         after_dedup_count = 0
         orderable_candidates: list[CandidateFeature] = []
+        submit_attempt_count = 0
+        submit_success_count = 0
         minervini_report_path: str | None = None
         buyable_codes: set[str] = set()
         buyable_report: dict[str, Any] = {}
@@ -5900,6 +6042,7 @@ class PB1Engine:
                 )
 
                 setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+                logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
                 t_minervini_start = time.monotonic()
                 signals = compute_minervini_signals(
                     self,
@@ -5908,14 +6051,14 @@ class PB1Engine:
                     benchmark=str(os.getenv("RS_BENCHMARK", "229200")),
                 )
                 signals["final30"] = list(final30_codes)
-                relax_min_buyable = int(os.getenv("MIN_BUYABLE", "5") or 5)
-                relax_passes = int(os.getenv("RELAX_PASSES", "3") or 3)
+                relax_min_buyable = int(self.effective_entry_filters.get("min_buyable", 1))
+                relax_passes = int(self.effective_entry_filters.get("relax_passes", 3))
                 relax_rs_step = int(os.getenv("RS_PCTILE_STEP", "5") or 5)
                 relax_vcp_step = int(os.getenv("VCP_SCORE_STEP", "5") or 5)
                 relax_keep_trend = (os.getenv("KEEP_TREND_TEMPLATE_ALWAYS", "1") == "1")
                 if self.bootstrap_enabled:
-                    relax_min_buyable = 3
-                    relax_passes = int(BOOTSTRAP_RELAX_PASSES)
+                    relax_min_buyable = int(self.effective_entry_filters.get("min_buyable", 1))
+                    relax_passes = int(self.effective_entry_filters.get("relax_passes", 5))
                     relax_rs_step = 5
                     relax_vcp_step = 5
                     relax_keep_trend = bool(BOOTSTRAP_KEEP_TREND_TEMPLATE_ALWAYS)
@@ -5958,7 +6101,14 @@ class PB1Engine:
                     buyable_report.get("vcp_cut_used"),
                 )
                 pass_codes = buyable_report.get("pass_codes") or {}
-                for key in ["pass0", "pass1", "pass2", "pass3"]:
+                ordered_pass_keys = sorted(
+                    pass_codes.keys(),
+                    key=lambda key: int(str(key).replace("pass", "") or 0),
+                )
+                for key in ordered_pass_keys:
+                    pass_idx = key.replace("pass", "")
+                    logger.info("[MINERVINI][RELAX][PASS%s] count=%s", pass_idx, len(pass_codes.get(key, [])))
+                    logger.info("[MINERVINI][RELAX][PASS%s][CODES] codes=%s", pass_idx, pass_codes.get(key, []))
                     logger.info(
                         "[MINERVINI][RELAX][CODES] %s count=%s codes=%s",
                         key,
@@ -6127,6 +6277,7 @@ class PB1Engine:
                 if not any(c.setup_ok for c in candidates):
                     self._apply_score_fallback(candidates)
                 setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+                logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
                 candidates = self._size_positions(candidates)
                 relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)
                 relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
@@ -6641,7 +6792,64 @@ class PB1Engine:
                 orderable_candidates = orderable_candidates[:3]
                 logger.warning("[PB1][BOOTSTRAP] orderable capped to top3")
 
+            if not orderable_candidates:
+                code_to_member = {
+                    str(m.get("code") or "").zfill(6): dict(m)
+                    for m in (scan_members or [])
+                    if m.get("code")
+                }
+                emergency_ranked_codes = sorted(
+                    code_to_member.keys(),
+                    key=lambda code: (
+                        float(code_to_member[code].get("score_final") or 0.0),
+                        float(code_to_member[code].get("flow_score") or 0.0),
+                        float(code_to_member[code].get("rs_percentile") or 0.0),
+                    ),
+                    reverse=True,
+                )
+                atr_max_ratio = float(PB1_MAX_ATR_PCT)
+                if atr_max_ratio > 1.0:
+                    atr_max_ratio = atr_max_ratio / 100.0
+                for code in emergency_ranked_codes:
+                    if code in held_codes or code in open_buy_codes or code in today_buy_codes:
+                        continue
+                    emergency_cf = next((c for c in candidates if c.code == code), None)
+                    if emergency_cf is None:
+                        computed = self._compute_candidates_from_codes([code])
+                        emergency_cf = computed[0] if computed else None
+                    if emergency_cf is None:
+                        continue
+                    order_px = float(
+                        self._to_float(emergency_cf.features.get("order_price"))
+                        or self._to_float(emergency_cf.features.get("close"))
+                        or 0.0
+                    )
+                    if order_px <= 0:
+                        continue
+                    if min_order_krw > 0 and order_px < min_order_krw:
+                        continue
+                    if float(available_cash_krw) < order_px:
+                        continue
+                    atr_pct = self._to_float(emergency_cf.features.get("atr_pct"))
+                    if atr_pct is None or float(atr_pct) > float(atr_max_ratio):
+                        continue
+                    emergency_cf.setup_ok = True
+                    emergency_cf.planned_qty = 1
+                    emergency_cf.planned_value = float(order_px)
+                    emergency_cf.sizing_reason = "EMERGENCY_CANDIDATE_FALLBACK"
+                    emergency_cf.sizing_details = {"candidate_tier": "emergency_force1", "qty": 1, "price": order_px}
+                    emergency_cf.features["candidate_tier"] = "emergency_force1"
+                    emergency_cf.client_order_key = self._client_order_key(emergency_cf.code, emergency_cf.mode, "BUY", "close", "PB1")
+                    orderable_candidates.append(emergency_cf)
+                    logger.warning(
+                        "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
+                        emergency_cf.code,
+                    )
+                    break
+
             orderable_codes = [c.code for c in orderable_candidates]
+            logger.info("[ORDER_CANDIDATES] count=%s codes=%s", len(orderable_codes), orderable_codes)
+            logger.info("[ORDER_CANDIDATES][READY] count=%s codes=%s", len(orderable_codes), orderable_codes)
             logger.info(
                 "[TRADE][ORDERABLE][CODES] count=%s codes=%s",
                 len(orderable_codes),
@@ -6757,6 +6965,17 @@ class PB1Engine:
                 entry_usable_krw,
                 tick_budget_krw,
             )
+            logger.info(
+                "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s submitted=%s",
+                len(scan_members),
+                len(setup_ok_codes),
+                len(setup_ok_codes),
+                len(self._debug_score_cut_codes),
+                len(self._debug_risk_ok_codes),
+                len(self._debug_sizing_ok_codes),
+                len(orderable_candidates),
+                submit_success_count,
+            )
             self._log_fail_reason_breakdown(candidates, note="post_filter")
             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
@@ -6804,7 +7023,6 @@ class PB1Engine:
             if self.phase in {"entry"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
-                orderable_candidates = orderable_candidates if entry_allowed else []
                 if ok_count > 0 and not orderable_candidates:
                     no_orders_reasons: list[str] = []
                     if not entry_allowed:
@@ -6868,7 +7086,7 @@ class PB1Engine:
                             balance_cache_hits=self.balance_cache_hits,
                             balance_tick_cache_hits=self.balance_tick_cache_hits,
                         )
-                if orderable_candidates:
+                if entry_allowed and orderable_candidates:
                     planned_total = sum(
                         float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
                         for cf in orderable_candidates
@@ -6906,22 +7124,31 @@ class PB1Engine:
                 t_order_submit = time.monotonic()
                 submitted_count = 0
                 failed_count = 0
-                for cf in orderable_candidates:
-                    try:
-                        if self.window_internal == "close":
-                            self._place_entry_close(cf)
-                        else:
-                            self._place_entry(cf)
-                        submitted_count += 1
-                    except Exception as e:
-                        failed_count += 1
-                        logger.exception(
-                            "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
-                            trace_id,
-                            cf.code,
-                            str(e),
-                        )
+                submit_attempt_count = len(orderable_candidates)
+                if not entry_allowed:
+                    logger.info(
+                        "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
+                        len(orderable_candidates),
+                    )
+                else:
+                    for cf in orderable_candidates:
+                        try:
+                            logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
+                            if self.window_internal == "close":
+                                self._place_entry_close(cf)
+                            else:
+                                self._place_entry(cf)
+                            submitted_count += 1
+                        except Exception as e:
+                            failed_count += 1
+                            logger.exception(
+                                "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
+                                trace_id,
+                                cf.code,
+                                str(e),
+                            )
                 dt_order_submit = time.monotonic() - t_order_submit
+                submit_success_count = submitted_count
                 
                 logger.info(
                     "[ORDER][SUBMIT] trace=%s submitted=%s failed=%s dt_build=%.2f dt_submit=%.2f",
@@ -7045,6 +7272,19 @@ class PB1Engine:
         intents_skipped = self._setup_reason_counter.most_common(3)
         logger.info("[PB1][TICK_SUMMARY] candidates_ok=%d priced_ok=%d intents_created=%d intents_skipped_reason_top3=%s",
                     candidates_ok, priced_ok, intents_created, intents_skipped)
+        self._debug_summary = {
+            "scanned_count": len(scan_members),
+            "setup_ok_count": len(setup_ok_codes),
+            "after_relax_count": len(setup_ok_codes),
+            "after_score_cut_count": len(self._debug_score_cut_codes),
+            "after_risk_count": len(self._debug_risk_ok_codes),
+            "after_sizing_count": len(self._debug_sizing_ok_codes),
+            "order_candidate_count": len(orderable_candidates),
+            "order_candidate_codes": [c.code for c in orderable_candidates],
+            "submit_attempt_count": int(submit_attempt_count),
+            "submit_success_count": int(submit_success_count),
+            "skip_reason_top": (drop_reason_counter.most_common(1)[0][0] if drop_reason_counter else "none"),
+        }
         
         # ✅ 스코어카드 JSONL 작성 (선택사항: 성능 영향 최소화)
         # try:

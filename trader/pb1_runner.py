@@ -453,6 +453,7 @@ def generate_run_summary_json(
         total_candidates = getattr(engine, "total_candidates", 0)
         ok_count = getattr(engine, "ok_count", 0)
         reject_reason_counts = getattr(engine, "reject_reason_counts", {})
+        debug_summary = getattr(engine, "_debug_summary", {}) or {}
         
         payload = {
             "run_id": str(run_id),
@@ -464,9 +465,19 @@ def generate_run_summary_json(
             "universe_as_of": universe_as_of,
             "fallback_used": bool(fallback_used),
             "counts": {
-                "scanned": int(total_candidates),
+                "scanned": int(debug_summary.get("scanned_count", total_candidates)),
                 "passed": int(ok_count),
+                "setup_ok_count": int(debug_summary.get("setup_ok_count", 0)),
+                "after_relax_count": int(debug_summary.get("after_relax_count", 0)),
+                "after_score_cut_count": int(debug_summary.get("after_score_cut_count", 0)),
+                "after_risk_count": int(debug_summary.get("after_risk_count", 0)),
+                "after_sizing_count": int(debug_summary.get("after_sizing_count", 0)),
+                "order_candidate_count": int(debug_summary.get("order_candidate_count", 0)),
+                "submit_attempt_count": int(debug_summary.get("submit_attempt_count", 0)),
+                "submit_success_count": int(debug_summary.get("submit_success_count", 0)),
             },
+            "order_candidate_codes": list(debug_summary.get("order_candidate_codes", []) or []),
+            "skip_reason_top": debug_summary.get("skip_reason_top", "none"),
             "drop_reasons": reject_reason_counts or {},
         }
         
@@ -478,6 +489,17 @@ def generate_run_summary_json(
             total_candidates,
             ok_count,
             len(reject_reason_counts),
+        )
+        logger.info(
+            "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s submitted=%s",
+            payload["counts"]["scanned"],
+            payload["counts"]["setup_ok_count"],
+            payload["counts"]["after_relax_count"],
+            payload["counts"]["after_score_cut_count"],
+            payload["counts"]["after_risk_count"],
+            payload["counts"]["after_sizing_count"],
+            payload["counts"]["order_candidate_count"],
+            payload["counts"]["submit_success_count"],
         )
         return str(summary_path)
     except Exception as e:
