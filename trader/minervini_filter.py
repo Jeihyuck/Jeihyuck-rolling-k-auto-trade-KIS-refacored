@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import os
 from typing import Any
+import logging
 
 import numpy as np
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -211,8 +215,12 @@ def select_buyable_with_relax(
 ) -> tuple[list[str], dict]:
     items = list(signals.get("items") or [])
     regime_pass = bool(signals.get("regime_pass"))
+    bootstrap_enabled = os.getenv("PB1_BOOTSTRAP_ENABLE", "1") == "1"
     base_rs = _int_env("MINERVINI_RS_MIN_PCTILE", 80)
     base_vcp = _int_env("MINERVINI_VCP_MIN_SCORE", 70)
+    if bootstrap_enabled:
+        base_rs = _int_env("BOOTSTRAP_MINERVINI_RS_MIN_PCTILE", 60)
+        base_vcp = _int_env("BOOTSTRAP_MINERVINI_VCP_MIN_SCORE", 45)
     allow_rs_only = os.getenv("ALLOW_RS_ONLY_WHEN_STRONG_TREND", "1") == "1"
 
     if not regime_pass:
@@ -222,10 +230,15 @@ def select_buyable_with_relax(
             "vcp_cut_used": base_vcp,
             "final_buyable_count": 0,
             "pass_counts": {},
+            "pass_codes": {},
+            "final_buyable_codes": [],
+            "base_rs": base_rs,
+            "base_vcp": base_vcp,
             "regime_pass": False,
         }
 
     pass_counts: dict[str, int] = {}
+    pass_codes: dict[str, list[str]] = {}
     chosen_codes: list[str] = []
     used_level = 0
     used_rs = base_rs
@@ -252,6 +265,15 @@ def select_buyable_with_relax(
             passed.append(str(item.get("code") or "").zfill(6))
 
         pass_counts[f"pass{p}"] = len(passed)
+        pass_codes[f"pass{p}"] = passed[:]
+        logger.info(
+            "[MINERVINI][RELAX][PASS_CODES] pass=%s count=%s codes=%s rs_cut=%s vcp_cut=%s",
+            p,
+            len(passed),
+            passed,
+            rs_cut,
+            vcp_cut,
+        )
         chosen_codes = passed
         used_level = p
         used_rs = rs_cut
@@ -259,12 +281,23 @@ def select_buyable_with_relax(
         if len(passed) >= int(min_buyable):
             break
 
+    logger.info(
+        "[MINERVINI][RELAX][FINAL_CODES] used=%s count=%s codes=%s",
+        used_level,
+        len(chosen_codes),
+        chosen_codes,
+    )
+
     report = {
         "relax_level_used": used_level,
         "rs_cut_used": used_rs,
         "vcp_cut_used": used_vcp,
         "final_buyable_count": len(chosen_codes),
         "pass_counts": pass_counts,
+        "pass_codes": pass_codes,
+        "final_buyable_codes": chosen_codes[:],
+        "base_rs": base_rs,
+        "base_vcp": base_vcp,
         "regime_pass": True,
     }
     return chosen_codes, report

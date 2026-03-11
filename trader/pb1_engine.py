@@ -28,6 +28,22 @@ from trader.config import (
     PB1_MIN_SCORE_BASE,
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,
+    PB1_BOOTSTRAP_ENABLE,
+    BOOTSTRAP_MINERVINI_RS_MIN_PCTILE,
+    BOOTSTRAP_MINERVINI_VCP_MIN_SCORE,
+    BOOTSTRAP_RELAX_PASSES,
+    BOOTSTRAP_KEEP_TREND_TEMPLATE_ALWAYS,
+    BOOTSTRAP_PB1_VOL_MAX,
+    BOOTSTRAP_PB1_VOLU_MAX,
+    BOOTSTRAP_PB1_PULLBACK_MIN,
+    BOOTSTRAP_PB1_PULLBACK_MAX,
+    BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS,
+    BOOTSTRAP_PB1_MIN_SCORE_BASE,
+    BOOTSTRAP_PB1_MIN_SCORE_FLOOR,
+    BOOTSTRAP_PB1_MIN_SCORE_STEP,
+    BOOTSTRAP_SCORE_CUT_KEEP_TOPN,
+    BOOTSTRAP_FORCE_MIN_1_SHARE,
+    BOOTSTRAP_MIN1_TOPN,
     PB1_MAX_ATR_PCT,
     PB1_MAX_ATR_PCT_RAW,
     PB1_MIN_VALUE20,
@@ -645,6 +661,12 @@ class PB1Engine:
         self.target_new_positions: int | None = None
         self._budget_plan_meta: dict[str, Any] | None = None
         self._touched_files: list[Path] = []
+        self.bootstrap_enabled = bool(PB1_BOOTSTRAP_ENABLE)
+        self.order_possible_cash_krw: float = 0.0
+        self._debug_score_cut_codes: list[str] = []
+        self._debug_risk_ok_codes: list[str] = []
+        self._debug_sizing_ok_codes: list[str] = []
+        self._debug_sizing_fail_items: list[dict[str, Any]] = []
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -766,6 +788,24 @@ class PB1Engine:
             thresholds.pullback_max,
             thresholds.require_both_contractions,
         )
+        if self.bootstrap_enabled and self.phase in {"prep", "entry"}:
+            thresholds = thresholds.with_overrides(
+                vol_contraction_max=float(BOOTSTRAP_PB1_VOL_MAX),
+                volu_contraction_max=float(BOOTSTRAP_PB1_VOLU_MAX),
+                pullback_min=float(BOOTSTRAP_PB1_PULLBACK_MIN),
+                pullback_max=float(BOOTSTRAP_PB1_PULLBACK_MAX),
+                require_both_contractions=bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS),
+            )
+            logger.warning(
+                "[PB1][BOOTSTRAP] enabled=1 thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s min_score_base:%.1f min_score_floor:%.1f}",
+                thresholds.vol_contraction_max,
+                thresholds.volu_contraction_max,
+                thresholds.pullback_min,
+                thresholds.pullback_max,
+                thresholds.require_both_contractions,
+                float(BOOTSTRAP_PB1_MIN_SCORE_BASE),
+                float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR),
+            )
         return thresholds
 
     def _resolve_strict_thresholds(self) -> FilterThresholds:
@@ -2277,20 +2317,36 @@ class PB1Engine:
         candidates: List[CandidateFeature],
     ) -> tuple[List[CandidateFeature], str, FilterThresholds, Counter[str], list[str], int, float, bool]:
         strict_thresholds = self._resolve_strict_thresholds()
-        medium_thresholds = self.filter_thresholds.with_overrides(
-            vol_contraction_max=1.00,
-            volu_contraction_max=1.00,
-            pullback_min=0.03,
-            pullback_max=0.15,
-            require_both_contractions=True,
-        )
-        loose_thresholds = self.filter_thresholds.with_overrides(
-            vol_contraction_max=1.10,
-            volu_contraction_max=1.10,
-            pullback_min=0.02,
-            pullback_max=0.18,
-            require_both_contractions=False,
-        )
+        if self.bootstrap_enabled:
+            medium_thresholds = self.filter_thresholds.with_overrides(
+                vol_contraction_max=min(float(BOOTSTRAP_PB1_VOL_MAX), 1.10),
+                volu_contraction_max=min(float(BOOTSTRAP_PB1_VOLU_MAX), 1.10),
+                pullback_min=max(float(BOOTSTRAP_PB1_PULLBACK_MIN), 0.01),
+                pullback_max=min(float(BOOTSTRAP_PB1_PULLBACK_MAX), 0.22),
+                require_both_contractions=False,
+            )
+            loose_thresholds = self.filter_thresholds.with_overrides(
+                vol_contraction_max=float(BOOTSTRAP_PB1_VOL_MAX),
+                volu_contraction_max=float(BOOTSTRAP_PB1_VOLU_MAX),
+                pullback_min=float(BOOTSTRAP_PB1_PULLBACK_MIN),
+                pullback_max=float(BOOTSTRAP_PB1_PULLBACK_MAX),
+                require_both_contractions=bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS),
+            )
+        else:
+            medium_thresholds = self.filter_thresholds.with_overrides(
+                vol_contraction_max=1.00,
+                volu_contraction_max=1.00,
+                pullback_min=0.03,
+                pullback_max=0.15,
+                require_both_contractions=True,
+            )
+            loose_thresholds = self.filter_thresholds.with_overrides(
+                vol_contraction_max=1.10,
+                volu_contraction_max=1.10,
+                pullback_min=0.02,
+                pullback_max=0.18,
+                require_both_contractions=False,
+            )
         tiers = [
             ("tier1", strict_thresholds),
             ("tier2", medium_thresholds),
@@ -2302,24 +2358,35 @@ class PB1Engine:
         tiers_tried: list[str] = []
         all_reason_counts: Counter[str] = Counter()
         relax_passes_used = 0
-        applied_min_score = float(PB1_MIN_SCORE_BASE)
-        applied_require_both = bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
+        applied_min_score = float(BOOTSTRAP_PB1_MIN_SCORE_BASE if self.bootstrap_enabled else PB1_MIN_SCORE_BASE)
+        applied_require_both = bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS if self.bootstrap_enabled else PB1_REQUIRE_BOTH_CONTRACTIONS)
 
         min_score_values: list[float] = []
-        current = float(PB1_MIN_SCORE_BASE)
-        floor = float(PB1_MIN_SCORE_FLOOR)
-        step = max(float(PB1_MIN_SCORE_STEP), 1.0)
-        max_passes = max(1, int(PB1_RELAX_MAX_PASSES))
+        if self.bootstrap_enabled:
+            current = float(BOOTSTRAP_PB1_MIN_SCORE_BASE)
+            floor = float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR)
+            step = max(float(BOOTSTRAP_PB1_MIN_SCORE_STEP), 1.0)
+            max_passes = max(1, int(BOOTSTRAP_RELAX_PASSES))
+        else:
+            current = float(PB1_MIN_SCORE_BASE)
+            floor = float(PB1_MIN_SCORE_FLOOR)
+            step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+            max_passes = max(1, int(PB1_RELAX_MAX_PASSES))
         while current >= floor and len(min_score_values) < max_passes:
             min_score_values.append(current)
             current -= step
         if not min_score_values:
-            min_score_values = [float(PB1_MIN_SCORE_BASE)]
+            min_score_values = [float(applied_min_score)]
 
         relax_passes: list[tuple[float, bool, str]] = [
-            (score, bool(PB1_REQUIRE_BOTH_CONTRACTIONS), "score_relax") for score in min_score_values
+            (
+                score,
+                bool(BOOTSTRAP_PB1_REQUIRE_BOTH_CONTRACTIONS if self.bootstrap_enabled else PB1_REQUIRE_BOTH_CONTRACTIONS),
+                "score_relax",
+            )
+            for score in min_score_values
         ]
-        if PB1_REQUIRE_BOTH_CONTRACTIONS and len(relax_passes) < max_passes + 1:
+        if (not self.bootstrap_enabled) and PB1_REQUIRE_BOTH_CONTRACTIONS and len(relax_passes) < max_passes + 1:
             relax_passes.append((min_score_values[-1], False, "require_both_off"))
 
         for min_score, require_both, relax_label in relax_passes:
@@ -2440,11 +2507,17 @@ class PB1Engine:
     ) -> tuple[float, set[str]]:
         ok_setups = [c for c in candidates if c.setup_ok]
         if not ok_setups:
-            return float(PB1_MIN_SCORE_BASE), set()
+            base_default = float(BOOTSTRAP_PB1_MIN_SCORE_BASE if self.bootstrap_enabled else PB1_MIN_SCORE_BASE)
+            return base_default, set()
         target = min(max(1, target_new_positions), len(ok_setups)) if target_new_positions > 0 else min(1, len(ok_setups))
-        base_cut = float(PB1_MIN_SCORE_BASE)
-        floor_cut = float(PB1_MIN_SCORE_FLOOR)
-        step = max(float(PB1_MIN_SCORE_STEP), 1.0)
+        if self.bootstrap_enabled:
+            base_cut = float(BOOTSTRAP_PB1_MIN_SCORE_BASE)
+            floor_cut = float(BOOTSTRAP_PB1_MIN_SCORE_FLOOR)
+            step = max(float(BOOTSTRAP_PB1_MIN_SCORE_STEP), 1.0)
+        else:
+            base_cut = float(PB1_MIN_SCORE_BASE)
+            floor_cut = float(PB1_MIN_SCORE_FLOOR)
+            step = max(float(PB1_MIN_SCORE_STEP), 1.0)
         applied_cut = base_cut
         selected: list[CandidateFeature] = []
         current_cut = base_cut
@@ -2462,6 +2535,18 @@ class PB1Engine:
         if len(selected) < target:
             ordered = sorted(ok_setups, key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
             selected = ordered[:target]
+        if self.bootstrap_enabled and len(selected) <= 1:
+            keep_n = max(1, int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN))
+            ordered = sorted(ok_setups, key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+            selected = ordered[: min(keep_n, len(ordered))]
+            kept_codes = [c.code for c in selected]
+            logger.warning(
+                "[PB1][BOOTSTRAP][SCORE_CUT_BYPASS] before=%s after=%s keep_topn=%s codes=%s",
+                len(ok_setups),
+                len(kept_codes),
+                keep_n,
+                kept_codes,
+            )
         selected_codes = {c.code for c in selected}
         logger.info(
             "[PB1][SCORE_CUT] base=%.1f floor=%.1f step=%.1f target=%s ok_setups=%s after_cut=%s applied=%.1f",
@@ -2497,6 +2582,13 @@ class PB1Engine:
         applied_cut, selected_codes = self._apply_adaptive_score_cut(
             ok_list,
             target_new_positions=int(self.target_new_positions or 0),
+        )
+        score_cut_codes = sorted(selected_codes)
+        self._debug_score_cut_codes = score_cut_codes
+        logger.info(
+            "[PB1][SCORE_CUT][CODES] count=%s codes=%s",
+            len(score_cut_codes),
+            score_cut_codes,
         )
         for cf in ok_list:
             score_fallback = bool(cf.features.get("score_fallback"))
@@ -2566,6 +2658,14 @@ class PB1Engine:
 
             filtered.append(cf)
 
+        risk_ok_codes = [c.code for c in filtered]
+        self._debug_risk_ok_codes = risk_ok_codes
+        logger.info(
+            "[PB1][RISK_GATE][CODES] count=%s codes=%s",
+            len(risk_ok_codes),
+            risk_ok_codes,
+        )
+
         if not filtered:
             return candidates
 
@@ -2626,6 +2726,9 @@ class PB1Engine:
         target_new_positions = max(1, int(self.target_new_positions or len(ranked) or 1))
         per_position_budget = min(max_pos_krw, tick_budget / target_new_positions) if tick_budget > 0 else max_pos_krw
         self._budget_plan_meta = {"risk_krw": risk_krw, "per_position_budget": per_position_budget}
+        bootstrap_force_min1 = bool(self.bootstrap_enabled and BOOTSTRAP_FORCE_MIN_1_SHARE)
+        bootstrap_min1_topn = max(1, int(BOOTSTRAP_MIN1_TOPN))
+        order_possible_cash = float(self.order_possible_cash_krw or 0.0)
         for cf in ranked:
             if not cf.setup_ok:
                 continue
@@ -2686,8 +2789,37 @@ class PB1Engine:
                     and rank <= SIZING_MIN_1_SHARE_TOPN
                     and usable_cash >= order_px
                 )
+                bootstrap_min1_allowed = (
+                    bootstrap_force_min1
+                    and rank <= bootstrap_min1_topn
+                    and qty <= 0
+                    and order_px <= tick_budget
+                    and order_px <= usable_cash
+                    and (order_possible_cash <= 0 or order_px <= order_possible_cash)
+                    and (min_order_krw <= 0 or order_px >= min_order_krw)
+                )
                 
-                if min_1_share_allowed:
+                if bootstrap_min1_allowed:
+                    qty = 1
+                    sizing_reason = "BOOTSTRAP_FORCE_MIN_1_SHARE"
+                    sizing_details = {
+                        "rank": rank,
+                        "topn": bootstrap_min1_topn,
+                        "price": order_px,
+                        "usable_cash": usable_cash,
+                        "tick_budget": tick_budget,
+                        "order_possible_cash": order_possible_cash,
+                        "forced_qty": 1,
+                    }
+                    logger.warning(
+                        "[PB1][BOOTSTRAP][MIN1_FORCE] code=%s rank=%s price=%.0f tick_budget=%.0f usable=%.0f -> qty=1",
+                        self._display_code(cf.code),
+                        rank,
+                        order_px,
+                        tick_budget,
+                        usable_cash,
+                    )
+                elif min_1_share_allowed:
                     # ✅ 최소 1주 보장 (상위 N개 종목에 한해)
                     qty = 1
                     sizing_reason = "FORCE_MIN_1_SHARE"
@@ -2719,6 +2851,12 @@ class PB1Engine:
                         "shortfall": max(0, order_px - tick_budget),
                         "usable_cash": usable_cash,
                         "reserve_applied_at_capital_level": reserve_krw,
+                        "budget_cap": budget_cap,
+                        "tick_budget": tick_budget,
+                        "order_px": order_px,
+                        "order_possible_cash": order_possible_cash,
+                        "bootstrap_force_min1": int(bootstrap_force_min1),
+                        "bootstrap_min1_topn": bootstrap_min1_topn,
                         "min_1_share_topn": SIZING_MIN_1_SHARE_TOPN,
                     }
             else:
@@ -2793,6 +2931,21 @@ class PB1Engine:
                 cf.features.get("value20"),
                 tick_budget,
             )
+
+        sized_ok = [c.code for c in candidates if (c.planned_qty or 0) > 0 and c.setup_ok]
+        sized_fail = [
+            {
+                "code": c.code,
+                "reason": getattr(c, "sizing_reason", None),
+                "detail": getattr(c, "sizing_details", None),
+            }
+            for c in candidates
+            if not ((c.planned_qty or 0) > 0 and c.setup_ok)
+        ]
+        self._debug_sizing_ok_codes = sized_ok
+        self._debug_sizing_fail_items = sized_fail
+        logger.info("[PB1][SIZING][OK_CODES] count=%s codes=%s", len(sized_ok), sized_ok)
+        logger.info("[PB1][SIZING][FAIL_CODES] count=%s items=%s", len(sized_fail), sized_fail)
 
         return candidates
 
@@ -5353,6 +5506,19 @@ class PB1Engine:
             )
             entry_summary_emitted = True
 
+        def _write_relax_debug_report(payload: dict[str, Any]) -> Path | None:
+            try:
+                report_path = runtime_path("runtime", "reports", "minervini", self._today, "relax_debug.json")
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                with report_path.open("w", encoding="utf-8") as fp:
+                    json.dump(to_jsonable(payload), fp, ensure_ascii=False, indent=2)
+                self._touched_files.append(report_path)
+                logger.info("[MINERVINI][RELAX_DEBUG][SAVE] path=%s", report_path)
+                return report_path
+            except Exception as exc:
+                logger.warning("[MINERVINI][RELAX_DEBUG][SAVE_FAIL] err=%s", exc)
+                return None
+
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
         self._balance_snapshot = holdings_snapshot
@@ -5373,6 +5539,7 @@ class PB1Engine:
                 logger.warning("[PB1][CASH][SUMMARY_FAIL] err=%s", exc)
         if order_possible_cash_krw > 0:
             available_cash_krw = order_possible_cash_krw
+        self.order_possible_cash_krw = float(order_possible_cash_krw)
         base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
         if entry_phase:
             reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
@@ -5689,6 +5856,21 @@ class PB1Engine:
         minervini_report_path: str | None = None
         buyable_codes: set[str] = set()
         buyable_report: dict[str, Any] = {}
+        relax_debug_payload: dict[str, Any] = {
+            "trade_date": self._today,
+            "phase": self.phase,
+            "env": self.env,
+            "bootstrap_enabled": int(self.bootstrap_enabled),
+            "final30_input_codes": list(final30_codes),
+            "pass_codes": {},
+            "score_cut_codes": [],
+            "risk_gate_codes": [],
+            "sizing_ok_codes": [],
+            "sizing_fail_items": [],
+            "final_orderable_codes": [],
+            "drop_reasons_by_code": {},
+            "drop_reason_examples": {},
+        }
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             if self.phase == "entry":
                 t_pb1_start = time.monotonic()
@@ -5723,13 +5905,34 @@ class PB1Engine:
                     benchmark=str(os.getenv("RS_BENCHMARK", "229200")),
                 )
                 signals["final30"] = list(final30_codes)
+                relax_min_buyable = int(os.getenv("MIN_BUYABLE", "5") or 5)
+                relax_passes = int(os.getenv("RELAX_PASSES", "3") or 3)
+                relax_rs_step = int(os.getenv("RS_PCTILE_STEP", "5") or 5)
+                relax_vcp_step = int(os.getenv("VCP_SCORE_STEP", "5") or 5)
+                relax_keep_trend = (os.getenv("KEEP_TREND_TEMPLATE_ALWAYS", "1") == "1")
+                if self.bootstrap_enabled:
+                    relax_min_buyable = 3
+                    relax_passes = int(BOOTSTRAP_RELAX_PASSES)
+                    relax_rs_step = 5
+                    relax_vcp_step = 5
+                    relax_keep_trend = bool(BOOTSTRAP_KEEP_TREND_TEMPLATE_ALWAYS)
+                    logger.warning(
+                        "[PB1][BOOTSTRAP][MINERVINI] enabled=1 min_buyable=%s relax_passes=%s rs_step=%s vcp_step=%s keep_trend=%s rs_min=%s vcp_min=%s",
+                        relax_min_buyable,
+                        relax_passes,
+                        relax_rs_step,
+                        relax_vcp_step,
+                        int(relax_keep_trend),
+                        BOOTSTRAP_MINERVINI_RS_MIN_PCTILE,
+                        BOOTSTRAP_MINERVINI_VCP_MIN_SCORE,
+                    )
                 buyable_codes_list, buyable_report = select_buyable_with_relax(
                     signals=signals,
-                    min_buyable=int(os.getenv("MIN_BUYABLE", "5") or 5),
-                    relax_passes=int(os.getenv("RELAX_PASSES", "3") or 3),
-                    rs_step=int(os.getenv("RS_PCTILE_STEP", "5") or 5),
-                    vcp_step=int(os.getenv("VCP_SCORE_STEP", "5") or 5),
-                    keep_trend=(os.getenv("KEEP_TREND_TEMPLATE_ALWAYS", "1") == "1"),
+                    min_buyable=relax_min_buyable,
+                    relax_passes=relax_passes,
+                    rs_step=relax_rs_step,
+                    vcp_step=relax_vcp_step,
+                    keep_trend=relax_keep_trend,
                 )
                 dt_minervini = time.monotonic() - t_minervini_start
                 buyable_codes = set(buyable_codes_list)
@@ -5742,7 +5945,7 @@ class PB1Engine:
                 pass_counts = buyable_report.get("pass_counts") or {}
                 logger.info(
                     "[MINERVINI][RELAX] target=%s pass0=%s pass1=%s pass2=%s pass3=%s used=%s rs_cut=%s vcp_cut=%s",
-                    int(os.getenv("MIN_BUYABLE", "5") or 5),
+                    relax_min_buyable,
                     pass_counts.get("pass0", 0),
                     pass_counts.get("pass1", 0),
                     pass_counts.get("pass2", 0),
@@ -5751,6 +5954,29 @@ class PB1Engine:
                     buyable_report.get("rs_cut_used"),
                     buyable_report.get("vcp_cut_used"),
                 )
+                pass_codes = buyable_report.get("pass_codes") or {}
+                for key in ["pass0", "pass1", "pass2", "pass3"]:
+                    logger.info(
+                        "[MINERVINI][RELAX][CODES] %s count=%s codes=%s",
+                        key,
+                        len(pass_codes.get(key, [])),
+                        pass_codes.get(key, []),
+                    )
+                logger.info(
+                    "[MINERVINI][RELAX][FINAL] used=%s rs_cut=%s vcp_cut=%s count=%s codes=%s",
+                    buyable_report.get("relax_level_used"),
+                    buyable_report.get("rs_cut_used"),
+                    buyable_report.get("vcp_cut_used"),
+                    len(buyable_report.get("final_buyable_codes", [])),
+                    buyable_report.get("final_buyable_codes", []),
+                )
+                relax_debug_payload["pass_codes"] = pass_codes
+                relax_debug_payload["final_buyable_codes"] = list(buyable_report.get("final_buyable_codes", []))
+                relax_debug_payload["relax_level_used"] = buyable_report.get("relax_level_used")
+                relax_debug_payload["rs_cut_used"] = buyable_report.get("rs_cut_used")
+                relax_debug_payload["vcp_cut_used"] = buyable_report.get("vcp_cut_used")
+                relax_debug_payload["base_rs"] = buyable_report.get("base_rs")
+                relax_debug_payload["base_vcp"] = buyable_report.get("base_vcp")
 
                 minervini_path = write_minervini_signals(
                     base_dir=Path("bot_state"),
@@ -5772,6 +5998,10 @@ class PB1Engine:
                         cf.reasons = list(cf.reasons or []) + ["minervini_not_buyable"]
 
                 candidates = self._size_positions(candidates)
+                relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)
+                relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
+                relax_debug_payload["sizing_ok_codes"] = list(self._debug_sizing_ok_codes)
+                relax_debug_payload["sizing_fail_items"] = list(self._debug_sizing_fail_items)
                 ok_after_risk = sorted(
                     [c for c in candidates if c.setup_ok and c.code in buyable_codes],
                     key=lambda c: float(c.features.get("score") or 0.0),
@@ -5895,6 +6125,10 @@ class PB1Engine:
                     self._apply_score_fallback(candidates)
                 setup_ok_codes = [c.code for c in candidates if c.setup_ok]
                 candidates = self._size_positions(candidates)
+                relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)
+                relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
+                relax_debug_payload["sizing_ok_codes"] = list(self._debug_sizing_ok_codes)
+                relax_debug_payload["sizing_fail_items"] = list(self._debug_sizing_fail_items)
                 ok_after_risk = sorted(
                     [c for c in candidates if c.setup_ok],
                     key=lambda c: float(c.features.get("score") or 0.0),
@@ -6364,8 +6598,78 @@ class PB1Engine:
                 if len(orderable_candidates) >= new_position_limit:
                     break
 
+            if (
+                self.bootstrap_enabled
+                and self.phase == "entry"
+                and entry_allowed
+                and bool(self.order_allowed)
+                and existing_positions_count == 0
+                and (self.env or "").lower() == "practice"
+                and not orderable_candidates
+            ):
+                fallback_pool = [
+                    c
+                    for c in candidates
+                    if bool(c.features.get("minervini_buyable"))
+                    and "planned_qty_zero_or_min_order" in (c.reasons or [])
+                ]
+                if fallback_pool:
+                    fallback_pool.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
+                    chosen = fallback_pool[0]
+                    order_px = float(chosen.features.get("order_price") or chosen.features.get("close") or 0.0)
+                    if order_px > 0:
+                        chosen.planned_qty = 1
+                        chosen.planned_value = float(order_px)
+                        chosen.setup_ok = True
+                        chosen.sizing_reason = "BOOTSTRAP_FALLBACK_FORCE_1"
+                        chosen.sizing_details = {
+                            "reason": "sizing_zero_but_buyable",
+                            "forced_qty": 1,
+                            "env": self.env,
+                        }
+                        orderable_candidates.append(chosen)
+                        logger.warning(
+                            "[PB1][BOOTSTRAP][FALLBACK_ORDER] code=%s reason=sizing_zero_but_buyable forcing_qty=1 env=%s",
+                            chosen.code,
+                            self.env,
+                        )
+
+            if self.bootstrap_enabled and len(orderable_candidates) > 3:
+                orderable_candidates = orderable_candidates[:3]
+                logger.warning("[PB1][BOOTSTRAP] orderable capped to top3")
+
+            orderable_codes = [c.code for c in orderable_candidates]
+            logger.info(
+                "[TRADE][ORDERABLE][CODES] count=%s codes=%s",
+                len(orderable_codes),
+                orderable_codes,
+            )
+            relax_debug_payload["final_orderable_codes"] = orderable_codes
+
             after_buyable_check_count = len(orderable_candidates)
             after_dedup_count = len(orderable_candidates)
+            drop_reasons_by_code: dict[str, list[str]] = {}
+            drop_reason_examples_full: dict[str, list[str]] = {}
+            for cf in candidates:
+                if cf.setup_ok:
+                    continue
+                reasons = [str(r) for r in (cf.reasons or ["unspecified_fail"]) if r]
+                if reasons:
+                    drop_reasons_by_code[cf.code] = sorted(set(reasons))
+                for reason in sorted(set(reasons)):
+                    bucket = drop_reason_examples_full.setdefault(reason, [])
+                    bucket.append(cf.code)
+            logger.info(
+                "[PB1][DROP_REASON][SAMPLES] reasons=%s",
+                {k: v[:10] for k, v in drop_reason_examples_full.items()},
+            )
+            relax_debug_payload["drop_reasons_by_code"] = drop_reasons_by_code
+            relax_debug_payload["drop_reason_examples"] = drop_reason_examples_full
+            relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)
+            relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
+            relax_debug_payload["sizing_ok_codes"] = list(self._debug_sizing_ok_codes)
+            relax_debug_payload["sizing_fail_items"] = list(self._debug_sizing_fail_items)
+            _write_relax_debug_report(relax_debug_payload)
             
             # [ENTRY][NO_BUY] 후보가 0일 때 이유 출력
             if not orderable_candidates:
