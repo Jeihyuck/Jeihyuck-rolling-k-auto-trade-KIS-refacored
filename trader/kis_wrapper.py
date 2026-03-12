@@ -1758,9 +1758,12 @@ class KisAPI:
             global _DAILY_CAP_WARNED
             if not _DAILY_CAP_WARNED:
                 if os.getenv("DAILY_CAPITAL") in (None, ""):
-                    logger.warning(
-                        "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
-                    )
+                    if (os.getenv("PB1_CAPITAL_MODE") or "CASH").strip().upper() == "CASH":
+                        logger.info("[CAPITAL][INFO] DAILY_CAPITAL unused because CAPITAL_MODE=CASH")
+                    else:
+                        logger.warning(
+                            "[ENV] DAILY_CAPITAL 미설정 -> settings/trader.config 기본값(%s) 사용", f"{DEFAULT_DAILY_CAPITAL:,}"
+                        )
                 _DAILY_CAP_WARNED = True
         except Exception:
             pass
@@ -1829,6 +1832,9 @@ class KisAPI:
         self._limiter.wait("daily")
 
         last_err = None
+        last_cause = "unknown"
+        last_msg_cd = None
+        last_msg1 = None
 
         for tr in _pick_tr(self.env, "DAILY_CHART"):   # TR 후보를 순차적으로 시도
             headers = self._headers(tr)
@@ -1855,97 +1861,146 @@ class KisAPI:
                 logger.debug("[DAILY_RAW_JSON] %s TR=%s → %s", iscd, tr, data)
             except KisTemporaryError as e:
                 last_err = e
+                msg = str(e).lower()
+                if "timeout" in msg:
+                    last_cause = "timeout"
+                elif "connection" in msg:
+                    last_cause = "connection_error"
+                else:
+                    last_cause = "temporary_error"
                 logger.warning("[DAILY_TEMP_FAIL] %s TR=%s err=%s", iscd, tr, e)
                 continue
             except Exception as e:
                 last_err = e
+                msg = str(e).lower()
+                if "json" in msg:
+                    last_cause = "json_decode_fail"
+                else:
+                    last_cause = "request_exception"
                 logger.warning("[DAILY_FAIL] %s TR=%s err=%s", iscd, tr, e)
                 continue
 
-                arr = data.get("output2") or data.get("output1") or data.get("output")
+            if resp.status_code != 200:
+                last_cause = f"http_status_{resp.status_code}"
+                last_err = RuntimeError(f"http status {resp.status_code}")
+                logger.warning("[KIS][DAILY][FAIL] symbol=%s cause=%s", iscd, last_cause)
+                continue
 
-                if resp.status_code == 200 and arr:
-                    rows: List[Dict[str, Any]] = []
-                    for r in arr:
-                        try:
-                            d = r.get("stck_bsop_date")
-                            o = r.get("stck_oprc")
-                            h = r.get("stck_hgpr")
-                            l = r.get("stck_lwpr")
-                            c = r.get("stck_clpr")
-                            v = r.get("acml_vol") or r.get("stck_vol") or r.get("stck_trqu")
-                            vol_val = float(v) if v is not None else None
-                            val_val = float(r.get("stck_trqu")) if r.get("stck_trqu") else None
-                            if d and o is not None and h is not None and l is not None and c is not None:
-                                rows.append({
-                                    "date": d,
-                                    "open": float(o),
-                                    "high": float(h),
-                                    "low": float(l),
-                                    "close": float(c),
-                                    "volume": vol_val,
-                                    "value": val_val,
-                                })
-                        except Exception as e:
-                            logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+            if not isinstance(data, dict):
+                last_cause = "empty_body"
+                last_err = RuntimeError("empty body")
+                logger.warning("[KIS][DAILY][FAIL] symbol=%s cause=%s", iscd, last_cause)
+                continue
 
-                    rows.sort(key=lambda x: x["date"])
-
-                    if len(rows) == 0:
-                        raise DataEmptyError(f"A{iscd} 0 candles")
-                    if len(rows) < 21:
-                        raise DataShortError(f"A{iscd} {len(rows)} candles (<21)")
-
-                    # ---- (4) DB upsert ----
-                    try:
-                        engine = make_engine()
-                        with engine.connect() as conn:
-                            for row in rows:
-                                conn.execute(
-                                    sa.insert(PRICE_DAILY).values(
-                                        market=market,
-                                        code=iscd,
-                                        date=row["date"],
-                                        open=row["open"],
-                                        high=row["high"],
-                                        low=row["low"],
-                                        close=row["close"],
-                                        volume=row["volume"],
-                                        value=row["value"],
-                                        source="KIS"
-                                    ).on_conflict_do_update(
-                                        index_elements=["market", "code", "date"],
-                                        set_={
-                                            "open": sa.text("EXCLUDED.open"),
-                                            "high": sa.text("EXCLUDED.high"),
-                                            "low": sa.text("EXCLUDED.low"),
-                                            "close": sa.text("EXCLUDED.close"),
-                                            "volume": sa.text("EXCLUDED.volume"),
-                                            "value": sa.text("EXCLUDED.value"),
-                                            "source": sa.text("EXCLUDED.source"),
-                                        }
-                                    )
-                                )
-                            conn.commit()
-                            logger.debug("[DAILY_DB_UPSERT] %s rows=%d", iscd, len(rows))
-                    except Exception as e:
-                        logger.debug("[DAILY_DB_UPSERT_SKIP] %s err=%s", iscd, e)
-
-                    # Cache the full result
-                    self._daily_chart_cache[cache_key] = (rows, time.time())
-
-                    need = max(count, 21)
-                    return rows[-need:][-count:]
-
-                last_err = RuntimeError(
-                    f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')} arr=None"
+            rt_cd = data.get("rt_cd")
+            last_msg_cd = data.get("msg_cd")
+            last_msg1 = data.get("msg1")
+            if rt_cd is not None and str(rt_cd) != "0":
+                last_cause = "rt_cd_nonzero"
+                last_err = RuntimeError(f"rt_cd_nonzero:{rt_cd}")
+                logger.warning(
+                    "[KIS][DAILY][FAIL] symbol=%s cause=rt_cd_nonzero msg_cd=%s msg1=%s",
+                    iscd,
+                    last_msg_cd,
+                    last_msg1,
                 )
-                logger.warning("[DAILY_FAIL] A%s: %s | raw=%s", iscd, last_err, data)
-                time.sleep(0.35 + random.uniform(0, 0.15))
+                continue
+
+            arr = data.get("output2") or data.get("output1") or data.get("output")
+            if arr is None:
+                last_cause = "missing_output_field"
+                last_err = RuntimeError("missing output field")
+                logger.warning("[KIS][DAILY][FAIL] symbol=%s cause=%s", iscd, last_cause)
+                continue
+
+            rows: List[Dict[str, Any]] = []
+            for r in arr:
+                try:
+                    d = r.get("stck_bsop_date")
+                    o = r.get("stck_oprc")
+                    h = r.get("stck_hgpr")
+                    l = r.get("stck_lwpr")
+                    c = r.get("stck_clpr")
+                    v = r.get("acml_vol") or r.get("stck_vol") or r.get("stck_trqu")
+                    vol_val = float(v) if v is not None else None
+                    val_val = float(r.get("stck_trqu")) if r.get("stck_trqu") else None
+                    if d and o is not None and h is not None and l is not None and c is not None:
+                        rows.append({
+                            "date": d,
+                            "open": float(o),
+                            "high": float(h),
+                            "low": float(l),
+                            "close": float(c),
+                            "volume": vol_val,
+                            "value": val_val,
+                        })
+                except Exception as e:
+                    logger.debug("[DAILY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
+
+            rows.sort(key=lambda x: x["date"])
+
+            if len(rows) == 0:
+                last_cause = "empty_body"
+                last_err = DataEmptyError(f"A{iscd} 0 candles")
+                logger.warning("[KIS][DAILY][FAIL] symbol=%s cause=%s", iscd, last_cause)
+                continue
+            if len(rows) < 21:
+                last_cause = "insufficient_rows"
+                last_err = DataShortError(f"A{iscd} {len(rows)} candles (<21)")
+                logger.warning("[KIS][DAILY][FAIL] symbol=%s cause=%s", iscd, last_cause)
+                continue
+
+            # ---- (4) DB upsert ----
+            try:
+                engine = make_engine()
+                with engine.connect() as conn:
+                    for row in rows:
+                        conn.execute(
+                            sa.insert(PRICE_DAILY).values(
+                                market=market,
+                                code=iscd,
+                                date=row["date"],
+                                open=row["open"],
+                                high=row["high"],
+                                low=row["low"],
+                                close=row["close"],
+                                volume=row["volume"],
+                                value=row["value"],
+                                source="KIS"
+                            ).on_conflict_do_update(
+                                index_elements=["market", "code", "date"],
+                                set_={
+                                    "open": sa.text("EXCLUDED.open"),
+                                    "high": sa.text("EXCLUDED.high"),
+                                    "low": sa.text("EXCLUDED.low"),
+                                    "close": sa.text("EXCLUDED.close"),
+                                    "volume": sa.text("EXCLUDED.volume"),
+                                    "value": sa.text("EXCLUDED.value"),
+                                    "source": sa.text("EXCLUDED.source"),
+                                }
+                            )
+                        )
+                    conn.commit()
+                    logger.debug("[DAILY_DB_UPSERT] %s rows=%d", iscd, len(rows))
+            except Exception as e:
+                logger.debug("[DAILY_DB_UPSERT_SKIP] %s err=%s", iscd, e)
+
+            # Cache the full result
+            self._daily_chart_cache[cache_key] = (rows, time.time())
+
+            need = max(count, 21)
+            return rows[-need:][-count:]
 
         if last_err:
-            logger.warning("[DAILY_FAIL] A%s: %s", iscd, last_err)
-        raise NetTemporaryError(f"DAILY A{iscd} net fail")
+            logger.warning(
+                "[KIS][DAILY][FAIL] symbol=%s cause=%s msg_cd=%s msg1=%s err=%s",
+                iscd,
+                last_cause,
+                last_msg_cd,
+                last_msg1,
+                last_err,
+            )
+        raise NetTemporaryError(f"DAILY_FAIL:{last_cause}")
 
     def inquire_investor(self, code: str, market: str = "KOSDAQ") -> dict:
         """주체수급 조회(inquire-investor) — 실패 시에도 예외를 던지지 않는다."""

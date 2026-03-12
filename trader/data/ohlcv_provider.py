@@ -58,11 +58,16 @@ class KISOHLCVProvider:
             return cached
 
         # DB 우선 조회
+        db_df_norm = pd.DataFrame()
+        db_meta: dict = {}
+        db_ready = False
+        db_rows = 0
         try:
             engine = make_engine()
             end_date = now_kst().date()
             start_date = end_date - timedelta(days=max(days, 260))
             candles = load_price_daily(engine, symbol, start_date, end_date)
+            db_rows = len(candles)
             if len(candles) >= days:
                 df = pd.DataFrame(candles)
                 raw_keys = list(df.columns)
@@ -73,15 +78,26 @@ class KISOHLCVProvider:
                     "source": "db",
                     "raw_keys": raw_keys,
                     "rows": len(df_norm),
+                    "stale_ok": True,
+                    "refresh_failed": False,
                 })
-                result = OHLCVResult(df_norm, meta)
-                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
-                logger.info("[OHLCV][DB][HIT] symbol=%s days=%d rows=%d", symbol, days, len(df_norm))
-                return result
+                db_df_norm = df_norm
+                db_meta = meta
+                db_ready = True
             else:
                 logger.debug("[OHLCV][DB][MISS] symbol=%s days=%d db_rows=%d", symbol, days, len(candles))
         except Exception as exc:
             logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
+
+        skip_refresh_trade = (
+            os.getenv("TRADE_SKIP_KIS_DAILY_REFRESH", "1") == "1"
+            and (os.getenv("MODE") or "").strip().lower() == "trade"
+        )
+        if db_ready and skip_refresh_trade:
+            result = OHLCVResult(db_df_norm, {**db_meta, "source": "db", "stale_ok": True, "refresh_failed": False})
+            daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+            logger.info("[OHLCV][DB][HIT] symbol=%s days=%d rows=%d", symbol, days, len(db_df_norm))
+            return result
 
         # ====================================================================
         # [PREFETCH_ONLY] 장중 외부 OHLCV 호출 차단
@@ -124,11 +140,32 @@ class KISOHLCVProvider:
         fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 260)
         if not fallback_allowed:
             logger.warning("[OHLCV][DB][NO_FALLBACK] symbol=%s days=%d", symbol, days)
+            if db_ready:
+                result = OHLCVResult(db_df_norm, {**db_meta, "source": "db", "stale_ok": True, "refresh_failed": True, "refresh_fail_reason": "no_fallback"})
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                return result
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "db", "error": "no_fallback", "volume_missing": True})
 
         gate = get_kis_gate()
         if not gate.allow("inquire-daily"):
             logger.warning("[OHLCV][KIS][GATE_BLOCKED] symbol=%s", symbol)
+            if db_ready:
+                logger.warning(
+                    "[OHLCV][KIS][REFRESH_FAIL_SOFT] symbol=%s cause=gate_blocked using_db_cache=1 db_rows=%s",
+                    symbol,
+                    len(db_df_norm),
+                )
+                return OHLCVResult(
+                    db_df_norm,
+                    {
+                        **db_meta,
+                        "source": "db",
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": "gate_blocked",
+                    },
+                )
+            logger.error("[OHLCV][KIS][REFRESH_FAIL_HARD] symbol=%s cause=gate_blocked db_rows=%s", symbol, db_rows)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "gate_blocked", "volume_missing": True})
 
         try:
@@ -144,9 +181,46 @@ class KISOHLCVProvider:
                     logger.debug("[OHLCV][DB][UPSERT_FAIL] symbol=%s err=%s", symbol, exc)
         except Exception as exc:
             self._warn_once(f"fail:{symbol}", "[OHLCV][KIS][FAIL] symbol=%s err=%s", symbol, exc)
+            if db_ready:
+                logger.warning(
+                    "[OHLCV][KIS][REFRESH_FAIL_SOFT] symbol=%s cause=%s using_db_cache=1 db_rows=%s",
+                    symbol,
+                    str(exc),
+                    len(db_df_norm),
+                )
+                result = OHLCVResult(
+                    db_df_norm,
+                    {
+                        **db_meta,
+                        "source": "db",
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": str(exc),
+                    },
+                )
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                return result
+            logger.error("[OHLCV][KIS][REFRESH_FAIL_HARD] symbol=%s cause=%s db_rows=%s", symbol, str(exc), db_rows)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": str(exc), "volume_missing": True})
 
         if not candles:
+            if db_ready:
+                logger.warning(
+                    "[OHLCV][KIS][REFRESH_FAIL_SOFT] symbol=%s cause=empty using_db_cache=1 db_rows=%s",
+                    symbol,
+                    len(db_df_norm),
+                )
+                return OHLCVResult(
+                    db_df_norm,
+                    {
+                        **db_meta,
+                        "source": "db",
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": "empty",
+                    },
+                )
+            logger.error("[OHLCV][KIS][REFRESH_FAIL_HARD] symbol=%s cause=empty db_rows=%s", symbol, db_rows)
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "empty", "volume_missing": True})
 
         df = pd.DataFrame(candles)
@@ -156,9 +230,11 @@ class KISOHLCVProvider:
         meta.update(
             {
                 "provider": self.name,
-                "source": "kis",
+                "source": "db+refresh" if db_ready else "kis",
                 "raw_keys": raw_keys,
                 "rows": len(df_norm),
+                "stale_ok": False,
+                "refresh_failed": False,
             }
         )
         result = OHLCVResult(df_norm, meta)

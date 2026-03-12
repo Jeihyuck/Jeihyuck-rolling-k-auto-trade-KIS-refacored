@@ -11,7 +11,10 @@ import copy
 from collections import Counter
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -94,6 +97,143 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 
 logger = logging.getLogger(__name__)
 log = logger
+
+REQUIRED_SCORED_FINAL30_COLS = [
+    "code",
+    "score_final",
+    "tech_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "rs_percentile",
+    "vcp_score",
+    "entry_style_selected",
+]
+
+
+def _missing_scored_cols(columns: list[str]) -> list[str]:
+    cols = {str(c) for c in (columns or [])}
+    return [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in cols]
+
+
+def _load_json_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return [dict(x) for x in items if isinstance(x, dict)]
+        return []
+    if isinstance(payload, list):
+        return [dict(x) for x in payload if isinstance(x, dict)]
+    return []
+
+
+def load_trade_final30_scored(
+    *,
+    engine,
+    env: str,
+    as_of: str,
+) -> dict[str, Any]:
+    env_n = (env or "").strip().lower()
+    as_of_s = str(as_of)
+    checked: list[str] = []
+    attempts: list[tuple[str, list[dict[str, Any]], str, bool]] = []
+
+    file_candidates = [
+        (
+            "ledger_final30_scored",
+            Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+        ),
+        (
+            "runtime_final30_scored",
+            Path("runtime") / "watchlist" / as_of_s / "final30_scored.json",
+        ),
+        (
+            "signals_final30",
+            Path("signals") / "final30.json",
+        ),
+    ]
+
+    for source_name, path in file_candidates:
+        checked.append(str(path))
+        rows = _load_json_rows(path)
+        if not rows:
+            continue
+        attempts.append((source_name, rows, as_of_s, False))
+
+    watchlist_repo = WatchlistRepo(engine)
+    as_of_date = datetime.strptime(as_of_s, "%Y-%m-%d").date()
+    scored_rows, used_as_of = watchlist_repo.load_watchlist(
+        env=env_n,
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of_date,
+        allow_latest_fallback=True,
+        ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
+        max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
+    )
+    checked.append("db:pb1_watchlist_final_scored")
+    if scored_rows:
+        attempts.append(("db_pb1_watchlist_final_scored", scored_rows, (used_as_of or as_of_date).isoformat(), False))
+
+    allow_plain_fallback = (os.getenv("TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK", "0") == "1")
+    checked.append("db:pb1_watchlist_final")
+    if allow_plain_fallback:
+        plain_rows, plain_as_of = watchlist_repo.load_watchlist(
+            env=env_n,
+            strategy="pb1_watchlist_final",
+            as_of=as_of_date,
+            allow_latest_fallback=True,
+            ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
+            max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
+        )
+        if plain_rows:
+            attempts.append(("db_pb1_watchlist_final", plain_rows, (plain_as_of or as_of_date).isoformat(), True))
+
+    logger.info("[TRADE][FINAL30][LOAD_ATTEMPT] checked=%s", checked)
+
+    for source_name, rows, used_as_of, used_fallback in attempts:
+        df = pd.DataFrame(rows)
+        columns = [str(c) for c in df.columns.tolist()]
+        missing = _missing_scored_cols(columns)
+        is_scored = len(missing) < 3
+        if not is_scored:
+            logger.warning(
+                "[TRADE][FINAL30][LOAD_REJECT] source=%s missing_scored_cols=%s",
+                source_name,
+                missing,
+            )
+            if not used_fallback:
+                continue
+        logger.info(
+            "[TRADE][FINAL30][LOAD] source=%s rows=%s is_scored=%s cols=%s",
+            source_name,
+            len(df),
+            int(is_scored),
+            columns,
+        )
+        return {
+            "df": df,
+            "source_name": source_name,
+            "as_of": used_as_of,
+            "columns": columns,
+            "is_scored": bool(is_scored),
+            "used_fallback": bool(used_fallback),
+        }
+
+    logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
+    return {
+        "df": pd.DataFrame(),
+        "source_name": "none",
+        "as_of": as_of_s,
+        "columns": [],
+        "is_scored": False,
+        "used_fallback": False,
+    }
 
 
 def check_prep_done() -> bool:
@@ -741,45 +881,47 @@ def _load_universe_context(
 ) -> UniverseContext:
     mode_input = (os.getenv("MODE") or "").strip().lower()
     if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
-        watchlist_repo = WatchlistRepo(engine)
-        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
-        ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
-        max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
-        requested_as_of = datetime.strptime(as_of, "%Y-%m-%d").date()
-        rows, used_as_of = watchlist_repo.load_watchlist(
-            env=env,
-            strategy=watchlist_strategy,
-            as_of=requested_as_of,
-            allow_latest_fallback=True,
-            ttl_days=ttl_days,
-            max_back_days=max_back_days,
-        )
-
-        if not rows or used_as_of is None:
+        result = load_trade_final30_scored(engine=engine, env=env, as_of=as_of)
+        df = result.get("df")
+        if df is None or df.empty:
             raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
 
-        age_days = (requested_as_of - used_as_of).days
-        if age_days > ttl_days:
-            raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
-        if len(rows) != 30:
-            raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(rows)}")
+        require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
+        if require_scored and not bool(result.get("is_scored")):
+            raise RuntimeError("WATCHLIST_FINAL_SCORED_REQUIRED")
 
-        members = [{"code": str(r.get("code") or "").zfill(6)} for r in rows if r.get("code")]
+        if "rank_final30" in df.columns:
+            df = df.sort_values(by=["rank_final30", "code"], ascending=[True, True], kind="mergesort")
+        elif "score_final" in df.columns:
+            df = df.sort_values(by=["score_final", "code"], ascending=[False, True], kind="mergesort")
+        else:
+            df = df.sort_values(by=["code"], ascending=[True], kind="mergesort")
+
+        members = [dict(row) for row in df.to_dict(orient="records") if row.get("code")]
+        for member in members:
+            member["code"] = str(member.get("code") or "").zfill(6)
+
         top10_codes = [m.get("code") for m in members[:10] if m.get("code")]
         logger.info(
             "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
             (env or "").strip().lower(),
-            watchlist_strategy,
-            requested_as_of.isoformat(),
-            used_as_of.isoformat(),
+            result.get("source_name"),
+            as_of,
+            result.get("as_of"),
             len(members),
         )
         logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
         return UniverseContext(
-            as_of_date=used_as_of.isoformat(),
+            as_of_date=str(result.get("as_of") or as_of),
             members=members,
             selected_path=None,
-            meta={"source": "watchlist_final", "as_of": used_as_of.isoformat()},
+            meta={
+                "source": result.get("source_name"),
+                "as_of": str(result.get("as_of") or as_of),
+                "is_scored": bool(result.get("is_scored")),
+                "columns": list(result.get("columns") or []),
+                "used_fallback": bool(result.get("used_fallback")),
+            },
             is_empty=len(members) == 0,
         )
 
@@ -1671,6 +1813,19 @@ def run_once(
 
     window_label = _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
+
+    if (
+        phase_for_log == "entry"
+        and window is not None
+        and window.name == "morning"
+        and window.phase != "entry"
+    ):
+        logger.error("[PB1][WINDOW_MISMATCH] expected_phase=entry actual_phase=%s", window.phase)
+        if hasattr(window, "_replace"):
+            window = window._replace(phase="entry")
+        else:
+            window = WindowDecision(name="morning", phase="entry")
+
     context_reasons = [r for r in context_reasons if not r.startswith("window:") and not r.startswith("phase:")]
     context_reasons.append(f"window:{window_label}")
     context_reasons.append(f"phase:{phase_for_log}")
@@ -2884,35 +3039,34 @@ def main() -> int:
         def _ensure_watchlist_for_guard(requested_as_of):
             nonlocal watchlist_loaded_for_guard
             watchlist_engine = make_engine()
-            watchlist_repo = WatchlistRepo(watchlist_engine)
-            watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
-            ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
-            max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
             watchlist_env = resolve_env(args.env)
-            watchlist_rows, watchlist_as_of = watchlist_repo.load_watchlist(
+            result = load_trade_final30_scored(
+                engine=watchlist_engine,
                 env=watchlist_env,
-                strategy=watchlist_strategy,
-                as_of=requested_as_of,
-                allow_latest_fallback=True,
-                ttl_days=ttl_days,
-                max_back_days=max_back_days,
+                as_of=requested_as_of.isoformat(),
             )
-            if not watchlist_rows or watchlist_as_of is None or len(watchlist_rows) != 30:
+            df = result.get("df")
+            if df is None or df.empty:
                 raise RuntimeError(
-                    f"[TRADE][WATCHLIST_FINAL] missing_or_bad n={len(watchlist_rows) if watchlist_rows else 0} as_of_try={requested_as_of.isoformat()}"
+                    f"[TRADE][WATCHLIST_FINAL] missing_or_bad n=0 as_of_try={requested_as_of.isoformat()}"
                 )
+            require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
+            if require_scored and not bool(result.get("is_scored")):
+                raise RuntimeError("[TRADE][WATCHLIST_FINAL] scored_required_but_missing")
+
             watchlist_loaded_for_guard = True
-            top10_codes = [str(item.get("code") or "").zfill(6) for item in watchlist_rows[:10] if item.get("code")]
+            rows = [dict(x) for x in df.to_dict(orient="records")]
+            top10_codes = [str(item.get("code") or "").zfill(6) for item in rows[:10] if item.get("code")]
             logger.info(
                 "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
                 watchlist_env,
-                watchlist_strategy,
+                result.get("source_name"),
                 requested_as_of.isoformat(),
-                watchlist_as_of.isoformat(),
-                len(watchlist_rows),
+                str(result.get("as_of") or requested_as_of.isoformat()),
+                len(rows),
             )
             logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
-            return watchlist_as_of
+            return datetime.strptime(str(result.get("as_of") or requested_as_of.isoformat()), "%Y-%m-%d").date()
 
         if as_of_override_raw:
             derived_as_of = _parse_as_of_override(as_of_override_raw)
@@ -3059,20 +3213,22 @@ def main() -> int:
                 derived_count,
             )
         
-        # ✅ DIAGNOSTIC: final30_snapshot 존재 여부 체크
-        from trader.final_list_store import load_final30
-        final30_codes = load_final30(env=derived_env, as_of=derived_as_of.isoformat())
-        if final30_codes:
+        # ✅ DIAGNOSTIC: canonical scored final30 존재 여부 체크
+        final30_result = load_trade_final30_scored(
+            engine=engine,
+            env=derived_env,
+            as_of=derived_as_of.isoformat(),
+        )
+        final30_df = final30_result.get("df")
+        if final30_df is not None and not final30_df.empty:
             logger.info(
                 "[TRADE_TICK][FINAL30_SNAPSHOT][OK] derived_as_of=%s count=%d",
                 derived_as_of.isoformat(),
-                len(final30_codes),
+                len(final30_df),
             )
         else:
-            logger.warning(
-                "[TRADE_TICK][FINAL30_SNAPSHOT][MISSING] derived_as_of=%s -> will use watchlist_final fallback",
-                derived_as_of.isoformat(),
-            )
+            logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
+            return 0
         
         watchlist_repo = WatchlistRepo(engine)
         watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()

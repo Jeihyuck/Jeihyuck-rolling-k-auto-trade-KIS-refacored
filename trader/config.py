@@ -238,6 +238,13 @@ CONFIG = {
     "KIS_RATE_LIMIT_COOLDOWN_SEC": "8",
     "PRICE_SNAPSHOT_TTL_SEC": "2",
     "DAILY_BAR_TTL_SEC": "1800",
+    "TRADE_REQUIRE_PREP_FINAL30_SCORED": "1",
+    "TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK": "0",
+    "TRADE_SKIP_KIS_DAILY_REFRESH": "1",
+    "ALLOW_TRADE_WITH_MISSING_SCORED_COLUMNS": "0",
+    "ENTRY_SCAN_SAVE_DEBUG": "1",
+    "ENTRY_SCAN_LOG_TOP_REJECTS": "10",
+    "TRADE_FORCE_MIN1_DIAG": "1",
     # Candidate Pool (주말 후보군 생성/주중 후보군 기반 진입)
     "CANDIDATE_POOL_ENABLED": "1",                    # 후보군 시스템 활성화
     "CANDIDATE_POOL_TTL_DAYS": "7",                   # 후보군 유효기간(일)

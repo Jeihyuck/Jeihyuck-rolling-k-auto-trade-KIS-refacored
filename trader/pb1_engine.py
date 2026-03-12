@@ -174,6 +174,18 @@ from trader.strategies.pb1_pullback_close import (
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_SCORED_FINAL30_COLS = [
+    "code",
+    "score_final",
+    "tech_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "rs_percentile",
+    "vcp_score",
+    "entry_style_selected",
+]
+
 # Minervini feature calc requires MA200 slope + VCP; force long window.
 MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
 MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
@@ -682,6 +694,20 @@ class PB1Engine:
         self._debug_sizing_ok_codes: list[str] = []
         self._debug_sizing_fail_items: list[dict[str, Any]] = []
         self._debug_summary: dict[str, Any] = {}
+
+        if (
+            self.phase == "entry"
+            and getattr(self.window, "name", "") == "morning"
+            and getattr(self.window, "phase", "") != "entry"
+        ):
+            logger.error(
+                "[PB1][WINDOW_MISMATCH] expected_phase=entry actual_phase=%s",
+                getattr(self.window, "phase", ""),
+            )
+            if hasattr(self.window, "_replace"):
+                self.window = self.window._replace(phase="entry")
+            else:
+                self.window = WindowDecision(name="morning", phase="entry")
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -4888,6 +4914,32 @@ class PB1Engine:
             normalized.append(item)
         return normalized, sorted(missing_cols)
 
+    @staticmethod
+    def _scored_missing_cols(columns: list[str]) -> list[str]:
+        colset = {str(c) for c in (columns or [])}
+        return [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in colset]
+
+    def _write_final30_input_reject_debug(
+        self,
+        *,
+        source: str,
+        as_of: str,
+        rows: int,
+        columns: list[str],
+        missing_scored_cols: list[str],
+    ) -> None:
+        diag_dir = Path("runtime") / "diagnostics" / str(self._today)
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        path = diag_dir / "final30_input_reject.json"
+        payload = {
+            "source": source,
+            "as_of": as_of,
+            "rows": int(rows),
+            "columns": list(columns or []),
+            "missing_scored_cols": list(missing_scored_cols or []),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _load_entry_final30_or_abort(self, as_of: str) -> list[str]:
         """
         ✅ FIX B-ENTRY: final30 로드 (없으면 watchlist_final_locked로 대체)
@@ -4897,25 +4949,45 @@ class PB1Engine:
         Raises:
             SystemExit(2) if both final30 and watchlist_final unavailable
         """
+        require_scored = (os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1")
+        allow_missing_scored = (os.getenv("ALLOW_TRADE_WITH_MISSING_SCORED_COLUMNS", "0") == "1")
+
+        if self._universe_context and self._universe_context.members:
+            rows = [dict(x or {}) for x in (self._universe_context.members or [])]
+            source = str((self._universe_context.meta or {}).get("source") or "universe_context")
+            cols = sorted({str(k) for r in rows for k in r.keys()})
+            missing_cols = self._scored_missing_cols(cols)
+            usable = (not missing_cols) or (not require_scored) or allow_missing_scored
+            logger.info("[FINAL30][INPUT_CHECK] source=%s usable=%s missing=%s", source, int(usable), missing_cols)
+            if not usable:
+                logger.error(
+                    "[PB1][ENTRY][INPUT_REJECT] source=%s missing_scored_cols=%s require_scored=1",
+                    source,
+                    missing_cols,
+                )
+                self._write_final30_input_reject_debug(
+                    source=source,
+                    as_of=as_of,
+                    rows=len(rows),
+                    columns=cols,
+                    missing_scored_cols=missing_cols,
+                )
+                raise SystemExit(2)
+
+            order_rows = list(rows)
+            has_rank = all("rank_final30" in x for x in order_rows)
+            if has_rank:
+                order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))
+            elif any("score_final" in x for x in order_rows):
+                order_rows.sort(key=lambda x: (-float(x.get("score_final") or 0.0), str(x.get("code") or "")))
+            else:
+                order_rows.sort(key=lambda x: str(x.get("code") or ""))
+            return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
+
         final30_codes = load_final30(self.env, as_of) or []
-        if final30_codes:
+        if final30_codes and not require_scored:
             logger.info("[FINAL30][LOAD] as_of=%s count=%s source=final30_snapshot", as_of, len(final30_codes))
             return final30_codes
-        
-        # ✅ final30 스냅샷 없으면 watchlist_final(universe_context)로 대체
-        if self._universe_context and self._universe_context.members:
-            normalized_rows, missing_cols = self._normalize_final30_rows(self._universe_context.members)
-            if missing_cols:
-                logger.warning("[FINAL30][FALLBACK][NORMALIZE] missing_cols=%s", missing_cols)
-            fallback_codes = [m.get("code") for m in normalized_rows if m.get("code")]
-            fallback_source = self._universe_context.meta.get("source", "unknown") if self._universe_context.meta else "unknown"
-            logger.warning(
-                "[PB1][ENTRY][FINAL30_FALLBACK] as_of=%s final30_snapshot_missing -> using watchlist source=%s count=%s",
-                as_of,
-                fallback_source,
-                len(fallback_codes),
-            )
-            return fallback_codes
         
         # 둘 다 없으면 abort
         logger.error(
@@ -5909,7 +5981,33 @@ class PB1Engine:
                 for m in universe_members
                 if m.get("code")
             }
-            scan_members = [{"code": c, "market": code_market.get(c, "")} for c in final30_codes]
+            source_meta = (self._universe_context.meta or {}) if self._universe_context else {}
+            source_name = str(source_meta.get("source") or "final30")
+            scored_rows = list(self._universe_context.members or []) if self._universe_context else []
+            has_rank_final30 = int(any("rank_final30" in (row or {}) for row in scored_rows))
+            canonical_codes = list(final30_codes)
+            if scored_rows:
+                if has_rank_final30:
+                    scored_rows = sorted(
+                        scored_rows,
+                        key=lambda x: (float((x or {}).get("rank_final30") or 999999), str((x or {}).get("code") or "")),
+                    )
+                elif any("score_final" in (row or {}) for row in scored_rows):
+                    scored_rows = sorted(
+                        scored_rows,
+                        key=lambda x: (-float((x or {}).get("score_final") or 0.0), str((x or {}).get("code") or "")),
+                    )
+                else:
+                    scored_rows = sorted(scored_rows, key=lambda x: str((x or {}).get("code") or ""))
+                canonical_codes = [str((row or {}).get("code") or "").zfill(6) for row in scored_rows if (row or {}).get("code")]
+            canonical_order_match = int(list(final30_codes) == list(canonical_codes))
+            logger.info(
+                "[ENTRY][SCAN_INPUT][ORDER] source=%s has_rank_final30=%s canonical_order_match=%s",
+                source_name,
+                has_rank_final30,
+                canonical_order_match,
+            )
+            scan_members = [{"code": c, "market": code_market.get(c, "")} for c in canonical_codes]
             scan_source = "final30"
         else:
             scan_members, scan_source = self._resolve_scan_members_for_entry(
@@ -6880,6 +6978,19 @@ class PB1Engine:
             relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
             relax_debug_payload["sizing_ok_codes"] = list(self._debug_sizing_ok_codes)
             relax_debug_payload["sizing_fail_items"] = list(self._debug_sizing_fail_items)
+
+            if not orderable_candidates and (os.getenv("TRADE_FORCE_MIN1_DIAG", "1") == "1"):
+                near_miss = sorted(
+                    [cf for cf in candidates if cf.code],
+                    key=lambda x: (len(list(set(x.reasons or []))), -float(x.features.get("score") or 0.0), x.code),
+                )[:3]
+                near_miss_payload: list[dict[str, Any]] = []
+                for cf in near_miss:
+                    miss = sorted(set(cf.reasons or []))
+                    near_miss_payload.append({"code": cf.code, "missing": miss})
+                    logger.info("[ENTRY_SCAN][NEAR_MISS] code=%s missing=%s", cf.code, miss)
+                relax_debug_payload["near_miss_candidates"] = near_miss_payload
+
             _write_relax_debug_report(relax_debug_payload)
             
             # [ENTRY][NO_BUY] 후보가 0일 때 이유 출력

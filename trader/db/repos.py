@@ -56,6 +56,7 @@ __all__ = [
     "load_watchlist",
     "save_pb1_watchlist_rows",
     "load_pb1_watchlist_codes",
+    "load_watchlist_scored",
 ]
 
 
@@ -2497,7 +2498,33 @@ class WatchlistRepo:
             }
             for row in rows
         ]
+        logger.info(
+            "[WATCHLIST][LOAD] strategy=%s members=%s",
+            strategy_n,
+            len(result),
+        )
         return result, used_as_of
+
+    def load_watchlist_scored(
+        self,
+        *,
+        env: str,
+        strategy: str = "pb1_watchlist_final_scored",
+        as_of: date | str,
+        allow_latest_fallback: bool = True,
+        ttl_days: int = 7,
+        max_back_days: int = 3,
+    ) -> tuple[List[Dict[str, Any]], date | None]:
+        rows, used_as_of = self.load_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            allow_latest_fallback=allow_latest_fallback,
+            ttl_days=ttl_days,
+            max_back_days=max_back_days,
+        )
+        logger.info("[WATCHLIST][LOAD] strategy=%s members=%s", _norm_strategy(strategy), len(rows))
+        return rows, used_as_of
     
     def get_latest_watchlist_date(
         self,
@@ -2521,6 +2548,27 @@ class WatchlistRepo:
             )
             result = conn.execute(stmt).scalar()
         return result
+
+
+def load_watchlist_scored(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date | str,
+    allow_latest_fallback: bool = True,
+    ttl_days: int = 7,
+    max_back_days: int = 3,
+) -> tuple[List[Dict[str, Any]], date | None]:
+    repo = WatchlistRepo(engine)
+    return repo.load_watchlist_scored(
+        env=env,
+        strategy=strategy,
+        as_of=as_of,
+        allow_latest_fallback=allow_latest_fallback,
+        ttl_days=ttl_days,
+        max_back_days=max_back_days,
+    )
 
 
 # ========================================

@@ -51,6 +51,23 @@ from trader.universe.build import build_universe
 
 logger = logging.getLogger(__name__)
 
+FINAL30_SCORED_EXPORT_COLS = [
+    "code",
+    "name",
+    "rank_final30",
+    "score_final",
+    "tech_score",
+    "flow_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "rs_percentile",
+    "vcp_score",
+    "atr_pct",
+    "pullback_pct",
+    "entry_style_selected",
+]
+
 def _env_true(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -273,6 +290,68 @@ def _as_dataframe(value: Any) -> pd.DataFrame:
     if isinstance(value, dict):
         return pd.DataFrame([value])
     return pd.DataFrame()
+
+
+def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(df.to_dict(orient="records"), start=1):
+        code = str(row.get("code") or "").zfill(6)
+        if not code:
+            continue
+        score_final = row.get("score_final")
+        rows.append(
+            {
+                "code": code,
+                "rank": int(row.get("rank_final30") or idx),
+                "score": float(score_final) if score_final is not None else None,
+                "meta": {
+                    "name": row.get("name"),
+                    "rank_final30": row.get("rank_final30"),
+                    "score_final": row.get("score_final"),
+                    "tech_score": row.get("tech_score"),
+                    "flow_score": row.get("flow_score"),
+                    "breakout_score": row.get("breakout_score"),
+                    "pullback_score": row.get("pullback_score"),
+                    "momentum_score": row.get("momentum_score"),
+                    "rs_percentile": row.get("rs_percentile"),
+                    "vcp_score": row.get("vcp_score"),
+                    "atr_pct": row.get("atr_pct"),
+                    "pullback_pct": row.get("pullback_pct"),
+                    "entry_style_selected": row.get("entry_style_selected"),
+                },
+            }
+        )
+    return rows
+
+
+def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFrame) -> None:
+    payload_df = (df.copy() if df is not None else pd.DataFrame())
+    for col in FINAL30_SCORED_EXPORT_COLS:
+        if col not in payload_df.columns:
+            payload_df[col] = None
+    payload_df = payload_df[FINAL30_SCORED_EXPORT_COLS]
+    payload_df["code"] = payload_df["code"].astype(str).str.zfill(6)
+    payload = payload_df.to_dict(orient="records")
+
+    target_paths = [
+        Path("runtime") / "watchlist" / as_of / "final30_scored.json",
+        Path("bot_state") / "trader_ledger" / "final30" / env / as_of / "final30_scored.json",
+    ]
+    for path in target_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[PREP][FINAL30_SCORED][SAVE] path=%s rows=%s", path, len(payload))
+
+    logger.info(
+        "[PREP][FINAL30_SCORED][FIELDS] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",
+        int("score_final" in payload_df.columns),
+        int("tech_score" in payload_df.columns),
+        int("breakout_score" in payload_df.columns),
+        int("pullback_score" in payload_df.columns),
+        int("momentum_score" in payload_df.columns),
+    )
 
 
 def _is_scored_final30_df(df: pd.DataFrame) -> bool:
@@ -1220,6 +1299,23 @@ def main() -> int:
         )
     except RuntimeError:
         raise RuntimeError("final30_scored_source_missing")
+
+    scored_strategy = "pb1_watchlist_final_scored"
+    scored_members = _build_scored_members(final30_scored_df_for_export)
+    if scored_members:
+        watchlist_repo.save_watchlist(
+            env=env,
+            strategy=scored_strategy,
+            as_of=as_of,
+            members=scored_members,
+        )
+        logger.info("[WATCHLIST][SAVE] strategy=%s members=%s", scored_strategy, len(scored_members))
+
+    _write_canonical_final30_scored_files(
+        env=env,
+        as_of=as_of.isoformat(),
+        df=final30_scored_df_for_export,
+    )
 
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),
