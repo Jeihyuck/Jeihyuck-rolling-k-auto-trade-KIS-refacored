@@ -160,15 +160,26 @@ def load_trade_final30_scored(
     ]
 
     for source_name, path in file_candidates:
+        abs_path = path.resolve()
+        exists = path.exists()
         checked.append(str(path))
+        logger.info("[TRADE][FINAL30][FILE_CHECK] path=%s exists=%s", abs_path, int(exists))
         rows = _load_json_rows(path)
         if not rows:
             continue
+        file_df = pd.DataFrame(rows)
+        file_cols = [str(c) for c in file_df.columns.tolist()]
+        logger.info(
+            "[TRADE][FINAL30][FILE_LOAD] path=%s rows=%s cols=%s",
+            abs_path,
+            len(file_df),
+            file_cols,
+        )
         attempts.append((source_name, rows, as_of_s, False))
 
     watchlist_repo = WatchlistRepo(engine)
     as_of_date = datetime.strptime(as_of_s, "%Y-%m-%d").date()
-    scored_rows, used_as_of = watchlist_repo.load_watchlist(
+    scored_rows, used_as_of = watchlist_repo.load_watchlist_scored(
         env=env_n,
         strategy="pb1_watchlist_final_scored",
         as_of=as_of_date,
@@ -203,8 +214,10 @@ def load_trade_final30_scored(
         is_scored = len(missing) < 3
         if not is_scored:
             logger.warning(
-                "[TRADE][FINAL30][LOAD_REJECT] source=%s missing_scored_cols=%s",
+                "[TRADE][FINAL30][LOAD_REJECT] source=%s rows=%s cols=%s missing_scored_cols=%s",
                 source_name,
+                len(df),
+                columns,
                 missing,
             )
             if not used_fallback:

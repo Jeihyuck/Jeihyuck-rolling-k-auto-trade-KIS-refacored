@@ -17,7 +17,13 @@ import pandas as pd
 from sqlalchemy import Engine
 
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
-from trader.db.repos import DerivedFlowRepo, DerivedMinerviniRepo, WatchlistRepo
+from trader.db.repos import (
+    CRITICAL_SCORED_COLS,
+    REQUIRED_FINAL30_SCORED_COLS,
+    DerivedFlowRepo,
+    DerivedMinerviniRepo,
+    WatchlistRepo,
+)
 from trader.flow_score import calculate_final_score, calculate_flow_score
 from trader.factors.multifactor import (
     compute_ai_rs_scores,
@@ -102,9 +108,18 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    raw_keys = set()
+    for row in rows or []:
+        raw_keys.update((row or {}).keys())
+    if rows and any(col not in raw_keys for col in CRITICAL_SCORED_COLS):
+        missing = [col for col in CRITICAL_SCORED_COLS if col not in raw_keys]
+        logger.warning("[WATCHLIST][FINAL30_SCORED][MISSING_CRITICAL] missing_cols=%s", missing)
+
     saved_rows: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows or [], start=1):
         item = dict(row or {})
+        for col in REQUIRED_FINAL30_SCORED_COLS:
+            item.setdefault(col, None)
         score = item.get("score")
         if score is None:
             score = item.get("score_final")
@@ -114,14 +129,12 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
             score_val = float(score or 0.0)
         except Exception:
             score_val = 0.0
-        saved_rows.append(
-            {
-                "code": str(item.get("code") or "").zfill(6),
-                "meta": item.get("meta", {}),
-                "rank": int(item.get("rank") or idx),
-                "score": score_val,
-            }
-        )
+        normalized = {col: item.get(col) for col in REQUIRED_FINAL30_SCORED_COLS}
+        normalized["code"] = str(item.get("code") or "").zfill(6)
+        normalized["rank"] = int(item.get("rank") or item.get("rank_final30") or idx)
+        normalized["score"] = score_val
+        normalized["meta"] = item.get("meta", {})
+        saved_rows.append({**normalized, "rank": normalized["rank"], "score": normalized["score"]})
     return saved_rows
 
 

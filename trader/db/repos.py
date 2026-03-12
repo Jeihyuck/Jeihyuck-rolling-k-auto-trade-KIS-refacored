@@ -57,6 +57,67 @@ __all__ = [
     "save_pb1_watchlist_rows",
     "load_pb1_watchlist_codes",
     "load_watchlist_scored",
+    "REQUIRED_FINAL30_SCORED_COLS",
+    "CRITICAL_SCORED_COLS",
+]
+
+
+REQUIRED_FINAL30_SCORED_COLS = [
+    "as_of",
+    "code",
+    "name",
+    "rank",
+    "rank_pool120",
+    "rank_top50",
+    "rank_final30",
+    "score",
+    "score_final",
+    "score_flow",
+    "score_liq",
+    "score_tech",
+    "tech_score",
+    "flow_score",
+    "final_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "entry_style_selected",
+    "entry_component",
+    "rs_pctile",
+    "rs_percentile",
+    "rs_score",
+    "vcp_score",
+    "trend_score",
+    "atr_pct",
+    "pullback_pct",
+    "foreign_20_ratio",
+    "inst_20_ratio",
+    "liq_avg",
+    "last_close",
+    "close",
+    "volume",
+    "volume_avg20",
+    "ma20",
+    "ma50",
+    "ma150",
+    "rows",
+    "meta",
+    "scores",
+    "reasons",
+    "reject_reasons",
+    "filters_passed",
+    "filters_failed",
+]
+
+CRITICAL_SCORED_COLS = [
+    "score_final",
+    "tech_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "rs_percentile",
+    "vcp_score",
+    "entry_style_selected",
 ]
 
 
@@ -81,6 +142,34 @@ def _norm_strategy(strategy: str | None) -> str:
 
 
 def save_pb1_watchlist_rows(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    rows: List[Dict[str, Any]],
+) -> None:
+    strategy_n = _norm_strategy(strategy)
+    if strategy_n == "pb1_watchlist_final_scored":
+        _save_pb1_watchlist_rows_scored(
+            engine,
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            rows=rows,
+        )
+        return
+
+    _save_pb1_watchlist_rows_plain(
+        engine,
+        env=env,
+        strategy=strategy,
+        as_of=as_of,
+        rows=rows,
+    )
+
+
+def _save_pb1_watchlist_rows_plain(
     engine: Engine,
     *,
     env: str,
@@ -131,6 +220,134 @@ def save_pb1_watchlist_rows(
         as_of_date,
         len(payload),
     )
+
+
+def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int) -> Dict[str, Any]:
+    src = dict(row or {})
+    normalized: Dict[str, Any] = {}
+    for col in REQUIRED_FINAL30_SCORED_COLS:
+        if col == "as_of":
+            normalized[col] = as_of_date.isoformat()
+            continue
+        normalized[col] = src.get(col)
+
+    code = str(normalized.get("code") or src.get("code") or "").zfill(6)
+    if not code:
+        return {}
+
+    rank_val = normalized.get("rank")
+    if rank_val is None:
+        rank_val = normalized.get("rank_final30")
+    try:
+        rank = int(rank_val if rank_val is not None else idx)
+    except Exception:
+        rank = idx
+
+    score_raw = normalized.get("score")
+    if score_raw is None:
+        score_raw = normalized.get("score_final")
+    if score_raw is None:
+        score_raw = normalized.get("final_score")
+    try:
+        score = float(score_raw) if score_raw is not None else None
+    except Exception:
+        score = None
+
+    # Persist full scored payload in meta and restore as top-level on scored load.
+    payload_meta = json_sanitize(normalized)
+    return {
+        "env": None,
+        "strategy": None,
+        "as_of": as_of_date,
+        "code": code,
+        "rank": rank,
+        "score": score,
+        "meta": payload_meta,
+    }
+
+
+def _save_pb1_watchlist_rows_scored(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    rows: List[Dict[str, Any]],
+) -> None:
+    env_n = _norm_env(env)
+    strategy_n = _norm_strategy(strategy)
+    as_of_date = to_date(as_of)
+
+    if not rows:
+        logger.warning("[WATCHLIST][SAVE_SCORED] empty rows -> skip env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
+        return
+
+    raw_keys = set()
+    for row in rows:
+        raw_keys.update((row or {}).keys())
+    missing_critical_from_source = [col for col in CRITICAL_SCORED_COLS if col not in raw_keys]
+    if missing_critical_from_source:
+        raise ValueError(
+            f"[WATCHLIST][SAVE_SCORED][FAIL] missing_critical_cols={missing_critical_from_source} strategy={strategy_n}"
+        )
+
+    payload: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        entry = _build_scored_payload_row(row, as_of_date=as_of_date, idx=idx)
+        if not entry:
+            continue
+        entry["env"] = env_n
+        entry["strategy"] = strategy_n
+        payload.append(entry)
+
+    if not payload:
+        logger.warning("[WATCHLIST][SAVE_SCORED] no valid rows after normalization env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
+        return
+
+    sample_meta = payload[0].get("meta") if isinstance(payload[0].get("meta"), dict) else {}
+    sample_keys = sorted(sample_meta.keys())
+    sample_row = {k: sample_meta.get(k) for k in CRITICAL_SCORED_COLS + ["code", "rank_final30", "score"] if k in sample_meta}
+    logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)
+    logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_ROW] %s", sample_row)
+
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.delete(schema.pb1_watchlist).where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == as_of_date,
+                )
+            )
+        )
+        conn.execute(sa.insert(schema.pb1_watchlist), payload)
+
+    logger.info(
+        "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
+        env_n,
+        strategy_n,
+        as_of_date,
+        len(payload),
+    )
+
+
+def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
+    meta = row.meta if isinstance(row.meta, dict) else {}
+    out: Dict[str, Any] = {
+        "code": row.code,
+        "rank": row.rank,
+        "score": float(row.score) if row.score is not None else None,
+        "meta": meta,
+    }
+    for key, value in meta.items():
+        if key in {"code", "rank", "score", "meta"}:
+            continue
+        out[key] = value
+    out.setdefault("code", row.code)
+    out.setdefault("rank", row.rank)
+    out.setdefault("score", float(row.score) if row.score is not None else None)
+    return out
 
 
 def load_pb1_watchlist_codes(
@@ -2400,6 +2617,16 @@ class WatchlistRepo:
         Watchlist를 DB에 upsert.
         members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
         """
+        if _norm_strategy(strategy) == "pb1_watchlist_final_scored":
+            save_pb1_watchlist_rows(
+                self.engine,
+                env=env,
+                strategy="pb1_watchlist_final_scored",
+                as_of=as_of,
+                rows=members,
+            )
+            return
+
         save_pb1_watchlist_rows(
             self.engine,
             env=env,
@@ -2425,6 +2652,16 @@ class WatchlistRepo:
         ✅ as_of는 DATE 타입으로 강제 변환 (VARCHAR 캐스팅 방지)
         ✅ allow_latest_fallback=True: as_of에 없으면 TTL 이내 최신 as_of 사용
         """
+        if _norm_strategy(strategy) == "pb1_watchlist_final_scored":
+            return self.load_watchlist_scored(
+                env=env,
+                strategy=strategy,
+                as_of=as_of,
+                allow_latest_fallback=allow_latest_fallback,
+                ttl_days=ttl_days,
+                max_back_days=max_back_days,
+            )
+
         as_of_date = to_date(as_of)
         env_n = _norm_env(env)
         strategy_n = _norm_strategy(strategy)
@@ -2515,16 +2752,100 @@ class WatchlistRepo:
         ttl_days: int = 7,
         max_back_days: int = 3,
     ) -> tuple[List[Dict[str, Any]], date | None]:
-        rows, used_as_of = self.load_watchlist(
-            env=env,
-            strategy=strategy,
-            as_of=as_of,
-            allow_latest_fallback=allow_latest_fallback,
+        as_of_date = to_date(as_of)
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
+        effective_max_back_days = int(max_back_days) if allow_latest_fallback else 0
+
+        codes = load_pb1_watchlist_codes(
+            self.engine,
+            env=env_n,
+            strategy=strategy_n,
+            as_of=as_of_date,
             ttl_days=ttl_days,
-            max_back_days=max_back_days,
+            max_back_days=effective_max_back_days,
         )
-        logger.info("[WATCHLIST][LOAD] strategy=%s members=%s", _norm_strategy(strategy), len(rows))
-        return rows, used_as_of
+        if not codes:
+            logger.info("[WATCHLIST][LOAD_SCORED] strategy=%s rows=0 cols=[]", strategy_n)
+            logger.info(
+                "[WATCHLIST][LOAD_SCORED][CHECK] has_score_final=0 has_tech_score=0 has_breakout_score=0 has_pullback_score=0 has_momentum_score=0 has_rs_percentile=0 has_vcp_score=0 has_entry_style_selected=0"
+            )
+            return [], None
+
+        schema = self._schema
+        with self.engine.connect() as conn:
+            exact_count_stmt = (
+                select(func.count())
+                .select_from(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
+                        schema.pb1_watchlist.c.as_of == as_of_date,
+                    )
+                )
+            )
+            exact_count = int(conn.execute(exact_count_stmt).scalar() or 0)
+
+            used_as_of = as_of_date if exact_count > 0 else None
+            if used_as_of is None and allow_latest_fallback:
+                effective_back_days = max(0, min(int(ttl_days), int(max_back_days)))
+                min_date = as_of_date - timedelta(days=effective_back_days)
+                latest_stmt = (
+                    select(func.max(schema.pb1_watchlist.c.as_of))
+                    .where(
+                        and_(
+                            schema.pb1_watchlist.c.env == env_n,
+                            schema.pb1_watchlist.c.strategy == strategy_n,
+                            schema.pb1_watchlist.c.as_of <= as_of_date,
+                            schema.pb1_watchlist.c.as_of >= min_date,
+                        )
+                    )
+                )
+                used_as_of = conn.execute(latest_stmt).scalar()
+
+            if used_as_of is None:
+                return [], None
+
+            stmt = (
+                select(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
+                        schema.pb1_watchlist.c.as_of == used_as_of,
+                    )
+                )
+                .order_by(schema.pb1_watchlist.c.rank)
+            )
+            raw_rows = conn.execute(stmt).fetchall()
+
+        result = [_normalize_scored_loaded_row(row) for row in raw_rows]
+        cols = sorted({k for item in result for k in item.keys()})
+        has = {col: int(col in cols) for col in CRITICAL_SCORED_COLS}
+        logger.info(
+            "[WATCHLIST][LOAD_SCORED] strategy=%s rows=%s cols=%s",
+            strategy_n,
+            len(result),
+            cols,
+        )
+        logger.info(
+            "[WATCHLIST][LOAD_SCORED][CHECK] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_vcp_score=%s has_entry_style_selected=%s",
+            has.get("score_final", 0),
+            has.get("tech_score", 0),
+            has.get("breakout_score", 0),
+            has.get("pullback_score", 0),
+            has.get("momentum_score", 0),
+            has.get("rs_percentile", 0),
+            has.get("vcp_score", 0),
+            has.get("entry_style_selected", 0),
+        )
+        if result:
+            sample_keys = sorted(result[0].keys())
+            sample_row = {k: result[0].get(k) for k in CRITICAL_SCORED_COLS + ["code", "rank_final30", "score"] if k in result[0]}
+            logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)
+            logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_ROW] %s", sample_row)
+        return result, used_as_of
     
     def get_latest_watchlist_date(
         self,
@@ -3136,6 +3457,16 @@ def save_watchlist(
     members: List[Dict[str, Any]],
 ) -> None:
     """Standalone save_watchlist function."""
+    if _norm_strategy(strategy) == "pb1_watchlist_final_scored":
+        save_pb1_watchlist_rows(
+            engine,
+            env=env,
+            strategy="pb1_watchlist_final_scored",
+            as_of=as_of,
+            rows=members,
+        )
+        return
+
     save_pb1_watchlist_rows(
         engine,
         env=env,

@@ -15,7 +15,13 @@ from settings import RUNTIME_DIR
 from trader.db.engine import get_engine
 from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
-from trader.db.repos import LedgerEventsRepo, UniverseRepo, WatchlistRepo
+from trader.db.repos import (
+    CRITICAL_SCORED_COLS,
+    REQUIRED_FINAL30_SCORED_COLS,
+    LedgerEventsRepo,
+    UniverseRepo,
+    WatchlistRepo,
+)
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import build_and_save_candidate_pool
 from trader.watchlist_builder import (
@@ -295,32 +301,46 @@ def _as_dataframe(value: Any) -> pd.DataFrame:
 def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
+    critical_missing_from_source = [col for col in CRITICAL_SCORED_COLS if col not in df.columns]
+    if critical_missing_from_source:
+        raise RuntimeError(
+            f"[PREP][FINAL30_SCORED][INTEGRITY_FAIL] source_missing_critical_cols={critical_missing_from_source}"
+        )
+
+    normalized_df = df.copy(deep=True)
+    for col in REQUIRED_FINAL30_SCORED_COLS:
+        if col not in normalized_df.columns:
+            normalized_df[col] = None
+    normalized_df = normalized_df[REQUIRED_FINAL30_SCORED_COLS]
+
+    missing_after_normalize = [col for col in CRITICAL_SCORED_COLS if col not in normalized_df.columns]
+    if missing_after_normalize:
+        raise RuntimeError(
+            f"[PREP][FINAL30_SCORED][INTEGRITY_FAIL] normalized_missing_critical_cols={missing_after_normalize}"
+        )
+
     rows: list[dict[str, Any]] = []
-    for idx, row in enumerate(df.to_dict(orient="records"), start=1):
+    for idx, row in enumerate(normalized_df.to_dict(orient="records"), start=1):
         code = str(row.get("code") or "").zfill(6)
         if not code:
             continue
-        score_final = row.get("score_final")
+        payload = dict(row)
+        payload["code"] = code
+        payload["rank"] = int(payload.get("rank") or payload.get("rank_final30") or idx)
+        payload["as_of"] = payload.get("as_of")
+
+        score_final = payload.get("score")
+        if score_final is None:
+            score_final = payload.get("score_final")
+        if score_final is None:
+            score_final = payload.get("final_score")
         rows.append(
             {
                 "code": code,
-                "rank": int(row.get("rank_final30") or idx),
+                "rank": int(payload.get("rank") or idx),
                 "score": float(score_final) if score_final is not None else None,
-                "meta": {
-                    "name": row.get("name"),
-                    "rank_final30": row.get("rank_final30"),
-                    "score_final": row.get("score_final"),
-                    "tech_score": row.get("tech_score"),
-                    "flow_score": row.get("flow_score"),
-                    "breakout_score": row.get("breakout_score"),
-                    "pullback_score": row.get("pullback_score"),
-                    "momentum_score": row.get("momentum_score"),
-                    "rs_percentile": row.get("rs_percentile"),
-                    "vcp_score": row.get("vcp_score"),
-                    "atr_pct": row.get("atr_pct"),
-                    "pullback_pct": row.get("pullback_pct"),
-                    "entry_style_selected": row.get("entry_style_selected"),
-                },
+                "meta": payload,
+                **payload,
             }
         )
     return rows
@@ -1310,6 +1330,44 @@ def main() -> int:
             members=scored_members,
         )
         logger.info("[WATCHLIST][SAVE] strategy=%s members=%s", scored_strategy, len(scored_members))
+
+        logger.info(
+            "[WATCHLIST][SAVE_VERIFY][START] strategy=%s as_of=%s",
+            scored_strategy,
+            as_of.isoformat(),
+        )
+        loaded_scored_rows, loaded_scored_as_of = watchlist_repo.load_watchlist_scored(
+            env=env,
+            strategy=scored_strategy,
+            as_of=as_of,
+            allow_latest_fallback=False,
+        )
+        loaded_scored_df = pd.DataFrame(loaded_scored_rows or [])
+        loaded_cols = [str(c) for c in loaded_scored_df.columns.tolist()]
+        logger.info(
+            "[WATCHLIST][SAVE_VERIFY][LOAD] rows=%s cols=%s used_as_of=%s",
+            len(loaded_scored_df),
+            loaded_cols,
+            loaded_scored_as_of.isoformat() if loaded_scored_as_of else "",
+        )
+
+        roundtrip_missing = [col for col in CRITICAL_SCORED_COLS if col not in loaded_cols]
+        if len(loaded_scored_df) != 30:
+            roundtrip_missing = [*roundtrip_missing, f"rows_not_30:{len(loaded_scored_df)}"]
+
+        if roundtrip_missing:
+            logger.error("[WATCHLIST][SAVE_VERIFY][FAIL] missing_cols=%s", roundtrip_missing)
+            logger.error("[PREP][FINAL30_SCORED][INTEGRITY_FAIL] db_roundtrip_missing_cols=%s", roundtrip_missing)
+            raise RuntimeError(f"PREP_FINAL30_SCORED_INTEGRITY_FAIL:{roundtrip_missing}")
+
+        logger.info(
+            "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s critical_scored_cols_present=1",
+            scored_strategy,
+        )
+        logger.info(
+            "[PREP][FINAL30_SCORED][DB_ROUNDTRIP_OK] rows=%s has_score_final=1 has_tech_score=1 has_breakout_score=1 has_pullback_score=1 has_momentum_score=1 has_rs_percentile=1 has_vcp_score=1 has_entry_style_selected=1",
+            len(loaded_scored_df),
+        )
 
     _write_canonical_final30_scored_files(
         env=env,

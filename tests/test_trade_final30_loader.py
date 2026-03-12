@@ -54,6 +54,9 @@ def test_load_trade_final30_scored_prefers_canonical_file(tmp_path, monkeypatch)
         def load_watchlist(self, **_kwargs):
             return [], None
 
+        def load_watchlist_scored(self, **_kwargs):
+            return [], None
+
     monkeypatch.setattr(pb1_runner, "WatchlistRepo", FakeRepo)
 
     result = pb1_runner.load_trade_final30_scored(engine=object(), env="practice", as_of=as_of)
@@ -71,9 +74,12 @@ def test_load_trade_final30_scored_uses_db_scored_when_file_missing(tmp_path, mo
         def __init__(self, *_args, **_kwargs):
             pass
 
-        def load_watchlist(self, *, strategy, **_kwargs):
+        def load_watchlist_scored(self, *, strategy, **_kwargs):
             if strategy == "pb1_watchlist_final_scored":
                 return [_scored_row("000660")], date(2026, 3, 11)
+            return [], None
+
+        def load_watchlist(self, *, strategy, **_kwargs):
             return [], None
 
     monkeypatch.setattr(pb1_runner, "WatchlistRepo", FakeRepo)
@@ -93,6 +99,11 @@ def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, mo
     class FakeRepo:
         def __init__(self, *_args, **_kwargs):
             pass
+
+        def load_watchlist_scored(self, *, strategy, **_kwargs):
+            if strategy == "pb1_watchlist_final_scored":
+                return [], None
+            return [], None
 
         def load_watchlist(self, *, strategy, **_kwargs):
             if strategy == "pb1_watchlist_final_scored":
