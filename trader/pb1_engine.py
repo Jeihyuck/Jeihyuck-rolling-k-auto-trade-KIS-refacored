@@ -5484,6 +5484,13 @@ class PB1Engine:
                 or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
             )
         )
+        compute_only_full_run = (
+            (env_bool("DRY_RUN", False) or env_bool("DRYRUN", False) or env_bool("FORCE_BLOCK_LIVE", False) or env_bool("DISABLE_LIVE_TRADING", False))
+            and (env_bool("FORCE_COMPUTE_ON_CUTOFF", False) or env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False))
+            and (env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False) or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False))
+        )
+        if compute_only_full_run and (self.window_label or "").lower() == "after":
+            logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
         if diag_compute_only:
             order_allowed = False
             logger.info("[DIAG][ENTRY_COMPUTE] enabled=1 submit_orders=0")
@@ -5663,7 +5670,9 @@ class PB1Engine:
         
         if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
             force_compute_when_cutoff = (
-                env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
+                env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
+                or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
+                or env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
                 or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
             )
             entry_allowed = False

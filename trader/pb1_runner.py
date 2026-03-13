@@ -347,12 +347,7 @@ def _force_live_env_lock_if_needed(intended_live: bool) -> bool:
     """
     if not intended_live:
         # Safe mode: just parse and return using safe parser
-        dry_run = parse_bool_any(os.getenv("DRY_RUN"), default=True)
-        logger.info(
-            "[LIVE_ENV_LOCK][SAFE] intended_live=False -> dry_run=%s (env=%s)",
-            dry_run,
-            os.getenv("DRY_RUN"),
-        )
+        dry_run = _env_bool_any(("DRY_RUN", "DRYRUN"), default=True)
         return dry_run
 
     # Hard lock: once live-intended, env must not block orders.
@@ -1125,6 +1120,33 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _env_bool_any(names: tuple[str, ...], default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        return parse_bool_any(raw, default=default)
+    return default
+
+
+def _compute_only_full_run_flags(*, dry_run: bool | None = None) -> dict[str, bool]:
+    dry_run_flag = dry_run if dry_run is not None else _env_bool_any(("DRY_RUN", "DRYRUN"), default=True)
+    force_block_live = _env_bool_any(("FORCE_BLOCK_LIVE",), default=False)
+    disable_live_trading = _env_bool_any(("DISABLE_LIVE_TRADING",), default=False)
+    force_compute = _env_bool_any(("FORCE_COMPUTE_ON_CUTOFF", "FORCE_COMPUTE_WHEN_CUTOFF"), default=False)
+    bypass_cutoff = _env_bool_any(("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", "BYPASS_ENTRY_CUTOFF_FOR_COMPUTE"), default=False)
+
+    enabled = bool(dry_run_flag or force_block_live or disable_live_trading) and bool(force_compute and bypass_cutoff)
+    return {
+        "enabled": enabled,
+        "dry_run": bool(dry_run_flag),
+        "force_block_live": bool(force_block_live),
+        "disable_live_trading": bool(disable_live_trading),
+        "force_compute": bool(force_compute),
+        "bypass_cutoff": bool(bypass_cutoff),
+    }
+
+
 def decide_market_window(now: datetime) -> str:
     forced_override = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
     if forced_override in {"preopen", "morning", "day", "close", "after"}:
@@ -1413,6 +1435,33 @@ def run_once(
     
     # ✅ [2] LIVE_ENV_LOCK 호출 → dry_run 파싱 (단 한 번만)
     dry_run = _force_live_env_lock_if_needed(intended_live=intended_live)
+    dry_run_from_alias = _env_bool_any(("DRY_RUN", "DRYRUN"), default=True)
+    disable_live_trading = _env_bool_any(("DISABLE_LIVE_TRADING",), default=False)
+    live_trading_enabled = _env_bool_any(("LIVE_TRADING_ENABLED",), default=False)
+    simulation_mode = _env_bool_any(("SIMULATION_MODE",), default=False)
+    logger.info(
+        "[LIVE_ENV_LOCK] dry_run=%s disable_live_trading=%s live_trading_enabled=%s simulation_mode=%s intended_live=%s raw_dry_run=%s raw_dryrun=%s raw_disable_live=%s",
+        dry_run_from_alias,
+        disable_live_trading,
+        live_trading_enabled,
+        simulation_mode,
+        intended_live,
+        os.getenv("DRY_RUN"),
+        os.getenv("DRYRUN"),
+        os.getenv("DISABLE_LIVE_TRADING"),
+    )
+
+    compute_only_flags = _compute_only_full_run_flags(dry_run=dry_run_from_alias)
+    compute_only_full_run = compute_only_flags["enabled"]
+    logger.info(
+        "[COMPUTE_ONLY][FULL_RUN] enabled=%s dry_run=%s force_block_live=%s disable_live=%s force_compute=%s bypass_cutoff=%s",
+        int(compute_only_full_run),
+        int(compute_only_flags["dry_run"]),
+        int(compute_only_flags["force_block_live"]),
+        int(compute_only_flags["disable_live_trading"]),
+        int(compute_only_flags["force_compute"]),
+        int(compute_only_flags["bypass_cutoff"]),
+    )
     
     # ✅ [3] LIVE mode 검증 (dry_run은 이미 파싱 완료)
     if intended_live:
@@ -1569,6 +1618,13 @@ def run_once(
     target_start = None
     if not loop_mode:
         action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
+        if market_window == "after" and compute_only_full_run:
+            action = "run"
+            target_start = None
+            resolved_phase = "entry"
+            phase_for_log = "entry"
+            phase_reason = "after_compute_only_full_run"
+            context_reasons.append("after_compute_only:existing_live_pipeline")
         trade_run_minervini = env_bool("TRADE_RUN_MINERVINI", default=False)
         if trade_run_minervini and mode == "DIAG" and action == "wait":
             logger.info(
@@ -1704,9 +1760,12 @@ def run_once(
     if action == "smoke" and mode == "DIAG" and diag_full:
         logger.info("[PB1][DIAG_FULL_EXEC] bypass smoke -> run engine once (no KIS HTTP)")
         action = "run"  # smoke 건너뛰고 엔진 실행
-    elif action == "smoke":
+    elif action == "smoke" and not compute_only_full_run:
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
+    elif action == "smoke" and compute_only_full_run:
+        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
+        action = "run"
 
     # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
@@ -1718,6 +1777,13 @@ def run_once(
             window_label = window.name
             phase_for_log = phase_default
             logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
+        elif compute_only_full_run and market_window == "after":
+            window = WindowDecision(name="after", phase="entry")
+            window_label = "after"
+            resolved_phase = "entry"
+            phase_for_log = "entry"
+            phase_reason = "after_compute_only_full_run"
+            logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
         else:
             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
             return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
@@ -1729,7 +1795,7 @@ def run_once(
     # ✅ CRITICAL: intended_live와 dry_run은 run_once에서 이미 확정됨
     # 여기서는 재계산하지 말고 env에서 그대로 읽기만 (이미 락됨)
     
-    dry_run = env_bool("DRY_RUN", default=True)
+    dry_run = _env_bool_any(("DRY_RUN", "DRYRUN"), default=True)
     intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
     
     logger.info(
@@ -1744,8 +1810,8 @@ def run_once(
     
     expect_live_flag = env_bool("EXPECT_LIVE_TRADING", False)
     mode_resolved = resolve_mode(os.getenv("STRATEGY_MODE", ""))
-    disable_live_flag_value = os.getenv("DISABLE_LIVE_TRADING", "0") in ("1", "true", "True")
-    live_trading_flag_value = os.getenv("LIVE_TRADING_ENABLED", "0") in ("1", "true", "True")
+    disable_live_flag_value = _env_bool_any(("DISABLE_LIVE_TRADING",), default=False)
+    live_trading_flag_value = _env_bool_any(("LIVE_TRADING_ENABLED",), default=False)
     
     expect_kis_env = os.getenv("EXPECT_KIS_ENV")
     kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
@@ -1823,6 +1889,14 @@ def run_once(
             phase_reason = "diagnostic"
         window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
         _apply_env_flags_if_needed(dry_run)
+
+    if compute_only_full_run and market_window == "after":
+        phase_override_arg = "entry"
+        phase_for_log = "entry"
+        phase_reason = "after_compute_only_full_run"
+        if window is None:
+            window = WindowDecision(name="after", phase="entry")
+        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
 
     window_label = _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
@@ -2057,7 +2131,10 @@ def run_once(
     db_write_reasons: list[str] = []
     universe_ctx: UniverseContext | None = None
     try:
-        if not close_cancel_only and trading_day and market_window in {"preopen", "morning", "day", "close"}:
+        if not close_cancel_only and trading_day and (
+            market_window in {"preopen", "morning", "day", "close"}
+            or (market_window == "after" and compute_only_full_run)
+        ):
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
@@ -2175,7 +2252,9 @@ def run_once(
                 )
                 if now.time() > cutoff_time:
                     force_compute_when_cutoff = (
-                        env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
+                        env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
+                        or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
+                        or env_bool("FORCE_COMPUTE_WHEN_CUTOFF", False)
                         or env_bool("BYPASS_ENTRY_CUTOFF_FOR_COMPUTE", False)
                         or PB1_DIAG_IGNORE_ENTRY_CUTOFF
                     )
