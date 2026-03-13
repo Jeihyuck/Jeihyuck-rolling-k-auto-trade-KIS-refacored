@@ -94,6 +94,60 @@ def _trend_pass(df: pd.DataFrame) -> tuple[bool, dict[str, float], list[str]]:
 
 
 def compute_minervini_signals(kis, as_of: str, symbols: list[str], benchmark: str = "229200") -> dict:
+    precomputed_final30 = getattr(kis, "_precomputed_final30_map", {}) if kis is not None else {}
+    precomputed_derived = getattr(kis, "_precomputed_derived_map", {}) if kis is not None else {}
+
+    if symbols and (precomputed_final30 or precomputed_derived):
+        items: list[dict] = []
+        for symbol in [str(s or "").zfill(6) for s in symbols if s]:
+            row = dict(precomputed_derived.get(symbol) or {})
+            row.update(dict(precomputed_final30.get(symbol) or {}))
+            if not row:
+                items.append({"code": symbol, "data_ok": False, "reasons": ["precomputed_missing"]})
+                continue
+            rs_percentile = _float_env("MINERVINI_RS_MIN_PCTILE", 80.0)
+            rs_pctile = float(row.get("rs_percentile") or row.get("rs_pctile") or 0.0)
+            vcp_score = float(row.get("vcp_score") or 0.0)
+            trend_score = float(row.get("trend_score") or 0.0)
+            breakout_score = float(row.get("breakout_score") or 0.0)
+            pullback_score = float(row.get("pullback_score") or 0.0)
+            momentum_score = float(row.get("momentum_score") or 0.0)
+            atr_pct = row.get("atr_pct")
+            atr_val = float(atr_pct) if atr_pct is not None else 0.0
+            trend_ok = trend_score > 0.0
+            atr_ok = atr_pct is None or atr_val <= _float_env("ATR_MAX_PCT", 0.10)
+            logger.info(
+                "[MINERVINI][PRECOMPUTED] code=%s rs=%s vcp=%s trend=%s",
+                symbol,
+                rs_pctile,
+                vcp_score,
+                trend_score,
+            )
+            items.append(
+                {
+                    "code": symbol,
+                    "data_ok": True,
+                    "trend_pass": bool(trend_ok),
+                    "atr_pass": bool(atr_ok),
+                    "rs_raw": float(row.get("rs_score") or rs_pctile),
+                    "rs_pctile": rs_pctile,
+                    "vcp_score": vcp_score,
+                    "pivot": float(row.get("pivot") or 0.0),
+                    "atr_pct": atr_val,
+                    "breakout_score": breakout_score,
+                    "pullback_score": pullback_score,
+                    "momentum_score": momentum_score,
+                    "reasons": [] if trend_ok else ["trend_template_fail"],
+                }
+            )
+        return {
+            "as_of": as_of,
+            "benchmark": benchmark,
+            "regime_mode": (os.getenv("MINERVINI_REGIME_MODE") or "STRICT").upper(),
+            "regime_pass": True,
+            "items": items,
+        }
+
     rs_lookbacks_raw = (os.getenv("MINERVINI_RS_LOOKBACKS") or "63,126").split(",")
     rs_lookbacks = [max(1, int(x.strip())) for x in rs_lookbacks_raw if x.strip()]
     vcp_lb = _int_env("MINERVINI_VCP_LOOKBACK", 120)

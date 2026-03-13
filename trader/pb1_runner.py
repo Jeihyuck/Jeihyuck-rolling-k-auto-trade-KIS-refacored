@@ -9,7 +9,7 @@ import traceback
 import time as time_mod
 import copy
 from collections import Counter
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -2125,6 +2125,10 @@ def run_once(
     result = None
     db_write_reasons: list[str] = []
     universe_ctx: UniverseContext | None = None
+    precomputed_final30_df = pd.DataFrame()
+    precomputed_derived_df = pd.DataFrame()
+    precomputed_universe_df = pd.DataFrame()
+    trade_use_precomputed_features = False
     try:
         if not close_cancel_only and trading_day and (
             market_window in {"preopen", "morning", "day", "close"}
@@ -2148,6 +2152,44 @@ def run_once(
                     window_label,
                 )
                 return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
+            mode_input = (os.getenv("MODE") or "").strip().lower()
+            if mode_input == "trade" and universe_ctx and universe_ctx.members:
+                precomputed_final30_df = pd.DataFrame(list(universe_ctx.members or []))
+                if not precomputed_final30_df.empty:
+                    trade_use_precomputed_features = True
+                    logger.info(
+                        "[TRADE][PRECOMPUTED_FEATURES] enabled=1 source=pb1_watchlist_final_scored rows=%s",
+                        len(precomputed_final30_df),
+                    )
+                    symbols = [str(x).zfill(6) for x in precomputed_final30_df.get("code", pd.Series(dtype=str)).tolist() if str(x).strip()]
+                    try:
+                        derived_repo = DerivedMinerviniRepo(engine)
+                        derived_rows, _actual_as_of = derived_repo.load_for_as_of_with_fallback(
+                            env=kis_env or "practice",
+                            as_of=date.fromisoformat(as_of),
+                            symbols=symbols,
+                            ttl_days=7,
+                        )
+                        precomputed_derived_df = pd.DataFrame(list(derived_rows or []))
+                    except Exception as exc:
+                        logger.warning("[TRADE][PRECOMPUTED_FEATURES][DERIVED_LOAD_FAIL] err=%s", exc)
+                    try:
+                        watchlist_repo = WatchlistRepo(engine)
+                        universe_rows, _used_as_of = watchlist_repo.load_watchlist_scored(
+                            env=kis_env or "practice",
+                            strategy="pb1_universe_scored",
+                            as_of=date.fromisoformat(as_of),
+                            allow_latest_fallback=True,
+                            ttl_days=7,
+                            max_back_days=3,
+                        )
+                        precomputed_universe_df = pd.DataFrame(list(universe_rows or []))
+                    except Exception:
+                        precomputed_universe_df = pd.DataFrame()
+            setattr(ctx, "precomputed_final30_df", precomputed_final30_df)
+            setattr(ctx, "precomputed_derived_df", precomputed_derived_df)
+            setattr(ctx, "precomputed_universe_df", precomputed_universe_df)
+            setattr(ctx, "trade_use_precomputed_features", bool(trade_use_precomputed_features))
         kis: KisAPI | None = None
         try:
             kis = KisAPI()
@@ -2414,6 +2456,10 @@ def run_once(
             preopen_max_new_positions=PB1_PREOPEN_MAX_NEW_POSITIONS if market_window == "preopen" else 0,
             universe_context=universe_ctx,
             diag_full_exec=diag_full_exec,  # ✅ DIAG 풀패스 플래그 전달
+            precomputed_final30_df=precomputed_final30_df,
+            precomputed_derived_df=precomputed_derived_df,
+            precomputed_universe_df=precomputed_universe_df,
+            trade_use_precomputed_features=trade_use_precomputed_features,
         )
         
         # ✅ DIAG_FULL_EXEC 실행 로그
@@ -2437,12 +2483,34 @@ def run_once(
                     logger.info("[ENTRY_SCAN] start scanning %s symbols", len(watchlist_members))
                     
                     # OHLCV Provider 설정
-                    def ohlcv_provider_for_entry(code: str, days: int):
+                    trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
+                    trade_precomputed_only = bool(
+                        phase_override_arg == "entry"
+                        and trade_use_precomputed_features
+                        and not precomputed_final30_df.empty
+                        and (window_label or "").strip().lower() in {"morning", "day", "intraday", "after"}
+                        and trade_input == "final30"
+                    )
+
+                    def ohlcv_provider_for_entry(
+                        code: str,
+                        days: int,
+                        *,
+                        usage_context: str | None = None,
+                        allow_long_fetch: bool = True,
+                        purpose: str | None = None,
+                    ):
                         """Entry scan용 OHLCV provider"""
                         try:
                             from trader.data.ohlcv_provider import KISOHLCVProvider
                             provider = KISOHLCVProvider(kis)
-                            result = provider.get_ohlcv(code, days)
+                            result = provider.get_ohlcv(
+                                code,
+                                days,
+                                usage_context=usage_context,
+                                allow_long_fetch=allow_long_fetch,
+                                purpose=purpose,
+                            )
                             return result.df
                         except Exception as exc:
                             logger.debug("[ENTRY_SCAN][OHLCV] code=%s days=%s err=%s", code, days, exc)
@@ -2452,6 +2520,9 @@ def run_once(
                     entry_signals_result = scan_all_strategies(
                         watchlist=watchlist_members,
                         ohlcv_provider=ohlcv_provider_for_entry,
+                        precomputed_final30_df=precomputed_final30_df,
+                        trade_precomputed_only=trade_precomputed_only,
+                        data_metrics=(engine_runner._data_metrics if engine_runner else None),
                     )
                     
                     logger.info(

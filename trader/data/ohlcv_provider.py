@@ -34,7 +34,15 @@ class OHLCVResult:
 class OHLCVProvider(Protocol):
     name: str
 
-    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult: ...
+    def get_ohlcv(
+        self,
+        symbol: str,
+        days: int,
+        *,
+        purpose: str | None = None,
+        usage_context: str | None = None,
+        allow_long_fetch: bool = True,
+    ) -> OHLCVResult: ...
 
 
 class KISOHLCVProvider:
@@ -50,7 +58,15 @@ class KISOHLCVProvider:
         self._warned_keys.add(key)
         logger.warning(message, *args)
 
-    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
+    def get_ohlcv(
+        self,
+        symbol: str,
+        days: int,
+        *,
+        purpose: str | None = None,
+        usage_context: str | None = None,
+        allow_long_fetch: bool = True,
+    ) -> OHLCVResult:
         cache_key = ("daily", symbol, days)
         cached = daily_cache.get(cache_key)
         if cached:
@@ -59,6 +75,7 @@ class KISOHLCVProvider:
 
         # DB 우선 조회
         db_df_norm = pd.DataFrame()
+        db_df_all_norm = pd.DataFrame()
         db_meta: dict = {}
         db_ready = False
         db_rows = 0
@@ -68,6 +85,20 @@ class KISOHLCVProvider:
             start_date = end_date - timedelta(days=max(days, 260))
             candles = load_price_daily(engine, symbol, start_date, end_date)
             db_rows = len(candles)
+            if len(candles) > 0:
+                df_all = pd.DataFrame(candles)
+                raw_all_keys = list(df_all.columns)
+                db_df_all_norm, db_all_meta = normalize_ohlcv(df_all)
+                db_all_meta.update(
+                    {
+                        "provider": self.name,
+                        "source": "db",
+                        "raw_keys": raw_all_keys,
+                        "rows": len(db_df_all_norm),
+                        "stale_ok": True,
+                        "refresh_failed": False,
+                    }
+                )
             if len(candles) >= days:
                 df = pd.DataFrame(candles)
                 raw_keys = list(df.columns)
@@ -88,6 +119,72 @@ class KISOHLCVProvider:
                 logger.debug("[OHLCV][DB][MISS] symbol=%s days=%d db_rows=%d", symbol, days, len(candles))
         except Exception as exc:
             logger.debug("[OHLCV][DB][ERROR] symbol=%s err=%s", symbol, exc)
+
+        trade_long_blocked = (
+            usage_context == "trade"
+            and (not allow_long_fetch)
+            and days > 60
+            and purpose != "regime"
+        )
+        if trade_long_blocked:
+            logger.warning(
+                "[OHLCV][TRADE][LONG_FETCH_BLOCKED] symbol=%s days=%s purpose=%s db_rows=%s",
+                symbol,
+                days,
+                purpose,
+                db_rows,
+            )
+            logger.info(
+                "[OHLCV][KIS][SKIP] symbol=%s days=%s usage_context=trade reason=precomputed_only",
+                symbol,
+                days,
+            )
+            if db_ready:
+                result = OHLCVResult(
+                    db_df_norm,
+                    {
+                        **db_meta,
+                        "source": "db",
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": "trade_long_blocked",
+                        "long_fetch_blocked": 1,
+                        "kis_trade_daily_blocked": 1,
+                        "kis_trade_daily_fetch": 0,
+                    },
+                )
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                return result
+            if not db_df_all_norm.empty:
+                limited = db_df_all_norm.tail(min(days, len(db_df_all_norm)))
+                result = OHLCVResult(
+                    limited,
+                    {
+                        "provider": self.name,
+                        "source": "db_short_only",
+                        "rows": len(limited),
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": "trade_long_blocked",
+                        "long_fetch_blocked": 1,
+                        "kis_trade_daily_blocked": 1,
+                        "kis_trade_daily_fetch": 0,
+                    },
+                )
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                return result
+            return OHLCVResult(
+                pd.DataFrame(),
+                {
+                    "provider": self.name,
+                    "source": "db_insufficient_trade_blocked",
+                    "error": "trade_long_blocked",
+                    "volume_missing": True,
+                    "long_fetch_blocked": 1,
+                    "kis_trade_daily_blocked": 1,
+                    "kis_trade_daily_fetch": 0,
+                },
+            )
 
         skip_refresh_trade = (
             os.getenv("TRADE_SKIP_KIS_DAILY_REFRESH", "1") == "1"
@@ -169,6 +266,29 @@ class KISOHLCVProvider:
             return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "kis", "error": "gate_blocked", "volume_missing": True})
 
         try:
+            if (
+                usage_context == "trade"
+                and (not allow_long_fetch)
+                and days > 60
+                and purpose != "regime"
+            ):
+                logger.info(
+                    "[OHLCV][KIS][SKIP] symbol=%s days=%s usage_context=trade reason=precomputed_only",
+                    symbol,
+                    days,
+                )
+                return OHLCVResult(
+                    db_df_norm if db_ready else pd.DataFrame(),
+                    {
+                        **(db_meta if db_ready else {"provider": self.name, "source": "db"}),
+                        "stale_ok": True,
+                        "refresh_failed": True,
+                        "refresh_fail_reason": "trade_long_blocked",
+                        "long_fetch_blocked": 1,
+                        "kis_trade_daily_blocked": 1,
+                        "kis_trade_daily_fetch": 0,
+                    },
+                )
             candles = self.kis.get_daily_candles(symbol, count=max(days, 260))  # type: ignore[attr-defined]
             logger.info("[OHLCV][KIS][FALLBACK] symbol=%s days=%d rows=%d", symbol, days, len(candles))
             # DB upsert for self-healing
@@ -238,6 +358,10 @@ class KISOHLCVProvider:
             }
         )
         result = OHLCVResult(df_norm, meta)
+        if usage_context == "trade":
+            result.meta["kis_trade_daily_fetch"] = 1
+            result.meta["kis_trade_daily_blocked"] = 0
+            result.meta.setdefault("long_fetch_blocked", 0)
         daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
         return result
 
@@ -261,7 +385,15 @@ class KRXOHLCVProvider:
         start = end - timedelta(days=back)
         return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
-    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
+    def get_ohlcv(
+        self,
+        symbol: str,
+        days: int,
+        *,
+        purpose: str | None = None,
+        usage_context: str | None = None,
+        allow_long_fetch: bool = True,
+    ) -> OHLCVResult:
         try:
             from pykrx.stock import get_market_ohlcv_by_date
         except Exception as exc:  # pragma: no cover - import guard
@@ -363,7 +495,15 @@ class ChainOHLCVProvider:
         result.meta["insufficient_candles"] = len(result.df) < days if days else False
         return result
 
-    def get_ohlcv(self, symbol: str, days: int, *, purpose: str | None = None) -> OHLCVResult:
+    def get_ohlcv(
+        self,
+        symbol: str,
+        days: int,
+        *,
+        purpose: str | None = None,
+        usage_context: str | None = None,
+        allow_long_fetch: bool = True,
+    ) -> OHLCVResult:
         """
         OHLCV 데이터 조회 (DB-first + guarded remote fetch).
         
@@ -394,32 +534,56 @@ class ChainOHLCVProvider:
                 )
                 return cache_result
         
-        # ====================================================================
-        # [TRADE-TICK GUARD] 긴 조회는 remote fetch 금지 (DB hit는 허용됨)
-        # ====================================================================
-        if os.getenv("MODE") == "trade" and days >= 260:
-            # DB에 충분한 데이터가 있으면 이미 위에서 반환됨
-            # 여기까지 왔다는 것은 DB 부족 → remote fetch 필요
-            is_benchmark = purpose in {"regime", "benchmark"}
-            
-            # 레짐/벤치마크는 제한적 허용 (경고 로그)
-            if is_benchmark:
-                logger.warning(
-                    "[OHLCV][TRADE][LONG_FETCH_ALLOWED] symbol=%s days=%d purpose=%s (regime/benchmark exception)",
-                    symbol, days, purpose
-                )
-                # remote fetch 허용하지만 아래 provider 루프에서 시도
-            else:
-                # 일반 종목은 금지
-                logger.error(
-                    "[OHLCV][TRADE][LONG_FETCH_BLOCKED] symbol=%s days=%d purpose=%s",
-                    symbol, days, purpose or "universe"
-                )
-                raise RuntimeError("TRADE_TICK_FORBIDS_LONG_OHLCV_FETCH")
+        trade_long_blocked = (
+            usage_context == "trade"
+            and (not allow_long_fetch)
+            and days > 60
+            and purpose != "regime"
+        )
+        if trade_long_blocked:
+            db_rows = int((best.meta or {}).get("rows", len(best.df)) if best else 0)
+            logger.warning(
+                "[OHLCV][TRADE][LONG_FETCH_BLOCKED] symbol=%s days=%s purpose=%s db_rows=%s",
+                symbol,
+                days,
+                purpose,
+                db_rows,
+            )
+            logger.info(
+                "[OHLCV][KIS][SKIP] symbol=%s days=%s usage_context=trade reason=precomputed_only",
+                symbol,
+                days,
+            )
+            if best:
+                best.meta["long_fetch_blocked"] = 1
+                best.meta["kis_trade_daily_blocked"] = 1
+                best.meta.setdefault("kis_trade_daily_fetch", 0)
+                return best
+            result = OHLCVResult(
+                pd.DataFrame(),
+                {
+                    "provider": "none",
+                    "source": "trade_precomputed_only",
+                    "errors": errors,
+                    "volume_missing": True,
+                    "long_fetch_blocked": 1,
+                    "kis_trade_daily_blocked": 1,
+                    "kis_trade_daily_fetch": 0,
+                },
+            )
+            result = self._annotate_result(result, days=days)
+            self._memory_cache[memory_key] = result
+            return result
 
         for provider in self.providers:
             try:
-                result = provider.get_ohlcv(symbol, days)
+                result = provider.get_ohlcv(
+                    symbol,
+                    days,
+                    purpose=purpose,
+                    usage_context=usage_context,
+                    allow_long_fetch=allow_long_fetch,
+                )
             except Exception as exc:  # pragma: no cover - provider resilience
                 errors.append(f"{provider.name}:exception:{exc}")
                 logger.warning("[OHLCV][PROVIDER][FAIL] provider=%s symbol=%s err=%s", provider.name, symbol, exc)

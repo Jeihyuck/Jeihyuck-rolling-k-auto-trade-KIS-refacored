@@ -568,6 +568,10 @@ class PB1Engine:
         preopen_max_new_positions: int = 0,
         universe_context: UniverseContext | None = None,
         diag_full_exec: bool = False,
+        precomputed_final30_df: pd.DataFrame | None = None,
+        precomputed_derived_df: pd.DataFrame | None = None,
+        precomputed_universe_df: pd.DataFrame | None = None,
+        trade_use_precomputed_features: bool = False,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -630,6 +634,29 @@ class PB1Engine:
             providers.append(KISOHLCVProvider(kis))
         providers.append(KRXOHLCVProvider())
         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
+        self.precomputed_final30_df = precomputed_final30_df
+        self.precomputed_derived_df = precomputed_derived_df
+        self.precomputed_universe_df = precomputed_universe_df
+        self.trade_use_precomputed_features = bool(trade_use_precomputed_features)
+        self._precomputed_final30_map: dict[str, dict[str, Any]] = {}
+        self._precomputed_derived_map: dict[str, dict[str, Any]] = {}
+        self._data_metrics: dict[str, int] = {
+            "precomputed_hits": 0,
+            "short_fetch_count": 0,
+            "long_fetch_blocked_count": 0,
+            "kis_daily_fetch_count_trade": 0,
+            "kis_daily_fetch_blocked_count_trade": 0,
+        }
+        if self.precomputed_final30_df is not None and not self.precomputed_final30_df.empty and "code" in self.precomputed_final30_df.columns:
+            for row in self.precomputed_final30_df.to_dict(orient="records"):
+                code_key = str((row or {}).get("code") or "").zfill(6)
+                if code_key:
+                    self._precomputed_final30_map[code_key] = dict(row or {})
+        if self.precomputed_derived_df is not None and not self.precomputed_derived_df.empty:
+            for row in self.precomputed_derived_df.to_dict(orient="records"):
+                code_key = str((row or {}).get("symbol") or (row or {}).get("code") or "").zfill(6)
+                if code_key:
+                    self._precomputed_derived_map[code_key] = dict(row or {})
         self._setup_reason_counter: Counter[str] = Counter()
         self.reject_reason_counts: dict[str, int] = {}
         self.reject_reason_samples: dict[str, list[str]] = {}
@@ -1695,11 +1722,30 @@ class PB1Engine:
         if code == str(REGIME_INDEX).zfill(6) or code == REGIME_INDEX:
             purpose = "regime"
         elif code == str(RS_BENCHMARK).zfill(6) or code == RS_BENCHMARK:
-            purpose = "benchmark"
+            purpose = "regime"
+
+        trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
+        trade_precomputed_only = bool(
+            self.phase == "entry"
+            and self.trade_use_precomputed_features
+            and bool(self._precomputed_final30_map)
+            and (self.window_internal in {"morning", "day", "intraday", "after"})
+            and trade_input == "final30"
+        )
+        usage_context = "trade" if (self.env == "trade" or os.getenv("MODE") == "trade") else None
+        allow_long_fetch = True
+        if trade_precomputed_only and count > 60 and purpose != "regime":
+            allow_long_fetch = False
         
         self.daily_fetch_count += 1
         try:
-            result = self.ohlcv_provider.get_ohlcv(code, count, purpose=purpose)
+            result = self.ohlcv_provider.get_ohlcv(
+                code,
+                count,
+                purpose=purpose,
+                usage_context=usage_context,
+                allow_long_fetch=allow_long_fetch,
+            )
         except Exception:
             logger.exception("[PB1][DATA][FAIL] code=%s", code)
             return pd.DataFrame(), {"volume_missing": True, "source": "error", "mapped": {}}
@@ -1711,6 +1757,11 @@ class PB1Engine:
         # 데이터 품질 로그: 252일(정확한 52주) 또는 120일(fallback) 여부 표시
         has_full_52w = 1 if len(df_norm) >= 252 else 0
         has_fallback = 1 if len(df_norm) >= 120 else 0
+        self._data_metrics["long_fetch_blocked_count"] += int(meta.get("long_fetch_blocked", 0) or 0)
+        self._data_metrics["kis_daily_fetch_count_trade"] += int(meta.get("kis_trade_daily_fetch", 0) or 0)
+        self._data_metrics["kis_trade_daily_blocked_count_trade"] += int(meta.get("kis_trade_daily_blocked", 0) or 0)
+        if count <= 60:
+            self._data_metrics["short_fetch_count"] += 1
         logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d purpose=%s",
                     code, count, len(df_norm), has_full_52w, has_fallback, purpose or "universe")
         return df_norm, meta
@@ -4868,10 +4919,88 @@ class PB1Engine:
                 continue
             market = code_market.get(code, "")
             try:
-                df, meta = self._fetch_daily(code, days=int(PB1_OHLCV_DAYS_BASE))
-                if df is None or df.empty:
-                    continue
-                features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                pre_row = self._precomputed_final30_map.get(code, {})
+                derived_row = self._precomputed_derived_map.get(code, {})
+                merged_features: dict[str, Any] = {}
+                if isinstance(derived_row.get("features_json"), dict):
+                    merged_features.update(derived_row.get("features_json") or {})
+                merged_features.update(derived_row or {})
+                merged_features.update(pre_row or {})
+
+                required_keys = {
+                    "breakout_score",
+                    "pullback_score",
+                    "momentum_score",
+                    "entry_style_selected",
+                    "pullback_pct",
+                    "ma20",
+                    "ma50",
+                    "ma150",
+                    "rs_percentile",
+                    "vcp_score",
+                    "trend_score",
+                    "atr_pct",
+                }
+                has_precomputed = required_keys.issubset(set(merged_features.keys()))
+
+                b_ok = float(merged_features.get("breakout_score") or 0.0) > 0.0
+                p_ok = float(merged_features.get("pullback_score") or 0.0) > 0.0
+                m_ok = float(merged_features.get("momentum_score") or 0.0) > 0.0
+                ma_ok = all(float(merged_features.get(k) or 0.0) > 0.0 for k in ("ma20", "ma50", "ma150"))
+                rs_ok = float(merged_features.get("rs_percentile") or 0.0) > 0.0
+                vcp_ok = float(merged_features.get("vcp_score") or 0.0) > 0.0
+
+                source_mode = "precomputed"
+                if has_precomputed:
+                    self._data_metrics["precomputed_hits"] += 1
+                    logger.info(
+                        "[PB1][FEATURE_SOURCE] code=%s breakout=%s pullback=%s momentum=%s ma=%s rs=%s vcp=%s source=precomputed",
+                        code,
+                        b_ok,
+                        p_ok,
+                        m_ok,
+                        ma_ok,
+                        rs_ok,
+                        vcp_ok,
+                    )
+                else:
+                    source_mode = "short_ohlcv"
+
+                df = pd.DataFrame()
+                meta: dict[str, Any] = {}
+                if not has_precomputed:
+                    df, meta = self._fetch_daily(code, days=60)
+                    if df is None or df.empty:
+                        continue
+                    fresh_features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                    merged_features.update(fresh_features)
+
+                features = {
+                    "close": float(merged_features.get("close") or (float(df["close"].iloc[-1]) if not df.empty else 0.0)),
+                    "ma20": float(merged_features.get("ma20") or 0.0),
+                    "ma50": float(merged_features.get("ma50") or 0.0),
+                    "ma10": float(merged_features.get("ma10") or 0.0),
+                    "atr14": float(merged_features.get("atr14") or merged_features.get("atr") or 0.0),
+                    "atr_pct": float(merged_features.get("atr_pct") or 0.0),
+                    "vol_contraction": float(merged_features.get("vol_contraction") or 0.9),
+                    "volu_contraction": float(merged_features.get("volu_contraction") or 0.9),
+                    "ma20_slope": merged_features.get("ma20_slope"),
+                    "high20": float(merged_features.get("high20") or 0.0),
+                    "pullback_pct": float(merged_features.get("pullback_pct") or 0.0),
+                    "tr_range_pct": float(merged_features.get("tr_range_pct") or 0.0),
+                    "trend_strength": float(merged_features.get("trend_strength") or 1.0),
+                    "value20": merged_features.get("value20"),
+                    "volume_missing": bool(merged_features.get("volume_missing", False)),
+                    "breakout_score": float(merged_features.get("breakout_score") or 0.0),
+                    "pullback_score": float(merged_features.get("pullback_score") or 0.0),
+                    "momentum_score": float(merged_features.get("momentum_score") or 0.0),
+                    "entry_style_selected": merged_features.get("entry_style_selected"),
+                    "rs_percentile": float(merged_features.get("rs_percentile") or 0.0),
+                    "vcp_score": float(merged_features.get("vcp_score") or 0.0),
+                    "trend_score": float(merged_features.get("trend_score") or 0.0),
+                    "ma150": float(merged_features.get("ma150") or 0.0),
+                    "source_mode": source_mode,
+                }
                 features["market"] = market
                 features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else False
                 loose_ok, loose_reasons = evaluate_pb1_setup(
@@ -5564,6 +5693,22 @@ class PB1Engine:
             self.dry_run,
             self.intended_live,
             self.env,
+        )
+        trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
+        window_name = (self.window_internal or self.window_label or "").strip().lower()
+        self.trade_precomputed_only = bool(
+            self.phase == "entry"
+            and bool(self._precomputed_final30_map)
+            and self.trade_use_precomputed_features
+            and window_name in {"morning", "day", "intraday", "after"}
+            and trade_input == "final30"
+        )
+        logger.info(
+            "[PB1][DATA_MODE] precomputed_only=%s phase=%s trade_input=%s window=%s",
+            self.trade_precomputed_only,
+            self.phase,
+            trade_input,
+            window_name,
         )
         # 타입 검증: orders 테이블의 시간 컬럼 타입 확인
         try:
@@ -6354,6 +6499,13 @@ class PB1Engine:
                     
                     # OHLCV 데이터 필요량 (signals 체크용)
                     signal_ohlcv_days = int(os.getenv("ENTRY_SIGNAL_OHLCV_DAYS", "260"))
+                    if self.trade_precomputed_only and signal_ohlcv_days > 60:
+                        logger.warning(
+                            "[ENTRY_SCAN][LONG_OHLCV_BLOCKED] code=ALL requested_days=%s source=trade_precomputed_only",
+                            signal_ohlcv_days,
+                        )
+                        self._data_metrics["long_fetch_blocked_count"] += 1
+                        signal_ohlcv_days = 60
                     
                     for cf in candidates:
                         if not cf.features.get("data_ok"):
@@ -7479,6 +7631,14 @@ class PB1Engine:
         intents_skipped = self._setup_reason_counter.most_common(3)
         logger.info("[PB1][TICK_SUMMARY] candidates_ok=%d priced_ok=%d intents_created=%d intents_skipped_reason_top3=%s",
                     candidates_ok, priced_ok, intents_created, intents_skipped)
+        logger.info(
+            "[TRADE][DATA_SUMMARY] precomputed_hits=%s short_fetch=%s long_fetch_blocked=%s kis_trade_daily_fetch=%s kis_trade_daily_blocked=%s",
+            self._data_metrics.get("precomputed_hits", 0),
+            self._data_metrics.get("short_fetch_count", 0),
+            self._data_metrics.get("long_fetch_blocked_count", 0),
+            self._data_metrics.get("kis_daily_fetch_count_trade", 0),
+            self._data_metrics.get("kis_trade_daily_blocked_count_trade", 0),
+        )
         self._debug_summary = {
             "scanned_count": len(scan_members),
             "setup_ok_count": len(setup_ok_codes),

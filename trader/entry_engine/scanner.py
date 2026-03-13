@@ -134,7 +134,14 @@ def _scan_momentum(*, watchlist: list[dict[str, Any]], ohlcv_provider: Callable[
     return signals
 
 
-def scan_entry_candidates(*, watchlist: list[dict[str, Any]], ohlcv_provider: Callable[[str, int], pd.DataFrame | None]) -> dict[str, list[EntrySignal]]:
+def scan_entry_candidates(
+    *,
+    watchlist: list[dict[str, Any]],
+    ohlcv_provider: Callable[..., pd.DataFrame | None],
+    precomputed_final30_df: pd.DataFrame | None = None,
+    trade_precomputed_only: bool = False,
+    data_metrics: dict[str, int] | None = None,
+) -> dict[str, list[EntrySignal]]:
     logger.info("[ENTRY_ENGINE][COMPAT] scan_all_strategies -> trader.entry_engine.scanner.scan_entry_candidates")
     logger.info("[ENTRY_SCAN][ALL] starting all strategies scan on %s symbols", len(watchlist))
 
@@ -159,6 +166,29 @@ def scan_entry_candidates(*, watchlist: list[dict[str, Any]], ohlcv_provider: Ca
     rejected_counts: Counter[str] = Counter()
     style_counts: Counter[str] = Counter()
 
+    precomputed_map: dict[str, dict[str, Any]] = {}
+    if precomputed_final30_df is not None and not precomputed_final30_df.empty and "code" in precomputed_final30_df.columns:
+        for row in precomputed_final30_df.to_dict(orient="records"):
+            code_key = str((row or {}).get("code") or "").zfill(6)
+            if code_key:
+                precomputed_map[code_key] = dict(row or {})
+
+    required_precomputed_cols = {
+        "breakout_score",
+        "pullback_score",
+        "momentum_score",
+        "ma20",
+        "ma50",
+        "pullback_pct",
+        "rs_percentile",
+        "vcp_score",
+    }
+
+    def _metric_inc(key: str, delta: int = 1) -> None:
+        if data_metrics is None:
+            return
+        data_metrics[key] = int(data_metrics.get(key, 0)) + int(delta)
+
     for item in watchlist:
         code = str(item.get("code") or "").zfill(6)
         if not code:
@@ -170,42 +200,85 @@ def scan_entry_candidates(*, watchlist: list[dict[str, Any]], ohlcv_provider: Ca
         if missing_scored:
             reasons.append("missing_scored_input")
 
-        try:
-            df = ohlcv_provider(code, 260)
-        except Exception:
-            df = None
-            reasons.append("price_data_missing")
+        precomputed_row = precomputed_map.get(code)
+        has_precomputed = bool(precomputed_row) and required_precomputed_cols.issubset(set(precomputed_row.keys()))
+        if has_precomputed:
+            logger.info("[ENTRY_SCAN][PRECOMPUTED_HIT] code=%s skip_long_ohlcv=1", code)
+            _metric_inc("precomputed_hits", 1)
 
-        if df is None or df.empty:
-            if "price_data_missing" not in reasons:
+            close = _safe_float(precomputed_row.get("close", item.get("close", 0.0)))
+            ma20 = _safe_float(precomputed_row.get("ma20", 0.0))
+            ma50 = _safe_float(precomputed_row.get("ma50", 0.0))
+            rs_percentile = _safe_float(precomputed_row.get("rs_percentile", item.get("rs_percentile", 0.0)))
+            atr_pct = _safe_float(precomputed_row.get("atr_pct", item.get("atr_pct", 0.0)))
+            pullback_pct_raw = _safe_float(precomputed_row.get("pullback_pct", 0.0))
+            pullback_pct = pullback_pct_raw / 100.0 if pullback_pct_raw > 1.0 else pullback_pct_raw
+            high_52w = _safe_float(precomputed_row.get("high_52w", 0.0))
+            high_50 = _safe_float(precomputed_row.get("high_50", 0.0))
+            vol_avg20 = _safe_float(precomputed_row.get("volume_avg20", 0.0))
+            vol = _safe_float(precomputed_row.get("volume", 0.0))
+
+            breakout_ok = _safe_float(precomputed_row.get("breakout_score", 0.0)) > 0.0
+            pullback_ok = _safe_float(precomputed_row.get("pullback_score", 0.0)) > 0.0
+            momentum_ok = _safe_float(precomputed_row.get("momentum_score", 0.0)) > 0.0
+        else:
+            request_days = 260
+            if trade_precomputed_only and request_days > 60:
+                logger.warning(
+                    "[ENTRY_SCAN][LONG_OHLCV_BLOCKED] code=%s requested_days=%s source=trade_precomputed_only",
+                    code,
+                    request_days,
+                )
+                _metric_inc("long_fetch_blocked_count", 1)
+                request_days = 60
+
+            try:
+                df = ohlcv_provider(
+                    code,
+                    request_days,
+                    usage_context="trade" if trade_precomputed_only else None,
+                    allow_long_fetch=not trade_precomputed_only,
+                    purpose="entry_scan",
+                )
+                _metric_inc("short_fetch_count", 1)
+            except TypeError:
+                # Backward compatible call shape.
+                df = ohlcv_provider(code, request_days)
+                _metric_inc("short_fetch_count", 1)
+            except Exception:
+                df = None
                 reasons.append("price_data_missing")
-            per_symbol_rejects[code] = reasons
-            rejected_counts.update(reasons)
-            continue
 
-        if len(df) < 50:
-            reasons.append("db_ohlcv_insufficient")
+            if df is None or df.empty:
+                if "price_data_missing" not in reasons:
+                    reasons.append("price_data_missing")
+                per_symbol_rejects[code] = reasons
+                rejected_counts.update(reasons)
+                continue
 
-        try:
-            close = _safe_float(df["close"].iloc[-1])
-            high_50 = _safe_float(df["high"].tail(50).max())
-            ma20 = _safe_float(df["close"].rolling(window=20, min_periods=1).mean().iloc[-1])
-            ma50 = _safe_float(df["close"].rolling(window=50, min_periods=1).mean().iloc[-1])
-            vol_avg20 = _safe_float(df["volume"].tail(20).mean())
-            vol = _safe_float(df["volume"].iloc[-1])
-            high_52w = _safe_float(df["high"].tail(min(252, len(df))).max())
-            pullback_pct = (high_52w - close) / high_52w if high_52w > 0 else 0.0
-            rs_percentile = _safe_float(item.get("rs_percentile", 0.0))
-            atr_pct = _safe_float(item.get("atr_pct", 0.0))
-        except Exception:
-            reasons.append("price_data_missing")
-            per_symbol_rejects[code] = reasons
-            rejected_counts.update(reasons)
-            continue
+            if len(df) < 50:
+                reasons.append("db_ohlcv_insufficient")
 
-        breakout_ok = close > high_50 and vol > (vol_avg20 * 1.5 if vol_avg20 > 0 else 0)
-        pullback_ok = close > ma50 and 0.05 <= pullback_pct <= 0.15
-        momentum_ok = rs_percentile >= 80 and close > ma20 and vol > (vol_avg20 if vol_avg20 > 0 else 0)
+            try:
+                close = _safe_float(df["close"].iloc[-1])
+                high_50 = _safe_float(df["high"].tail(50).max())
+                ma20 = _safe_float(df["close"].rolling(window=20, min_periods=1).mean().iloc[-1])
+                ma50 = _safe_float(df["close"].rolling(window=50, min_periods=1).mean().iloc[-1])
+                vol_avg20 = _safe_float(df["volume"].tail(20).mean())
+                vol = _safe_float(df["volume"].iloc[-1])
+                high_52w = _safe_float(df["high"].tail(min(252, len(df))).max())
+                pullback_pct = (high_52w - close) / high_52w if high_52w > 0 else 0.0
+                rs_percentile = _safe_float(item.get("rs_percentile", 0.0))
+                atr_pct = _safe_float(item.get("atr_pct", 0.0))
+            except Exception:
+                reasons.append("price_data_missing")
+                per_symbol_rejects[code] = reasons
+                rejected_counts.update(reasons)
+                continue
+
+            breakout_ok = close > high_50 and vol > (vol_avg20 * 1.5 if vol_avg20 > 0 else 0)
+            pullback_ok = close > ma50 and 0.05 <= pullback_pct <= 0.15
+            momentum_ok = rs_percentile >= 80 and close > ma20 and vol > (vol_avg20 if vol_avg20 > 0 else 0)
 
         if not breakout_ok:
             reasons.append("breakout_condition_fail")
