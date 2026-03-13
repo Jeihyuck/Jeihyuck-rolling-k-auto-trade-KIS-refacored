@@ -644,6 +644,8 @@ class PB1Engine:
             "precomputed_hits": 0,
             "short_fetch_count": 0,
             "long_fetch_blocked_count": 0,
+            "kis_trade_daily_fetch_count_trade": 0,
+            "kis_trade_daily_blocked_count_trade": 0,
             "kis_daily_fetch_count_trade": 0,
             "kis_daily_fetch_blocked_count_trade": 0,
         }
@@ -1705,6 +1707,11 @@ class PB1Engine:
         )
         return top
 
+    def _metric_add(self, key: str, delta: int | float) -> None:
+        if not hasattr(self, "_data_metrics") or self._data_metrics is None:
+            self._data_metrics = {}
+        self._data_metrics[key] = self._data_metrics.get(key, 0) + delta
+
     def _fetch_daily(self, code: str, count: int | None = None, days: int | None = None) -> tuple[pd.DataFrame, Dict]:
         """OHLCV 로딩 (기본 PB1_OHLCV_DAYS_BASE일 윈도우로 안정화)
         
@@ -1736,6 +1743,12 @@ class PB1Engine:
         allow_long_fetch = True
         if trade_precomputed_only and count > 60 and purpose != "regime":
             allow_long_fetch = False
+        if purpose == "regime":
+            logger.info(
+                "[OHLCV][TRADE][REGIME_EXCEPTION] symbol=%s days=%s db_first=1 long_fetch_allowed=1",
+                code,
+                count,
+            )
         
         self.daily_fetch_count += 1
         try:
@@ -1757,11 +1770,16 @@ class PB1Engine:
         # 데이터 품질 로그: 252일(정확한 52주) 또는 120일(fallback) 여부 표시
         has_full_52w = 1 if len(df_norm) >= 252 else 0
         has_fallback = 1 if len(df_norm) >= 120 else 0
-        self._data_metrics["long_fetch_blocked_count"] += int(meta.get("long_fetch_blocked", 0) or 0)
-        self._data_metrics["kis_daily_fetch_count_trade"] += int(meta.get("kis_trade_daily_fetch", 0) or 0)
-        self._data_metrics["kis_trade_daily_blocked_count_trade"] += int(meta.get("kis_trade_daily_blocked", 0) or 0)
+        self._metric_add("long_fetch_blocked_count", int(meta.get("long_fetch_blocked", 0) or 0))
+        fetch_delta = int(meta.get("kis_trade_daily_fetch", 0) or 0)
+        self._metric_add("kis_trade_daily_fetch_count_trade", fetch_delta)
+        # Backward-compat metric key kept for existing summary and dashboards.
+        self._metric_add("kis_daily_fetch_count_trade", fetch_delta)
+        blocked_delta = int(meta.get("kis_trade_daily_blocked", 0) or 0)
+        self._metric_add("kis_trade_daily_blocked_count_trade", blocked_delta)
+        self._metric_add("kis_daily_fetch_blocked_count_trade", blocked_delta)
         if count <= 60:
-            self._data_metrics["short_fetch_count"] += 1
+            self._metric_add("short_fetch_count", 1)
         logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d purpose=%s",
                     code, count, len(df_norm), has_full_52w, has_fallback, purpose or "universe")
         return df_norm, meta
@@ -4952,7 +4970,7 @@ class PB1Engine:
 
                 source_mode = "precomputed"
                 if has_precomputed:
-                    self._data_metrics["precomputed_hits"] += 1
+                    self._metric_add("precomputed_hits", 1)
                     logger.info(
                         "[PB1][FEATURE_SOURCE] code=%s breakout=%s pullback=%s momentum=%s ma=%s rs=%s vcp=%s source=precomputed",
                         code,
@@ -5585,6 +5603,15 @@ class PB1Engine:
         self._setup_reason_counter.clear()
         self.current_code = None
         self.top_candidates = []
+        self._data_metrics = {
+            "precomputed_hits": 0,
+            "short_fetch_count": 0,
+            "long_fetch_blocked_count": 0,
+            "kis_trade_daily_fetch_count_trade": 0,
+            "kis_trade_daily_blocked_count_trade": 0,
+            "kis_daily_fetch_count_trade": 0,
+            "kis_daily_fetch_blocked_count_trade": 0,
+        }
         self.askbid_fail_count = 0  # [PATCH] 회로차단기용 실패 카운트
         final_status = "OK"
         final_notes: str | None = None
@@ -6504,7 +6531,7 @@ class PB1Engine:
                             "[ENTRY_SCAN][LONG_OHLCV_BLOCKED] code=ALL requested_days=%s source=trade_precomputed_only",
                             signal_ohlcv_days,
                         )
-                        self._data_metrics["long_fetch_blocked_count"] += 1
+                        self._metric_add("long_fetch_blocked_count", 1)
                         signal_ohlcv_days = 60
                     
                     for cf in candidates:
@@ -7636,7 +7663,7 @@ class PB1Engine:
             self._data_metrics.get("precomputed_hits", 0),
             self._data_metrics.get("short_fetch_count", 0),
             self._data_metrics.get("long_fetch_blocked_count", 0),
-            self._data_metrics.get("kis_daily_fetch_count_trade", 0),
+            self._data_metrics.get("kis_trade_daily_fetch_count_trade", self._data_metrics.get("kis_daily_fetch_count_trade", 0)),
             self._data_metrics.get("kis_trade_daily_blocked_count_trade", 0),
         )
         self._debug_summary = {
