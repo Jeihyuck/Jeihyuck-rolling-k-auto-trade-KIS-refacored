@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,10 @@ from trader.config import (
     MINERVINI_ONLY,
     RS_MIN_PCTILE,
     VCP_MIN_SCORE,
+    PB1_BOOTSTRAP_ENABLE,
+    BOOTSTRAP_MINERVINI_RS_MIN_PCTILE,
+    BOOTSTRAP_MINERVINI_VCP_MIN_SCORE,
+    BOOTSTRAP_RELAX_PASSES,
 )
 from trader.db.repos import WatchlistRepo
 from trader.flow_score import calculate_flow_score, rank_by_dollar_volume, calculate_final_score
@@ -40,6 +44,13 @@ from trader.time_coerce import to_date
 from trader.snapshot_policy import validate_snapshot_date
 
 logger = logging.getLogger(__name__)
+
+
+_LAST_CANDIDATE_POOL_BUILD_REPORT: Dict[str, Any] = {}
+
+
+def get_last_candidate_pool_build_report() -> Dict[str, Any]:
+    return dict(_LAST_CANDIDATE_POOL_BUILD_REPORT)
 
 
 def resolve_env(cli_env: str | None) -> str:
@@ -72,6 +83,9 @@ class CandidatePoolBuilder:
         min_price: float = CANDIDATE_POOL_MIN_PRICE,
         liq_days: int = CANDIDATE_POOL_LIQ_DAYS,
         min_rows: int = CANDIDATE_POOL_MIN_ROWS,
+        minervini_rs_min: Optional[float] = None,
+        minervini_vcp_min: Optional[float] = None,
+        relax_passes: Optional[int] = None,
     ):
         """
         Args:
@@ -86,6 +100,99 @@ class CandidatePoolBuilder:
         self.min_price = min_price
         self.liq_days = liq_days
         self.min_rows = min_rows
+        self.minervini_rs_min = minervini_rs_min
+        self.minervini_vcp_min = minervini_vcp_min
+        self.relax_passes = relax_passes
+        self.last_build_report: Dict[str, Any] = {}
+
+    def resolve_minervini_thresholds(self) -> Dict[str, Any]:
+        """Resolve base/floor thresholds and identify source for diagnostics."""
+        source = "config_default"
+
+        env_base_rs = os.getenv("CANDIDATE_POOL_RS_MIN_PCTILE")
+        env_base_vcp = os.getenv("CANDIDATE_POOL_VCP_MIN_SCORE")
+        base_rs = float(os.getenv("RS_MIN_PCTILE", str(RS_MIN_PCTILE)) or RS_MIN_PCTILE)
+        base_vcp = float(os.getenv("VCP_MIN_SCORE", str(VCP_MIN_SCORE)) or VCP_MIN_SCORE)
+
+        if env_base_rs is not None:
+            base_rs = float(env_base_rs)
+            source = "env_override"
+        if env_base_vcp is not None:
+            base_vcp = float(env_base_vcp)
+            source = "env_override"
+
+        if self.minervini_rs_min is not None:
+            base_rs = float(self.minervini_rs_min)
+            source = "explicit_builder_param"
+        if self.minervini_vcp_min is not None:
+            base_vcp = float(self.minervini_vcp_min)
+            source = "explicit_builder_param"
+
+        bootstrap_enabled = os.getenv("PB1_BOOTSTRAP_ENABLE", "1" if PB1_BOOTSTRAP_ENABLE else "0") == "1"
+        bootstrap_rs = float(
+            os.getenv("BOOTSTRAP_MINERVINI_RS_MIN_PCTILE", str(BOOTSTRAP_MINERVINI_RS_MIN_PCTILE))
+            or BOOTSTRAP_MINERVINI_RS_MIN_PCTILE
+        )
+        bootstrap_vcp = float(
+            os.getenv("BOOTSTRAP_MINERVINI_VCP_MIN_SCORE", str(BOOTSTRAP_MINERVINI_VCP_MIN_SCORE))
+            or BOOTSTRAP_MINERVINI_VCP_MIN_SCORE
+        )
+        relax_passes = int(
+            self.relax_passes
+            if self.relax_passes is not None
+            else os.getenv("BOOTSTRAP_RELAX_PASSES", str(BOOTSTRAP_RELAX_PASSES))
+        )
+        relax_passes = max(0, relax_passes)
+
+        if bootstrap_enabled and source == "config_default":
+            source = "bootstrap_override"
+
+        return {
+            "base_rs_min": float(base_rs),
+            "base_vcp_min": float(base_vcp),
+            "bootstrap_rs_min": float(bootstrap_rs),
+            "bootstrap_vcp_min": float(bootstrap_vcp),
+            "relax_passes": relax_passes,
+            "source": source,
+            "bootstrap_enabled": bootstrap_enabled,
+        }
+
+    def _build_relax_thresholds(
+        self,
+        *,
+        base_rs: float,
+        base_vcp: float,
+        floor_rs: float,
+        floor_vcp: float,
+        relax_passes: int,
+    ) -> List[Tuple[float, float]]:
+        if relax_passes <= 0:
+            return [(float(base_rs), float(base_vcp))]
+
+        thresholds: List[Tuple[float, float]] = []
+        rs_drop = max(0.0, float(base_rs) - float(floor_rs))
+        vcp_drop = max(0.0, float(base_vcp) - float(floor_vcp))
+        for p in range(relax_passes + 1):
+            vcp_progress = p / float(relax_passes)
+            rs_progress = min(1.0, (2.0 * p) / float(relax_passes))
+            rs_min = max(float(floor_rs), float(base_rs) - rs_drop * rs_progress)
+            vcp_min = max(float(floor_vcp), float(base_vcp) - vcp_drop * vcp_progress)
+            thresholds.append((round(rs_min, 1), round(vcp_min, 1)))
+        return thresholds
+
+    def _apply_minervini_filter(self, rows: List[Dict[str, Any]], rs_min: float, vcp_min: float) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            rs_val = row.get("rs_percentile")
+            vcp_val = row.get("vcp_score")
+            if rs_val is None or float(rs_val) < float(rs_min):
+                continue
+            if vcp_val is None or float(vcp_val) < float(vcp_min):
+                continue
+            if not bool(row.get("trend_ok", False)):
+                continue
+            filtered.append(row)
+        return filtered
     
     def build_light_scan(
         self,
@@ -269,61 +376,255 @@ class CandidatePoolBuilder:
             for item in scored:
                 item["rs_percentile"] = 0.0
 
-        # --- Minervini filter ---
-        filtered_scored = []
-        filtered_out = 0
-        for row in scored:
-            if float(row.get("rs_percentile", 0.0) or 0.0) < float(RS_MIN_PCTILE):
-                filtered_out += 1
-                continue
-            if float(row.get("vcp_score", 0.0) or 0.0) < float(VCP_MIN_SCORE):
-                filtered_out += 1
-                continue
-            if not bool(row.get("trend_ok", False)):
-                filtered_out += 1
-                continue
-            filtered_scored.append(row)
+        thresholds = self.resolve_minervini_thresholds()
+        source = thresholds.get("source", "config_default")
+        source_label = "config/bootstrap" if source == "bootstrap_override" else str(source)
 
-        if not filtered_scored:
-            logger.warning("[CANDIDATE_POOL][BUILD][MINERVINI] candidate pool empty -> fallback to RS ranking")
-            fallback_ranked = sorted(
-                scored,
-                key=lambda x: float(x.get("rs_percentile", 0.0) or 0.0),
-                reverse=True,
-            )
-            filtered_scored = fallback_ranked[: self.target_size]
+        base_rs_min = float(thresholds["base_rs_min"])
+        base_vcp_min = float(thresholds["base_vcp_min"])
+        floor_rs_min = float(thresholds["bootstrap_rs_min"])
+        floor_vcp_min = float(thresholds["bootstrap_vcp_min"])
+        relax_passes = int(thresholds["relax_passes"])
+        min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", str(CANDIDATE_POOL_MIN_SIZE)))
 
         logger.info(
-            "[CANDIDATE_POOL][BUILD][MINERVINI] input=%s filtered_out=%s kept=%s rs_min=%s vcp_min=%s",
-            len(scored),
-            filtered_out,
-            len(filtered_scored),
-            RS_MIN_PCTILE,
-            VCP_MIN_SCORE,
+            "[CANDIDATE_POOL][BUILD][THRESHOLDS] base_rs_min=%.1f base_vcp_min=%.1f bootstrap_rs_min=%.1f bootstrap_vcp_min=%.1f relax_passes=%s source=%s",
+            base_rs_min,
+            base_vcp_min,
+            floor_rs_min,
+            floor_vcp_min,
+            relax_passes,
+            source_label,
         )
 
-        # 점수 내림차순 정렬 후 상위 target_size개 선택
-        filtered_scored.sort(key=lambda x: x["score"], reverse=True)
-        selected = filtered_scored[:self.target_size]
-        
-        result_codes = [item["code"] for item in selected]
-        
+        rs_vals = pd.Series([row.get("rs_percentile") for row in scored], dtype="float64")
+        vcp_vals = pd.Series([row.get("vcp_score") for row in scored], dtype="float64")
+        rs_null = int(rs_vals.isna().sum())
+        vcp_null = int(vcp_vals.isna().sum())
+        rs_pass = int((rs_vals >= base_rs_min).sum())
+        vcp_pass = int((vcp_vals >= base_vcp_min).sum())
+        both_pass = int(((rs_vals >= base_rs_min) & (vcp_vals >= base_vcp_min)).sum())
+
+        rs_clean = rs_vals.dropna()
+        vcp_clean = vcp_vals.dropna()
+        rs_summary = (
+            float(rs_clean.min()) if not rs_clean.empty else 0.0,
+            float(rs_clean.quantile(0.25)) if not rs_clean.empty else 0.0,
+            float(rs_clean.median()) if not rs_clean.empty else 0.0,
+            float(rs_clean.quantile(0.75)) if not rs_clean.empty else 0.0,
+            float(rs_clean.max()) if not rs_clean.empty else 0.0,
+        )
+        vcp_summary = (
+            float(vcp_clean.min()) if not vcp_clean.empty else 0.0,
+            float(vcp_clean.quantile(0.25)) if not vcp_clean.empty else 0.0,
+            float(vcp_clean.median()) if not vcp_clean.empty else 0.0,
+            float(vcp_clean.quantile(0.75)) if not vcp_clean.empty else 0.0,
+            float(vcp_clean.max()) if not vcp_clean.empty else 0.0,
+        )
+
+        logger.info(
+            "[CANDIDATE_POOL][BUILD][MINERVINI][DISTRIBUTION] input=%s rs_min=%.1f vcp_min=%.1f rs_pass=%s vcp_pass=%s both_pass=%s rs_null=%s vcp_null=%s rs_stats=min:%.1f,p25:%.1f,median:%.1f,p75:%.1f,max:%.1f vcp_stats=min:%.1f,p25:%.1f,median:%.1f,p75:%.1f,max:%.1f",
+            len(scored),
+            base_rs_min,
+            base_vcp_min,
+            rs_pass,
+            vcp_pass,
+            both_pass,
+            rs_null,
+            vcp_null,
+            rs_summary[0],
+            rs_summary[1],
+            rs_summary[2],
+            rs_summary[3],
+            rs_summary[4],
+            vcp_summary[0],
+            vcp_summary[1],
+            vcp_summary[2],
+            vcp_summary[3],
+            vcp_summary[4],
+        )
+
+        sample_rows: List[Dict[str, Any]] = []
+        for row in sorted(scored, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[:10]:
+            rs_val = row.get("rs_percentile")
+            vcp_val = row.get("vcp_score")
+            pass_rs = rs_val is not None and float(rs_val) >= base_rs_min
+            pass_vcp = vcp_val is not None and float(vcp_val) >= base_vcp_min
+            sample_rows.append(
+                {
+                    "code": str(row.get("code", "")),
+                    "rs_percentile": round(float(rs_val), 2) if rs_val is not None else None,
+                    "vcp_score": round(float(vcp_val), 2) if vcp_val is not None else None,
+                    "pass_rs": int(pass_rs),
+                    "pass_vcp": int(pass_vcp),
+                    "pass_both": int(pass_rs and pass_vcp),
+                }
+            )
+        logger.info("[CANDIDATE_POOL][BUILD][MINERVINI][SAMPLE] %s", sample_rows)
+
+        logger.info(
+            "[CANDIDATE_POOL][BUILD][RELAX_POLICY] base=(%.1f,%.1f) floor=(%.1f,%.1f) relax_passes=%s",
+            base_rs_min,
+            base_vcp_min,
+            floor_rs_min,
+            floor_vcp_min,
+            relax_passes,
+        )
+
+        pass_thresholds = self._build_relax_thresholds(
+            base_rs=base_rs_min,
+            base_vcp=base_vcp_min,
+            floor_rs=floor_rs_min,
+            floor_vcp=floor_vcp_min,
+            relax_passes=relax_passes,
+        )
+
+        strict_rows: List[Dict[str, Any]] = []
+        chosen_rows: List[Dict[str, Any]] = []
+        chosen_pass = 0
+        chosen_rs = base_rs_min
+        chosen_vcp = base_vcp_min
+        for pass_idx, (pass_rs_min, pass_vcp_min) in enumerate(pass_thresholds):
+            pass_rows = self._apply_minervini_filter(scored, pass_rs_min, pass_vcp_min)
+            if pass_idx == 0:
+                strict_rows = pass_rows[:]
+            logger.info(
+                "[CANDIDATE_POOL][BUILD][RELAX_PASS] pass=%s rs_min=%.1f vcp_min=%.1f kept=%s min_size=%s",
+                pass_idx,
+                pass_rs_min,
+                pass_vcp_min,
+                len(pass_rows),
+                min_size,
+            )
+            chosen_rows = pass_rows
+            chosen_pass = pass_idx
+            chosen_rs = pass_rs_min
+            chosen_vcp = pass_vcp_min
+            if len(pass_rows) >= min_size:
+                break
+
+        for row in strict_rows:
+            row["selection_mode"] = "strict_minervini"
+        strict_codes = {str(row.get("code", "")) for row in strict_rows}
+        for row in chosen_rows:
+            code = str(row.get("code", ""))
+            if code not in strict_codes:
+                row["selection_mode"] = "relaxed_minervini"
+
+        chosen_sorted = sorted(chosen_rows, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+        selected_rows = chosen_sorted[: self.target_size]
+
+        fallback_added_rows: List[Dict[str, Any]] = []
+        if len(selected_rows) < min_size:
+            selected_codes = {str(row.get("code", "")) for row in selected_rows}
+            fallback_eligible = sorted(scored, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+            needed = max(0, min_size - len(selected_rows))
+            for row in fallback_eligible:
+                code = str(row.get("code", ""))
+                if code in selected_codes:
+                    continue
+                row["selection_mode"] = "fallback_topup"
+                fallback_added_rows.append(row)
+                selected_rows.append(row)
+                selected_codes.add(code)
+                if len(fallback_added_rows) >= needed:
+                    break
+            logger.warning(
+                "[CANDIDATE_POOL][BUILD][FALLBACK_TOPUP] strict_kept=%s needed=%s added=%s final_selected=%s",
+                len(chosen_rows),
+                needed,
+                len(fallback_added_rows),
+                len(selected_rows),
+            )
+
+        selected_rows = selected_rows[: max(min_size, min(self.target_size, len(selected_rows)))]
+        result_codes = [str(item.get("code", "")) for item in selected_rows]
+
+        strict_final = sum(1 for row in selected_rows if row.get("selection_mode") == "strict_minervini")
+        relaxed_final = sum(1 for row in selected_rows if row.get("selection_mode") == "relaxed_minervini")
+        fallback_final = sum(1 for row in selected_rows if row.get("selection_mode") == "fallback_topup")
+
+        final_sample: List[Dict[str, Any]] = []
+        for row in selected_rows[:10]:
+            final_sample.append(
+                {
+                    "code": str(row.get("code", "")),
+                    "selection_mode": row.get("selection_mode", "unknown"),
+                    "rs_percentile": round(float(row.get("rs_percentile", 0.0) or 0.0), 2),
+                    "vcp_score": round(float(row.get("vcp_score", 0.0) or 0.0), 2),
+                }
+            )
+
+        logger.info(
+            "[CANDIDATE_POOL][BUILD][FINAL] selected=%s strict=%s relaxed=%s fallback=%s min_size=%s target_size=%s",
+            len(result_codes),
+            strict_final,
+            relaxed_final,
+            fallback_final,
+            min_size,
+            self.target_size,
+        )
+        logger.info("[CANDIDATE_POOL][BUILD][FINAL_SAMPLE] %s", final_sample)
+
+        self.last_build_report = {
+            "universe": len(codes),
+            "prefilter_survivors": len(scored),
+            "strict_kept": len(strict_rows),
+            "relaxed_kept": len(chosen_rows),
+            "fallback_eligible": len(scored),
+            "fallback_added": len(fallback_added_rows),
+            "final_selected": len(result_codes),
+            "min_size": min_size,
+            "target_size": self.target_size,
+            "chosen_pass": chosen_pass,
+            "thresholds_used": {
+                "base_rs_min": base_rs_min,
+                "base_vcp_min": base_vcp_min,
+                "floor_rs_min": floor_rs_min,
+                "floor_vcp_min": floor_vcp_min,
+                "used_rs_min": chosen_rs,
+                "used_vcp_min": chosen_vcp,
+                "relax_passes": relax_passes,
+                "source": source_label,
+            },
+            "selection_mode_by_code": {
+                str(row.get("code", "")): str(row.get("selection_mode", "unknown")) for row in selected_rows
+            },
+            "selection_mode_counts": {
+                "strict_minervini": strict_final,
+                "relaxed_minervini": relaxed_final,
+                "fallback_topup": fallback_final,
+            },
+        }
+
+        if len(result_codes) < min_size:
+            reason = "insufficient_prefilter_survivors" if len(scored) < min_size else "thresholds_too_strict_or_score_distribution"
+            logger.error(
+                "[CANDIDATE_POOL][BUILD][FAIL] universe=%s prefilter_survivors=%s strict_kept=%s relaxed_kept=%s fallback_eligible=%s final_selected=%s min_size=%s reason=%s thresholds_used=%s",
+                len(codes),
+                len(scored),
+                len(strict_rows),
+                len(chosen_rows),
+                len(scored),
+                len(result_codes),
+                min_size,
+                reason,
+                self.last_build_report.get("thresholds_used"),
+            )
+            raise RuntimeError(
+                "candidate_pool_build_failed: "
+                f"universe={len(codes)} prefilter_survivors={len(scored)} strict_kept={len(strict_rows)} "
+                f"relaxed_kept={len(chosen_rows)} fallback_eligible={len(scored)} final_selected={len(result_codes)} "
+                f"min_size={min_size} reason={reason}"
+            )
+
         logger.info(
             "[CANDIDATE_POOL][BUILD][DONE] as_of=%s universe_size=%s scored=%s selected=%s",
-            as_of, len(codes), len(filtered_scored), len(result_codes)
+            as_of,
+            len(codes),
+            len(scored),
+            len(result_codes),
         )
-        
-        # ✅ selected < min_size 즉시 실패 처리
-        min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
-        if len(result_codes) < min_size:
-            logger.error(
-                "[CANDIDATE_POOL][BUILD][FAIL] selected=%s < min_size=%s (from %s scored). "
-                "Filter criteria too strict or data quality issue. "
-                "Consider: (1) lowering min_price=%s, (2) lowering min_rows=%s, (3) increasing target_size=%s",
-                len(result_codes), min_size, len(filtered_scored), self.min_price, self.min_rows, self.target_size
-            )
-            raise RuntimeError(f"candidate pool size {len(result_codes)} < min_size {min_size}")
-        
         return result_codes
     
     def build_final30_pipeline(
@@ -639,6 +940,11 @@ def build_and_save_candidate_pool(
     except Exception as exc:
         logger.error("[CANDIDATE_POOL][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
+
+    build_report = dict(getattr(builder, "last_build_report", {}) or {})
+    global _LAST_CANDIDATE_POOL_BUILD_REPORT
+    _LAST_CANDIDATE_POOL_BUILD_REPORT = build_report
+    mode_map = build_report.get("selection_mode_by_code", {}) if isinstance(build_report, dict) else {}
     
     # DB에 저장 (pb1_watchlist)
     pool_members = [
@@ -646,7 +952,10 @@ def build_and_save_candidate_pool(
             "code": code,
             "rank": idx + 1,
             "score": None,
-            "meta": {"kind": "pool"},
+            "meta": {
+                "kind": "pool",
+                "selection_mode": mode_map.get(str(code), "unknown"),
+            },
         }
         for idx, code in enumerate(pool_codes)
     ]
@@ -658,8 +967,21 @@ def build_and_save_candidate_pool(
     
     min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
     if len(pool_members) < min_size:
-        logger.error("[WATCHLIST][SAVE] members=%s < min_size=%s - failing", len(pool_members), min_size)
-        raise RuntimeError(f"candidate pool size {len(pool_members)} < min_size {min_size}")
+        logger.error(
+            "[WATCHLIST][SAVE][FAIL] members=%s < min_size=%s strict_kept=%s relaxed_kept=%s fallback_eligible=%s",
+            len(pool_members),
+            min_size,
+            build_report.get("strict_kept", -1),
+            build_report.get("relaxed_kept", -1),
+            build_report.get("fallback_eligible", -1),
+        )
+        raise RuntimeError(
+            "candidate_pool_save_failed: "
+            f"selected={len(pool_members)} min_size={min_size} "
+            f"strict_kept={build_report.get('strict_kept', 'na')} "
+            f"relaxed_kept={build_report.get('relaxed_kept', 'na')} "
+            f"fallback_eligible={build_report.get('fallback_eligible', 'na')}"
+        )
     
     repo.save_watchlist(
         env=env,
@@ -672,6 +994,14 @@ def build_and_save_candidate_pool(
         "[CANDIDATE_POOL][SAVE] env=%s strategy=%s size=%s as_of=%s",
         env, strategy, len(pool_codes), as_of
     )
+
+    if build_report:
+        logger.info(
+            "[CANDIDATE_POOL][SAVE][SELECTION_MODE] strict=%s relaxed=%s fallback=%s",
+            build_report.get("selection_mode_counts", {}).get("strict_minervini", 0),
+            build_report.get("selection_mode_counts", {}).get("relaxed_minervini", 0),
+            build_report.get("selection_mode_counts", {}).get("fallback_topup", 0),
+        )
     
     return pool_codes
 

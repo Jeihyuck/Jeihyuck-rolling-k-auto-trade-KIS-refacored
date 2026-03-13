@@ -23,7 +23,10 @@ from trader.db.repos import (
     WatchlistRepo,
 )
 from trader.minervini.compute import compute_and_store_derived_minervini
-from trader.candidate_pool_builder import build_and_save_candidate_pool
+from trader.candidate_pool_builder import (
+    build_and_save_candidate_pool,
+    get_last_candidate_pool_build_report,
+)
 from trader.watchlist_builder import (
     build_and_save_watchlist,
     recover_bundle_from_db,
@@ -887,14 +890,38 @@ def main() -> int:
     def _pool_ohlcv(code: str, days: int = 80):
         return _load_db_ohlcv_df(engine=engine, code=code, as_of=as_of, count=days)
 
-    pool_codes = build_and_save_candidate_pool(
-        engine=engine,
-        env=env,
-        as_of=effective_as_of,
-        members=members,
-        ohlcv_provider=_pool_ohlcv,
-        force_rebuild=force_candidate,
-        skip_prefetch=True,
+    try:
+        pool_codes = build_and_save_candidate_pool(
+            engine=engine,
+            env=env,
+            as_of=effective_as_of,
+            members=members,
+            ohlcv_provider=_pool_ohlcv,
+            force_rebuild=force_candidate,
+            skip_prefetch=True,
+        )
+    except Exception as exc:
+        report = get_last_candidate_pool_build_report()
+        logger.error(
+            "[PREP][CANDIDATE_POOL][FAIL] reason=%s strict_kept=%s relaxed_kept=%s fallback_eligible=%s final_selected=%s min_size=%s thresholds=%s",
+            str(exc),
+            report.get("strict_kept", "na"),
+            report.get("relaxed_kept", "na"),
+            report.get("fallback_eligible", "na"),
+            report.get("final_selected", "na"),
+            report.get("min_size", "na"),
+            report.get("thresholds_used", {}),
+        )
+        raise
+
+    pool_report = get_last_candidate_pool_build_report()
+    mode_counts = pool_report.get("selection_mode_counts", {}) if isinstance(pool_report, dict) else {}
+    logger.info(
+        "[PREP][CANDIDATE_POOL] selected=%s source=builder strict=%s relaxed=%s fallback=%s",
+        len(pool_codes),
+        int(mode_counts.get("strict_minervini", 0)),
+        int(mode_counts.get("relaxed_minervini", 0)),
+        int(mode_counts.get("fallback_topup", 0)),
     )
     dt_pool = time.monotonic() - t_pool
     logger.info("[PREP][HEARTBEAT] stage=candidate_pool status=done")
