@@ -28,6 +28,11 @@ from trader.config import (
     PB1_MIN_SCORE_BASE,
     PB1_MIN_SCORE_FLOOR,
     PB1_MIN_SCORE_STEP,
+    PB1_MIN_BUYABLE,
+    PB1_USE_MINERVINI_AS_RANK_ONLY,
+    PB1_MINERVINI_HARD_GATE,
+    PB1_EMERGENCY_ORDER_ENABLED,
+    PB1_EMERGENCY_DIAG_ONLY,
     PB1_BOOTSTRAP_ENABLE,
     BOOTSTRAP_MINERVINI_RS_MIN_PCTILE,
     BOOTSTRAP_MINERVINI_VCP_MIN_SCORE,
@@ -773,7 +778,7 @@ class PB1Engine:
             "score_keep_topn": int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN))),
             "force_min1_enabled": bool(self._bool_env("PB1_FORCE_MIN1", BOOTSTRAP_FORCE_MIN_1_SHARE)),
             "force_min1_topn": int(self._int_env("PB1_FORCE_MIN1_TOPN", int(BOOTSTRAP_MIN1_TOPN))),
-            "min_buyable": int(self._int_env("MIN_BUYABLE", 1)),
+            "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", PB1_MIN_BUYABLE)))),
         }
 
     def _resolve_effective_entry_filters(self) -> dict[str, Any]:
@@ -790,7 +795,7 @@ class PB1Engine:
             "min_score_floor": float(PB1_MIN_SCORE_FLOOR),
             "min_score_step": float(PB1_MIN_SCORE_STEP),
             "relax_passes": int(PB1_RELAX_MAX_PASSES),
-            "min_buyable": max(1, int(self._int_env("MIN_BUYABLE", 5))),
+            "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", PB1_MIN_BUYABLE)))),
             "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN)))),
         }
         env_overrides = {
@@ -806,7 +811,10 @@ class PB1Engine:
             "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", defaults["min_score_floor"])),
             "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", defaults["min_score_step"])),
             "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", defaults["relax_passes"]))),
-            "min_buyable": max(1, int(self._int_env("MIN_BUYABLE", defaults["min_buyable"]))),
+            "min_buyable": max(
+                1,
+                int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", defaults["min_buyable"]))),
+            ),
             "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", defaults["score_keep_topn"]))),
         }
         effective = dict(defaults)
@@ -4866,13 +4874,32 @@ class PB1Engine:
                 features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
                 features["market"] = market
                 features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else False
-                setup_ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume)
+                loose_ok, loose_reasons = evaluate_pb1_setup(
+                    features,
+                    market=market,
+                    require_volume=self.require_volume,
+                    mode="relaxed",
+                    relax_ma_filter=PB1_RELAX_MA_FILTER,
+                    relax_ma20_slope=PB1_RELAX_MA20_SLOPE,
+                )
+                strict_ok, strict_reasons = evaluate_pb1_setup(
+                    features,
+                    market=market,
+                    require_volume=self.require_volume,
+                    mode="strict",
+                    relax_ma_filter=False,
+                    relax_ma20_slope=False,
+                )
+                features["setup_loose_ok"] = bool(loose_ok)
+                features["setup_strict_ok"] = bool(strict_ok)
+                features["setup_loose_reasons"] = list(loose_reasons or [])
+                features["setup_strict_reasons"] = list(strict_reasons or [])
                 cf = CandidateFeature(
                     code=code,
                     market=market,
                     features=features,
-                    setup_ok=bool(setup_ok),
-                    reasons=list(reasons or []),
+                    setup_ok=bool(loose_ok),
+                    reasons=list(loose_reasons or []),
                     mode=1,
                     mode_reasons=["pb1_from_final30"],
                 )
@@ -6088,6 +6115,7 @@ class PB1Engine:
         applied_min_score = float(self.effective_entry_filters.get("min_score_base", PB1_MIN_SCORE_BASE))
         applied_require_both = bool(self.effective_entry_filters.get("require_both_contractions", PB1_REQUIRE_BOTH_CONTRACTIONS))
         setup_ok_codes: list[str] = []
+        strict_setup_ok_codes: list[str] = []
         drop_reason_counter: Counter[str] = Counter()
         drop_examples: Dict[str, list[str]] = {}
         after_risk_check_count = 0
@@ -6114,6 +6142,10 @@ class PB1Engine:
             "drop_reasons_by_code": {},
             "drop_reason_examples": {},
         }
+        minervini_rank_only = bool(self._bool_env("PB1_USE_MINERVINI_AS_RANK_ONLY", PB1_USE_MINERVINI_AS_RANK_ONLY))
+        minervini_hard_gate = bool(self._bool_env("PB1_MINERVINI_HARD_GATE", PB1_MINERVINI_HARD_GATE))
+        emergency_order_enabled = bool(self._bool_env("PB1_EMERGENCY_ORDER_ENABLED", PB1_EMERGENCY_ORDER_ENABLED))
+        emergency_diag_only = bool(self._bool_env("PB1_EMERGENCY_DIAG_ONLY", PB1_EMERGENCY_DIAG_ONLY))
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             if self.phase == "entry":
                 t_pb1_start = time.monotonic()
@@ -6130,16 +6162,22 @@ class PB1Engine:
                     dt_minervini,
                 )
                 logger.info(
-                    "[ENTRY][PB1_FILTER] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
+                    "[ENTRY][PB1_FILTER][LOOSE] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
                     trace_id,
                     data_ok_count,
-                    len([c for c in candidates if c.setup_ok]),
+                    len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
                     dt_pb1_filter,
                     "final30_pb1",
                     0,
                 )
-
-                setup_ok_codes = [c.code for c in candidates if c.setup_ok]
+                strict_setup_ok_codes = [c.code for c in candidates if bool(c.features.get("setup_strict_ok", False))]
+                logger.info(
+                    "[ENTRY][PB1_FILTER][STRICT] trace=%s before=%s after=%s",
+                    trace_id,
+                    len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
+                    len(strict_setup_ok_codes),
+                )
+                setup_ok_codes = [c.code for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]
                 logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
                 t_minervini_start = time.monotonic()
                 signals = compute_minervini_signals(
@@ -6154,6 +6192,12 @@ class PB1Engine:
                 relax_rs_step = int(os.getenv("RS_PCTILE_STEP", "5") or 5)
                 relax_vcp_step = int(os.getenv("VCP_SCORE_STEP", "5") or 5)
                 relax_keep_trend = (os.getenv("KEEP_TREND_TEMPLATE_ALWAYS", "1") == "1")
+                logger.info(
+                    "[MINERVINI][CFG] min_buyable=%s rank_only=%s hard_gate=%s",
+                    relax_min_buyable,
+                    int(minervini_rank_only),
+                    int(minervini_hard_gate),
+                )
                 if self.bootstrap_enabled:
                     relax_min_buyable = int(self.effective_entry_filters.get("min_buyable", 1))
                     relax_passes = int(self.effective_entry_filters.get("relax_passes", 5))
@@ -6244,20 +6288,37 @@ class PB1Engine:
                     signal_item = signal_item_map.get(cf.code) or {}
                     if signal_item.get("pivot") is not None:
                         cf.features["pivot"] = signal_item.get("pivot")
-                    if cf.setup_ok and cf.code not in buyable_codes:
+                    if (not minervini_rank_only) and minervini_hard_gate and cf.setup_ok and cf.code not in buyable_codes:
                         cf.setup_ok = False
                         cf.reasons = list(cf.reasons or []) + ["minervini_not_buyable"]
+
+                if minervini_rank_only or not minervini_hard_gate:
+                    logger.info(
+                        "[MINERVINI][RANK_ONLY] input=%s ranked=%s",
+                        len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
+                        len(candidates),
+                    )
 
                 candidates = self._size_positions(candidates)
                 relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)
                 relax_debug_payload["risk_gate_codes"] = list(self._debug_risk_ok_codes)
                 relax_debug_payload["sizing_ok_codes"] = list(self._debug_sizing_ok_codes)
                 relax_debug_payload["sizing_fail_items"] = list(self._debug_sizing_fail_items)
-                ok_after_risk = sorted(
-                    [c for c in candidates if c.setup_ok and c.code in buyable_codes],
-                    key=lambda c: float(c.features.get("score") or 0.0),
-                    reverse=True,
-                )
+                if minervini_rank_only or not minervini_hard_gate:
+                    ok_after_risk = sorted(
+                        [c for c in candidates if c.setup_ok],
+                        key=lambda c: (
+                            1 if c.code in buyable_codes else 0,
+                            float(c.features.get("score") or 0.0),
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    ok_after_risk = sorted(
+                        [c for c in candidates if c.setup_ok and c.code in buyable_codes],
+                        key=lambda c: float(c.features.get("score") or 0.0),
+                        reverse=True,
+                    )
             else:
                 t_minervini_start = time.monotonic()
                 candidates = self._compute_candidates(scan_members)
@@ -6720,7 +6781,7 @@ class PB1Engine:
                     last_volume=last_volume,
                     cfg=self.minervini_config,
                 )
-                setup_filters_ok = bool(cf.features.get("pullback_ok", cf.setup_ok))
+                setup_filters_ok = bool(cf.features.get("setup_loose_ok", cf.features.get("pullback_ok", cf.setup_ok)))
                 entry_ok, entry_reasons, entry_mode = self._entry_gate(
                     setup_filters_ok=setup_filters_ok,
                     breakout_trigger_ok=trigger_ok,
@@ -6931,19 +6992,45 @@ class PB1Engine:
                     atr_pct = self._to_float(emergency_cf.features.get("atr_pct"))
                     if atr_pct is None or float(atr_pct) > float(atr_max_ratio):
                         continue
-                    emergency_cf.setup_ok = True
-                    emergency_cf.planned_qty = 1
-                    emergency_cf.planned_value = float(order_px)
+                    emergency_cf.features["candidate_tier"] = "emergency_force1"
                     emergency_cf.sizing_reason = "EMERGENCY_CANDIDATE_FALLBACK"
                     emergency_cf.sizing_details = {"candidate_tier": "emergency_force1", "qty": 1, "price": order_px}
-                    emergency_cf.features["candidate_tier"] = "emergency_force1"
-                    emergency_cf.client_order_key = self._client_order_key(emergency_cf.code, emergency_cf.mode, "BUY", "close", "PB1")
-                    orderable_candidates.append(emergency_cf)
-                    logger.warning(
-                        "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
-                        emergency_cf.code,
-                    )
+                    if emergency_order_enabled and not emergency_diag_only:
+                        emergency_cf.setup_ok = True
+                        emergency_cf.features["setup_loose_ok"] = True
+                        emergency_cf.features["setup_strict_ok"] = False
+                        emergency_cf.planned_qty = 1
+                        emergency_cf.planned_value = float(order_px)
+                        emergency_cf.client_order_key = self._client_order_key(emergency_cf.code, emergency_cf.mode, "BUY", "close", "PB1")
+                        orderable_candidates.append(emergency_cf)
+                        logger.warning(
+                            "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
+                            emergency_cf.code,
+                        )
+                    else:
+                        logger.warning(
+                            "[ORDER_CANDIDATES][EMERGENCY][DIAG_ONLY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK order_enabled=%s diag_only=%s",
+                            emergency_cf.code,
+                            int(emergency_order_enabled),
+                            int(emergency_diag_only),
+                        )
                     break
+
+            valid_orderable: list[CandidateFeature] = []
+            for cf in orderable_candidates:
+                loose_ok = bool(cf.features.get("setup_loose_ok", cf.setup_ok))
+                strict_ok = bool(cf.features.get("setup_strict_ok", False))
+                if loose_ok or strict_ok:
+                    valid_orderable.append(cf)
+                    continue
+                logger.warning(
+                    "[ORDER_CANDIDATES][DROP] code=%s reason=setup_not_ok loose_ok=%s strict_ok=%s",
+                    cf.code,
+                    int(loose_ok),
+                    int(strict_ok),
+                )
+                self._record_drop(drop_reason_counter, drop_examples, "setup_not_ok", cf.code)
+            orderable_candidates = valid_orderable
 
             orderable_codes = [c.code for c in orderable_candidates]
             logger.info("[ORDER_CANDIDATES] count=%s codes=%s", len(orderable_codes), orderable_codes)

@@ -11,13 +11,21 @@ import pandas as pd
 from trader.config import (
     PB1_DAY_SL_R,
     PB1_DAY_TP_R,
+    PB1_MA20_SLOPE_HARD_FAIL_MIN,
+    PB1_PULLBACK_BAND_KOSDAQ_STRICT,
     PB1_PULLBACK_BAND_KOSDAQ,
+    PB1_PULLBACK_BAND_KOSPI_STRICT,
     PB1_PULLBACK_BAND_KOSPI,
+    PB1_PULLBACK_BAND_RELAXED,
+    PB1_RELAX_MA20_SLOPE,
+    PB1_RELAX_MA_FILTER,
     PB1_R_FLOOR_PCT,
     PB1_SWING_TREND_MIN,
     PB1_SWING_VOL_CONTRACTION_MAX,
     PB1_SWING_VOLU_CONTRACTION_MAX,
+    PB1_VOL_CONTRACTION_MAX_STRICT,
     PB1_VOL_CONTRACTION_MAX,
+    PB1_VOLU_CONTRACTION_MAX_STRICT,
     PB1_VOLU_CONTRACTION_MAX,
     PB1_TIME_STOP_DAYS,
     KOSDAQ_HARD_STOP_PCT,
@@ -99,8 +107,17 @@ def _is_missing(value: float | None) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
-def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool = True) -> Tuple[bool, List[str]]:
+def evaluate_setup(
+    features: Dict[str, float],
+    market: str,
+    require_volume: bool = True,
+    *,
+    mode: str = "relaxed",
+    relax_ma_filter: bool | None = None,
+    relax_ma20_slope: bool | None = None,
+) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
+    soft_reasons: List[str] = []
     close = features.get("close")
     ma20 = features.get("ma20")
     ma50 = features.get("ma50")
@@ -109,21 +126,47 @@ def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool
     volu_c = features.get("volu_contraction")
     slope = features.get("ma20_slope")
     volume_missing = bool(features.get("volume_missing"))
+    use_relaxed_mode = str(mode or "").strip().lower() != "strict"
+    if use_relaxed_mode and not PB1_PULLBACK_BAND_RELAXED:
+        use_relaxed_mode = False
+    if relax_ma_filter is None:
+        relax_ma_filter = PB1_RELAX_MA_FILTER
+    if relax_ma20_slope is None:
+        relax_ma20_slope = PB1_RELAX_MA20_SLOPE
+    if not use_relaxed_mode:
+        relax_ma_filter = False
+        relax_ma20_slope = False
 
     if volume_missing and require_volume:
         reasons.append("volume_missing")
     if close is None or ma20 is None or ma50 is None:
         reasons.append("missing_ma")
     else:
-        if not (close > ma20 and close > ma50):
-            reasons.append("close_below_ma")
-    if slope is None or slope <= 0:
+        if relax_ma_filter:
+            if not (close > ma20):
+                reasons.append("close_below_ma20")
+            if not (close > ma50):
+                soft_reasons.append("close_below_ma50")
+        else:
+            if not (close > ma20 and close > ma50):
+                reasons.append("close_below_ma")
+    if slope is None:
+        reasons.append("ma20_slope_missing")
+    elif relax_ma20_slope:
+        if slope <= PB1_MA20_SLOPE_HARD_FAIL_MIN:
+            reasons.append("ma20_slope_hard_fail")
+        elif slope <= 0:
+            soft_reasons.append("ma20_slope_nonpos")
+    elif slope <= 0:
         reasons.append("ma20_slope_nonpos")
 
     if pullback is None:
         reasons.append("pullback_missing")
     else:
-        low, high = (PB1_PULLBACK_BAND_KOSPI if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ)
+        if use_relaxed_mode:
+            low, high = (PB1_PULLBACK_BAND_KOSPI if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ)
+        else:
+            low, high = (PB1_PULLBACK_BAND_KOSPI_STRICT if market == "KOSPI" else PB1_PULLBACK_BAND_KOSDAQ_STRICT)
         if high <= 1.0:
             # 호환성을 위해 0~1 구간으로 들어온 설정값은 %로 확장
             low *= 100.0
@@ -131,12 +174,15 @@ def evaluate_setup(features: Dict[str, float], market: str, require_volume: bool
         if not (low <= pullback <= high):
             reasons.append("pullback_out_of_band")
 
-    if _is_missing(vol_c) or vol_c > PB1_VOL_CONTRACTION_MAX:
+    vol_max = PB1_VOL_CONTRACTION_MAX if use_relaxed_mode else PB1_VOL_CONTRACTION_MAX_STRICT
+    volu_max = PB1_VOLU_CONTRACTION_MAX if use_relaxed_mode else PB1_VOLU_CONTRACTION_MAX_STRICT
+    if _is_missing(vol_c) or vol_c > vol_max:
         reasons.append("vol_contraction_fail")
-    if not volume_missing and (_is_missing(volu_c) or volu_c > PB1_VOLU_CONTRACTION_MAX):
+    if not volume_missing and (_is_missing(volu_c) or volu_c > volu_max):
         reasons.append("volu_contraction_fail")
 
-    return (len(reasons) == 0, reasons)
+    merged_reasons = reasons + [f"soft:{r}" for r in soft_reasons]
+    return (len(reasons) == 0, merged_reasons)
 
 
 def choose_mode(features: Dict[str, float]) -> Tuple[int, List[str]]:
