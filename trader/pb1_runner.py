@@ -1763,27 +1763,24 @@ def run_once(
     elif action == "smoke" and not compute_only_full_run:
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
-    elif action == "smoke" and compute_only_full_run:
-        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
+    elif action == "smoke" and compute_only_full_run and ((getattr(window, "name", None) == "after") or market_window == "after"):
+        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
         action = "run"
 
     # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
         if mode == "DIAG" and diag_full:
             # ✅ window 타입 유지: WindowDecision 객체로 생성
-            from trader.window_router import WindowDecision
             phase_default = os.getenv("PB1_PHASE_DEFAULT", "entry")
             window = WindowDecision(name="day", phase=phase_default)
             window_label = window.name
             phase_for_log = phase_default
             logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
         elif compute_only_full_run and market_window == "after":
-            window = WindowDecision(name="after", phase="entry")
-            window_label = "after"
             resolved_phase = "entry"
             phase_for_log = "entry"
             phase_reason = "after_compute_only_full_run"
-            logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
+            logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
         else:
             logger.info("[PB1][WINDOW] outside active windows override=%s now=%s", args.window, now)
             return [], False, {}, phase_for_log, "OUTSIDE_WINDOW"
@@ -1894,9 +1891,7 @@ def run_once(
         phase_override_arg = "entry"
         phase_for_log = "entry"
         phase_reason = "after_compute_only_full_run"
-        if window is None:
-            window = WindowDecision(name="after", phase="entry")
-        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] using existing live pipeline path")
+        logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
 
     window_label = _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
