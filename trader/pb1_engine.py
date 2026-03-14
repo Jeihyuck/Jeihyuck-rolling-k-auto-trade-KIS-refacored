@@ -551,7 +551,7 @@ class PB1Engine:
         positions_repo: PositionsRepo,
         ledger_repo: LedgerEventsRepo,
         kis: KisAPI | None,
-        window: WindowDecision,
+        window: WindowDecision | str | None,
         window_label: str,
         phase: str,
         dry_run: bool,
@@ -574,6 +574,16 @@ class PB1Engine:
         precomputed_derived_df: pd.DataFrame | None = None,
         precomputed_universe_df: pd.DataFrame | None = None,
         trade_use_precomputed_features: bool = False,
+        derived_as_of: str | None = None,
+        final30_df: pd.DataFrame | None = None,
+        final30_source: str | None = None,
+        final30_locked: bool = False,
+        watchlist_final_df: pd.DataFrame | None = None,
+        precomputed_features_df: pd.DataFrame | None = None,
+        market_window_name: str | None = None,
+        compute_only_full_run: bool = False,
+        force_block_live: bool = False,
+        trading_day: bool | None = None,
     ) -> None:
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
@@ -581,9 +591,30 @@ class PB1Engine:
         self.positions_repo = positions_repo
         self.ledger_repo = ledger_repo
         self.kis = kis
-        self.window = window
-        self.window_label = window_label
+        raw_window = ""
+        if isinstance(window, str):
+            raw_window = window
+        elif window is not None:
+            raw_window = str(getattr(window, "name", "") or "")
+        raw_window = raw_window or str(window_label or "")
+        normalized_window = raw_window.strip().lower()
+        if normalized_window in {"morning", "preopen", "close", "intraday"}:
+            self.window_name = "intraday"
+        elif normalized_window == "after":
+            self.window_name = "after"
+        else:
+            self.window_name = "day"
+        self.market_window_name = (market_window_name or self.window_name or "day").strip().lower()
+        if self.market_window_name in {"morning", "preopen", "close", "intraday"}:
+            self.market_window_name = "intraday"
+        elif self.market_window_name not in {"after", "day"}:
+            self.market_window_name = "day"
+        self.window = self.window_name
+        self.window_label = self.window_name
         self.phase = phase
+        self.phase_name = (str(phase or "entry").strip().lower() or "entry")
+        if self.phase_name not in {"entry", "exit", "manage"}:
+            self.phase_name = "entry"
         
         # ✅ CRITICAL: dry_run may come as bool/int/str. Never use bool("0")!
         # parse_bool_any handles all cases: bool(True/False), int(0/1), str("0"/"1"/"yes"/"no"/etc)
@@ -636,8 +667,27 @@ class PB1Engine:
             providers.append(KISOHLCVProvider(kis))
         providers.append(KRXOHLCVProvider())
         self.ohlcv_provider = ChainOHLCVProvider(providers, env=env)
-        self.precomputed_final30_df = precomputed_final30_df
-        self.precomputed_derived_df = precomputed_derived_df
+        self._now_kst = now_kst_value or now_kst()
+        self._today = self._now_kst.date().isoformat()
+        derived_default = None
+        if universe_context and getattr(universe_context, "as_of_date", None):
+            derived_default = str(universe_context.as_of_date)
+        self.derived_as_of = str(derived_as_of or derived_default or self._today)
+        self.final30_df = final30_df if final30_df is not None else precomputed_final30_df
+        source_default = None
+        if universe_context and getattr(universe_context, "meta", None):
+            source_default = str((universe_context.meta or {}).get("source") or "")
+        self.final30_source = str(final30_source or source_default or "none")
+        self.final30_locked = bool(final30_locked)
+        if self.final30_df is not None and not self.final30_df.empty:
+            self.final30_locked = True
+        self.watchlist_final_df = watchlist_final_df
+        self.precomputed_features_df = precomputed_features_df
+        self.compute_only_full_run = bool(compute_only_full_run)
+        self.force_block_live = bool(force_block_live)
+        self.trading_day = bool(self._now_kst.weekday() < 5) if trading_day is None else bool(trading_day)
+        self.precomputed_final30_df = precomputed_final30_df if precomputed_final30_df is not None else self.final30_df
+        self.precomputed_derived_df = precomputed_derived_df if precomputed_derived_df is not None else precomputed_features_df
         self.precomputed_universe_df = precomputed_universe_df
         self.trade_use_precomputed_features = bool(trade_use_precomputed_features)
         self._precomputed_final30_map: dict[str, dict[str, Any]] = {}
@@ -674,8 +724,6 @@ class PB1Engine:
         self.ok_count = 0
         self.daily_fetch_count = 0
         self.price_fetch_count = 0
-        self._now_kst = now_kst_value or now_kst()
-        self._today = self._now_kst.date().isoformat()
         self.entry_mode = PB1_ENTRY_MODE
         self.entry_require_both = bool(PB1_REQUIRE_BOTH)
         self.entry_cond_mode = ENTRY_COND_MODE
@@ -717,8 +765,8 @@ class PB1Engine:
             self.bootstrap_enabled,
             self.force_min1_enabled,
             self.force_min1_topn,
-            self.phase,
-            self.window,
+            self.phase_name,
+            self.window_name,
         )
         self.effective_entry_filters = self._resolve_effective_entry_filters()
         self.filter_thresholds = self._resolve_filter_thresholds()
@@ -737,19 +785,10 @@ class PB1Engine:
         self._debug_sizing_fail_items: list[dict[str, Any]] = []
         self._debug_summary: dict[str, Any] = {}
 
-        if (
-            self.phase == "entry"
-            and getattr(self.window, "name", "") == "morning"
-            and getattr(self.window, "phase", "") != "entry"
-        ):
-            logger.error(
-                "[PB1][WINDOW_MISMATCH] expected_phase=entry actual_phase=%s",
-                getattr(self.window, "phase", ""),
-            )
-            if hasattr(self.window, "_replace"):
-                self.window = self.window._replace(phase="entry")
-            else:
-                self.window = WindowDecision(name="morning", phase="entry")
+        logger.info(
+            "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
+            self.derived_as_of,
+        )
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -877,8 +916,8 @@ class PB1Engine:
             )
         logger.info(
             "[PB1][EFFECTIVE_FILTERS] phase=%s window=%s filters=%s",
-            self.phase,
-            self.window,
+            self.phase_name,
+            self.window_name,
             effective,
         )
         return effective
@@ -5390,6 +5429,38 @@ class PB1Engine:
         require_scored = (os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1")
         allow_missing_scored = (os.getenv("ALLOW_TRADE_WITH_MISSING_SCORED_COLUMNS", "0") == "1")
 
+        if self.final30_locked:
+            locked_df = self.final30_df if self.final30_df is not None else pd.DataFrame()
+            usable_locked = bool(locked_df is not None and not locked_df.empty)
+            logger.info(
+                "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s",
+                int(self.final30_locked),
+                self.final30_source,
+                self.derived_as_of,
+                int(usable_locked),
+            )
+            if not usable_locked:
+                logger.error(
+                    "[PB1][INVARIANT][VIOLATION] final30_locked=1 but final30_df is empty as_of=%s source=%s",
+                    self.derived_as_of,
+                    self.final30_source,
+                )
+                raise RuntimeError("FINAL30_LOCK_MISSING")
+            order_rows = [dict(x or {}) for x in locked_df.to_dict(orient="records")]
+            if "rank_final30" in locked_df.columns:
+                order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))
+            elif "score_final" in locked_df.columns:
+                order_rows.sort(key=lambda x: (-float(x.get("score_final") or 0.0), str(x.get("code") or "")))
+            else:
+                order_rows.sort(key=lambda x: str(x.get("code") or ""))
+            logger.info(
+                "[PB1][FINAL30][USE_LOCKED] source=%s as_of=%s rows=%s",
+                self.final30_source,
+                self.derived_as_of,
+                len(order_rows),
+            )
+            return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
+
         if self._universe_context and self._universe_context.members:
             rows = [dict(x or {}) for x in (self._universe_context.members or [])]
             source = str((self._universe_context.meta or {}).get("source") or "universe_context")
@@ -5863,6 +5934,14 @@ class PB1Engine:
         return totals
 
     def run(self) -> RunResult:
+        # IMPORTANT:
+        # Do NOT create a separate after-hours / weekend / smoke trading engine.
+        # The same intraday trade path must be reused for market hours, after-hours compute-only,
+        # and non-trading-day validation. Only order submission gates may differ.
+        # 중요:
+        # 장중 공통 매매 로직을 훼손하지 않는다.
+        # 장마감 후/비거래일 검증도 동일한 trade 경로를 사용하며,
+        # 달라질 수 있는 것은 주문 제출 허용 여부뿐이다.
         self._warned_keys.clear()
         self._setup_reason_counter.clear()
         self.current_code = None
@@ -5978,28 +6057,40 @@ class PB1Engine:
         
         logger.info(
             "[PB1][RUN] window=%s window_internal=%s phase=%s dry_run=%s intended_live=%s env=%s",
-            self.window_label,
+            self.market_window_name,
             self.window_internal,
-            self.phase,
+            self.phase_name,
             self.dry_run,
             self.intended_live,
             self.env,
         )
         trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
-        window_name = (self.window_internal or self.window_label or "").strip().lower()
+        window_name = (self.market_window_name or self.window_internal or self.window_label or "").strip().lower()
+        precomputed_mode_reason = "default"
+        force_precomputed_mode = bool(
+            self.compute_only_full_run
+            or self.force_block_live
+            or (not self.trading_day)
+            or window_name == "after"
+        )
+        if force_precomputed_mode:
+            precomputed_mode_reason = "locked_final30_compute_only"
         self.trade_precomputed_only = bool(
-            self.phase == "entry"
+            self.phase_name == "entry"
+            and self.final30_locked
             and bool(self._precomputed_final30_map)
             and self.trade_use_precomputed_features
             and window_name in {"morning", "day", "intraday", "after"}
             and trade_input == "final30"
+            and force_precomputed_mode
         )
         logger.info(
-            "[PB1][DATA_MODE] precomputed_only=%s phase=%s trade_input=%s window=%s",
+            "[PB1][DATA_MODE] precomputed_only=%s phase=%s trade_input=%s window=%s reason=%s",
             self.trade_precomputed_only,
-            self.phase,
+            self.phase_name,
             trade_input,
             window_name,
+            precomputed_mode_reason,
         )
         # 타입 검증: orders 테이블의 시간 컬럼 타입 확인
         try:
@@ -6401,12 +6492,19 @@ class PB1Engine:
         
         # ✅ FIX B: actual_as_of를 universe_context에서 추출 (trade 모드에서 watchlist lock된 as_of)
         # 리포트용 today() 날짜가 아니라, 실제 데이터 기반 as_of를 사용
+        if not self.derived_as_of:
+            raise RuntimeError("ASOF_LOCK_MISSING")
+        as_of_final = str(self.derived_as_of)
+        reason = "run_ctx_lock"
         if self._universe_context and self._universe_context.as_of_date:
-            as_of_final = self._universe_context.as_of_date
-            reason = f"universe_context (source={self._universe_context.meta.get('source', 'unknown') if self._universe_context.meta else 'unknown'})"
-        else:
-            as_of_final = get_as_of_date()
-            reason = "fallback_today"
+            universe_as_of = str(self._universe_context.as_of_date)
+            if universe_as_of != as_of_final:
+                logger.error(
+                    "[PB1][INVARIANT][VIOLATION] derived_as_of_mismatch start=%s universe=%s",
+                    as_of_final,
+                    universe_as_of,
+                )
+                raise RuntimeError("ASOF_INVARIANT_VIOLATION")
         
         logger.info(
             "[PB1][ASOF][CONTEXT] as_of_final=%s reason=%s universe_context_available=%s",
@@ -6490,6 +6588,13 @@ class PB1Engine:
             )
             scan_members = [{"code": c, "market": code_market.get(c, "")} for c in canonical_codes]
             scan_source = "final30"
+            if len(final30_codes) > 0 and len(scan_members) != len(final30_codes):
+                logger.error(
+                    "[PB1][INVARIANT][VIOLATION] final30_rows=%s engine_input_rows=%s",
+                    len(final30_codes),
+                    len(scan_members),
+                )
+                raise RuntimeError("FINAL30_INPUT_ROWS_MISMATCH")
         else:
             scan_members, scan_source = self._resolve_scan_members_for_entry(
                 universe_members=universe_members,

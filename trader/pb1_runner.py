@@ -1065,6 +1065,35 @@ def _resolve_window_label(market_window: str, window: WindowDecision | None) -> 
     return window.name if window else "none"
 
 
+def _normalize_window_phase(*, raw_window: Any, market_window: str, phase: str) -> tuple[str, str]:
+    raw_name = ""
+    raw_type = type(raw_window).__name__ if raw_window is not None else "NoneType"
+    if isinstance(raw_window, str):
+        raw_name = raw_window
+    elif raw_window is not None:
+        raw_name = str(getattr(raw_window, "name", "") or "")
+    seed = (market_window or raw_name or "day").strip().lower()
+    if seed in {"preopen", "morning", "intraday", "close"}:
+        window_name = "intraday"
+    elif seed == "after":
+        window_name = "after"
+    else:
+        window_name = "day"
+    phase_seed = (phase or "entry").strip().lower()
+    if phase_seed in {"entry", "exit", "manage"}:
+        phase_name = phase_seed
+    else:
+        phase_name = "entry"
+    logger.info(
+        "[WINDOW][NORMALIZED] raw_type=%s raw_name=%s normalized_window=%s normalized_phase=%s",
+        raw_type,
+        raw_name or "none",
+        window_name,
+        phase_name,
+    )
+    return window_name, phase_name
+
+
 def _parse_hhmm_to_time(hhmm: str) -> dtime:
     hh, mm = hhmm.split(":")
     return dtime(hour=int(hh), minute=int(mm))
@@ -1504,11 +1533,28 @@ def run_once(
     trade_budget_sec = max(0, max_seconds - persist_budget_sec) if max_seconds > 0 else 0
     run_start_ts = time_mod.time()
     
+    # IMPORTANT:
+    # Do NOT create a separate after-hours / weekend / smoke trading engine.
+    # The same intraday trade path must be reused for market hours, after-hours compute-only,
+    # and non-trading-day validation. Only order submission gates may differ.
+    # 중요:
+    # 장중 공통 매매 로직을 훼손하지 않는다.
+    # 장마감 후/비거래일 검증도 동일한 trade 경로를 사용하며,
+    # 달라질 수 있는 것은 주문 제출 허용 여부뿐이다.
     # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
     trade_date = now.date()
     derived_as_of_date = resolve_derived_as_of(now)
     as_of = derived_as_of_date.isoformat()
     asof_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "INTRADAY_USE_PREV_CLOSE"
+    run_ctx: dict[str, Any] = {
+        "trade_date": trade_date.isoformat(),
+        "derived_as_of": as_of,
+        "window_name": "day",
+        "phase_name": "entry",
+        "final30_source": None,
+        "final30_locked": False,
+    }
+    os.environ["AS_OF_OVERRIDE"] = as_of
     
     logger.info(
         "[ASOF][RUN_ONCE] trade_date=%s derived_as_of=%s reason=%s",
@@ -1516,6 +1562,7 @@ def run_once(
         as_of,
         asof_reason,
     )
+    logger.info("[ASOF][LOCK] trade_date=%s derived_as_of=%s immutable=1", trade_date.isoformat(), as_of)
     
     runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
@@ -1585,6 +1632,14 @@ def run_once(
         window_override=args.window,
         phase_seed=phase_seed,
     )
+    normalized_window_name, normalized_phase_name = _normalize_window_phase(
+        raw_window=resolved_window,
+        market_window=market_window,
+        phase=resolved_phase,
+    )
+    run_ctx["window_name"] = normalized_window_name
+    run_ctx["phase_name"] = normalized_phase_name
+    logger.info("[ASOF][USE] component=runner value=%s source=run_ctx", run_ctx["derived_as_of"])
     
     # ✅ DIAG_FULL_EXEC: DIAG 모드에서 window/phase 강제 우회
     diag_full_exec = env_bool("PB1_DIAG_FULL_EXEC", False)
@@ -1604,6 +1659,13 @@ def run_once(
         context_reasons.append("window:locked")
     window = resolved_window
     phase_for_log = resolved_phase
+    normalized_window_name, normalized_phase_name = _normalize_window_phase(
+        raw_window=window,
+        market_window=market_window,
+        phase=phase_for_log,
+    )
+    run_ctx["window_name"] = normalized_window_name
+    run_ctx["phase_name"] = normalized_phase_name
 
     os.environ.setdefault("MORNING_WINDOW_START", MORNING_WINDOW_START)
     os.environ.setdefault("MORNING_WINDOW_END", MORNING_WINDOW_END)
@@ -1709,9 +1771,8 @@ def run_once(
             # nontrading_smoke는 실행하되, 엔진도 계속 진행
             exit_status = "DIAG_NONTRADING_CONTINUE"
             
-            # ✅ CRITICAL: DIAG 모드에서도 derived_as_of 사용
-            diag_derived_as_of_date = resolve_derived_as_of(now)
-            as_of = diag_derived_as_of_date.isoformat()
+            # ✅ CRITICAL: DIAG 모드에서도 run 시작 시 lock된 derived_as_of를 그대로 사용
+            as_of = str(run_ctx.get("derived_as_of") or as_of)
             
             logger.info(
                 "[ASOF][DIAG][NONTRADING] trade_date=%s derived_as_of=%s",
@@ -1743,6 +1804,15 @@ def run_once(
                 except Exception as exc:
                     logger.warning("[NONTRADING_SMOKE][FAIL] err=%s", exc)
             # ✅ DIAG는 계속 실행 (return 하지 않음)
+        elif compute_only_full_run or bool(compute_only_flags.get("force_block_live")) or dry_run:
+            logger.info(
+                "[PB1][NONTRADING][COMPUTE] continue same trade path order_blocked=1 derived_as_of=%s",
+                str(run_ctx.get("derived_as_of") or as_of),
+            )
+            market_window = "after"
+            window_label = "after"
+            run_ctx["window_name"] = "after"
+            run_ctx["phase_name"] = "entry"
         else:
             # LIVE 모드: 장외면 스킵
             exit_status = "NONTRADING_DAY_EXIT"
@@ -1763,19 +1833,21 @@ def run_once(
     elif action == "smoke" and not compute_only_full_run:
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
-    elif action == "smoke" and compute_only_full_run and ((getattr(window, "name", None) == "after") or market_window == "after"):
+    elif action == "smoke" and compute_only_full_run and ((run_ctx.get("window_name") == "after") or market_window == "after"):
         logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
         action = "run"
 
     # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
         if mode == "DIAG" and diag_full:
-            # ✅ window 타입 유지: WindowDecision 객체로 생성
+            # ✅ window 객체를 강제 생성하지 않고 문자열 컨텍스트로 고정
             phase_default = os.getenv("PB1_PHASE_DEFAULT", "entry")
-            window = WindowDecision(name="day", phase=phase_default)
-            window_label = window.name
+            window = None
+            window_label = "day"
             phase_for_log = phase_default
-            logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window.name, phase_default)
+            run_ctx["window_name"] = "day"
+            run_ctx["phase_name"] = "entry" if phase_default not in {"entry", "exit", "manage"} else phase_default
+            logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window_label, phase_default)
         elif compute_only_full_run and market_window == "after":
             resolved_phase = "entry"
             phase_for_log = "entry"
@@ -1856,16 +1928,12 @@ def run_once(
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_override_arg = resolved_phase
     
-    # ✅ 방어: window가 bool로 잘못 설정되지 않았는지 체크
-    if isinstance(window, bool):
-        raise RuntimeError(f"BUG: window became bool. check DIAG_FULL override. window={window}")
-    
     if (
-        window
+        window_label
         and event_name_lower == "push"
         and args.phase == "auto"
         and not force_phase_env
-        and window.name == "day"
+        and window_label == "day"
         and env_bool("PB1_FORCE_ENTRY_ON_PUSH", PB1_FORCE_ENTRY_ON_PUSH)
     ):
         try:
@@ -1884,7 +1952,8 @@ def run_once(
         if args.phase == "auto" and not force_phase_env:
             phase_override_arg = "verify"
             phase_reason = "diagnostic"
-        window = window or WindowDecision(name="diagnostic", phase=phase_override_arg or "verify")
+        window = None
+        window_label = "day"
         _apply_env_flags_if_needed(dry_run)
 
     if compute_only_full_run and market_window == "after":
@@ -1893,20 +1962,16 @@ def run_once(
         phase_reason = "after_compute_only_full_run"
         logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
 
-    window_label = _resolve_window_label(market_window, window)
+    window_label = window_label or _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
 
-    if (
-        phase_for_log == "entry"
-        and window is not None
-        and window.name == "morning"
-        and window.phase != "entry"
-    ):
-        logger.error("[PB1][WINDOW_MISMATCH] expected_phase=entry actual_phase=%s", window.phase)
-        if hasattr(window, "_replace"):
-            window = window._replace(phase="entry")
-        else:
-            window = WindowDecision(name="morning", phase="entry")
+    normalized_window_name, normalized_phase_name = _normalize_window_phase(
+        raw_window=window_label,
+        market_window=market_window,
+        phase=phase_for_log,
+    )
+    run_ctx["window_name"] = normalized_window_name
+    run_ctx["phase_name"] = normalized_phase_name
 
     context_reasons = [r for r in context_reasons if not r.startswith("window:") and not r.startswith("phase:")]
     context_reasons.append(f"window:{window_label}")
@@ -2130,15 +2195,25 @@ def run_once(
     precomputed_universe_df = pd.DataFrame()
     trade_use_precomputed_features = False
     try:
-        if not close_cancel_only and trading_day and (
-            market_window in {"preopen", "morning", "day", "close"}
-            or (market_window == "after" and compute_only_full_run)
-        ):
+        should_lock_entry_sources = (
+            not close_cancel_only
+            and (
+                trading_day
+                or compute_only_full_run
+                or (not trading_day)
+            )
+            and (
+                market_window in {"preopen", "morning", "day", "close", "after", "intraday"}
+                or compute_only_full_run
+                or (not trading_day)
+            )
+        )
+        if should_lock_entry_sources:
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
                     engine=engine,
-                    as_of=as_of,
+                    as_of=str(run_ctx.get("derived_as_of") or as_of),
                     env=kis_env or "practice",
                     strategy=universe_strategy,
                 )
@@ -2156,7 +2231,16 @@ def run_once(
             if mode_input == "trade" and universe_ctx and universe_ctx.members:
                 precomputed_final30_df = pd.DataFrame(list(universe_ctx.members or []))
                 if not precomputed_final30_df.empty:
+                    final30_source_name = str((universe_ctx.meta or {}).get("source") or "db_pb1_watchlist_final_scored")
+                    run_ctx["final30_source"] = final30_source_name
+                    run_ctx["final30_locked"] = True
                     trade_use_precomputed_features = True
+                    logger.info(
+                        "[TRADE][FINAL30][LOCK] source=%s as_of=%s rows=%s locked=1",
+                        final30_source_name,
+                        str(run_ctx.get("derived_as_of") or as_of),
+                        len(precomputed_final30_df),
+                    )
                     logger.info(
                         "[TRADE][PRECOMPUTED_FEATURES] enabled=1 source=pb1_watchlist_final_scored rows=%s",
                         len(precomputed_final30_df),
@@ -2166,7 +2250,7 @@ def run_once(
                         derived_repo = DerivedMinerviniRepo(engine)
                         derived_rows, _actual_as_of = derived_repo.load_for_as_of_with_fallback(
                             env=kis_env or "practice",
-                            as_of=date.fromisoformat(as_of),
+                            as_of=date.fromisoformat(str(run_ctx.get("derived_as_of") or as_of)),
                             symbols=symbols,
                             ttl_days=7,
                         )
@@ -2178,7 +2262,7 @@ def run_once(
                         universe_rows, _used_as_of = watchlist_repo.load_watchlist_scored(
                             env=kis_env or "practice",
                             strategy="pb1_universe_scored",
-                            as_of=date.fromisoformat(as_of),
+                            as_of=date.fromisoformat(str(run_ctx.get("derived_as_of") or as_of)),
                             allow_latest_fallback=True,
                             ttl_days=7,
                             max_back_days=3,
@@ -2186,11 +2270,23 @@ def run_once(
                         precomputed_universe_df = pd.DataFrame(list(universe_rows or []))
                     except Exception:
                         precomputed_universe_df = pd.DataFrame()
+                    logger.info(
+                        "[ENTRY_SOURCE][LOCK] final30_rows=%s watchlist_rows=%s precomputed_rows=%s",
+                        len(precomputed_final30_df),
+                        len(precomputed_final30_df),
+                        len(precomputed_derived_df),
+                    )
             setattr(ctx, "precomputed_final30_df", precomputed_final30_df)
             setattr(ctx, "precomputed_derived_df", precomputed_derived_df)
             setattr(ctx, "precomputed_universe_df", precomputed_universe_df)
             setattr(ctx, "trade_use_precomputed_features", bool(trade_use_precomputed_features))
         kis: KisAPI | None = None
+        allow_compute_without_kis = bool(
+            compute_only_full_run
+            or (not trading_day)
+            or market_window == "after"
+            or bool(compute_only_flags.get("force_block_live"))
+        )
         try:
             kis = KisAPI()
             if kis.env != kis_env:
@@ -2199,8 +2295,12 @@ def run_once(
                 intended_live = False  # ✅ CRITICAL: must sync intended_live when forcing dry_run
                 _apply_env_flags_if_needed(dry_run)
         except Exception:
-            logger.exception("[PB1] KIS init failed -> skip tick")
-            return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
+            if allow_compute_without_kis:
+                logger.warning("[PB1][KIS][OPTIONAL_FAIL] init failed but compute-only path continues", exc_info=True)
+                kis = None
+            else:
+                logger.exception("[PB1] KIS init failed -> skip tick")
+                return touched_files, False, {}, phase_for_log, "SKIP_KIS_INIT"
 
         balance_snapshot_raw: dict | None = None
         balance_source: str | None = None
@@ -2409,7 +2509,7 @@ def run_once(
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
 
-        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY:
+        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY and not allow_compute_without_kis:
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             db_write_reasons.append("balance_degraded")
@@ -2437,9 +2537,9 @@ def run_once(
             positions_repo=positions_repo,
             ledger_repo=ledger_repo,
             kis=kis,
-            window=window,
-            window_label=window_label,
-            phase=phase_override_arg,
+            window=run_ctx.get("window_name") or window_label,
+            window_label=run_ctx.get("window_name") or window_label,
+            phase=run_ctx.get("phase_name") or phase_override_arg,
             dry_run=dry_run_for_engine,  # ✅ bool 강제된 값 전달
             env=kis_env or "practice",
             run_id=run_record_id,
@@ -2460,6 +2560,16 @@ def run_once(
             precomputed_derived_df=precomputed_derived_df,
             precomputed_universe_df=precomputed_universe_df,
             trade_use_precomputed_features=trade_use_precomputed_features,
+            derived_as_of=str(run_ctx.get("derived_as_of") or as_of),
+            final30_df=precomputed_final30_df,
+            final30_source=str(run_ctx.get("final30_source") or "db_pb1_watchlist_final_scored"),
+            final30_locked=bool(run_ctx.get("final30_locked")) and (precomputed_final30_df is not None and not precomputed_final30_df.empty),
+            watchlist_final_df=precomputed_final30_df,
+            precomputed_features_df=precomputed_derived_df,
+            market_window_name=run_ctx.get("window_name") or "day",
+            compute_only_full_run=compute_only_full_run,
+            force_block_live=bool(compute_only_flags.get("force_block_live")),
+            trading_day=trading_day,
         )
         
         # ✅ DIAG_FULL_EXEC 실행 로그
@@ -2474,10 +2584,14 @@ def run_once(
         # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
         entry_signals_result = {}
         entry_scan_compat_failed = False
-        if phase_override_arg == "entry" and not close_cancel_only:
+        if (run_ctx.get("phase_name") or phase_override_arg) == "entry" and not close_cancel_only:
             try:
-                # Watchlist 로드 (universe_ctx에서)
-                watchlist_members = universe_ctx.members if universe_ctx else []
+                locked_watchlist_members = []
+                if precomputed_final30_df is not None and not precomputed_final30_df.empty:
+                    locked_watchlist_members = [dict(x or {}) for x in precomputed_final30_df.to_dict(orient="records")]
+                elif universe_ctx:
+                    locked_watchlist_members = list(universe_ctx.members or [])
+                watchlist_members = locked_watchlist_members
                 
                 if watchlist_members:
                     logger.info("[ENTRY_SCAN] start scanning %s symbols", len(watchlist_members))
@@ -2485,10 +2599,10 @@ def run_once(
                     # OHLCV Provider 설정
                     trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
                     trade_precomputed_only = bool(
-                        phase_override_arg == "entry"
+                        (run_ctx.get("phase_name") or phase_override_arg) == "entry"
                         and trade_use_precomputed_features
                         and not precomputed_final30_df.empty
-                        and (window_label or "").strip().lower() in {"morning", "day", "intraday", "after"}
+                        and (run_ctx.get("window_name") or window_label or "").strip().lower() in {"day", "intraday", "after"}
                         and trade_input == "final30"
                     )
 
@@ -2544,7 +2658,11 @@ def run_once(
                             signal.close,
                         )
                 else:
-                    logger.warning("[ENTRY_SCAN] skipped - no watchlist members")
+                    logger.error(
+                        "[ENTRY_SCAN][LOCK_MISSING] final30_locked=%s derived_as_of=%s",
+                        int(bool(run_ctx.get("final30_locked"))),
+                        str(run_ctx.get("derived_as_of") or as_of),
+                    )
             except Exception as exc:
                 entry_scan_compat_failed = True
                 logger.warning(
@@ -2559,6 +2677,23 @@ def run_once(
             result = engine_runner.run()
             if entry_scan_compat_failed:
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
+
+        if result is not None:
+            result_reason = result.notes or "none"
+            if not trading_day and (compute_only_full_run or dry_run or bool(compute_only_flags.get("force_block_live"))):
+                result.status = "OK_NONTRADING_COMPUTE"
+                result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
+            elif market_window == "after" and compute_only_full_run:
+                result.status = "OK_WINDOW_BLOCKED_COMPUTE"
+                result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
+            elif result.status in {"OK_NO_TRADE", "NO_TRADE"} and result.notes and "no_candidates" in result.notes:
+                result.status = "OK_NO_CANDIDATES"
+                result_reason = "NO_CANDIDATES_AFTER_RELAX"
+            elif result.status in {"OK_NO_TRADE", "NO_TRADE"}:
+                result.status = "OK_NO_TRADE"
+                result_reason = result.notes or "NO_ORDER_INTENTS"
+            logger.info("[RUN_SUMMARY][RESULT] status=%s reason=%s", result.status, result_reason)
+            result.notes = result_reason
         
         # ✅ RUN 요약 JSON 생성
         try:
@@ -3510,8 +3645,6 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
-    if result_status == "ERROR":
-        return 0
     return _exit_code_for_status(result_status)
 
 
