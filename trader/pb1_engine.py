@@ -76,6 +76,8 @@ from trader.config import (
     PB1_VOLU_MAX_INTRADAY,
     PB1_PULLBACK_MIN,
     PB1_PULLBACK_MAX,
+    PB1_RELAX_MA_FILTER,
+    PB1_RELAX_MA20_SLOPE,
     PB1_ENTRY_MODE,
     PB1_REQUIRE_BOTH,
     PB1_REQUIRE_BOTH_CONTRACTIONS,
@@ -640,6 +642,7 @@ class PB1Engine:
         self.trade_use_precomputed_features = bool(trade_use_precomputed_features)
         self._precomputed_final30_map: dict[str, dict[str, Any]] = {}
         self._precomputed_derived_map: dict[str, dict[str, Any]] = {}
+        self._precomputed_universe_map: dict[str, dict[str, Any]] = {}
         self._data_metrics: dict[str, int] = {
             "precomputed_hits": 0,
             "short_fetch_count": 0,
@@ -659,6 +662,11 @@ class PB1Engine:
                 code_key = str((row or {}).get("symbol") or (row or {}).get("code") or "").zfill(6)
                 if code_key:
                     self._precomputed_derived_map[code_key] = dict(row or {})
+        if self.precomputed_universe_df is not None and not self.precomputed_universe_df.empty:
+            for row in self.precomputed_universe_df.to_dict(orient="records"):
+                code_key = str((row or {}).get("symbol") or (row or {}).get("code") or "").zfill(6)
+                if code_key:
+                    self._precomputed_universe_map[code_key] = dict(row or {})
         self._setup_reason_counter: Counter[str] = Counter()
         self.reject_reason_counts: dict[str, int] = {}
         self.reject_reason_samples: dict[str, list[str]] = {}
@@ -1015,6 +1023,236 @@ class PB1Engine:
         except Exception:
             return None
 
+    @staticmethod
+    def _value_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        if isinstance(value, (float, np.floating)):
+            return not np.isfinite(float(value))
+        return False
+
+    @classmethod
+    def _has_numeric_value(cls, value: Any) -> bool:
+        if cls._value_missing(value):
+            return False
+        try:
+            return np.isfinite(float(value))
+        except Exception:
+            return False
+
+    @classmethod
+    def _pick_first_present(cls, row: dict[str, Any] | None, *keys: str) -> Any:
+        source = row or {}
+        for key in keys:
+            value = source.get(key)
+            if not cls._value_missing(value):
+                return value
+        return None
+
+    @classmethod
+    def _pick_first_float(cls, row: dict[str, Any] | None, *keys: str) -> float | None:
+        return cls._to_float(cls._pick_first_present(row, *keys))
+
+    @classmethod
+    def _normalize_pullback_pct(cls, value: Any) -> float | None:
+        pullback_pct = cls._to_float(value)
+        if pullback_pct is None:
+            return None
+        if 0.0 < pullback_pct <= 1.0:
+            return float(pullback_pct) * 100.0
+        return float(pullback_pct)
+
+    @classmethod
+    def _zero_like_missing(cls, key: str, value: Any, *, zero_missing_keys: set[str] | None = None) -> bool:
+        if key not in (zero_missing_keys or set()):
+            return False
+        try:
+            return float(value) == 0.0
+        except Exception:
+            return False
+
+    @classmethod
+    def _merge_non_missing(
+        cls,
+        target: dict[str, Any],
+        source: dict[str, Any] | None,
+        *,
+        zero_missing_keys: set[str] | None = None,
+    ) -> None:
+        for key, value in (source or {}).items():
+            if key in target and not cls._value_missing(target.get(key)) and not cls._zero_like_missing(
+                key,
+                target.get(key),
+                zero_missing_keys=zero_missing_keys,
+            ):
+                continue
+            if cls._value_missing(value):
+                continue
+            target[key] = value
+
+    def _map_precomputed_candidate_row(self, code: str) -> tuple[dict[str, Any], dict[str, int], list[str], bool, bool]:
+        pre_row = dict(self._precomputed_final30_map.get(code) or {})
+        derived_row = dict(self._precomputed_derived_map.get(code) or {})
+        universe_row = dict(self._precomputed_universe_map.get(code) or {})
+        derived_extra = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
+        zero_fill_keys = {
+            "atr_pct",
+            "high20",
+            "ma10",
+            "ma20",
+            "ma50",
+            "ma150",
+            "ma20_slope",
+            "pullback_pct",
+            "tr_range_pct",
+            "trend_strength",
+            "value20",
+            "vol_contraction",
+            "volu_contraction",
+        }
+
+        mapped: dict[str, Any] = {
+            "close": self._pick_first_float(pre_row, "close", "last_close"),
+            "ma20": self._pick_first_float(pre_row, "ma20"),
+            "ma50": self._pick_first_float(pre_row, "ma50"),
+            "ma150": self._pick_first_float(pre_row, "ma150"),
+            "breakout_score": self._pick_first_float(pre_row, "breakout_score"),
+            "pullback_score": self._pick_first_float(pre_row, "pullback_score"),
+            "momentum_score": self._pick_first_float(pre_row, "momentum_score"),
+            "rs_percentile": self._pick_first_float(pre_row, "rs_percentile", "rs_pctile", "rs_score"),
+            "vcp_score": self._pick_first_float(pre_row, "vcp_score"),
+            "trend_score": self._pick_first_float(pre_row, "trend_score"),
+            "entry_style_selected": self._pick_first_present(pre_row, "entry_style_selected"),
+            "pullback_pct": self._normalize_pullback_pct(self._pick_first_present(pre_row, "pullback_pct")),
+            "atr_pct": self._pick_first_float(pre_row, "atr_pct"),
+            "score_final": self._pick_first_float(pre_row, "score_final", "final_score"),
+            "tech_score": self._pick_first_float(pre_row, "tech_score", "score_tech"),
+        }
+        self._merge_non_missing(mapped, pre_row, zero_missing_keys=zero_fill_keys)
+        self._merge_non_missing(mapped, derived_extra, zero_missing_keys=zero_fill_keys)
+        self._merge_non_missing(
+            mapped,
+            {
+                "close": self._pick_first_float(derived_row, "close", "last_close"),
+                "ma20": self._pick_first_float(derived_row, "ma20"),
+                "ma50": self._pick_first_float(derived_row, "ma50"),
+                "ma150": self._pick_first_float(derived_row, "ma150"),
+                "breakout_score": self._pick_first_float(derived_row, "breakout_score"),
+                "pullback_score": self._pick_first_float(derived_row, "pullback_score"),
+                "momentum_score": self._pick_first_float(derived_row, "momentum_score"),
+                "rs_percentile": self._pick_first_float(derived_row, "rs_percentile", "rs_pctile", "rs_score"),
+                "vcp_score": self._pick_first_float(derived_row, "vcp_score"),
+                "trend_score": self._pick_first_float(derived_row, "trend_score"),
+                "entry_style_selected": self._pick_first_present(derived_row, "entry_style_selected"),
+                "pullback_pct": self._normalize_pullback_pct(self._pick_first_present(derived_row, "pullback_pct")),
+                "atr_pct": self._pick_first_float(derived_row, "atr_pct"),
+                "score_final": self._pick_first_float(derived_row, "score_final", "final_score"),
+                "tech_score": self._pick_first_float(derived_row, "tech_score", "score_tech"),
+            },
+            zero_missing_keys=zero_fill_keys,
+        )
+        self._merge_non_missing(mapped, derived_row, zero_missing_keys=zero_fill_keys)
+        self._merge_non_missing(
+            mapped,
+            {
+                "close": self._pick_first_float(universe_row, "close", "last_close"),
+                "ma20": self._pick_first_float(universe_row, "ma20"),
+                "ma50": self._pick_first_float(universe_row, "ma50"),
+                "ma150": self._pick_first_float(universe_row, "ma150"),
+                "breakout_score": self._pick_first_float(universe_row, "breakout_score"),
+                "pullback_score": self._pick_first_float(universe_row, "pullback_score"),
+                "momentum_score": self._pick_first_float(universe_row, "momentum_score"),
+                "rs_percentile": self._pick_first_float(universe_row, "rs_percentile", "rs_pctile", "rs_score"),
+                "vcp_score": self._pick_first_float(universe_row, "vcp_score"),
+                "trend_score": self._pick_first_float(universe_row, "trend_score"),
+                "entry_style_selected": self._pick_first_present(universe_row, "entry_style_selected"),
+                "pullback_pct": self._normalize_pullback_pct(self._pick_first_present(universe_row, "pullback_pct")),
+                "atr_pct": self._pick_first_float(universe_row, "atr_pct"),
+                "score_final": self._pick_first_float(universe_row, "score_final", "final_score"),
+                "tech_score": self._pick_first_float(universe_row, "tech_score", "score_tech"),
+            },
+            zero_missing_keys=zero_fill_keys,
+        )
+        self._merge_non_missing(mapped, universe_row, zero_missing_keys=zero_fill_keys)
+
+        checks = {
+            "has_close": int(self._has_numeric_value(mapped.get("close"))),
+            "has_breakout_score": int(self._has_numeric_value(mapped.get("breakout_score"))),
+            "has_pullback_score": int(self._has_numeric_value(mapped.get("pullback_score"))),
+            "has_momentum_score": int(self._has_numeric_value(mapped.get("momentum_score"))),
+            "has_rs_percentile": int(self._has_numeric_value(mapped.get("rs_percentile"))),
+            "has_vcp_score": int(self._has_numeric_value(mapped.get("vcp_score"))),
+            "has_ma20": int(self._has_numeric_value(mapped.get("ma20"))),
+            "has_ma50": int(self._has_numeric_value(mapped.get("ma50"))),
+            "has_ma150": int(self._has_numeric_value(mapped.get("ma150"))),
+            "has_entry_style_selected": int(not self._value_missing(mapped.get("entry_style_selected"))),
+            "has_price_context": int(
+                any(
+                    self._has_numeric_value(mapped.get(key))
+                    for key in ("pullback_pct", "atr_pct", "high20", "tr_range_pct", "vol_contraction", "volu_contraction")
+                )
+            ),
+        }
+        reasons: list[str] = []
+        if not (pre_row or derived_row or universe_row):
+            reasons.append("schema_not_mapped")
+        if not checks["has_close"]:
+            reasons.append("missing_close")
+        if not checks["has_breakout_score"]:
+            reasons.append("missing_breakout_score")
+        if not checks["has_pullback_score"]:
+            reasons.append("missing_pullback_score")
+        if not checks["has_momentum_score"]:
+            reasons.append("missing_momentum_score")
+        if not checks["has_rs_percentile"]:
+            reasons.append("missing_rs_percentile")
+        if not checks["has_vcp_score"]:
+            reasons.append("missing_vcp_score")
+        if not checks["has_ma20"]:
+            reasons.append("missing_ma20")
+        if not checks["has_ma50"]:
+            reasons.append("missing_ma50")
+        if not checks["has_ma150"]:
+            reasons.append("missing_ma150")
+        if not checks["has_entry_style_selected"]:
+            reasons.append("missing_entry_style_selected")
+        if not checks["has_price_context"]:
+            reasons.append("missing_price_context")
+
+        usable_precomputed_row = all(
+            checks[key]
+            for key in (
+                "has_close",
+                "has_breakout_score",
+                "has_pullback_score",
+                "has_momentum_score",
+                "has_rs_percentile",
+                "has_vcp_score",
+                "has_ma20",
+                "has_ma50",
+                "has_ma150",
+                "has_entry_style_selected",
+                "has_price_context",
+            )
+        )
+        precomputed_data_ok = all(
+            checks[key]
+            for key in (
+                "has_close",
+                "has_breakout_score",
+                "has_pullback_score",
+                "has_momentum_score",
+                "has_rs_percentile",
+                "has_ma20",
+                "has_ma50",
+                "has_ma150",
+            )
+        )
+        checks["usable_precomputed_row"] = int(usable_precomputed_row)
+        return mapped, checks, reasons, usable_precomputed_row, precomputed_data_ok
+
     def _extract_holdings_prices(self, holdings_rows: Iterable[dict]) -> Dict[str, float]:
         prices: Dict[str, float] = {}
         for row in holdings_rows or []:
@@ -1215,41 +1453,37 @@ class PB1Engine:
         }
         ledger_store = LedgerStore(LEDGER_BASE_DIR, env=self.env, run_id=self.run_id)
         ledger_positions = ledger_store.rebuild_positions_average_cost(lookback_days=LEDGER_LOOKBACK_DAYS)
-        if ledger_positions:
-            api_codes = set(kis_holdings.keys())
-            for (code, sid, mode), state in ledger_positions.items():
-                if sid != 1:
-                    continue
-                total_qty = int(state.get("total_qty") or 0)
-                if total_qty <= 0 or code in api_codes:
-                    continue
-                logger.warning(
-                    "[RECONCILE][ORPHAN] code=%s reason=ledger_only ledger_qty=%s",
-                    code,
-                    total_qty,
-                )
-                self.ledger_repo.append_event(
-                    env=self.env,
-                    run_id=self.run_id,
-                    strategy=self.STRATEGY_NAME,
-                    event_type="POSITION_ORPHANED",
-                    ts=now_kst(),
-                    code=code,
-                    market=state.get("market"),
-                    sid=sid,
-                    mode=mode,
-                    qty=total_qty,
-                    ok=True,
-                    reasons=["ledger_only"],
-                    payload_json={"ledger_total_qty": total_qty},
-                )
+        api_codes = set(kis_holdings.keys())
+        for (code, sid, mode), state in ledger_positions.items():
+            if sid != 1:
+                continue
+            total_qty = int(state.get("total_qty") or 0)
+            if total_qty <= 0 or code in api_codes:
+                continue
+            logger.warning(
+                "[RECONCILE][ORPHAN] code=%s reason=ledger_only ledger_qty=%s",
+                code,
+                total_qty,
+            )
+            self.ledger_repo.add_event(
+                env=self.env,
+                run_id=self.run_id,
+                strategy=self.STRATEGY_NAME,
+                event_type="POSITION_ORPHANED",
+                code=code,
+                market=state.get("market"),
+                sid=sid,
+                qty=total_qty,
+                ok=True,
+                payload_json={"ledger_total_qty": total_qty},
+            )
         ledger_by_code: dict[str, dict] = {}
         for (code, sid, mode), state in ledger_positions.items():
             if sid != 1:
                 continue
             existing = ledger_by_code.get(code)
             if not existing or int(state.get("total_qty") or 0) > int(existing.get("total_qty") or 0):
-                ledger_by_code[code] = {**state, "sid": sid, "mode": mode, "code": code}
+                ledger_by_code[code] = state
 
         positions: list[dict] = []
         for code, holding in kis_holdings.items():
@@ -1259,8 +1493,6 @@ class PB1Engine:
             avg = holding.get("avg_buy_price") or ledger_state.get("avg_buy_price") or 0.0
             positions.append(
                 {
-                    "code": code,
-                    "sid": 1,
                     "mode": int(ledger_state.get("mode") or 1),
                     "qty": qty,
                     "kis_qty": qty,
@@ -4937,40 +5169,35 @@ class PB1Engine:
                 continue
             market = code_market.get(code, "")
             try:
-                pre_row = self._precomputed_final30_map.get(code, {})
-                derived_row = self._precomputed_derived_map.get(code, {})
-                merged_features: dict[str, Any] = {}
-                if isinstance(derived_row.get("features_json"), dict):
-                    merged_features.update(derived_row.get("features_json") or {})
-                merged_features.update(derived_row or {})
-                merged_features.update(pre_row or {})
+                merged_features, usable_checks, usable_reasons, usable_precomputed_row, precomputed_data_ok = self._map_precomputed_candidate_row(code)
 
-                required_keys = {
-                    "breakout_score",
-                    "pullback_score",
-                    "momentum_score",
-                    "entry_style_selected",
-                    "pullback_pct",
-                    "ma20",
-                    "ma50",
-                    "ma150",
-                    "rs_percentile",
-                    "vcp_score",
-                    "trend_score",
-                    "atr_pct",
-                }
-                has_precomputed = required_keys.issubset(set(merged_features.keys()))
-
-                b_ok = float(merged_features.get("breakout_score") or 0.0) > 0.0
-                p_ok = float(merged_features.get("pullback_score") or 0.0) > 0.0
-                m_ok = float(merged_features.get("momentum_score") or 0.0) > 0.0
-                ma_ok = all(float(merged_features.get(k) or 0.0) > 0.0 for k in ("ma20", "ma50", "ma150"))
-                rs_ok = float(merged_features.get("rs_percentile") or 0.0) > 0.0
-                vcp_ok = float(merged_features.get("vcp_score") or 0.0) > 0.0
+                b_ok = usable_checks["has_breakout_score"] == 1
+                p_ok = usable_checks["has_pullback_score"] == 1
+                m_ok = usable_checks["has_momentum_score"] == 1
+                ma_ok = all(usable_checks[key] == 1 for key in ("has_ma20", "has_ma50", "has_ma150"))
+                rs_ok = usable_checks["has_rs_percentile"] == 1
+                vcp_ok = usable_checks["has_vcp_score"] == 1
 
                 source_mode = "precomputed"
-                if has_precomputed:
+                if self._precomputed_final30_map.get(code) or self._precomputed_derived_map.get(code):
                     self._metric_add("precomputed_hits", 1)
+                    logger.info(
+                        "[PB1][PRECOMPUTED][USABLE_CHECK] code=%s has_close=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_vcp_score=%s has_ma20=%s has_ma50=%s has_ma150=%s has_entry_style_selected=%s has_price_context=%s usable=%s reasons=%s",
+                        code,
+                        usable_checks["has_close"],
+                        usable_checks["has_breakout_score"],
+                        usable_checks["has_pullback_score"],
+                        usable_checks["has_momentum_score"],
+                        usable_checks["has_rs_percentile"],
+                        usable_checks["has_vcp_score"],
+                        usable_checks["has_ma20"],
+                        usable_checks["has_ma50"],
+                        usable_checks["has_ma150"],
+                        usable_checks["has_entry_style_selected"],
+                        usable_checks["has_price_context"],
+                        int(usable_precomputed_row),
+                        usable_reasons,
+                    )
                     logger.info(
                         "[PB1][FEATURE_SOURCE] code=%s breakout=%s pullback=%s momentum=%s ma=%s rs=%s vcp=%s source=precomputed",
                         code,
@@ -4986,12 +5213,44 @@ class PB1Engine:
 
                 df = pd.DataFrame()
                 meta: dict[str, Any] = {}
-                if not has_precomputed:
+                need_short_ohlcv_fill = not precomputed_data_ok or any(
+                    self._value_missing(merged_features.get(key))
+                    for key in ("ma20_slope", "vol_contraction", "volu_contraction", "high20", "tr_range_pct", "trend_strength", "ma10", "value20")
+                )
+                if need_short_ohlcv_fill:
                     df, meta = self._fetch_daily(code, days=60)
                     if df is None or df.empty:
-                        continue
-                    fresh_features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
-                    merged_features.update(fresh_features)
+                        if not precomputed_data_ok:
+                            logger.info(
+                                "[PB1][PRECOMPUTED][DATA_OK_FAIL] code=%s reasons=%s source=%s",
+                                code,
+                                usable_reasons,
+                                source_mode,
+                            )
+                            continue
+                    else:
+                        fresh_features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                        self._merge_non_missing(
+                            merged_features,
+                            fresh_features,
+                            zero_missing_keys={
+                                "atr_pct",
+                                "high20",
+                                "ma10",
+                                "ma20",
+                                "ma50",
+                                "ma150",
+                                "ma20_slope",
+                                "pullback_pct",
+                                "tr_range_pct",
+                                "trend_strength",
+                                "value20",
+                                "vol_contraction",
+                                "volu_contraction",
+                            },
+                        )
+                        if source_mode == "precomputed":
+                            source_mode = "precomputed+short_ohlcv_fill"
 
                 features = {
                     "close": float(merged_features.get("close") or (float(df["close"].iloc[-1]) if not df.empty else 0.0)),
@@ -5017,10 +5276,15 @@ class PB1Engine:
                     "vcp_score": float(merged_features.get("vcp_score") or 0.0),
                     "trend_score": float(merged_features.get("trend_score") or 0.0),
                     "ma150": float(merged_features.get("ma150") or 0.0),
+                    "score_final": float(merged_features.get("score_final") or 0.0),
+                    "tech_score": float(merged_features.get("tech_score") or 0.0),
                     "source_mode": source_mode,
+                    "precomputed_usable_row": bool(usable_precomputed_row),
+                    "precomputed_usable_reasons": list(usable_reasons),
                 }
                 features["market"] = market
-                features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else False
+                features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else bool(merged_features.get("volume_missing", False))
+                features["data_ok"] = bool(precomputed_data_ok or not df.empty)
                 loose_ok, loose_reasons = evaluate_pb1_setup(
                     features,
                     market=market,
@@ -5869,6 +6133,15 @@ class PB1Engine:
             int(order_allowed),
             entry_reason or "ok",
         )
+        candidate_allowed = bool(calc_allowed and self.phase in {"prep", "entry"} and not skip_entry_scan)
+        rank_allowed = bool(calc_allowed and self.phase in {"prep", "entry"})
+        logger.info(
+            "[PB1][GATE] calc_allowed=%s candidate_allowed=%s rank_allowed=%s order_allowed=%s",
+            int(calc_allowed),
+            int(candidate_allowed),
+            int(rank_allowed),
+            int(order_allowed),
+        )
 
         if not entry_allowed:
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
@@ -6330,10 +6603,11 @@ class PB1Engine:
         if self.phase in {"prep", "entry"} and not skip_entry_scan:
             if self.phase == "entry":
                 t_pb1_start = time.monotonic()
-                candidates = self._compute_candidates_from_codes(final30_codes)
+                scan_input_codes = [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")]
+                candidates = self._compute_candidates_from_codes(scan_input_codes)
                 dt_pb1_filter = time.monotonic() - t_pb1_start
                 dt_minervini = 0.0
-                data_ok_count = len(candidates)
+                data_ok_count = len([c for c in candidates if bool(c.features.get("data_ok"))])
                 logger.info(
                     "[ENTRY][CANDIDATES] trace=%s start scan_count=%s source=%s data_ok=%s dt_minervini=%.2f",
                     trace_id,
@@ -6346,28 +6620,29 @@ class PB1Engine:
                     "[ENTRY][PB1_FILTER][LOOSE] trace=%s before=%s after=%s dt=%.2f tier=%s relax_passes=%s",
                     trace_id,
                     data_ok_count,
-                    len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
+                    len([c for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]),
                     dt_pb1_filter,
                     "final30_pb1",
                     0,
                 )
-                strict_setup_ok_codes = [c.code for c in candidates if bool(c.features.get("setup_strict_ok", False))]
+                strict_setup_ok_codes = [c.code for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_strict_ok", False))]
                 logger.info(
                     "[ENTRY][PB1_FILTER][STRICT] trace=%s before=%s after=%s",
                     trace_id,
-                    len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
+                    len([c for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]),
                     len(strict_setup_ok_codes),
                 )
-                setup_ok_codes = [c.code for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]
+                setup_ok_codes = [c.code for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]
                 logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
+                minervini_input_codes = list(setup_ok_codes) or [c.code for c in candidates if bool(c.features.get("data_ok"))]
                 t_minervini_start = time.monotonic()
                 signals = compute_minervini_signals(
                     self,
                     as_of=as_of_final,
-                    symbols=final30_codes,
+                    symbols=minervini_input_codes,
                     benchmark=str(os.getenv("RS_BENCHMARK", "229200")),
                 )
-                signals["final30"] = list(final30_codes)
+                signals["final30"] = list(scan_input_codes)
                 relax_min_buyable = int(self.effective_entry_filters.get("min_buyable", 1))
                 relax_passes = int(self.effective_entry_filters.get("relax_passes", 3))
                 relax_rs_step = int(os.getenv("RS_PCTILE_STEP", "5") or 5)
@@ -6474,10 +6749,14 @@ class PB1Engine:
                         cf.reasons = list(cf.reasons or []) + ["minervini_not_buyable"]
 
                 if minervini_rank_only or not minervini_hard_gate:
+                    minervini_ranked_count = len([
+                        item for item in (signals.get("items") or [])
+                        if bool(item.get("data_ok"))
+                    ])
                     logger.info(
                         "[MINERVINI][RANK_ONLY] input=%s ranked=%s",
-                        len([c for c in candidates if bool(c.features.get("setup_loose_ok", c.setup_ok))]),
-                        len(candidates),
+                        len(minervini_input_codes),
+                        minervini_ranked_count,
                     )
 
                 candidates = self._size_positions(candidates)
@@ -6696,7 +6975,6 @@ class PB1Engine:
                 # top candidates 저장
                 top_candidates_path = runtime_path("top_candidates.json")
                 try:
-                    import json
                     with open(top_candidates_path, 'w') as f:
                         json.dump(self.top_candidates, f)
                     logger.info(
