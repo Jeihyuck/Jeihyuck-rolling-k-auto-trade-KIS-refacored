@@ -6,7 +6,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
@@ -196,6 +196,13 @@ REQUIRED_SCORED_FINAL30_COLS = [
 # Minervini feature calc requires MA200 slope + VCP; force long window.
 MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
 MA200_SLOPE_LOOKBACK = int(os.getenv("MA200_SLOPE_LOOKBACK", "20"))
+KST = ZoneInfo("Asia/Seoul")
+BUYABLE_GATE_TODAY_BUY_EVENT_TYPES = {"BUY_FILL"}
+BUYABLE_GATE_COOLDOWN_RULE = "filled_trade_required"
+LEDGER_BUY_EXECUTION_EVENT_TYPES = {"BUY_FILLED", "ORDER_FILLED_BUY", "BUY_EXECUTED", "EXECUTED_BUY"}
+LEDGER_BUY_SUBMISSION_EVENT_TYPES = {"ORDER_INTENT", "ORDER_SUBMITTED", "ORDER_ACCEPTED_BUY", "ORDER_ACCEPTED"}
+LEDGER_SKIP_EVENT_TYPES = {"ORDER_SKIP"}
+LEDGER_RECONCILE_EVENT_TYPES = {"RECONCILE"}
 
 
 def _minervini_ohlcv_days() -> int:
@@ -673,6 +680,9 @@ class PB1Engine:
         if universe_context and getattr(universe_context, "as_of_date", None):
             derived_default = str(universe_context.as_of_date)
         self.derived_as_of = str(derived_as_of or derived_default or self._today)
+        self.selection_as_of = self.derived_as_of
+        self.execution_date_kst = self._today
+        self.run_ctx_as_of = self.derived_as_of
         self.final30_df = final30_df if final30_df is not None else precomputed_final30_df
         source_default = None
         if universe_context and getattr(universe_context, "meta", None):
@@ -1761,6 +1771,281 @@ class PB1Engine:
         if name:
             enriched.append(f"name:{name}")
         return enriched
+
+    def _coerce_kst_datetime(self, value: Any) -> datetime | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.astimezone(KST) if value.tzinfo else value.replace(tzinfo=KST)
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time(), tzinfo=KST)
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.astimezone(KST) if parsed.tzinfo else parsed.replace(tzinfo=KST)
+
+    def _format_kst_datetime(self, value: Any) -> str | None:
+        dt_value = self._coerce_kst_datetime(value)
+        return dt_value.isoformat() if dt_value else None
+
+    def _parse_cooldown_until(self, value: Any) -> datetime | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            if len(raw) == 10:
+                try:
+                    day_value = date.fromisoformat(raw)
+                except ValueError:
+                    return None
+                return datetime.combine(day_value + timedelta(days=1), datetime.min.time(), tzinfo=KST)
+        return self._coerce_kst_datetime(value)
+
+    def _classify_ledger_event(self, event: dict[str, Any]) -> dict[str, bool]:
+        event_type = str(event.get("event_type") or "").upper()
+        side = str(event.get("side") or "").upper()
+        payload = event.get("payload_json") if isinstance(event.get("payload_json"), dict) else {}
+        filled_qty = int(payload.get("filled_qty") or payload.get("executed_qty") or event.get("qty") or 0)
+        is_buy_execution_event = bool(side == "BUY" and event_type in LEDGER_BUY_EXECUTION_EVENT_TYPES and filled_qty > 0)
+        is_buy_submission_event = bool(side == "BUY" and event_type in LEDGER_BUY_SUBMISSION_EVENT_TYPES and not is_buy_execution_event)
+        is_skip_event = event_type in LEDGER_SKIP_EVENT_TYPES
+        is_reconcile_event = event_type in LEDGER_RECONCILE_EVENT_TYPES
+        starts_cooldown = bool(is_buy_execution_event and filled_qty > 0)
+        logger.info(
+            "[LEDGER][CLASSIFY] event_type=%s is_buy_execution=%s is_buy_submission=%s is_skip=%s is_reconcile=%s starts_cooldown=%s",
+            event_type or "UNKNOWN",
+            int(is_buy_execution_event),
+            int(is_buy_submission_event),
+            int(is_skip_event),
+            int(is_reconcile_event),
+            int(starts_cooldown),
+        )
+        return {
+            "is_buy_execution_event": is_buy_execution_event,
+            "is_buy_submission_event": is_buy_submission_event,
+            "is_skip_event": is_skip_event,
+            "is_reconcile_event": is_reconcile_event,
+            "starts_cooldown": starts_cooldown,
+        }
+
+    def _normalize_today_buy_event(self, fill_row: dict[str, Any]) -> dict[str, Any]:
+        created_at = self._coerce_kst_datetime(fill_row.get("filled_at") or fill_row.get("created_at"))
+        return {
+            "event_id": fill_row.get("fill_id") or fill_row.get("trade_id") or fill_row.get("broker_fill_id"),
+            "event_type": next(iter(BUYABLE_GATE_TODAY_BUY_EVENT_TYPES)),
+            "code": str(fill_row.get("code") or "").zfill(6),
+            "side": str(fill_row.get("side") or "BUY").upper(),
+            "status": "FILLED",
+            "qty": int(fill_row.get("qty") or 0),
+            "filled_qty": int(fill_row.get("qty") or 0),
+            "created_at": created_at.isoformat() if created_at else None,
+            "event_date_kst": created_at.date().isoformat() if created_at else None,
+            "trade_date_ref": self.execution_date_kst,
+            "run_id": fill_row.get("run_id"),
+        }
+
+    def _normalize_cooldown_event(self, fill_row: dict[str, Any], *, cooldown_until: str | None, matched_now: bool) -> dict[str, Any]:
+        created_at = self._coerce_kst_datetime(fill_row.get("filled_at") or fill_row.get("created_at"))
+        return {
+            "event_id": fill_row.get("fill_id") or fill_row.get("trade_id") or fill_row.get("broker_fill_id"),
+            "event_type": f"{str(fill_row.get('side') or 'TRADE').upper()}_FILL",
+            "code": str(fill_row.get("code") or "").zfill(6),
+            "created_at": created_at.isoformat() if created_at else None,
+            "cooldown_until": cooldown_until,
+            "cooldown_days": int(REENTRY_COOLDOWN_DAYS),
+            "source_rule": BUYABLE_GATE_COOLDOWN_RULE,
+            "matched_now": int(bool(matched_now)),
+            "run_id": fill_row.get("run_id"),
+        }
+
+    def _build_buyable_gate_context(self, *, codes: Iterable[str], positions: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        code_list = [str(code).zfill(6) for code in codes if str(code or "").strip()]
+        if not code_list:
+            logger.info("[PB1][BUYABLE_GATE][SUMMARY] total=0 today_buy_exists=0 cooldown_active=0")
+            return {}
+
+        today_start = self._now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        lookback_days = max(int(REENTRY_COOLDOWN_DAYS), 1) + 7
+        lookback_start = today_start - timedelta(days=lookback_days)
+
+        today_buy_fills = self.fills_repo.list_fills_in_window(
+            self.env,
+            start_at=today_start,
+            end_at=tomorrow_start,
+            side="BUY",
+            codes=code_list,
+        )
+        recent_fill_rows = self.fills_repo.list_fills_in_window(
+            self.env,
+            start_at=lookback_start,
+            end_at=tomorrow_start,
+            codes=code_list,
+        )
+        recent_order_rows = self.orders_repo.list_orders_in_window(
+            self.env,
+            start_at=lookback_start,
+            end_at=tomorrow_start,
+            codes=code_list,
+        )
+        recent_ledger_rows = self.ledger_repo.list_events_in_window(
+            self.env,
+            start_at=lookback_start,
+            end_at=tomorrow_start,
+            codes=code_list,
+        )
+
+        position_by_code = {str(row.get("code") or "").zfill(6): dict(row) for row in positions if row.get("code")}
+        today_buy_by_code: dict[str, list[dict[str, Any]]] = {}
+        recent_fills_by_code: dict[str, list[dict[str, Any]]] = {}
+        recent_orders_by_code: dict[str, list[dict[str, Any]]] = {}
+        recent_ledger_by_code: dict[str, list[dict[str, Any]]] = {}
+
+        for row in today_buy_fills:
+            code_key = str(row.get("code") or "").zfill(6)
+            today_buy_by_code.setdefault(code_key, []).append(dict(row))
+        for row in recent_fill_rows:
+            code_key = str(row.get("code") or "").zfill(6)
+            recent_fills_by_code.setdefault(code_key, []).append(dict(row))
+        for row in recent_order_rows:
+            code_key = str(row.get("code") or "").zfill(6)
+            recent_orders_by_code.setdefault(code_key, []).append(dict(row))
+        for row in recent_ledger_rows:
+            code_key = str(row.get("code") or "").zfill(6)
+            recent_ledger_by_code.setdefault(code_key, []).append(dict(row))
+
+        snapshots: dict[str, dict[str, Any]] = {}
+        today_buy_count = 0
+        cooldown_active_count = 0
+        for code_key in code_list:
+            pos = position_by_code.get(code_key, {})
+            today_buy_events = [self._normalize_today_buy_event(row) for row in today_buy_by_code.get(code_key, [])]
+            recent_fill_events = sorted(
+                recent_fills_by_code.get(code_key, []),
+                key=lambda row: self._coerce_kst_datetime(row.get("filled_at") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
+                reverse=True,
+            )
+            recent_order_events = sorted(
+                recent_orders_by_code.get(code_key, []),
+                key=lambda row: self._coerce_kst_datetime(row.get("submitted_at") or row.get("acked_at") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
+                reverse=True,
+            )
+            for ledger_event in recent_ledger_by_code.get(code_key, [])[:5]:
+                self._classify_ledger_event(ledger_event)
+
+            last_buy_fill = next((row for row in recent_fill_events if str(row.get("side") or "").upper() == "BUY"), None)
+            last_fill_event = recent_fill_events[0] if recent_fill_events else None
+            last_order_event = recent_order_events[0] if recent_order_events else None
+            cooldown_until_raw = str(pos.get("cooldown_until") or "") or None
+            cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
+            cooldown_active = bool(cooldown_until_dt and cooldown_until_dt > self._now_kst and recent_fill_events)
+            cooldown_events = [
+                self._normalize_cooldown_event(row, cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw, matched_now=cooldown_active)
+                for row in recent_fill_events[:5]
+            ] if cooldown_until_raw else []
+            snapshot = {
+                "holding_qty": int(pos.get("qty") or 0),
+                "today_buy_exists": bool(today_buy_events),
+                "cooldown_active": cooldown_active,
+                "today_buy_events": today_buy_events,
+                "cooldown_events": cooldown_events,
+                "today_buy_source_events_count": len(today_buy_events),
+                "cooldown_source_events_count": len(cooldown_events),
+                "last_buy_event_at": self._format_kst_datetime((last_buy_fill or {}).get("filled_at") if last_buy_fill else None),
+                "last_fill_event_at": self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None),
+                "last_order_submit_at": self._format_kst_datetime(
+                    (last_order_event or {}).get("submitted_at")
+                    or (last_order_event or {}).get("acked_at")
+                    or (last_order_event or {}).get("created_at")
+                    if last_order_event
+                    else None
+                ),
+                "cooldown_until": cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw,
+                "cooldown_rule_name": BUYABLE_GATE_COOLDOWN_RULE,
+            }
+            snapshots[code_key] = snapshot
+            today_buy_count += int(snapshot["today_buy_exists"])
+            cooldown_active_count += int(snapshot["cooldown_active"])
+
+        logger.info(
+            "[PB1][BUYABLE_GATE][SUMMARY] total=%s today_buy_exists=%s cooldown_active=%s",
+            len(code_list),
+            today_buy_count,
+            cooldown_active_count,
+        )
+        return snapshots
+
+    def _log_buyable_gate_trace(self, *, code: str, entry_allowed: bool, snapshot: dict[str, Any]) -> None:
+        code_key = str(code or "").zfill(6)
+        logger.info(
+            "[BUYABLE_GATE][COMMON_PATH] func_name=%s code=%s window=%s phase=%s mode=%s intended_live=%s",
+            "_build_buyable_gate_context",
+            self._display_code(code_key),
+            self.window_internal,
+            self.phase_name,
+            self.strategy,
+            int(bool(self.intended_live)),
+        )
+        logger.info(
+            "[PB1][BUYABLE_GATE][TRACE] code=%s env=%s now_kst=%s trade_date=%s derived_as_of=%s run_ctx_as_of=%s strategy_mode=%s window=%s phase=%s intended_live=%s entry_allowed=%s holding_qty=%s today_buy_exists=%s cooldown_active=%s today_buy_source_events_count=%s cooldown_source_events_count=%s last_buy_event_at=%s last_fill_event_at=%s last_order_submit_at=%s cooldown_until=%s cooldown_rule=%s",
+            self._display_code(code_key),
+            self.env,
+            self._now_kst.isoformat(),
+            self.execution_date_kst,
+            self.selection_as_of,
+            self.run_ctx_as_of,
+            self.strategy,
+            self.window_internal,
+            self.phase_name,
+            int(bool(self.intended_live)),
+            int(bool(entry_allowed)),
+            snapshot.get("holding_qty", 0),
+            int(bool(snapshot.get("today_buy_exists"))),
+            int(bool(snapshot.get("cooldown_active"))),
+            snapshot.get("today_buy_source_events_count", 0),
+            snapshot.get("cooldown_source_events_count", 0),
+            snapshot.get("last_buy_event_at"),
+            snapshot.get("last_fill_event_at"),
+            snapshot.get("last_order_submit_at"),
+            snapshot.get("cooldown_until"),
+            snapshot.get("cooldown_rule_name"),
+        )
+        if snapshot.get("today_buy_exists"):
+            for event in snapshot.get("today_buy_events", []):
+                logger.info(
+                    "[PB1][BUYABLE_GATE][TODAY_BUY_EVENTS] event_id=%s event_type=%s code=%s side=%s status=%s qty=%s filled_qty=%s created_at=%s event_date_kst=%s trade_date_ref=%s run_id=%s",
+                    event.get("event_id"),
+                    event.get("event_type"),
+                    event.get("code"),
+                    event.get("side"),
+                    event.get("status"),
+                    event.get("qty"),
+                    event.get("filled_qty"),
+                    event.get("created_at"),
+                    event.get("event_date_kst"),
+                    event.get("trade_date_ref"),
+                    event.get("run_id"),
+                )
+        if snapshot.get("cooldown_active"):
+            for event in snapshot.get("cooldown_events", []):
+                logger.info(
+                    "[PB1][BUYABLE_GATE][COOLDOWN_EVENTS] event_id=%s event_type=%s code=%s created_at=%s cooldown_until=%s cooldown_days=%s source_rule=%s matched_now=%s run_id=%s",
+                    event.get("event_id"),
+                    event.get("event_type"),
+                    event.get("code"),
+                    event.get("created_at"),
+                    event.get("cooldown_until"),
+                    event.get("cooldown_days"),
+                    event.get("source_rule"),
+                    event.get("matched_now"),
+                    event.get("run_id"),
+                )
 
     def _entry_gate(self, *, setup_filters_ok: bool, breakout_trigger_ok: bool) -> tuple[bool, list[str], str]:
         mode = (self.entry_cond_mode or "OR").strip().upper()
@@ -4709,6 +4994,7 @@ class PB1Engine:
                 fields=fields,
             )
 
+        cooldown_until: str | None = None
         if decision_reasons and decision_reasons[0] in {"STOP_HIT", "FAILED_BREAKOUT"}:
             # NOTE: self._now_kst is datetime (tz-aware). Avoid calling .date() twice.
             #       Use datetime + Timedelta then .date() to get a stable "YYYY-MM-DD".
@@ -4716,14 +5002,6 @@ class PB1Engine:
                 cooldown_until = self._now_kst.date().isoformat()
             else:
                 cooldown_until = (self._now_kst + pd.Timedelta(days=REENTRY_COOLDOWN_DAYS)).date().isoformat()
-            self.positions_repo.update_position_fields(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=sid,
-                mode=mode,
-                code=code,
-                fields={"cooldown_until": cooldown_until},
-            )
 
         if self._should_block_order(client_key, code=code, side="SELL", stage="PB1-EXIT")[0]:
             logger.info("[PB1][EXIT-SKIP] code=%s mode=%s reason=dup key=%s", display_code, mode, client_key)
@@ -4936,6 +5214,15 @@ class PB1Engine:
                 tax=0.0,
                 filled_at=filled_at,
             )
+            if cooldown_until:
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    fields={"cooldown_until": cooldown_until},
+                )
             logger.info(
                 "[TRADE][FILL][SELL] code=%s oid=%s fill_qty=%s fill_px=%.2f",
                 display_code,
@@ -7142,7 +7429,6 @@ class PB1Engine:
                 if self.flags.live_trading_enabled and not self.flags.dry_run and self.flags.run_mode == "LIVE":
                     raise
                 today_orders = []
-            today_buy_codes = {row.get("code") for row in today_orders if row.get("code")}
             today_spent = 0.0
             for row in today_orders:
                 qty = float(row.get("qty") or 0)
@@ -7151,6 +7437,13 @@ class PB1Engine:
                     limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
                 today_spent += qty * float(limit_price or 0.0)
             planned_spent = today_spent
+            buyable_gate_context = self._build_buyable_gate_context(
+                codes=[cf.code for cf in ok_after_risk if cf.code],
+                positions=positions,
+            )
+            today_buy_codes = {
+                code for code, snapshot in buyable_gate_context.items() if bool(snapshot.get("today_buy_exists"))
+            }
             for cf in ok_after_risk:
                 self.current_code = cf.code
                 close_price = float(cf.features.get("close") or 0.0)
@@ -7265,7 +7558,9 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
-                if cf.code in today_buy_codes:
+                gate_snapshot = buyable_gate_context.get(str(cf.code or "").zfill(6), {})
+                self._log_buyable_gate_trace(code=cf.code, entry_allowed=entry_allowed, snapshot=gate_snapshot)
+                if gate_snapshot.get("today_buy_exists"):
                     self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
                     self._log_buyable_gate(code=cf.code, ok=False, reasons=["today_buy_exists"])
                     self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
@@ -7277,8 +7572,7 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
-                cooldown_until = cooldown_map.get(cf.code)
-                if cooldown_until and str(cooldown_until) >= self._today:
+                if gate_snapshot.get("cooldown_active"):
                     self._record_drop(drop_reason_counter, drop_examples, "cooldown_active", cf.code)
                     self._log_buyable_gate(code=cf.code, ok=False, reasons=["cooldown_active"])
                     self._log_order_skip(cf, ["cooldown_active"], "PB1-CLOSE")

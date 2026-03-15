@@ -1284,6 +1284,11 @@ class OrdersRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def _window_expr(self, column):
+        if self.engine.dialect.name == "postgresql":
+            return sa.cast(column, sa.DateTime(timezone=True))
+        return column
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -1513,6 +1518,45 @@ class OrdersRepo:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
+    def list_orders_in_window(
+        self,
+        env: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        side: str | None = None,
+        code: str | None = None,
+        codes: Iterable[str] | None = None,
+        status_include: Iterable[str] | None = None,
+        status_exclude: Iterable[str] | None = None,
+    ) -> list[dict]:
+        env_n = _norm_env(env)
+        code_list = [str(item).zfill(6) for item in (codes or []) if str(item or "").strip()]
+        created_at_expr = self._window_expr(self._schema.orders.c.created_at)
+        conditions = [
+            self._schema.orders.c.env == env_n,
+            created_at_expr >= start_at,
+            created_at_expr < end_at,
+        ]
+        if side:
+            conditions.append(self._schema.orders.c.side == str(side).upper())
+        if code:
+            conditions.append(self._schema.orders.c.code == str(code).zfill(6))
+        elif code_list:
+            conditions.append(self._schema.orders.c.code.in_(code_list))
+        if status_include:
+            conditions.append(self._schema.orders.c.status.in_([str(item).upper() for item in status_include]))
+        if status_exclude:
+            conditions.append(self._schema.orders.c.status.not_in([str(item).upper() for item in status_exclude]))
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(created_at_expr.desc())
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
     def upsert_reconciled_order(
         self,
         *,
@@ -1622,6 +1666,11 @@ class FillsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def _window_expr(self, column):
+        if self.engine.dialect.name == "postgresql":
+            return sa.cast(column, sa.DateTime(timezone=True))
+        return column
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -1653,6 +1702,35 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == code)
         stmt = select(self._schema.fills).where(and_(*conditions))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def list_fills_in_window(
+        self,
+        env: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        side: str | None = None,
+        code: str | None = None,
+        codes: Iterable[str] | None = None,
+    ) -> list[dict]:
+        env_n = _norm_env(env)
+        code_list = [str(item).zfill(6) for item in (codes or []) if str(item or "").strip()]
+        filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
+        conditions = [
+            self._schema.fills.c.env == env_n,
+            filled_at_expr >= start_at,
+            filled_at_expr < end_at,
+        ]
+        if side:
+            conditions.append(self._schema.fills.c.side == str(side).upper())
+        if code:
+            conditions.append(self._schema.fills.c.code == str(code).zfill(6))
+        elif code_list:
+            conditions.append(self._schema.fills.c.code.in_(code_list))
+        stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
@@ -1757,6 +1835,11 @@ class LedgerEventsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
+
+    def _window_expr(self, column):
+        if self.engine.dialect.name == "postgresql":
+            return sa.cast(column, sa.DateTime(timezone=True))
+        return column
 
     def _payload_as_of_expr(self) -> sa.sql.ClauseElement:
         if self.engine.dialect.name == "postgresql":
@@ -2131,6 +2214,42 @@ class LedgerEventsRepo:
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0
+
+    def list_events_in_window(
+        self,
+        env: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        code: str | None = None,
+        codes: Iterable[str] | None = None,
+        event_types: Iterable[str] | None = None,
+        side: str | None = None,
+    ) -> list[dict]:
+        env_n = _norm_env(env)
+        code_list = [str(item).zfill(6) for item in (codes or []) if str(item or "").strip()]
+        ts_expr = self._window_expr(self._schema.ledger_events.c.ts)
+        conditions = [
+            self._schema.ledger_events.c.env == env_n,
+            ts_expr >= start_at,
+            ts_expr < end_at,
+        ]
+        if code:
+            conditions.append(self._schema.ledger_events.c.code == str(code).zfill(6))
+        elif code_list:
+            conditions.append(self._schema.ledger_events.c.code.in_(code_list))
+        if event_types:
+            conditions.append(self._schema.ledger_events.c.event_type.in_([str(item).upper() for item in event_types]))
+        if side:
+            conditions.append(self._schema.ledger_events.c.side == str(side).upper())
+        stmt = (
+            select(self._schema.ledger_events)
+            .where(and_(*conditions))
+            .order_by(ts_expr.desc())
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
 
 
 class PositionsRepo:
