@@ -709,27 +709,8 @@ jobs:
           fi
 
           DERIVED_ASOF="${DERIVED_ASOF:-${AS_OF_OVERRIDE:-}}"
-          READINESS_CONTEXT="$(python - <<'PY'
-            import os
-            from datetime import date
-
-            from trader.time_utils import now_kst, resolve_trade_readiness_as_of
-
-            run_date = now_kst().date()
-            window = os.getenv("WINDOW", "")
-            requested_raw = os.getenv("DERIVED_ASOF") or os.getenv("AS_OF_OVERRIDE") or ""
-            candidate_as_of = date.fromisoformat(requested_raw) if requested_raw else None
-            resolved = resolve_trade_readiness_as_of(
-              run_date=run_date,
-              market_window=window,
-              exchange="KRX",
-              candidate_as_of=candidate_as_of,
-            )
-            for key in ("run_date", "calendar_prev", "requested_as_of", "resolved_as_of"):
-              print(f"{key.upper()}={resolved[key].isoformat()}")
-            print(f"READINESS_REASON={resolved['reason']}")
-            PY
-            )"
+          RUN_DATE="$(TZ=Asia/Seoul date +%F)"
+          READINESS_CONTEXT="$(python scripts/resolve_trade_readiness_context.py --run-date "${RUN_DATE}" --window "${WINDOW}" --as-of "${DERIVED_ASOF}" --exchange KRX)"
           while IFS='=' read -r key value; do
             export "${key}=${value}"
           done <<< "${READINESS_CONTEXT}"
