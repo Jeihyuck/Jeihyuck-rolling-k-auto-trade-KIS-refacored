@@ -715,15 +715,20 @@ jobs:
             export "${key}=${value}"
           done <<< "${READINESS_CONTEXT}"
 
-          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} run_date=${RUN_DATE} window=${WINDOW} calendar_prev=${CALENDAR_PREV} requested_as_of=${REQUESTED_ASOF} resolved_as_of=${RESOLVED_ASOF} reason=${READINESS_REASON} source=db_ledger"
+          : "${CALENDAR_PREV:?missing CALENDAR_PREV from readiness context}"
+          : "${REQUESTED_AS_OF:?missing REQUESTED_AS_OF from readiness context}"
+          : "${RESOLVED_AS_OF:?missing RESOLVED_AS_OF from readiness context}"
+          : "${READINESS_REASON:?missing READINESS_REASON from readiness context}"
+
+          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} run_date=${RUN_DATE} window=${WINDOW} calendar_prev=${CALENDAR_PREV} requested_as_of=${REQUESTED_AS_OF} resolved_as_of=${RESOLVED_AS_OF} reason=${READINESS_REASON} source=db_ledger"
 
           set +e
-          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --run-date "${RUN_DATE}" --as-of "${REQUESTED_ASOF}" --window "${WINDOW}"
+          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --run-date "${RUN_DATE}" --as-of "${REQUESTED_AS_OF}" --window "${WINDOW}"
           rc=$?
           set -e
 
           if [ "$rc" -eq 0 ]; then
-            echo "[PREP][FALLBACK] readiness satisfied -> using resolved_as_of=${RESOLVED_ASOF}"
+            echo "[PREP][FALLBACK] readiness satisfied -> using resolved_as_of=${RESOLVED_AS_OF}"
           elif [ "$rc" -eq 10 ]; then
             case "${WINDOW}" in
               preopen|morning|intraday|open|session|day)
