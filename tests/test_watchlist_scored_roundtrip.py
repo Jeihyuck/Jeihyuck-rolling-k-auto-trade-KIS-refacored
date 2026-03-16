@@ -90,6 +90,35 @@ def test_scored_watchlist_roundtrip_preserves_critical_columns() -> None:
     assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
 
 
+def test_universe_scored_roundtrip_preserves_critical_columns() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+    as_of = date(2026, 3, 11)
+    members = [_scored_member(i) for i in range(1, 6)]
+
+    repo.save_watchlist(
+        env="practice",
+        strategy="pb1_universe_scored",
+        as_of=as_of,
+        members=members,
+    )
+
+    loaded, used_as_of = repo.load_watchlist_scored(
+        env="practice",
+        strategy="pb1_universe_scored",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+
+    assert used_as_of == as_of
+    assert len(loaded) == 5
+    df = pd.DataFrame(loaded)
+    assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
+
+
 def test_scored_strategy_rejects_plain_serializer_shape() -> None:
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)

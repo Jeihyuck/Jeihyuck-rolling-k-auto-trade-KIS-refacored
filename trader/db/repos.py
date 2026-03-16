@@ -120,6 +120,11 @@ CRITICAL_SCORED_COLS = [
     "entry_style_selected",
 ]
 
+SCORED_WATCHLIST_STRATEGIES = {
+    "pb1_watchlist_final_scored",
+    "pb1_universe_scored",
+}
+
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
@@ -150,7 +155,7 @@ def save_pb1_watchlist_rows(
     rows: List[Dict[str, Any]],
 ) -> None:
     strategy_n = _norm_strategy(strategy)
-    if strategy_n == "pb1_watchlist_final_scored":
+    if strategy_n in SCORED_WATCHLIST_STRATEGIES:
         _save_pb1_watchlist_rows_scored(
             engine,
             env=env,
@@ -2736,11 +2741,11 @@ class WatchlistRepo:
         Watchlist를 DB에 upsert.
         members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
         """
-        if _norm_strategy(strategy) == "pb1_watchlist_final_scored":
+        if _norm_strategy(strategy) in SCORED_WATCHLIST_STRATEGIES:
             save_pb1_watchlist_rows(
                 self.engine,
                 env=env,
-                strategy="pb1_watchlist_final_scored",
+                strategy=strategy,
                 as_of=as_of,
                 rows=members,
             )

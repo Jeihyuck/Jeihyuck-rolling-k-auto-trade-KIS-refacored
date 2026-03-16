@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 
 TRADER_RUNTIME_DIR_ENV = "TRADER_RUNTIME_DIR"
@@ -9,6 +10,10 @@ TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def repo_root() -> Path:
+    return _repo_root()
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
@@ -66,3 +71,18 @@ def close_entry_orders_path(order_date: str) -> Path:
     path = runtime_path("runtime", "close_entry", f"orders_{order_date}.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _as_of_str(as_of: str | date) -> str:
+    if isinstance(as_of, date):
+        return as_of.isoformat()
+    return str(as_of).strip()
+
+
+def get_final30_scored_paths(env: str, as_of: str | date) -> list[Path]:
+    env_n = (env or "").strip().lower()
+    as_of_s = _as_of_str(as_of)
+    return [
+        Path("runtime") / "watchlist" / as_of_s / "final30_scored.json",
+        Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+    ]

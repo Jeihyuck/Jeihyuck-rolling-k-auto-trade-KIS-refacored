@@ -97,7 +97,10 @@ def load_watchlist_for_trade(
             used_as_of_date.isoformat(),
             len(members),
         )
-        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
+        logger.info(
+            "[TRADE][WATCHLIST_FINAL][TOP10] source=pb1_watchlist_final rank_basis=stored_rank codes=%s",
+            top10_codes,
+        )
         
         return UniverseContext(
             as_of_date=as_of_date.isoformat(),

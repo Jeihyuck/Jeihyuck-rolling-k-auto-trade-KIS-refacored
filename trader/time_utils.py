@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
 import os
 from datetime import date, datetime, time, timedelta
@@ -13,6 +14,14 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 20)
+_PYKRX_WARNED_SIGNATURES: set[tuple[str, str, str]] = set()
+_NOISY_EXTERNAL_LOGGERS = (
+    "pykrx",
+    "pykrx.website",
+    "pykrx.website.krx",
+    "requests",
+    "urllib3",
+)
 
 
 def now_kst() -> datetime:
@@ -183,6 +192,58 @@ def _fallback_previous_or_same_weekday(d: date) -> date:
     return resolved
 
 
+def _fallback_previous_weekday(d: date) -> date:
+    resolved = d - timedelta(days=1)
+    while resolved.weekday() >= 5:
+        resolved -= timedelta(days=1)
+    return resolved
+
+
+def _fallback_last_weekday_scan(d: date, *, lookback_days: int = 7) -> date:
+    for days_back in range(1, max(lookback_days, 1) + 1):
+        candidate = d - timedelta(days=days_back)
+        if candidate.weekday() < 5:
+            return candidate
+    return _fallback_previous_weekday(d)
+
+
+def _log_pykrx_fail_once(*, scope: str, subject: str, fallback: str, error: Exception) -> None:
+    error_name = type(error).__name__
+    signature = (scope, subject, error_name)
+    if signature in _PYKRX_WARNED_SIGNATURES:
+        return
+    _PYKRX_WARNED_SIGNATURES.add(signature)
+    logger.warning(
+        "[TIME][TRADING_DAY][PYKRX_FAIL] %s fallback=%s error=%s",
+        subject,
+        fallback,
+        error_name,
+    )
+
+
+@contextmanager
+def _suppress_noisy_external_loggers():
+    states: list[tuple[logging.Logger, bool, int]] = []
+    try:
+        for name in _NOISY_EXTERNAL_LOGGERS:
+            ext_logger = logging.getLogger(name)
+            states.append((ext_logger, ext_logger.disabled, ext_logger.level))
+            ext_logger.disabled = True
+        yield
+    finally:
+        for ext_logger, disabled, level in states:
+            ext_logger.disabled = disabled
+            ext_logger.setLevel(level)
+
+
+def _resolve_pykrx_previous_or_same(d: date) -> date:
+    from pykrx.stock import get_nearest_business_day_in_a_week
+
+    with _suppress_noisy_external_loggers():
+        resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
+    return date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+
+
 def coerce_to_previous_trading_day(
     d: date,
     *,
@@ -196,16 +257,13 @@ def coerce_to_previous_trading_day(
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
         try:
-            from pykrx.stock import get_nearest_business_day_in_a_week
-
-            resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
-            return date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+            return _resolve_pykrx_previous_or_same(d)
         except Exception as exc:
-            logger.debug(
-                "[TIME_UTILS][TRADING_DAY] exchange=%s date=%s fallback=weekday_only err=%s",
-                normalized_exchange,
-                d.isoformat(),
-                exc,
+            _log_pykrx_fail_once(
+                scope="coerce_to_previous_trading_day",
+                subject=f"input={d.isoformat()}",
+                fallback="calendar_weekday_rule",
+                error=exc,
             )
 
     return _fallback_previous_or_same_weekday(d)
@@ -218,11 +276,21 @@ def is_trading_date(
     trading_day_resolver: Callable[[date, str], date] | None = None,
 ) -> bool:
     """특정 날짜가 거래일인지 판정한다."""
-    return coerce_to_previous_trading_day(
-        d,
-        exchange=exchange,
-        trading_day_resolver=trading_day_resolver,
-    ) == d
+    if trading_day_resolver is not None:
+        return trading_day_resolver(d, exchange) == d
+
+    normalized_exchange = (exchange or "KRX").strip().upper()
+    if normalized_exchange == "KRX":
+        try:
+            return _resolve_pykrx_previous_or_same(d) == d
+        except Exception as exc:
+            _log_pykrx_fail_once(
+                scope="is_trading_date",
+                subject=f"date={d.isoformat()}",
+                fallback="weekday_heuristic",
+                error=exc,
+            )
+    return d.weekday() < 5
 
 
 def resolve_prev_trading_day(
@@ -233,11 +301,29 @@ def resolve_prev_trading_day(
 ) -> date:
     """기준 실행일 직전 거래일을 반환한다."""
     candidate = run_date - timedelta(days=1)
-    return coerce_to_previous_trading_day(
-        candidate,
-        exchange=exchange,
-        trading_day_resolver=trading_day_resolver,
-    )
+    if trading_day_resolver is not None:
+        return coerce_to_previous_trading_day(
+            candidate,
+            exchange=exchange,
+            trading_day_resolver=trading_day_resolver,
+        )
+
+    normalized_exchange = (exchange or "KRX").strip().upper()
+    if normalized_exchange == "KRX":
+        try:
+            return _resolve_pykrx_previous_or_same(candidate)
+        except Exception as exc:
+            _log_pykrx_fail_once(
+                scope="resolve_prev_trading_day",
+                subject=(
+                    f"date={run_date.isoformat()} prev_candidate={candidate.isoformat()}"
+                ),
+                fallback="last_weekday_scan",
+                error=exc,
+            )
+            return _fallback_last_weekday_scan(run_date)
+
+    return _fallback_previous_weekday(run_date)
 
 
 def resolve_trade_readiness_as_of(

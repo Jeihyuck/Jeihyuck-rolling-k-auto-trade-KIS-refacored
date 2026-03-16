@@ -55,6 +55,7 @@ from trader.time_utils import (
     prev_business_day,
     resolve_derived_as_of,
 )
+from trader.runtime_paths import get_final30_scored_paths
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -358,14 +359,21 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
     payload_df["code"] = payload_df["code"].astype(str).str.zfill(6)
     payload = payload_df.to_dict(orient="records")
 
-    target_paths = [
-        Path("runtime") / "watchlist" / as_of / "final30_scored.json",
-        Path("bot_state") / "trader_ledger" / "final30" / env / as_of / "final30_scored.json",
-    ]
+    target_paths = get_final30_scored_paths(env, as_of)
     for path in target_paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info("[PREP][FINAL30_SCORED][SAVE] path=%s rows=%s", path, len(payload))
+        try:
+            bytes_written = path.stat().st_size
+        except OSError:
+            bytes_written = -1
+        logger.info(
+            "[PREP][FINAL30_SCORED][VERIFY] path=%s exists=%s bytes=%s",
+            path,
+            int(path.exists()),
+            bytes_written,
+        )
 
     logger.info(
         "[PREP][FINAL30_SCORED][FIELDS] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",

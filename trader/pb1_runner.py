@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from trader.runtime_paths import get_final30_scored_paths, repo_root
+
 from trader.config import (
     AFTERNOON_WINDOW_END,
     AFTERNOON_WINDOW_START,
@@ -145,25 +147,25 @@ def load_trade_final30_scored(
     attempts: list[tuple[str, list[dict[str, Any]], str, bool]] = []
 
     file_candidates = [
-        (
-            "ledger_final30_scored",
-            Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
-        ),
-        (
-            "runtime_final30_scored",
-            Path("runtime") / "watchlist" / as_of_s / "final30_scored.json",
-        ),
-        (
-            "signals_final30",
-            Path("signals") / "final30.json",
-        ),
+        ("runtime_final30_scored", get_final30_scored_paths(env_n, as_of_s)[0]),
+        ("ledger_final30_scored", get_final30_scored_paths(env_n, as_of_s)[1]),
+        ("signals_final30", Path("signals") / "final30.json"),
     ]
+    current_cwd = Path.cwd().resolve()
+    current_repo_root = repo_root().resolve()
 
     for source_name, path in file_candidates:
         abs_path = path.resolve()
         exists = path.exists()
         checked.append(str(path))
-        logger.info("[TRADE][FINAL30][FILE_CHECK] path=%s exists=%s", abs_path, int(exists))
+        logger.info(
+            "[TRADE][FINAL30][FILE_CHECK] path=%s exists=%s cwd=%s repo_root=%s builder=%s",
+            abs_path,
+            int(exists),
+            current_cwd,
+            current_repo_root,
+            "shared_path_helper" if source_name != "signals_final30" else "legacy_signals_fallback",
+        )
         rows = _load_json_rows(path)
         if not rows:
             continue
@@ -918,7 +920,18 @@ def _load_universe_context(
             result.get("as_of"),
             len(members),
         )
-        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
+        logger.info(
+            "[TRADE][WATCHLIST_FINAL][TOP10] source=%s rank_basis=%s codes=%s",
+            result.get("source_name"),
+            "rank_final30" if "rank_final30" in df.columns else ("score_final" if "score_final" in df.columns else "code"),
+            top10_codes,
+        )
+        logger.info(
+            "[TRADE][FINAL30][TOP10] source=%s rank_basis=%s codes=%s",
+            result.get("source_name"),
+            "rank_final30" if "rank_final30" in df.columns else ("score_final" if "score_final" in df.columns else "code"),
+            top10_codes,
+        )
         return UniverseContext(
             as_of_date=str(result.get("as_of") or as_of),
             members=members,

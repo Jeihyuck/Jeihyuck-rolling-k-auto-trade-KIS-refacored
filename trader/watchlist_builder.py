@@ -2783,23 +2783,114 @@ def save_bundle(
             tech_nonzero,
             final_nonzero,
         )
+
+    def _normalize_scored_stage_rows(
+        stage_rows: List[Dict[str, Any]],
+        *,
+        fallback_rows: List[Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        fallback_by_code = {
+            str((row or {}).get("code") or "").zfill(6): dict(row or {})
+            for row in (fallback_rows or [])
+            if (row or {}).get("code")
+        }
+        normalized_rows: List[Dict[str, Any]] = []
+        for idx, row in enumerate(stage_rows or [], start=1):
+            item = _sync_item_and_meta_fields(dict(row or {}))
+            code = str(item.get("code") or "").zfill(6)
+            if not code:
+                continue
+            item["code"] = code
+            ref = fallback_by_code.get(code, {})
+            for key in (
+                "breakout_score",
+                "pullback_score",
+                "momentum_score",
+                "rs_percentile",
+                "vcp_score",
+                "entry_style_selected",
+                "ma20",
+                "ma50",
+                "ma150",
+                "close",
+                "volume",
+                "volume_avg20",
+                "tech_score",
+                "flow_score",
+                "score_final",
+                "final_score",
+                "score",
+            ):
+                value = item.get(key)
+                if value in (None, "", [], {}):
+                    ref_val = ref.get(key)
+                    if ref_val not in (None, "", [], {}):
+                        item[key] = ref_val
+
+            breakout_score = _safe_float(item.get("breakout_score"), 0.0)
+            pullback_score = _safe_float(item.get("pullback_score"), 0.0)
+            momentum_score = _safe_float(item.get("momentum_score"), 0.0)
+            if not item.get("entry_style_selected"):
+                if breakout_score >= pullback_score and breakout_score >= momentum_score:
+                    item["entry_style_selected"] = "BREAKOUT"
+                elif pullback_score >= momentum_score:
+                    item["entry_style_selected"] = "PULLBACK"
+                else:
+                    item["entry_style_selected"] = "MOMENTUM"
+
+            item["rank"] = _safe_int(item.get("rank") or item.get("rank_final30") or idx, idx)
+            item["score"] = _safe_float(
+                item.get("score", item.get("score_final", item.get("final_score", item.get("tech_score", 0.0)))),
+                0.0,
+            )
+            normalized_rows.append(_sync_item_and_meta_fields(item))
+        return normalized_rows
+
+    final30_scored_rows = _normalize_scored_stage_rows(bundle.final30)
+    universe_scored_rows = _normalize_scored_stage_rows(bundle.universe_scored, fallback_rows=final30_scored_rows)
+    final30_cols = set(pd.DataFrame(final30_scored_rows).columns.tolist()) if final30_scored_rows else set()
+    universe_cols = set(pd.DataFrame(universe_scored_rows).columns.tolist()) if universe_scored_rows else set()
+    logger.info(
+        "[WATCHLIST][SCHEMA_DIFF] lhs=universe_scored rhs=final30_scored missing=%s",
+        sorted(final30_cols - universe_cols),
+    )
     
     # 1. universe_scored - FULL universe (should be 196, not 120)
     # Note: In current architecture, this is actually candidate_pool-based (120)
     # TODO: Refactor to use broader universe (196+) as true "universe_scored"
-    if bundle.universe_scored:
-        _log_stage_fields("universe_scored", bundle.universe_scored)
+    if universe_scored_rows:
+        _log_stage_fields("universe_scored", universe_scored_rows)
         logger.info(
             "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=universe_filtered_from_raw120 rows=%s",
-            len(bundle.universe_scored),
+            len(universe_scored_rows),
         )
         repo.save_watchlist(
             env=env,
             strategy="pb1_universe_scored",
             as_of=as_of,
-            members=bundle.universe_scored,
+            members=universe_scored_rows,
         )
-        logger.info("[BUNDLE][SAVE] pb1_universe_scored n=%s", len(bundle.universe_scored))
+        verified_result = repo.load_watchlist_scored(
+            env=env,
+            strategy="pb1_universe_scored",
+            as_of=as_of,
+            allow_latest_fallback=False,
+        )
+        if isinstance(verified_result, tuple) and len(verified_result) == 2:
+            verified_rows, _ = verified_result
+        else:
+            verified_rows = []
+        verified_df = pd.DataFrame(verified_rows or [])
+        logger.info("[BUNDLE][SAVE] pb1_universe_scored n=%s", len(universe_scored_rows))
+        logger.info(
+            "[WATCHLIST][SAVE_VERIFY][UNIVERSE_SCORED] rows=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_entry_style_selected=%s",
+            len(verified_rows),
+            int("breakout_score" in verified_df.columns),
+            int("pullback_score" in verified_df.columns),
+            int("momentum_score" in verified_df.columns),
+            int("rs_percentile" in verified_df.columns),
+            int("entry_style_selected" in verified_df.columns),
+        )
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_universe_scored empty")
     

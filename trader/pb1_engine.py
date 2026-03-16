@@ -241,6 +241,9 @@ CASH_KEYS = (
 )
 
 _ENTRY_BLOCK_REASON_MAP = {
+    "SIZING_CAP_BELOW_ONE_SHARE": "SIZING_CAP_BELOW_ONE_SHARE",
+    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "SIZING_MIN_ORDER_NOTIONAL_FAIL",
+    "SIZING_QTY_ZERO": "SIZING_QTY_ZERO",
     "cap_below_min_order": "MIN_ORDER_KRW",
     "min_order_krw": "MIN_ORDER_KRW",
     "cap_below_one_share": "MIN_ORDER_KRW",
@@ -258,6 +261,12 @@ _ENTRY_BLOCK_REASON_MAP = {
     "max_positions": "MAX_POSITIONS",
     "target_new_positions_limit": "MAX_POSITIONS",
     "target_new_positions_zero": "TARGET_NEW_POSITIONS_ZERO",
+    "BUYABLE_EXISTING_HOLDING": "BUYABLE_EXISTING_HOLDING",
+    "BUYABLE_OPEN_ORDER": "BUYABLE_OPEN_ORDER",
+    "BUYABLE_TODAY_BUY_EXISTS": "BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_COOLDOWN": "BUYABLE_COOLDOWN",
+    "BUYABLE_DUPLICATE": "BUYABLE_DUPLICATE",
+    "BUYABLE_WINDOW_BLOCK": "BUYABLE_WINDOW_BLOCK",
     "open_order": "RATE_LIMIT",
     "today_buy_exists": "RATE_LIMIT",
     "duplicate_order": "DUPLICATE",
@@ -269,6 +278,9 @@ _ENTRY_BLOCK_REASON_MAP = {
 }
 
 _ORDER_SKIP_REASON_MAP = {
+    "SIZING_CAP_BELOW_ONE_SHARE": "ORDER_SKIP_SIZING_CAP_BELOW_ONE_SHARE",
+    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "ORDER_SKIP_SIZING_MIN_ORDER_NOTIONAL_FAIL",
+    "SIZING_QTY_ZERO": "ORDER_SKIP_SIZING_QTY_ZERO",
     "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
     "min_order_krw": "ORDER_SKIP_MIN_ORDER",
     "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
@@ -280,6 +292,12 @@ _ORDER_SKIP_REASON_MAP = {
     "entry_capital_zero": "ORDER_SKIP_NO_CASH",
     "tick_budget_zero": "ORDER_SKIP_NO_CASH",
     "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
+    "BUYABLE_EXISTING_HOLDING": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING",
+    "BUYABLE_OPEN_ORDER": "ORDER_SKIP_BUYABLE_OPEN_ORDER",
+    "BUYABLE_TODAY_BUY_EXISTS": "ORDER_SKIP_BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_COOLDOWN": "ORDER_SKIP_BUYABLE_COOLDOWN",
+    "BUYABLE_DUPLICATE": "ORDER_SKIP_BUYABLE_DUPLICATE",
+    "BUYABLE_WINDOW_BLOCK": "ORDER_SKIP_BUYABLE_WINDOW_BLOCK",
     "open_order": "ORDER_SKIP_RATE_LIMIT",
     "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
     "duplicate_order": "ORDER_SKIP_DUPLICATE",
@@ -436,6 +454,18 @@ class CandidateFeature:
     score: float | None = None
     sizing_reason: str | None = None  # 명확한 reason 코드 (BUDGET_INSUFFICIENT_FOR_1_SHARE, MIN_ORDER_NOTIONAL_FAIL 등)
     sizing_details: Dict[str, Any] | None = None  # 수치 정보: buy_budget, price, qty, shortfall 등
+
+
+def _normalize_sizing_failure_reason(raw_reason: str | None) -> str:
+    if raw_reason == "BUDGET_INSUFFICIENT_FOR_1_SHARE":
+        return "SIZING_CAP_BELOW_ONE_SHARE"
+    if raw_reason == "MIN_ORDER_NOTIONAL_FAIL":
+        return "SIZING_MIN_ORDER_NOTIONAL_FAIL"
+    if raw_reason == "FORCE_MIN1_TOPN":
+        return "SIZING_FORCE_MIN1_TOPN"
+    if raw_reason == "OK":
+        return "SIZING_OK"
+    return "SIZING_QTY_ZERO"
 
 
 @dataclass
@@ -3659,8 +3689,8 @@ class PB1Engine:
             )
             if qty <= 0:
                 cf.setup_ok = False
-                cf.reasons.append("planned_qty_zero_or_min_order")
-                cf.sizing_reason = sizing_reason
+                cf.sizing_reason = _normalize_sizing_failure_reason(sizing_reason)
+                cf.reasons.append(cf.sizing_reason)
                 cf.sizing_details = sizing_details
                 continue
             cf.planned_qty = qty
@@ -3669,7 +3699,7 @@ class PB1Engine:
             cf.features["planned_value"] = cf.planned_value
             cf.features["initial_stop"] = float(stop0)
             cf.features["stop_price"] = float(stop0)
-            cf.sizing_reason = "OK"
+            cf.sizing_reason = "SIZING_OK"
             cf.sizing_details = {"qty": qty, "price": order_px, "notional": cf.planned_value}
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
             allocated_slots += 1
@@ -5912,7 +5942,10 @@ class PB1Engine:
                 used_as_of,
                 len(rows),
             )
-            logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
+            logger.info(
+                "[TRADE][WATCHLIST_FINAL][TOP10] source=pb1_watchlist_final rank_basis=stored_rank codes=%s",
+                top10_codes,
+            )
 
             pool_codes = [item["code"] for item in rows]
             members = [
@@ -6967,6 +7000,9 @@ class PB1Engine:
         after_risk_check_count = 0
         after_buyable_check_count = 0
         after_dedup_count = 0
+        buyable_ok_codes: list[str] = []
+        buyable_stage_counter: Counter[str] = Counter()
+        order_stage_counter: Counter[str] = Counter()
         orderable_candidates: list[CandidateFeature] = []
         submit_attempt_count = 0
         submit_success_count = 0
@@ -7194,6 +7230,8 @@ class PB1Engine:
                     pullback_count = 0
                     momentum_count = 0
                     no_signal_count = 0
+                    precomputed_style_counts: Counter[str] = Counter()
+                    scanner_style_counts: Counter[str] = Counter()
                     
                     # OHLCV 데이터 필요량 (signals 체크용)
                     signal_ohlcv_days = int(os.getenv("ENTRY_SIGNAL_OHLCV_DAYS", "260"))
@@ -7208,6 +7246,13 @@ class PB1Engine:
                     for cf in candidates:
                         if not cf.features.get("data_ok"):
                             continue
+                        precomputed_style = str(
+                            cf.features.get("entry_style_selected")
+                            or cf.features.get("entry_style")
+                            or ""
+                        ).strip().upper()
+                        if precomputed_style:
+                            precomputed_style_counts[precomputed_style] += 1
                         
                         # OHLCV 데이터 가져오기
                         try:
@@ -7221,12 +7266,33 @@ class PB1Engine:
                             if breakout_signal(df):
                                 cf.features["entry_signal"] = "breakout"
                                 breakout_count += 1
+                                scanner_style_counts["BREAKOUT"] += 1
+                                if precomputed_style and precomputed_style != "BREAKOUT":
+                                    logger.info(
+                                        "[ENTRY_SCAN][STYLE_SOURCE] code=%s precomputed_entry_style=%s scanner_strategy=BREAKOUT reason=signal_scan_priority",
+                                        cf.code,
+                                        precomputed_style,
+                                    )
                             elif pullback_signal(df):
                                 cf.features["entry_signal"] = "pullback"
                                 pullback_count += 1
+                                scanner_style_counts["PULLBACK"] += 1
+                                if precomputed_style and precomputed_style != "PULLBACK":
+                                    logger.info(
+                                        "[ENTRY_SCAN][STYLE_SOURCE] code=%s precomputed_entry_style=%s scanner_strategy=PULLBACK reason=signal_scan_priority",
+                                        cf.code,
+                                        precomputed_style,
+                                    )
                             elif momentum_signal(df):
                                 cf.features["entry_signal"] = "momentum"
                                 momentum_count += 1
+                                scanner_style_counts["MOMENTUM"] += 1
+                                if precomputed_style and precomputed_style != "MOMENTUM":
+                                    logger.info(
+                                        "[ENTRY_SCAN][STYLE_SOURCE] code=%s precomputed_entry_style=%s scanner_strategy=MOMENTUM reason=signal_scan_priority",
+                                        cf.code,
+                                        precomputed_style,
+                                    )
                             else:
                                 cf.features["entry_signal"] = "none"
                                 no_signal_count += 1
@@ -7249,6 +7315,11 @@ class PB1Engine:
                     logger.info("[ENTRY_SCAN] breakout signals=%s", breakout_count)
                     logger.info("[ENTRY_SCAN] pullback signals=%s", pullback_count)
                     logger.info("[ENTRY_SCAN] momentum signals=%s", momentum_count)
+                    logger.info(
+                        "[ENTRY_SCAN][STYLE_COMPARE] precomputed=%s scanner=%s",
+                        dict(precomputed_style_counts),
+                        dict(scanner_style_counts),
+                    )
                     
                     # Entry signal이 없는 종목 필터링 (옵션)
                     filter_no_signal = os.getenv("ENTRY_SIGNAL_REQUIRED", "0") == "1"
@@ -7453,6 +7524,7 @@ class PB1Engine:
                     if pivot_val and order_price > 0:
                         if order_price <= pivot_val * 1.003:
                             self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
+                            buyable_stage_counter["pivot_not_broken"] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
                             self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
                             self._emit_buy_decision(
@@ -7465,6 +7537,7 @@ class PB1Engine:
                             continue
                         if order_price > pivot_val * 1.03:
                             self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
+                            buyable_stage_counter["pivot_overshoot"] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
                             self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
                             self._emit_buy_decision(
@@ -7475,85 +7548,42 @@ class PB1Engine:
                                 entry_reason=entry_reason,
                             )
                             continue
-                planned_cap = float(cf.features.get("planned_cap") or (order_price * float(cf.planned_qty or 0)))
                 if cf.planned_qty <= 0:
-                    self._record_drop(drop_reason_counter, drop_examples, "qty_zero", cf.code)
-                    logger.info(
-                        "[PB1][SKIP] code=%s reason=qty_zero cap=%.0f close=%.0f min_order=%.0f",
-                        cf.code,
-                        planned_cap,
-                        close_price,
-                        min_order_krw,
-                    )
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["qty_zero"])
-                    self._log_order_skip(cf, ["qty_zero"], "PB1-CLOSE")
+                    sizing_reason = _normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))
+                    self._record_drop(drop_reason_counter, drop_examples, sizing_reason, cf.code)
+                    order_stage_counter[sizing_reason] += 1
+                    self._log_order_skip(cf, [sizing_reason], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=0.0,
-                        reasons=["qty_zero"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
-                if min_order_krw > 0 and planned_cap < min_order_krw:
-                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_min_order", cf.code)
-                    logger.info(
-                        "[PB1][SKIP] code=%s reason=cap_below_min_order cap=%.0f close=%.0f min_order=%.0f",
-                        cf.code,
-                        planned_cap,
-                        close_price,
-                        min_order_krw,
-                    )
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_min_order"])
-                    self._log_order_skip(cf, ["cap_below_min_order"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_price * float(cf.planned_qty or 0),
-                        reasons=["cap_below_min_order"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
-                if order_price > 0 and planned_cap < order_price:
-                    self._record_drop(drop_reason_counter, drop_examples, "cap_below_one_share", cf.code)
-                    logger.info(
-                        "[PB1][SKIP] code=%s reason=cap_below_one_share cap=%.0f close=%.0f min_order=%.0f",
-                        cf.code,
-                        planned_cap,
-                        close_price,
-                        min_order_krw,
-                    )
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cap_below_one_share"])
-                    self._log_order_skip(cf, ["cap_below_one_share"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_price * float(cf.planned_qty or 0),
-                        reasons=["cap_below_one_share"],
+                        reasons=[sizing_reason],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
                 order_value = order_price * float(cf.planned_qty or 0)
                 if not allow_add_to_existing and cf.code in held_codes:
-                    self._record_drop(drop_reason_counter, drop_examples, "holding_position", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["holding_position"])
-                    self._log_order_skip(cf, ["holding_position"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_EXISTING_HOLDING", cf.code)
+                    buyable_stage_counter["BUYABLE_EXISTING_HOLDING"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_EXISTING_HOLDING"])
+                    self._log_order_skip(cf, ["BUYABLE_EXISTING_HOLDING"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["holding_position"],
+                        reasons=["BUYABLE_EXISTING_HOLDING"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
                 if cf.code in open_buy_codes:
-                    self._record_drop(drop_reason_counter, drop_examples, "open_order", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["open_order"])
-                    self._log_order_skip(cf, ["open_order"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_OPEN_ORDER", cf.code)
+                    buyable_stage_counter["BUYABLE_OPEN_ORDER"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_OPEN_ORDER"])
+                    self._log_order_skip(cf, ["BUYABLE_OPEN_ORDER"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["open_order"],
+                        reasons=["BUYABLE_OPEN_ORDER"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
@@ -7561,25 +7591,27 @@ class PB1Engine:
                 gate_snapshot = buyable_gate_context.get(str(cf.code or "").zfill(6), {})
                 self._log_buyable_gate_trace(code=cf.code, entry_allowed=entry_allowed, snapshot=gate_snapshot)
                 if gate_snapshot.get("today_buy_exists"):
-                    self._record_drop(drop_reason_counter, drop_examples, "today_buy_exists", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["today_buy_exists"])
-                    self._log_order_skip(cf, ["today_buy_exists"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_TODAY_BUY_EXISTS", cf.code)
+                    buyable_stage_counter["BUYABLE_TODAY_BUY_EXISTS"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_TODAY_BUY_EXISTS"])
+                    self._log_order_skip(cf, ["BUYABLE_TODAY_BUY_EXISTS"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["today_buy_exists"],
+                        reasons=["BUYABLE_TODAY_BUY_EXISTS"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
                 if gate_snapshot.get("cooldown_active"):
-                    self._record_drop(drop_reason_counter, drop_examples, "cooldown_active", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["cooldown_active"])
-                    self._log_order_skip(cf, ["cooldown_active"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_COOLDOWN", cf.code)
+                    buyable_stage_counter["BUYABLE_COOLDOWN"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_COOLDOWN"])
+                    self._log_order_skip(cf, ["BUYABLE_COOLDOWN"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["cooldown_active"],
+                        reasons=["BUYABLE_COOLDOWN"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
@@ -7602,42 +7634,46 @@ class PB1Engine:
                                 prior.get("created_at"),
                                 prior.get("run_id"),
                             )
-                        self._record_drop(drop_reason_counter, drop_examples, "duplicate_order", cf.code)
-                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["duplicate_order"])
-                        self._log_order_skip(cf, ["duplicate_order"], "PB1-CLOSE")
+                        self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_DUPLICATE", cf.code)
+                        buyable_stage_counter["BUYABLE_DUPLICATE"] += 1
+                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_DUPLICATE"])
+                        self._log_order_skip(cf, ["BUYABLE_DUPLICATE"], "PB1-CLOSE")
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
-                            reasons=["duplicate_order"],
+                            reasons=["BUYABLE_DUPLICATE"],
                             entry_allowed=entry_allowed,
                             entry_reason=entry_reason,
                         )
                         continue
                 if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
-                    self._record_drop(drop_reason_counter, drop_examples, "entry_mode_close_only", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_close_only"])
-                    self._log_order_skip(cf, ["entry_mode_close_only"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
+                    buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
+                    self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["entry_mode_close_only"],
+                        reasons=["BUYABLE_WINDOW_BLOCK"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
                 if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
-                    self._record_drop(drop_reason_counter, drop_examples, "entry_mode_intraday_only", cf.code)
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["entry_mode_intraday_only"])
-                    self._log_order_skip(cf, ["entry_mode_intraday_only"], "PB1-CLOSE")
+                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
+                    buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
+                    self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["entry_mode_intraday_only"],
+                        reasons=["BUYABLE_WINDOW_BLOCK"],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
                     continue
                 self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
+                buyable_ok_codes.append(cf.code)
                 last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
                 last_volume = float(cf.features.get("last_volume") or 0.0)
                 trigger_ok, trigger_info = entry_trigger(
@@ -7684,6 +7720,7 @@ class PB1Engine:
                         cf.features["entry_trigger"] = trigger_info
                     for reason in entry_reasons:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                        order_stage_counter[reason] += 1
                     self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -7696,6 +7733,7 @@ class PB1Engine:
                 df, _ = self._fetch_daily(cf.code)
                 if df.empty:
                     self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
+                    order_stage_counter["stop_calc_fail"] += 1
                     self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -7719,6 +7757,7 @@ class PB1Engine:
                 )
                 if stop0 >= entry_price:
                     self._record_drop(drop_reason_counter, drop_examples, "stop_above_entry", cf.code)
+                    order_stage_counter["stop_above_entry"] += 1
                     self._log_order_skip(cf, ["stop_above_entry"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -7755,6 +7794,7 @@ class PB1Engine:
                 if reasons:
                     for reason in reasons:
                         self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                        order_stage_counter[reason] += 1
                     self._log_order_skip(cf, reasons, "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
@@ -7895,6 +7935,7 @@ class PB1Engine:
                     int(strict_ok),
                 )
                 self._record_drop(drop_reason_counter, drop_examples, "setup_not_ok", cf.code)
+                order_stage_counter["setup_not_ok"] += 1
             orderable_candidates = valid_orderable
 
             orderable_codes = [c.code for c in orderable_candidates]
@@ -7907,7 +7948,7 @@ class PB1Engine:
             )
             relax_debug_payload["final_orderable_codes"] = orderable_codes
 
-            after_buyable_check_count = len(orderable_candidates)
+            after_buyable_check_count = len(buyable_ok_codes)
             after_dedup_count = len(orderable_candidates)
             drop_reasons_by_code: dict[str, list[str]] = {}
             drop_reason_examples_full: dict[str, list[str]] = {}
@@ -8028,6 +8069,40 @@ class PB1Engine:
                 entry_usable_krw,
                 tick_budget_krw,
             )
+            risk_stage_counter: Counter[str] = Counter()
+            sizing_stage_counter: Counter[str] = Counter()
+            risk_ok_set = set(self._debug_risk_ok_codes)
+            sizing_ok_set = set(self._debug_sizing_ok_codes)
+            setup_ok_set = set(setup_ok_codes)
+            for cf in candidates:
+                if cf.code in setup_ok_set and cf.code not in risk_ok_set:
+                    for reason in sorted(set(cf.reasons or ["unspecified_risk_fail"])):
+                        risk_stage_counter[reason] += 1
+                elif cf.code in risk_ok_set and cf.code not in sizing_ok_set:
+                    sizing_stage_counter[_normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))] += 1
+            logger.info(
+                "[ENTRY][FUNNEL] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s submitted=%s",
+                len(setup_ok_codes),
+                len(self._debug_risk_ok_codes),
+                len(self._debug_sizing_ok_codes),
+                len(buyable_ok_codes),
+                len(orderable_candidates),
+                submit_success_count,
+            )
+            for stage_name, stage_counter, before_count, after_count in (
+                ("risk", risk_stage_counter, len(setup_ok_codes), len(self._debug_risk_ok_codes)),
+                ("sizing", sizing_stage_counter, len(self._debug_risk_ok_codes), len(self._debug_sizing_ok_codes)),
+                ("buyable", buyable_stage_counter, len(self._debug_sizing_ok_codes), len(buyable_ok_codes)),
+                ("order_candidates", order_stage_counter, len(buyable_ok_codes), len(orderable_candidates)),
+            ):
+                drop_count = max(0, before_count - after_count)
+                if drop_count > 0:
+                    logger.info(
+                        "[ENTRY][FUNNEL][DROP] stage=%s count=%s reasons=%s",
+                        stage_name,
+                        drop_count,
+                        [reason for reason, _count in stage_counter.most_common(self.drop_reasons_topn)],
+                    )
             logger.info(
                 "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s submitted=%s",
                 len(scan_members),
