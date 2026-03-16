@@ -18,6 +18,85 @@ def test_preopen_date_policy_uses_prev_trading_day() -> None:
     assert as_of == date(2026, 3, 6)
 
 
+def test_trade_readiness_policy_uses_prev_trading_day_on_monday_morning() -> None:
+    from trader.time_utils import resolve_trade_readiness_as_of
+
+    def fake_resolver(target: date, exchange: str) -> date:
+        mapping = {
+            date(2026, 3, 15): date(2026, 3, 13),
+        }
+        return mapping.get(target, target)
+
+    resolved = resolve_trade_readiness_as_of(
+        run_date=date(2026, 3, 16),
+        market_window="morning",
+        exchange="KRX",
+        trading_day_resolver=fake_resolver,
+    )
+
+    assert resolved["requested_as_of"] == date(2026, 3, 15)
+    assert resolved["resolved_as_of"] == date(2026, 3, 13)
+    assert resolved["reason"] == "PREV_TRADING_DAY"
+
+
+def test_trade_readiness_policy_uses_prior_session_on_tuesday_morning() -> None:
+    from trader.time_utils import resolve_trade_readiness_as_of
+
+    resolved = resolve_trade_readiness_as_of(
+        run_date=date(2026, 3, 17),
+        market_window="morning",
+        exchange="KRX",
+        trading_day_resolver=lambda target, _exchange: target,
+    )
+
+    assert resolved["requested_as_of"] == date(2026, 3, 16)
+    assert resolved["resolved_as_of"] == date(2026, 3, 16)
+    assert resolved["reason"] == "PREV_TRADING_DAY"
+
+
+def test_trade_readiness_policy_uses_latest_trading_day_after_holiday() -> None:
+    from trader.time_utils import resolve_trade_readiness_as_of
+
+    def fake_resolver(target: date, exchange: str) -> date:
+        mapping = {
+            date(2026, 3, 2): date(2026, 2, 27),
+        }
+        return mapping.get(target, target)
+
+    resolved = resolve_trade_readiness_as_of(
+        run_date=date(2026, 3, 3),
+        market_window="morning",
+        exchange="KRX",
+        trading_day_resolver=fake_resolver,
+    )
+
+    assert resolved["requested_as_of"] == date(2026, 3, 2)
+    assert resolved["resolved_as_of"] == date(2026, 2, 27)
+    assert resolved["reason"] == "PREV_TRADING_DAY"
+
+
+def test_trade_readiness_policy_corrects_naive_non_trading_candidate() -> None:
+    from trader.time_utils import resolve_trade_readiness_as_of
+
+    def fake_resolver(target: date, exchange: str) -> date:
+        mapping = {
+            date(2026, 3, 15): date(2026, 3, 13),
+        }
+        return mapping.get(target, target)
+
+    resolved = resolve_trade_readiness_as_of(
+        run_date=date(2026, 3, 16),
+        market_window="after",
+        exchange="KRX",
+        candidate_as_of=date(2026, 3, 15),
+        trading_day_resolver=fake_resolver,
+    )
+
+    assert resolved["requested_as_of"] == date(2026, 3, 15)
+    assert resolved["resolved_as_of"] == date(2026, 3, 13)
+    assert resolved["reason"] == "PREV_TRADING_DAY"
+
+
 def test_candidate_pool_future_snapshot_rejected() -> None:
     from trader.candidate_pool_builder import load_candidate_pool
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, time, timedelta
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,114 @@ def prev_business_day(d: date) -> date:
     return prev
 
 
+def _fallback_previous_or_same_weekday(d: date) -> date:
+    """Fallback trading-day coercion when exchange calendar is unavailable."""
+    resolved = d
+    while resolved.weekday() >= 5:
+        resolved -= timedelta(days=1)
+    return resolved
+
+
+def coerce_to_previous_trading_day(
+    d: date,
+    *,
+    exchange: str = "KRX",
+    trading_day_resolver: Callable[[date, str], date] | None = None,
+) -> date:
+    """주어진 날짜를 이전 또는 동일 거래일로 보정한다."""
+    if trading_day_resolver is not None:
+        return trading_day_resolver(d, exchange)
+
+    normalized_exchange = (exchange or "KRX").strip().upper()
+    if normalized_exchange == "KRX":
+        try:
+            from pykrx.stock import get_nearest_business_day_in_a_week
+
+            resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
+            return date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+        except Exception as exc:
+            logger.debug(
+                "[TIME_UTILS][TRADING_DAY] exchange=%s date=%s fallback=weekday_only err=%s",
+                normalized_exchange,
+                d.isoformat(),
+                exc,
+            )
+
+    return _fallback_previous_or_same_weekday(d)
+
+
+def is_trading_date(
+    d: date,
+    *,
+    exchange: str = "KRX",
+    trading_day_resolver: Callable[[date, str], date] | None = None,
+) -> bool:
+    """특정 날짜가 거래일인지 판정한다."""
+    return coerce_to_previous_trading_day(
+        d,
+        exchange=exchange,
+        trading_day_resolver=trading_day_resolver,
+    ) == d
+
+
+def resolve_prev_trading_day(
+    run_date: date,
+    *,
+    exchange: str = "KRX",
+    trading_day_resolver: Callable[[date, str], date] | None = None,
+) -> date:
+    """기준 실행일 직전 거래일을 반환한다."""
+    candidate = run_date - timedelta(days=1)
+    return coerce_to_previous_trading_day(
+        candidate,
+        exchange=exchange,
+        trading_day_resolver=trading_day_resolver,
+    )
+
+
+def resolve_trade_readiness_as_of(
+    *,
+    run_date: date,
+    market_window: str,
+    exchange: str = "KRX",
+    candidate_as_of: date | None = None,
+    trading_day_resolver: Callable[[date, str], date] | None = None,
+) -> dict[str, date | str | bool]:
+    """Trade readiness/prep fallback에서 사용할 공통 as_of 정책을 반환한다."""
+    window = (market_window or "").strip().lower()
+    calendar_prev = run_date - timedelta(days=1)
+    requested_as_of = candidate_as_of or calendar_prev
+    trading_windows = {"preopen", "morning", "intraday", "open", "session", "day"}
+
+    if window in trading_windows:
+        resolved_as_of = resolve_prev_trading_day(
+            run_date,
+            exchange=exchange,
+            trading_day_resolver=trading_day_resolver,
+        )
+        reason = "PREV_TRADING_DAY"
+    else:
+        resolved_as_of = coerce_to_previous_trading_day(
+            requested_as_of,
+            exchange=exchange,
+            trading_day_resolver=trading_day_resolver,
+        )
+        reason = "PREV_TRADING_DAY" if resolved_as_of != requested_as_of else "REQUESTED_AS_OF"
+
+    return {
+        "run_date": run_date,
+        "calendar_prev": calendar_prev,
+        "requested_as_of": requested_as_of,
+        "resolved_as_of": resolved_as_of,
+        "reason": reason,
+        "is_calendar_prev_trading_day": is_trading_date(
+            calendar_prev,
+            exchange=exchange,
+            trading_day_resolver=trading_day_resolver,
+        ),
+    }
+
+
 def resolve_derived_as_of(now: datetime | None = None, cli_as_of: date | str | None = None) -> date:
     """
     Trade에서 사용할 derived 데이터의 as_of 날짜를 결정.
@@ -236,8 +345,8 @@ def resolve_derived_as_of(now: datetime | None = None, cli_as_of: date | str | N
 
     today = now.date()
     
-    # 전일 영업일 계산
-    derived_as_of = prev_business_day(today)
+    # 전일 거래일 계산 (주말/휴일 보정)
+    derived_as_of = resolve_prev_trading_day(today)
     
     logger.debug(
         "[ASOF][RESOLVE] now=%s today=%s derived_as_of=%s reason=INTRADAY_USE_PREV_CLOSE",

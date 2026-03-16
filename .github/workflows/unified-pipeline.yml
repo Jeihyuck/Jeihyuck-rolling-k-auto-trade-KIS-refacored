@@ -709,22 +709,43 @@ jobs:
           fi
 
           DERIVED_ASOF="${DERIVED_ASOF:-${AS_OF_OVERRIDE:-}}"
-          if [ -z "${DERIVED_ASOF}" ]; then
-            DERIVED_ASOF="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; now = datetime.now(ZoneInfo("Asia/Seoul")); d = now.date() - timedelta(days=1); print(d.isoformat())')"
-          fi
+          READINESS_CONTEXT="$(python - <<'PY'
+import os
+from datetime import date
 
-          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} as_of=${DERIVED_ASOF} window=${WINDOW} source=db_ledger"
+from trader.time_utils import now_kst, resolve_trade_readiness_as_of
+
+run_date = now_kst().date()
+window = os.getenv("WINDOW", "")
+requested_raw = os.getenv("DERIVED_ASOF") or os.getenv("AS_OF_OVERRIDE") or ""
+candidate_as_of = date.fromisoformat(requested_raw) if requested_raw else None
+resolved = resolve_trade_readiness_as_of(
+    run_date=run_date,
+    market_window=window,
+    exchange="KRX",
+    candidate_as_of=candidate_as_of,
+)
+for key in ("run_date", "calendar_prev", "requested_as_of", "resolved_as_of"):
+    print(f"{key.upper()}={resolved[key].isoformat()}")
+print(f"READINESS_REASON={resolved['reason']}")
+PY
+)"
+          while IFS='=' read -r key value; do
+            export "${key}=${value}"
+          done <<< "${READINESS_CONTEXT}"
+
+          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} run_date=${RUN_DATE} window=${WINDOW} calendar_prev=${CALENDAR_PREV} requested_as_of=${REQUESTED_ASOF} resolved_as_of=${RESOLVED_ASOF} reason=${READINESS_REASON} source=db_ledger"
 
           set +e
-          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --as-of "${DERIVED_ASOF}" --window "${WINDOW}"
+          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --run-date "${RUN_DATE}" --as-of "${REQUESTED_ASOF}" --window "${WINDOW}"
           rc=$?
           set -e
 
           if [ "$rc" -eq 0 ]; then
-            echo "[PREP][FALLBACK] readiness satisfied from db/ledger -> skip rebuild"
+            echo "[PREP][FALLBACK] readiness satisfied -> using resolved_as_of=${RESOLVED_ASOF}"
           elif [ "$rc" -eq 10 ]; then
             case "${WINDOW}" in
-              morning|intraday|day)
+              preopen|morning|intraday|open|session|day)
                 echo "[PREP][FALLBACK] readiness missing in intraday window -> rebuild blocked"
                 exit 1
                 ;;
