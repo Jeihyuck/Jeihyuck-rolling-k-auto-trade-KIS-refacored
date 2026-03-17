@@ -3181,6 +3181,9 @@ def main() -> int:
     os.environ["STRATEGY_ENV"] = resolved_env
     if not os.getenv("KIS_ENV"):
         os.environ["KIS_ENV"] = resolved_env
+    strategy_env_raw = os.getenv("STRATEGY_ENV")
+    kis_env_raw = os.getenv("KIS_ENV")
+    derived_env = (strategy_env_raw or kis_env_raw or "practice").strip().lower()
 
     # ✅ 설계 1: JOB 모드 분리 (BUILD_WATCHLIST vs TRADE_INTRADAY)
     job_mode = os.getenv("PB1_JOB", "TRADE_INTRADAY").upper()
@@ -3252,8 +3255,10 @@ def main() -> int:
             return 1
     
     # ✅ 환경변수 검증: KIS_ENV vs STRATEGY_ENV 일치 확인
-    kis_env = os.getenv("KIS_ENV", "").lower()
-    strategy_env = os.getenv("STRATEGY_ENV", "").lower()
+    kis_env_raw = os.getenv("KIS_ENV")
+    strategy_env_raw = os.getenv("STRATEGY_ENV")
+    kis_env = (kis_env_raw or "").strip().lower()
+    strategy_env = (strategy_env_raw or "").strip().lower()
     
     # ✅ NEW: allow mismatch in DIAG/DRY_RUN (candidate-only/minervini test)
     # LIVE real trading must remain strict.
@@ -3285,6 +3290,10 @@ def main() -> int:
     if not strategy_env and kis_env:
         os.environ["STRATEGY_ENV"] = kis_env
         logger.info("[PB1][ENV][AUTO] STRATEGY_ENV not set -> using KIS_ENV=%s", kis_env)
+
+    strategy_env_raw = os.getenv("STRATEGY_ENV")
+    kis_env_raw = os.getenv("KIS_ENV")
+    derived_env = (strategy_env_raw or kis_env_raw or derived_env or "practice").strip().lower()
     
     # ✅ [NEW] MINERVINI_ONLY 모드 강제 설정
     minervini_only_env = os.getenv("MINERVINI_ONLY", "0") == "1"
@@ -3422,6 +3431,14 @@ def main() -> int:
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
         watchlist_repo = WatchlistRepo(engine)
+        derived_env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or derived_env or "practice").strip().lower()
+        derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
+        logger.info(
+            "[PB1][ENV_DERIVE] strategy_env=%s kis_env=%s derived_env=%s",
+            os.getenv("STRATEGY_ENV"),
+            os.getenv("KIS_ENV"),
+            derived_env,
+        )
         watchlist_final_count = watchlist_repo.count_watchlist(
             env=derived_env,
             strategy="pb1_watchlist_final",
@@ -3466,9 +3483,6 @@ def main() -> int:
                 scored_contract.get("null_critical"),
             )
             return 0
-
-        derived_env = os.getenv("STRATEGY_ENV", "practice").strip().lower()
-        derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
         
         # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
         if derived_count <= 0:
