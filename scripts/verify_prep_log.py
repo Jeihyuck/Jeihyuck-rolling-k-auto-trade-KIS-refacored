@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Dict, List
 
 
+REQUIRED_FINAL30_FILE_LABELS = {"runtime", "ledger", "signals"}
+
+
 @dataclass
 class VerifyResults:
     """Verification results container."""
@@ -27,6 +30,7 @@ class VerifyResults:
     entry_nonzero_present: bool = False
     final30_saved: bool = False
     final30_count: int = 0
+    final30_file_labels: List[str] = field(default_factory=list)
     asof_consistent: bool = False
     candidate_pool_future_rejected: bool = False
     candidate_pool_future_seen: bool = False
@@ -134,6 +138,17 @@ def parse_log_file(log_path: Path) -> VerifyResults:
         match = re.search(r'\[PREP\]\[WATCHLIST\]\[FINAL\]\[SAVE\].*n=(\d+)', log_content)
         if match:
             results.final30_count = int(match.group(1))
+
+    file_labels = set(
+        match.group(1)
+        for match in re.finditer(
+            r'\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=(\w+) path=.* exists=True bytes=(\d+) rows=(\d+)',
+            log_content,
+        )
+        if int(match.group(2)) > 0 and int(match.group(3)) > 0
+    )
+    results.final30_file_labels = sorted(file_labels)
+    results.final30_saved = results.final30_saved and REQUIRED_FINAL30_FILE_LABELS.issubset(file_labels)
     
     # as_of consistency
     asof_match = re.search(r'\[PREP\]\[ASOF_CONSISTENCY\].*consistent=(\d+)', log_content)
@@ -224,9 +239,9 @@ def print_verification_results(results: VerifyResults) -> None:
         print("✅ contract violation recovered successfully")
 
     if results.final30_saved:
-        print(f"✅ final30 save found (count={results.final30_count})")
+        print(f"✅ final30 save found (count={results.final30_count}, files={results.final30_file_labels})")
     else:
-        print("::error::final30 save missing")
+        print(f"::error::final30 save missing files={results.final30_file_labels}")
 
     if results.exporter_preserved_scores:
         print("✅ exporter preserved score fields")

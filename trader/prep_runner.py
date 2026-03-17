@@ -55,7 +55,7 @@ from trader.time_utils import (
     prev_business_day,
     resolve_derived_as_of,
 )
-from trader.runtime_paths import get_final30_artifact_paths, get_final30_scored_paths
+from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -350,7 +350,7 @@ def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFrame) -> None:
+def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFrame) -> dict[str, dict[str, Any]]:
     payload_df = (df.copy() if df is not None else pd.DataFrame())
     for col in FINAL30_SCORED_EXPORT_COLS:
         if col not in payload_df.columns:
@@ -359,9 +359,10 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
     payload_df["code"] = payload_df["code"].astype(str).str.zfill(6)
     payload = payload_df.to_dict(orient="records")
     critical_cols = [col for col in CRITICAL_SCORED_COLS if col in payload_df.columns]
+    file_results: dict[str, dict[str, Any]] = {}
 
-    def _write_payload(path: Path, *, source_name: str) -> None:
-        if source_name == "signals_final30":
+    def _write_payload(label: str, path: Path) -> None:
+        if label == "signals":
             file_payload = {
                 "as_of": as_of,
                 "env": env,
@@ -371,10 +372,11 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             }
         else:
             file_payload = payload
-        path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("[PREP][FINAL30_SCORED][SAVE] source=%s path=%s rows=%s", source_name, path, len(payload))
+        tmp_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+        tmp_path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
 
-    def _validate_saved_file(path: Path, *, source_name: str) -> bool:
+    def _validate_saved_file(label: str, path: Path) -> bool:
         exists = int(path.exists())
         bytes_written = 0
         json_ok = 0
@@ -394,9 +396,25 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             except Exception:
                 json_ok = 0
         detected_critical_cols = sorted([col for col in CRITICAL_SCORED_COLS if rows and col in rows[0]])
+        file_results[label] = {
+            "path": path,
+            "exists": bool(exists == 1),
+            "bytes": bytes_written,
+            "rows": len(rows),
+            "json_ok": bool(json_ok == 1),
+            "critical_cols": detected_critical_cols,
+        }
+        logger.info(
+            "[PREP][FINAL30_FILE][WRITE] label=%s path=%s exists=%s bytes=%s rows=%s",
+            label,
+            str(path),
+            path.exists(),
+            bytes_written,
+            len(rows),
+        )
         logger.info(
             "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s json_ok=%s rows=%s critical_cols=%s",
-            source_name,
+            label,
             path,
             exists,
             bytes_written,
@@ -412,16 +430,16 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             and set(CRITICAL_SCORED_COLS).issubset(set(detected_critical_cols))
         )
 
-    for source_name, path in get_final30_artifact_paths(env, as_of, include_legacy=True):
+    for label, path in build_final30_scored_paths(repo_root(), env, as_of).items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_payload(path, source_name=source_name)
-        if not _validate_saved_file(path, source_name=source_name):
-            logger.warning("[PREP][FINAL30_SCORED][RETRY] source=%s path=%s", source_name, path)
-            _write_payload(path, source_name=source_name)
-            if not _validate_saved_file(path, source_name=source_name):
+        _write_payload(label, path)
+        if not _validate_saved_file(label, path):
+            logger.warning("[PREP][FINAL30_SCORED][RETRY] source=%s path=%s", label, path)
+            _write_payload(label, path)
+            if not _validate_saved_file(label, path):
                 logger.warning(
                     "[PREP][FINAL30_SCORED][VERIFY_FAIL] source=%s path=%s expected_rows=30 required_cols=%s",
-                    source_name,
+                    label,
                     path,
                     critical_cols,
                 )
@@ -434,6 +452,7 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
         int("pullback_score" in payload_df.columns),
         int("momentum_score" in payload_df.columns),
     )
+    return file_results
 
 
 def _is_scored_final30_df(df: pd.DataFrame) -> bool:
@@ -1367,22 +1386,6 @@ def main() -> int:
             final30_path,
         )
 
-        signal_dir = Path("signals")
-        signal_dir.mkdir(parents=True, exist_ok=True)
-        signal_path = signal_dir / "final30.json"
-        signal_payload = {
-            "as_of": as_of.isoformat(),
-            "env": env,
-            "count": len(watchlist),
-            "items": watchlist,
-            "meta": {
-                "strategy": watchlist_final_strategy,
-                "bundle_source": watchlist_bundle.get("degrade", {}).get("reason", "fresh_build"),
-            },
-        }
-        signal_path.write_text(json.dumps(signal_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("[PREP][SIGNALS][FINAL30_JSON] path=%s count=%s", signal_path, len(watchlist))
-
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id
     ledger_repo = LedgerEventsRepo(engine)
@@ -1455,10 +1458,34 @@ def main() -> int:
             len(loaded_scored_df),
         )
 
-    _write_canonical_final30_scored_files(
+    final30_file_results = _write_canonical_final30_scored_files(
         env=env,
         as_of=as_of.isoformat(),
         df=final30_scored_df_for_export,
+    )
+    prep_repo_root = repo_root().resolve()
+    prep_cwd = Path.cwd().resolve()
+    final30_paths = build_final30_scored_paths(prep_repo_root, env, as_of.isoformat())
+    logger.info(
+        "[PREP][FINAL30][PATHS] repo_root=%s cwd=%s paths=%s",
+        prep_repo_root,
+        prep_cwd,
+        {label: str(path) for label, path in final30_paths.items()},
+    )
+    for label, path in final30_paths.items():
+        path_info = final30_file_results.get(label, {})
+        logger.info(
+            "[PREP][FINAL30][PATH] label=%s path=%s exists=%s bytes=%s rows=%s",
+            label,
+            str(path),
+            int(bool(path_info.get("exists"))),
+            int(path_info.get("bytes") or 0),
+            int(path_info.get("rows") or 0),
+        )
+    logger.info(
+        "[PREP][SIGNALS][FINAL30_JSON] path=%s count=%s source=canonical_scored_contract",
+        final30_paths["signals"],
+        int(len(final30_scored_df_for_export)),
     )
 
     frames = {
@@ -1660,6 +1687,27 @@ def main() -> int:
     prep_status = "DONE"
     flow_coverage = 0.0
     degraded_exclude_flow = False
+    strict_final30_file_contract = _env_true("STRICT_FINAL30_FILE_CONTRACT", "0")
+    final30_file_failures = [
+        f"final30_file_contract_missing:{label}"
+        for label, info in final30_file_results.items()
+        if not bool(info.get("exists")) or int(info.get("bytes") or 0) <= 0 or int(info.get("rows") or 0) <= 0
+    ]
+    final30_file_contract_ok = len(final30_scored_df_for_export) > 0 and not final30_file_failures
+    logger.info(
+        "[PREP][FINAL30_FILE][CONTRACT] ok=%s strict=%s failures=%s",
+        int(final30_file_contract_ok),
+        int(strict_final30_file_contract),
+        final30_file_failures,
+    )
+    if final30_file_failures:
+        logger.warning(
+            "[PREP][FINAL30_FILE][WARN] repo_root=%s cwd=%s failures=%s",
+            prep_repo_root,
+            prep_cwd,
+            final30_file_failures,
+        )
+        contract_failures = list(contract_failures) + final30_file_failures
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:
@@ -1752,6 +1800,12 @@ def main() -> int:
             as_of,
         )
 
+    if final30_file_failures:
+        if strict_final30_file_contract:
+            prep_status = "FAIL"
+        elif prep_status != "FAIL":
+            prep_status = "DEGRADED"
+
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
     flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
@@ -1814,6 +1868,8 @@ def main() -> int:
             "flow_coverage": flow_coverage,
             "contract_failures": contract_failures,
             "contract_mode": contract_mode,
+            "final30_file_contract_ok": final30_file_contract_ok,
+            "final30_file_failures": final30_file_failures,
             "final_source": final30_source_label,
             "prep_status": prep_status,
             "durations_sec": {

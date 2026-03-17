@@ -6773,6 +6773,21 @@ class PB1Engine:
         self.askbid_fail_count = 0  # [PATCH] 회로차단기용 실패 카운트
         final_status = "OK"
         final_notes: str | None = None
+        engine_dry_run = bool(getattr(self, "dry_run", False))
+        engine_intended_live = bool(getattr(self, "intended_live", False))
+        engine_phase = getattr(self, "phase", None)
+        engine_force_block_live = bool(getattr(self, "force_block_live", False))
+        engine_live_trading_enabled = bool(getattr(self, "live_trading_enabled", False))
+        engine_run_mode = getattr(self, "run_mode", None)
+        engine_compute_only = bool(getattr(self, "compute_only_full_run", False))
+        logger.info(
+            "[PB1][ENGINE_STATE] dry_run=%s intended_live=%s phase=%s has_flags=%s force_block_live=%s",
+            bool(getattr(self, "dry_run", False)),
+            bool(getattr(self, "intended_live", False)),
+            getattr(self, "phase", None),
+            hasattr(self, "flags"),
+            bool(getattr(self, "force_block_live", False)),
+        )
         
         # ✅ [GATE] calc_allowed, order_allowed 분리
         calc_allowed = self.calc_allowed  # 계산 허용
@@ -6866,7 +6881,7 @@ class PB1Engine:
                 entry_reason = f"phase_{self.phase}"
                 # 주문만 차단, 계산은 계속 허용
         # ✅ FATAL 가드: intended_live=True인데 dry_run=True면 즉시 종료
-        if self.intended_live and self.dry_run:
+        if engine_intended_live and engine_dry_run:
             raise RuntimeError(
                 "FATAL: intended_live=True but pb1_engine received dry_run=True. "
                 "This would block live orders. Fix dry_run propagation."
@@ -8058,7 +8073,7 @@ class PB1Engine:
                 today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
             except Exception as e:
                 logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
-                if self.flags.live_trading_enabled and not self.flags.dry_run and self.flags.run_mode == "LIVE":
+                if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
                     raise
                 today_orders = []
             today_spent = 0.0
@@ -8452,7 +8467,32 @@ class PB1Engine:
                 orderable_candidates = orderable_candidates[:3]
                 logger.warning("[PB1][BOOTSTRAP] orderable capped to top3")
 
-            if not orderable_candidates:
+            allow_emergency_candidate = bool(engine_dry_run and os.getenv("PB1_EMERGENCY_DEBUG", "0") == "1")
+            has_buyable_block_reason = any(
+                str(reason).upper().startswith("BUYABLE_")
+                for reason in drop_reason_counter.keys()
+            )
+            has_buyable_gate_blocks = bool(today_buy_codes) or any(
+                bool(snapshot.get("today_buy_exists")) or bool(snapshot.get("cooldown_active"))
+                for snapshot in buyable_gate_context.values()
+            )
+            emergency_fallback_blocked = bool(
+                engine_intended_live
+                or engine_force_block_live
+                or engine_compute_only
+                or has_buyable_gate_blocks
+                or has_buyable_block_reason
+            )
+            logger.info(
+                "[ORDER_CANDIDATES][EMERGENCY][GATE] enabled=%s dry_run=%s intended_live=%s force_block_live=%s pb1_emergency_debug=%s",
+                int(allow_emergency_candidate and not emergency_fallback_blocked),
+                int(engine_dry_run),
+                int(engine_intended_live),
+                int(engine_force_block_live),
+                os.getenv("PB1_EMERGENCY_DEBUG", "0"),
+            )
+
+            if not orderable_candidates and allow_emergency_candidate and not emergency_fallback_blocked:
                 code_to_member = {
                     str(m.get("code") or "").zfill(6): dict(m)
                     for m in (scan_members or [])
@@ -8496,12 +8536,6 @@ class PB1Engine:
                     emergency_cf.features["candidate_tier"] = "emergency_force1"
                     emergency_cf.sizing_reason = "EMERGENCY_CANDIDATE_FALLBACK"
                     emergency_cf.sizing_details = {"candidate_tier": "emergency_force1", "qty": 1, "price": order_px}
-                    allow_emergency_diag_fallback = bool(
-                        os.getenv("MODE") == "diag"
-                        or os.getenv("DIAGNOSTIC_MODE", "0") == "1"
-                        or os.getenv("DIAGNOSTIC_ONLY", "0") == "1"
-                        or (self.flags.dry_run and os.getenv("PB1_EMERGENCY_DEBUG", "0") == "1")
-                    )
                     if emergency_order_enabled and not emergency_diag_only:
                         emergency_cf.setup_ok = True
                         emergency_cf.features["setup_loose_ok"] = True
@@ -8514,7 +8548,7 @@ class PB1Engine:
                             "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
                             emergency_cf.code,
                         )
-                    elif allow_emergency_diag_fallback:
+                    else:
                         logger.warning(
                             "[ORDER_CANDIDATES][EMERGENCY][DIAG_ONLY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK order_enabled=%s diag_only=%s",
                             emergency_cf.code,
@@ -8796,17 +8830,26 @@ class PB1Engine:
                         no_orders_reasons.append("exhausted_candidates")
                     blocked_by = _normalize_entry_block_counts(drop_reason_counter)
                     blocked_by.update(_normalize_entry_block_reasons(no_orders_reasons))
+                    blocked_summary = _format_reason_counts(blocked_by)
                     primary_reason = _primary_no_trade_reason(
                         blocked_by,
                         ok_count=ok_count,
                         order_candidates=len(orderable_candidates),
                     )
-                    final_status = "NO_TRADE"
-                    final_notes = f"no_orders:{no_orders_reasons or 'none'}"
+                    final_status = "OK_NO_TRADE"
+                    final_notes = "NO_ORDERABLE_CANDIDATES"
+                    logger.info(
+                        "[ENTRY][NO_ORDERABLE] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s reason_top=%s",
+                        len(setup_ok_codes),
+                        after_risk_check_count,
+                        len(self._debug_sizing_ok_codes),
+                        after_buyable_check_count,
+                        drop_reason_counter.most_common(self.drop_reasons_topn),
+                    )
                     logger.info(
                         "[PB1][NO_TRADE] reason=no_orders primary_no_trade_reason=%s blocked_by=%s no_orders_reason=%s",
                         primary_reason,
-                        _format_reason_counts(blocked_by),
+                        blocked_summary,
                         no_orders_reasons or ["none"],
                     )
                     if self.phase in {"prep", "entry"}:

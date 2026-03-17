@@ -132,3 +132,13 @@ def test_get_final30_artifact_paths_are_repo_root_anchored(tmp_path, monkeypatch
     assert paths[0][1] == tmp_path / "runtime" / "watchlist" / "2026-03-11" / "final30_scored.json"
     assert paths[1][1] == tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json"
     assert paths[2][1] == tmp_path / "signals" / "final30.json"
+
+
+def test_build_final30_scored_paths_returns_three_contract_paths(tmp_path):
+    paths = runtime_paths.build_final30_scored_paths(tmp_path, "practice", "2026-03-11")
+
+    assert paths == {
+        "runtime": tmp_path / "runtime" / "watchlist" / "2026-03-11" / "final30_scored.json",
+        "ledger": tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json",
+        "signals": tmp_path / "signals" / "final30.json",
+    }

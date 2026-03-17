@@ -66,8 +66,10 @@ else
 	echo "PASS contract violation recovered successfully" | tee -a "$VERIFY_LOG"
 fi
 
-if grep -q "\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].*n=30" "$LOG" || grep -q "\[PREP\]\[FINAL30_SNAPSHOT\]\[SAVE\].*count=30" "$LOG"; then
-	echo "PASS final30 save found (count=30)" | tee -a "$VERIFY_LOG"
+if grep -q "\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=runtime .*exists=True .*rows=30" "$LOG" && \
+	 grep -q "\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=ledger .*exists=True .*rows=30" "$LOG" && \
+	 grep -q "\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=signals .*exists=True .*rows=30" "$LOG"; then
+	echo "PASS final30 save found (runtime/ledger/signals)" | tee -a "$VERIFY_LOG"
 else
 	echo "FAIL final30 save missing" | tee -a "$VERIFY_LOG"
 	critical=1

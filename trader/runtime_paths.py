@@ -79,8 +79,18 @@ def _as_of_str(as_of: str | date) -> str:
     return str(as_of).strip()
 
 
+def build_final30_scored_paths(repo_root: Path, env: str, as_of: str | date) -> dict[str, Path]:
+    env_n = (env or "").strip().lower()
+    as_of_s = _as_of_str(as_of)
+    return {
+        "runtime": repo_root / "runtime" / "watchlist" / as_of_s / "final30_scored.json",
+        "ledger": repo_root / "bot_state" / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+        "signals": repo_root / "signals" / "final30.json",
+    }
+
+
 def get_final30_scored_paths(env: str, as_of: str | date) -> list[Path]:
-    return [path for _name, path in get_final30_artifact_paths(env, as_of, include_legacy=False)]
+    return list(build_final30_scored_paths(repo_root(), env, as_of).values())[:2]
 
 
 def get_final30_artifact_paths(
@@ -89,16 +99,11 @@ def get_final30_artifact_paths(
     *,
     include_legacy: bool = True,
 ) -> list[tuple[str, Path]]:
-    env_n = (env or "").strip().lower()
-    as_of_s = _as_of_str(as_of)
-    root = repo_root()
+    paths_by_label = build_final30_scored_paths(repo_root(), env, as_of)
     paths: list[tuple[str, Path]] = [
-        ("runtime_final30_scored", root / "runtime" / "watchlist" / as_of_s / "final30_scored.json"),
-        (
-            "ledger_final30_scored",
-            root / "bot_state" / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
-        ),
+        ("runtime_final30_scored", paths_by_label["runtime"]),
+        ("ledger_final30_scored", paths_by_label["ledger"]),
     ]
     if include_legacy:
-        paths.append(("signals_final30", root / "signals" / "final30.json"))
+        paths.append(("signals_final30", paths_by_label["signals"]))
     return paths

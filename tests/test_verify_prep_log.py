@@ -6,6 +6,37 @@ from pathlib import Path
 
 import pytest
 
+from scripts.verify_prep_log import parse_log_file
+
+
+def test_parse_log_file_requires_all_final30_contract_files(tmp_path) -> None:
+    log_path = tmp_path / "prep.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[LEDGER_EVENT] event_type=PREP_DONE as_of=2026-03-16 symbols=30 flow_coverage=100.0%",
+                "[PREP][DONE] as_of=2026-03-16 source=fresh_build universe=200 pool120=120 top50=50 final30=30 flow_coverage=100.0 final_source=watchlist_result.final30_scored contract_mode=strict dt=1.23",
+                "[PREP][DERIVED_VERIFY][OK]",
+                "[PREP][ASOF_CONSISTENCY] universe=2026-03-16 ohlcv=2026-03-16 derived=2026-03-16 candidate_pool=2026-03-16 watchlist=2026-03-16 flow=2026-03-16 final30=2026-03-16 consistent=1",
+                "[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=10 pullback_nonzero=8 momentum_nonzero=12",
+                "[EXPORT][SCORES] name=final30 tech_nonzero=30 score_final_nonzero=30 breakout_nonzero=10 pullback_nonzero=8 momentum_nonzero=12",
+                "[PREP][WATCHLIST_FINAL][SAVE] strategy=pb1_watchlist_final as_of=2026-03-16 n=30",
+                "[PREP][FINAL30_FILE][WRITE] label=runtime path=/repo/runtime/watchlist/2026-03-16/final30_scored.json exists=True bytes=1024 rows=30",
+                "[PREP][FINAL30_FILE][WRITE] label=ledger path=/repo/bot_state/trader_ledger/final30/practice/2026-03-16/final30_scored.json exists=True bytes=1024 rows=30",
+                "[PREP][FINAL30_FILE][WRITE] label=signals path=/repo/signals/final30.json exists=True bytes=1024 rows=30",
+                "[PREP][FINAL30_FILE][CONTRACT] ok=1 strict=0 failures=[]",
+                "[DERIVED][LOAD] rows=196",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = parse_log_file(log_path)
+
+    assert results.final30_saved is True
+    assert results.final30_file_labels == ["ledger", "runtime", "signals"]
+    assert results.has_critical_failure() is False
+
 
 def test_verify_success_full_policy_path():
     log_content = """
