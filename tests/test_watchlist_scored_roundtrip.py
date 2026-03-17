@@ -132,6 +132,44 @@ def test_universe_scored_roundtrip_preserves_critical_columns() -> None:
     assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
 
 
+def test_scored_contract_rank_warning_does_not_fail_verification() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+    as_of = date(2026, 3, 11)
+    members = []
+    for idx in range(1, 31):
+        member = _scored_member(idx)
+        member["rank"] = 0
+        member["rank_final30"] = 0
+        members.append(member)
+
+    repo.save_watchlist(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        members=members,
+    )
+
+    summary = verify_final30_scored_contract(
+        engine,
+        env="practice",
+        as_of=as_of,
+        allow_latest_fallback=False,
+        log_result=False,
+    )
+
+    assert summary["ok"] is True
+    assert summary["rows"] == 30
+    assert summary["uniq_codes"] == 30
+    assert summary["null_critical"] == 0
+    assert summary["rank_warn"] is True
+    assert summary["rank_source"] == "synthetic_for_diag"
+    assert summary["uniq_ranks"] == 30
+
+
 def test_scored_strategy_rejects_plain_serializer_shape() -> None:
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
@@ -153,6 +191,20 @@ def test_trade_loader_uses_db_scored_without_reject(tmp_path, monkeypatch, caplo
     class FakeRepo:
         def __init__(self, *_args, **_kwargs):
             pass
+
+        def verify_watchlist_scored_contract(self, **_kwargs):
+            row = _scored_member(1)
+            return {
+                "ok": True,
+                "rows": 1,
+                "uniq_codes": 1,
+                "uniq_ranks": 1,
+                "rank_warn": False,
+                "rank_source": "rank_final30",
+                "null_critical": 0,
+                "missing_fields": [],
+                "rows_data": [row],
+            }
 
         def load_watchlist_scored(self, *, strategy, **_kwargs):
             if strategy == "pb1_watchlist_final_scored":
