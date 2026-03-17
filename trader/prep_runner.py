@@ -360,8 +360,7 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
     payload = payload_df.to_dict(orient="records")
     critical_cols = [col for col in CRITICAL_SCORED_COLS if col in payload_df.columns]
 
-    for source_name, path in get_final30_artifact_paths(env, as_of, include_legacy=True):
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def _write_payload(path: Path, *, source_name: str) -> None:
         if source_name == "signals_final30":
             file_payload = {
                 "as_of": as_of,
@@ -374,19 +373,58 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             file_payload = payload
         path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info("[PREP][FINAL30_SCORED][SAVE] source=%s path=%s rows=%s", source_name, path, len(payload))
-        try:
-            bytes_written = path.stat().st_size
-        except OSError:
-            bytes_written = -1
+
+    def _validate_saved_file(path: Path, *, source_name: str) -> bool:
+        exists = int(path.exists())
+        bytes_written = 0
+        json_ok = 0
+        rows: list[dict[str, Any]] = []
+        if exists:
+            try:
+                bytes_written = int(path.stat().st_size)
+            except OSError:
+                bytes_written = 0
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                json_ok = 1
+                if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+                    rows = [dict(item) for item in parsed.get("items") if isinstance(item, dict)]
+                elif isinstance(parsed, list):
+                    rows = [dict(item) for item in parsed if isinstance(item, dict)]
+            except Exception:
+                json_ok = 0
+        detected_critical_cols = sorted([col for col in CRITICAL_SCORED_COLS if rows and col in rows[0]])
         logger.info(
-            "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s rows=%s critical_cols=%s",
+            "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s json_ok=%s rows=%s critical_cols=%s",
             source_name,
             path,
-            int(path.exists()),
+            exists,
             bytes_written,
-            len(payload),
-            critical_cols,
+            json_ok,
+            len(rows),
+            detected_critical_cols,
         )
+        return bool(
+            exists == 1
+            and bytes_written > 0
+            and json_ok == 1
+            and len(rows) == 30
+            and set(CRITICAL_SCORED_COLS).issubset(set(detected_critical_cols))
+        )
+
+    for source_name, path in get_final30_artifact_paths(env, as_of, include_legacy=True):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_payload(path, source_name=source_name)
+        if not _validate_saved_file(path, source_name=source_name):
+            logger.warning("[PREP][FINAL30_SCORED][RETRY] source=%s path=%s", source_name, path)
+            _write_payload(path, source_name=source_name)
+            if not _validate_saved_file(path, source_name=source_name):
+                logger.warning(
+                    "[PREP][FINAL30_SCORED][VERIFY_FAIL] source=%s path=%s expected_rows=30 required_cols=%s",
+                    source_name,
+                    path,
+                    critical_cols,
+                )
 
     logger.info(
         "[PREP][FINAL30_SCORED][FIELDS] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",

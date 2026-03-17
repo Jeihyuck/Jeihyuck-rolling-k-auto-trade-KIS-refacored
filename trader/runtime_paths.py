@@ -91,13 +91,14 @@ def get_final30_artifact_paths(
 ) -> list[tuple[str, Path]]:
     env_n = (env or "").strip().lower()
     as_of_s = _as_of_str(as_of)
+    root = repo_root()
     paths: list[tuple[str, Path]] = [
-        ("runtime_final30_scored", Path("runtime") / "watchlist" / as_of_s / "final30_scored.json"),
+        ("runtime_final30_scored", root / "runtime" / "watchlist" / as_of_s / "final30_scored.json"),
         (
             "ledger_final30_scored",
-            Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+            root / "bot_state" / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
         ),
     ]
     if include_legacy:
-        paths.append(("signals_final30", Path("signals") / "final30.json"))
+        paths.append(("signals_final30", root / "signals" / "final30.json"))
     return paths

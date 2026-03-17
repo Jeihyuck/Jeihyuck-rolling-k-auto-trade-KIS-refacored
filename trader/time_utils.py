@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import io
 import logging
 import os
 from datetime import date, datetime, time, timedelta
@@ -208,8 +209,8 @@ def _fallback_last_weekday_scan(d: date, *, lookback_days: int = 7) -> date:
     return _fallback_previous_weekday(d)
 
 
-def _log_pykrx_fail_once(*, scope: str, subject: str, fallback: str, error: Exception) -> None:
-    error_name = type(error).__name__
+def _log_pykrx_fail_once(*, scope: str, subject: str, fallback: str, error: Exception | None = None, err_type: str | None = None) -> None:
+    error_name = err_type or type(error).__name__
     signature = (scope, subject, error_name)
     if signature in _PYKRX_WARNED_SIGNATURES:
         return
@@ -237,25 +238,39 @@ def _suppress_noisy_external_loggers():
             ext_logger.setLevel(level)
 
 
+def _safe_get_nearest_business_day_in_a_week(date_str: str, *, prev: bool = True) -> tuple[str | None, str | None]:
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    previous_disable_level = logging.root.manager.disable
+    try:
+        with _suppress_noisy_external_loggers(), redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            logging.disable(logging.CRITICAL)
+            from pykrx.stock import get_nearest_business_day_in_a_week
+
+            resolved = get_nearest_business_day_in_a_week(date_str, prev=prev)
+        return str(resolved), None
+    except Exception as exc:
+        return None, type(exc).__name__
+    finally:
+        logging.disable(previous_disable_level)
+
+
 def _resolve_pykrx_previous_or_same(d: date) -> date | None:
     cache_key = d.isoformat()
     if cache_key in _PYKRX_PREV_OR_SAME_CACHE:
         return _PYKRX_PREV_OR_SAME_CACHE[cache_key]
 
-    try:
-        from pykrx.stock import get_nearest_business_day_in_a_week
-
-        with _suppress_noisy_external_loggers():
-            resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
-        resolved_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
-    except Exception as exc:
+    resolved, err_type = _safe_get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
+    if not resolved:
         _log_pykrx_fail_once(
             scope="resolve_pykrx_previous_or_same",
             subject=f"date={d.isoformat()}",
             fallback="weekday_heuristic",
-            error=exc,
+            err_type=err_type or "PYKRX_UNKNOWN_ERROR",
         )
         resolved_date = None
+    else:
+        resolved_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
 
     _PYKRX_PREV_OR_SAME_CACHE[cache_key] = resolved_date
     return resolved_date
@@ -274,10 +289,7 @@ def coerce_to_previous_trading_day(
     heuristic = _fallback_previous_or_same_weekday(d)
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
-        try:
-            _resolve_pykrx_previous_or_same(d)
-        except Exception:
-            pass
+        _resolve_pykrx_previous_or_same(d)
     return heuristic
 
 
@@ -311,10 +323,7 @@ def resolve_prev_trading_day(
 
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
-        try:
-            _resolve_pykrx_previous_or_same(candidate)
-        except Exception:
-            pass
+        _resolve_pykrx_previous_or_same(candidate)
     return _fallback_last_weekday_scan(run_date)
 
 

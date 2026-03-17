@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from trader import pb1_runner
+from trader import runtime_paths
 
 
 REQUIRED = {
@@ -40,9 +41,10 @@ def _scored_row(code: str) -> dict:
 
 
 def test_load_trade_final30_scored_prefers_canonical_file(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
     as_of = "2026-03-11"
-    path = Path("runtime") / "watchlist" / as_of / "final30_scored.json"
+    path = tmp_path / "runtime" / "watchlist" / as_of / "final30_scored.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = [_scored_row("005930")]
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -68,7 +70,8 @@ def test_load_trade_final30_scored_prefers_canonical_file(tmp_path, monkeypatch)
 
 
 def test_load_trade_final30_scored_uses_db_scored_when_file_missing(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
 
     class FakeRepo:
         def __init__(self, *_args, **_kwargs):
@@ -93,7 +96,8 @@ def test_load_trade_final30_scored_uses_db_scored_when_file_missing(tmp_path, mo
 
 
 def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
     monkeypatch.delenv("TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK", raising=False)
 
     class FakeRepo:
@@ -118,3 +122,13 @@ def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, mo
 
     assert result["df"].empty
     assert result["source_name"] == "none"
+
+
+def test_get_final30_artifact_paths_are_repo_root_anchored(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
+
+    paths = runtime_paths.get_final30_artifact_paths("practice", "2026-03-11", include_legacy=True)
+
+    assert paths[0][1] == tmp_path / "runtime" / "watchlist" / "2026-03-11" / "final30_scored.json"
+    assert paths[1][1] == tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json"
+    assert paths[2][1] == tmp_path / "signals" / "final30.json"

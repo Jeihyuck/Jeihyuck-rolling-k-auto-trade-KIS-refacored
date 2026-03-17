@@ -367,6 +367,40 @@ def _format_reason_counts(counter: Counter[str]) -> str:
         return "none"
     parts = [f"{key}:{count}" for key, count in counter.most_common()]
     return ",".join(parts)
+
+
+NO_TRADE_REASON_PRIORITY = (
+    "BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_COOLDOWN",
+    "ATR_PCT_TOO_HIGH",
+    "atr_pct_too_high",
+    "SIZING_CAP_BELOW_ONE_SHARE",
+    "MIN_ORDER_KRW",
+)
+
+
+def _summarize_blocked_reasons(counter: Counter[str] | dict[str, int] | None) -> Counter[str]:
+    normalized_input = Counter(counter or {})
+    return _normalize_entry_block_counts(normalized_input)
+
+
+def _primary_no_trade_reason(
+    counter: Counter[str] | dict[str, int] | None,
+    *,
+    ok_count: int,
+    order_candidates: int,
+) -> str:
+    if order_candidates > 0:
+        return "ORDERS_PRESENT"
+    normalized = _summarize_blocked_reasons(counter)
+    for reason in NO_TRADE_REASON_PRIORITY:
+        if normalized.get(reason, 0) > 0:
+            return reason
+    if normalized:
+        return sorted(normalized.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    if ok_count > 0:
+        return "NO_ORDERABLE_CANDIDATES"
+    return "NO_CANDIDATES_AFTER_RELAX"
     
 def _classify_no_candidate_result() -> tuple[str, str]:
     return "OK_NO_TRADE", "NO_CANDIDATES_AFTER_RELAX"
@@ -5182,7 +5216,35 @@ class PB1Engine:
         partial_level = int(pos.get("partial_exit_level") or 0)
         entry_reason_value = pos.get("entry_reason") or (pos.get("entry_meta_json") or {}).get("entry_reason")
         entry_style_selected = pos.get("entry_style_selected") or (pos.get("entry_meta_json") or {}).get("entry_style_selected")
+        stop_price_at_entry = pos.get("stop_price_at_entry")
+        pivot_price_at_entry = pos.get("pivot_price_at_entry")
+        missing_meta = [
+            field
+            for field, value in (
+                ("entry_reason", entry_reason_value),
+                ("entry_style_selected", entry_style_selected),
+                ("stop_price_at_entry", stop_price_at_entry),
+                ("pivot_price_at_entry", pivot_price_at_entry),
+            )
+            if value in (None, "")
+        ]
         entry_reason_normalized, exit_family = self._resolve_exit_family(entry_reason_value, entry_style_selected)
+        logger.info(
+            "[EXIT][POSITION_META] code=%s entry_reason=%s entry_style_selected=%s stop_price_at_entry=%s pivot_price_at_entry=%s meta_ok=%s",
+            display_code,
+            entry_reason_value,
+            entry_style_selected,
+            stop_price_at_entry,
+            pivot_price_at_entry,
+            int(not missing_meta),
+        )
+        if missing_meta:
+            logger.warning(
+                "[EXIT][META_MISSING] code=%s missing=%s fallback=%s",
+                display_code,
+                missing_meta,
+                exit_family,
+            )
         if exit_family == "GENERIC_EXIT":
             logger.warning(
                 "[EXIT][FALLBACK] code=%s reason=no_entry_reason_in_position_meta",
@@ -5423,6 +5485,13 @@ class PB1Engine:
             display_code,
             int(should_sell),
             decision_reasons,
+        )
+        logger.info(
+            "[EXIT][EVAL] code=%s exit_family=%s should_sell=%s reasons=%s",
+            display_code,
+            exit_family,
+            int(should_sell),
+            decision_reasons or ["ok_hold"],
         )
 
         if not should_sell:
@@ -6753,6 +6822,8 @@ class PB1Engine:
         
         entry_summary_emitted = False
         entry_decision_emitted = False
+        entry_decision_result: str | None = None
+        entry_decision_reason: str | None = None
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
         entry_phase = self.phase in {"prep", "entry"}
         max_positions = int(PB1_MAX_POSITIONS)
@@ -6993,6 +7064,8 @@ class PB1Engine:
             total_krw: float = 0.0,
         ) -> None:
             nonlocal entry_decision_emitted
+            nonlocal entry_decision_result
+            nonlocal entry_decision_reason
             if entry_decision_emitted:
                 return
             blocked_text = _format_reason_counts(blocked_by)
@@ -7011,6 +7084,8 @@ class PB1Engine:
                     ok_setups,
                     blocked_text,
                 )
+            entry_decision_result = result
+            entry_decision_reason = reason
             entry_decision_emitted = True
 
         def _emit_entry_summary(
@@ -7045,6 +7120,53 @@ class PB1Engine:
             except Exception as exc:
                 logger.warning("[MINERVINI][RELAX_DEBUG][SAVE_FAIL] err=%s", exc)
                 return None
+
+        def _set_run_summary_payload(
+            *,
+            scanned: int,
+            setup_ok: int,
+            relax_ok: int,
+            score_ok: int,
+            risk_ok: int,
+            sized_ok: int,
+            buyable_ok: int,
+            order_candidates: int,
+            submitted: int,
+            blocked_reasons_counter: Counter[str] | dict[str, int] | None,
+            no_trade_reason: str | None,
+        ) -> None:
+            blocked_counter = _summarize_blocked_reasons(blocked_reasons_counter)
+            payload = {
+                "scanned": int(scanned),
+                "setup_ok": int(setup_ok),
+                "relax_ok": int(relax_ok),
+                "score_ok": int(score_ok),
+                "risk_ok": int(risk_ok),
+                "sized_ok": int(sized_ok),
+                "buyable_ok": int(buyable_ok),
+                "order_candidates": int(order_candidates),
+                "submitted": int(submitted),
+                "blocked_reasons_counter": {key: int(value) for key, value in blocked_counter.items()},
+                "blocked_by": _format_reason_counts(blocked_counter),
+                "no_trade_reason": no_trade_reason,
+                "entry_decision_result": entry_decision_result,
+                "entry_decision_reason": entry_decision_reason,
+            }
+            self._run_summary_payload = payload
+            self._debug_summary = {
+                "scanned_count": payload["scanned"],
+                "setup_ok_count": payload["setup_ok"],
+                "after_relax_count": payload["relax_ok"],
+                "after_score_cut_count": payload["score_ok"],
+                "after_risk_count": payload["risk_ok"],
+                "after_sizing_count": payload["sized_ok"],
+                "after_buyable_count": payload["buyable_ok"],
+                "order_candidate_count": payload["order_candidates"],
+                "submit_success_count": payload["submitted"],
+                "blocked_reasons_counter": payload["blocked_reasons_counter"],
+                "skip_reason_top": payload["no_trade_reason"] or "none",
+                "entry_decision_result": payload["entry_decision_result"],
+            }
 
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
@@ -7210,6 +7332,19 @@ class PB1Engine:
                 reason="PHASE_VERIFY",
                 ok_setups=0,
                 blocked_by=_normalize_entry_block_reasons(["phase_verify"]),
+            )
+            _set_run_summary_payload(
+                scanned=0,
+                setup_ok=0,
+                relax_ok=0,
+                score_ok=0,
+                risk_ok=0,
+                sized_ok=0,
+                buyable_ok=0,
+                order_candidates=0,
+                submitted=0,
+                blocked_reasons_counter=Counter({"PHASE_VERIFY": 1}),
+                no_trade_reason="PHASE_VERIFY",
             )
             return RunResult(
                 status=final_status,
@@ -8361,6 +8496,12 @@ class PB1Engine:
                     emergency_cf.features["candidate_tier"] = "emergency_force1"
                     emergency_cf.sizing_reason = "EMERGENCY_CANDIDATE_FALLBACK"
                     emergency_cf.sizing_details = {"candidate_tier": "emergency_force1", "qty": 1, "price": order_px}
+                    allow_emergency_diag_fallback = bool(
+                        os.getenv("MODE") == "diag"
+                        or os.getenv("DIAGNOSTIC_MODE", "0") == "1"
+                        or os.getenv("DIAGNOSTIC_ONLY", "0") == "1"
+                        or (self.flags.dry_run and os.getenv("PB1_EMERGENCY_DEBUG", "0") == "1")
+                    )
                     if emergency_order_enabled and not emergency_diag_only:
                         emergency_cf.setup_ok = True
                         emergency_cf.features["setup_loose_ok"] = True
@@ -8373,7 +8514,7 @@ class PB1Engine:
                             "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
                             emergency_cf.code,
                         )
-                    else:
+                    elif allow_emergency_diag_fallback:
                         logger.warning(
                             "[ORDER_CANDIDATES][EMERGENCY][DIAG_ONLY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK order_enabled=%s diag_only=%s",
                             emergency_cf.code,
@@ -8612,6 +8753,19 @@ class PB1Engine:
                         ok_setups=ok_count,
                         blocked_by=_normalize_entry_block_counts(drop_reason_counter),
                     )
+                    _set_run_summary_payload(
+                        scanned=len(scan_members),
+                        setup_ok=len(setup_ok_codes),
+                        relax_ok=len(setup_ok_codes),
+                        score_ok=len(self._debug_score_cut_codes),
+                        risk_ok=len(self._debug_risk_ok_codes),
+                        sized_ok=len(self._debug_sizing_ok_codes),
+                        buyable_ok=len(buyable_ok_codes),
+                        order_candidates=0,
+                        submitted=0,
+                        blocked_reasons_counter=drop_reason_counter,
+                        no_trade_reason="NO_CANDIDATES_AFTER_RELAX",
+                    )
                     return RunResult(
                         status=final_status,
                         notes=final_notes,
@@ -8640,10 +8794,19 @@ class PB1Engine:
                         no_orders_reasons.append("min_order_krw")
                     if not no_orders_reasons:
                         no_orders_reasons.append("exhausted_candidates")
+                    blocked_by = _normalize_entry_block_counts(drop_reason_counter)
+                    blocked_by.update(_normalize_entry_block_reasons(no_orders_reasons))
+                    primary_reason = _primary_no_trade_reason(
+                        blocked_by,
+                        ok_count=ok_count,
+                        order_candidates=len(orderable_candidates),
+                    )
                     final_status = "NO_TRADE"
                     final_notes = f"no_orders:{no_orders_reasons or 'none'}"
                     logger.info(
-                        "[PB1][NO_TRADE] reason=no_orders no_orders_reason=%s",
+                        "[PB1][NO_TRADE] reason=no_orders primary_no_trade_reason=%s blocked_by=%s no_orders_reason=%s",
+                        primary_reason,
+                        _format_reason_counts(blocked_by),
                         no_orders_reasons or ["none"],
                     )
                     if self.phase in {"prep", "entry"}:
@@ -8657,9 +8820,6 @@ class PB1Engine:
                             )
                         self._log_reason_summary(final_notes)
                         _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
-                        blocked_by = _normalize_entry_block_counts(drop_reason_counter)
-                        blocked_by.update(_normalize_entry_block_reasons(no_orders_reasons))
-                        
                         # ✅ FORCE_BUY 스모크 모드 (주문 endpoint 도달 검증)
                         if os.getenv("PB1_FORCE_BUY", "0") == "1":
                             qty = int(os.getenv("PB1_FORCE_BUY_QTY", "1"))
@@ -8677,6 +8837,19 @@ class PB1Engine:
                             reason="NO_ORDER_INTENTS",
                             ok_setups=ok_count,
                             blocked_by=blocked_by,
+                        )
+                        _set_run_summary_payload(
+                            scanned=len(scan_members),
+                            setup_ok=len(setup_ok_codes),
+                            relax_ok=len(setup_ok_codes),
+                            score_ok=len(self._debug_score_cut_codes),
+                            risk_ok=len(self._debug_risk_ok_codes),
+                            sized_ok=len(self._debug_sizing_ok_codes),
+                            buyable_ok=len(buyable_ok_codes),
+                            order_candidates=0,
+                            submitted=0,
+                            blocked_reasons_counter=blocked_by,
+                            no_trade_reason=primary_reason,
                         )
                         return RunResult(
                             status=final_status,
@@ -8892,21 +9065,35 @@ class PB1Engine:
             self._data_metrics.get("kis_trade_daily_fetch_count_trade", self._data_metrics.get("kis_daily_fetch_count_trade", 0)),
             self._data_metrics.get("kis_trade_daily_blocked_count_trade", 0),
         )
-        self._debug_summary = {
-            "scanned_count": len(scan_members),
-            "setup_ok_count": len(setup_ok_codes),
-            "after_relax_count": len(setup_ok_codes),
-            "after_score_cut_count": len(self._debug_score_cut_codes),
-            "after_risk_count": len(self._debug_risk_ok_codes),
-            "after_sizing_count": len(self._debug_sizing_ok_codes),
-            "order_candidate_count": len(orderable_candidates),
-            "order_candidate_codes": [c.code for c in orderable_candidates],
-            "submit_attempt_count": int(submit_attempt_count),
-            "submit_success_count": int(submit_success_count),
-            "accepted_count": int(accepted_count) if 'accepted_count' in locals() else 0,
-            "filled_count": int(filled_count) if 'filled_count' in locals() else 0,
-            "skip_reason_top": (drop_reason_counter.most_common(1)[0][0] if drop_reason_counter else "none"),
-        }
+        _set_run_summary_payload(
+            scanned=len(scan_members),
+            setup_ok=len(setup_ok_codes),
+            relax_ok=len(setup_ok_codes),
+            score_ok=len(self._debug_score_cut_codes),
+            risk_ok=len(self._debug_risk_ok_codes),
+            sized_ok=len(self._debug_sizing_ok_codes),
+            buyable_ok=len(buyable_ok_codes),
+            order_candidates=len(orderable_candidates),
+            submitted=int(submit_success_count),
+            blocked_reasons_counter=drop_reason_counter,
+            no_trade_reason=(
+                _primary_no_trade_reason(
+                    drop_reason_counter,
+                    ok_count=len(setup_ok_codes),
+                    order_candidates=len(orderable_candidates),
+                )
+                if not orderable_candidates
+                else None
+            ),
+        )
+        self._debug_summary.update(
+            {
+                "order_candidate_codes": [c.code for c in orderable_candidates],
+                "submit_attempt_count": int(submit_attempt_count),
+                "accepted_count": int(accepted_count) if 'accepted_count' in locals() else 0,
+                "filled_count": int(filled_count) if 'filled_count' in locals() else 0,
+            }
+        )
         
         # ✅ 스코어카드 JSONL 작성 (선택사항: 성능 영향 최소화)
         # try:

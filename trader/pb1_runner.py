@@ -593,11 +593,22 @@ def generate_run_summary_json(
         
         summary_path = summary_root / f"run_{run_id}.json"
         
-        # engine에서 필요한 정보 추출
-        total_candidates = getattr(engine, "total_candidates", 0)
-        ok_count = getattr(engine, "ok_count", 0)
-        reject_reason_counts = getattr(engine, "reject_reason_counts", {})
+        run_summary = getattr(engine, "_run_summary_payload", None) or {}
         debug_summary = getattr(engine, "_debug_summary", {}) or {}
+        reject_reason_counts = getattr(engine, "reject_reason_counts", {})
+        counts = {
+            "scanned": int(run_summary.get("scanned", debug_summary.get("scanned_count", 0))),
+            "passed": int(run_summary.get("setup_ok", debug_summary.get("setup_ok_count", 0))),
+            "setup_ok_count": int(run_summary.get("setup_ok", debug_summary.get("setup_ok_count", 0))),
+            "after_relax_count": int(run_summary.get("relax_ok", debug_summary.get("after_relax_count", 0))),
+            "after_score_cut_count": int(run_summary.get("score_ok", debug_summary.get("after_score_cut_count", 0))),
+            "after_risk_count": int(run_summary.get("risk_ok", debug_summary.get("after_risk_count", 0))),
+            "after_sizing_count": int(run_summary.get("sized_ok", debug_summary.get("after_sizing_count", 0))),
+            "buyable_ok_count": int(run_summary.get("buyable_ok", debug_summary.get("after_buyable_count", 0))),
+            "order_candidate_count": int(run_summary.get("order_candidates", debug_summary.get("order_candidate_count", 0))),
+            "submit_attempt_count": int(debug_summary.get("submit_attempt_count", run_summary.get("order_candidates", 0))),
+            "submit_success_count": int(run_summary.get("submitted", debug_summary.get("submit_success_count", 0))),
+        }
         
         payload = {
             "run_id": str(run_id),
@@ -608,20 +619,14 @@ def generate_run_summary_json(
             "watchlist_as_of": watchlist_as_of,
             "universe_as_of": universe_as_of,
             "fallback_used": bool(fallback_used),
-            "counts": {
-                "scanned": int(debug_summary.get("scanned_count", total_candidates)),
-                "passed": int(ok_count),
-                "setup_ok_count": int(debug_summary.get("setup_ok_count", 0)),
-                "after_relax_count": int(debug_summary.get("after_relax_count", 0)),
-                "after_score_cut_count": int(debug_summary.get("after_score_cut_count", 0)),
-                "after_risk_count": int(debug_summary.get("after_risk_count", 0)),
-                "after_sizing_count": int(debug_summary.get("after_sizing_count", 0)),
-                "order_candidate_count": int(debug_summary.get("order_candidate_count", 0)),
-                "submit_attempt_count": int(debug_summary.get("submit_attempt_count", 0)),
-                "submit_success_count": int(debug_summary.get("submit_success_count", 0)),
-            },
+            "counts": counts,
             "order_candidate_codes": list(debug_summary.get("order_candidate_codes", []) or []),
-            "skip_reason_top": debug_summary.get("skip_reason_top", "none"),
+            "skip_reason_top": run_summary.get("no_trade_reason") or debug_summary.get("skip_reason_top", "none"),
+            "blocked_reasons_counter": dict(run_summary.get("blocked_reasons_counter") or {}),
+            "blocked_by": run_summary.get("blocked_by", "none"),
+            "no_trade_reason": run_summary.get("no_trade_reason"),
+            "entry_decision_result": run_summary.get("entry_decision_result"),
+            "entry_decision_reason": run_summary.get("entry_decision_reason"),
             "drop_reasons": reject_reason_counts or {},
         }
         
@@ -630,20 +635,20 @@ def generate_run_summary_json(
             "[RUN_SUMMARY] path=%s run_id=%s scanned=%s passed=%s drop_reasons=%s",
             summary_path,
             run_id,
-            total_candidates,
-            ok_count,
+            counts["scanned"],
+            counts["passed"],
             len(reject_reason_counts),
         )
         logger.info(
             "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s submitted=%s",
-            payload["counts"]["scanned"],
-            payload["counts"]["setup_ok_count"],
-            payload["counts"]["after_relax_count"],
-            payload["counts"]["after_score_cut_count"],
-            payload["counts"]["after_risk_count"],
-            payload["counts"]["after_sizing_count"],
-            payload["counts"]["order_candidate_count"],
-            payload["counts"]["submit_success_count"],
+            counts["scanned"],
+            counts["setup_ok_count"],
+            counts["after_relax_count"],
+            counts["after_score_cut_count"],
+            counts["after_risk_count"],
+            counts["after_sizing_count"],
+            counts["order_candidate_count"],
+            counts["submit_success_count"],
         )
         return str(summary_path)
     except Exception as e:

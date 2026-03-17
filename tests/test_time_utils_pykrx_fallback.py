@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import logging
 
 from trader import time_utils
 
@@ -37,3 +38,20 @@ def test_resolve_pykrx_previous_or_same_is_cached(monkeypatch) -> None:
 
     # External helper should be used only once because the second call is cached.
     assert time_utils._PYKRX_PREV_OR_SAME_CACHE["2026-03-14"] == date(2026, 3, 14)
+
+
+def test_safe_pykrx_helper_logs_single_warning(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.WARNING)
+    time_utils._PYKRX_PREV_OR_SAME_CACHE.clear()
+
+    def _boom(*_args, **_kwargs):
+        raise IndexError("broken")
+
+    monkeypatch.setattr("pykrx.stock.get_nearest_business_day_in_a_week", _boom, raising=False)
+
+    assert time_utils._resolve_pykrx_previous_or_same(date(2026, 3, 16)) is None
+
+    messages = [record.getMessage() for record in caplog.records if "[TIME][TRADING_DAY][PYKRX_FAIL]" in record.getMessage()]
+    assert len(messages) == 1
+    assert "err_type=RuntimeError" not in messages[0]
+    assert "err_type=IndexError" in messages[0]
