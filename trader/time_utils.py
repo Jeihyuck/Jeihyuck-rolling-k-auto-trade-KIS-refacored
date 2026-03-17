@@ -15,6 +15,7 @@ KST = ZoneInfo("Asia/Seoul")
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 20)
 _PYKRX_WARNED_SIGNATURES: set[tuple[str, str, str]] = set()
+_PYKRX_PREV_OR_SAME_CACHE: dict[str, date | None] = {}
 _NOISY_EXTERNAL_LOGGERS = (
     "pykrx",
     "pykrx.website",
@@ -214,7 +215,7 @@ def _log_pykrx_fail_once(*, scope: str, subject: str, fallback: str, error: Exce
         return
     _PYKRX_WARNED_SIGNATURES.add(signature)
     logger.warning(
-        "[TIME][TRADING_DAY][PYKRX_FAIL] %s fallback=%s error=%s",
+        "[TIME][TRADING_DAY][PYKRX_FAIL] %s fallback=%s err_type=%s",
         subject,
         fallback,
         error_name,
@@ -236,12 +237,28 @@ def _suppress_noisy_external_loggers():
             ext_logger.setLevel(level)
 
 
-def _resolve_pykrx_previous_or_same(d: date) -> date:
-    from pykrx.stock import get_nearest_business_day_in_a_week
+def _resolve_pykrx_previous_or_same(d: date) -> date | None:
+    cache_key = d.isoformat()
+    if cache_key in _PYKRX_PREV_OR_SAME_CACHE:
+        return _PYKRX_PREV_OR_SAME_CACHE[cache_key]
 
-    with _suppress_noisy_external_loggers():
-        resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
-    return date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+    try:
+        from pykrx.stock import get_nearest_business_day_in_a_week
+
+        with _suppress_noisy_external_loggers():
+            resolved = get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
+        resolved_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+    except Exception as exc:
+        _log_pykrx_fail_once(
+            scope="resolve_pykrx_previous_or_same",
+            subject=f"date={d.isoformat()}",
+            fallback="weekday_heuristic",
+            error=exc,
+        )
+        resolved_date = None
+
+    _PYKRX_PREV_OR_SAME_CACHE[cache_key] = resolved_date
+    return resolved_date
 
 
 def coerce_to_previous_trading_day(
@@ -254,19 +271,14 @@ def coerce_to_previous_trading_day(
     if trading_day_resolver is not None:
         return trading_day_resolver(d, exchange)
 
+    heuristic = _fallback_previous_or_same_weekday(d)
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
         try:
-            return _resolve_pykrx_previous_or_same(d)
-        except Exception as exc:
-            _log_pykrx_fail_once(
-                scope="coerce_to_previous_trading_day",
-                subject=f"input={d.isoformat()}",
-                fallback="calendar_weekday_rule",
-                error=exc,
-            )
-
-    return _fallback_previous_or_same_weekday(d)
+            _resolve_pykrx_previous_or_same(d)
+        except Exception:
+            pass
+    return heuristic
 
 
 def is_trading_date(
@@ -279,17 +291,6 @@ def is_trading_date(
     if trading_day_resolver is not None:
         return trading_day_resolver(d, exchange) == d
 
-    normalized_exchange = (exchange or "KRX").strip().upper()
-    if normalized_exchange == "KRX":
-        try:
-            return _resolve_pykrx_previous_or_same(d) == d
-        except Exception as exc:
-            _log_pykrx_fail_once(
-                scope="is_trading_date",
-                subject=f"date={d.isoformat()}",
-                fallback="weekday_heuristic",
-                error=exc,
-            )
     return d.weekday() < 5
 
 
@@ -311,19 +312,10 @@ def resolve_prev_trading_day(
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
         try:
-            return _resolve_pykrx_previous_or_same(candidate)
-        except Exception as exc:
-            _log_pykrx_fail_once(
-                scope="resolve_prev_trading_day",
-                subject=(
-                    f"date={run_date.isoformat()} prev_candidate={candidate.isoformat()}"
-                ),
-                fallback="last_weekday_scan",
-                error=exc,
-            )
-            return _fallback_last_weekday_scan(run_date)
-
-    return _fallback_previous_weekday(run_date)
+            _resolve_pykrx_previous_or_same(candidate)
+        except Exception:
+            pass
+    return _fallback_last_weekday_scan(run_date)
 
 
 def resolve_trade_readiness_as_of(
@@ -339,6 +331,11 @@ def resolve_trade_readiness_as_of(
     calendar_prev = run_date - timedelta(days=1)
     requested_as_of = candidate_as_of or calendar_prev
     trading_windows = {"preopen", "morning", "intraday", "open", "session", "day"}
+    calendar_prev_is_trading_day = is_trading_date(
+        calendar_prev,
+        exchange=exchange,
+        trading_day_resolver=trading_day_resolver,
+    )
 
     if window in trading_windows:
         resolved_as_of = resolve_prev_trading_day(
@@ -361,11 +358,7 @@ def resolve_trade_readiness_as_of(
         "requested_as_of": requested_as_of,
         "resolved_as_of": resolved_as_of,
         "reason": reason,
-        "is_calendar_prev_trading_day": is_trading_date(
-            calendar_prev,
-            exchange=exchange,
-            trading_day_resolver=trading_day_resolver,
-        ),
+        "is_calendar_prev_trading_day": calendar_prev_is_trading_day,
     }
 
 

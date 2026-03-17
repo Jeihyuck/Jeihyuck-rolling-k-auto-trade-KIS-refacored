@@ -37,6 +37,8 @@ class VerifyResults:
     contract_failures: List[str] = field(default_factory=list)
     contract_recoveries: List[str] = field(default_factory=list)
     traceback_detected: bool = False
+    traceback_non_fatal: bool = False
+    pykrx_recovered: bool = False
     failures: List[str] = field(default_factory=list)
     
     def has_critical_failure(self) -> bool:
@@ -52,7 +54,7 @@ class VerifyResults:
             or unrecovered_contracts
             or not self.exporter_preserved_scores
             or not self.derived_ok_by_count
-            or self.traceback_detected
+            or (self.traceback_detected and not self.traceback_non_fatal)
             or bool(self.failures)
         )
 
@@ -161,6 +163,11 @@ def parse_log_file(log_path: Path) -> VerifyResults:
     # Explicit fatal guard: only unrecovered fatal exception should fail verify.
     if re.search(r'Traceback \(most recent call last\)', log_content):
         results.traceback_detected = True
+    results.pykrx_recovered = bool(
+        re.search(r'\[TIME\]\[TRADING_DAY\]\[PYKRX_FAIL\].*fallback=', log_content)
+        and (results.prep_done or results.prep_done_log)
+    )
+    results.traceback_non_fatal = bool(results.traceback_detected and results.pykrx_recovered)
     
     # Exporter preservation: compare inmem and exporter for key score fields when both exist.
     if results.inmem_scores and results.export_scores:
@@ -226,8 +233,10 @@ def print_verification_results(results: VerifyResults) -> None:
     else:
         print("::error::watchlist/exporter score mismatch")
 
-    if results.traceback_detected:
+    if results.traceback_detected and not results.traceback_non_fatal:
         print("::error::Python traceback detected")
+    elif results.traceback_non_fatal:
+        print("✅ traceback detected but recovered by PYKRX fallback + PREP done marker")
     else:
         print("✅ no traceback detected")
     

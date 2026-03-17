@@ -55,7 +55,7 @@ from trader.time_utils import (
     prev_business_day,
     resolve_derived_as_of,
 )
-from trader.runtime_paths import get_final30_scored_paths
+from trader.runtime_paths import get_final30_artifact_paths, get_final30_scored_paths
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -358,21 +358,34 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
     payload_df = payload_df[FINAL30_SCORED_EXPORT_COLS]
     payload_df["code"] = payload_df["code"].astype(str).str.zfill(6)
     payload = payload_df.to_dict(orient="records")
+    critical_cols = [col for col in CRITICAL_SCORED_COLS if col in payload_df.columns]
 
-    target_paths = get_final30_scored_paths(env, as_of)
-    for path in target_paths:
+    for source_name, path in get_final30_artifact_paths(env, as_of, include_legacy=True):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("[PREP][FINAL30_SCORED][SAVE] path=%s rows=%s", path, len(payload))
+        if source_name == "signals_final30":
+            file_payload = {
+                "as_of": as_of,
+                "env": env,
+                "count": len(payload),
+                "items": payload,
+                "source": "prep_final30_scored",
+            }
+        else:
+            file_payload = payload
+        path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[PREP][FINAL30_SCORED][SAVE] source=%s path=%s rows=%s", source_name, path, len(payload))
         try:
             bytes_written = path.stat().st_size
         except OSError:
             bytes_written = -1
         logger.info(
-            "[PREP][FINAL30_SCORED][VERIFY] path=%s exists=%s bytes=%s",
+            "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s rows=%s critical_cols=%s",
+            source_name,
             path,
             int(path.exists()),
             bytes_written,
+            len(payload),
+            critical_cols,
         )
 
     logger.info(
@@ -1028,17 +1041,17 @@ def main() -> int:
     )
 
     # ✅ FIX: Use centralized contract validation function
+    contract_mode = str(watchlist_bundle.get("contract_mode") or "candidate_pool_based")
     contract_failures = validate_watchlist_contract(
         universe_scored=bundle_universe,
         pool120=bundle_pool120,
         top50=bundle_top50,
         final30=bundle_final30,
-        min_universe=120,
         min_pool=pool_min,
-        min_top50=topk,
         exact_final30=finaln,
-        contract_mode="candidate_pool_based",
+        contract_mode=contract_mode,
         universe_scored_source="universe_filtered_from_raw120",
+        candidate_pool_size=len(bundle_universe),
     )
 
     def _count_score_nonzero(rows: list[dict], keys: tuple[str, ...]) -> int:
@@ -1762,6 +1775,8 @@ def main() -> int:
             "runtime_exported": runtime_exported,
             "flow_coverage": flow_coverage,
             "contract_failures": contract_failures,
+            "contract_mode": contract_mode,
+            "final_source": final30_source_label,
             "prep_status": prep_status,
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
@@ -1883,11 +1898,16 @@ def main() -> int:
         )
 
     logger.info(
-        "[PREP][DONE] as_of=%s symbols=%s pool=%s watchlist=%s dt=%.2f",
-        as_of,
-        len(symbols),
-        len(pool_codes or []),
-        len(watchlist or []),
+        "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s dt=%.2f",
+        as_of.isoformat(),
+        bundle_source,
+        len(bundle_universe),
+        len(bundle_pool120),
+        len(bundle_top50),
+        len(bundle_final30),
+        flow_coverage * 100.0,
+        final30_source_label,
+        contract_mode,
         time.monotonic() - t0,
     )
     return 0

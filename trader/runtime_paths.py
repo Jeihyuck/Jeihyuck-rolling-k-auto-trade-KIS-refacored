@@ -80,9 +80,24 @@ def _as_of_str(as_of: str | date) -> str:
 
 
 def get_final30_scored_paths(env: str, as_of: str | date) -> list[Path]:
+    return [path for _name, path in get_final30_artifact_paths(env, as_of, include_legacy=False)]
+
+
+def get_final30_artifact_paths(
+    env: str,
+    as_of: str | date,
+    *,
+    include_legacy: bool = True,
+) -> list[tuple[str, Path]]:
     env_n = (env or "").strip().lower()
     as_of_s = _as_of_str(as_of)
-    return [
-        Path("runtime") / "watchlist" / as_of_s / "final30_scored.json",
-        Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+    paths: list[tuple[str, Path]] = [
+        ("runtime_final30_scored", Path("runtime") / "watchlist" / as_of_s / "final30_scored.json"),
+        (
+            "ledger_final30_scored",
+            Path("bot_state") / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
+        ),
     ]
+    if include_legacy:
+        paths.append(("signals_final30", Path("signals") / "final30.json"))
+    return paths

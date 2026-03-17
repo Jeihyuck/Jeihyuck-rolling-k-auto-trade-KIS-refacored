@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from trader.runtime_paths import get_final30_scored_paths, repo_root
+from trader.runtime_paths import get_final30_artifact_paths, get_final30_scored_paths, repo_root
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -146,11 +146,7 @@ def load_trade_final30_scored(
     checked: list[str] = []
     attempts: list[tuple[str, list[dict[str, Any]], str, bool]] = []
 
-    file_candidates = [
-        ("runtime_final30_scored", get_final30_scored_paths(env_n, as_of_s)[0]),
-        ("ledger_final30_scored", get_final30_scored_paths(env_n, as_of_s)[1]),
-        ("signals_final30", Path("signals") / "final30.json"),
-    ]
+    file_candidates = get_final30_artifact_paths(env_n, as_of_s, include_legacy=True)
     current_cwd = Path.cwd().resolve()
     current_repo_root = repo_root().resolve()
 
@@ -263,10 +259,8 @@ def check_prep_done() -> bool:
         runtime_dir = runtime_base / "repo" / "runtime" if (runtime_base / "repo").exists() else runtime_base / "runtime"
         
         # Check for final30 snapshot/watchlist
-        final30_candidates = [
-            runtime_dir / "snapshots" / "final30.json",
-            runtime_dir / "watchlist" / f"final30_{(now_kst().date()).isoformat()}.json",
-        ]
+        final30_candidates = [runtime_dir / "snapshots" / "final30.json"]
+        final30_candidates.extend(get_final30_scored_paths(os.getenv("KIS_ENV", "practice"), now_kst().date().isoformat()))
         
         for candidate_path in final30_candidates:
             if candidate_path.exists() and candidate_path.stat().st_size > 100:

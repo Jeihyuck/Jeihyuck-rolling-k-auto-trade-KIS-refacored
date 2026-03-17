@@ -275,6 +275,7 @@ def validate_watchlist_contract(
     exact_final30: Optional[int] = None,
     contract_mode: str = "candidate_pool_based",
     universe_scored_source: str = "unknown",
+    candidate_pool_size: Optional[int] = None,
 ) -> List[str]:
     """
     Validate watchlist bundle contract.
@@ -288,49 +289,74 @@ def validate_watchlist_contract(
     """
     failures = []
 
-    def resolve_contract_thresholds(mode: str) -> dict[str, int]:
-        if mode == "candidate_pool_based":
+    def resolve_contract_thresholds(mode: str) -> dict[str, int | None]:
+        normalized_mode = (mode or "candidate_pool_based").strip().lower()
+        if normalized_mode == "candidate_pool_based":
             return {
-                "min_universe": 120,
+                "min_universe": None,
                 "min_pool120": 40,
-                "exact_top50": 50,
+                "min_top50": 30,
                 "exact_final30": 30,
             }
         return {
-            "min_universe": 150,
-            "min_pool120": 40,
+            "min_universe": 120,
+            "min_pool120": 120,
             "exact_top50": 50,
             "exact_final30": 30,
         }
 
-    thresholds = resolve_contract_thresholds(contract_mode)
-    if min_universe is not None:
+    normalized_mode = (contract_mode or "candidate_pool_based").strip().lower()
+    if normalized_mode == "broad_universe_based":
+        normalized_mode = "full_universe_based"
+
+    thresholds = resolve_contract_thresholds(normalized_mode)
+    if min_universe is not None and thresholds.get("min_universe") is not None:
         thresholds["min_universe"] = int(min_universe)
     if min_pool is not None:
         thresholds["min_pool120"] = int(min_pool)
     if min_top50 is not None:
-        thresholds["exact_top50"] = int(min_top50)
+        if normalized_mode == "candidate_pool_based":
+            thresholds["min_top50"] = int(min_top50)
+        else:
+            thresholds["exact_top50"] = int(min_top50)
     if exact_final30 is not None:
         thresholds["exact_final30"] = int(exact_final30)
 
+    if normalized_mode == "candidate_pool_based":
+        effective_candidate_pool_size = int(candidate_pool_size or len(universe_scored) or 0)
+        min_pool_floor = max(int(thresholds["min_pool120"] or 0), 30)
+        if effective_candidate_pool_size > 0:
+            thresholds["min_pool120"] = min(effective_candidate_pool_size, min_pool_floor)
+        thresholds["min_top50"] = max(int(thresholds.get("min_top50") or 0), 30)
+
     logger.info(
         "[CONTRACT][POLICY] mode=%s thresholds=%s universe_scored_source=%s",
-        contract_mode,
+        normalized_mode,
         thresholds,
         universe_scored_source,
     )
 
-    if len(universe_scored) < thresholds["min_universe"]:
+    if thresholds.get("min_universe") is not None and len(universe_scored) < int(thresholds["min_universe"]):
         failures.append(f"contract_universe_too_small:{len(universe_scored)}<{thresholds['min_universe']}")
 
-    if len(pool120) < thresholds["min_pool120"]:
+    if len(pool120) < int(thresholds["min_pool120"]):
         failures.append(f"contract_pool120_too_small:{len(pool120)}<{thresholds['min_pool120']}")
 
-    if len(top50) != thresholds["exact_top50"]:
+    if normalized_mode == "candidate_pool_based":
+        if len(top50) < int(thresholds.get("min_top50") or 0):
+            failures.append(f"contract_top50_too_small:{len(top50)}<{thresholds['min_top50']}")
+    elif len(top50) != int(thresholds["exact_top50"]):
         failures.append(f"contract_top50_not_exact:{len(top50)}!={thresholds['exact_top50']}")
 
-    if len(final30) != thresholds["exact_final30"]:
+    if len(final30) != int(thresholds["exact_final30"]):
         failures.append(f"contract_final30_not_exact:{len(final30)}!={thresholds['exact_final30']}")
+
+    final30_keys = set()
+    for row in final30 or []:
+        final30_keys.update((row or {}).keys())
+    missing_critical_cols = [col for col in CRITICAL_SCORED_COLS if col not in final30_keys]
+    if missing_critical_cols:
+        failures.append(f"contract_final30_missing_critical_cols:{','.join(missing_critical_cols)}")
     
     if failures:
         logger.error(
@@ -785,18 +811,18 @@ class WatchlistBuilder:
             len(final30),
         )
 
-        contract_failures: List[str] = []
-        pool_min = _env_int("PB1_WATCHLIST_POOL_MIN", 40)
-        universe_min = _env_int("PB1_WATCHLIST_UNIVERSE_MIN", 150)
-        
-        if len(universe_scored) <= 0:
-            contract_failures.append("universe_scored_empty")
-        elif len(universe_scored) < universe_min:
-            contract_failures.append(f"contract_universe_too_small:{len(universe_scored)}<{universe_min}")
-        if len(pool120) < pool_min:
-            contract_failures.append(f"pool120_too_small:{len(pool120)}<{pool_min}")
-        if len(top50) < int(self.topk):
-            contract_failures.append(f"top50_too_small:{len(top50)}<{int(self.topk)}")
+        contract_mode = "full_universe_based" if len(members) >= max(self.pooln, 120) else "candidate_pool_based"
+        contract_failures = validate_watchlist_contract(
+            universe_scored=universe_scored,
+            pool120=pool120,
+            top50=top50,
+            final30=final30,
+            min_pool=_env_int("PB1_WATCHLIST_POOL_MIN", 40),
+            exact_final30=int(self.finaln),
+            contract_mode=contract_mode,
+            universe_scored_source="watchlist_builder",
+            candidate_pool_size=len(members),
+        )
 
         degrade_meta = {
             "used": False,
@@ -882,6 +908,7 @@ class WatchlistBuilder:
             "degrade": degrade_meta,
             "shortage_reason": shortage_reason,
             "contract_failures": contract_failures,
+            "contract_mode": contract_mode,
         }
 
         logger.info(

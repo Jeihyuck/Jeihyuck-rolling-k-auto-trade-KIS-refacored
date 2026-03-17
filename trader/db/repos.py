@@ -125,6 +125,44 @@ SCORED_WATCHLIST_STRATEGIES = {
     "pb1_universe_scored",
 }
 
+ENTRY_META_SCALAR_KEYS = (
+    "entry_reason",
+    "entry_style_selected",
+    "entry_decision_family",
+    "entry_rule_version",
+)
+
+
+def _merge_json_dict(base: Any, incoming: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if isinstance(base, dict):
+        merged.update(base)
+    if isinstance(incoming, dict):
+        merged.update(incoming)
+    return json_sanitize(merged)
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _entry_meta_columns(entry_meta: dict[str, Any] | None, *, json_field: str) -> dict[str, Any]:
+    payload = json_sanitize(entry_meta or {})
+    return {
+        "entry_reason": payload.get("entry_reason"),
+        "entry_style_selected": payload.get("entry_style_selected"),
+        "entry_decision_family": payload.get("entry_decision_family"),
+        json_field: payload,
+        "stop_price_at_entry": _safe_float_or_none(payload.get("stop_price_at_entry")),
+        "pivot_price_at_entry": _safe_float_or_none(payload.get("pivot_price_at_entry")),
+        "entry_rule_version": payload.get("entry_rule_version"),
+    }
+
 
 def _coerce_uuid(value: Any, *, uses_native_uuid: bool, database_url: str) -> Any:
     return uuid_value_for_url(database_url, value if isinstance(value, UUID) else value)
@@ -1327,6 +1365,7 @@ class OrdersRepo:
         request_json: dict | None,
         *,
         status: str = "CREATED",
+        entry_meta_json: dict | None = None,
     ) -> tuple[str, bool]:
         db_url = str(self.engine.url)
         original_request_json = request_json
@@ -1349,6 +1388,7 @@ class OrdersRepo:
             "client_order_key": client_order_key,
             "status": status,
             "request_json": request_json or {},
+            **_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"),
         }
         payload = dict(payload)
         if "request_json" in payload:
@@ -1360,6 +1400,12 @@ class OrdersRepo:
                 )
             ).scalar()
             if existing:
+                if entry_meta_json:
+                    conn.execute(
+                        sa.update(self._schema.orders)
+                        .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                        .values(**_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"), updated_at=func.now())
+                    )
                 return str(existing), False
             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
             try:
@@ -1379,35 +1425,56 @@ class OrdersRepo:
                 execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
                 return str(payload["order_id"]), True
 
-    def mark_submitted(self, env: str, client_order_key: str, kis_odno: str | None, response_json: dict | None) -> None:
+    def mark_submitted(
+        self,
+        env: str,
+        client_order_key: str,
+        kis_odno: str | None,
+        response_json: dict | None,
+        *,
+        entry_meta_json: dict | None = None,
+    ) -> None:
         safe_response_json = json_sanitize(response_json or {})
+        values = {
+            "status": "SUBMITTED",
+            "kis_odno": kis_odno,
+            "broker_order_id": kis_odno or client_order_key,
+            "response_json": safe_response_json,
+            "submitted_at": func.now(),
+            "updated_at": func.now(),
+        }
+        if entry_meta_json:
+            values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
-                .values(
-                    status="SUBMITTED",
-                    kis_odno=kis_odno,
-                    broker_order_id=kis_odno or client_order_key,
-                    response_json=safe_response_json,
-                    submitted_at=func.now(),
-                    updated_at=func.now(),
-                )
+                .values(**values)
             )
 
-    def mark_acked(self, env: str, kis_odno: str | None, response_json: dict | None) -> None:
+    def mark_acked(
+        self,
+        env: str,
+        kis_odno: str | None,
+        response_json: dict | None,
+        *,
+        entry_meta_json: dict | None = None,
+    ) -> None:
         safe_response_json = json_sanitize(response_json or {})
+        values = {
+            "status": "ACKED",
+            "response_json": safe_response_json,
+            "broker_order_id": kis_odno,
+            "acked_at": func.now(),
+            "updated_at": func.now(),
+        }
+        if entry_meta_json:
+            values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
-                .values(
-                    status="ACKED",
-                    response_json=safe_response_json,
-                    broker_order_id=kis_odno,
-                    acked_at=func.now(),
-                    updated_at=func.now(),
-                )
+                .values(**values)
             )
 
     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
@@ -1757,6 +1824,7 @@ class FillsRepo:
         tax: float,
         filled_at: datetime,
         raw_json: dict | None,
+        fill_meta_json: dict | None = None,
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
@@ -1780,6 +1848,7 @@ class FillsRepo:
             "tax": tax,
             "filled_at": filled_at,
             "raw_json": safe_raw_json,
+            **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
         conflict_cols = ["env", "broker_fill_id"] if broker_fill_id else [
             "env",
@@ -1793,6 +1862,7 @@ class FillsRepo:
         update_cols = {
             "raw_json": safe_raw_json,
             "broker_fill_id": broker_fill_id,
+            **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
         with self.engine.begin() as conn:
             if conn.dialect.name == "postgresql":
@@ -2343,20 +2413,37 @@ class PositionsRepo:
     ) -> None:
         if not fields:
             return
-        stmt = (
-            sa.update(self._schema.positions)
-            .where(
-                and_(
-                    self._schema.positions.c.env == env,
-                    self._schema.positions.c.strategy == strategy,
-                    self._schema.positions.c.sid == sid,
-                    self._schema.positions.c.mode == mode,
-                    self._schema.positions.c.code == code,
-                )
-            )
-            .values(**fields, updated_at=func.now())
-        )
+        values = dict(fields)
         with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(self._schema.positions).where(
+                    and_(
+                        self._schema.positions.c.env == env,
+                        self._schema.positions.c.strategy == strategy,
+                        self._schema.positions.c.sid == sid,
+                        self._schema.positions.c.mode == mode,
+                        self._schema.positions.c.code == code,
+                    )
+                )
+            ).mappings().first()
+            existing_row = dict(existing) if existing else {}
+            if "entry_meta_json" in values:
+                values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
+            if "last_exit_eval_json" in values:
+                values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
+            stmt = (
+                sa.update(self._schema.positions)
+                .where(
+                    and_(
+                        self._schema.positions.c.env == env,
+                        self._schema.positions.c.strategy == strategy,
+                        self._schema.positions.c.sid == sid,
+                        self._schema.positions.c.mode == mode,
+                        self._schema.positions.c.code == code,
+                    )
+                )
+                .values(**values, updated_at=func.now())
+            )
             conn.execute(stmt)
 
     def apply_fill(
@@ -2374,6 +2461,7 @@ class PositionsRepo:
         fee: float,
         tax: float,
         filled_at: datetime,
+        entry_meta_json: dict | None = None,
     ) -> None:
         with self.engine.begin() as conn:
             stmt = select(self._schema.positions).where(
@@ -2413,6 +2501,20 @@ class PositionsRepo:
                     "market": market,
                     "last_trade_at": filled_at,
                 }
+                if entry_meta_json:
+                    merged_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, entry_meta_json)
+                    values.update(
+                        {
+                            "entry_reason": merged_entry_meta.get("entry_reason") or row.get("entry_reason") if row else merged_entry_meta.get("entry_reason"),
+                            "entry_style_selected": merged_entry_meta.get("entry_style_selected") or row.get("entry_style_selected") if row else merged_entry_meta.get("entry_style_selected"),
+                            "entry_decision_family": merged_entry_meta.get("entry_decision_family") or row.get("entry_decision_family") if row else merged_entry_meta.get("entry_decision_family"),
+                            "entry_rule_version": merged_entry_meta.get("entry_rule_version") or row.get("entry_rule_version") if row else merged_entry_meta.get("entry_rule_version"),
+                            "entry_meta_json": merged_entry_meta,
+                            "stop_price_at_entry": _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")) or row.get("stop_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")),
+                            "pivot_price_at_entry": _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")) or row.get("pivot_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")),
+                            "exit_policy_family": merged_entry_meta.get("exit_policy_family") or row.get("exit_policy_family") if row else merged_entry_meta.get("exit_policy_family"),
+                        }
+                    )
             else:
                 qty_to_close = min(qty, current_qty)
                 remaining_qty = max(current_qty - qty_to_close, 0)
@@ -2451,6 +2553,14 @@ class PositionsRepo:
                         total_cost=values["total_cost"],
                         realized_pnl=values["realized_pnl"],
                         last_trade_at=filled_at,
+                        entry_reason=values.get("entry_reason"),
+                        entry_style_selected=values.get("entry_style_selected"),
+                        entry_decision_family=values.get("entry_decision_family"),
+                        entry_rule_version=values.get("entry_rule_version"),
+                        entry_meta_json=values.get("entry_meta_json", {}),
+                        stop_price_at_entry=values.get("stop_price_at_entry"),
+                        pivot_price_at_entry=values.get("pivot_price_at_entry"),
+                        exit_policy_family=values.get("exit_policy_family"),
                     )
                 )
 

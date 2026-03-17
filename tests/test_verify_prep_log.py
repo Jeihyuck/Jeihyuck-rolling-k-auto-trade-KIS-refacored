@@ -201,5 +201,34 @@ RuntimeError: boom
         log_path.unlink()
 
 
+def test_verify_pykrx_traceback_is_non_fatal_when_done_marker_exists():
+    log_content = """
+[TIME][TRADING_DAY][PYKRX_FAIL] date=2026-03-08 fallback=weekday_heuristic err_type=JSONDecodeError
+Traceback (most recent call last)
+TypeError: not all arguments converted during string formatting
+[PREP][DERIVED][MINERVINI] upserted=196
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-08 rows=196 rs_nonzero=196 vcp_nonzero=196 trend_nonzero=196
+[PREP][ASOF_CONSISTENCY] universe=2026-03-08 ohlcv=2026-03-08 derived=2026-03-08 candidate_pool=2026-03-08 watchlist=2026-03-08 flow=2026-03-08 final30=2026-03-08 consistent=1
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=30 pullback_nonzero=30 momentum_nonzero=30
+[PREP][WATCHLIST_FINAL][SAVE] n=30
+event_type=PREP_DONE
+[PREP][DONE] as_of=2026-03-08 source=db_exact universe=196 pool120=120 top50=50 final30=30 flow_coverage=100.0 final_source=db_roundtrip contract_mode=full_universe_based dt=31.0
+"""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        from scripts.verify_prep_log import parse_log_file
+
+        results = parse_log_file(log_path)
+        assert results.traceback_detected is True
+        assert results.traceback_non_fatal is True
+        assert not results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

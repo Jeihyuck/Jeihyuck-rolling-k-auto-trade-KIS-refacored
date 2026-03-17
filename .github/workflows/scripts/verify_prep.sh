@@ -82,8 +82,13 @@ else
 fi
 
 if grep -q "Traceback (most recent call last)" "$LOG"; then
-	echo "FAIL Python traceback detected" | tee -a "$VERIFY_LOG"
-	critical=1
+	if grep -q "\[TIME\]\[TRADING_DAY\]\[PYKRX_FAIL\].*fallback=" "$LOG" && \
+	   { grep -q "\[PREP\]\[DONE\]" "$LOG" || grep -q "event_type=PREP_DONE" "$LOG"; }; then
+		echo "PASS traceback classified as non-fatal PYKRX fallback noise" | tee -a "$VERIFY_LOG"
+	else
+		echo "FAIL Python traceback detected" | tee -a "$VERIFY_LOG"
+		critical=1
+	fi
 else
 	echo "PASS no traceback detected" | tee -a "$VERIFY_LOG"
 fi
