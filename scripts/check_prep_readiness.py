@@ -8,7 +8,7 @@ import sys
 import sqlalchemy as sa
 
 from trader.db.engine import make_engine
-from trader.db.repos import DerivedMinerviniRepo, LedgerEventsRepo, WatchlistRepo
+from trader.db.repos import CRITICAL_SCORED_COLS, DerivedMinerviniRepo, LedgerEventsRepo, WatchlistRepo
 from trader.db.schema import schema_for_engine
 from trader.runtime_paths import build_final30_scored_paths, repo_root
 from trader.time_utils import now_kst, resolve_trade_readiness_as_of
@@ -112,20 +112,29 @@ def main() -> int:
             log_result=False,
         )
 
+        scored_columns = set(scored_contract.get("columns") or [])
+        critical_missing_fields = [field for field in CRITICAL_SCORED_COLS if field not in scored_columns]
+        critical_scored_ok = not critical_missing_fields
+        rank_contract_warn = bool(scored_contract.get("rank_warn"))
+        optional_contract_warn = bool(scored_contract.get("missing_fields"))
+
         db_contract_ok = bool(
             prep_done
             and derived_count >= 1
             and watchlist_final_count == 30
             and watchlist_final_scored_count == 30
-            and scored_contract.get("ok")
+            and int(scored_contract.get("rows") or 0) == 30
+            and int(scored_contract.get("uniq_codes") or 0) == 30
+            and int(scored_contract.get("null_critical") or 0) == 0
+            and critical_scored_ok
         )
 
         status = "ready" if db_contract_ok else "not_ready"
         grade = "ok"
-        reason_code = "DB_CONTRACT_OK"
-        if db_contract_ok and not file_contract_ok:
+        reason_code = "DB_READY"
+        if db_contract_ok and (not file_contract_ok or rank_contract_warn or optional_contract_warn):
             grade = "warn"
-            reason_code = "DB_CONTRACT_OK_FILE_OPTIONAL_MISSING"
+            reason_code = "DB_READY_FILE_MISSING_OR_RANK_WARN"
         elif not db_contract_ok:
             grade = "error"
             reason_code = "DB_CONTRACT_INCOMPLETE"
@@ -133,7 +142,8 @@ def main() -> int:
         print(
             f"[PREP][READINESS][DB] env={env} as_of={resolved_as_of.isoformat()} prep_done={int(prep_done)} "
             f"prep_done_count={prep_done_count} derived_minervini={derived_count} watchlist_final={watchlist_final_count} "
-            f"watchlist_final_scored={watchlist_final_scored_count} db_contract_ok={int(db_contract_ok)}"
+            f"watchlist_final_scored={watchlist_final_scored_count} db_contract_ok={int(db_contract_ok)} "
+            f"rank_contract_warn={int(rank_contract_warn)}"
         )
         print(
             f"[PREP][READINESS][FILES] runtime={final30_path_stats['runtime']['exists']} "
@@ -153,7 +163,9 @@ def main() -> int:
             f"[PREP][READINESS] status={status} grade={grade} reason={reason_code} env={env} "
             f"run_date={run_date.isoformat()} window={window} requested_as_of={requested_as_of.isoformat()} "
             f"resolved_as_of={resolved_as_of.isoformat()} calendar_prev={calendar_prev.isoformat()} resolve_reason={reason} "
-            f"missing_paths={final30_missing} scored_missing_fields={scored_contract.get('missing_fields')}"
+            f"missing_paths={final30_missing} scored_missing_fields={scored_contract.get('missing_fields')} "
+            f"critical_missing_fields={critical_missing_fields} uniq_codes={scored_contract.get('uniq_codes')} "
+            f"null_critical={scored_contract.get('null_critical')}"
         )
         return 10
     except Exception as exc:

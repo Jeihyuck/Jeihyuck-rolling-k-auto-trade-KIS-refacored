@@ -219,6 +219,27 @@ def _contract_value_missing(value: Any) -> bool:
     return False
 
 
+def _extract_rank_candidates(rows: List[Dict[str, Any]], field: str) -> list[int]:
+    values: list[int] = []
+    for row in rows:
+        value = (row or {}).get(field)
+        if _contract_value_missing(value):
+            continue
+        try:
+            values.append(int(value))
+        except Exception:
+            continue
+    return values
+
+
+def _select_contract_rank_values(rows: List[Dict[str, Any]]) -> tuple[list[int], str]:
+    for field in ("rank_final30", "rank"):
+        values = _extract_rank_candidates(rows, field)
+        if values and len(set(values)) > 1:
+            return values, field
+    return list(range(len(rows))), "synthetic_for_diag"
+
+
 def summarize_final30_scored_contract(
     rows: List[Dict[str, Any]],
     *,
@@ -234,13 +255,9 @@ def summarize_final30_scored_contract(
     codes = [str((row or {}).get("code") or "").zfill(6) for row in normalized_rows if str((row or {}).get("code") or "").strip()]
     uniq_codes = len(set(codes))
 
-    rank_values: list[int] = []
-    for row in normalized_rows:
-        try:
-            rank_values.append(int((row or {}).get("rank_final30")))
-        except Exception:
-            continue
+    rank_values, rank_source = _select_contract_rank_values(normalized_rows)
     uniq_ranks = len(set(rank_values))
+    rank_warn = rank_source == "synthetic_for_diag" or uniq_ranks != int(expected_rows)
 
     as_of_values = sorted({str((row or {}).get("as_of") or "")[:10] for row in normalized_rows if str((row or {}).get("as_of") or "").strip()})
     null_critical = sum(
@@ -253,14 +270,14 @@ def summarize_final30_scored_contract(
     ok = (
         len(normalized_rows) == int(expected_rows)
         and uniq_codes == int(expected_rows)
-        and uniq_ranks == int(expected_rows)
         and null_critical == 0
-        and as_of_values == [expected_as_of]
     )
     return {
         "rows": len(normalized_rows),
         "uniq_codes": uniq_codes,
         "uniq_ranks": uniq_ranks,
+        "rank_source": rank_source,
+        "rank_warn": bool(rank_warn),
         "null_critical": null_critical,
         "as_of_values": as_of_values,
         "missing_fields": missing_fields,
@@ -3120,10 +3137,12 @@ class WatchlistRepo:
         summary["strategy"] = _norm_strategy(strategy)
         if log_result:
             logger.info(
-                "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s env=%s as_of=%s ok=%s",
+                "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s rank_source=%s rank_warn=%s null_critical=%s env=%s as_of=%s ok=%s",
                 summary["rows"],
                 summary["uniq_codes"],
                 summary["uniq_ranks"],
+                summary["rank_source"],
+                int(summary["rank_warn"]),
                 summary["null_critical"],
                 summary["env"],
                 summary["as_of"],

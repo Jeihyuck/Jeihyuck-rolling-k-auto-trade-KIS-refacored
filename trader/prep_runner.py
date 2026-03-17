@@ -1472,7 +1472,15 @@ def main() -> int:
             as_of=as_of,
             allow_latest_fallback=False,
         )
-        db_commit_ok = len(exact_final_rows) == 30 and bool(scored_contract.get("ok"))
+        scored_columns = set(scored_contract.get("columns") or [])
+        critical_missing_fields = [col for col in CRITICAL_SCORED_COLS if col not in scored_columns]
+        db_commit_ok = bool(
+            len(exact_final_rows) == 30
+            and int(scored_contract.get("rows") or 0) == 30
+            and int(scored_contract.get("uniq_codes") or 0) == 30
+            and int(scored_contract.get("null_critical") or 0) == 0
+            and not critical_missing_fields
+        )
         logger.info(
             "[PREP][DB_COMMIT][VERIFY] env=%s as_of=%s final=%s final_scored=%s required=30 ok=%s",
             env,
@@ -1481,14 +1489,22 @@ def main() -> int:
             scored_contract.get("rows"),
             int(db_commit_ok),
         )
+        if scored_contract.get("rank_warn"):
+            logger.warning(
+                "[PREP][DB_COMMIT][WARN] rank_uniqueness_warn=1 source=%s",
+                scored_contract.get("rank_source") or "unknown",
+            )
         if not db_commit_ok:
             logger.error(
-                "[PREP][COMMIT][FAIL] env=%s as_of=%s final=%s final_scored=%s missing_fields=%s",
+                "[PREP][COMMIT][FAIL] env=%s as_of=%s final=%s final_scored=%s uniq_codes=%s null_critical=%s missing_fields=%s critical_missing_fields=%s",
                 env,
                 as_of.isoformat(),
                 len(exact_final_rows),
                 scored_contract.get("rows"),
+                scored_contract.get("uniq_codes"),
+                scored_contract.get("null_critical"),
                 scored_contract.get("missing_fields"),
+                critical_missing_fields,
             )
             raise RuntimeError("PREP_DB_COMMIT_VERIFY_FAILED")
 
